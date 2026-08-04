@@ -227,6 +227,13 @@ impl From<&str> for ReplicationType {
 }
 
 /// ReplicationState represents internal replication state
+/// Bounds on the per-target delete-marker version map. The map is rebuilt from
+/// attacker-influenced object metadata, so cap the entry count and both string
+/// lengths rather than trusting what was persisted.
+pub(crate) const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
+pub(crate) const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
+pub(crate) const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReplicationState {
     pub replica_timestamp: Option<OffsetDateTime>,
@@ -239,6 +246,16 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
+    /// Exact version id the delete marker got on each replication target, keyed
+    /// by target ARN. Skipped by serde: `ReplicationState` has a positional wire
+    /// form, so this travels in the object's internal metadata instead and is
+    /// re-derived on read. See `persist_target_delete_marker_versions`.
+    #[serde(skip)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+    /// Set when the persisted keys disagreed across the dual internal prefixes,
+    /// so callers fail closed instead of purging the wrong target version.
+    #[serde(skip)]
+    pub target_delete_marker_version_ids_corrupt: bool,
 }
 
 impl ReplicationState {
@@ -311,6 +328,7 @@ impl ReplicationState {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
+            target_delete_marker_version_id: self.target_delete_marker_version_ids.get(arn).cloned(),
             resync_timestamp,
             ..Default::default()
         }
@@ -414,6 +432,8 @@ pub struct ReplicatedTargetInfo {
     pub endpoint: String,
     pub secure: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delete_marker_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -926,6 +946,36 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map.insert(key, value);
     }
 
+    // Carry the previously recorded per-target delete-marker versions forward,
+    // dropping anything that no longer satisfies the bounds, then fold in the
+    // versions this round's targets reported. A map that has already grown past
+    // the cap is discarded rather than trusted.
+    let mut target_delete_marker_version_ids = prev_state.target_delete_marker_version_ids.clone();
+    target_delete_marker_version_ids.retain(|arn, version_id| {
+        !arn.is_empty()
+            && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+            && !version_id.is_empty()
+            && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+    });
+    if target_delete_marker_version_ids.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+        target_delete_marker_version_ids.clear();
+    }
+    for target in &rinfos.targets {
+        let Some(version_id) = target.target_delete_marker_version_id.as_ref() else {
+            continue;
+        };
+        if (!target_delete_marker_version_ids.contains_key(&target.arn)
+            && target_delete_marker_version_ids.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            || target.arn.is_empty()
+            || target.arn.len() > MAX_REPLICATION_TARGET_ARN_LEN
+            || version_id.is_empty()
+            || version_id.len() > MAX_REPLICATION_TARGET_VERSION_ID_LEN
+        {
+            continue;
+        }
+        target_delete_marker_version_ids.insert(target.arn.clone(), version_id.clone());
+    }
+
     ReplicationState {
         replicate_decision_str: prev_state.replicate_decision_str.clone(),
         reset_statuses_map,
@@ -936,6 +986,8 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         replication_timestamp: rinfos.replication_timestamp,
         purge_targets,
         version_purge_status_internal: vpurge_statuses,
+        target_delete_marker_version_ids,
+        target_delete_marker_version_ids_corrupt: prev_state.target_delete_marker_version_ids_corrupt,
 
         ..Default::default()
     }

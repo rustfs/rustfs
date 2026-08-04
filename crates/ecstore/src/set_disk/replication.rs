@@ -37,7 +37,10 @@ impl RestoreCleanupIdentity {
     }
 
     fn matches_file_info(&self, fi: &FileInfo, expected_etag: &str) -> bool {
-        self.version_id == fi.version_id
+        // Normalize the nil version on both sides: a versioning-suspended object
+        // is `Some(Uuid::nil())` on one and `None` on the other, so a raw compare
+        // reports every suspended restore as "changed before finalization".
+        self.version_id.filter(|version_id| !version_id.is_nil()) == fi.version_id.filter(|version_id| !version_id.is_nil())
             && self.data_dir == fi.data_dir
             && self.mod_time == fi.mod_time
             && self.size == fi.size

@@ -14,6 +14,7 @@
 
 use crate::config::RustFSBufferConfig;
 use crate::runtime_sources as root_runtime_sources;
+use crate::storage::storage_api::NotificationSys;
 use crate::storage::storage_api::runtime_sources_consumer::ECStore;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Result as IamResult, store::object::ObjectStore, sys::IamSys};
@@ -26,6 +27,8 @@ use rustfs_lock::LockClient;
 use std::sync::Arc;
 
 pub(crate) use crate::runtime_sources::{AppContext, ServerContextSlot};
+#[cfg(test)]
+pub(crate) use crate::runtime_sources::{IamInterface, KmsInterface};
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     root_runtime_sources::current_app_context()
@@ -37,6 +40,10 @@ pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
 
 pub(crate) fn current_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
     root_runtime_sources::current_object_store_handle_for_context(context)
+}
+
+pub(crate) fn current_notification_system_for_context(context: Option<&AppContext>) -> Option<Arc<NotificationSys>> {
+    root_runtime_sources::current_notification_system_for_context(context)
 }
 
 pub(crate) fn current_replication_stats_handle_for_context(

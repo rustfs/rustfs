@@ -435,6 +435,22 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_no_lock_preserve_empty_with_metadata<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(
+        api,
+        file,
+        &ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
 pub async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
 where
     S: ObjectIO<
@@ -2594,9 +2610,10 @@ mod tests {
     use super::{
         SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        lookup_configs, new_and_save_server_config, read_config, read_config_preserve_empty, read_config_with_metadata,
-        read_config_without_migrate, read_server_config_snapshot, save_server_config, save_server_config_snapshot,
-        save_server_config_snapshot_with_generation, server_config_transaction_lock_path, storage_class_kvs_mut,
+        lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
+        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
+        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+        server_config_transaction_lock_path, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -5027,9 +5044,14 @@ mod tests {
             .expect_err("the existing config contract treats empty objects as missing");
         assert!(matches!(err, Error::ConfigNotFound));
 
-        let data = read_config_preserve_empty(store, "config/empty.json")
+        let data = read_config_preserve_empty(store.clone(), "config/empty.json")
             .await
             .expect("payload-validating callers must observe the empty object");
+        assert!(data.is_empty());
+
+        let (data, _) = read_config_no_lock_preserve_empty_with_metadata(store, "config/empty.json")
+            .await
+            .expect("no-lock payload-validating callers must observe the empty object");
         assert!(data.is_empty());
     }
 

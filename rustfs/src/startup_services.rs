@@ -75,11 +75,14 @@ pub(crate) async fn init_startup_runtime_services(
     let optional_runtimes = init_optional_runtime_services().await?;
 
     init_buffer_profile_system(config);
-    init_audit_runtime().await;
     init_deadlock_detector_runtime();
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
     let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+
+    // Audit initialization requires the AppContext (server config + object store)
+    // which is published by ensure_startup_after_iam inside init_iam_runtime.
+    init_audit_runtime().await;
     // Unconditional: deferred IAM recovers in the background and has no callback into this
     // scheduler, so gating on the inline disposition would leave a recovered node with
     // self-pointing replication rules until the next restart. The task waits for IAM and

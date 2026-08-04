@@ -42,6 +42,7 @@ use crate::bucket::lifecycle::tier_free_version_recovery::{
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
 use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
+use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
@@ -90,8 +91,8 @@ use rustfs_utils::{
     string::{parse_bool, strings_has_prefix_fold},
 };
 use s3s::dto::{
-    BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ObjectLockConfiguration, RestoreRequest,
-    RestoreRequestType, RestoreStatus, Timestamp,
+    BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
+    Timestamp,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
@@ -309,6 +310,7 @@ struct ExpiryTask {
     obj_info: ObjectInfo,
     event: lifecycle::Event,
     src: LcEventSrc,
+    bucket_incarnation_id: Uuid,
 }
 
 impl ExpiryOp for ExpiryTask {
@@ -587,6 +589,7 @@ struct NewerNoncurrentTask {
     versions: Vec<ObjectToDelete>,
     event: lifecycle::Event,
     src: LcEventSrc,
+    bucket_incarnation_id: Uuid,
 }
 
 impl ExpiryOp for NewerNoncurrentTask {
@@ -697,13 +700,20 @@ impl ExpiryState {
         queued
     }
 
-    pub fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
+    pub fn enqueue_by_days(
+        &mut self,
+        oi: &ObjectInfo,
+        event: &lifecycle::Event,
+        src: &LcEventSrc,
+        bucket_incarnation_id: Uuid,
+    ) -> bool {
         let trace = LifecycleExpiryTrace::for_object(oi, event, src, 1);
         trace.emit(EVENT_LIFECYCLE_EXPIRED_DETECTED, "detected", None);
         let task = ExpiryTask {
             obj_info: oi.clone(),
             event: event.clone(),
             src: src.clone(),
+            bucket_incarnation_id,
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
@@ -730,6 +740,7 @@ impl ExpiryState {
         versions: Vec<ObjectToDelete>,
         lc_event: lifecycle::Event,
         src: &LcEventSrc,
+        bucket_incarnation_id: Uuid,
     ) -> bool {
         if versions.is_empty() {
             return true;
@@ -743,6 +754,7 @@ impl ExpiryState {
             versions,
             event: lc_event.clone(),
             src: src.clone(),
+            bucket_incarnation_id,
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
@@ -855,9 +867,23 @@ impl ExpiryState {
                         let trace = LifecycleExpiryTrace::for_object(&v.obj_info, &v.event, &v.src, 1);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
                         let deleted = if !v.obj_info.transitioned_object.status.is_empty() {
-                            apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await
+                            apply_expiry_on_transitioned_object(
+                                api.clone(),
+                                &v.obj_info,
+                                &v.event,
+                                &v.src,
+                                v.bucket_incarnation_id,
+                            )
+                            .await
                         } else {
-                            apply_expiry_on_non_transitioned_objects(api.clone(), &v.obj_info, &v.event, &v.src).await
+                            apply_expiry_on_non_transitioned_objects(
+                                api.clone(),
+                                &v.obj_info,
+                                &v.event,
+                                &v.src,
+                                v.bucket_incarnation_id,
+                            )
+                            .await
                         };
                         if deleted {
                             trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
@@ -875,7 +901,14 @@ impl ExpiryState {
                         let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
                         let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
-                        crate::client::object_handlers_common::delete_object_versions(&api, &v.bucket, &v.versions, v.event.clone()).await;
+                        crate::client::object_handlers_common::delete_object_versions(
+                            &api,
+                            &v.bucket,
+                            &v.versions,
+                            v.event.clone(),
+                            v.bucket_incarnation_id,
+                        )
+                        .await;
                         trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
                     }
                     else if v.as_any().is::<Jentry>() {
@@ -2886,7 +2919,7 @@ async fn read_stale_multipart_candidate(
     ) {
         Ok(file_info) => (Some(file_info.metadata), file_info.mod_time),
         Err(err) => {
-            warn!(
+            debug!(
                 event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
@@ -3265,10 +3298,27 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
 }
 
 pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(lifecycle) = runtime_sources::bucket_lifecycle_config(&oi.bucket).await else {
+    let Some(api) = runtime_sources::object_store_handle() else {
         return;
     };
-    let Some(api) = runtime_sources::object_store_handle() else {
+    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+        Ok(configs) => configs,
+        Err(err) => {
+            observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
+            warn!(
+                event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                error = %err,
+                reason = "metadata_unavailable",
+                "Failed to load authoritative lifecycle metadata"
+            );
+            return;
+        }
+    };
+    let Some(lifecycle) = configs.lifecycle else {
         return;
     };
 
@@ -3312,16 +3362,13 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         object_infos.push(oi.clone());
     }
 
-    let lock_config = match metadata_boundary::get_object_lock_config(&oi.bucket).await {
-        Ok((cfg, _)) => Some(Arc::new(cfg)),
-        Err(_) => None,
-    };
     let object_opts = object_infos
         .iter()
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
-    let events = match Evaluator::new(Arc::new(lifecycle))
-        .with_lock_retention(lock_config)
+    let lock_config = configs.object_lock;
+    let events = match Evaluator::new(lifecycle)
+        .with_lock_retention(lock_config.clone())
         .eval(&object_opts)
         .await
     {
@@ -3350,6 +3397,19 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         if event.due != Some(OffsetDateTime::UNIX_EPOCH) {
             continue;
         }
+        if matches!(
+            event.action,
+            IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        ) && !matches!(
+            object_lock_boundary::check_object_lock_for_deletion_with_config(lock_config.as_deref(), object, false),
+            Ok(None)
+        ) {
+            record_scanner_lifecycle_expiry_blocked(&src, 1);
+            continue;
+        }
 
         match event.action {
             IlmAction::DeleteAction
@@ -3357,7 +3417,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
             | IlmAction::DeleteRestoredVersionAction
             | IlmAction::DeleteAllVersionsAction
             | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                apply_expiry_rule(event, &src, object).await;
+                enqueue_expiry_rule_with_incarnation(event, &src, object, configs.bucket_incarnation_id).await;
             }
             IlmAction::DeleteVersionAction => {
                 to_delete_objs.push(ObjectToDelete {
@@ -3377,10 +3437,13 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         && let Some(event) = noncurrent_event
     {
         let expiry_state = runtime_sources::expiry_state_handle();
-        expiry_state
-            .write()
-            .await
-            .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event, &src);
+        expiry_state.write().await.enqueue_by_newer_noncurrent(
+            &oi.bucket,
+            to_delete_objs,
+            event,
+            &src,
+            configs.bucket_incarnation_id,
+        );
     }
 }
 
@@ -3757,11 +3820,17 @@ fn should_defer_date_expiry_for_recent_config_update(lc: &BucketLifecycleConfigu
     })
 }
 
-async fn apply_existing_object_expiry(api: Arc<ECStore>, object: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+async fn apply_existing_object_expiry(
+    api: Arc<ECStore>,
+    object: &ObjectInfo,
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
+) {
     if object.is_remote() {
-        apply_expiry_on_transitioned_object(api, object, event, src).await;
+        apply_expiry_on_transitioned_object(api, object, event, src, bucket_incarnation_id).await;
     } else {
-        apply_expiry_on_non_transitioned_objects(api, object, event, src).await;
+        apply_expiry_on_non_transitioned_objects(api, object, event, src, bucket_incarnation_id).await;
     }
 }
 
@@ -3770,6 +3839,7 @@ struct ExistingObjectExpiryContext<'a> {
     bucket: &'a str,
     lc: Arc<BucketLifecycleConfiguration>,
     lock_config: Option<Arc<ObjectLockConfiguration>>,
+    bucket_incarnation_id: Uuid,
     src: &'a LcEventSrc,
     defer_date_expiry_once: bool,
 }
@@ -3821,6 +3891,17 @@ async fn enqueue_expiry_for_existing_object_group(
             | IlmAction::DeleteRestoredVersionAction
             | IlmAction::DeleteAllVersionsAction
             | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                if !event.action.delete_restored() {
+                    let object_lock_result = object_lock_boundary::check_object_lock_for_deletion_with_config(
+                        context.lock_config.as_deref(),
+                        object,
+                        false,
+                    );
+                    if !matches!(object_lock_result, Ok(None)) {
+                        record_scanner_lifecycle_expiry_blocked(context.src, 1);
+                        continue;
+                    }
+                }
                 let now = OffsetDateTime::now_utc();
                 if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
                     if context.defer_date_expiry_once
@@ -3864,10 +3945,17 @@ async fn enqueue_expiry_for_existing_object_group(
                             record_scanner_lifecycle_expiry_blocked(context.src, 1);
                             continue;
                         }
-                        apply_existing_object_expiry(context.api.clone(), object, event, context.src).await;
+                        apply_existing_object_expiry(
+                            context.api.clone(),
+                            object,
+                            event,
+                            context.src,
+                            context.bucket_incarnation_id,
+                        )
+                        .await;
                     }
                 } else {
-                    apply_expiry_rule(event, context.src, object).await;
+                    enqueue_expiry_rule_with_incarnation(event, context.src, object, context.bucket_incarnation_id).await;
                 }
             }
             _ => {}
@@ -3878,22 +3966,22 @@ async fn enqueue_expiry_for_existing_object_group(
         && let Some(event) = noncurrent_event
     {
         let expiry_state = runtime_sources::expiry_state_handle();
-        expiry_state
-            .write()
-            .await
-            .enqueue_by_newer_noncurrent(context.bucket, to_delete_objs, event, context.src);
+        expiry_state.write().await.enqueue_by_newer_noncurrent(
+            context.bucket,
+            to_delete_objs,
+            event,
+            context.src,
+            context.bucket_incarnation_id,
+        );
     }
 }
 
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    let Ok((lc, _)) = metadata_boundary::get_lifecycle_config(bucket).await else {
+    let configs = metadata_boundary::get_expiry_configs(&api, bucket).await?;
+    let Some(lc) = configs.lifecycle else {
         return Ok(());
     };
-    let lc = Arc::new(lc);
-    let lock_config = metadata_boundary::get_object_lock_config(bucket)
-        .await
-        .ok()
-        .map(|(cfg, _)| Arc::new(cfg));
+    let lock_config = configs.object_lock;
     let mut marker = None;
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;
@@ -3903,6 +3991,7 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
         bucket,
         lc: lc.clone(),
         lock_config: lock_config.clone(),
+        bucket_incarnation_id: configs.bucket_incarnation_id,
         src: &src,
         defer_date_expiry_once,
     };
@@ -4057,20 +4146,45 @@ fn transitioned_object_delete_opts(
     action: IlmAction,
     versioned: bool,
     version_suspended: bool,
-) -> ObjectOptions {
+    bucket_incarnation_id: Uuid,
+) -> crate::error::Result<ObjectOptions> {
     let mut opts = ObjectOptions {
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
+        expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
     if action.delete_versioned() {
         opts.version_id = oi.version_id.map(|id| id.to_string());
     }
     if action.delete_restored() {
+        let etag = oi
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or_else(|| Error::other("restored-copy expiry requires an object etag"))?;
+        let data_dir = oi
+            .data_dir
+            .ok_or_else(|| Error::other("restored-copy expiry requires a local data directory"))?;
+        let restore_expiry = oi
+            .restore_expires
+            .ok_or_else(|| Error::other("restored-copy expiry requires a restore expiry"))?;
         opts.transition.expire_restored = true;
+        opts.transition.status.clone_from(&oi.transitioned_object.status);
+        opts.transition.tier.clone_from(&oi.transitioned_object.tier);
+        opts.transition.etag = etag.to_string();
+        opts.transition.expected_data_dir = Some(data_dir);
+        opts.transition.expected_remote_name.clone_from(&oi.transitioned_object.name);
+        opts.transition
+            .expected_remote_version_id
+            .clone_from(&oi.transitioned_object.version_id);
+        opts.transition.restore_expiry = restore_expiry;
+        if let Some(version_id) = oi.version_id {
+            opts.version_id = Some(version_id.to_string());
+        }
     }
-    opts
+    Ok(opts)
 }
 
 pub async fn expire_transitioned_object(
@@ -4078,12 +4192,14 @@ pub async fn expire_transitioned_object(
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
 ) -> Result<ObjectInfo, std::io::Error> {
     let snapshot = lifecycle_delete_config_snapshot(&api, oi)
         .await
         .map_err(std::io::Error::other)?;
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
-    let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended);
+    let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
+        .map_err(std::io::Error::other)?;
     opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
@@ -4509,7 +4625,7 @@ const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
 
 pub async fn eval_action_from_lifecycle(
     lc: &BucketLifecycleConfiguration,
-    lr: Option<DefaultRetention>,
+    lock_config: Option<&ObjectLockConfiguration>,
     oi: &ObjectInfo,
 ) -> lifecycle::Event {
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
@@ -4522,7 +4638,7 @@ pub async fn eval_action_from_lifecycle(
         "Evaluated lifecycle action during secondary scan"
     );
 
-    let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
+    let lock_enabled = lock_config.is_some_and(ObjectLockApi::enabled);
     let object_locked = object_lock_boundary::is_object_locked_by_metadata(&oi.user_defined, oi.delete_marker);
 
     match event.action {
@@ -4538,12 +4654,14 @@ pub async fn eval_action_from_lifecycle(
             {
                 return lifecycle::Event::default();
             }
-            // Lifecycle operations should never bypass governance retention
-            if object_locked
-                || (lock_enabled
-                    && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
-                        .await
-                        .is_some())
+            // Destructive expiry never bypasses retention. Restore expiry only
+            // removes the local copy; the retained logical version remains.
+            if !event.action.delete_restored()
+                && (object_locked
+                    || !matches!(
+                        object_lock_boundary::check_object_lock_for_deletion_with_config(lock_config, oi, false),
+                        Ok(None)
+                    ))
             {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
@@ -4676,9 +4794,10 @@ pub async fn apply_expiry_on_transitioned_object(
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
     src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
 ) -> bool {
     let time_ilm = Metrics::time_ilm(lc_event.action);
-    if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src).await {
+    if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src, bucket_incarnation_id).await {
         return false;
     }
     time_ilm(1)();
@@ -4691,6 +4810,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
 ) -> bool {
     let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
         Ok(snapshot) => snapshot,
@@ -4714,6 +4834,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         version_suspended,
         expiration: ExpirationOptions { expire: true },
         delete_replication_config_snapshot: Some(Arc::new(snapshot)),
+        expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
 
@@ -4775,10 +4896,61 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     true
 }
 
-pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+async fn enqueue_expiry_rule_with_incarnation(
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    oi: &ObjectInfo,
+    bucket_incarnation_id: Uuid,
+) -> bool {
     let expiry_state = runtime_sources::expiry_state_handle();
     let mut expiry_state = expiry_state.write().await;
-    expiry_state.enqueue_by_days(oi, event, src)
+    expiry_state.enqueue_by_days(oi, event, src, bucket_incarnation_id)
+}
+
+pub(crate) async fn apply_expiry_rule_in(api: Arc<ECStore>, event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    let Ok(_lifecycle_guard) = api.acquire_bucket_lifecycle_read_lock(&oi.bucket).await else {
+        return false;
+    };
+    let Ok(bucket_incarnation_id) = api.bucket_incarnation_id_from_disk(&oi.bucket).await else {
+        return false;
+    };
+    let current = match api
+        .get_object_info(
+            &oi.bucket,
+            &oi.name,
+            &ObjectOptions {
+                version_id: oi.version_id.map(|version_id| version_id.to_string()),
+                versioned: oi.version_id.is_some(),
+                expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(current) => current,
+        Err(_) => return false,
+    };
+    if current.version_id != oi.version_id
+        || current.data_dir != oi.data_dir
+        || current.mod_time != oi.mod_time
+        || current.etag != oi.etag
+        || current.delete_marker != oi.delete_marker
+        || current.transitioned_object.name != oi.transitioned_object.name
+        || current.transitioned_object.version_id != oi.transitioned_object.version_id
+        || current.transitioned_object.tier != oi.transitioned_object.tier
+        || current.transitioned_object.status != oi.transitioned_object.status
+        || current.restore_expires != oi.restore_expires
+    {
+        return false;
+    }
+    enqueue_expiry_rule_with_incarnation(event, src, oi, bucket_incarnation_id).await
+}
+
+pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+    let Some(api) = runtime_sources::object_store_handle() else {
+        return false;
+    };
+    apply_expiry_rule_in(api, event, src, oi).await
 }
 
 fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> DeletedObject {
@@ -4853,11 +5025,11 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EXPIRED_DETECTED, EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState,
-        FreeVersionTask, ManualTransitionJobRecoveryOutcome, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
-        ManualTransitionRunReport, StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
-        TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule,
-        TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
+        DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
+        EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState, ExpiryTask, FreeVersionTask, ManualTransitionJobRecoveryOutcome,
+        ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, StaleMultipartUploadCandidate,
+        TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE,
+        TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
@@ -4937,8 +5109,9 @@ mod tests {
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
     use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
-        RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
+        BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,
+        RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
     use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
@@ -5854,29 +6027,44 @@ mod tests {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
             version_id: Some(vid),
+            data_dir: Some(Uuid::new_v4()),
+            etag: Some("etag".to_string()),
+            restore_expires: Some(OffsetDateTime::now_utc() - StdDuration::from_secs(1)),
+            transitioned_object: TransitionedObject {
+                name: "remote-object".to_string(),
+                tier: "tier".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         // Plain version expiry: exact version, real delete.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteVersionAction, true, false);
+        let incarnation = Uuid::new_v4();
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteVersionAction, true, false, incarnation)
+            .expect("build version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
         assert!(!opts.transition.expire_restored);
         assert!(opts.expiration.expire);
 
         // Restore-expiry of the latest version: restored-copy cleanup only.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredAction, true, false);
-        assert!(opts.version_id.is_none());
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredAction, true, false, incarnation)
+            .expect("build restored expiry options");
+        assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert!(opts.transition.expire_restored);
 
         // Restore-expiry of a noncurrent version: restored-copy cleanup of the
         // exact version. Routing this through the full transitioned-object
         // delete instead would remove the remote tier data.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredVersionAction, true, false);
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredVersionAction, true, false, incarnation)
+            .expect("build restored-version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert!(opts.transition.expire_restored);
 
         // Whole-object expiry stays a real delete.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteAction, false, false);
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteAction, false, false, incarnation)
+            .expect("build object expiry options");
         assert!(opts.version_id.is_none());
         assert!(!opts.transition.expire_restored);
     }
@@ -5905,7 +6093,7 @@ mod tests {
             ..Default::default()
         };
 
-        let queued = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner);
+        let queued = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner, Uuid::new_v4());
 
         assert!(!queued);
         assert_eq!(state.stats.missed_tasks(), 1);
@@ -6011,8 +6199,9 @@ mod tests {
             ..Default::default()
         };
 
-        let first = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner);
-        let second = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner);
+        let incarnation = Uuid::new_v4();
+        let first = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner, incarnation);
+        let second = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner, incarnation);
 
         assert!(first);
         assert!(!second);
@@ -6029,6 +6218,39 @@ mod tests {
             2
         );
         assert!(observed.contains(&(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("queue_full"))));
+    }
+
+    #[tokio::test]
+    async fn expiry_task_retains_enqueue_time_bucket_incarnation() {
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let incarnation = Uuid::new_v4();
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::DeleteAction,
+            ..Default::default()
+        };
+        {
+            let mut state = state.write().await;
+            assert!(state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner, incarnation));
+        }
+
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("expiry task should be queued")
+            .expect("expiry task payload should be present");
+        let task = task
+            .as_any()
+            .downcast_ref::<ExpiryTask>()
+            .expect("queued payload should be an expiry task");
+        assert_eq!(task.bucket_incarnation_id, incarnation);
     }
 
     #[tokio::test]
@@ -7738,6 +7960,48 @@ mod tests {
                 prefix: None,
                 transitions: None,
             }],
+        }
+    }
+
+    fn all_versions_expiration_lifecycle() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_all_versions: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("delete-all".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    fn lock_enabled_without_default_retention() -> ObjectLockConfiguration {
+        ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        }
+    }
+
+    fn lock_enabled_with_default_retention() -> ObjectLockConfiguration {
+        ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    days: Some(30),
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    years: None,
+                }),
+            }),
         }
     }
 
@@ -9938,6 +10202,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_object_lifecycle_skips_current_expiration_for_bucket_default_retention() {
+        let lc = latest_expiration_lifecycle();
+        let mut object = current_object(ReplicationStatusType::Completed);
+        object.mod_time = Some(OffsetDateTime::now_utc());
+        let lock_config = lock_enabled_with_default_retention();
+
+        let event = eval_action_from_lifecycle(&lc, Some(&lock_config), &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn existing_object_lifecycle_skips_delete_all_when_lock_enabled_without_default_retention() {
+        let lc = all_versions_expiration_lifecycle();
+        let object = current_object(ReplicationStatusType::Completed);
+        let lock_config = lock_enabled_without_default_retention();
+
+        let event = eval_action_from_lifecycle(&lc, Some(&lock_config), &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-lock-metadata-error-{}", Uuid::new_v4().simple());
+        let object = "due/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let mut reader = PutObjReader::from_vec(b"must survive lifecycle metadata failure".to_vec());
+        let object_info = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("due object should be created");
+
+        let lifecycle = latest_expiration_lifecycle();
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
+        metadata.lifecycle_config_xml = crate::bucket::utils::serialize(&lifecycle).unwrap();
+        metadata.lifecycle_config = Some(lifecycle);
+        metadata.object_lock_config_xml = b"<ObjectLockConfiguration>".to_vec();
+        metadata.object_lock_config = None;
+        sys.persist_and_set(metadata)
+            .await
+            .expect("corrupt Object Lock payload should be persisted for the read-boundary test");
+        sys.reload_from_store(&bucket)
+            .await
+            .expect("peer-style reload should publish the malformed persisted snapshot");
+
+        let exact_error = super::metadata_boundary::get_expiry_configs(&ecstore, &bucket)
+            .await
+            .expect_err("malformed Object Lock metadata must reject lifecycle config resolution");
+        assert!(
+            exact_error
+                .to_string()
+                .contains("persisted bucket Object Lock configuration is invalid")
+        );
+
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_events = Arc::clone(&observed);
+        let _observer = set_lifecycle_observability_observer(move |event, state, reason| {
+            observed_events
+                .lock()
+                .expect("lifecycle metadata error observer should not poison")
+                .push((event, state, reason));
+        });
+
+        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+
+        assert!(
+            observed.lock().expect("observed events should not poison").contains(&(
+                EVENT_LIFECYCLE_EVALUATION_FAILED,
+                "failed",
+                Some("metadata_unavailable")
+            )),
+            "immediate expiry must expose the authoritative metadata failure"
+        );
+        {
+            let state = runtime_state.read().await;
+            assert_eq!(state.stats.pending_tasks(), 0, "immediate expiry must not enqueue a delete");
+        }
+        assert!(
+            ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_ok(),
+            "immediate expiry must leave the due object intact"
+        );
+
+        let scanner_error = super::enqueue_expiry_for_existing_objects(ecstore.clone(), &bucket)
+            .await
+            .expect_err("scanner must propagate the authoritative Object Lock metadata error");
+        assert_eq!(scanner_error.to_string(), exact_error.to_string());
+        {
+            let state = runtime_state.read().await;
+            assert_eq!(state.stats.pending_tasks(), 0, "scanner must not enqueue a delete");
+        }
+        assert!(
+            ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_ok(),
+            "scanner must leave the due object intact"
+        );
+    }
+
+    #[tokio::test]
     async fn existing_object_lifecycle_skips_current_expiration_for_explicit_legal_hold() {
         let lc = latest_expiration_lifecycle();
         let object = current_object_with_metadata(
@@ -9970,6 +10352,37 @@ mod tests {
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
 
         assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn restored_copy_expiry_is_not_blocked_by_retention() {
+        let lifecycle = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: Vec::new(),
+        };
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut object = current_object_with_metadata(
+            ReplicationStatusType::Completed,
+            HashMap::from([
+                (
+                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                ),
+                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+            ]),
+        );
+        object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+        object.restore_expires = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+
+        let current = eval_action_from_lifecycle(&lifecycle, None, &object).await;
+        assert_eq!(current.action, IlmAction::DeleteRestoredAction);
+
+        object.is_latest = false;
+        object.successor_mod_time = Some(OffsetDateTime::now_utc());
+        let noncurrent = eval_action_from_lifecycle(&lifecycle, None, &object).await;
+        assert_eq!(noncurrent.action, IlmAction::DeleteRestoredVersionAction);
     }
 
     #[tokio::test]
