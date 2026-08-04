@@ -249,19 +249,22 @@ async fn restore_metadata_backup(
     rename_all(&backup_path, xl_path, object_dir, publication_root).await
 }
 
-#[cfg(windows)]
-fn lock_destination_commit_directory(
-    dir_path: &Path,
+fn lock_rename_commit_directories(
+    source_parent: &Path,
+    destination_parent: &Path,
     base_dir: &Path,
     publication_root: &os::PublicationRoot,
-) -> Result<os::ExistingBaseDirectoryGuard> {
-    os::run_blocking_namespace_operation(|| {
+) -> Result<os::RenameCommitGuard> {
+    #[cfg(windows)]
+    let result = os::run_blocking_namespace_operation(|| {
         #[cfg(test)]
-        run_destination_commit_directory_preparation(dir_path);
-        os::mkdir_all_below_existing_base_std(dir_path, base_dir, publication_root)
-    })
-    .map_err(to_file_error)
-    .map_err(DiskError::from)
+        run_destination_commit_directory_preparation(destination_parent);
+        os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root)
+    });
+    #[cfg(not(windows))]
+    let result = os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root);
+
+    result.map_err(to_file_error).map_err(DiskError::from)
 }
 
 async fn restore_delete_rollback(
@@ -8119,10 +8122,12 @@ impl DiskAPI for LocalDisk {
             shard_sync_res?;
             remove_dst_base_before_commit(dst_path).map_err(to_file_error)?;
             // Windows acquisition order is the volume mutation lock above,
-            // then this object identity guard, then each publication's source
-            // and destination handles. Keep the object guard through xl.meta.
-            #[cfg(windows)]
-            let _destination_commit_guard = lock_destination_commit_directory(
+            // then the common source and destination directory trees, then each
+            // source entry. Reuse the trees across data and xl.meta publication.
+            let rename_commit_guard = lock_rename_commit_directories(
+                src_file_path
+                    .parent()
+                    .ok_or_else(|| DiskError::other("missing staged metadata parent"))?,
                 dst_file_path
                     .parent()
                     .ok_or_else(|| DiskError::other("missing object metadata parent"))?,
@@ -8131,7 +8136,14 @@ impl DiskAPI for LocalDisk {
             )?;
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
-                && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent, &self.publication_root).await
+                && let Err(err) = os::rename_all_with_commit_guard(
+                    src_data_path,
+                    dst_data_path,
+                    &skip_parent,
+                    &self.publication_root,
+                    &rename_commit_guard,
+                )
+                .await
             {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
@@ -8216,7 +8228,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::Unexpected);
             }
 
-            if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent, &self.publication_root).await {
+            if let Err(err) = os::rename_all_with_commit_guard(
+                &src_file_path,
+                &dst_file_path,
+                &skip_parent,
+                &self.publication_root,
+                &rename_commit_guard,
+            )
+            .await
+            {
                 if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 }
@@ -8305,7 +8325,7 @@ impl DiskAPI for LocalDisk {
             // complete. Do not retain the Windows object identity guard while
             // cleaning staging paths or invalidating cached descriptors.
             #[cfg(windows)]
-            drop(_destination_commit_guard);
+            drop(rename_commit_guard);
 
             if let Some(src_file_path_parent) = src_file_path.parent() {
                 if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
@@ -8450,10 +8470,12 @@ impl DiskAPI for LocalDisk {
                 };
 
             remove_dst_base_before_commit(dst_path).map_err(to_file_error)?;
-            // Match the non-inline commit order and retain one destination
-            // object identity across rollback-backup and xl.meta publication.
-            #[cfg(windows)]
-            let _destination_commit_guard = lock_destination_commit_directory(
+            // Match the non-inline commit order and pin the common staging and
+            // destination directory identities through xl.meta publication.
+            let rename_commit_guard = lock_rename_commit_directories(
+                src_file_path
+                    .parent()
+                    .ok_or_else(|| DiskError::other("missing staged metadata parent"))?,
                 dst_file_path
                     .parent()
                     .ok_or_else(|| DiskError::other("missing object metadata parent"))?,
@@ -8483,7 +8505,16 @@ impl DiskAPI for LocalDisk {
             let commit_result = match remove_staged_meta_before_commit(dst_path, &src_file_path) {
                 Err(err) => Err(DiskError::from(to_file_error(err))),
                 Ok(()) if should_fail_commit_rename(dst_path) => Err(DiskError::other("test fail during metadata commit rename")),
-                Ok(()) => rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await,
+                Ok(()) => {
+                    os::rename_all_with_commit_guard(
+                        &src_file_path,
+                        &dst_file_path,
+                        &dst_volume_dir,
+                        &self.publication_root,
+                        &rename_commit_guard,
+                    )
+                    .await
+                }
             };
             if let Err(err) = commit_result {
                 if let Some(backup_path) = local_rollback_path.as_deref() {
@@ -8553,7 +8584,7 @@ impl DiskAPI for LocalDisk {
             // The commit no longer has a rollback path. Release the Windows
             // object identity guard before best-effort staging cleanup.
             #[cfg(windows)]
-            drop(_destination_commit_guard);
+            drop(rename_commit_guard);
 
             if let Some(backup_path) = local_rollback_path.as_deref() {
                 let _ = remove_file_if_exists(backup_path);
@@ -12267,6 +12298,7 @@ mod test {
     async fn test_rename_data_writes_old_metadata_backup_for_inline_overwrite() {
         use tempfile::tempdir;
 
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
@@ -12305,6 +12337,14 @@ mod test {
         assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
         let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
         assert!(backup_path.exists());
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(backup_path.parent().expect("backup must have a parent")),
+            "strict inline overwrite must persist the rollback backup directory entry"
+        );
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&dst_object_dir),
+            "strict inline overwrite must persist the committed xl.meta directory entry"
+        );
         // The rollback backup must contain the previous metadata bytes verbatim so
         // that undo_write can restore the prior committed object; guards the inline
         // backup write against truncation/corruption regressions.
