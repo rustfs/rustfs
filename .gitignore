@@ -83,3 +83,7 @@ worktrees/*
 
 # Local AI-agent review artifacts (omo evidence dumps)
 .omo/
+
+# insta scratch files; the accepted .snap files ARE the assertions and are committed
+*.snap.new
+*.pending-snap

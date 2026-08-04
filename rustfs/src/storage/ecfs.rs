@@ -15,15 +15,15 @@
 use super::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
-    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
-    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
-    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
-    update_bucket_metadata_config,
+    decode_tags_to_map, delete_bucket_metadata_config_if_incarnation, encode_tags, get_bucket_accelerate_config,
+    get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config,
+    get_bucket_website_config, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    record_replication_proxy, serialize, update_bucket_metadata_config_if_incarnation,
 };
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::ApiError;
-use crate::storage::access::has_bypass_governance_header;
+use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
@@ -135,19 +135,16 @@ impl FS {
         let tags = match store.get_object_tags(bucket, object, &opts).await {
             Ok(t) => t,
             Err(e) => {
-                if is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if is_err_object_not_found(&e) || is_err_version_not_found(&e) || is_err_bucket_not_found(&e) {
                     debug!(
                         target: "rustfs::storage::ecfs",
                         bucket = %bucket,
                         object = %object,
                         version_id = ?version_id,
                         error = %e,
-                        "object or version not found when fetching tags for policy; treating as no tags"
+                        "object, version, or bucket not found when fetching tags for policy; treating as no tags"
                     );
                     return Ok(std::collections::HashMap::new());
-                }
-                if is_err_bucket_not_found(&e) {
-                    return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
                 }
                 warn!(
                     target: "rustfs::storage::ecfs",
@@ -192,6 +189,12 @@ const MAXIMUM_RETENTION_YEARS: i32 = 100;
 
 fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
+}
+
+pub(crate) fn propagate_object_lock_peer_reload(result: std::result::Result<(), StorageError>) -> S3Result<()> {
+    result.map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to publish Object Lock metadata: {err}"))
+    })
 }
 
 fn invalid_retention_period(message: impl Into<String>) -> S3Error {
@@ -371,6 +374,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -380,7 +384,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        delete_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+        delete_bucket_metadata_config_if_incarnation(&req.input.bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1058,6 +1062,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1068,9 +1073,14 @@ impl S3 for FS {
 
         let accelerate_config = serialize(&req.input.accelerate_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_ACCELERATE_CONFIG,
+            accelerate_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
     }
@@ -1101,6 +1111,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         record_s3_op(S3Operation::PutBucketLogging);
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
@@ -1112,9 +1123,14 @@ impl S3 for FS {
 
         let logging_config = serialize(&req.input.bucket_logging_status)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_LOGGING_CONFIG,
+            logging_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
@@ -1161,6 +1177,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1171,9 +1188,14 @@ impl S3 for FS {
 
         let payment_config = serialize(&req.input.request_payment_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_REQUEST_PAYMENT_CONFIG,
+            payment_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
     }
@@ -1203,6 +1225,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let Some(store) = self.server_ctx.object_store() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1213,9 +1236,14 @@ impl S3 for FS {
 
         let website_config = serialize(&req.input.website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
-            .await
-            .map_err(crate::error::ApiError::from)?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_WEBSITE_CONFIG,
+            website_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
 
         Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
@@ -1295,6 +1323,7 @@ impl S3 for FS {
             version_id: opts.version_id.clone(),
             ..Default::default()
         };
+        apply_bucket_generation_guard(&req, &bucket, &mut popts)?;
 
         // PutObjectLegalHold only rewrites metadata, so replication is not scheduled by the
         // object PUT path. Schedule it explicitly, otherwise the legal hold never reaches the
@@ -1353,6 +1382,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let PutObjectLockConfigurationInput {
             bucket,
             object_lock_configuration,
@@ -1396,7 +1426,7 @@ impl S3 for FS {
         let object_lock_config =
             String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
-        let updated_at = update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
+        let updated_at = update_bucket_metadata_config_if_incarnation(&bucket, OBJECT_LOCK_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -1410,9 +1440,20 @@ impl S3 for FS {
             };
             let versioning_data = serialize(&enable_versioning_config)
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-            update_bucket_metadata_config(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
-                .await
-                .map_err(ApiError::from)?;
+            update_bucket_metadata_config_if_incarnation(
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                versioning_data,
+                expected_incarnation_id,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
+
+        if let Some(notification_sys) =
+            runtime_sources::current_notification_system_for_context(self.server_ctx.app_context().as_deref())
+        {
+            propagate_object_lock_peer_reload(notification_sys.load_bucket_metadata(&bucket).await)?;
         }
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
@@ -1494,6 +1535,7 @@ impl S3 for FS {
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         opts.object_lock_retention = Some(ObjectLockRetentionOptions {
             mode: new_mode,
             retain_until: new_retain_until,

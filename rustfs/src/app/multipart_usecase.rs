@@ -15,7 +15,10 @@
 //! Multipart application use-case contracts.
 
 use super::storage_api::multipart_usecase::ECStore;
-use super::storage_api::multipart_usecase::access::{has_bypass_governance_header, replication_request_authorized};
+use super::storage_api::multipart_usecase::access::{
+    apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, has_bypass_governance_header,
+    replication_request_authorized,
+};
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
@@ -52,8 +55,8 @@ use super::storage_api::multipart_usecase::sse::{
     DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal,
     apply_bucket_default_lock_retention, authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-    get_buffer_size_opt_in, map_get_object_reader_error, mark_encrypted_multipart_metadata, sse_decryption,
-    sse_prepare_encryption,
+    get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+    sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_data_cache::{
@@ -61,7 +64,8 @@ use crate::app::object_data_cache::{
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    build_put_like_object_lock_metadata, map_quota_check_outcome, validate_existing_object_lock_for_write,
+    acquire_copy_bucket_lifecycle_locks, build_put_like_object_lock_metadata, map_quota_check_outcome,
+    validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -343,6 +347,8 @@ impl DefaultMultipartUsecase {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         record_s3_op(S3Operation::AbortMultipartUpload);
+        let mut opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let AbortMultipartUploadInput {
             bucket, key, upload_id, ..
         } = req.input;
@@ -351,8 +357,6 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts = &ObjectOptions::default();
-
         // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
         // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
         // appears invalid. This differs from other multipart operations (upload_part, list_parts,
@@ -360,7 +364,7 @@ impl DefaultMultipartUsecase {
         // The lenient validation matches AWS S3 behavior where format validation is relaxed for
         // abort operations to avoid leaking information about upload_id format requirements.
         match store
-            .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
+            .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), &opts)
             .await
         {
             Ok(_) => {
@@ -388,7 +392,7 @@ impl DefaultMultipartUsecase {
             S3Operation::CompleteMultipartUpload,
         );
         let replication_authorized = replication_request_authorized(&req);
-        let input = req.input;
+        let input = req.input.clone();
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
@@ -454,6 +458,7 @@ impl DefaultMultipartUsecase {
 
         let mut opts = get_complete_multipart_upload_opts_with_replication_authorization(&req.headers, replication_authorized)
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
         opts.versioned = versioned;
@@ -495,7 +500,7 @@ impl DefaultMultipartUsecase {
         };
 
         let multipart_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
         EncryptionRequest {
@@ -715,17 +720,22 @@ impl DefaultMultipartUsecase {
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
+            &object_lock_config_state,
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
-        )
-        .await?
-        {
+        )? {
             metadata.extend(object_lock_metadata);
         }
-        apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
+        apply_bucket_default_lock_retention(
+            &bucket,
+            &object_lock_config_state,
+            &mut metadata,
+            has_explicit_object_lock_retention,
+        )?;
         let (header_sse_customer_algorithm, header_sse_customer_key, header_sse_customer_key_md5) =
             extract_ssec_params_from_headers(&req.headers)?;
         let sse_customer_algorithm = sse_customer_algorithm.or(header_sse_customer_algorithm);
@@ -771,6 +781,7 @@ impl DefaultMultipartUsecase {
             put_opts_with_replication_authorization(&bucket, &key, version_id, &req.headers, metadata, replication_authorized)
                 .await
                 .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
 
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
@@ -835,6 +846,8 @@ impl DefaultMultipartUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        let mut opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let input = req.input;
         let UploadPartInput {
             body,
@@ -881,7 +894,6 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut opts = ObjectOptions::default();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
@@ -1095,6 +1107,8 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let mut opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let ListMultipartUploadsInput {
             bucket,
             prefix,
@@ -1110,13 +1124,29 @@ impl DefaultMultipartUsecase {
             key_marker,
             max_uploads,
         } = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
-
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // `apply_bucket_generation_guard` tolerates a missing guard (only the S3
+        // access layer installs one), so resolve the current generation rather
+        // than failing the request. Listing is filtered by this value, so a
+        // stale one simply hides foreign-incarnation uploads, as intended.
+        let expected_incarnation_id = match opts.expected_bucket_incarnation_id {
+            Some(incarnation_id) => incarnation_id,
+            None => store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?,
+        };
+
         let result = store
-            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
+            .list_multipart_uploads_for_bucket_incarnation(
+                &bucket,
+                &prefix,
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
 
@@ -1124,6 +1154,8 @@ impl DefaultMultipartUsecase {
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        let mut opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let ListPartsInput {
             bucket,
             key,
@@ -1140,14 +1172,7 @@ impl DefaultMultipartUsecase {
         };
 
         let res = store
-            .list_object_parts(
-                &bucket,
-                &key,
-                &upload_id,
-                params.part_number_marker,
-                params.max_parts,
-                &ObjectOptions::default(),
-            )
+            .list_object_parts(&bucket, &key, &upload_id, params.part_number_marker, params.max_parts, &opts)
             .await
             .map_err(ApiError::from)?;
 
@@ -1161,6 +1186,17 @@ impl DefaultMultipartUsecase {
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         // Captured before `req.input` is destructured below.
         let copy_principal = SseKmsPrincipal::from_request(&req);
+        let source_bucket = match &req.input.copy_source {
+            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Bucket { bucket, .. } => bucket.to_string(),
+        };
+        let mut source_generation_opts = ObjectOptions::default();
+        apply_copy_source_bucket_generation_guard(&req, &source_bucket, &mut source_generation_opts)?;
+        let expected_source_incarnation_id = source_generation_opts.expected_bucket_incarnation_id;
+        let mut destination_generation_opts = ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &req.input.bucket, &mut destination_generation_opts)?;
+        let expected_destination_incarnation_id = destination_generation_opts.expected_bucket_incarnation_id;
         let UploadPartCopyInput {
             bucket,
             key,
@@ -1203,8 +1239,47 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
+            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
+        let current_source_incarnation_id = store
+            .bucket_incarnation_id_from_disk(&src_bucket)
+            .await
+            .map_err(ApiError::from)?;
+        if expected_source_incarnation_id.is_some_and(|expected| expected != current_source_incarnation_id) {
+            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
+        }
+        let current_destination_incarnation_id = if src_bucket == bucket {
+            current_source_incarnation_id
+        } else {
+            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
+        };
+        if expected_destination_incarnation_id.is_some_and(|expected| expected != current_destination_incarnation_id) {
+            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
+        }
+        let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
+            .as_ref()
+            .unwrap_or(&source_bucket_lifecycle_guard);
+        if source_bucket_lifecycle_guard.is_lock_lost() || destination_bucket_lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_bucket_generation",
+                bucket: bucket.clone(),
+                object: key.clone(),
+                required: 1,
+                achieved: 0,
+            })
+            .into());
+        }
+        let mut dst_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(current_destination_incarnation_id),
+            ..Default::default()
+        };
+        if src_bucket != bucket {
+            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+        }
+        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+
         let mp_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
             .map_err(ApiError::from)?;
         EncryptionRequest {
@@ -1233,8 +1308,19 @@ impl DefaultMultipartUsecase {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,
             version_suspended: src_opts.version_suspended,
+            expected_bucket_incarnation_id: Some(current_source_incarnation_id),
             ..Default::default()
         };
+        if source_bucket_lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "copy_source_bucket_generation",
+                bucket: src_bucket.clone(),
+                object: src_key.clone(),
+                required: 1,
+                achieved: 0,
+            })
+            .into());
+        }
 
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
@@ -1400,10 +1486,7 @@ impl DefaultMultipartUsecase {
 
         let mut reader = PutObjReader::new(reader);
 
-        let dst_opts = ObjectOptions {
-            user_defined: dst_user_defined,
-            ..Default::default()
-        };
+        dst_opts.user_defined = dst_user_defined;
 
         let part_info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &dst_opts)
@@ -1756,7 +1839,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
         let input = AbortMultipartUploadInput::builder()
             .bucket("bucket".to_string())

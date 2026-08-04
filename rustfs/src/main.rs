@@ -47,7 +47,7 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
 #[global_allocator]
-static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::new();
+static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::with(MiMallocAllocator);
 
 #[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
 #[global_allocator]

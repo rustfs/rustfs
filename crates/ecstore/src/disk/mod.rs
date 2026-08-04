@@ -149,6 +149,13 @@ impl Disk {
             Disk::Remote(_) => None,
         }
     }
+
+    pub(crate) async fn cached_disk_id(&self) -> Option<Uuid> {
+        match self {
+            Disk::Local(local_disk) => local_disk.get_current_disk_id().await,
+            Disk::Remote(remote_disk) => remote_disk.get_disk_id().await.ok().flatten(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -673,6 +680,15 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.enable_health_check(),
             Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
+        }
+    }
+
+    /// Returns the absolute filesystem path for a (volume, path) pair if this
+    /// disk is local, or `None` if it is a remote disk.
+    pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_if_local(volume, path)),
+            Disk::Remote(_) => None,
         }
     }
 }

@@ -118,7 +118,7 @@ impl ECStore {
                 &bucket,
                 version,
                 bucket_configs.lifecycle_config.as_ref(),
-                bucket_configs.lock_retention.clone(),
+                bucket_configs.object_lock_config.as_ref(),
                 true,
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
             )
@@ -384,7 +384,7 @@ impl ECStore {
         );
 
         let pool = clone_arc_by_index(self.pools.as_slice(), pool_index, "invalid rebalance pool index")?;
-        let bucket_configs = Arc::new(load_rebalance_bucket_configs(&bucket).await?);
+        let bucket_configs = Arc::new(load_rebalance_bucket_configs(self, &bucket).await?);
 
         let mut jobs = Vec::new();
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));

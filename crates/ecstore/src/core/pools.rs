@@ -18,13 +18,13 @@ use crate::bucket::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
-            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule, eval_action_from_lifecycle,
+            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
             lifecycle_delete_all_versions_blocked_by_replication,
         },
+        get_expiry_configs,
         lifecycle::IlmAction,
     },
     metadata_sys,
-    object_lock::objectlock_sys::BucketObjectLockSys,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
@@ -60,7 +60,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
-use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -2192,7 +2192,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     bucket: &str,
     version: &rustfs_filemeta::FileInfo,
     lifecycle_config: Option<&BucketLifecycleConfiguration>,
-    lock_retention: Option<DefaultRetention>,
+    object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
 ) -> Result<bool> {
@@ -2202,12 +2202,16 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
 
     let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
     let object_info = crate::object_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
-    let event = eval_action_from_lifecycle(lifecycle_config, lock_retention, &object_info).await;
+    let event = eval_action_from_lifecycle(lifecycle_config, object_lock_config, &object_info).await;
 
     match event.action {
         IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
             if apply_actions && object_info.is_remote() {
-                let _ = apply_expiry_on_transitioned_object(store, &object_info, &event, event_source).await;
+                let Ok(bucket_incarnation_id) = store.bucket_incarnation_id_from_disk(bucket).await else {
+                    return Ok(false);
+                };
+                let _ =
+                    apply_expiry_on_transitioned_object(store, &object_info, &event, event_source, bucket_incarnation_id).await;
             }
             Ok(false)
         }
@@ -2215,7 +2219,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
-            let applied = !apply_actions || apply_expiry_rule(&event, event_source, &object_info).await;
+            let applied = !apply_actions || apply_expiry_rule_in(store, &event, event_source, &object_info).await;
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
         _ => Ok(false),
@@ -2647,7 +2651,7 @@ impl ECStore {
     }
 
     #[allow(unused_assignments, clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, set, _worker_permit, lifecycle_config, lock_retention, replication_config))]
+    #[tracing::instrument(skip(self, set, _worker_permit, lifecycle_config, object_lock_config, replication_config))]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -2657,7 +2661,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         _worker_permit: OwnedSemaphorePermit,
         lifecycle_config: Option<BucketLifecycleConfiguration>,
-        lock_retention: Option<DefaultRetention>,
+        object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     ) -> Result<()> {
         debug!(
@@ -2708,7 +2712,7 @@ impl ECStore {
                 &bucket,
                 version,
                 lifecycle_config.as_ref(),
-                lock_retention.clone(),
+                object_lock_config.as_ref(),
                 true,
                 &LcEventSrc::Decom,
             )
@@ -3113,7 +3117,7 @@ impl ECStore {
         let mut listing_workers = Vec::with_capacity(pool.disk_set.len());
 
         let mut lifecycle_config = None;
-        let mut lock_retention = None;
+        let mut object_lock_config = None;
         let mut replication_config = None;
 
         if bi.name != RUSTFS_META_BUCKET {
@@ -3122,8 +3126,9 @@ impl ECStore {
                 "versioning",
                 BucketVersioningSys::get(&bi.name).await,
             )?;
-            lifecycle_config = runtime_sources::bucket_lifecycle_config(&bi.name).await;
-            lock_retention = BucketObjectLockSys::get(&bi.name).await;
+            let expiry_configs = get_expiry_configs(self, &bi.name).await?;
+            lifecycle_config = expiry_configs.lifecycle.map(|config| (*config).clone());
+            object_lock_config = expiry_configs.object_lock.map(|config| (*config).clone());
             replication_config = resolve_decommission_optional_bucket_config_result(
                 &bi.name,
                 "replication",
@@ -3155,7 +3160,7 @@ impl ECStore {
                 let workers = workers.clone();
                 let set = set.clone();
                 let lifecycle_config = lifecycle_config.clone();
-                let lock_retention = lock_retention.clone();
+                let object_lock_config = object_lock_config.clone();
                 let replication_config = replication_config.clone();
                 let entry_error = entry_error.clone();
                 let callback_rx = rx.clone();
@@ -3165,7 +3170,7 @@ impl ECStore {
                     let workers = workers.clone();
                     let set = set.clone();
                     let lifecycle_config = lifecycle_config.clone();
-                    let lock_retention = lock_retention.clone();
+                    let object_lock_config = object_lock_config.clone();
                     let replication_config = replication_config.clone();
                     let entry_error = entry_error.clone();
                     let callback_rx = callback_rx.clone();
@@ -3227,7 +3232,7 @@ impl ECStore {
                                 set,
                                 worker_permit,
                                 lifecycle_config,
-                                lock_retention,
+                                object_lock_config,
                                 replication_config,
                             )
                             .await
@@ -3960,10 +3965,11 @@ impl ECStore {
         for set in &pool.disk_set {
             for bucket_info in &buckets {
                 let mut lifecycle_config = None;
-                let mut lock_retention = None;
+                let mut object_lock_config = None;
                 if bucket_info.name != RUSTFS_META_BUCKET {
-                    lifecycle_config = runtime_sources::bucket_lifecycle_config(&bucket_info.name).await;
-                    lock_retention = BucketObjectLockSys::get(&bucket_info.name).await;
+                    let expiry_configs = get_expiry_configs(self, &bucket_info.name).await?;
+                    lifecycle_config = expiry_configs.lifecycle.map(|config| (*config).clone());
+                    object_lock_config = expiry_configs.object_lock.map(|config| (*config).clone());
                 }
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
@@ -3973,7 +3979,7 @@ impl ECStore {
                 let entry_error_cb = entry_error.clone();
                 let bucket_name = bucket_info.name.clone();
                 let lifecycle_config_cb = lifecycle_config.clone();
-                let lock_retention_cb = lock_retention.clone();
+                let object_lock_config_cb = object_lock_config.clone();
                 let store = Arc::clone(self);
                 let callback_rx_cb = callback_rx.clone();
 
@@ -3982,7 +3988,7 @@ impl ECStore {
                     let entry_error = entry_error_cb.clone();
                     let bucket_name = bucket_name.clone();
                     let lifecycle_config = lifecycle_config_cb.clone();
-                    let lock_retention = lock_retention_cb.clone();
+                    let object_lock_config = object_lock_config_cb.clone();
                     let store = Arc::clone(&store);
                     let callback_rx = callback_rx_cb.clone();
                     Box::pin(async move {
@@ -4024,7 +4030,7 @@ impl ECStore {
                                 &bucket_name,
                                 version,
                                 lifecycle_config.as_ref(),
-                                lock_retention.clone(),
+                                object_lock_config.as_ref(),
                                 false,
                                 &LcEventSrc::Decom,
                             )

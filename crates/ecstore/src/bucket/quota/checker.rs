@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
-use crate::bucket::metadata_sys::{BucketMetadataSys, update};
+use crate::bucket::metadata_sys::{BucketMetadataSys, update, update_if_incarnation};
 use crate::data_usage::get_bucket_usage_memory;
 use rustfs_common::metrics::Metric;
 use rustfs_config::QUOTA_CONFIG_FILE;
@@ -145,14 +145,35 @@ impl QuotaChecker {
     }
 
     pub async fn set_quota_config(&mut self, bucket: &str, quota: BucketQuota) -> Result<OffsetDateTime, QuotaError> {
+        self.set_quota_config_for_incarnation(bucket, quota, None).await
+    }
+
+    pub async fn set_quota_config_if_incarnation(
+        &mut self,
+        bucket: &str,
+        quota: BucketQuota,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<OffsetDateTime, QuotaError> {
+        self.set_quota_config_for_incarnation(bucket, quota, Some(expected_incarnation_id))
+            .await
+    }
+
+    async fn set_quota_config_for_incarnation(
+        &mut self,
+        bucket: &str,
+        quota: BucketQuota,
+        expected_incarnation_id: Option<uuid::Uuid>,
+    ) -> Result<OffsetDateTime, QuotaError> {
         let json_data = serde_json::to_vec(&quota).map_err(|e| QuotaError::InvalidConfig {
             reason: format!("Failed to serialize quota config: {}", e),
         })?;
         let start_time = Instant::now();
 
-        let updated_at = update(bucket, QUOTA_CONFIG_FILE, json_data)
-            .await
-            .map_err(QuotaError::StorageError)?;
+        let updated_at = match expected_incarnation_id {
+            Some(incarnation_id) => update_if_incarnation(bucket, QUOTA_CONFIG_FILE, json_data, incarnation_id).await,
+            None => update(bucket, QUOTA_CONFIG_FILE, json_data).await,
+        }
+        .map_err(QuotaError::StorageError)?;
 
         rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
         Ok(updated_at)

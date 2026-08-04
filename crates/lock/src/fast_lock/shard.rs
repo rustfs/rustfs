@@ -215,12 +215,30 @@ impl LockShard {
             let remaining = deadline - Instant::now();
 
             if retry_count < MAX_RETRIES && remaining > Duration::from_millis(10) {
-                // For early retries, use a brief exponential backoff instead of full notification wait
+                // For early retries, wait for a release notification bounded by
+                // an exponential backoff. The bound (not a bare sleep) matters:
+                // a plain `sleep` subscribes to nothing, so a release during
+                // the backoff wakes nobody — `notify_writer`/`notify_readers`
+                // are gated on the waiter counters, which a sleeper never
+                // increments. Under N-writer same-key contention the lock sits
+                // free while every loser sleeps out its full backoff, and the
+                // ladder compounds superlinearly with N. The backoff cap still
+                // protects against lost/stolen wakeups, exactly as
+                // NOTIFY_WAIT_CAP does for the post-retry wait below.
                 let backoff_ms = std::cmp::min(10 << retry_count, 100); // 10ms, 20ms, 40ms, 80ms, 100ms max
                 let backoff_duration = Duration::from_millis(backoff_ms);
 
                 if backoff_duration < remaining {
-                    tokio::time::sleep(backoff_duration).await;
+                    match request.mode {
+                        LockMode::Shared => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_read()).await;
+                        }
+                        LockMode::Exclusive => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_write()).await;
+                        }
+                    }
                     retry_count += 1;
                     continue;
                 }
@@ -851,6 +869,70 @@ mod tests {
 
         // Release first lock
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+    }
+
+    // Regression for the waiter-preserving early retry (rustfs#5657).
+    //
+    // The early retries used a bare `sleep`, which subscribes to nothing.
+    // `notify_writer`/`notify_readers` are gated on the waiter counters, so a
+    // sleeping waiter is invisible to every release: the lock sits free while
+    // each loser sleeps out its full 10/20/40/80/100ms rung, and under N-writer
+    // same-key contention that ladder — not the hold — is what the wait costs.
+    // Registration is what lets a release reach the waiter at all; the wakeup
+    // itself is covered by `write_lock_waiter_is_not_stranded_by_missed_wakeup`.
+    //
+    // MAX_RETRIES rungs total ~750ms, so the window sampled here sits entirely
+    // inside the early-retry phase, where a sleeping waiter registers nowhere.
+    //
+    // Wakeup *latency* is deliberately not asserted: NOTIFY_POOL is a global of
+    // 128 `Notify`s shared by every lock in the process, so a waiter in another
+    // concurrently-running test can consume this one's `notify_one` and push it
+    // out to the end of its rung. That is the same stolen wakeup NOTIFY_WAIT_CAP
+    // exists to bound, and it makes any latency budget flaky in-suite.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_retry_registers_as_waiter() {
+        let shard = Arc::new(LockShard::new(0));
+        let key = ObjectKey::new("bucket", "object");
+        let holder: Arc<str> = Arc::from("holder");
+        let waiter: Arc<str> = Arc::from("waiter");
+
+        let request = |owner: Arc<str>| ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner,
+            acquire_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+
+        assert!(shard.acquire_lock(&request(holder.clone())).await.is_ok());
+
+        let waiter_shard = shard.clone();
+        let waiter_request = request(waiter.clone());
+        let waiter_task = tokio::spawn(async move { waiter_shard.acquire_lock(&waiter_request).await });
+
+        let sample_until = Instant::now() + Duration::from_millis(200);
+        let mut registered = false;
+        while !registered && Instant::now() < sample_until {
+            registered = shard
+                .objects
+                .read()
+                .get(&key)
+                .is_some_and(|state| state.atomic_state.writers_waiting_count() > 0);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            registered,
+            "a waiter in the early-retry backoff must be registered in the writer waiter count, \
+             otherwise releases cannot reach it"
+        );
+
+        assert!(shard.release_lock(&key, &holder, LockMode::Exclusive));
+        waiter_task
+            .await
+            .expect("waiter task should not panic")
+            .expect("waiter must acquire once the holder releases");
     }
 
     #[test]

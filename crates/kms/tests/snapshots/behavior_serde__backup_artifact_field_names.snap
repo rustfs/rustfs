@@ -1,0 +1,9 @@
+---
+source: crates/kms/tests/behavior_serde.rs
+expression: field_names(artifact)
+---
+- aead_algorithm
+- encrypted_digest
+- kind
+- len
+- path

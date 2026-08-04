@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ECStore;
+use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{
-    PolicySys, ReplicationStatusType, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config,
-    is_err_bucket_not_found,
+    ECStore, PolicySys, ReplicationStatusType, StorageError, get_bucket_metadata, get_bucket_policy_raw,
+    get_lock_acquire_timeout, get_public_access_block_config, is_err_bucket_not_found,
 };
 use crate::auth::{
     check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
@@ -26,7 +26,9 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
-use crate::storage::storage_api::access_consumer::contract::bucket::BucketOperations;
+use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
+use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::HeaderMap;
 use metrics::counter;
@@ -96,6 +98,220 @@ pub(crate) fn recursive_force_delete_is_authorized(headers: &HeaderMap, is_owner
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostObjectRequestMarker;
+
+#[derive(Clone, Debug)]
+pub(crate) struct BucketGenerationGuard {
+    bucket: String,
+    incarnation_id: uuid::Uuid,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BucketConfigMutationSnapshot {
+    bucket: String,
+    incarnation_id: uuid::Uuid,
+}
+
+pub(crate) fn bucket_config_mutation_incarnation<T>(req: &S3Request<T>, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
+    let Some(snapshot) = req.extensions.get::<BucketConfigMutationSnapshot>() else {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
+            return Err(s3_error!(InternalError, "bucket config mutation snapshot is missing"));
+        }
+        return Ok(None);
+    };
+    if snapshot.bucket != bucket {
+        return Err(s3_error!(InternalError, "bucket config mutation snapshot does not match request bucket"));
+    }
+    Ok(Some(snapshot.incarnation_id))
+}
+
+async fn load_bucket_config_mutation_snapshot<T>(
+    fs: &FS,
+    req: &S3Request<T>,
+    bucket: &str,
+) -> S3Result<BucketConfigMutationSnapshot> {
+    let store = fs
+        .server_ctx()
+        .object_store()
+        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+    let lock = store
+        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
+        .await
+        .map_err(ApiError::from)?;
+    let _lifecycle_guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
+        ApiError::from(match err {
+            rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+                mode: "bucket_config_mutation",
+                bucket: bucket.to_string(),
+                object: BUCKET_LIFECYCLE_LOCK_OBJECT.to_string(),
+                required,
+                achieved,
+            },
+            other => StorageError::Lock(other),
+        })
+    })?;
+    let incarnation_id = load_bucket_generation_from_store(store.as_ref(), req, bucket)
+        .await?
+        .incarnation_id;
+    Ok(BucketConfigMutationSnapshot {
+        bucket: bucket.to_string(),
+        incarnation_id,
+    })
+}
+
+async fn authorize_bucket_config_mutation<T>(fs: &FS, req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    let bucket = req_info_ref(req)?
+        .bucket
+        .clone()
+        .ok_or_else(|| s3_error!(InternalError, "bucket config mutation request has no bucket"))?;
+    let snapshot = load_bucket_config_mutation_snapshot(fs, req, &bucket).await;
+    authorize_request(req, action).await?;
+    req.extensions.insert(snapshot?);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct CopySourceBucketGenerationGuard {
+    bucket: String,
+    incarnation_id: uuid::Uuid,
+}
+
+#[cfg(test)]
+type RestoreAuthorizationTestHook = (String, std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+
+#[cfg(test)]
+static RESTORE_AUTHORIZATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<RestoreAuthorizationTestHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn install_restore_authorization_test_hook(
+    bucket: String,
+    authorized: std::sync::Arc<tokio::sync::Barrier>,
+    resume: std::sync::Arc<tokio::sync::Barrier>,
+) {
+    *RESTORE_AUTHORIZATION_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("restore authorization test hook lock should not be poisoned") = Some((bucket, authorized, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_restore_authorization_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = RESTORE_AUTHORIZATION_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("restore authorization test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, authorized, resume)) = hook {
+        authorized.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PendingDeleteBucketGenerationGuard {
+    Ready(BucketGenerationGuard),
+    Failed { code: S3ErrorCode, message: String },
+}
+
+impl PendingDeleteBucketGenerationGuard {
+    fn from_result(result: S3Result<BucketGenerationGuard>) -> Self {
+        match result {
+            Ok(guard) => Self::Ready(guard),
+            Err(err) => Self::Failed {
+                code: err.code().clone(),
+                message: err.message().unwrap_or_else(|| err.code().as_str()).to_string(),
+            },
+        }
+    }
+}
+
+pub(crate) async fn load_bucket_generation_from_store<T>(
+    store: &crate::storage::storage_api::ECStore,
+    req: &S3Request<T>,
+    bucket: &str,
+) -> S3Result<BucketGenerationGuard> {
+    if let Some(existing) = req.extensions.get::<BucketGenerationGuard>() {
+        return if existing.bucket == bucket {
+            Ok(existing.clone())
+        } else {
+            Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"))
+        };
+    }
+
+    let incarnation_id = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
+    Ok(BucketGenerationGuard {
+        bucket: bucket.to_string(),
+        incarnation_id,
+    })
+}
+
+async fn load_bucket_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) -> S3Result<BucketGenerationGuard> {
+    let store = fs
+        .server_ctx()
+        .object_store()
+        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+    load_bucket_generation_from_store(store.as_ref(), req, bucket).await
+}
+
+async fn load_copy_source_bucket_generation(fs: &FS, bucket: &str) -> S3Result<CopySourceBucketGenerationGuard> {
+    let store = fs
+        .server_ctx()
+        .object_store()
+        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
+    let incarnation_id = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
+    Ok(CopySourceBucketGenerationGuard {
+        bucket: bucket.to_string(),
+        incarnation_id,
+    })
+}
+
+pub(crate) fn apply_bucket_generation_guard<T>(req: &S3Request<T>, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
+    let pending_guard = req.extensions.get::<PendingDeleteBucketGenerationGuard>();
+    let guard = match pending_guard {
+        Some(PendingDeleteBucketGenerationGuard::Ready(guard)) => Some(guard),
+        Some(PendingDeleteBucketGenerationGuard::Failed { code, message }) => {
+            return Err(S3Error::with_message(code.clone(), message.clone()));
+        }
+        None => req.extensions.get::<BucketGenerationGuard>(),
+    };
+    let Some(guard) = guard else {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
+            return Err(s3_error!(InternalError, "bucket generation guard is missing"));
+        }
+        return Ok(());
+    };
+    if guard.bucket != bucket {
+        return Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"));
+    }
+    opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    Ok(())
+}
+
+pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
+    req: &S3Request<T>,
+    bucket: &str,
+    opts: &mut ObjectOptions,
+) -> S3Result<()> {
+    let Some(guard) = req.extensions.get::<CopySourceBucketGenerationGuard>() else {
+        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
+            return Err(s3_error!(InternalError, "copy source bucket generation guard is missing"));
+        }
+        return Ok(());
+    };
+    if guard.bucket != bucket {
+        return Err(s3_error!(
+            InternalError,
+            "copy source bucket generation guard does not match request bucket"
+        ));
+    }
+    opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    Ok(())
+}
 
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
     req.extensions
@@ -867,6 +1083,15 @@ fn put_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
 }
 
+/// Both website-config handlers authorize through this one function so the
+/// write side and the delete side cannot drift apart. RustFS has no dedicated
+/// `s3:PutBucketWebsite` / `s3:DeleteBucketWebsite` action, so the bucket-config
+/// mutation convention applies (same as `put_bucket_request_payment` and
+/// `put_bucket_accelerate_configuration`).
+fn bucket_website_config_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutBucketPolicyAction)
+}
+
 fn post_object_authorize_action() -> Action {
     Action::S3Action(S3Action::PutObjectAction)
 }
@@ -1123,38 +1348,49 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await
+        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the CompleteMultipartUpload request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
         authorize_request(req, complete_multipart_upload_authorize_action()).await?;
-        authorize_replication_only_put_headers(req).await
+        authorize_replication_only_put_headers(req).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
-        {
-            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Bucket { bucket, key, version_id } => {
-                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-                }
-            };
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let (src_bucket, src_key, version_id) = match &req.input.copy_source {
+            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Bucket { bucket, key, version_id } => {
+                (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
+            }
+        };
+        let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
 
+        {
             let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(src_bucket.clone());
             req_info.object = Some(src_key.clone());
@@ -1164,6 +1400,7 @@ impl S3Access for FS {
             // s3:GetObjectVersion, not s3:GetObject.
             authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
         }
+        req.extensions.insert(source_bucket_generation?);
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
 
@@ -1183,11 +1420,14 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
         }
 
+        req.extensions.insert(bucket_generation?);
         Ok(())
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1204,6 +1444,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
         }
 
+        req.extensions.insert(bucket_generation?);
         Ok(())
     }
 
@@ -1239,7 +1480,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
@@ -1249,7 +1490,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
     }
 
     /// Checks whether the DeleteBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -1279,7 +1520,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
     }
 
     /// Checks whether the DeleteBucketMetricsConfiguration request has accesses to the resources.
@@ -1306,7 +1547,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketPolicyAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketPolicyAction)).await
     }
 
     /// Checks whether the DeleteBucketReplication request has accesses to the resources.
@@ -1316,7 +1557,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
     }
 
     /// Checks whether the DeleteBucketTagging request has accesses to the resources.
@@ -1326,7 +1567,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
@@ -1336,18 +1577,24 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_bucket_config_mutation(self, req, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the DeleteObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        if let Some(store) = runtime_sources::current_object_store_handle()
-            && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
-            && is_err_bucket_not_found(&err)
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        // Preserve DeleteObject's established NoSuchBucket response instead of
+        // letting policy lookup turn a missing bucket into AccessDenied.
+        if let Err(err) = &bucket_generation
+            && err.code() == &S3ErrorCode::NoSuchBucket
         {
-            return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::NoSuchBucket,
+                err.message().unwrap_or("The specified bucket does not exist").to_string(),
+            ));
         }
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
@@ -1374,6 +1621,9 @@ impl S3Access for FS {
         if has_bypass_governance_header(&req.headers) {
             authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
         }
+
+        req.extensions
+            .insert(PendingDeleteBucketGenerationGuard::from_result(bucket_generation));
 
         Ok(())
     }
@@ -1409,7 +1659,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction)).await
     }
 
     /// Checks whether the GetBucketAccelerateConfiguration request has accesses to the resources.
@@ -1798,10 +2048,14 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.
@@ -1838,11 +2092,15 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, list_parts_authorize_action()).await
+        authorize_request(req, list_parts_authorize_action()).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the PostObject request has accesses to the resources.
@@ -1868,7 +2126,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketAcl request has accesses to the resources.
@@ -1898,7 +2156,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketCorsAction)).await
     }
 
     /// Checks whether the PutBucketEncryption request has accesses to the resources.
@@ -1908,7 +2166,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
     }
 
     /// Checks whether the PutBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -1941,14 +2199,14 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
     }
 
     async fn put_bucket_logging(&self, req: &mut S3Request<PutBucketLoggingInput>) -> S3Result<()> {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketLoggingAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLoggingAction)).await
     }
 
     /// Checks whether the PutBucketMetricsConfiguration request has accesses to the resources.
@@ -1968,7 +2226,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketNotificationAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketNotificationAction)).await
     }
 
     /// Checks whether the PutBucketOwnershipControls request has accesses to the resources.
@@ -1985,7 +2243,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, put_bucket_policy_authorize_action()).await
+        authorize_bucket_config_mutation(self, req, put_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
@@ -1995,7 +2253,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
     }
 
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
@@ -2005,7 +2263,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketTagging request has accesses to the resources.
@@ -2015,7 +2273,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
     }
 
     /// Checks whether the PutBucketVersioning request has accesses to the resources.
@@ -2025,7 +2283,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketVersioningAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketVersioningAction)).await
     }
 
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
@@ -2035,7 +2293,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_bucket_config_mutation(self, req, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the PutObject request has accesses to the resources.
@@ -2055,7 +2313,12 @@ impl S3Access for FS {
             ));
         }
 
+        let bucket = req.input.bucket.clone();
+        // Snapshot before authorization, but preserve AccessDenied precedence
+        // by exposing any bucket-state error only after authorization succeeds.
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        req.extensions.insert(bucket_generation?);
 
         // POST-object form uploads (s3s routes them through this hook with the
         // original POST method before the dedicated post_object hook) are
@@ -2104,7 +2367,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
@@ -2114,7 +2381,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
@@ -2124,6 +2391,8 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -2131,6 +2400,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
         }
 
+        req.extensions.insert(bucket_generation?);
         Ok(())
     }
 
@@ -2153,19 +2423,25 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPublicAccessBlockAction)).await
+        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPublicAccessBlockAction)).await
     }
 
     /// Checks whether the RestoreObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
+        #[cfg(test)]
+        wait_for_restore_authorization_test_hook(&bucket).await;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
@@ -2183,26 +2459,33 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the UploadPartCopy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
-        {
-            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Bucket { bucket, key, version_id } => {
-                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-                }
-            };
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let (src_bucket, src_key, version_id) = match &req.input.copy_source {
+            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Bucket { bucket, key, version_id } => {
+                (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
+            }
+        };
+        let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
 
+        {
             let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(src_bucket.clone());
             req_info.object = Some(src_key.clone());
@@ -2212,13 +2495,16 @@ impl S3Access for FS {
             // s3:GetObjectVersion, not s3:GetObject.
             authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
         }
+        req.extensions.insert(source_bucket_generation?);
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = None;
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.
@@ -2233,22 +2519,52 @@ impl S3Access for FS {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        AMZ_WRITE_OFFSET_BYTES_HEADER, BucketPolicyArgs, BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, FS,
-        ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
-        bucket_policy_needs_existing_object_tag_from_hint, classify_bucket_policy_raw_load_error,
-        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
-        legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
+        AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
+        BucketPolicyRawLoadErrorKind, FS, ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        bucket_policy_needs_existing_object_tag_from_hint, bucket_website_config_authorize_action,
+        classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action,
+        has_write_offset_bytes_header, install_restore_authorization_test_hook, legal_hold_write_requested,
+        list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions,
         merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
         post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested,
         secondary_tag_hint_action, table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
+    use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+    use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
+    use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+    use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_kms::KmsServiceManager;
     use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use s3s::{S3ErrorCode, S3Request, dto::*};
+    use serial_test::serial;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use time::OffsetDateTime;
+
+    struct UnreadyIam;
+
+    impl IamInterface for UnreadyIam {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            panic!("bucket generation guard tests do not resolve IAM")
+        }
+
+        fn is_ready(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestKms;
+
+    impl KmsInterface for TestKms {
+        fn handle(&self) -> Arc<KmsServiceManager> {
+            Arc::new(KmsServiceManager::new())
+        }
+    }
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -2299,6 +2615,17 @@ mod tests {
     #[test]
     fn put_bucket_policy_uses_put_bucket_policy_action() {
         assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
+    }
+
+    #[test]
+    fn bucket_website_config_never_authorizes_through_a_read_action() {
+        let action = bucket_website_config_authorize_action();
+
+        // The regression: DeleteBucketWebsite permanently removes the persisted
+        // website configuration but authorized through s3:GetBucketPolicy, so a
+        // read-only "may read my bucket policy" grant was enough to destroy it.
+        assert_ne!(action, Action::S3Action(S3Action::GetBucketPolicyAction));
+        assert_eq!(action, Action::S3Action(S3Action::PutBucketPolicyAction));
     }
 
     #[test]
@@ -2483,18 +2810,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_object_tag_conditions_key_format() {
-        let mut tags = HashMap::new();
-        tags.insert("ExistingObjectTag/security".to_string(), vec!["public".to_string()]);
-        tags.insert("ExistingObjectTag/project".to_string(), vec!["webapp".to_string()]);
-        let object_tag_conditions = ObjectTagConditions::new("bucket", "object", None, tags);
+    #[tokio::test]
+    async fn test_required_existing_object_tags_are_merged_into_authorization_conditions() {
+        let mut request = build_request((), Method::GET);
+        request.extensions.insert(ObjectTagConditions::new(
+            "bucket",
+            "tagged-object",
+            None,
+            HashMap::from([
+                ("ExistingObjectTag/security".to_string(), vec!["restricted".to_string()]),
+                ("ExistingObjectTag/project".to_string(), vec!["webapp".to_string()]),
+            ]),
+        ));
         let mut conditions = HashMap::new();
         conditions.insert("delimiter".to_string(), vec!["/".to_string()]);
-        for (k, v) in &object_tag_conditions.values {
-            conditions.insert(k.clone(), v.clone());
-        }
-        assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
+
+        maybe_merge_object_tag_conditions(
+            &mut request,
+            Action::S3Action(S3Action::GetObjectAction),
+            "bucket",
+            "tagged-object",
+            None,
+            &mut conditions,
+            true,
+        )
+        .await
+        .expect("merge required existing object tags into authorization conditions");
+
+        assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["restricted".to_string()]));
         assert_eq!(conditions.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
@@ -2766,6 +3109,375 @@ mod tests {
         let req_info = req.extensions.get::<ReqInfo>().expect("request info should remain available");
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn put_object_access_captures_authorized_bucket_incarnation() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms),))));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        let bucket = "generation-guard-collision";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("test bucket should be created");
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(bucket)
+            .await
+            .expect("new bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test bucket policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.to_string(), metadata)
+            .await
+            .expect("test bucket policy should be published");
+
+        let input = PutObjectInput::builder()
+            .bucket(bucket.to_string())
+            .key(bucket.to_string())
+            .build()
+            .expect("put object input should build");
+        let mut req = build_request(input, Method::PUT);
+        ensure_req_info(&mut req);
+
+        fs.put_object(&mut req)
+            .await
+            .expect("anonymous PutObject should be authorized by the test policy");
+        let mut opts = crate::storage::ObjectOptions::default();
+        apply_bucket_generation_guard(&req, bucket, &mut opts).expect("request snapshot should apply to PutObject options");
+        assert_eq!(
+            opts.expected_bucket_incarnation_id,
+            Some(
+                store
+                    .bucket_incarnation_id(bucket)
+                    .await
+                    .expect("bucket incarnation should remain readable")
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delete_object_access_captures_authorized_bucket_incarnation() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        assert!(server_ctx.install(Arc::clone(&app_context)));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        let bucket = format!("delete-generation-guard-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("test bucket should be created");
+        assert!(
+            fs.get_object_tag_conditions_for_policy(&bucket, "missing-object", None)
+                .await
+                .expect("a missing object must be treated as having no policy tags")
+                .is_empty()
+        );
+        assert!(
+            fs.get_object_tag_conditions_for_policy(&format!("missing-{bucket}"), "missing-object", None)
+                .await
+                .expect("a missing bucket must be indistinguishable during pre-authorization tag lookup")
+                .is_empty()
+        );
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("new bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test bucket policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("test bucket policy should be published");
+
+        let input = DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("object".to_string())
+            .build()
+            .expect("delete object input should build");
+        let mut req = build_request(input, Method::DELETE);
+        ensure_req_info(&mut req);
+
+        fs.delete_object(&mut req)
+            .await
+            .expect("anonymous DeleteObject should be authorized by the test policy");
+        let mut opts = crate::storage::ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("request snapshot should apply to DeleteObject options");
+        assert_eq!(
+            opts.expected_bucket_incarnation_id,
+            Some(
+                store
+                    .bucket_incarnation_id(&bucket)
+                    .await
+                    .expect("bucket incarnation should remain readable")
+            )
+        );
+
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the authorized bucket generation");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate the same bucket name");
+        let mut reader = crate::storage::PutObjReader::from_vec(b"new generation".to_vec());
+        store
+            .put_object(&bucket, "object", &mut reader, &crate::storage::ObjectOptions::default())
+            .await
+            .expect("put the new-generation object");
+
+        let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context))
+            .execute_delete_object(req)
+            .await
+            .expect_err("the old authorization must not delete from the recreated bucket");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        store
+            .get_object_info(&bucket, "object", &crate::storage::ObjectOptions::default())
+            .await
+            .expect("the new-generation object must survive the stale request");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn copy_operations_reject_recreated_source_bucket_after_authorization() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        assert!(server_ctx.install(Arc::clone(&app_context)));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        let suffix = uuid::Uuid::new_v4();
+        let src_bucket = format!("copy-src-generation-{suffix}");
+        let dst_bucket = format!("copy-dst-generation-{suffix}");
+        for bucket in [&src_bucket, &dst_bucket] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create copy test bucket");
+        }
+
+        let src_policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::{src_bucket}/*"]}}]}}"#
+        );
+        let mut src_metadata = (*crate::storage::get_bucket_metadata(&src_bucket)
+            .await
+            .expect("source bucket metadata should be cached"))
+        .clone();
+        src_metadata.policy_config = Some(serde_json::from_str(&src_policy_json).expect("source policy should parse"));
+        src_metadata.policy_config_json = src_policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(src_bucket.clone(), src_metadata)
+            .await
+            .expect("publish source policy");
+
+        let dst_policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{dst_bucket}/*"]}}]}}"#
+        );
+        let mut dst_metadata = (*crate::storage::get_bucket_metadata(&dst_bucket)
+            .await
+            .expect("destination bucket metadata should be cached"))
+        .clone();
+        dst_metadata.policy_config = Some(serde_json::from_str(&dst_policy_json).expect("destination policy should parse"));
+        dst_metadata.policy_config_json = dst_policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(dst_bucket.clone(), dst_metadata)
+            .await
+            .expect("publish destination policy");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: src_bucket.clone().into(),
+                key: "secret".into(),
+                version_id: None,
+            })
+            .bucket(dst_bucket.clone())
+            .key("copied".to_string())
+            .build()
+            .expect("copy input should build");
+        let mut req = build_request(input, Method::PUT);
+        ensure_req_info(&mut req);
+
+        fs.copy_object(&mut req)
+            .await
+            .expect("test policies should authorize the copy request");
+        let mut source_opts = crate::storage::ObjectOptions::default();
+        apply_copy_source_bucket_generation_guard(&req, &src_bucket, &mut source_opts)
+            .expect("authorized source generation should be attached");
+        let authorized_source_incarnation_id = source_opts
+            .expected_bucket_incarnation_id
+            .expect("source incarnation should be captured");
+
+        let upload = store
+            .new_multipart_upload(&dst_bucket, "multipart-copy", &crate::storage::ObjectOptions::default())
+            .await
+            .expect("create destination multipart upload");
+        let upload_input = UploadPartCopyInput::builder()
+            .bucket(dst_bucket.clone())
+            .key("multipart-copy".to_string())
+            .copy_source(CopySource::Bucket {
+                bucket: src_bucket.clone().into(),
+                key: "secret".into(),
+                version_id: None,
+            })
+            .part_number(1)
+            .upload_id(upload.upload_id)
+            .build()
+            .expect("part copy input should build");
+        let mut upload_req = build_request(upload_input, Method::PUT);
+        ensure_req_info(&mut upload_req);
+        fs.upload_part_copy(&mut upload_req)
+            .await
+            .expect("test policies should authorize the part copy request");
+
+        store
+            .delete_bucket(&src_bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the authorized source generation");
+        store
+            .make_bucket(&src_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate the source bucket name");
+        assert_ne!(
+            authorized_source_incarnation_id,
+            store
+                .bucket_incarnation_id(&src_bucket)
+                .await
+                .expect("read recreated source incarnation")
+        );
+        let mut reader = crate::storage::PutObjReader::from_vec(b"new generation secret".to_vec());
+        store
+            .put_object(&src_bucket, "secret", &mut reader, &crate::storage::ObjectOptions::default())
+            .await
+            .expect("write the new-generation source object");
+
+        let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(Arc::clone(&app_context)))
+            .execute_copy_object(req)
+            .await
+            .expect_err("stale authorization must not read from the recreated source bucket");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        let err = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(Some(app_context))
+            .execute_upload_part_copy(upload_req)
+            .await
+            .expect_err("stale authorization must not read the recreated source into a part");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        store
+            .get_object_info(&dst_bucket, "copied", &crate::storage::ObjectOptions::default())
+            .await
+            .expect_err("the new-generation source object must not be copied");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        assert!(server_ctx.install(Arc::clone(&app_context)));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        let bucket = format!("restore-generation-guard-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the bucket generation being authorized");
+        let authorized_incarnation_id = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read the authorized bucket incarnation");
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:RestoreObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("authorized bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("publish the RestoreObject policy");
+
+        let input = RestoreObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("object".to_string())
+            .restore_request(Some(RestoreRequest {
+                days: Some(1),
+                description: None,
+                glacier_job_parameters: None,
+                output_location: None,
+                select_parameters: None,
+                tier: None,
+                type_: None,
+            }))
+            .build()
+            .expect("restore object input should build");
+        let mut req = build_request(input, Method::POST);
+        ensure_req_info(&mut req);
+        let authorized = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_restore_authorization_test_hook(bucket.clone(), Arc::clone(&authorized), Arc::clone(&resume));
+
+        let access = tokio::spawn(async move {
+            let result = fs.restore_object(&mut req).await;
+            (result, req)
+        });
+        authorized.wait().await;
+
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the authorized bucket generation");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate the bucket with the same name");
+        let recreated_incarnation_id = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("read the recreated bucket incarnation");
+        assert_ne!(authorized_incarnation_id, recreated_incarnation_id);
+        resume.wait().await;
+
+        let (result, req) = access.await.expect("RestoreObject access task should join");
+        result.expect("the already-authorized request should retain its generation guard");
+        let mut opts = crate::storage::ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("apply the RestoreObject authorization guard");
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(authorized_incarnation_id));
+
+        let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context))
+            .execute_restore_object(req)
+            .await
+            .expect_err("the old RestoreObject authorization must not reach the recreated bucket");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("clean up the recreated bucket");
+    }
+
+    #[test]
+    fn dispatched_put_object_fails_closed_without_generation_guard() {
+        let input = PutObjectInput::builder()
+            .bucket("generation-guard-bucket".to_string())
+            .key("object".to_string())
+            .build()
+            .expect("put object input should build");
+        let mut req = build_request(input, Method::PUT);
+        req.extensions.insert(ServerContextSlot::new());
+
+        let mut opts = crate::storage::ObjectOptions::default();
+        let err = apply_bucket_generation_guard(&req, "generation-guard-bucket", &mut opts)
+            .expect_err("a dispatched PutObject must not commit without its authorization fence");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]

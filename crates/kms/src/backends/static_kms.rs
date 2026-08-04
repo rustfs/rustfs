@@ -26,7 +26,7 @@
 
 use crate::backends::{BackendCapabilities, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
-use crate::encryption::DataKeyEnvelope;
+use crate::encryption::{DataKeyEnvelope, context_aad};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -36,7 +36,7 @@ use aes_gcm::{
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::RngExt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -44,11 +44,6 @@ use zeroize::Zeroizing;
 const NONCE_SIZE: usize = 12;
 /// AES-256 key size in bytes.
 const KEY_SIZE: usize = 32;
-
-fn context_aad(context: &HashMap<String, String>) -> Result<Vec<u8>> {
-    let canonical: BTreeMap<&str, &str> = context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
-    serde_json::to_vec(&canonical).map_err(Into::into)
-}
 
 /// Static single-key KMS backend.
 ///
@@ -113,8 +108,18 @@ impl StaticKmsBackend {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::rng().fill(&mut nonce_bytes[..]);
 
-        // Generate 32 random bytes as plaintext DEK
-        let mut plaintext = [0u8; KEY_SIZE];
+        // The requested spec decides the DEK length; a caller that asked for
+        // AES_128 and silently got 256 bits would build objects whose recorded
+        // spec does not match their key material.
+        // Lengths track `KeySpec::key_size`; the request carries the spec as a
+        // string, so the mapping is repeated here rather than shared.
+        let key_length = match request.key_spec.as_str() {
+            "AES_256" | "ChaCha20" => 32,
+            "AES_128" => 16,
+            _ => return Err(KmsError::unsupported_algorithm(&request.key_spec)),
+        };
+
+        let mut plaintext = vec![0u8; key_length];
         rand::rng().fill(&mut plaintext[..]);
 
         // Encrypt DEK with AES-256-GCM using the static key directly
@@ -127,7 +132,7 @@ impl StaticKmsBackend {
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: plaintext.as_ref(),
+                    msg: plaintext.as_slice(),
                     aad: &aad,
                 },
             )

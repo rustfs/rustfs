@@ -26,8 +26,15 @@ use crate::object_api::ObjectOptions;
 use crate::storage_api_contracts::object::{ObjectOperations as _, ObjectToDelete};
 use crate::store::ECStore;
 use rustfs_lock::MAX_DELETE_LIST;
+use uuid::Uuid;
 
-pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
+pub async fn delete_object_versions(
+    api: &Arc<ECStore>,
+    bucket: &str,
+    to_del: &[ObjectToDelete],
+    _lc_event: lifecycle::Event,
+    bucket_incarnation_id: Uuid,
+) {
     let delete_config_snapshot = match ReplicationObjectBridge::delete_request_config(api, bucket).await {
         Ok(snapshot) => Arc::new(snapshot),
         Err(err) => {
@@ -59,6 +66,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                 to_del.to_vec(),
                 ObjectOptions {
                     delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
+                    expected_bucket_incarnation_id: Some(bucket_incarnation_id),
                     ..Default::default()
                 },
             )

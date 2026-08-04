@@ -239,6 +239,13 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
+    /// Skipped by serde: this state has a positional wire form, so the map
+    /// travels in the object's internal metadata and is re-derived on read.
+    /// Kept in step with the filemeta crate's copy of the same state.
+    #[serde(skip)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+    #[serde(skip)]
+    pub target_delete_marker_version_ids_corrupt: bool,
 }
 
 impl ReplicationState {
@@ -311,6 +318,7 @@ impl ReplicationState {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
+            target_delete_marker_version_id: self.target_delete_marker_version_ids.get(arn).cloned(),
             resync_timestamp,
             ..Default::default()
         }
@@ -414,6 +422,9 @@ pub struct ReplicatedTargetInfo {
     pub endpoint: String,
     pub secure: bool,
     pub error: Option<String>,
+    /// Version the target assigned to the delete marker it just created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delete_marker_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -1022,6 +1033,11 @@ fn version_purge_statuses_string(targets: &HashMap<String, VersionPurgeStatusTyp
     if result.is_empty() { None } else { Some(result) }
 }
 
+/// Kept in step with the bounds used by the filemeta crate's copy.
+const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
+const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
+const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
+
 pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationState, _vid: Option<String>) -> ReplicationState {
     let reset_status_map: Vec<(String, String)> = rinfos
         .targets
@@ -1048,6 +1064,35 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map.insert(key, value);
     }
 
+    // Carry forward the recorded per-target delete-marker versions, dropping
+    // anything outside the bounds, then fold in what this round's targets
+    // reported. A map already past the cap is discarded rather than trusted.
+    let mut target_delete_marker_version_ids = prev_state.target_delete_marker_version_ids.clone();
+    target_delete_marker_version_ids.retain(|arn, version_id| {
+        !arn.is_empty()
+            && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+            && !version_id.is_empty()
+            && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+    });
+    if target_delete_marker_version_ids.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+        target_delete_marker_version_ids.clear();
+    }
+    for target in &rinfos.targets {
+        let Some(version_id) = target.target_delete_marker_version_id.as_ref() else {
+            continue;
+        };
+        if (!target_delete_marker_version_ids.contains_key(&target.arn)
+            && target_delete_marker_version_ids.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            || target.arn.is_empty()
+            || target.arn.len() > MAX_REPLICATION_TARGET_ARN_LEN
+            || version_id.is_empty()
+            || version_id.len() > MAX_REPLICATION_TARGET_VERSION_ID_LEN
+        {
+            continue;
+        }
+        target_delete_marker_version_ids.insert(target.arn.clone(), version_id.clone());
+    }
+
     ReplicationState {
         replicate_decision_str: prev_state.replicate_decision_str.clone(),
         reset_statuses_map,
@@ -1058,6 +1103,8 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         replication_timestamp: rinfos.replication_timestamp,
         purge_targets,
         version_purge_status_internal: vpurge_statuses,
+        target_delete_marker_version_ids,
+        target_delete_marker_version_ids_corrupt: prev_state.target_delete_marker_version_ids_corrupt,
 
         ..Default::default()
     }

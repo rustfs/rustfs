@@ -54,8 +54,8 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params, create_bitrot_reader_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled, object_mmap_read_max_length,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -1406,6 +1406,102 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
     }
 }
 
+/// When all online shards are local and mmap-read is enabled, materialize
+/// shard bytes with one `batch_shard_pread` instead of per-shard
+/// `spawn_blocking` via `open_disk_reader`.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> Option<BitrotReaderSetup> {
+    use crate::disk::local::batch_shard_pread;
+    use std::io::Cursor;
+
+    let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
+    if adj_len > object_mmap_read_max_length() {
+        return None;
+    }
+
+    let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
+            return None;
+        }
+        if let Some(disk) = disk_op.as_ref() {
+            let data_dir = files[idx].data_dir.unwrap_or_default();
+            let path_str = format!("{object}/{data_dir}/part.{part_number}");
+            match disk.get_object_path_if_local(bucket, &path_str) {
+                Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
+                _ => return None,
+            }
+        }
+    }
+
+    if batch_items.is_empty() {
+        return None;
+    }
+
+    let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
+    let batch_results = batch_shard_pread(requests).await;
+
+    let mut setup = BitrotReaderSetup::new(disks.len());
+    for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
+        setup.mark_scheduled(*idx);
+        match &batch_results[i] {
+            Ok(bytes) => {
+                let reader = BitrotReader::new(
+                    ShardReader::InMemory(Cursor::new(bytes.clone())),
+                    shard_size,
+                    checksum_algo.clone(),
+                    skip_verify_bitrot,
+                );
+                setup.apply_reader_result(*idx, Ok(Some(reader)));
+            }
+            Err(e) => {
+                setup.apply_reader_result(*idx, Err(e.clone()));
+            }
+        }
+    }
+
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if setup.scheduled[idx] {
+            continue;
+        }
+        setup.mark_scheduled(idx);
+        if disk_op.is_none() {
+            setup.apply_reader_result(idx, Ok(None));
+        }
+    }
+
+    Some(setup)
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    _files: &[FileInfo],
+    _disks: &[Option<DiskStore>],
+    _bucket: &str,
+    _object: &str,
+    _part_number: usize,
+    _read_offset: usize,
+    _read_length: usize,
+    _shard_size: usize,
+    _checksum_algo: HashAlgorithm,
+    _skip_verify_bitrot: bool,
+) -> Option<BitrotReaderSetup> {
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     files: &[FileInfo],
@@ -1564,6 +1660,44 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
+
+    if use_mmap_read
+        && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+        )
+        .await
+    {
+        record_bitrot_reader_setup_strategy(strategy, mode, attribution);
+        fill_deferred_bitrot_readers(
+            &mut setup,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            data_shards,
+            parity_shards,
+            mode,
+        );
+        record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
+        return setup;
+    }
+
     if strategy == BitrotReaderSetupStrategy::AllShards {
         return create_bitrot_readers_until_quorum_all_shards(
             files,
@@ -3791,6 +3925,29 @@ impl SetDisks {
         Ok(m)
     }
 
+    fn reduce_delete_prefix_results(results: Vec<disk::error::Result<()>>, write_quorum: usize) -> disk::error::Result<()> {
+        let has_existing_volume = results
+            .iter()
+            .any(|result| matches!(result, Ok(()) | Err(DiskError::FileNotFound)));
+        let volume_not_found_count = results
+            .iter()
+            .filter(|result| matches!(result, Err(DiskError::VolumeNotFound)))
+            .count();
+        let errs = results
+            .into_iter()
+            .map(|result| result.err().filter(|err| !DiskError::is_err_object_not_found(err)))
+            .collect::<Vec<_>>();
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+        if !has_existing_volume && volume_not_found_count >= write_quorum {
+            return Err(DiskError::VolumeNotFound);
+        }
+
+        Ok(())
+    }
+
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
@@ -3813,18 +3970,12 @@ impl SetDisks {
                     )
                     .await
                 } else {
-                    Ok(())
+                    Err(DiskError::DiskNotFound)
                 }
             });
         }
 
-        let errs = join_all(futures).await.into_iter().map(|v| v.err()).collect::<Vec<_>>();
-
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err);
-        }
-
-        Ok(())
+        Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
     }
 
     /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
@@ -5744,16 +5895,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_prefix_removes_present_disks_and_ignores_missing_disk_slots() {
+    async fn delete_prefix_succeeds_when_present_disks_reach_quorum() {
         let bucket = "delete-prefix-bucket";
-        let (_dir, disk) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"payload".as_slice())]).await;
-        let set = io_primitives_test_set(vec![Some(disk.clone()), None], 1).await;
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let (_dir3, disk3) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"three".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), Some(disk3.clone()), None], 2).await;
 
         set.delete_prefix(bucket, "prefix")
             .await
-            .expect("missing disk slots should not block prefix deletion");
+            .expect("three successful disks should meet a four-disk write quorum");
 
-        assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        for disk in [disk1, disk2, disk3] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_counts_confirmed_absence_toward_quorum() {
+        let bucket = "delete-prefix-confirmed-absence";
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let (_dir3, disk3) = read_multiple_test_disk(bucket, &[]).await;
+        let (_dir4, disk4) = read_multiple_test_disk(bucket, &[]).await;
+        disk3
+            .delete_volume(bucket, true)
+            .await
+            .expect("third disk bucket should be absent");
+        disk4
+            .delete_volume(bucket, true)
+            .await
+            .expect("fourth disk bucket should be absent");
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), Some(disk3), Some(disk4)], 2).await;
+
+        set.delete_prefix(bucket, "prefix")
+            .await
+            .expect("successful deletes and confirmed absence should jointly meet quorum");
+
+        for disk in [disk1, disk2] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[test]
+    fn delete_prefix_result_reduction_preserves_existing_volume_evidence() {
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::DiskNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::FileNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Ok(()),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                    Err(DiskError::VolumeNotFound),
+                ],
+                3,
+            ),
+            Err(DiskError::VolumeNotFound)
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![Ok(()), Ok(()), Err(DiskError::DiskNotFound), Err(DiskError::DiskNotFound)],
+                3,
+            ),
+            Err(DiskError::ErasureWriteQuorum)
+        );
+        assert_eq!(
+            SetDisks::reduce_delete_prefix_results(
+                vec![
+                    Ok(()),
+                    Err(DiskError::FileAccessDenied),
+                    Err(DiskError::FileAccessDenied),
+                    Err(DiskError::FileAccessDenied),
+                ],
+                3,
+            ),
+            Err(DiskError::FileAccessDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_at_quorum_minus_one() {
+        let bucket = "delete-prefix-quorum-minus-one";
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"two".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone()), None, None], 2).await;
+
+        let err = set
+            .delete_prefix(bucket, "prefix")
+            .await
+            .expect_err("two successful disks must not meet a four-disk write quorum");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+        for disk in [disk1, disk2] {
+            assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_when_all_disk_slots_are_missing() {
+        let set = io_primitives_test_set(vec![None, None, None, None], 2).await;
+
+        let err = set
+            .delete_prefix("delete-prefix-offline", "prefix")
+            .await
+            .expect_err("an entirely offline set must not report a successful deletion");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
     }
 
     #[tokio::test]

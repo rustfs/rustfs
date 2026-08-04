@@ -20,6 +20,8 @@ use rustfs_config::{ENV_TEST_IAM_FAIL_INIT_ATTEMPTS, ENV_TEST_IAM_RETRY_INTERVAL
 use std::time::Duration;
 use temp_env::async_with_vars;
 
+mod common;
+
 fn response_preview(body: &str) -> String {
     body.chars().take(512).collect()
 }
@@ -37,8 +39,13 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
 }
 
 #[cfg(debug_assertions)]
-#[tokio::test]
-async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
+#[test]
+fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
+    common::run_embedded_test(test_embedded_server_recovers_after_deferred_iam_bootstrap_body);
+}
+
+#[cfg(debug_assertions)]
+async fn test_embedded_server_recovers_after_deferred_iam_bootstrap_body() {
     async_with_vars(
         [
             (ENV_TEST_IAM_FAIL_INIT_ATTEMPTS, Some("1")),

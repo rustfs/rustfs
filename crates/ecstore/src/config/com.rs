@@ -435,6 +435,22 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_no_lock_preserve_empty_with_metadata<S>(api: Arc<S>, file: &str) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(
+        api,
+        file,
+        &ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
 pub async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
 where
     S: ObjectIO<
@@ -586,10 +602,47 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
-    save_config_with_opts_and_metadata(api, file, data, opts).await.map(|_| ())
+    save_config_with_opts_inner(api, file, data, opts, true).await.map(|_| ())
+}
+
+/// Saves a configuration object without logging an error for a retryable caller-owned failure.
+pub async fn save_config_with_opts_quiet<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, false).await.map(|_| ())
 }
 
 async fn save_config_with_opts_and_metadata<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<ObjectInfo>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts_inner(api, file, data, opts, true).await
+}
+
+async fn save_config_with_opts_inner<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    opts: &ObjectOptions,
+    log_error: bool,
+) -> Result<ObjectInfo>
 where
     S: ObjectIO<
             Error = Error,
@@ -605,7 +658,9 @@ where
     match api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         Ok(object_info) => Ok(object_info),
         Err(err) => {
-            error!("save_config_with_opts: err: {:?}, file: {}", err, file);
+            if log_error {
+                error!("save_config_with_opts: err: {:?}, file: {}", err, file);
+            }
             Err(err)
         }
     }
@@ -2555,9 +2610,10 @@ mod tests {
     use super::{
         SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        lookup_configs, new_and_save_server_config, read_config, read_config_preserve_empty, read_config_with_metadata,
-        read_config_without_migrate, read_server_config_snapshot, save_server_config, save_server_config_snapshot,
-        save_server_config_snapshot_with_generation, server_config_transaction_lock_path, storage_class_kvs_mut,
+        lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
+        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
+        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+        server_config_transaction_lock_path, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -4988,9 +5044,14 @@ mod tests {
             .expect_err("the existing config contract treats empty objects as missing");
         assert!(matches!(err, Error::ConfigNotFound));
 
-        let data = read_config_preserve_empty(store, "config/empty.json")
+        let data = read_config_preserve_empty(store.clone(), "config/empty.json")
             .await
             .expect("payload-validating callers must observe the empty object");
+        assert!(data.is_empty());
+
+        let (data, _) = read_config_no_lock_preserve_empty_with_metadata(store, "config/empty.json")
+            .await
+            .expect("no-lock payload-validating callers must observe the empty object");
         assert!(data.is_empty());
     }
 

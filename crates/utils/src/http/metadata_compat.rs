@@ -15,7 +15,7 @@
 //! System metadata compatibility: write both x-rustfs-internal-* and x-minio-internal-*
 //! for MinIO interoperability. Read prefers RustFS, fallback to MinIO.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const RUSTFS_INTERNAL_PREFIX: &str = "x-rustfs-internal-";
 pub const MINIO_INTERNAL_PREFIX: &str = "x-minio-internal-";
@@ -42,6 +42,7 @@ pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
 pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
+pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
@@ -57,6 +58,9 @@ pub const SUFFIX_REPLICATION_RESET_ARN_PREFIX: &str = "replication-reset-";
 pub const SUFFIX_TIER_FV_ID: &str = "tier-free-versionID";
 pub const SUFFIX_TIER_FV_MARKER: &str = "tier-free-marker";
 pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
+
+/// Per-target delete-marker version ids are stored one key per target ARN.
+pub const SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX: &str = "replication-delete-marker-version-";
 
 /// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
 /// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
@@ -245,6 +249,74 @@ pub fn contains_key_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> bool 
 pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
+}
+
+/// Strips an internal metadata prefix while preserving the suffix casing.
+pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
+    if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) {
+        key.get(RUSTFS_INTERNAL_PREFIX.len()..)
+    } else if starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
+        key.get(MINIO_INTERNAL_PREFIX.len()..)
+    } else {
+        None
+    }
+}
+
+/// Reads the bounded per-target delete-marker version map in one metadata scan.
+/// The boolean is set when matching metadata is malformed or compatibility keys disagree.
+pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+    const MAX_ENTRIES: usize = 1_000;
+    const MAX_ARN_LEN: usize = 1_024;
+    const MAX_VERSION_ID_LEN: usize = 1_024;
+
+    let mut versions = BTreeMap::<String, Option<String>>::new();
+    let mut corrupt = false;
+    for (key, value) in map {
+        let Some(suffix) = strip_internal_prefix_preserving_case(key) else {
+            continue;
+        };
+        let Some(prefix) = suffix.get(..SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX) {
+            continue;
+        }
+        let arn = &suffix[SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()..];
+        if !arn.starts_with("arn:") || arn.len() > MAX_ARN_LEN || value.is_empty() || value.len() > MAX_VERSION_ID_LEN {
+            corrupt = true;
+            continue;
+        }
+        match versions.entry(arn.to_string()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(value.clone()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_deref() != Some(value.as_str()) {
+                    entry.insert(None);
+                    corrupt = true;
+                }
+            }
+        }
+    }
+
+    // Apply the cap after collecting, never during. Capping mid-iteration made
+    // the surviving subset depend on `HashMap` order, so two disks decoding the
+    // same metadata could keep different entries and hash differently — turning
+    // an over-cap object into a quorum failure instead of a reported corruption.
+    // `BTreeMap` order is total, so truncating here is identical everywhere.
+    if versions.len() > MAX_ENTRIES {
+        corrupt = true;
+        let retained = versions.keys().take(MAX_ENTRIES).cloned().collect::<Vec<_>>();
+        versions.retain(|arn, _| retained.binary_search(arn).is_ok());
+    }
+
+    (
+        versions
+            .into_iter()
+            .filter_map(|(arn, version_id)| version_id.map(|version_id| (arn, version_id)))
+            .collect(),
+        corrupt,
+    )
 }
 
 #[cfg(test)]
@@ -477,5 +549,60 @@ mod tests {
         assert_eq!(get_bytes(&meta_sys, &long_suffix), Some(b"payload".to_vec()));
         remove_bytes(&mut meta_sys, &long_suffix);
         assert!(!contains_key_bytes(&meta_sys, &long_suffix));
+    }
+
+    #[test]
+    fn target_delete_marker_versions_preserve_arn_case_and_report_conflicts() {
+        let arn = "arn:rustfs:replication::Target:Bucket";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, &suffix, "target-version".to_string());
+
+        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+        assert_eq!(versions.get(arn).map(String::as_str), Some("target-version"));
+        assert!(!corrupt);
+
+        metadata.insert(format!("{MINIO_INTERNAL_PREFIX}{suffix}"), "other-version".to_string());
+        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+        assert!(versions.is_empty());
+        assert!(corrupt);
+    }
+
+    #[test]
+    fn target_delete_marker_versions_bound_distinct_entries_during_scan() {
+        let metadata = (0..=1_000)
+            .map(|index| {
+                (
+                    format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:target:{index:04}"),
+                    format!("version-{index}"),
+                )
+            })
+            .collect();
+
+        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+
+        assert_eq!(versions.len(), 1_000);
+        assert!(corrupt);
+    }
+    #[test]
+    fn target_delete_marker_versions_cap_is_deterministic_across_decodes() {
+        // Two decodes of the same oversized metadata must agree, or the two disks
+        // holding it hash differently and the object loses quorum instead of
+        // reporting corruption.
+        let mut metadata = HashMap::new();
+        for index in 0..1_050 {
+            metadata.insert(
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:target:{index:05}"),
+                format!("version-{index}"),
+            );
+        }
+
+        let (first, first_corrupt) = target_delete_marker_versions(&metadata);
+        let (second, second_corrupt) = target_delete_marker_versions(&metadata);
+
+        assert!(first_corrupt, "exceeding the cap must be reported as corrupt");
+        assert_eq!(first_corrupt, second_corrupt);
+        assert_eq!(first, second, "the retained subset must not depend on map iteration order");
+        assert_eq!(first.len(), 1_000);
     }
 }

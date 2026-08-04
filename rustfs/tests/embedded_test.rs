@@ -22,6 +22,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 
+mod common;
+
 /// Helper: create an S3 client pointed at the embedded server.
 fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     let creds = Credentials::new(access_key, secret_key, None, None, "test");
@@ -35,8 +37,12 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     Client::from_conf(config)
 }
 
-#[tokio::test]
-async fn test_embedded_server_basic_s3_operations() {
+#[test]
+fn test_embedded_server_basic_s3_operations() {
+    common::run_embedded_test(test_embedded_server_basic_s3_operations_body);
+}
+
+async fn test_embedded_server_basic_s3_operations_body() {
     // 1. Pick a free port and start the embedded server.
     let port = match find_available_port() {
         Ok(port) => port,
