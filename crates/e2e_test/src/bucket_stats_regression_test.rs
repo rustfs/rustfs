@@ -32,7 +32,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, awscurl_get, init_logging};
-    use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use rustfs_data_usage::DataUsageInfo;
@@ -92,13 +91,13 @@ mod tests {
         for attempt in 0..18 {
             sleep(Duration::from_secs(5)).await;
 
-            if let Ok(usage) = get_data_usage(&env).await {
-                if let Some(bucket_usage) = usage.buckets_usage.get(bucket) {
-                    info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
-                    if bucket_usage.objects_count >= 10 {
-                        found_nonzero = true;
-                        break;
-                    }
+            if let Ok(usage) = get_data_usage(&env).await
+                && let Some(bucket_usage) = usage.buckets_usage.get(bucket)
+            {
+                info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
+                if bucket_usage.objects_count >= 10 {
+                    found_nonzero = true;
+                    break;
                 }
             }
         }
@@ -160,13 +159,13 @@ mod tests {
         for attempt in 0..18 {
             sleep(Duration::from_secs(5)).await;
 
-            if let Ok(usage) = get_data_usage(&env).await {
-                if let Some(bucket_usage) = usage.buckets_usage.get(bucket) {
-                    info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
-                    if bucket_usage.objects_count == 0 {
-                        found_zero = true;
-                        break;
-                    }
+            if let Ok(usage) = get_data_usage(&env).await
+                && let Some(bucket_usage) = usage.buckets_usage.get(bucket)
+            {
+                info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
+                if bucket_usage.objects_count == 0 {
+                    found_zero = true;
+                    break;
                 }
             }
         }

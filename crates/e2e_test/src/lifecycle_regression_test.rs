@@ -38,8 +38,7 @@ mod tests {
     };
     use serial_test::serial;
     use std::error::Error;
-    use tokio::time::{Duration, sleep, timeout};
-    use tracing::{info, warn};
+    use tracing::info;
 
     type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 

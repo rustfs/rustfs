@@ -31,7 +31,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
-    use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
     use serial_test::serial;
@@ -85,8 +84,13 @@ mod tests {
             .await
             .expect("list objects before delete");
 
-        let keys: Vec<_> = list.contents().iter().map(|o| o.key().unwrap_or("")).collect();
-        assert!(keys.contains(&"to-delete.txt"), "RT-05 FAIL: object not in LIST before delete");
+        assert!(
+            list.contents()
+                .iter()
+                .map(|o| o.key().unwrap_or(""))
+                .any(|key| key == "to-delete.txt"),
+            "RT-05 FAIL: object not in LIST before delete"
+        );
 
         // DELETE
         client
@@ -105,9 +109,12 @@ mod tests {
             .await
             .expect("list objects after delete");
 
-        let keys: Vec<_> = list.contents().iter().map(|o| o.key().unwrap_or("")).collect();
         assert!(
-            !keys.contains(&"to-delete.txt"),
+            !list
+                .contents()
+                .iter()
+                .map(|o| o.key().unwrap_or(""))
+                .any(|key| key == "to-delete.txt"),
             "RT-05 FAIL: deleted object still in LIST (regression rustfs#5375)"
         );
 

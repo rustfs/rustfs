@@ -31,7 +31,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
-    use aws_sdk_s3::Client;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use serial_test::serial;
     use std::error::Error;
