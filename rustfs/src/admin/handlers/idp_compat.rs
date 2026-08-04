@@ -59,10 +59,11 @@ use rustfs_madmin::{
     ServiceAccountInfo,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_utils::MaskedAccessKey;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 use time::OffsetDateTime;
 use tracing::warn;
 use url::form_urlencoded;
@@ -210,6 +211,59 @@ struct RevokeTokensResp {
 /// provider. This limitation is reported as COMPAT-SEMANTICS-ONLY.
 pub struct RevokeTokens {}
 
+const MAX_CONCURRENT_STS_REVOCATIONS: usize = 16;
+const MAX_GLOBAL_STS_REVOCATIONS: usize = 64;
+static STS_REVOCATION_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_GLOBAL_STS_REVOCATIONS));
+
+async fn revoke_matching_sts_accounts<E, F, Fut>(
+    accounts: Vec<StoredCredentials>,
+    user_provider: String,
+    revoke: F,
+) -> Result<Result<usize, E>, tokio::task::JoinError>
+where
+    E: Send + 'static,
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), E>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        use futures::StreamExt;
+
+        let access_keys = accounts
+            .into_iter()
+            .filter(|credential| guess_user_provider(credential) == user_provider)
+            .map(|credential| credential.access_key)
+            .collect::<Vec<_>>();
+        let results = futures::stream::iter(access_keys)
+            .map(|access_key| {
+                let revoke = revoke.clone();
+                async move { revoke(access_key).await }
+            })
+            .buffer_unordered(MAX_CONCURRENT_STS_REVOCATIONS)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut revoked = 0usize;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => revoked += 1,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(revoked),
+        }
+    })
+    .await
+}
+
 #[async_trait::async_trait]
 impl Operation for RevokeTokens {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -248,7 +302,7 @@ impl Operation for RevokeTokens {
                 subsystem = LOG_SUBSYSTEM_IDP,
                 event = EVENT_ADMIN_IDP_STATE,
                 action = "revoke_tokens",
-                target_user = %target_user,
+                target_user = %MaskedAccessKey(&target_user),
                 result = "list_sts_failed",
                 error = ?e,
                 "admin idp state"
@@ -260,31 +314,49 @@ impl Operation for RevokeTokens {
         // not persist that claim. Only an empty type / full revoke deletes.
         let revoke_all = query.full_revoke || query.token_revoke_type.is_empty();
 
-        let mut revoked = 0usize;
-        if revoke_all {
-            for sts in &sts_accounts {
-                // Provider scoping: only revoke STS credentials that were issued
-                // through the requested identity provider.
-                if guess_user_provider(sts) != user_provider {
-                    continue;
+        let revoked = if revoke_all {
+            let batch_result = revoke_matching_sts_accounts(sts_accounts, user_provider.clone(), move |access_key| {
+                let iam_store = iam_store.clone();
+                async move {
+                    let _permit = STS_REVOCATION_PERMITS
+                        .acquire()
+                        .await
+                        .map_err(rustfs_iam::error::Error::other)?;
+                    iam_store.delete_temp_account(&access_key, true).await
                 }
-
-                iam_store.delete_temp_account(&sts.access_key, true).await.map_err(|e| {
+            })
+            .await
+            .map_err(|err| {
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_IDP,
+                    event = EVENT_ADMIN_IDP_STATE,
+                    action = "revoke_tokens",
+                    result = "batch_task_failed",
+                    error = ?err,
+                    "admin idp state"
+                );
+                s3_error!(InternalError, "revoke token batch failed")
+            })?;
+            match batch_result {
+                Ok(revoked) => revoked,
+                Err(err) => {
                     warn!(
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_IDP,
                         event = EVENT_ADMIN_IDP_STATE,
                         action = "revoke_tokens",
-                        access_key = %sts.access_key,
+                        target_user = %MaskedAccessKey(&target_user),
                         result = "delete_failed",
-                        error = ?e,
+                        error = ?err,
                         "admin idp state"
                     );
-                    s3_error!(InternalError, "revoke token failed")
-                })?;
-                revoked += 1;
+                    return Err(s3_error!(InternalError, "revoke token failed"));
+                }
             }
-        }
+        } else {
+            0
+        };
 
         let _ = owner;
         json_response(
@@ -947,6 +1019,95 @@ mod tests {
         assert!(!q.full_revoke);
         // revoke_all is derived in the handler: empty type OR fullRevoke.
         assert!(q.full_revoke || q.token_revoke_type.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_tokens_attempts_all_matching_credentials_before_returning_error() {
+        let credentials = ["first-sts", "second-sts"].map(|access_key| StoredCredentials {
+            access_key: access_key.to_string(),
+            secret_key: "temporary-user-secret".to_string(),
+            session_token: "session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        });
+        let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let result = revoke_matching_sts_accounts(credentials.to_vec(), "builtin".to_string(), {
+            let attempted = std::sync::Arc::clone(&attempted);
+            move |access_key| {
+                let attempted = std::sync::Arc::clone(&attempted);
+                async move {
+                    attempted
+                        .lock()
+                        .expect("attempted revocations mutex poisoned")
+                        .push(access_key.clone());
+                    if access_key == "first-sts" {
+                        Err("first revoke failed")
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        })
+        .await
+        .expect("revocation batch task");
+
+        assert_eq!(result, Err("first revoke failed"));
+        assert_eq!(
+            *attempted.lock().expect("attempted revocations mutex poisoned"),
+            vec!["first-sts".to_string(), "second-sts".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_tokens_batch_survives_caller_cancellation() {
+        let credentials = (0..32)
+            .map(|index| StoredCredentials {
+                access_key: format!("sts-{index}"),
+                secret_key: "temporary-user-secret".to_string(),
+                session_token: "session-token".to_string(),
+                expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+                parent_user: "parent-user".to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first_window_started = std::sync::Arc::new(tokio::sync::Barrier::new(17));
+        let release_first_window = std::sync::Arc::new(tokio::sync::Barrier::new(17));
+
+        let caller = tokio::spawn(revoke_matching_sts_accounts(credentials, "builtin".to_string(), {
+            let attempts = std::sync::Arc::clone(&attempts);
+            let progress = std::sync::Arc::clone(&progress);
+            let first_window_started = std::sync::Arc::clone(&first_window_started);
+            let release_first_window = std::sync::Arc::clone(&release_first_window);
+            move |_| {
+                let attempts = std::sync::Arc::clone(&attempts);
+                let progress = std::sync::Arc::clone(&progress);
+                let first_window_started = std::sync::Arc::clone(&first_window_started);
+                let release_first_window = std::sync::Arc::clone(&release_first_window);
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    progress.notify_one();
+                    if attempt < MAX_CONCURRENT_STS_REVOCATIONS {
+                        first_window_started.wait().await;
+                        release_first_window.wait().await;
+                    }
+                    Ok::<(), ()>(())
+                }
+            }
+        }));
+        first_window_started.wait().await;
+
+        caller.abort();
+        assert!(caller.await.expect_err("caller task should be cancelled").is_cancelled());
+        release_first_window.wait().await;
+        while attempts.load(std::sync::atomic::Ordering::SeqCst) < 32 {
+            progress.notified().await;
+        }
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 32);
     }
 
     #[test]

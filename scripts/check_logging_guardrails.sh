@@ -671,6 +671,25 @@ for pattern in "${forbidden_patterns[@]}"; do
   fi
 done
 
+if rg -n -F -- 'warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing")' crates/iam/src/store/object.rs >/dev/null; then
+  echo "❌ logging guardrail violation: missing IAM identity is an expected debug event, not a warning" >&2
+  exit 1
+fi
+
+unmasked_iam_identity_logs="$(rg -n 'IAM (user identity|JWT claim)' crates/iam/src/store/object.rs | rg -v 'MaskedAccessKey' || true)"
+if [[ -n "$unmasked_iam_identity_logs" ]]; then
+  echo "❌ logging guardrail violation: IAM identity log omits MaskedAccessKey" >&2
+  echo "$unmasked_iam_identity_logs" >&2
+  exit 1
+fi
+
+unmasked_revoke_fields="$(rg -n '(access_key\s*=\s*%\s*&?sts\.access_key|target_user\s*=\s*%\s*&?target_user)' rustfs/src/admin/handlers/idp_compat.rs || true)"
+if [[ -n "$unmasked_revoke_fields" ]]; then
+  echo "❌ logging guardrail violation: revoke-tokens log exposes an unmasked credential identifier" >&2
+  echo "$unmasked_revoke_fields" >&2
+  exit 1
+fi
+
 # Secret material must never be interpolated into log or error strings.
 # Error messages are log content: they propagate via `?` and are printed by
 # startup/error logging far from the construction site, and a value that fails
