@@ -732,7 +732,7 @@ pub async fn start_http_server(
             .transpose()
             .map_err(Error::other)?;
 
-        b.set_auth(IAMAuth::new(access_key, secret_key));
+        b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
             admin::make_admin_route(config.console_enable, admin_server_ctx)?,
