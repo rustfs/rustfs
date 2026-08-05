@@ -487,7 +487,11 @@ fn sync_file(path: &Path) -> io::Result<()> {
     if _probe.as_ref().is_some_and(file_sync_probe::ActiveGuard::should_fail) {
         return Err(io::Error::other("injected file sync failure"));
     }
-    std::fs::File::open(path)?.sync_data()
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path)?;
+    file.sync_data()
 }
 
 fn sync_files(paths: &[PathBuf]) -> io::Result<()> {
@@ -4392,6 +4396,19 @@ mod tests {
             fsync_dir_recorder::was_fsynced(temp_dir.path()),
             "successful sequential sync must fsync the directory"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    async fn windows_sync_dir_files_opens_shards_for_flushing() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("part.1"), b"shard").expect("write shard");
+        let _probe = file_sync_probe::set(temp_dir.path());
+
+        sync_dir_files(temp_dir.path())
+            .await
+            .expect("Windows shard handles must carry write access for FlushFileBuffers");
     }
 
     #[tokio::test]

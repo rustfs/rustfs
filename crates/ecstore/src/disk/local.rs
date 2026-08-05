@@ -4595,7 +4595,13 @@ impl LocalDisk {
             log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
         })?;
         #[cfg(windows)]
-        let publication_root_path = Path::new(&endpoint_path);
+        let publication_root_path = {
+            // `resolve_local_disk_root` validates fallback mount roots. The
+            // publication root must still retain the configured alias so paths
+            // created before final-path normalization remain relative to it.
+            drop(root);
+            Path::new(&endpoint_path)
+        };
         #[cfg(not(windows))]
         let publication_root_path = root.as_path();
         let publication_root = os::PublicationRoot::new(publication_root_path)
