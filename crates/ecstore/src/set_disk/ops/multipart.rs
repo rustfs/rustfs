@@ -357,6 +357,20 @@ fn paginate_upload_page(remaining: &[MultipartInfo], max_uploads: usize) -> (Vec
     (page, is_truncated, next_upload_id_marker)
 }
 
+/// Deterministic per-upload damage during a multipart listing: the metadata
+/// exists but is torn, undecodable, or not identifiable as an upload. The same
+/// corrupt family as `classify_metadata_response_error`'s corrupt group. This
+/// deliberately excludes transient fault shapes (`DiskNotFound`, `Timeout`,
+/// `Io`, `ErasureReadQuorum` from offline-disk quorum loss, ...): degrading on
+/// those would silently drop healthy uploads from a 200 listing while disks
+/// are merely unreachable (issue #5716 review).
+fn is_corrupt_upload_metadata_error(err: &DiskError) -> bool {
+    matches!(
+        err,
+        DiskError::FileCorrupt | DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::OutdatedXLMeta
+    )
+}
+
 async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str) -> disk::error::Result<Vec<String>> {
     if !disk.is_online().await {
         return Err(DiskError::DiskNotFound);
@@ -637,25 +651,78 @@ impl SetDisks {
                         }
                         return Ok(None);
                     }
-                    let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
-                    let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
-                    if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
-                        return Err(err);
-                    }
-                    let (_, mod_time, etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
-                    let file_info = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum)?;
-                    if expected_incarnation_id
-                        .is_some_and(|expected| !multipart_bucket_incarnation_matches(&file_info.metadata, expected))
-                    {
+                    // Affirmative per-upload damage (issue #5716): the staging
+                    // namespace is one flat set of sha256(bucket/object)
+                    // directories shared by every bucket, so a directory whose
+                    // metadata is torn or undecodable must degrade to that
+                    // upload alone. Erroring out instead turns one damaged
+                    // directory into a permanent InternalError for every
+                    // ListMultipartUploads of the bucket. Only the corrupt
+                    // error family counts as damage — transient faults (offline
+                    // disks, timeouts, IO churn) keep failing the listing below
+                    // so clients retry instead of silently losing entries.
+                    let corrupt_metadata = errs
+                        .iter()
+                        .filter(|err| err.as_ref().is_some_and(is_corrupt_upload_metadata_error))
+                        .count();
+                    if corrupt_metadata > 0 && missing_metadata + corrupt_metadata >= discovery_quorum {
+                        debug!(
+                            bucket,
+                            upload_path = %upload_path,
+                            missing_metadata,
+                            corrupt_metadata,
+                            "skipping multipart upload directory with corrupt metadata during listing"
+                        );
                         return Ok(None);
                     }
+                    let decoded: disk::error::Result<Option<(FileInfo, String)>> = (|| {
+                        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+                        let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+                        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+                            return Err(err);
+                        }
+                        let (_, mod_time, etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
+                        let file_info = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum)?;
+                        if expected_incarnation_id
+                            .is_some_and(|expected| !multipart_bucket_incarnation_matches(&file_info.metadata, expected))
+                        {
+                            return Ok(None);
+                        }
 
-                    let object = match (
-                        file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
-                        file_info.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
-                    ) {
-                        (Some(stored_bucket), Some(object)) if stored_bucket == bucket && !object.is_empty() => object.clone(),
-                        _ => return Err(DiskError::CorruptedFormat),
+                        let object = match (
+                            file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
+                            file_info.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
+                        ) {
+                            (Some(stored_bucket), Some(object)) if stored_bucket == bucket && !object.is_empty() => {
+                                object.clone()
+                            }
+                            // A healthy upload that belongs to another bucket:
+                            // not ours to list, and not corruption.
+                            (Some(stored_bucket), Some(_)) if stored_bucket != bucket => return Ok(None),
+                            _ => return Err(DiskError::CorruptedFormat),
+                        };
+                        Ok(Some((file_info, object)))
+                    })();
+                    let (file_info, object) = match decoded {
+                        Ok(Some(decoded)) => decoded,
+                        Ok(None) => return Ok(None),
+                        // Deterministic damage (undecodable metadata that still
+                        // reached quorum, or metadata without its owner keys):
+                        // skip this upload only.
+                        Err(err) if is_corrupt_upload_metadata_error(&err) => {
+                            debug!(
+                                bucket,
+                                upload_path = %upload_path,
+                                error = %err,
+                                "skipping multipart upload directory with unidentifiable metadata during listing"
+                            );
+                            return Ok(None);
+                        }
+                        // Everything else — quorum loss from offline disks,
+                        // timeouts, transport errors — can hide uploads that are
+                        // actually fine; keep failing the listing so clients
+                        // retry instead of silently losing entries.
+                        Err(err) => return Err(err),
                     };
                     if !object.starts_with(prefix) {
                         return Ok(None);
@@ -4269,6 +4336,196 @@ mod tests {
             .expect("incarnation-scoped multipart listing should succeed");
         assert_eq!(scoped.uploads.len(), 1);
         assert_eq!(scoped.uploads[0].upload_id, current.upload_id);
+    }
+
+    /// The `<deployment-id>.` prefix inside an upload id is read from a
+    /// process-global that concurrently-running tests reinitialize, so id
+    /// assertions compare only the stable `<uuid>x<timestamp>` suffix.
+    fn upload_uuid_suffix(upload_id: &str) -> String {
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload_id.as_bytes())
+            .expect("upload id should be url-safe base64");
+        let decoded = String::from_utf8(decoded).expect("upload id should decode to utf8");
+        decoded
+            .split_once('.')
+            .map(|(_, suffix)| suffix.to_owned())
+            .unwrap_or(decoded)
+    }
+
+    /// Regression (issue #5716): the multipart staging namespace is flat —
+    /// `sha256(bucket/object)` directories from every bucket share one volume —
+    /// so a bucket-scoped listing reads metadata belonging to other buckets'
+    /// in-flight uploads. Those entries must be filtered out, not treated as
+    /// corruption: with the `_ => CorruptedFormat` arm, any concurrent upload
+    /// in another bucket turned every ListMultipartUploads for this bucket
+    /// into an InternalError.
+    #[tokio::test]
+    async fn list_multipart_uploads_ignores_other_buckets_uploads() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cross-bucket-a";
+        let other_bucket = "multipart-cross-bucket-b";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+            disk.make_volume(other_bucket)
+                .await
+                .expect("other bucket volume should be created");
+        }
+
+        let mine = set_disks
+            .new_multipart_upload(bucket, "blobs/data/layer.bin", &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        set_disks
+            .new_multipart_upload(other_bucket, "cache/other-layer.bin", &ObjectOptions::default())
+            .await
+            .expect("other bucket multipart upload should be created");
+
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "blobs/", None, None, None, 1000, None)
+            .await
+            .expect("a concurrent upload in another bucket must not poison this bucket's listing");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&mine.upload_id));
+
+        let bucket_wide = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("bucket-wide listing must also skip other buckets' uploads");
+        assert_eq!(bucket_wide.uploads.len(), 1);
+        assert_eq!(bucket_wide.uploads[0].object, "blobs/data/layer.bin");
+    }
+
+    /// Regression (issue #5716): a single upload directory whose `xl.meta` was
+    /// destroyed (crash mid-write, torn disk state) must degrade to that upload
+    /// alone. Failing the whole ListMultipartUploads turns one piece of stale
+    /// debris into a permanent outage for every multipart client of the bucket.
+    #[tokio::test]
+    async fn list_multipart_uploads_skips_undecodable_upload_dirs() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-corrupt-dir-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let healthy = set_disks
+            .new_multipart_upload(bucket, "healthy/object.bin", &ObjectOptions::default())
+            .await
+            .expect("healthy multipart upload should be created");
+        set_disks
+            .new_multipart_upload(bucket, "debris/object.bin", &ObjectOptions::default())
+            .await
+            .expect("debris multipart upload should be created");
+
+        // Destroy the debris upload's metadata on every disk, as an unclean
+        // shutdown mid-create can. The directory stays listable while its
+        // xl.meta no longer decodes.
+        let debris_sha = SetDisks::get_multipart_sha_dir(bucket, "debris/object.bin");
+        let mut corrupted = 0usize;
+        for temp_dir in &temp_dirs {
+            let sha_dir = temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&debris_sha);
+            for meta in multipart_meta_files_on_disk(temp_dir, "xl.meta").await {
+                if meta.starts_with(sha_dir.to_string_lossy().as_ref()) {
+                    tokio::fs::write(&meta, b"not an xl.meta")
+                        .await
+                        .expect("corrupting xl.meta should succeed");
+                    corrupted += 1;
+                }
+            }
+        }
+        assert!(corrupted > 0, "the debris upload must exist on disk before corruption");
+
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "healthy/", None, None, None, 1000, None)
+            .await
+            .expect("one undecodable upload dir must not fail the whole listing");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&healthy.upload_id));
+
+        let bucket_wide = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("bucket-wide listing must skip the undecodable upload dir");
+        assert_eq!(bucket_wide.uploads.len(), 1);
+        assert_eq!(
+            upload_uuid_suffix(&bucket_wide.uploads[0].upload_id),
+            upload_uuid_suffix(&healthy.upload_id)
+        );
+    }
+
+    /// Companion boundary to `list_multipart_uploads_skips_undecodable_upload_dirs`:
+    /// corruption BELOW the discovery quorum must not hide the upload — the
+    /// surviving disks still identify it, so it stays listed.
+    #[tokio::test]
+    async fn list_multipart_uploads_survives_sub_quorum_corruption() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-partial-corrupt-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, "partial/object.bin", &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        // Corrupt the upload's metadata on exactly one disk (discovery quorum
+        // on this 4-disk set is 2): the other replicas keep it identifiable.
+        let sha = SetDisks::get_multipart_sha_dir(bucket, "partial/object.bin");
+        let mut corrupted = 0usize;
+        for temp_dir in &temp_dirs {
+            let sha_dir = temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&sha);
+            for meta in multipart_meta_files_on_disk(temp_dir, "xl.meta").await {
+                if meta.starts_with(sha_dir.to_string_lossy().as_ref()) {
+                    tokio::fs::write(&meta, b"not an xl.meta")
+                        .await
+                        .expect("corrupting xl.meta should succeed");
+                    corrupted += 1;
+                }
+            }
+            if corrupted > 0 {
+                break;
+            }
+        }
+        assert_eq!(corrupted, 1, "exactly one disk's metadata should be corrupted");
+
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "partial/", None, None, None, 1000, None)
+            .await
+            .expect("sub-quorum corruption must not fail the listing");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&upload.upload_id));
+    }
+
+    /// Pins the degrade-vs-propagate classification (issue #5716 review): only
+    /// affirmative corruption may skip an upload during listing; every
+    /// transient fault shape must keep failing the listing so clients retry
+    /// instead of silently losing entries.
+    #[test]
+    fn corrupt_upload_metadata_classification_excludes_transient_faults() {
+        for corrupt in [
+            DiskError::FileCorrupt,
+            DiskError::CorruptedFormat,
+            DiskError::CorruptedBackend,
+            DiskError::OutdatedXLMeta,
+        ] {
+            assert!(is_corrupt_upload_metadata_error(&corrupt), "{corrupt:?} is deterministic damage");
+        }
+        for transient in [
+            DiskError::DiskNotFound,
+            DiskError::Timeout,
+            DiskError::FaultyDisk,
+            DiskError::FaultyRemoteDisk,
+            DiskError::DiskAccessDenied,
+            DiskError::VolumeAccessDenied,
+            DiskError::ErasureReadQuorum,
+            DiskError::FileNotFound,
+            DiskError::Io(std::io::Error::other("connection refused")),
+        ] {
+            assert!(
+                !is_corrupt_upload_metadata_error(&transient),
+                "{transient:?} must keep failing the listing"
+            );
+        }
     }
 
     /// Recursively collect every file named `file_name` under the multipart

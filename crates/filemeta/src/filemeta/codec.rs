@@ -44,12 +44,17 @@ impl FileMeta {
     }
 
     pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
+        // A file too short to hold the XL2 magic, or one that carries the
+        // wrong magic, is not merely unreadable — it is affirmative evidence
+        // of a torn or foreign write. Classify it as FileCorrupt so quorum
+        // and listing code can distinguish deterministic damage from
+        // transient IO faults (issue #5716).
         if buf.len() < 8 {
-            return Err(Error::other("xl file header not exists"));
+            return Err(Error::FileCorrupt);
         }
 
         if buf[0..4] != XL_FILE_HEADER {
-            return Err(Error::other("xl file header err"));
+            return Err(Error::FileCorrupt);
         }
 
         let major = byteorder::LittleEndian::read_u16(&buf[4..6]);
