@@ -2950,6 +2950,68 @@ impl SetDisks {
             return Err(ret_err);
         }
 
+        // A synthetic inline-rollback dir (rollback_data_dir set, cleanup_data_dir
+        // unset) holds only the xl.meta.bkp consumed by the quorum-failure undo
+        // above. Once the commit holds quorum that window is closed, and the
+        // commit_rename_data_dir pass reclaims real old data dirs only, so the
+        // synthetic dir must be reclaimed here — otherwise every overwrite of an
+        // inline version by a non-inline one leaves <object>/<rollback-dir>/
+        // behind, and DeleteBucket keeps failing with BucketNotEmpty after the
+        // object is deleted. Best-effort: residue must not fail the durable write.
+        let rollback_only_futures: Vec<_> = disks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, disk)| {
+                let disk = disk.clone()?;
+                if errs[idx].is_some() || cleanup_data_dirs[idx].is_some() {
+                    return None;
+                }
+                let rollback_dir = data_dirs[idx]?;
+                // Anti-misdelete guard, same posture as commit_rename_data_dir:
+                // never touch the data dir the commit just published.
+                if file_infos[idx].data_dir == Some(rollback_dir) {
+                    return None;
+                }
+                let dst_bucket = dst_bucket.clone();
+                let path = format!("{dst_object}/{rollback_dir}");
+                Some(tokio::spawn(async move {
+                    disk.delete_data_dir(
+                        &dst_bucket,
+                        &path,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                }))
+            })
+            .collect();
+        for result in join_all(rollback_only_futures).await {
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) if err == DiskError::FileNotFound || err == DiskError::VolumeNotFound => {}
+                Ok(Err(err)) => {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        dst_bucket = %dst_bucket,
+                        dst_object = %dst_object,
+                        error = %err,
+                        "failed to reclaim synthetic inline-rollback dir after commit"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        dst_bucket = %dst_bucket,
+                        dst_object = %dst_object,
+                        error = %err,
+                        "synthetic inline-rollback reclaim task failed"
+                    );
+                }
+            }
+        }
+
         let data_dir = Self::reduce_common_data_dir(&cleanup_data_dirs, write_quorum);
         let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
@@ -5201,6 +5263,84 @@ mod tests {
         assert!(stored.deleted);
         assert_eq!(stored.version_id, None);
         assert!(stored.is_canonical_delete_marker());
+    }
+
+    /// Overwriting an inline version with a non-inline one stages the old
+    /// xl.meta as `<object>/<synthetic-rollback-dir>/xl.meta.bkp` for the
+    /// quorum-failure undo. After a successful quorum commit that dir must be
+    /// reclaimed — leftover residue keeps DeleteBucket failing with
+    /// BucketNotEmpty long after the object itself is deleted.
+    #[tokio::test]
+    async fn rename_data_reclaims_synthetic_inline_rollback_dir_after_commit() {
+        let bucket = "rename-inline-rollback-bucket";
+        let object = "object";
+        let (dirs, mut online_disks) = call_counter_local_disks(bucket, 1).await;
+        let online_disk = online_disks.pop().expect("one test disk slot should be present");
+        let disk = online_disk.as_ref().expect("test disk should be online");
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("temporary metadata volume should be available: {err:?}"),
+        }
+
+        let disk_root = dirs[0].path();
+
+        // Commit an inline version (data carried in xl.meta, no data dir).
+        let mut inline_fi = metadata_test_fileinfo(object);
+        inline_fi.data = Some(Bytes::from_static(b"inline-body"));
+        inline_fi.mod_time = Some(OffsetDateTime::now_utc());
+        std::fs::create_dir_all(disk_root.join(RUSTFS_META_TMP_BUCKET).join("tmp-inline"))
+            .expect("inline staging dir should be created");
+        SetDisks::rename_data(
+            std::slice::from_ref(&online_disk),
+            RUSTFS_META_TMP_BUCKET,
+            "tmp-inline",
+            std::slice::from_ref(&inline_fi),
+            bucket,
+            object,
+            1,
+        )
+        .await
+        .expect("inline version should commit");
+
+        // Overwrite the same (nil) version with a non-inline one.
+        let new_data_dir = Uuid::new_v4();
+        let mut streaming_fi = metadata_test_fileinfo(object);
+        streaming_fi.data_dir = Some(new_data_dir);
+        streaming_fi.mod_time = Some(OffsetDateTime::now_utc());
+        let staged_data_dir = disk_root
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join("tmp-streaming")
+            .join(new_data_dir.to_string());
+        std::fs::create_dir_all(&staged_data_dir).expect("streaming staging dir should be created");
+        std::fs::write(staged_data_dir.join("part.1"), b"streamed-body").expect("staged part should be written");
+        SetDisks::rename_data(
+            std::slice::from_ref(&online_disk),
+            RUSTFS_META_TMP_BUCKET,
+            "tmp-streaming",
+            std::slice::from_ref(&streaming_fi),
+            bucket,
+            object,
+            1,
+        )
+        .await
+        .expect("non-inline overwrite should commit");
+
+        let mut leftovers: Vec<String> = std::fs::read_dir(disk_root.join(bucket).join(object))
+            .expect("committed object dir should be readable")
+            .map(|entry| {
+                entry
+                    .expect("object dir entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        leftovers.sort();
+        assert_eq!(
+            leftovers,
+            vec![new_data_dir.to_string(), STORAGE_FORMAT_FILE.to_string()],
+            "only the committed data dir and xl.meta may remain — synthetic rollback residue breaks DeleteBucket"
+        );
     }
 
     #[tokio::test]
