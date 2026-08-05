@@ -631,6 +631,10 @@ fn object_cleanup_report<'a>(
 }
 
 fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
+    manifest_list_avro_bytes_with_spec(manifest_paths, 0)
+}
+
+fn manifest_list_avro_bytes_with_spec(manifest_paths: &[&str], partition_spec_id: i32) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -638,9 +642,18 @@ fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
               "name": "manifest_file",
               "fields": [
                 {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
                 {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
                 {"name": "sequence_number", "type": "long"},
-                {"name": "added_snapshot_id", "type": "long"}
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": "int"},
+                {"name": "existing_files_count", "type": "int"},
+                {"name": "deleted_files_count", "type": "int"},
+                {"name": "added_rows_count", "type": "long"},
+                {"name": "existing_rows_count", "type": "long"},
+                {"name": "deleted_rows_count", "type": "long"}
               ]
             }
             "#,
@@ -654,13 +667,551 @@ fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
                     "manifest_path".to_string(),
                     apache_avro::types::Value::String((*manifest_path).to_string()),
                 ),
-                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+                ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
+                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(partition_spec_id)),
+                ("content".to_string(), apache_avro::types::Value::Int(0)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
                 ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
+                ("added_files_count".to_string(), apache_avro::types::Value::Int(1)),
+                ("existing_files_count".to_string(), apache_avro::types::Value::Int(0)),
+                ("deleted_files_count".to_string(), apache_avro::types::Value::Int(0)),
+                ("added_rows_count".to_string(), apache_avro::types::Value::Long(1)),
+                ("existing_rows_count".to_string(), apache_avro::types::Value::Long(0)),
+                ("deleted_rows_count".to_string(), apache_avro::types::Value::Long(0)),
             ]))
             .expect("manifest list record should append");
     }
     writer.into_inner().expect("manifest list avro bytes should flush")
+}
+
+fn v1_manifest_list_avro_bytes(manifest_path: &str) -> Vec<u8> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+        {
+          "type": "record",
+          "name": "manifest_file",
+          "fields": [
+            {"name": "manifest_path", "type": "string"},
+            {"name": "manifest_length", "type": "long"},
+            {"name": "partition_spec_id", "type": "int"},
+            {"name": "added_snapshot_id", "type": "long"}
+          ]
+        }
+        "#,
+    )
+    .expect("v1 manifest list schema should parse");
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    writer
+        .append(apache_avro::types::Value::Record(vec![
+            ("manifest_path".to_string(), apache_avro::types::Value::String(manifest_path.to_string())),
+            ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
+            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+            ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(10)),
+        ]))
+        .expect("v1 manifest list record should append");
+    writer.into_inner().expect("v1 manifest list should flush")
+}
+
+fn v1_manifest_avro_bytes(data_file_path: &str) -> Vec<u8> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+        {
+          "type": "record",
+          "name": "manifest_entry",
+          "fields": [
+            {"name": "status", "type": "int"},
+            {"name": "snapshot_id", "type": "long"},
+            {
+              "name": "data_file",
+              "type": {
+                "type": "record",
+                "name": "data_file",
+                "fields": [
+                  {"name": "file_path", "type": "string"},
+                  {"name": "file_format", "type": "string"},
+                  {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
+                  {"name": "record_count", "type": "long"},
+                  {"name": "file_size_in_bytes", "type": "long"}
+                ]
+              }
+            }
+          ]
+        }
+        "#,
+    )
+    .expect("v1 manifest schema should parse");
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    writer
+        .append(apache_avro::types::Value::Record(vec![
+            ("status".to_string(), apache_avro::types::Value::Int(1)),
+            ("snapshot_id".to_string(), apache_avro::types::Value::Long(10)),
+            (
+                "data_file".to_string(),
+                apache_avro::types::Value::Record(vec![
+                    ("file_path".to_string(), apache_avro::types::Value::String(data_file_path.to_string())),
+                    ("file_format".to_string(), apache_avro::types::Value::String("PARQUET".to_string())),
+                    ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
+                    ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                    ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                ]),
+            ),
+        ]))
+        .expect("v1 manifest record should append");
+    writer.into_inner().expect("v1 manifest should flush")
+}
+
+fn table_metadata_json_for_validation() -> serde_json::Value {
+    serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
+        "last-sequence-number": 0,
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        }],
+        "current-schema-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "default-spec-id": 0,
+        "last-partition-id": 999,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-sort-order-id": 0,
+        "properties": {},
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": [],
+        "refs": {}
+    })
+}
+
+#[test]
+fn iceberg_metadata_validation_accepts_complete_v1_and_v2_shapes() {
+    validate_supported_table_metadata(&table_metadata_json_for_validation())
+        .expect("complete Iceberg v2 metadata should validate");
+
+    let v1 = serde_json::json!({
+        "format-version": 1,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "partition-spec": [],
+        "properties": {},
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": []
+    });
+    validate_supported_table_metadata(&v1).expect("complete Iceberg v1 metadata should validate");
+}
+
+#[test]
+fn iceberg_metadata_validation_rejects_incomplete_v2_and_dangling_references() {
+    let metadata = table_metadata_json_for_validation();
+    for field in [
+        "last-updated-ms",
+        "last-column-id",
+        "last-sequence-number",
+        "schemas",
+        "current-schema-id",
+        "partition-specs",
+        "default-spec-id",
+        "last-partition-id",
+        "sort-orders",
+        "default-sort-order-id",
+    ] {
+        let mut incomplete = metadata.clone();
+        incomplete
+            .as_object_mut()
+            .expect("metadata should be an object")
+            .remove(field);
+        validate_supported_table_metadata(&incomplete).expect_err("missing required Iceberg v2 metadata fields must be rejected");
+    }
+
+    let mut dangling = metadata;
+    dangling["snapshots"] = serde_json::json!([{"snapshot-id": 10, "schema-id": 7}]);
+    dangling["current-snapshot-id"] = serde_json::Value::from(10);
+    dangling["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
+    let error = validate_supported_table_metadata(&dangling).expect_err("dangling snapshot references must be rejected");
+    assert!(matches!(error, TableCatalogStoreError::Invalid(_)));
+}
+
+#[test]
+fn iceberg_metadata_validation_enforces_snapshot_and_ref_contracts() {
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(1);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"},
+        "schema-id": 0
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    validate_supported_table_metadata(&metadata).expect("complete snapshot and main ref should validate");
+
+    let mut missing_timestamp = metadata.clone();
+    missing_timestamp["snapshots"][0]
+        .as_object_mut()
+        .expect("snapshot should be an object")
+        .remove("timestamp-ms");
+    validate_supported_table_metadata(&missing_timestamp).expect_err("snapshot timestamp must be required");
+
+    let mut mismatched_main = metadata.clone();
+    mismatched_main["snapshots"]
+        .as_array_mut()
+        .expect("snapshots should be an array")
+        .push(serde_json::json!({
+            "snapshot-id": 11,
+            "sequence-number": 1,
+            "timestamp-ms": 2,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+            "summary": {"operation": "append"}
+        }));
+    mismatched_main["refs"]["main"]["snapshot-id"] = serde_json::Value::from(11);
+    validate_supported_table_metadata(&mismatched_main).expect_err("main ref must point to current-snapshot-id");
+
+    let mut invalid_tag = metadata;
+    invalid_tag["refs"]["release"] = serde_json::json!({
+        "type": "tag",
+        "snapshot-id": 10,
+        "min-snapshots-to-keep": 2
+    });
+    validate_supported_table_metadata(&invalid_tag).expect_err("tags must reject branch-only retention fields");
+}
+
+#[test]
+fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
+    let mut v2 = table_metadata_json_for_validation();
+    v2["last-sequence-number"] = serde_json::Value::from(1);
+    v2["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 2,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    let error = validate_supported_table_metadata(&v2).expect_err("a v2 snapshot sequence must not exceed the table sequence");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid(
+            "Iceberg v2 snapshot sequence-number must be between zero and last-sequence-number".to_string()
+        )
+    );
+
+    let mut v1 = serde_json::json!({
+        "format-version": 1,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {"type": "struct", "fields": []},
+        "partition-spec": [],
+        "snapshots": [{
+            "snapshot-id": 10,
+            "sequence-number": 1,
+            "timestamp-ms": 1,
+            "manifests": []
+        }]
+    });
+    let error = validate_supported_table_metadata(&v1).expect_err("v1 metadata must not carry a non-zero snapshot sequence");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("Iceberg v1 snapshot sequence-number must be zero when present".to_string())
+    );
+    v1["snapshots"][0]["sequence-number"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&v1).expect("a zero v1 compatibility sequence should validate");
+}
+
+#[test]
+fn iceberg_metadata_decoder_accepts_both_gzip_file_name_conventions() {
+    use std::io::Write;
+
+    let metadata = table_metadata_json_for_validation();
+    let data = serde_json::to_vec(&metadata).expect("metadata should serialize");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&data).expect("metadata should compress");
+    let compressed = encoder.finish().expect("gzip stream should finish");
+
+    for metadata_location in ["v1.gz.metadata.json", "v1.metadata.json.gz"] {
+        let decoded = decode_table_metadata_json(metadata_location, &compressed)
+            .expect("Iceberg gzip metadata naming conventions should decode");
+        assert_eq!(decoded, metadata);
+    }
+}
+
+#[test]
+fn metadata_log_locations_normalize_same_bucket_s3_uris() {
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let metadata = serde_json::json!({
+        "metadata-log": [
+            {"timestamp-ms": 1, "metadata-file": format!("s3://warehouse/{metadata_location}")},
+            {"timestamp-ms": 2, "metadata-file": format!("s3://other/{metadata_location}")}
+        ]
+    });
+
+    assert_eq!(
+        metadata_log_locations(&metadata, "warehouse", &namespace, &table),
+        BTreeSet::from([metadata_location])
+    );
+}
+
+#[test]
+fn iceberg_metadata_version_synchronization_builds_complete_v2_shape() {
+    let mut metadata = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "schema-id": 7,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "partition-spec": [],
+        "properties": {},
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": []
+    });
+
+    synchronize_table_metadata_version_fields(&mut metadata).expect("v1 fields should synchronize to v2");
+    validate_supported_table_metadata(&metadata).expect("synchronized metadata should satisfy the v2 contract");
+    assert_eq!(metadata["current-schema-id"], 7);
+    assert_eq!(metadata["default-spec-id"], 0);
+    assert_eq!(metadata["default-sort-order-id"], 0);
+    assert_eq!(metadata["last-sequence-number"], 0);
+    assert!(metadata.get("schema").is_none());
+    assert!(metadata.get("partition-spec").is_none());
+}
+
+#[test]
+fn iceberg_manifest_validation_accepts_deflate_and_rejects_unknown_content() {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+        {
+          "type": "record",
+          "name": "manifest_file",
+          "fields": [
+            {"name": "manifest_path", "type": "string"},
+            {"name": "partition_spec_id", "type": "int"}
+          ]
+        }
+        "#,
+    )
+    .expect("manifest list schema should parse");
+    let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), apache_avro::Codec::Deflate(Default::default()));
+    writer
+        .append(apache_avro::types::Value::Record(vec![
+            (
+                "manifest_path".to_string(),
+                apache_avro::types::Value::String("s3://warehouse/tables/table-id/metadata/manifest.avro".to_string()),
+            ),
+            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+        ]))
+        .expect("compressed manifest list record should append");
+    let compressed = writer.into_inner().expect("compressed manifest list should flush");
+    let references = manifest_list_references_from_manifest_list_avro(&compressed)
+        .expect("deflate-compressed manifest lists should be supported with bounded decoding");
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].manifest_path, "s3://warehouse/tables/table-id/metadata/manifest.avro");
+
+    let unknown_content = manifest_avro_bytes_with_status(&[("s3://warehouse/tables/table-id/data/part.parquet", 3, 1)]);
+    let error = data_file_references_from_manifest_avro(&unknown_content)
+        .expect_err("unknown Iceberg manifest content values must be rejected");
+    assert!(matches!(error, TableCatalogStoreError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = TableEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: "warehouse".to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id: "table-id".to_string(),
+        table_uuid: "table-uuid".to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+        metadata_location: "tables/table-id/metadata/v1.metadata.json".to_string(),
+        version_token: "token-v1".to_string(),
+        generation: 1,
+        state: TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    };
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
+    let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-10.avro";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-10.avro",
+            manifest_list_avro_bytes_with_spec(&[manifest_location], 7),
+        )
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    let error = validate_table_snapshot_graph(&context, &metadata)
+        .await
+        .expect_err("manifest partition specs absent from table metadata must be rejected");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("snapshot manifest references missing partition spec 7".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_allows_missing_deleted_files() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
+    let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-10.avro";
+    let deleted_data_location = "s3://warehouse/tables/table-id/data/deleted.parquet";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-10.avro",
+            manifest_list_avro_bytes(&[manifest_location]),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/manifest-10.avro",
+            manifest_avro_bytes_with_status(&[(deleted_data_location, 0, 2)]),
+        )
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "delete"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_graph(&context, &metadata)
+        .await
+        .expect("deleted manifest entries may reference files that have already been removed");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_accepts_empty_manifest_lists() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-empty.avro";
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-empty.avro", manifest_list_avro_bytes(&[]))
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_graph(&context, &metadata)
+        .await
+        .expect("an empty Iceberg snapshot may have an empty manifest list");
+}
+
+#[tokio::test]
+async fn iceberg_v2_snapshot_graph_accepts_reused_v1_manifests() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-v1.avro";
+    let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-v1.avro";
+    let data_location = "s3://warehouse/tables/table-id/data/v1.parquet";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-v1.avro",
+            v1_manifest_list_avro_bytes(manifest_location),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/manifest-v1.avro",
+            v1_manifest_avro_bytes(data_location),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/v1.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_graph(&context, &metadata)
+        .await
+        .expect("v2 tables may retain v1 manifest lists and manifests after upgrade");
+}
+
+#[tokio::test]
+async fn catalog_object_limited_reads_reject_oversized_results() {
+    let backend = TestCatalogObjectBackend::default();
+    backend.seed_object("warehouse", "metadata.json", vec![0; 5]).await;
+
+    let error = backend
+        .read_object_limited("warehouse", "metadata.json", 4)
+        .await
+        .expect_err("bounded catalog reads must reject oversized objects");
+    assert!(matches!(error, TableCatalogStoreError::Invalid(_)));
 }
 
 fn manifest_avro_bytes(files: &[(&str, i32)]) -> Vec<u8> {
@@ -8436,6 +8987,8 @@ fn table_metadata_file_path_stays_under_metadata_boundary() {
 #[test]
 fn table_metadata_file_name_validation_rejects_unsafe_names() {
     assert!(is_valid_table_metadata_file_name("00001.metadata.json"));
+    assert!(is_valid_table_metadata_file_name("00001.gz.metadata.json"));
+    assert!(is_valid_table_metadata_file_name("00001.metadata.json.gz"));
     assert!(is_valid_table_metadata_file_name("v1-4f2c_metadata.json"));
 
     assert!(!is_valid_table_metadata_file_name(""));

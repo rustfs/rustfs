@@ -97,36 +97,20 @@ where
     .await?;
 
     for metadata_location in retained_metadata_locations {
-        let Some(metadata_object) = backend.read_object(table_bucket, metadata_location).await? else {
-            insert_referenced_object_report(
-                &mut reports,
-                metadata_location.clone(),
-                TableMetadataMaintenanceObjectKind::MetadataFile,
-                TableMetadataMaintenanceObjectState::ManualReviewRequired,
-                TableMetadataMaintenanceReason::UnreadableMetadata,
-            );
-            continue;
+        let metadata = match read_table_metadata_value(backend, table_bucket, metadata_location).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) | Err(TableCatalogStoreError::Invalid(_)) => {
+                insert_referenced_object_report(
+                    &mut reports,
+                    metadata_location.clone(),
+                    TableMetadataMaintenanceObjectKind::MetadataFile,
+                    TableMetadataMaintenanceObjectState::ManualReviewRequired,
+                    TableMetadataMaintenanceReason::UnreadableMetadata,
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
         };
-        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_object.data) else {
-            insert_referenced_object_report(
-                &mut reports,
-                metadata_location.clone(),
-                TableMetadataMaintenanceObjectKind::MetadataFile,
-                TableMetadataMaintenanceObjectState::ManualReviewRequired,
-                TableMetadataMaintenanceReason::UnreadableMetadata,
-            );
-            continue;
-        };
-        if !metadata.is_object() {
-            insert_referenced_object_report(
-                &mut reports,
-                metadata_location.clone(),
-                TableMetadataMaintenanceObjectKind::MetadataFile,
-                TableMetadataMaintenanceObjectState::ManualReviewRequired,
-                TableMetadataMaintenanceReason::UnreadableMetadata,
-            );
-            continue;
-        }
         metadata_maintenance_referenced_object_reports_for_metadata(
             backend,
             table_bucket,
@@ -253,21 +237,36 @@ where
         TableMetadataMaintenanceReason::ManifestList,
     );
 
-    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
-        mark_referenced_object_manual_review(
-            reports,
-            &manifest_list_key,
-            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
-        );
-        return Ok(());
+    let manifest_list_object = match backend
+        .read_object_limited(table_bucket, &manifest_list_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+        .await
+    {
+        Ok(Some(manifest_list_object)) => manifest_list_object,
+        Ok(None) | Err(TableCatalogStoreError::Invalid(_)) => {
+            mark_referenced_object_manual_review(
+                reports,
+                &manifest_list_key,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
     };
-    let Ok(manifest_paths) = manifest_paths_from_manifest_list_avro(&manifest_list_object.data) else {
-        mark_referenced_object_manual_review(
-            reports,
-            &manifest_list_key,
-            TableMetadataMaintenanceReason::UnsupportedManifestAvro,
-        );
-        return Ok(());
+    let manifest_paths = match decode_manifest_list_avro_async(manifest_list_object.data).await {
+        Ok(decoded) => decoded
+            .references
+            .into_iter()
+            .map(|reference| reference.manifest_path)
+            .collect::<Vec<_>>(),
+        Err(TableCatalogStoreError::Invalid(_)) => {
+            mark_referenced_object_manual_review(
+                reports,
+                &manifest_list_key,
+                TableMetadataMaintenanceReason::UnsupportedManifestAvro,
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
     };
     for manifest_location in manifest_paths {
         metadata_maintenance_referenced_manifest_file(
@@ -327,13 +326,28 @@ where
         TableMetadataMaintenanceReason::ManifestFile,
     );
 
-    let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
-        mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
-        return Ok(());
+    let manifest_object = match backend
+        .read_object_limited(table_bucket, &manifest_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+        .await
+    {
+        Ok(Some(manifest_object)) => manifest_object,
+        Ok(None) | Err(TableCatalogStoreError::Invalid(_)) => {
+            mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
+            return Ok(());
+        }
+        Err(err) => return Err(err),
     };
-    let Ok(file_references) = file_references_from_manifest_avro(&manifest_object.data) else {
-        mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
-        return Ok(());
+    let file_references = match decode_manifest_avro_async(manifest_object.data).await {
+        Ok(decoded) => decoded
+            .references
+            .into_iter()
+            .map(|reference| (reference.location, reference.object_kind))
+            .collect::<Vec<_>>(),
+        Err(TableCatalogStoreError::Invalid(_)) => {
+            mark_referenced_object_manual_review(reports, &manifest_key, TableMetadataMaintenanceReason::UnsupportedManifestAvro);
+            return Ok(());
+        }
+        Err(err) => return Err(err),
     };
     for (file_location, object_kind) in file_references {
         let Some(file_key) = table_catalog_object_key_from_location(table_bucket, &file_location) else {

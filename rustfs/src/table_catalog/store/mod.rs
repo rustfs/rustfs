@@ -269,8 +269,38 @@ pub(crate) enum TableCatalogPutPrecondition {
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 
+    async fn read_object_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let result = self.read_object(bucket, object).await?;
+        if result.as_ref().is_some_and(|object| object.data.len() > max_size) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+            )));
+        }
+        Ok(result)
+    }
+
     async fn read_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object(bucket, object).await
+    }
+
+    async fn read_object_unlocked_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let result = self.read_object_unlocked(bucket, object).await?;
+        if result.as_ref().is_some_and(|object| object.data.len() > max_size) {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+            )));
+        }
+        Ok(result)
     }
 
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
@@ -1115,7 +1145,18 @@ where
     S: TableCatalogStorage,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
-        self.read_object_with_options(bucket, object, ObjectOptions::default()).await
+        self.read_object_with_options(bucket, object, ObjectOptions::default(), None)
+            .await
+    }
+
+    async fn read_object_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.read_object_with_options(bucket, object, ObjectOptions::default(), Some(max_size))
+            .await
     }
 
     async fn read_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
@@ -1126,6 +1167,25 @@ where
                 no_lock: true,
                 ..Default::default()
             },
+            None,
+        )
+        .await
+    }
+
+    async fn read_object_unlocked_limited(
+        &self,
+        bucket: &str,
+        object: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.read_object_with_options(
+            bucket,
+            object,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+            Some(max_size),
         )
         .await
     }
@@ -1286,12 +1346,22 @@ where
         bucket: &str,
         object: &str,
         opts: ObjectOptions,
+        max_size: Option<usize>,
     ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         let info = match self.store.get_object_info(bucket, object, &opts).await {
             Ok(info) => info,
             Err(err) if is_missing_storage_error(&err) => return Ok(None),
             Err(err) => return Err(storage_error_to_catalog("read catalog object info", err)),
         };
+        if let Some(max_size) = max_size {
+            let object_size = usize::try_from(info.size)
+                .map_err(|_| TableCatalogStoreError::Invalid(format!("catalog object {bucket}/{object} has an invalid size")))?;
+            if object_size > max_size {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+                )));
+            }
+        }
         let mut reader = match self
             .store
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
@@ -1302,11 +1372,21 @@ where
             Err(err) => return Err(storage_error_to_catalog("read catalog object", err)),
         };
         let mut data = Vec::new();
-        reader
-            .stream
-            .read_to_end(&mut data)
-            .await
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}")))?;
+        if let Some(max_size) = max_size {
+            let read_limit = u64::try_from(max_size.saturating_add(1)).unwrap_or(u64::MAX);
+            reader.stream.take(read_limit).read_to_end(&mut data).await.map_err(|err| {
+                TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}"))
+            })?;
+            if data.len() > max_size {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+                )));
+            }
+        } else {
+            reader.stream.read_to_end(&mut data).await.map_err(|err| {
+                TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}"))
+            })?;
+        }
         Ok(Some(TableCatalogObject {
             data,
             etag: info.etag,
