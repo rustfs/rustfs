@@ -21,6 +21,7 @@ use crate::admin::{
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -1148,21 +1149,21 @@ async fn read_bounded_json_body<T: DeserializeOwned>(
     if let Some(content_length) = headers.get(http::header::CONTENT_LENGTH) {
         let content_length = content_length
             .to_str()
-            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be valid ASCII"))?
+            .map_err(|_| S3Error::from(ApiError::invalid_request("Content-Length must be valid ASCII")))?
             .parse::<usize>()
-            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be a non-negative integer"))?;
+            .map_err(|_| S3Error::from(ApiError::invalid_request("Content-Length must be a non-negative integer")))?;
         if content_length > max_size {
-            return Err(s3_error!(InvalidRequest, "{operation} request body is too large"));
+            return Err(S3Error::from(ApiError::invalid_request(format!("{operation} request body is too large"))));
         }
     }
     let body = tokio::time::timeout(timeout, input.store_all_limited(max_size))
         .await
-        .map_err(|_| s3_error!(InvalidRequest, "timed out reading {operation} request body"))?
-        .map_err(|err| s3_error!(InvalidRequest, "failed to read request body: {}", err))?;
+        .map_err(|_| S3Error::from(ApiError::invalid_request(format!("timed out reading {operation} request body"))))?
+        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}"))))?;
     if body.is_empty() {
-        return Err(s3_error!(InvalidRequest, "request body is required"));
+        return Err(S3Error::from(ApiError::invalid_request("request body is required")));
     }
-    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+    serde_json::from_slice(&body).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 async fn read_json_body_or_default<T>(mut input: Body) -> S3Result<T>
