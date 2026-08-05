@@ -2101,15 +2101,17 @@ fn open_windows_relative(
 #[cfg(windows)]
 fn create_windows_superseding_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_SUPERSEDE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    create_windows_owned_file(parent, component, FILE_SUPERSEDE)
+    create_windows_owned_file(parent, component, FILE_SUPERSEDE, FILE_SHARE_READ)
 }
 
 #[cfg(windows)]
 fn create_windows_new_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
 
-    create_windows_owned_file(parent, component, FILE_CREATE)
+    create_windows_owned_file(parent, component, FILE_CREATE, FILE_SHARE_READ | FILE_SHARE_DELETE)
 }
 
 #[cfg(windows)]
@@ -2117,12 +2119,13 @@ fn create_windows_owned_file(
     parent: &winapi_util::Handle,
     component: &std::ffi::OsStr,
     create_disposition: u32,
+    share_access: u32,
 ) -> io::Result<winapi_util::Handle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
         Win32::Storage::FileSystem::{
             DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_WRITE_DATA, SYNCHRONIZE,
+            FILE_WRITE_DATA, SYNCHRONIZE,
         },
     };
 
@@ -2132,7 +2135,7 @@ fn create_windows_owned_file(
         parent,
         component,
         DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
-        FILE_SHARE_READ,
+        share_access,
         create_disposition,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         FILE_ATTRIBUTE_NORMAL,
