@@ -783,10 +783,10 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
 
-    pub(crate) async fn load_data_usage_from_backend_cached(
+    pub(crate) async fn load_admin_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend_cached(store).await
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
     }
 }
 
