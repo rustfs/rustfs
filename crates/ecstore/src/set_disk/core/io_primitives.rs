@@ -49,7 +49,7 @@ use crate::diagnostics::get::{
 use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::disk::{
     DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
-    PartTransactionAction, part_transaction_path,
+    PartTransactionAction, STORAGE_FORMAT_FILE_BACKUP, part_transaction_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
@@ -2950,63 +2950,63 @@ impl SetDisks {
             return Err(ret_err);
         }
 
-        // A synthetic inline-rollback dir (rollback_data_dir set, cleanup_data_dir
-        // unset) holds only the xl.meta.bkp consumed by the quorum-failure undo
-        // above. Once the commit holds quorum that window is closed, and the
-        // commit_rename_data_dir pass reclaims real old data dirs only, so the
-        // synthetic dir must be reclaimed here — otherwise every overwrite of an
-        // inline version by a non-inline one leaves <object>/<rollback-dir>/
-        // behind, and DeleteBucket keeps failing with BucketNotEmpty after the
-        // object is deleted. Best-effort: residue must not fail the durable write.
-        let rollback_only_futures: Vec<_> = disks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, disk)| {
-                let disk = disk.clone()?;
-                if errs[idx].is_some() || cleanup_data_dirs[idx].is_some() {
-                    return None;
-                }
-                let rollback_dir = data_dirs[idx]?;
-                // Anti-misdelete guard, same posture as commit_rename_data_dir:
-                // never touch the data dir the commit just published.
-                if file_infos[idx].data_dir == Some(rollback_dir) {
-                    return None;
-                }
-                let dst_bucket = dst_bucket.clone();
-                let path = format!("{dst_object}/{rollback_dir}");
-                Some(tokio::spawn(async move {
-                    disk.delete_data_dir(
-                        &dst_bucket,
-                        &path,
-                        DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                }))
-            })
-            .collect();
-        for result in join_all(rollback_only_futures).await {
+        // The write is authoritatively committed, so the per-disk rollback
+        // backup (`object/<rollback_dir>/xl.meta.bkp`) is dead weight now.
+        // When the rollback dir doubles as the real dereferenced data dir it
+        // is reclaimed wholesale by `commit_rename_data_dir`; a rollback dir
+        // reported separately (an overwrite of an inline version, whose dir is
+        // synthetic) is excluded from that recursive reclamation for safety
+        // (#5703) and must be reclaimed here instead — otherwise every inline
+        // overwrite strands a backup file that keeps the object dir non-empty
+        // and makes a later DeleteBucket fail with BucketNotEmpty forever.
+        // Delete exactly the backup file, never the directory tree: the
+        // synthetic UUID is a fixed, publicly-known constant for unversioned
+        // objects, so `object/<rollback_dir>` can simultaneously be a
+        // legitimate child key's directory — recursively deleting it would
+        // reopen the authorization bypass #5703 closed. The non-recursive
+        // delete removes the directory only when the backup was its sole
+        // content. Best-effort space reclamation — like
+        // `commit_rename_data_dir`, this must never negate the already-durable
+        // ACK.
+        let mut backup_reclaims = Vec::new();
+        for (idx, disk) in disks.iter().enumerate() {
+            if errs[idx].is_some() {
+                continue;
+            }
+            let Some(rollback_dir) = data_dirs[idx] else {
+                continue;
+            };
+            if cleanup_data_dirs[idx] == Some(rollback_dir) {
+                continue;
+            }
+            let Some(disk) = disk.clone() else {
+                continue;
+            };
+            let dst_bucket = dst_bucket.clone();
+            let dst_object = dst_object.clone();
+            backup_reclaims.push(tokio::spawn(async move {
+                let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
+                disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+            }));
+        }
+        for result in join_all(backup_reclaims).await {
             match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) if err == DiskError::FileNotFound || err == DiskError::VolumeNotFound => {}
+                Ok(Ok(())) => {}
+                Ok(Err(DiskError::FileNotFound | DiskError::VolumeNotFound)) => {}
                 Ok(Err(err)) => {
                     warn!(
-                        target: "rustfs_ecstore::set_disk",
                         dst_bucket = %dst_bucket,
                         dst_object = %dst_object,
                         error = %err,
-                        "failed to reclaim synthetic inline-rollback dir after commit"
+                        "rollback backup reclamation failed after committed rename"
                     );
                 }
-                Err(err) => {
+                Err(join_err) => {
                     warn!(
-                        target: "rustfs_ecstore::set_disk",
                         dst_bucket = %dst_bucket,
                         dst_object = %dst_object,
-                        error = %err,
-                        "synthetic inline-rollback reclaim task failed"
+                        error = %join_err,
+                        "rollback backup reclamation task failed after committed rename"
                     );
                 }
             }
