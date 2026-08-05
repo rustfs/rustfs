@@ -1618,7 +1618,6 @@ mod tests {
             ("credentials.expiration", serde_json::json!("2026-01-01T00:00:00Z")),
             ("api", serde_json::json!("s3v2")),
             ("disableProxy", serde_json::json!(true)),
-            ("healthCheckDuration", serde_json::json!(5)),
             ("edge", serde_json::json!(true)),
             ("edgeSyncBeforeExpiry", serde_json::json!(true)),
         ] {
@@ -1677,6 +1676,43 @@ mod tests {
         assert!(message.contains("credentials.session_token"));
         assert!(!message.contains("session-token-must-not-leak"));
         assert!(!message.contains("secret"));
+    }
+
+    #[test]
+    fn remote_target_request_accepts_go_duration_wire_values() {
+        // `mc replicate add` defaults `--healthcheck-seconds` to 60; madmin
+        // serializes Go `time.Duration` fields as nanosecond integers.
+        let mut request = valid_remote_target_request();
+        request["healthCheckDuration"] = serde_json::json!(60_000_000_000u64);
+        request["totalDowntime"] = serde_json::json!(90_000_000_000u64);
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("madmin-shaped request should deserialize")
+            .into_bucket_target()
+            .expect("mc default healthCheckDuration must be accepted");
+
+        assert_eq!(target.health_check_duration, std::time::Duration::from_secs(60));
+        assert_eq!(target.total_downtime, std::time::Duration::from_secs(90));
+    }
+
+    #[test]
+    fn remote_target_request_accepts_legacy_seconds_health_check() {
+        // Older RustFS clients sent these duration fields as plain seconds.
+        let mut request = valid_remote_target_request();
+        request["healthCheckDuration"] = serde_json::json!(60);
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect("legacy seconds healthCheckDuration must be accepted");
+
+        assert_eq!(target.health_check_duration, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn remote_target_health_check_duration_is_declared_writable() {
+        assert!(REMOTE_TARGET_WRITABLE_FIELDS.contains(&"healthCheckDuration"));
+        assert!(!REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(&"healthCheckDuration"));
     }
 
     #[test]

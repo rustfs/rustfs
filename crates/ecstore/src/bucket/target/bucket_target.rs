@@ -490,6 +490,29 @@ mod tests {
     }
 
     #[test]
+    fn bucket_target_reads_go_nanosecond_durations_defensively() {
+        // MinIO-written bucket-targets metadata and madmin clients encode
+        // these fields as Go `time.Duration` nanoseconds; RustFS has always
+        // persisted seconds. Both encodings must decode to the same interval.
+        let target: BucketTarget = serde_json::from_value(serde_json::json!({
+            "endpoint": "localhost:9000",
+            "targetbucket": "target",
+            "type": "replication",
+            "healthCheckDuration": 60_000_000_000u64,
+            "totalDowntime": 90_000_000_000u64
+        }))
+        .expect("nanosecond durations should deserialize");
+
+        assert_eq!(target.health_check_duration, Duration::from_secs(60));
+        assert_eq!(target.total_downtime, Duration::from_secs(90));
+
+        // The persisted wire format stays seconds for existing RustFS readers.
+        let value = serde_json::to_value(&target).expect("target should serialize");
+        assert_eq!(value["healthCheckDuration"], 60);
+        assert_eq!(value["totalDowntime"], 90);
+    }
+
+    #[test]
     fn test_bucket_target_debug_redacts_credentials() {
         let target = BucketTarget {
             credentials: Some(Credentials {
