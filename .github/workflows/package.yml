@@ -1,0 +1,463 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Package Workflow - Build DEB/RPM packages
+#
+# This workflow builds DEB and RPM packages from pre-built Linux binaries
+# and uploads them to Cloudflare R2.
+#
+# Trigger:
+# - release published: automatically package when a GitHub release is published
+# - workflow_dispatch: manual trigger with optional tag/run_id
+#
+# Flow:
+# 1. Find the Build workflow run for the release tag
+# 2. Download Linux binaries (x86_64-gnu, aarch64-gnu) from build artifacts
+# 3. Build DEB packages for amd64 and arm64
+# 4. Build RPM packages for x86_64 and aarch64
+# 5. Upload all packages to Cloudflare R2
+
+name: Package DEB/RPM
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (e.g. 1.0.0-beta.12). Leave empty for latest main build."
+        required: false
+        type: string
+      build_run_id:
+        description: "Build workflow run ID (overrides tag lookup)"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.event.inputs.tag || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Resolve which build run to use and extract version info
+  resolve:
+    name: Resolve Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build_type: ${{ steps.resolve.outputs.build_type }}
+      build_run_id: ${{ steps.resolve.outputs.build_run_id }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve build run
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+
+          # Determine tag
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=""
+          fi
+
+          echo "Tag: ${TAG:-<none>}"
+
+          # Determine build run ID
+          BUILD_RUN_ID=""
+
+          if [[ -n "$INPUT_RUN_ID" ]]; then
+            # Explicit run ID takes priority
+            BUILD_RUN_ID="$INPUT_RUN_ID"
+            echo "Using explicit build run ID: $BUILD_RUN_ID"
+
+          elif [[ -n "$TAG" ]]; then
+            # Find the build run that produced this tag
+            echo "Looking for build run for tag: $TAG"
+            BUILD_RUN_ID=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=${TAG}&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+
+            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
+              # Tag might not be a branch; try event=push with head_branch matching
+              BUILD_RUN_ID=$(gh api \
+                "repos/${{ github.repository }}/actions/workflows/build.yml/runs?event=push&status=success&per_page=100" \
+                --jq ".workflow_runs[] | select(.head_branch == \"$TAG\") | .id" 2>/dev/null | head -1 || echo "")
+            fi
+
+            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
+              echo "❌ No successful build run found for tag: $TAG"
+              exit 1
+            fi
+            echo "Found build run: $BUILD_RUN_ID"
+
+          else
+            # No tag — latest successful main build
+            echo "No tag specified, looking for latest main build"
+            BUILD_RUN_ID=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=main&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+
+            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
+              echo "❌ No successful main build found"
+              exit 1
+            fi
+            echo "Latest main build: $BUILD_RUN_ID"
+          fi
+
+          # Determine version and build type
+          if [[ -n "$TAG" ]]; then
+            VERSION="$TAG"
+            if [[ "$TAG" == *"-preview"* ]]; then
+              BUILD_TYPE="preview"
+            elif [[ "$TAG" == *"alpha"* || "$TAG" == *"beta"* || "$TAG" == *"rc"* ]]; then
+              BUILD_TYPE="prerelease"
+            else
+              BUILD_TYPE="release"
+            fi
+          else
+            SHORT_SHA=$(gh api "repos/${{ github.repository }}/actions/runs/${BUILD_RUN_ID}" \
+              --jq '.head_sha' 2>/dev/null | head -c 7)
+            VERSION="dev-${SHORT_SHA}"
+            BUILD_TYPE="development"
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "build_type=$BUILD_TYPE"
+            echo "build_run_id=$BUILD_RUN_ID"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "📊 Resolved:"
+          echo "  Version: $VERSION"
+          echo "  Build type: $BUILD_TYPE"
+          echo "  Build run ID: $BUILD_RUN_ID"
+
+  # Build DEB and RPM packages for each architecture
+  package:
+    name: Package (${{ matrix.arch }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+            artifact_name: "rustfs-linux-x86_64-gnu"
+          - arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+            artifact_name: "rustfs-linux-aarch64-gnu"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download binary artifact from build run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: ${{ matrix.artifact_name }}*
+          path: ./binary-artifact
+          run-id: ${{ needs.resolve.outputs.build_run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+
+      - name: Extract binary
+        id: binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find ./binary-artifact -name "*.zip" -type f | head -1)
+          if [[ -z "$ZIP_FILE" ]]; then
+            echo "❌ No binary artifact found"
+            ls -la ./binary-artifact/ || true
+            exit 1
+          fi
+
+          echo "Found artifact: $ZIP_FILE"
+
+          mkdir -p ./bin
+          unzip -o "$ZIP_FILE" -d ./bin
+
+          if [[ ! -f ./bin/rustfs ]]; then
+            echo "❌ rustfs binary not found in archive"
+            exit 1
+          fi
+
+          chmod +x ./bin/rustfs
+          ls -lh ./bin/rustfs
+          echo "✅ Binary extracted"
+
+      - name: Build DEB package
+        id: deb
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.resolve.outputs.version }}"
+          DEB_ARCH="${{ matrix.deb_arch }}"
+          # DEB version: replace - with ~ (1.0.0-beta.12 -> 1.0.0~beta.12)
+          DEB_VERSION="${VERSION/-/~}"
+          PKG_DIR="rustfs_${DEB_VERSION}_${DEB_ARCH}"
+
+          echo "Building DEB: ${PKG_DIR}.deb"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/etc/default"
+          mkdir -p "${PKG_DIR}/lib/systemd/system"
+          mkdir -p "${PKG_DIR}/usr/share/doc/rustfs"
+
+          cp ./bin/rustfs "${PKG_DIR}/usr/bin/"
+          chmod 755 "${PKG_DIR}/usr/bin/rustfs"
+
+          cp deploy/build/rustfs.service "${PKG_DIR}/lib/systemd/system/"
+
+          cat > "${PKG_DIR}/etc/default/rustfs" << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
+          cat > "${PKG_DIR}/DEBIAN/control" << EOF
+          Package: rustfs
+          Version: ${DEB_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${DEB_ARCH}
+          Depends: libc6 (>= 2.31)
+          Maintainer: RustFS Team <support@rustfs.com>
+          Description: High-performance distributed object storage
+           RustFS is a high-performance distributed object storage software
+           built using Rust. It is compatible with MinIO and S3 API.
+          Homepage: https://rustfs.com
+          EOF
+
+          cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
+          #!/bin/bash
+          set -e
+          if ! getent passwd rustfs > /dev/null 2>&1; then
+              useradd -r -s /bin/false -d /opt/rustfs rustfs
+          fi
+          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
+          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          echo "RustFS installed. Configure /etc/default/rustfs then: systemctl start rustfs"
+          POSTINST
+          chmod 755 "${PKG_DIR}/DEBIAN/postinst"
+
+          cat > "${PKG_DIR}/DEBIAN/prerm" << 'PRERM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
+              systemctl stop rustfs
+          fi
+          PRERM
+          chmod 755 "${PKG_DIR}/DEBIAN/prerm"
+
+          cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTRM
+          chmod 755 "${PKG_DIR}/DEBIAN/postrm"
+
+          cp LICENSE "${PKG_DIR}/usr/share/doc/rustfs/"
+          cp README.md "${PKG_DIR}/usr/share/doc/rustfs/"
+
+          fakeroot dpkg-deb --build "${PKG_DIR}"
+
+          DEB_FILE="${PKG_DIR}.deb"
+          ls -lh "$DEB_FILE"
+          echo "deb_file=$DEB_FILE" >> "$GITHUB_OUTPUT"
+          echo "✅ DEB built: $DEB_FILE"
+
+      - name: Build RPM package
+        id: rpm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.resolve.outputs.version }}"
+          RPM_ARCH="${{ matrix.rpm_arch }}"
+
+          echo "Building RPM for ${RPM_ARCH}"
+
+          sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential
+          sudo gem install fpm
+
+          fpm -s dir -t rpm \
+            --name rustfs \
+            --version "$VERSION" \
+            --architecture "$RPM_ARCH" \
+            --depends "glibc >= 2.31" \
+            --maintainer "RustFS Team <support@rustfs.com>" \
+            --description "High-performance distributed object storage" \
+            --url "https://rustfs.com" \
+            --license "Apache-2.0" \
+            --after-install <(cat <<'POSTINST'
+          #!/bin/bash
+          set -e
+          if ! getent passwd rustfs > /dev/null 2>&1; then
+              useradd -r -s /bin/false -d /opt/rustfs rustfs
+          fi
+          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
+          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTINST
+            ) \
+            --before-remove <(cat <<'PRERM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
+              systemctl stop rustfs
+          fi
+          PRERM
+            ) \
+            --after-remove <(cat <<'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTRM
+            ) \
+            --config-files /etc/default/rustfs \
+            ./bin/rustfs=/usr/bin/rustfs \
+            deploy/build/rustfs.service=/lib/systemd/system/rustfs.service \
+            LICENSE=/usr/share/doc/rustfs/LICENSE \
+            README.md=/usr/share/doc/rustfs/README.md
+
+          RPM_FILE=$(ls -1 rustfs-*.rpm 2>/dev/null | head -1)
+          if [[ -z "$RPM_FILE" ]]; then
+            echo "❌ RPM build failed"
+            exit 1
+          fi
+
+          ls -lh "$RPM_FILE"
+          echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
+          echo "✅ RPM built: $RPM_FILE"
+
+      - name: Upload packages to artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: packages-${{ matrix.arch }}
+          path: |
+            *.deb
+            *.rpm
+          retention-days: 30
+
+      - name: Upload packages to Cloudflare R2
+        if: env.R2_ACCESS_KEY_ID != ''
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_EC2_METADATA_DISABLED: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials missing, skipping upload"
+            exit 0
+          fi
+
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y awscli
+          fi
+
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
+
+          BUILD_TYPE="${{ needs.resolve.outputs.build_type }}"
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            R2_PREFIX="artifacts/rustfs/packages/dev"
+          else
+            R2_PREFIX="artifacts/rustfs/packages/release"
+          fi
+          R2_PATH="s3://${R2_BUCKET}/${R2_PREFIX}/"
+
+          echo "📤 Uploading to $R2_PATH"
+
+          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
+          RPM_FILE="${{ steps.rpm.outputs.rpm_file }}"
+
+          for f in "$DEB_FILE" "$RPM_FILE"; do
+            if [[ -n "$f" && -f "$f" ]]; then
+              echo "Uploading: $f"
+              aws s3 cp "$f" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            fi
+          done
+
+          echo "✅ Upload complete"
+
+          # Also upload as latest for release/prerelease
+          if [[ "$BUILD_TYPE" == "release" || "$BUILD_TYPE" == "prerelease" ]]; then
+            LATEST_PATH="s3://${R2_BUCKET}/artifacts/rustfs/packages/latest/"
+            for f in "$DEB_FILE" "$RPM_FILE"; do
+              if [[ -n "$f" && -f "$f" ]]; then
+                echo "Uploading latest: $(basename "$f")"
+                aws s3 cp "$f" "$LATEST_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+              fi
+            done
+            echo "✅ Latest packages updated"
+          fi
+
+  # Summary
+  summary:
+    name: Summary
+    needs: [ resolve, package ]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print summary
+        shell: bash
+        run: |
+          echo "## 📦 Package Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${{ needs.resolve.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build Type | ${{ needs.resolve.outputs.build_type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build Run | #${{ needs.resolve.outputs.build_run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Package Status | ${{ needs.package.result }} |" >> "$GITHUB_STEP_SUMMARY"
