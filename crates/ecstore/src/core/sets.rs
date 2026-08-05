@@ -1093,7 +1093,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
         Ok(result)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     async fn heal_object(
         &self,
         bucket: &str,

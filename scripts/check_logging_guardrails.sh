@@ -690,6 +690,102 @@ if [[ -n "$unmasked_revoke_fields" ]]; then
   exit 1
 fi
 
+heal_hotpath_files=(
+  "crates/ecstore/src/store/heal.rs"
+  "crates/ecstore/src/store/mod.rs"
+  "crates/ecstore/src/core/sets.rs"
+  "crates/ecstore/src/set_disk/ops/heal.rs"
+)
+
+heal_function_pattern='async fn (handle_)?heal_object(_dir)?\('
+trace_heal_instrumentation_pattern='#\[(tracing::)?instrument\(\s*level\s*=\s*"trace"[^]]*\)\]\s*(pub(\([^)]*\))?\s+)?async fn (handle_)?heal_object(_dir)?\('
+heal_function_count="$(rg -n "$heal_function_pattern" "${heal_hotpath_files[@]}" | wc -l | tr -d ' ')"
+trace_heal_instrumentation_count="$(
+  rg -U -o "$trace_heal_instrumentation_pattern" "${heal_hotpath_files[@]}" |
+    rg -c 'async fn (handle_)?heal_object' || true
+)"
+if [[ "$heal_function_count" != "$trace_heal_instrumentation_count" ]]; then
+  echo "❌ logging guardrail violation: per-object heal instrumentation must be TRACE-only" >&2
+  echo "found $heal_function_count per-object heal functions but $trace_heal_instrumentation_count TRACE spans" >&2
+  exit 1
+fi
+
+unexpected_heal_info="$(
+  rg -n '\binfo!' crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/erasure/coding/heal.rs |
+    rg -v 'set disk formats success, NoHealRequired' || true
+)"
+if [[ -n "$unexpected_heal_info" ]]; then
+  echo "❌ logging guardrail violation: per-object set-disk heal events must not be emitted at INFO" >&2
+  echo "$unexpected_heal_info" >&2
+  exit 1
+fi
+
+heal_info_event_pattern='info!\([^;]*(EVENT_HEAL_OBJECT_STARTED|state\s*=\s*"(metadata_corrupt|metadata_invalid|erasure_distribution_mismatch)"|disks_with_all_partsv2: metadata is corrupted|disks_with_all_partsv2: metadata is not valid|disks_with_all_partsv2: erasure distribution is not the same as onlineDisks)[^;]*\);'
+if rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: per-object heal diagnostics must not be emitted at INFO" >&2
+  rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+raw_heal_metadata_pattern='(\?(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\s*=\s*\?|(?:latest_meta|meta)\s*:\s*\{:#?\?\}|\{(parts_metadata|online_disks|out_dated_disks|latest_meta|meta):#?\?\}|\{:#?\?\}[^;]*(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|unexpected file distribution \(\{:#?\?\}\))'
+if rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal logs must not dump raw object or disk metadata" >&2
+  rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+# Keep the matchers honest. These unsafe equivalents previously bypassed the
+# guard when attributes/macros were multiline, long, or used structured Debug.
+for fixture in \
+  $'#[tracing::instrument(\n    level = "info",\n    skip(self),\n)]\nasync fn heal_object(' \
+  $'#[instrument(skip(self), fields(level = "trace"))]\nasync fn heal_object('; do
+  fixture_function_count="$(printf '%s\n' "$fixture" | rg -c "$heal_function_pattern" || true)"
+  fixture_trace_count="$(
+    printf '%s\n' "$fixture" |
+      rg -U -o "$trace_heal_instrumentation_pattern" |
+      rg -c 'async fn (handle_)?heal_object' || true
+  )"
+  if [[ "$fixture_function_count" == "$fixture_trace_count" ]]; then
+    echo "❌ logging guardrail self-test failed: unsafe heal span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+printf -v heal_info_padding '%*s' 600 ''
+long_info_event_fixture="info!(${heal_info_padding} event = EVENT_HEAL_OBJECT_STARTED);"
+if ! printf '%s\n' "$long_info_event_fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+  echo "❌ logging guardrail self-test failed: long per-object INFO event was not detected" >&2
+  exit 1
+fi
+
+for fixture in \
+  'info!("disks_with_all_partsv2: metadata is corrupted, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: metadata is not valid, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: erasure distribution is not the same as onlineDisks");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: retired per-object INFO event was not detected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  'debug!(latest_meta = ?latest_meta, "raw metadata")' \
+  'trace!("latest_meta: {:#?}", latest_meta)' \
+  'warn!("available disks: {:?}", online_disks)' \
+  'debug!("{:#?}", parts_metadata)' \
+  'debug!("raw metadata: {latest_meta:?}")' \
+  'trace!("raw metadata: {meta:#?}")' \
+  'warn!("raw disks: {online_disks:?}")' \
+  'warn!("unexpected file distribution ({:?})", online_disks)'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$raw_heal_metadata_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: raw heal metadata fixture was not detected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 # Secret material must never be interpolated into log or error strings.
 # Error messages are log content: they propagate via `?` and are printed by
 # startup/error logging far from the construction site, and a value that fails

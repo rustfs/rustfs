@@ -3964,9 +3964,15 @@ async fn disks_with_all_parts(
         };
 
         if corrupted {
-            info!(
-                "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
-                object_name
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object = %object_name,
+                disk_index = index,
+                state = "metadata_corrupt",
+                "Set disk object metadata is corrupt"
             );
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
@@ -3977,9 +3983,15 @@ async fn disks_with_all_parts(
 
         if erasure_distribution_reliable {
             if !file_info_is_valid_for_metadata(meta) {
-                info!(
-                    "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
-                    object_name
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object = %object_name,
+                    disk_index = index,
+                    state = "metadata_invalid",
+                    "Set disk object metadata is invalid"
                 );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
@@ -3991,9 +4003,15 @@ async fn disks_with_all_parts(
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
-                info!(
-                    "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
-                    object_name
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object = %object_name,
+                    disk_index = index,
+                    state = "erasure_distribution_mismatch",
+                    "Set disk erasure distribution mismatched online disks"
                 );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
@@ -4066,6 +4084,7 @@ async fn disks_with_all_parts(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
                         object = %object_name,
                         disk_index = index,
                         state = "verify_failed",
@@ -4085,6 +4104,7 @@ async fn disks_with_all_parts(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
                         object = %object_name,
                         disk_index = index,
                         state = "check_parts_failed",
@@ -4153,9 +4173,13 @@ pub fn should_heal_object_on_disk(
     }
 
     if !meta.equals(latest_meta) {
-        warn!(
-            "should_heal_object_on_disk: metadata is outdated, object_name={}, meta: {:?}, latest_meta: {:?}",
-            meta.name, meta, latest_meta
+        debug!(
+            event = EVENT_SET_DISK_HEAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            object = %meta.name,
+            state = "metadata_outdated",
+            "Set disk object metadata is outdated"
         );
         return (true, true, Some(DiskError::OutdatedXLMeta));
     }
