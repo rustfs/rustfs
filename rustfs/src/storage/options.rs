@@ -302,7 +302,18 @@ pub async fn put_opts_with_replication_authorization(
         vid
     };
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    // The S3 API addresses the null version as the literal "null"
+    // (MinIO-compatible replication senders, including RustFS itself, put it
+    // in the versionId query); normalize it to the internal nil-UUID
+    // representation exactly like get_opts / del_opts do.
+    let vid = vid.map(|v| {
+        let id = v.as_str().trim();
+        if id.eq_ignore_ascii_case("null") {
+            Uuid::nil().to_string()
+        } else {
+            id.to_owned()
+        }
+    });
 
     if let Some(ref id) = vid
         && *id != Uuid::nil().to_string()

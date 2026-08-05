@@ -6658,11 +6658,7 @@ async fn wait_for_target_request_version_id(
             return Ok(record.version_id);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "fake target never received {operation:?} for {key}; journal: {:?}",
-                target.requests()
-            )
-            .into());
+            return Err(format!("fake target never received {operation:?} for {key}; journal: {:?}", target.requests()).into());
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -6737,7 +6733,10 @@ async fn test_replication_put_and_create_multipart_carry_source_version_id_query
         .key("large.bin")
         .send()
         .await?;
-    let upload_id = create.upload_id().ok_or("multipart initiate must return an upload id")?.to_string();
+    let upload_id = create
+        .upload_id()
+        .ok_or("multipart initiate must return an upload id")?
+        .to_string();
     let mut completed_parts = Vec::new();
     for (part_number, body) in [(1, vec![b'a'; 5 * 1024 * 1024]), (2, vec![b'b'; 1024])] {
         let uploaded = source_client
