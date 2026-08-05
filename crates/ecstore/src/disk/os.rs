@@ -1601,13 +1601,25 @@ impl RenameDestinationPathGuard {
                     "guarded destination file must be an immediate child of its directory",
                 ));
             }
-            let file_name = file_path
+            file_path
                 .file_name()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
-            let mut file = create_windows_superseding_file(self._directory_guard.last_handle()?, file_name)?;
+            let staging_name = format!(".rustfs-write-{}", uuid::Uuid::new_v4());
+            let mut file = create_windows_new_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
+            set_windows_file_delete_on_close(&file, true)?;
             std::io::Write::write_all(file.as_file_mut(), data)?;
             if sync_file {
                 file.as_file().sync_data()?;
+            }
+            set_windows_file_delete_on_close(&file, false)?;
+            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &file, 0) {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&file, true) {
+                    return Err(io::Error::new(
+                        rename_err.kind(),
+                        format!("{rename_err}; failed to schedule staged file cleanup: {cleanup_err}"),
+                    ));
+                }
+                return Err(rename_err);
             }
             drop(file);
             if sync_parent {
@@ -2078,25 +2090,40 @@ fn open_windows_relative(
 
 #[cfg(windows)]
 fn create_windows_superseding_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_SUPERSEDE;
+
+    create_windows_owned_file(parent, component, FILE_SUPERSEDE)
+}
+
+#[cfg(windows)]
+fn create_windows_new_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
+
+    create_windows_owned_file(parent, component, FILE_CREATE)
+}
+
+#[cfg(windows)]
+fn create_windows_owned_file(
+    parent: &winapi_util::Handle,
+    component: &std::ffi::OsStr,
+    create_disposition: u32,
+) -> io::Result<winapi_util::Handle> {
     use windows_sys::{
-        Wdk::Storage::FileSystem::{
-            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT,
-        },
+        Wdk::Storage::FileSystem::{FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
         Win32::Storage::FileSystem::{
             DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ, FILE_WRITE_DATA, SYNCHRONIZE,
         },
     };
 
-    // FILE_SUPERSEDE replaces an existing directory entry with a new file
-    // object instead of truncating the object behind a hard link. Opening
-    // relative to the retained parent also prevents final-component traversal.
+    // Open relative to the retained parent so the caller's disposition cannot
+    // be redirected through a replaced path component or final reparse point.
     let file = open_windows_relative(
         parent,
         component,
         DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
         FILE_SHARE_READ,
-        FILE_SUPERSEDE,
+        create_disposition,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         FILE_ATTRIBUTE_NORMAL,
         true,
@@ -2105,16 +2132,50 @@ fn create_windows_superseding_file(parent: &winapi_util::Handle, component: &std
     if info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "superseded Windows metadata entry is not an ordinary file",
+            "guarded Windows metadata entry is not an ordinary file",
         ));
     }
     if winapi_util::file::information(&file)?.number_of_links() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "superseded Windows metadata entry retained an unexpected hard link",
+            "guarded Windows metadata entry retained an unexpected hard link",
         ));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+// SAFETY: the disposition buffer has the exact kernel layout and the borrowed
+// file handle remains live for the synchronous NtSetInformationFile call.
+#[allow(unsafe_code)]
+fn set_windows_file_delete_on_close(file: &winapi_util::Handle, delete_file: bool) -> io::Result<()> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{FILE_DISPOSITION_INFORMATION, FileDispositionInformation, NtSetInformationFile},
+        Win32::{Foundation::RtlNtStatusToDosError, System::IO::IO_STATUS_BLOCK},
+    };
+
+    let mut disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: delete_file };
+    let length = u32::try_from(size_of::<FILE_DISPOSITION_INFORMATION>())
+        .map_err(|_| io::Error::other("Windows file disposition size exceeds u32"))?;
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            std::ptr::addr_of_mut!(disposition).cast(),
+            length,
+            FileDispositionInformation,
+        )
+    };
+    if status >= 0 {
+        return Ok(());
+    }
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    match i32::try_from(code) {
+        Ok(code) => Err(io::Error::from_raw_os_error(code)),
+        Err(_) => Err(io::Error::other(format!("Windows file disposition failed with NTSTATUS {status:#x}"))),
+    }
 }
 
 #[cfg(windows)]
