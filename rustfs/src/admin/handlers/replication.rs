@@ -39,6 +39,7 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
+use jiff::Timestamp;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
@@ -146,7 +147,7 @@ struct RemoteTargetCredentialsRequest {
     #[serde(alias = "sessionToken", default)]
     session_token: Option<String>,
     #[serde(default)]
-    expiration: Option<chrono::DateTime<chrono::Utc>>,
+    expiration: Option<Timestamp>,
 }
 
 impl From<RemoteTargetCredentialsRequest> for TargetCredentials {
@@ -1184,9 +1185,9 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetRequest, SUPPORTED_REMOTE_TARGET_API,
-        TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops, unique_replication_peers,
-        validate_remote_target_tls_settings,
+        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
+        SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops,
+        unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::BucketTarget;
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1591,6 +1592,23 @@ mod tests {
         };
 
         assert!(err.to_string().contains("credentials.secretKey is required"));
+    }
+
+    #[test]
+    fn remote_target_credentials_expiration_json_remains_rfc3339() {
+        let credentials: RemoteTargetCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "accessKey": "access",
+            "secretKey": "secret",
+            "expiration": "2026-01-01T00:00:00Z"
+        }))
+        .expect("credentials expiration should deserialize from RFC3339 JSON");
+        let credentials = crate::admin::storage_api::bucket::target::Credentials::from(credentials);
+        let expiration = credentials.expiration.expect("expiration should be preserved");
+
+        assert_eq!(
+            serde_json::to_value(expiration).expect("expiration should serialize to JSON"),
+            serde_json::json!("2026-01-01T00:00:00Z")
+        );
     }
 
     #[test]

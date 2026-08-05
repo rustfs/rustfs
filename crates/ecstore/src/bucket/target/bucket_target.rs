@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use jiff::Timestamp;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,7 +33,7 @@ pub struct Credentials {
     #[serde(rename = "secretKey")]
     pub secret_key: String,
     pub session_token: Option<String>,
-    pub expiration: Option<chrono::DateTime<chrono::Utc>>,
+    pub expiration: Option<Timestamp>,
 }
 
 impl Credentials {
@@ -408,7 +409,11 @@ mod tests {
         assert_eq!(credentials.access_key, "test-access-key");
         assert_eq!(credentials.secret_key, "test-secret-key");
         assert_eq!(credentials.session_token, Some("test-session-token".to_string()));
-        assert!(credentials.expiration.is_some());
+        assert_eq!(
+            serde_json::to_value(credentials.expiration.expect("expiration should parse"))
+                .expect("expiration should serialize to JSON"),
+            serde_json::json!("2024-12-31T23:59:59Z")
+        );
 
         // Verify latency statistics
         assert_eq!(target.latency.curr, Duration::from_millis(100));
@@ -562,12 +567,15 @@ mod tests {
                 .and_then(|credentials| credentials.session_token.as_deref()),
             Some("legacy-session-token")
         );
-        assert!(
+        assert_eq!(
             target
                 .credentials
                 .as_ref()
                 .and_then(|credentials| credentials.expiration)
-                .is_some()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("expiration should serialize to JSON"),
+            Some(serde_json::json!("2024-12-31T23:59:59Z"))
         );
     }
 
@@ -609,7 +617,11 @@ mod tests {
             credentials.session_token,
             Some("AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT".to_string())
         );
-        assert!(credentials.expiration.is_some());
+        assert_eq!(
+            serde_json::to_value(credentials.expiration.expect("expiration should parse"))
+                .expect("expiration should serialize to JSON"),
+            serde_json::json!("2024-12-31T23:59:59Z")
+        );
     }
 
     #[test]

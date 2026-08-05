@@ -14,7 +14,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::heal_commands::HealResultItem;
@@ -85,7 +85,7 @@ pub struct TraceInfo {
     #[serde(rename = "funcname")]
     func_name: String,
     #[serde(rename = "time")]
-    time: DateTime<Utc>,
+    time: Timestamp,
     #[serde(rename = "path")]
     path: String,
     #[serde(rename = "dur")]
@@ -154,7 +154,7 @@ pub struct TraceCallStats {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TraceRequestInfo {
-    time: DateTime<Utc>,
+    time: Timestamp,
     proto: String,
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,11 +170,46 @@ pub struct TraceRequestInfo {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TraceResponseInfo {
-    time: DateTime<Utc>,
+    time: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_code: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_timestamps_serialize_as_rfc3339_utc() {
+        let timestamp = Timestamp::constant(1_700_000_000, 123_456_000);
+        let trace = TraceInfo {
+            time: timestamp,
+            http: Some(TraceHTTPStats {
+                req_info: TraceRequestInfo {
+                    time: timestamp,
+                    ..Default::default()
+                },
+                resp_info: TraceResponseInfo {
+                    time: timestamp,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(trace).expect("trace should serialize");
+        assert_eq!(value["time"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(value["http"]["req_info"]["time"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(value["http"]["resp_info"]["time"], "2023-11-14T22:13:20.123456Z");
+        let trace: TraceInfo = serde_json::from_value(value).expect("trace should deserialize");
+        assert_eq!(trace.time, timestamp);
+        let http = trace.http.expect("http trace should deserialize");
+        assert_eq!(http.req_info.time, timestamp);
+        assert_eq!(http.resp_info.time, timestamp);
+    }
 }

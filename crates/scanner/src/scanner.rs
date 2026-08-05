@@ -4492,7 +4492,11 @@ mod tests {
         let setup_report = global_metrics().report().await;
         assert!(setup_report.current_cycle_active);
         assert_eq!(setup_report.current_cycle, 0);
-        assert_eq!(setup_report.current_started, cycle_started);
+        assert_eq!(setup_report.current_started.as_second(), cycle_started.timestamp());
+        assert_eq!(
+            setup_report.current_started.subsec_nanosecond(),
+            i32::try_from(cycle_started.timestamp_subsec_nanos()).expect("chrono nanoseconds fit in i32")
+        );
 
         mark_scan_cycle_idle(&mut cycle_info, &mut guard).await;
         let idle_report = global_metrics().report().await;

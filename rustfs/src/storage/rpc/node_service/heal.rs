@@ -14,6 +14,7 @@
 
 use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
+use jiff::Timestamp;
 use rmp_serde::Deserializer;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_heal::HealOperationsSnapshot;
@@ -27,6 +28,31 @@ use super::super::encode_msgpack_map;
 const NODE_HEAL_STATUS_VERSION: u8 = 1;
 const NODE_HEAL_STATUS_MAX_SIZE: usize = 64 * 1024;
 const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
+
+fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Timestamp {
+    let seconds = timestamp.timestamp();
+    let nanoseconds = match i32::try_from(timestamp.timestamp_subsec_nanos()) {
+        Ok(nanoseconds) => nanoseconds,
+        Err(_) => {
+            return if seconds < 0 { Timestamp::MIN } else { Timestamp::MAX };
+        }
+    };
+
+    match Timestamp::new(seconds, nanoseconds) {
+        Ok(timestamp) => timestamp,
+        Err(_) => {
+            if seconds < 0 {
+                Timestamp::MIN
+            } else {
+                Timestamp::MAX
+            }
+        }
+    }
+}
+
+fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(timestamp))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HealControlCoordinator {
@@ -156,7 +182,7 @@ pub(crate) struct NodeHealProgress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NodeHealInfo {
-    bitrot_start_time: Option<chrono::DateTime<chrono::Utc>>,
+    bitrot_start_time: Option<Timestamp>,
     bitrot_start_cycle: u64,
     current_scan_mode: HealScanMode,
 }
@@ -164,7 +190,7 @@ struct NodeHealInfo {
 impl From<BackgroundHealInfo> for NodeHealInfo {
     fn from(info: BackgroundHealInfo) -> Self {
         Self {
-            bitrot_start_time: info.bitrot_start_time,
+            bitrot_start_time: info.bitrot_start_time.map(chrono_to_jiff_timestamp),
             bitrot_start_cycle: info.bitrot_start_cycle,
             current_scan_mode: info.current_scan_mode,
         }
@@ -174,7 +200,7 @@ impl From<BackgroundHealInfo> for NodeHealInfo {
 impl From<NodeHealInfo> for BackgroundHealInfo {
     fn from(info: NodeHealInfo) -> Self {
         Self {
-            bitrot_start_time: info.bitrot_start_time,
+            bitrot_start_time: info.bitrot_start_time.map(jiff_to_chrono_datetime),
             bitrot_start_cycle: info.bitrot_start_cycle,
             current_scan_mode: info.current_scan_mode,
         }
@@ -213,7 +239,7 @@ impl NodeHealStatusSnapshot {
 
     pub(crate) fn info(&self) -> BackgroundHealInfo {
         BackgroundHealInfo {
-            bitrot_start_time: self.info.bitrot_start_time,
+            bitrot_start_time: self.info.bitrot_start_time.map(jiff_to_chrono_datetime),
             bitrot_start_cycle: self.info.bitrot_start_cycle,
             current_scan_mode: self.info.current_scan_mode,
         }
@@ -270,6 +296,7 @@ mod tests {
         Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
+    use chrono::SecondsFormat;
     use rustfs_heal::HealOperationsSnapshot;
     use rustfs_scanner::scanner::BackgroundHealInfo;
 
@@ -459,6 +486,54 @@ mod tests {
         let decoded = decode_node_heal_status(&encoded).expect("fixed v1 fixture should decode");
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
+    }
+
+    #[test]
+    fn node_heal_status_timestamp_json_remains_rfc3339() {
+        let fixture = serde_json::json!({
+            "version": 1,
+            "servicesEnabled": true,
+            "initialized": true,
+            "info": {"bitrotStartTime": "2023-11-14T22:13:20.123456Z", "bitrotStartCycle": 9, "currentScanMode": 1},
+            "operations": {
+                "queueLength": 2, "activeTasks": 1, "retryingTasks": 0,
+                "queuedByPriority": {"low": 0, "normal": 2, "high": 0, "urgent": 0},
+                "activeByPriority": {"low": 0, "normal": 0, "high": 1, "urgent": 0},
+                "retryingByPriority": {"low": 0, "normal": 0, "high": 0, "urgent": 0},
+                "queuedBySource": {"scanner": 2, "admin": 0, "autoHeal": 0, "internal": 0, "readRepair": 0},
+                "activeBySource": {"scanner": 0, "admin": 1, "autoHeal": 0, "internal": 0, "readRepair": 0},
+                "retryingBySource": {"scanner": 0, "admin": 0, "autoHeal": 0, "internal": 0, "readRepair": 0}
+            },
+            "progress": null
+        });
+        let encoded = rmp_serde::to_vec_named(&fixture).expect("fixture should encode");
+        let decoded = decode_node_heal_status(&encoded).expect("timestamp fixture should decode");
+        let info = decoded.info();
+
+        assert_eq!(
+            info.bitrot_start_time
+                .expect("bitrot start time should be preserved")
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+            "2023-11-14T22:13:20.123456Z"
+        );
+
+        let started_at = chrono::DateTime::parse_from_rfc3339("2023-11-14T22:13:20.123456Z")
+            .expect("fixture timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let snapshot = NodeHealStatusSnapshot::for_test(
+            true,
+            true,
+            BackgroundHealInfo {
+                bitrot_start_time: Some(started_at),
+                bitrot_start_cycle: 9,
+                current_scan_mode: rustfs_common::heal_channel::HealScanMode::Deep,
+            },
+            HealOperationsSnapshot::default(),
+            None,
+        );
+        let encoded = encode_node_heal_status(&snapshot).expect("snapshot should encode");
+        let encoded_json: serde_json::Value = rmp_serde::from_slice(&encoded).expect("encoded snapshot should decode as JSON");
+        assert_eq!(encoded_json["info"]["bitrotStartTime"], serde_json::json!("2023-11-14T22:13:20.123456Z"));
     }
 
     #[test]
