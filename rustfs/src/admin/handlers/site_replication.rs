@@ -152,7 +152,7 @@ const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replicati
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
 const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
 const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
-const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
+const MINIO_SITE_REPLICATION_PEER_JOIN_PATH: &str = "/minio/admin/v3/site-replication/peer/join";
 
 fn site_replicator_service_account_policy() -> S3Result<Policy> {
     Policy::parse_config(
@@ -2882,9 +2882,7 @@ fn site_replication_peer_wire_path(path: &str) -> String {
         .split_once('?')
         .map(|(path, query)| (path, Some(query)))
         .unwrap_or((path, None));
-    let wire_path = if path_only == SITE_REPLICATION_PEER_JOIN_PATH {
-        MINIO_SITE_REPLICATION_JOIN_PATH.to_string()
-    } else if let Some(suffix) = path_only.strip_prefix(RUSTFS_ADMIN_V3_PREFIX) {
+    let wire_path = if let Some(suffix) = path_only.strip_prefix(RUSTFS_ADMIN_V3_PREFIX) {
         format!("{MINIO_ADMIN_V3_PREFIX}{suffix}")
     } else {
         path_only.to_string()
@@ -2897,7 +2895,9 @@ fn site_replication_peer_wire_path(path: &str) -> String {
 }
 
 fn site_replication_peer_payload_encrypted(wire_path: &str) -> bool {
-    wire_path.split_once('?').map(|(path, _)| path).unwrap_or(wire_path) == MINIO_SITE_REPLICATION_JOIN_PATH
+    // MinIO's SRPeerJoin handler force-decrypts the request body, so the
+    // peer/join payload must always travel encrypted.
+    wire_path.split_once('?').map(|(path, _)| path).unwrap_or(wire_path) == MINIO_SITE_REPLICATION_PEER_JOIN_PATH
 }
 
 fn site_replication_peer_payload(path: &str, secret_key: &str, payload: Vec<u8>) -> S3Result<(Vec<u8>, &'static str)> {
@@ -8079,6 +8079,18 @@ fn sts_replication_compatibility_policy<'a>(claims: &HashMap<String, Value>, par
 
 pub struct SiteReplicationAddHandler {}
 
+/// MinIO's `SRPeerJoin` replies with an empty body on success; synthesize the
+/// peer identity from the add preflight metainfo in that case.
+fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPeerJoinResponse, serde_json::Error> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(SRPeerJoinResponse {
+            peer: fallback_peer,
+            initial_sync_error_message: String::new(),
+        });
+    }
+    serde_json::from_slice(body)
+}
+
 #[async_trait::async_trait]
 impl Operation for SiteReplicationAddHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -8147,7 +8159,7 @@ impl Operation for SiteReplicationAddHandler {
 
         let mut joined_endpoints = HashSet::new();
         let mut initial_sync_errors = SiteReplicationErrorSummary::default();
-        for site in &sites {
+        for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
             if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
                 || !joined_endpoints.insert(site_identity_key(&site.endpoint))
             {
@@ -8160,7 +8172,10 @@ impl Operation for SiteReplicationAddHandler {
             let body =
                 send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
 
-            let join_response: SRPeerJoinResponse = serde_json::from_slice(&body).map_err(|e| {
+            let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
+                .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
+            fallback_peer.deployment_id = preflight.deployment_id.clone();
+            let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
                 S3Error::with_message(
                     S3ErrorCode::InternalError,
                     format!("parse peer join response from {} failed: {e}", site.endpoint),
@@ -13683,7 +13698,7 @@ mod tests {
     fn test_site_replication_peer_wire_path_matches_minio_routes() {
         assert_eq!(
             site_replication_peer_wire_path(SITE_REPLICATION_PEER_JOIN_PATH),
-            "/minio/admin/v3/site-replication/join"
+            "/minio/admin/v3/site-replication/peer/join"
         );
         assert_eq!(
             site_replication_peer_wire_path("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
@@ -13697,14 +13712,43 @@ mod tests {
 
     #[test]
     fn test_site_replication_peer_payload_encryption_matches_minio_contract() {
-        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
+        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/join"));
         assert!(site_replication_peer_payload_encrypted(
-            "/minio/admin/v3/site-replication/join?replicateILMExpiry=true"
+            "/minio/admin/v3/site-replication/peer/join?bootstrapToken=token"
         ));
+        // The outbound rewrite no longer produces the legacy `/site-replication/join`
+        // path; it must not be treated as an encrypted MinIO route.
+        assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
         assert!(!site_replication_peer_payload_encrypted(
             "/minio/admin/v3/site-replication/peer/bucket-meta"
         ));
         assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/iam-item"));
+    }
+
+    #[test]
+    fn test_parse_peer_join_response_tolerates_empty_minio_success_body() {
+        let fallback = PeerInfo {
+            deployment_id: "remote-deployment".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+
+        for body in [&b""[..], b" \r\n\t "] {
+            let response = parse_peer_join_response(body, fallback.clone()).expect("empty join body is a MinIO success");
+            assert_eq!(response.peer.deployment_id, "remote-deployment");
+            assert_eq!(response.peer.endpoint, "https://remote.example.com");
+            assert!(response.initial_sync_error_message.is_empty());
+        }
+
+        let json = serde_json::to_vec(&SRPeerJoinResponse {
+            peer: peer("actual", "https://actual.example.com"),
+            initial_sync_error_message: "sync failed".to_string(),
+        })
+        .expect("serialize join response");
+        let response = parse_peer_join_response(&json, fallback.clone()).expect("parse join response body");
+        assert_eq!(response.peer.endpoint, "https://actual.example.com");
+        assert_eq!(response.initial_sync_error_message, "sync failed");
+
+        assert!(parse_peer_join_response(b"not-json", fallback).is_err());
     }
 
     #[test]
