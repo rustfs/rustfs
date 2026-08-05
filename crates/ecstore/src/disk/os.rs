@@ -1605,16 +1605,17 @@ impl RenameDestinationPathGuard {
                 .file_name()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
             let staging_name = format!(".rustfs-write-{}", uuid::Uuid::new_v4());
-            let mut staged = create_windows_staged_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
+            let WindowsStagedFile { mut writer, publication } =
+                create_windows_staged_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
             let write_result: io::Result<()> = (|| {
-                std::io::Write::write_all(staged.writer.as_file_mut(), data)?;
+                std::io::Write::write_all(writer.as_file_mut(), data)?;
                 if sync_file {
-                    staged.writer.as_file().sync_data()?;
+                    writer.as_file().sync_data()?;
                 }
                 Ok(())
             })();
             if let Err(write_err) = write_result {
-                if let Err(cleanup_err) = set_windows_file_delete_on_close(&staged.publication, true) {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&publication, true) {
                     return Err(io::Error::new(
                         write_err.kind(),
                         format!("{write_err}; failed to schedule staged file cleanup: {cleanup_err}"),
@@ -1622,8 +1623,13 @@ impl RenameDestinationPathGuard {
                 }
                 return Err(write_err);
             }
-            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &staged.publication, 0) {
-                if let Err(cleanup_err) = set_windows_file_delete_on_close(&staged.publication, true) {
+            // Windows rejects replacement while the staged entry still has an
+            // active data writer, even though that writer shares deletion. Keep
+            // the separate publication handle as the identity anchor and close
+            // the writer before issuing the handle-relative rename.
+            drop(writer);
+            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &publication, 0) {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&publication, true) {
                     return Err(io::Error::new(
                         rename_err.kind(),
                         format!("{rename_err}; failed to schedule staged file cleanup: {cleanup_err}"),
@@ -1631,7 +1637,7 @@ impl RenameDestinationPathGuard {
                 }
                 return Err(rename_err);
             }
-            drop(staged);
+            drop(publication);
             if sync_parent {
                 fsync_dir_std(&self.directory)?;
             }
