@@ -22,7 +22,7 @@ use rustfs_iam::{
     store::{MappedPolicy, object::ObjectStore},
     sys::{IamSys, is_safe_claim_policy_name},
 };
-use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
 use s3s::{S3Error, S3ErrorCode};
 use serde_json::Value;
@@ -238,7 +238,7 @@ fn issue_credentials(
 
 fn site_replication_item(credentials: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
     SRIAMItem {
-        r#type: "sts-credential".to_string(),
+        r#type: SR_IAM_ITEM_STS_ACC.to_string(),
         sts_credential: Some(SRSTSCredential {
             access_key: credentials.access_key.clone(),
             secret_key: credentials.secret_key.clone(),

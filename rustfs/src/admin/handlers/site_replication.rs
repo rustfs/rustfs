@@ -70,11 +70,11 @@ use rustfs_iam::sys::{
 use rustfs_madmin::{
     AddOrUpdateUserReq, BucketBandwidth, GroupAddRemove, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric,
     LDAPConfigSettings, LDAPSettings, OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus,
-    ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SRBucketInfo, SRBucketMeta,
-    SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric,
-    SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq,
-    SRResyncOpStatus, SRRetryStats, SRSessionPolicy, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRSvcAccCreate,
-    SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC,
+    SR_IAM_ITEM_STS_ACC_LEGACY, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem,
+    SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation,
+    SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRRetryStats, SRSessionPolicy, SRSiteSummary,
+    SRStateEditReq, SRStateInfo, SRStatusInfo, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -7854,7 +7854,11 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                 .map_err(ApiError::from)?;
             Ok(())
         }
-        "sts-credential" => {
+        // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The legacy alias
+        // `sts-credential` (emitted by older RustFS releases) stays accepted permanently
+        // so mixed-version RustFS sites keep replicating STS credentials during rolling
+        // upgrades; it is a compatibility layer, not temporary code.
+        SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => {
             let Some(sts_credential) = item.sts_credential else {
                 return Err(s3_error!(InvalidRequest, "stsCredential is required"));
             };

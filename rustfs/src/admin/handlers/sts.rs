@@ -32,7 +32,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
-use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
@@ -79,7 +79,7 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
 /// Build the site-replication IAM item that mirrors an AssumeRole temporary credential to peers.
 fn assume_role_site_replication_item(cred: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
     SRIAMItem {
-        r#type: "sts-credential".to_string(),
+        r#type: SR_IAM_ITEM_STS_ACC.to_string(),
         sts_credential: Some(SRSTSCredential {
             access_key: cred.access_key.clone(),
             secret_key: cred.secret_key.clone(),
