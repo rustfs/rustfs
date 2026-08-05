@@ -1653,6 +1653,54 @@ mod tests {
     }
 
     #[test]
+    fn sr_info_deserializes_minio_nil_maps_as_empty() {
+        // Go json.Marshal emits nil maps as null; an SR-unconfigured MinIO
+        // site reports SRInfo with every map nil.
+        let nil_map_json = json!({
+            "Enabled": false,
+            "Name": "site-minio",
+            "DeploymentID": "minio-deploy-1",
+            "Buckets": null,
+            "Policies": null,
+            "UserPolicies": null,
+            "UserInfoMap": null,
+            "GroupDescMap": null,
+            "GroupPolicies": null,
+            "ReplicationCfg": null,
+            "ILMExpiryRules": null,
+            "State": null,
+            "apiVersion": "1"
+        });
+
+        let info: SRInfo = serde_json::from_value(nil_map_json).expect("MinIO nil-map SRInfo JSON should deserialize");
+
+        assert!(!info.enabled);
+        assert_eq!(info.deployment_id, "minio-deploy-1");
+        assert!(info.buckets.is_empty());
+        assert!(info.policies.is_empty());
+        assert!(info.user_policies.is_empty());
+        assert!(info.user_info_map.is_empty());
+        assert!(info.group_desc_map.is_empty());
+        assert!(info.group_policies.is_empty());
+        assert!(info.replication_cfg.is_empty());
+        assert!(info.ilm_expiry_rules.is_empty());
+        assert!(info.state.peers.is_empty());
+
+        // Go's zero-value SRStateInfo serializes as an object whose nil
+        // peers map is null, not as a null State.
+        let nil_peers_json = json!({
+            "Enabled": false,
+            "DeploymentID": "minio-deploy-1",
+            "State": { "name": "", "peers": null }
+        });
+
+        let info: SRInfo = serde_json::from_value(nil_peers_json).expect("MinIO nil-peers SRInfo JSON should deserialize");
+
+        assert_eq!(info.deployment_id, "minio-deploy-1");
+        assert!(info.state.peers.is_empty());
+    }
+
+    #[test]
     fn sr_info_serialization_stays_camel_case() {
         let info: SRInfo =
             serde_json::from_value(minio_pascal_case_sr_info_json()).expect("MinIO PascalCase SRInfo JSON should deserialize");
