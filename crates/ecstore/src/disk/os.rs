@@ -1605,16 +1605,16 @@ impl RenameDestinationPathGuard {
                 .file_name()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
             let staging_name = format!(".rustfs-write-{}", uuid::Uuid::new_v4());
-            let mut file = create_windows_new_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
+            let mut staged = create_windows_staged_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
             let write_result: io::Result<()> = (|| {
-                std::io::Write::write_all(file.as_file_mut(), data)?;
+                std::io::Write::write_all(staged.writer.as_file_mut(), data)?;
                 if sync_file {
-                    file.as_file().sync_data()?;
+                    staged.writer.as_file().sync_data()?;
                 }
                 Ok(())
             })();
             if let Err(write_err) = write_result {
-                if let Err(cleanup_err) = set_windows_file_delete_on_close(&file, true) {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&staged.publication, true) {
                     return Err(io::Error::new(
                         write_err.kind(),
                         format!("{write_err}; failed to schedule staged file cleanup: {cleanup_err}"),
@@ -1622,8 +1622,8 @@ impl RenameDestinationPathGuard {
                 }
                 return Err(write_err);
             }
-            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &file, 0) {
-                if let Err(cleanup_err) = set_windows_file_delete_on_close(&file, true) {
+            if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &staged.publication, 0) {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&staged.publication, true) {
                     return Err(io::Error::new(
                         rename_err.kind(),
                         format!("{rename_err}; failed to schedule staged file cleanup: {cleanup_err}"),
@@ -1631,7 +1631,7 @@ impl RenameDestinationPathGuard {
                 }
                 return Err(rename_err);
             }
-            drop(file);
+            drop(staged);
             if sync_parent {
                 fsync_dir_std(&self.directory)?;
             }
@@ -2101,17 +2101,62 @@ fn open_windows_relative(
 #[cfg(windows)]
 fn create_windows_superseding_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_SUPERSEDE;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    create_windows_owned_file(parent, component, FILE_SUPERSEDE, FILE_SHARE_READ)
+    create_windows_owned_file(parent, component, FILE_SUPERSEDE)
 }
 
 #[cfg(windows)]
-fn create_windows_new_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
-    use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+struct WindowsStagedFile {
+    writer: winapi_util::Handle,
+    publication: winapi_util::Handle,
+}
 
-    create_windows_owned_file(parent, component, FILE_CREATE, FILE_SHARE_READ | FILE_SHARE_DELETE)
+#[cfg(windows)]
+fn create_windows_staged_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<WindowsStagedFile> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+        Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_DATA, SYNCHRONIZE,
+        },
+    };
+
+    // Keep writing and namespace mutation on separate handles. Their share
+    // modes admit each other while jointly excluding third-party writers and
+    // deleters until publication finishes.
+    let writer = open_windows_relative(
+        parent,
+        component,
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_ATTRIBUTE_NORMAL,
+        true,
+    )?;
+    validate_windows_owned_file(&writer)?;
+    let expected_identity = windows_file_identity(&writer)?;
+    let publication = open_windows_relative(
+        parent,
+        component,
+        DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        0,
+        false,
+    )?;
+    validate_windows_owned_file(&publication)?;
+    if windows_file_identity(&publication)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged Windows metadata identity changed while publication was prepared",
+        ));
+    }
+
+    Ok(WindowsStagedFile { writer, publication })
 }
 
 #[cfg(windows)]
@@ -2119,13 +2164,11 @@ fn create_windows_owned_file(
     parent: &winapi_util::Handle,
     component: &std::ffi::OsStr,
     create_disposition: u32,
-    share_access: u32,
 ) -> io::Result<winapi_util::Handle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
         Win32::Storage::FileSystem::{
-            DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_WRITE_DATA, SYNCHRONIZE,
+            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_WRITE_DATA, SYNCHRONIZE,
         },
     };
 
@@ -2135,26 +2178,34 @@ fn create_windows_owned_file(
         parent,
         component,
         DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
-        share_access,
+        FILE_SHARE_READ,
         create_disposition,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         FILE_ATTRIBUTE_NORMAL,
         true,
     )?;
-    let info = windows_file_attribute_tag(&file)?;
+    validate_windows_owned_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn validate_windows_owned_file(file: &winapi_util::Handle) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+
+    let info = windows_file_attribute_tag(file)?;
     if info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "guarded Windows metadata entry is not an ordinary file",
         ));
     }
-    if winapi_util::file::information(&file)?.number_of_links() != 1 {
+    if winapi_util::file::information(file)?.number_of_links() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "guarded Windows metadata entry retained an unexpected hard link",
         ));
     }
-    Ok(file)
+    Ok(())
 }
 
 #[cfg(windows)]
