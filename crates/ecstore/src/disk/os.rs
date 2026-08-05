@@ -2073,10 +2073,7 @@ fn open_windows_relative(
 }
 
 #[cfg(windows)]
-fn create_windows_superseding_file(
-    parent: &winapi_util::Handle,
-    component: &std::ffi::OsStr,
-) -> io::Result<winapi_util::Handle> {
+fn create_windows_superseding_file(parent: &winapi_util::Handle, component: &std::ffi::OsStr) -> io::Result<winapi_util::Handle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{
             FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT,
@@ -3391,6 +3388,42 @@ mod tests {
             .expect("source replacement should succeed after guard release");
         std::fs::rename(&destination_parent, destination_base.join("replacement-object"))
             .expect("destination replacement should succeed after guard release");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_commit_guard_publishes_data_directory_with_prepared_metadata() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let configured_root = temp_dir.path();
+        let publication_root = PublicationRoot::new(configured_root).expect("open publication root");
+        let root = publication_root.path();
+        let source_parent = root.join(".rustfs.sys/tmp/staged-object");
+        let destination_base = root.join("bucket");
+        let destination_parent = destination_base.join("object");
+        let source_data = source_parent.join("data-dir");
+        let destination_data = destination_parent.join("data-dir");
+        std::fs::create_dir_all(&source_data).expect("create staged data directory");
+        std::fs::write(source_data.join("part.1"), b"payload").expect("write staged part");
+        std::fs::create_dir(&destination_base).expect("create destination bucket");
+
+        let commit_guard = prepare_rename_commit_guard(&source_parent, &destination_parent, &destination_base, &publication_root)
+            .expect("prepare shared commit guard");
+        let source_metadata = source_parent.join("xl.meta");
+        let destination_metadata = destination_parent.join("xl.meta");
+        let mut prepared_metadata =
+            create_prepared_rename_source_with_commit_guard(&source_metadata, &destination_metadata, &commit_guard)
+                .expect("prepare staged metadata");
+        prepared_metadata
+            .write_all(b"metadata", false)
+            .expect("write staged metadata");
+
+        rename_with_commit_guard_std(&source_data, &destination_data, &commit_guard)
+            .expect("publish staged data directory while metadata source remains open");
+        rename_prepared_source_with_commit_guard_std(&prepared_metadata, &source_metadata, &destination_metadata, &commit_guard)
+            .expect("publish prepared metadata");
+
+        assert_eq!(std::fs::read(destination_data.join("part.1")).expect("read published part"), b"payload");
+        assert_eq!(std::fs::read(destination_metadata).expect("read published metadata"), b"metadata");
     }
 
     #[cfg(windows)]

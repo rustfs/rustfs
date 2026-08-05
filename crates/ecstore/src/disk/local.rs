@@ -4594,9 +4594,15 @@ impl LocalDisk {
         let root = resolve_local_disk_root(&endpoint_path).inspect_err(|err| {
             log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
         })?;
-        let publication_root = os::PublicationRoot::new(&root).map_err(DiskError::from).inspect_err(|err| {
-            log_startup_disk_error("open_publication_root", &root, err);
-        })?;
+        #[cfg(windows)]
+        let publication_root_path = Path::new(&endpoint_path);
+        #[cfg(not(windows))]
+        let publication_root_path = root.as_path();
+        let publication_root = os::PublicationRoot::new(publication_root_path)
+            .map_err(DiskError::from)
+            .inspect_err(|err| {
+                log_startup_disk_error("open_publication_root", publication_root_path, err);
+            })?;
         // On Windows the configured endpoint may be a junction, subst drive, or
         // mapped path. Use the final path from the pinned root handle for every
         // subsequent path-based operation so retargeting the configured alias
