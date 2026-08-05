@@ -119,7 +119,7 @@ fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<Offse
     Ok((bytes, modtime))
 }
 
-fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
+pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
     let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
     let base = version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR;
     let mut salt = 0u128;
@@ -240,8 +240,15 @@ async fn write_metadata_rollback_backup(object_dir: &Path, rollback_dir: Uuid, d
 }
 
 async fn restore_metadata_backup(object_dir: &Path, xl_path: &Path, rollback_dir: Uuid) -> Result<()> {
-    let backup_path = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
-    rename_all(&backup_path, xl_path, object_dir).await
+    let rollback_path = object_dir.join(rollback_dir.to_string());
+    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
+    rename_all(&backup_path, xl_path, object_dir).await?;
+    // A synthetic inline rollback dir held only the backup the rename above
+    // just consumed; reclaim it so the object dir can empty out. A real data
+    // dir still holds its parts, so the non-recursive remove is a benign
+    // no-op there (mirrors restore_delete_rollback).
+    let _ = fs::remove_dir(&rollback_path).await;
+    Ok(())
 }
 
 async fn restore_delete_rollback(object_dir: &Path, xl_path: &Path, rollback_dir: Uuid) -> Result<()> {
@@ -12226,6 +12233,54 @@ mod test {
                 .exists(),
             "copy fallback backup should be consumed by atomic rollback"
         );
+    }
+
+    // The undo_write restore consumes `<rollback>/xl.meta.bkp` by rename; a
+    // synthetic rollback dir is then empty and must be reclaimed so the object
+    // dir can empty out (BucketNotEmpty leak). A real data dir still holds its
+    // parts and must survive the non-recursive remove.
+    #[tokio::test]
+    async fn restore_metadata_backup_reclaims_empty_rollback_dir_only() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let object_dir = dir.path().join("bucket").join("obj");
+        let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let rollback_dir = Uuid::new_v4();
+        let rollback_path = object_dir.join(rollback_dir.to_string());
+        fs::create_dir_all(&rollback_path)
+            .await
+            .expect("rollback dir should be created");
+        fs::write(rollback_path.join(STORAGE_FORMAT_FILE_BACKUP), b"old-meta")
+            .await
+            .expect("backup should be written");
+
+        restore_metadata_backup(&object_dir, &xl_path, rollback_dir)
+            .await
+            .expect("restore should succeed");
+        assert_eq!(
+            fs::read(&xl_path).await.expect("xl.meta should be restored"),
+            b"old-meta",
+            "restore must move the backup back onto xl.meta"
+        );
+        assert!(!rollback_path.exists(), "an emptied synthetic rollback dir must be reclaimed");
+
+        // Real data dir: parts remain, the dir must survive.
+        let real_dir = Uuid::new_v4();
+        let real_path = object_dir.join(real_dir.to_string());
+        fs::create_dir_all(&real_path).await.expect("real data dir should be created");
+        fs::write(real_path.join(STORAGE_FORMAT_FILE_BACKUP), b"older-meta")
+            .await
+            .expect("backup should be written");
+        fs::write(real_path.join("part.1"), b"data")
+            .await
+            .expect("part should be written");
+
+        restore_metadata_backup(&object_dir, &xl_path, real_dir)
+            .await
+            .expect("restore should succeed");
+        assert!(real_path.join("part.1").exists(), "a real data dir must keep its parts");
+        assert!(real_path.exists(), "a non-empty data dir must not be removed");
     }
 
     #[tokio::test]
