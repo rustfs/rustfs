@@ -1356,8 +1356,8 @@ fn namespace_from_path_value(value: &str) -> S3Result<crate::table_catalog::Name
     let decoded = percent_decode_str(value)
         .decode_utf8()
         .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))?;
-    // RUSTFS_COMPAT_TODO(table-catalog-dotted-namespace): Keep dotted paths for clients configured before
-    // the Iceberg REST unit-separator contract. Remove after the minimum supported release advertises %1F.
+    // RUSTFS_COMPAT_TODO(table-catalog-dotted-namespace): Remove after the minimum supported release
+    // advertises %1F; until then, keep dotted paths for clients using the legacy namespace contract.
     let segments = if legacy_dotted {
         decoded.split('.').map(str::to_string).collect()
     } else {
