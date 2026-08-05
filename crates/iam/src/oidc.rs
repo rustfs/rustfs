@@ -21,23 +21,24 @@
 use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreJsonWebKeySet};
 use openidconnect::{
-    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, JsonWebKeySetUrl,
-    LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl,
-    RequestTokenError, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, DiscoveryError, IssuerUrl,
+    JsonWebKeySetUrl, LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl,
+    ProviderMetadataWithLogout, RedirectUrl, RequestTokenError, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_OIDC_RESPONSE_SIZE};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
-use rustfs_utils::egress::OutboundPolicy;
+use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy, find_outbound_dns_policy_rejection};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::net::IpAddr;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
@@ -308,6 +309,8 @@ pub(crate) struct ReqwestHttpClient {
     /// `None` in production: the process-cached outbound policy from the environment is used.
     /// `Some(..)` only in tests, to explicitly allow a loopback mock endpoint.
     policy_override: Option<OutboundPolicy>,
+    #[cfg(test)]
+    dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
 }
 
 /// Build a reqwest client pinned to the shared outbound egress policy for a single request.
@@ -318,7 +321,11 @@ pub(crate) struct ReqwestHttpClient {
 /// connection so DNS rebinding fails closed. Redirects are not followed: a redirect target
 /// would otherwise skip URL-shape re-validation. The timeouts bound how long a slow or
 /// stalled provider can pin the calling task.
-fn build_oidc_http_client(uri: &str, policy_override: Option<&OutboundPolicy>) -> Result<Client, OidcHttpError> {
+fn build_oidc_http_client(
+    uri: &str,
+    policy_override: Option<&OutboundPolicy>,
+    #[cfg(test)] dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
+) -> Result<(Client, Url), OidcHttpError> {
     let url = Url::parse(uri).map_err(|_| OidcHttpError::ForbiddenOutbound("invalid outbound OIDC URL".to_string()))?;
     let resolver = match policy_override {
         Some(policy) => policy.resolver_for(&url),
@@ -326,17 +333,45 @@ fn build_oidc_http_client(uri: &str, policy_override: Option<&OutboundPolicy>) -
             .map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?
             .resolver_for(&url),
     }
-    .map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?;
+    .map_err(|err| {
+        let base = err.to_string();
+        let origin = url.origin().ascii_serialization();
+        let can_allow_origin =
+            OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(&url).is_ok());
+        oidc_forbidden_outbound_error(&url, base, can_allow_origin)
+    })?;
+    #[cfg(test)]
+    let resolver: Arc<dyn reqwest::dns::Resolve> = dns_resolver_override.unwrap_or_else(|| Arc::new(resolver));
 
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .dns_resolver(resolver)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(OIDC_HTTP_REQUEST_TIMEOUT)
         .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
-    if should_bypass_proxy_for_oidc_uri(uri) {
-        builder = builder.no_proxy();
+    #[cfg(test)]
+    let builder = builder.proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("test proxy URL should parse"));
+    let builder = builder.no_proxy();
+    builder.build().map(|client| (client, url)).map_err(OidcHttpError::Reqwest)
+}
+
+fn oidc_forbidden_outbound_error(url: &Url, base: String, can_allow_origin: bool) -> OidcHttpError {
+    let reason = if can_allow_origin {
+        let origin = url.origin().ascii_serialization();
+        format!(
+            "{base}; add {origin} to {ENV_OUTBOUND_ALLOW_ORIGINS} (comma-separated) and restart RustFS to allow this operator-owned OIDC provider (origin only, no path)"
+        )
+    } else {
+        base
+    };
+    OidcHttpError::ForbiddenOutbound(reason)
+}
+
+fn oidc_http_error_from_reqwest(url: &Url, error: reqwest::Error) -> OidcHttpError {
+    if let Some(rejection) = find_outbound_dns_policy_rejection(&error) {
+        let base = rejection.to_string();
+        return oidc_forbidden_outbound_error(url, base, rejection.allow_origin_can_recover());
     }
-    builder.build().map_err(OidcHttpError::Reqwest)
+    OidcHttpError::Reqwest(error)
 }
 
 /// Buffer a provider response body, failing closed once `limit` bytes have been seen.
@@ -359,18 +394,13 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
     Ok(body)
 }
 
-fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
-    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']);
-
-    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
-}
-
 impl ReqwestHttpClient {
     fn new() -> Result<Self, String> {
-        Ok(Self { policy_override: None })
+        Ok(Self {
+            policy_override: None,
+            #[cfg(test)]
+            dns_resolver_override: None,
+        })
     }
 
     /// Test-only constructor that pins outbound requests to an explicit policy, so a
@@ -379,6 +409,15 @@ impl ReqwestHttpClient {
     fn with_policy(policy: OutboundPolicy) -> Self {
         Self {
             policy_override: Some(policy),
+            dns_resolver_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_policy_and_dns_resolver(policy: OutboundPolicy, resolver: Arc<dyn reqwest::dns::Resolve>) -> Self {
+        Self {
+            policy_override: Some(policy),
+            dns_resolver_override: Some(resolver),
         }
     }
 }
@@ -408,7 +447,12 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 );
             }
 
-            let client = build_oidc_http_client(&uri, self.policy_override.as_ref())?;
+            let (client, url) = build_oidc_http_client(
+                &uri,
+                self.policy_override.as_ref(),
+                #[cfg(test)]
+                self.dns_resolver_override.clone(),
+            )?;
             let response = client
                 .request(parts.method, uri.clone())
                 .headers(parts.headers)
@@ -421,6 +465,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             OIDC_PLUGIN_AUTHN_METRICS.record(elapsed_ms, succeeded);
 
             let response = response.map_err(|err| {
+                let error = oidc_http_error_from_reqwest(&url, err);
                 error!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -429,10 +474,10 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     method = %method,
                     uri = %uri,
                     elapsed_ms,
-                    error = %err,
+                    error = %error,
                     "oidc outbound http"
                 );
-                OidcHttpError::Reqwest(err)
+                error
             })?;
 
             let status = response.status();
@@ -866,11 +911,11 @@ impl OidcSys {
                         redirect_uri = %redirect_uri,
                         request_error_kind = %request_error_kind,
                         request_error_status = %request_error_status,
-                        error = %e,
+                        error = %err,
                         "oidc token exchange failed"
                     );
                     format!(
-                        "token exchange failed: {e}: stage=token_request_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, request_error_kind={}, request_error_status={}",
+                        "token exchange failed: stage=token_request_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, request_error_kind={}, request_error_status={}, request_error={}",
                         session.provider_id,
                         config.config_url,
                         issuer,
@@ -878,7 +923,8 @@ impl OidcSys {
                         redirect_uri,
                         config.client_id,
                         request_error_kind,
-                        request_error_status
+                        request_error_status,
+                        err
                     )
                 }
                 RequestTokenError::Parse(parse_err, body) => {
@@ -1656,17 +1702,18 @@ impl OidcSys {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
             for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
-                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client)
-                    .await
-                    .map_err(|e| format!("discovery failed: {e}"))
-                {
+                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client).await {
                     Ok(metadata) => {
                         return Ok(ProviderState {
                             metadata,
                             discovered_at: Instant::now(),
                         });
                     }
+                    Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
+                        return Err(format!("OIDC provider discovery blocked by outbound policy: {reason}"));
+                    }
                     Err(error) => {
+                        let error = format!("discovery failed: {error}");
                         let is_transient_transport = error.contains("Request failed");
                         let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
                         if should_retry {
@@ -1747,9 +1794,13 @@ impl OidcSys {
         }
 
         let jwks_url = jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?;
-        let jwks = CoreJsonWebKeySet::fetch_async(&jwks_url, http_client)
-            .await
-            .map_err(|err| format!("failed to fetch JWKS: {err}"))?;
+        let jwks = match CoreJsonWebKeySet::fetch_async(&jwks_url, http_client).await {
+            Ok(jwks) => jwks,
+            Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
+                return Err(format!("JWKS request blocked by outbound policy: {reason}"));
+            }
+            Err(err) => return Err(format!("failed to fetch JWKS: {err}")),
+        };
 
         Ok(ProviderState {
             metadata: provider_metadata.set_jwks(jwks),
@@ -2046,6 +2097,25 @@ pub(crate) fn test_config(id: &str) -> OidcProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_utils::egress::OutboundDnsPolicyRejection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct RejectingDnsResolver {
+        allow_origin_can_recover: bool,
+        calls: Option<Arc<AtomicUsize>>,
+    }
+
+    impl reqwest::dns::Resolve for RejectingDnsResolver {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            if let Some(calls) = &self.calls {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
+            let host = name.as_str().to_string();
+            let rejection = OutboundDnsPolicyRejection::new(host, self.allow_origin_can_recover);
+            Box::pin(async move { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, rejection).into()) })
+        }
+    }
 
     #[test]
     fn test_extract_string_claim() {
@@ -2854,22 +2924,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
-        assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
-        assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
-        assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
-        assert!(!should_bypass_proxy_for_oidc_uri(
-            "https://idp.example.com/.well-known/openid-configuration"
-        ));
-        assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
-    }
-
-    #[test]
     fn build_oidc_http_client_rejects_forbidden_targets_without_allowlist() {
         // Cloud metadata endpoint is never allowed.
         assert!(
             matches!(
-                build_oidc_http_client("http://169.254.169.254/latest/meta-data/", None),
+                build_oidc_http_client("http://169.254.169.254/latest/meta-data/", None, None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "metadata endpoint must be rejected"
@@ -2877,7 +2936,7 @@ mod tests {
         // Loopback is rejected by default (no allow-origins configured).
         assert!(
             matches!(
-                build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", None),
+                build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", None, None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "loopback must be rejected by default"
@@ -2885,7 +2944,7 @@ mod tests {
         // A public hostname passes the up-front shape/host check; the resolved IP is still
         // re-classified at connection time by the pinned resolver.
         assert!(
-            build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None).is_ok(),
+            build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None, None).is_ok(),
             "public https endpoint should build"
         );
     }
@@ -2894,17 +2953,179 @@ mod tests {
     fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
         let policy = OutboundPolicy::from_allowed_origins("http://127.0.0.1:8080").expect("origin should parse");
         assert!(
-            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy)).is_ok(),
+            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy), None).is_ok(),
             "explicitly allow-listed loopback origin should build"
         );
         // A metadata endpoint stays forbidden even when a loopback origin is allow-listed.
         assert!(
             matches!(
-                build_oidc_http_client("http://169.254.169.254/", Some(&policy)),
+                build_oidc_http_client("http://169.254.169.254/", Some(&policy), None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "metadata endpoint stays forbidden despite an unrelated allow-list entry"
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_reports_forbidden_outbound_without_retrying() {
+        let config_url = "http://192.168.65.254:8080/realms/rustfs/.well-known/openid-configuration";
+        let config = build_mocked_oidc_provider_config("default", config_url);
+        let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::default());
+
+        let error = match OidcSys::discover_provider(&config, &http_client).await {
+            Ok(_) => panic!("private OIDC provider should require an explicit allowlist origin"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
+        assert!(error.contains(&format!("add http://192.168.65.254:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert!(!error.contains("discovery failed for all issuer variants"));
+    }
+
+    #[tokio::test]
+    async fn oidc_explicit_issuer_reports_forbidden_jwks_endpoint() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| {
+                (
+                    format!("{base}/realms/rustfs"),
+                    "http://192.168.65.254:8080/realms/rustfs/protocol/openid-connect/certs".to_string(),
+                    "/unused".to_string(),
+                )
+            },
+            1,
+        ) else {
+            return;
+        };
+        let mut config =
+            build_mocked_oidc_provider_config("default", &format!("{base}/realms/rustfs/.well-known/openid-configuration"));
+        config.issuer = Some(format!("{base}/realms/rustfs"));
+        let policy = OutboundPolicy::from_allowed_origins(&base).expect("loopback discovery origin should be allowed");
+        let http_client = ReqwestHttpClient::with_policy(policy);
+
+        let error = match OidcSys::discover_provider(&config, &http_client).await {
+            Ok(_) => panic!("private JWKS endpoint should require an explicit allowlist origin"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("JWKS request blocked by outbound policy"));
+        assert!(error.contains(&format!("add http://192.168.65.254:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn oidc_token_exchange_reports_forbidden_token_endpoint() {
+        let provider_id = "default";
+        let token_endpoint = "http://192.168.65.254:8080/realms/rustfs/protocol/openid-connect/token";
+        let metadata = serde_json::from_value::<ProviderMetadataWithLogout>(serde_json::json!({
+            "issuer": "https://idp.example.com/realms/rustfs",
+            "authorization_endpoint": "https://idp.example.com/realms/rustfs/protocol/openid-connect/auth",
+            "token_endpoint": token_endpoint,
+            "jwks_uri": "https://idp.example.com/realms/rustfs/protocol/openid-connect/certs",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"]
+        }))
+        .expect("provider metadata should parse");
+        let config = build_mocked_oidc_provider_config(
+            provider_id,
+            "https://idp.example.com/realms/rustfs/.well-known/openid-configuration",
+        );
+        let state_store = OidcStateStore::new();
+        state_store
+            .insert(
+                "test-state".to_string(),
+                OidcAuthSession {
+                    provider_id: provider_id.to_string(),
+                    pkce_verifier: "test-pkce-verifier".to_string(),
+                    nonce: "test-nonce".to_string(),
+                    redirect_after: None,
+                },
+            )
+            .await;
+        let sys = OidcSys {
+            configs: HashMap::from([(provider_id.to_string(), config)]),
+            provider_states: RwLock::new(HashMap::from([(
+                provider_id.to_string(),
+                ProviderState {
+                    metadata,
+                    discovered_at: Instant::now(),
+                },
+            )])),
+            state_store,
+            http_client: ReqwestHttpClient::with_policy(OutboundPolicy::default()),
+        };
+
+        let error = match sys
+            .exchange_code("test-state", "test-code", "https://console.example.com/oauth_callback")
+            .await
+        {
+            Ok(_) => panic!("private token endpoint should require an explicit allowlist origin"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("request_error_kind=forbidden_outbound"));
+        assert!(error.contains(&format!("add http://192.168.65.254:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    }
+
+    #[tokio::test]
+    async fn oidc_reqwest_dns_policy_rejection_stays_typed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = build_mocked_oidc_provider_config(
+            "default",
+            "http://keycloak.internal:8080/realms/rustfs/.well-known/openid-configuration",
+        );
+        let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
+            OutboundPolicy::default(),
+            Arc::new(RejectingDnsResolver {
+                allow_origin_can_recover: true,
+                calls: Some(calls.clone()),
+            }),
+        );
+
+        let error = match OidcSys::discover_provider(&config, &http_client).await {
+            Ok(_) => panic!("private DNS answer should fail discovery"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
+        assert!(error.contains(&format!("add http://keycloak.internal:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "policy rejection must not be retried");
+    }
+
+    #[tokio::test]
+    async fn oidc_nonrecoverable_dns_policy_rejection_omits_allowlist_hint() {
+        let uri = "http://metadata.internal/latest/meta-data";
+        let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
+            OutboundPolicy::default(),
+            Arc::new(RejectingDnsResolver {
+                allow_origin_can_recover: false,
+                calls: None,
+            }),
+        );
+        let request = http::Request::builder()
+            .uri(uri)
+            .body(Vec::new())
+            .expect("request should build");
+
+        let error = http_client
+            .call(request)
+            .await
+            .expect_err("metadata DNS answer should be rejected");
+        let message = error.to_string();
+
+        assert!(matches!(error, OidcHttpError::ForbiddenOutbound(_)));
+        assert!(message.contains("metadata.internal"));
+        assert!(!message.contains(&format!("add http://metadata.internal to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    }
+
+    #[test]
+    fn oidc_metadata_endpoint_rejection_does_not_offer_allowlist_bypass() {
+        let error = build_oidc_http_client("http://169.254.169.254/latest/meta-data/", Some(&OutboundPolicy::default()), None)
+            .expect_err("metadata endpoint must remain forbidden");
+        let message = error.to_string();
+
+        assert!(message.contains("metadata endpoint"));
+        assert!(!message.contains(&format!("add http://169.254.169.254 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
     }
 
     /// Serve exactly `body_len` bytes with no `Content-Length`, so the body ends only at EOF

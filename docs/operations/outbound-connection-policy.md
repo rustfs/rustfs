@@ -4,10 +4,11 @@ This document describes the outbound connection policy that RustFS applies to
 server-initiated HTTP(S) requests, and the `RUSTFS_OUTBOUND_ALLOW_ORIGINS`
 allowlist operators can use to reach endpoints on private or container networks.
 
-It is written for operators who upgraded to `1.0.0-beta.11` (or later) and found
-that event-notification webhooks, audit webhooks, or other outbound integrations
-stopped reaching endpoints that worked before — typically Docker Compose service
-names, `host.docker.internal`, or RFC 1918 addresses.
+It is written for operators whose outbound integrations stopped reaching
+endpoints after an upgrade — typically Docker Compose service names,
+`host.docker.internal`, or RFC 1918 addresses. Webhook and audit clients adopted
+this policy in `1.0.0-beta.11`; OIDC provider requests adopted it in
+`1.0.0-beta.12`.
 
 ## Background: what the policy protects
 
@@ -21,14 +22,19 @@ The policy governs the outbound clients used by:
 
 - event-notification webhooks (`RUSTFS_NOTIFY_WEBHOOK_*`);
 - audit webhooks (`RUSTFS_AUDIT_WEBHOOK_*`);
-- OIDC identity-provider requests;
+- OIDC identity-provider discovery, JWKS, and token requests (since `1.0.0-beta.12`);
 - S3 tiering (warm-backend) endpoints;
 - Keystone auth URLs.
 
-The webhook and audit outbound clients also **disable proxies and do not follow
-redirects**, so the destination must be reachable directly at the configured URL.
+The webhook, audit, and OIDC outbound clients also **disable proxies and do not
+follow redirects**, so the destination must be reachable directly at the
+configured URL. OIDC intentionally ignores `HTTP_PROXY`, `HTTPS_PROXY`, and
+`ALL_PROXY`: a forward proxy resolves the provider hostname outside RustFS and
+would bypass the connection-boundary address check.
 
-## What changed in beta.11
+## What changed in beta.11 (and for OIDC in beta.12)
+
+For webhook and audit clients:
 
 | | beta.10 | beta.11+ |
 |---|---|---|
@@ -43,6 +49,13 @@ exact origin is on the allowlist. This is why a Compose setup that delivered
 events on beta.10 can go silent after the upgrade even though the configuration
 is unchanged.
 
+OIDC joined the same policy in beta.12. An internal identity provider that
+worked in beta.11 can therefore fail discovery after upgrading to beta.12 unless
+its exact origin is allowlisted. The policy remains active for discovery, JWKS,
+and token requests to prevent SSRF and DNS-rebinding bypasses; these requests
+must have direct network reachability because proxy environment variables are
+not used.
+
 ## Symptoms
 
 - Bucket event rules and webhook configuration look correct.
@@ -52,6 +65,9 @@ is unchanged.
 a loopback, private, shared, or reserved address.
 - Startup or target validation reports `webhook endpoint is not allowed: ...`
   with a reason such as `private address` or `loopback host`.
+- An OIDC provider or login button is missing, and startup reports
+  `OIDC provider discovery blocked by outbound policy` with the exact origin to
+  allowlist.
 
 ## `RUSTFS_OUTBOUND_ALLOW_ORIGINS`
 
@@ -127,7 +143,7 @@ services:
 The endpoint keeps its full path (`/events`); the allowlist entry is the origin
 (`http://logstash:8080`) only.
 
-## Upgrade checklist (beta.10 → beta.11+)
+## Upgrade checklist (beta.10 → beta.11+, or OIDC beta.11 → beta.12+)
 
 1. List every outbound endpoint whose hostname resolves to a loopback, private,
    shared, or reserved address: notification webhooks, audit webhooks, OIDC

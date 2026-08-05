@@ -82,6 +82,59 @@ impl fmt::Display for OutboundPolicyError {
 
 impl std::error::Error for OutboundPolicyError {}
 
+/// A DNS answer was rejected at the connection boundary because every resolved
+/// address was forbidden by the outbound policy.
+#[derive(Debug)]
+pub struct OutboundDnsPolicyRejection {
+    host: String,
+    allow_origin_can_recover: bool,
+}
+
+impl OutboundDnsPolicyRejection {
+    /// Records the rejected host and whether an exact operator allowlist origin
+    /// could permit at least one of its resolved addresses.
+    pub fn new(host: String, allow_origin_can_recover: bool) -> Self {
+        Self {
+            host,
+            allow_origin_can_recover,
+        }
+    }
+
+    /// Whether an exact allowlist origin could permit at least one rejected address.
+    pub fn allow_origin_can_recover(&self) -> bool {
+        self.allow_origin_can_recover
+    }
+}
+
+impl fmt::Display for OutboundDnsPolicyRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "outbound DNS resolution for '{}' returned no allowed addresses", self.host)
+    }
+}
+
+impl std::error::Error for OutboundDnsPolicyRejection {}
+
+/// Finds a typed DNS policy rejection through transport error wrappers.
+pub fn find_outbound_dns_policy_rejection<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a OutboundDnsPolicyRejection> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(rejection) = error.downcast_ref::<OutboundDnsPolicyRejection>() {
+            return Some(rejection);
+        }
+        if let Some(rejection) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .and_then(|inner| inner.downcast_ref::<OutboundDnsPolicyRejection>())
+        {
+            return Some(rejection);
+        }
+        current = error.source();
+    }
+    None
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct OutboundPolicy {
     allowed_restricted_origins: HashSet<String>,
@@ -226,14 +279,29 @@ impl reqwest::dns::Resolve for OutboundDnsResolver {
                     .map_err(|err| std::io::Error::new(std::io::ErrorKind::NotFound, err))?
                     .collect()
             };
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("DNS resolution for '{host}' returned no addresses"),
+                )
+                .into());
+            }
+            let mut allow_origin_can_recover = false;
             let addrs = addresses
                 .into_iter()
-                .filter(|address| resolved_ip_allowed(address.ip(), allow_restricted))
+                .filter(|address| match validate_policy_ip(address.ip()) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        let recoverable = restricted_reason_can_be_overridden(reason);
+                        allow_origin_can_recover |= recoverable;
+                        allow_restricted && recoverable
+                    }
+                })
                 .collect::<Vec<_>>();
             if addrs.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!("outbound DNS resolution for '{host}' returned no allowed addresses"),
+                    OutboundDnsPolicyRejection::new(host, allow_origin_can_recover),
                 )
                 .into());
             }
@@ -300,13 +368,6 @@ fn restricted_reason_can_be_overridden(reason: &str) -> bool {
         reason,
         "loopback host" | "loopback address" | "private address" | "shared address" | "reserved address"
     )
-}
-
-fn resolved_ip_allowed(ip: IpAddr, allow_restricted: bool) -> bool {
-    match validate_policy_ip(ip) {
-        Ok(()) => true,
-        Err(reason) => allow_restricted && restricted_reason_can_be_overridden(reason),
-    }
 }
 
 fn validate_policy_ip(ip: IpAddr) -> Result<(), &'static str> {
@@ -488,7 +549,7 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundPolicy, OutboundUrlError, validate_outbound_url};
+    use super::{OutboundPolicy, OutboundUrlError, find_outbound_dns_policy_rejection, validate_outbound_url};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use url::Url;
@@ -835,12 +896,38 @@ mod tests {
             .map(|addr| addr.ip())
             .collect::<Vec<_>>();
         assert_eq!(addrs, vec!["8.8.8.8".parse::<std::net::IpAddr>().expect("public IP")]);
-        assert!(
-            reqwest::dns::Resolve::resolve(&resolver, "rebound.test".parse().expect("resolver hostname"))
-                .await
-                .is_err(),
-            "a rebound answer containing only restricted addresses must fail closed"
-        );
+        let error = match reqwest::dns::Resolve::resolve(&resolver, "rebound.test".parse().expect("resolver hostname")).await {
+            Ok(_) => panic!("a rebound answer containing only restricted addresses must fail closed"),
+            Err(error) => error,
+        };
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("resolver must preserve its PermissionDenied root error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+        let rejection =
+            find_outbound_dns_policy_rejection(&*error).expect("typed policy rejection must remain in the error chain");
+        assert_eq!(rejection.host, "rebound.test");
+        assert!(rejection.allow_origin_can_recover());
+    }
+
+    #[tokio::test]
+    async fn outbound_dns_resolver_does_not_classify_empty_answers_as_policy_rejections() {
+        let endpoint = Url::parse("https://empty.test/hook").expect("endpoint should parse");
+        let resolver = OutboundPolicy::default()
+            .resolver_for(&endpoint)
+            .expect("public hostname should be accepted")
+            .with_overrides(HashMap::from([("empty.test".to_string(), Vec::new())]));
+
+        let error = match reqwest::dns::Resolve::resolve(&resolver, "empty.test".parse().expect("resolver hostname")).await {
+            Ok(_) => panic!("an empty DNS answer must fail"),
+            Err(error) => error,
+        };
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("resolver errors must remain I/O errors");
+
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+        assert!(find_outbound_dns_policy_rejection(&*error).is_none());
     }
 
     #[tokio::test]
@@ -975,5 +1062,74 @@ mod tests {
                 .any(|message| message.contains("returned no allowed addresses")),
             "request must fail in the DNS policy layer: {error_chain:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reqwest_preserves_recoverable_private_dns_policy_rejection() {
+        let endpoint = Url::parse("http://keycloak.internal:8080/realms/rustfs").expect("endpoint should parse");
+        let resolver = OutboundPolicy::default()
+            .resolver_for(&endpoint)
+            .expect("hostname should pass the URL-shape check")
+            .with_overrides(HashMap::from([(
+                "keycloak.internal".to_string(),
+                vec![
+                    "10.96.0.20".parse().expect("private IP"),
+                    "169.254.169.254".parse().expect("metadata IP"),
+                ],
+            )]));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+
+        let error = client
+            .get(endpoint)
+            .send()
+            .await
+            .expect_err("private DNS answer should be rejected before connecting");
+        let rejection = find_outbound_dns_policy_rejection(&error).expect("typed DNS policy rejection should be preserved");
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut io_kind = None;
+        while let Some(source) = current {
+            if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+                io_kind = Some(io_error.kind());
+                break;
+            }
+            current = source.source();
+        }
+
+        assert_eq!(rejection.host, "keycloak.internal");
+        assert!(rejection.allow_origin_can_recover());
+        assert_eq!(io_kind, Some(std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn reqwest_preserves_nonrecoverable_metadata_dns_policy_rejection() {
+        let endpoint = Url::parse("http://metadata.internal/latest").expect("endpoint should parse");
+        let resolver = OutboundPolicy::default()
+            .resolver_for(&endpoint)
+            .expect("hostname should pass the URL-shape check")
+            .with_overrides(HashMap::from([(
+                "metadata.internal".to_string(),
+                vec!["169.254.169.254".parse().expect("metadata IP")],
+            )]));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("test client should build");
+
+        let error = client
+            .get(endpoint)
+            .send()
+            .await
+            .expect_err("metadata DNS answer should be rejected before connecting");
+        let rejection = find_outbound_dns_policy_rejection(&error).expect("typed DNS policy rejection should be preserved");
+
+        assert_eq!(rejection.host, "metadata.internal");
+        assert!(!rejection.allow_origin_can_recover());
     }
 }
