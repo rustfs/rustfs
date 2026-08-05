@@ -214,7 +214,13 @@ impl QuotaChecker {
         // the writes issued before the next complete scanner cycle. Buckets
         // with no persisted baseline anywhere keep failing closed.
         let store = self.metadata_sys.read().await.object_store();
-        if let Some(baseline) = crate::data_usage::lookup_degraded_bucket_usage_baseline(store, bucket).await {
+        // Box the fallback: it embeds the whole snapshot-load future, and every
+        // object write nests a quota check several futures deep, so keeping it
+        // inline would grow each write's state machine by the loader's full
+        // size — the debug-build 2MiB worker-stack overflow class fixed for
+        // bucket-config writes in #5648. The allocation only happens on the
+        // degraded path; the authoritative fast path returns above.
+        if let Some(baseline) = Box::pin(crate::data_usage::lookup_degraded_bucket_usage_baseline(store, bucket)).await {
             debug!(bucket, baseline, "Bucket quota admission using degraded persisted usage baseline");
             return Ok(baseline);
         }
