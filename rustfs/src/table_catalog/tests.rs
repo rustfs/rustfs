@@ -8961,15 +8961,6 @@ async fn catalog_backings_expose_implicit_parents_and_protect_child_namespaces()
         .create_namespace(test_namespace_entry(bucket, &child))
         .await
         .expect("object-backed child namespace should be created");
-    let mut inactive_parent = test_namespace_entry(bucket, &parent);
-    inactive_parent.state = TableCatalogEntryState::Deleted;
-    object_backend
-        .seed_object(
-            RUSTFS_META_BUCKET,
-            &object_store.paths.namespace_entry_path(bucket, &parent),
-            serde_json::to_vec(&inactive_parent).expect("inactive parent should serialize"),
-        )
-        .await;
     let implicit_parent = object_store
         .get_namespace(bucket, &parent.public_name())
         .await
@@ -8981,6 +8972,19 @@ async fn catalog_backings_expose_implicit_parents_and_protect_child_namespaces()
         object_store.drop_namespace(bucket, &parent.public_name()).await,
         Err(TableCatalogStoreError::Conflict(_))
     );
+    assert_matches!(
+        object_store.create_namespace(test_namespace_entry(bucket, &parent)).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    let mut inactive_parent = test_namespace_entry(bucket, &parent);
+    inactive_parent.state = TableCatalogEntryState::Deleted;
+    object_backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &object_store.paths.namespace_entry_path(bucket, &parent),
+            serde_json::to_vec(&inactive_parent).expect("inactive parent should serialize"),
+        )
+        .await;
     object_store
         .create_namespace(test_namespace_entry(bucket, &parent))
         .await
@@ -9010,6 +9014,10 @@ async fn catalog_backings_expose_implicit_parents_and_protect_child_namespaces()
         .expect("strong parent lookup should succeed")
         .expect("implicit strong parent should exist");
     assert_eq!(implicit_parent.namespace, parent.public_name());
+    assert_matches!(
+        strong_store.create_namespace(test_namespace_entry(bucket, &parent)).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
     strong_store
         .update_namespace_properties(
             bucket,
@@ -9268,6 +9276,14 @@ where
             .await
             .expect("implicit parent view should load")
             .is_some()
+    );
+    assert_matches!(
+        store.create_namespace(test_namespace_entry(bucket, &table_parent)).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    assert_matches!(
+        store.create_namespace(test_namespace_entry(bucket, &view_parent)).await,
+        Err(TableCatalogStoreError::Conflict(_))
     );
     let tables = store
         .list_all_tables(bucket)

@@ -3500,7 +3500,17 @@ where
                 etag.map(TableCatalogPutPrecondition::IfMatch)
                     .ok_or_else(|| TableCatalogStoreError::Internal(format!("catalog namespace entry has no etag: {object}")))?
             }
-            None => TableCatalogPutPrecondition::IfAbsent,
+            None => {
+                if self.has_active_namespace_object(&entry.table_bucket, &namespace).await?
+                    || self.has_active_namespace_descendant(&entry.table_bucket, &namespace).await?
+                {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "catalog object already exists: namespace {}/{}",
+                        entry.table_bucket, entry.namespace
+                    )));
+                }
+                TableCatalogPutPrecondition::IfAbsent
+            }
         };
         self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
             .await

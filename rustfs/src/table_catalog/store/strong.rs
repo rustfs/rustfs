@@ -969,10 +969,9 @@ where
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
-            if state
-                .namespaces
-                .get(&key)
-                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            let existing = state.namespaces.get(&key);
+            if existing.is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+                || (existing.is_none() && Self::namespace_exists_locked(&state, &entry.table_bucket, &namespace))
             {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "catalog object already exists: namespace {}/{}",
