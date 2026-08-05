@@ -1320,7 +1320,7 @@ pub struct SiteNetPerfResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerInfo, PeerSite, SRResyncOpStatus};
+    use super::{PeerInfo, PeerSite, SRInfo, SRResyncOpStatus};
     use serde_json::{Value, json};
 
     const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
@@ -1509,5 +1509,134 @@ mod tests {
             serde_json::to_value(status).expect("expanded resync status should serialize"),
             status_json
         );
+    }
+
+    /// Mirrors `json.Marshal(madmin.SRInfo{...})` output from MinIO: the
+    /// madmin-go SRInfo top-level fields carry no json tags (except
+    /// APIVersion), so Go emits them in PascalCase, while every nested
+    /// struct has lowercase tags.
+    fn minio_pascal_case_sr_info_json() -> Value {
+        json!({
+            "Enabled": true,
+            "Name": "site-minio",
+            "DeploymentID": "minio-deploy-1",
+            "Buckets": {
+                "photos": {
+                    "bucket": "photos",
+                    "versioningConfig": "PHZlcnNpb25pbmcvPg=="
+                }
+            },
+            "Policies": {
+                "readonly": {
+                    "policy": { "Version": "2012-10-17" },
+                    "updatedAt": "2026-07-22T01:00:00Z"
+                }
+            },
+            "UserPolicies": {
+                "alice": {
+                    "userOrGroup": "alice",
+                    "userType": 1,
+                    "isGroup": false,
+                    "policy": "readonly"
+                }
+            },
+            "UserInfoMap": {
+                "alice": {
+                    "status": "enabled",
+                    "updatedAt": "2026-07-22T01:00:00Z"
+                }
+            },
+            "GroupDescMap": {
+                "devs": {
+                    "name": "devs",
+                    "status": "enabled",
+                    "members": ["alice"],
+                    "policy": "readonly"
+                }
+            },
+            "GroupPolicies": {
+                "devs": {
+                    "userOrGroup": "devs",
+                    "userType": 0,
+                    "isGroup": true,
+                    "policy": "readonly"
+                }
+            },
+            "ReplicationCfg": {
+                "photos": { "role": "arn:minio:replication::minio-deploy-1:photos" }
+            },
+            "ILMExpiryRules": {
+                "rule-1": {
+                    "ilm-rule": "PFJ1bGUvPg==",
+                    "bucket": "photos"
+                }
+            },
+            "State": {
+                "name": "site-minio",
+                "peers": {
+                    "minio-deploy-1": {
+                        "endpoint": "https://minio.example.com",
+                        "name": "site-minio",
+                        "deploymentID": "minio-deploy-1"
+                    }
+                },
+                "updatedAt": "2026-07-22T01:00:00Z"
+            },
+            "apiVersion": "1"
+        })
+    }
+
+    #[test]
+    fn sr_info_deserializes_minio_pascal_case_top_level_fields() {
+        let info: SRInfo =
+            serde_json::from_value(minio_pascal_case_sr_info_json()).expect("MinIO PascalCase SRInfo JSON should deserialize");
+
+        assert!(info.enabled, "Enabled must map to enabled");
+        assert_eq!(info.name, "site-minio");
+        assert_eq!(info.deployment_id, "minio-deploy-1", "DeploymentID must map to deployment_id");
+        assert!(info.buckets.contains_key("photos"), "Buckets must map to buckets");
+        assert!(info.policies.contains_key("readonly"), "Policies must map to policies");
+        assert!(info.user_policies.contains_key("alice"), "UserPolicies must map to user_policies");
+        assert!(info.user_info_map.contains_key("alice"), "UserInfoMap must map to user_info_map");
+        assert!(info.group_desc_map.contains_key("devs"), "GroupDescMap must map to group_desc_map");
+        assert!(info.group_policies.contains_key("devs"), "GroupPolicies must map to group_policies");
+        assert!(info.replication_cfg.contains_key("photos"), "ReplicationCfg must map to replication_cfg");
+        assert!(info.ilm_expiry_rules.contains_key("rule-1"), "ILMExpiryRules must map to ilm_expiry_rules");
+        assert!(
+            info.state.peers.contains_key("minio-deploy-1"),
+            "State must map to state with populated peers"
+        );
+    }
+
+    #[test]
+    fn sr_info_serialization_stays_camel_case() {
+        let info: SRInfo =
+            serde_json::from_value(minio_pascal_case_sr_info_json()).expect("MinIO PascalCase SRInfo JSON should deserialize");
+
+        let value = serde_json::to_value(info).expect("SRInfo should serialize");
+        let object = value.as_object().expect("SRInfo JSON should be an object");
+
+        for camel_key in [
+            "enabled",
+            "name",
+            "deploymentID",
+            "buckets",
+            "policies",
+            "userPolicies",
+            "userInfoMap",
+            "groupDescMap",
+            "groupPolicies",
+            "replicationCfg",
+            "ilmExpiryRules",
+            "state",
+        ] {
+            assert!(object.contains_key(camel_key), "serialized SRInfo must keep camelCase key {camel_key}");
+        }
+        for pascal_key in ["Enabled", "Name", "DeploymentID", "Buckets", "State", "ILMExpiryRules"] {
+            assert!(
+                !object.contains_key(pascal_key),
+                "serialized SRInfo must not emit PascalCase key {pascal_key}"
+            );
+        }
     }
 }
