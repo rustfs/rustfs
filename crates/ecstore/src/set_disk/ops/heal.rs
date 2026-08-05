@@ -404,7 +404,16 @@ impl SetDisks {
             "Set disk object metadata read"
         );
         if DiskError::is_all_not_found(&errs) {
-            debug!(bucket, object, version_id, "heal_object skipped missing object");
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                version_id,
+                state = "missing_object_skipped",
+                "Set disk heal skipped missing object"
+            );
             let err = if !version_id.is_empty() {
                 DiskError::FileVersionNotFound
             } else {
@@ -525,7 +534,18 @@ impl SetDisks {
                                 if is_meta {
                                     meta_to_heal_count += 1;
                                 }
-                                debug!("heal_object Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
+                                debug!(
+                                    event = EVENT_SET_DISK_HEAL,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    bucket,
+                                    object,
+                                    version_id,
+                                    disk_index = index,
+                                    endpoint = %self.set_endpoints[index],
+                                    state = "disk_marked_for_healing",
+                                    "Set disk marked for healing"
+                                );
                             }
 
                             let drive_state = match reason {
@@ -609,6 +629,8 @@ impl SetDisks {
                                     latest_meta.erasure.data_blocks
                                 );
                                 error!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_HEAL,
                                     bucket,
                                     object,
                                     version_id,
@@ -627,6 +649,8 @@ impl SetDisks {
                                     latest_meta.erasure.parity_blocks
                                 );
                                 error!(
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_HEAL,
                                     bucket,
                                     object,
                                     version_id,
@@ -682,6 +706,8 @@ impl SetDisks {
                                 }
                                 Err(err) => {
                                     error!(
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_HEAL,
                                         bucket,
                                         object,
                                         version_id,
@@ -808,8 +834,12 @@ impl SetDisks {
                             None => {
                                 if !latest_meta.deleted && !latest_meta.is_remote() {
                                     error!(
-                                        "heal: latest metadata for {}/{} has no data_dir, cannot heal object data",
-                                        bucket, object
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_HEAL,
+                                        bucket,
+                                        object,
+                                        version_id,
+                                        "Heal object latest metadata has no data_dir, cannot heal object data"
                                     );
                                     return Err(DiskError::FileCorrupt);
                                 }
@@ -1293,6 +1323,8 @@ impl SetDisks {
                 Ok(()) => wrote += 1,
                 Err(error) => {
                     warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_HEAL,
                         bucket,
                         object,
                         disk_index = index,
@@ -1326,7 +1358,16 @@ impl SetDisks {
             }
             Ok(_) => {}
             Err(e) => {
-                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    error = %e,
+                    state = "orphan_data_reclaim_failed",
+                    "Set disk orphan data-dir reclaim failed"
+                );
             }
         }
     }
@@ -1730,7 +1771,13 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         };
 
         if count_errs(&errs, &DiskError::UnformattedDisk) == 0 {
-            info!("set disk formats success, NoHealRequired, errs: {:?}", errs);
+            debug!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                error_count = errs.iter().flatten().count(),
+                result = "no_heal_required",
+                "set disk formats success"
+            );
             return Ok((result, Some(StorageError::NoHealRequired)));
         }
 

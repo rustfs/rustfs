@@ -711,8 +711,7 @@ if [[ "$heal_function_count" != "$trace_heal_instrumentation_count" ]]; then
 fi
 
 unexpected_heal_info="$(
-  rg -n '\binfo!' crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/erasure/coding/heal.rs |
-    rg -v 'set disk formats success, NoHealRequired' || true
+  rg -n '\binfo!' crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/erasure/coding/heal.rs || true
 )"
 if [[ -n "$unexpected_heal_info" ]]; then
   echo "❌ logging guardrail violation: per-object set-disk heal events must not be emitted at INFO" >&2
