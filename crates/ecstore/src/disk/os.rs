@@ -1606,12 +1606,22 @@ impl RenameDestinationPathGuard {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
             let staging_name = format!(".rustfs-write-{}", uuid::Uuid::new_v4());
             let mut file = create_windows_new_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
-            set_windows_file_delete_on_close(&file, true)?;
-            std::io::Write::write_all(file.as_file_mut(), data)?;
-            if sync_file {
-                file.as_file().sync_data()?;
+            let write_result = (|| {
+                std::io::Write::write_all(file.as_file_mut(), data)?;
+                if sync_file {
+                    file.as_file().sync_data()?;
+                }
+                Ok(())
+            })();
+            if let Err(write_err) = write_result {
+                if let Err(cleanup_err) = set_windows_file_delete_on_close(&file, true) {
+                    return Err(io::Error::new(
+                        write_err.kind(),
+                        format!("{write_err}; failed to schedule staged file cleanup: {cleanup_err}"),
+                    ));
+                }
+                return Err(write_err);
             }
-            set_windows_file_delete_on_close(&file, false)?;
             if let Err(rename_err) = rename_windows_prepared(file_path, &self._directory_guard, &file, 0) {
                 if let Err(cleanup_err) = set_windows_file_delete_on_close(&file, true) {
                     return Err(io::Error::new(
