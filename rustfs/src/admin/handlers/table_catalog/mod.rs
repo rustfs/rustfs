@@ -1353,14 +1353,22 @@ fn namespace_from_path_value(value: &str) -> S3Result<crate::table_catalog::Name
         && !value.contains(REST_NAMESPACE_SEPARATOR)
         && !value.contains(REST_NAMESPACE_SEPARATOR_URL_ENCODED)
         && !value.contains("%1f");
-    let decoded = percent_decode_str(value)
-        .decode_utf8()
-        .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))?;
     // RUSTFS_COMPAT_TODO(table-catalog-dotted-namespace): Remove after the minimum supported release
     // advertises %1F; until then, keep dotted paths for clients using the legacy namespace contract.
     let segments = if legacy_dotted {
-        decoded.split('.').map(str::to_string).collect()
+        value
+            .split('.')
+            .map(|segment| {
+                percent_decode_str(segment)
+                    .decode_utf8()
+                    .map(|decoded| decoded.into_owned())
+                    .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))
+            })
+            .collect::<S3Result<Vec<_>>>()?
     } else {
+        let decoded = percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))?;
         decoded.split(REST_NAMESPACE_SEPARATOR).map(str::to_string).collect()
     };
     crate::table_catalog::Namespace::from_segments(segments)

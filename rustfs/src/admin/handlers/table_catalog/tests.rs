@@ -1273,7 +1273,14 @@ fn rest_pagination_rejects_malformed_token_payloads() {
 #[tokio::test]
 async fn namespace_listing_returns_direct_children_and_scopes_pagination_to_parent() {
     let store = TestTableCatalogStore::default();
-    for name in ["accounting.tax.paid", "accounting.ledger", "analytics.daily", "sales"] {
+    for name in [
+        "accounting",
+        "accounting.tax.paid",
+        "accounting.ledger",
+        "analytics",
+        "analytics.daily",
+        "sales",
+    ] {
         let namespace = crate::table_catalog::Namespace::parse(name).expect("namespace should parse");
         store.namespaces.lock().await.push(crate::table_catalog::NamespaceEntry {
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
