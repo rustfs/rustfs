@@ -1352,6 +1352,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_opts_normalizes_null_version_id() {
+        // MinIO-compatible replication senders (including RustFS itself since
+        // the P0-5 fix) address the null version as the literal "null" in the
+        // versionId query; the PUT / CreateMultipartUpload receive path must
+        // normalize it to the internal nil-UUID representation, exactly like
+        // get_opts / del_opts already do.
+        let headers = create_test_headers();
+
+        let opts = put_opts("test-bucket", "test-object", Some("null".to_string()), &headers, HashMap::new())
+            .await
+            .expect("PUT with versionId=null must be accepted as the null version");
+
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
     async fn test_copy_dst_opts() {
         let headers = create_test_headers();
         let metadata = create_test_metadata();
