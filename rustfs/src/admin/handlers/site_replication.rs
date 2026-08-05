@@ -13683,7 +13683,7 @@ mod tests {
     fn test_site_replication_peer_wire_path_matches_minio_routes() {
         assert_eq!(
             site_replication_peer_wire_path(SITE_REPLICATION_PEER_JOIN_PATH),
-            "/minio/admin/v3/site-replication/join"
+            "/minio/admin/v3/site-replication/peer/join"
         );
         assert_eq!(
             site_replication_peer_wire_path("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
@@ -13697,10 +13697,13 @@ mod tests {
 
     #[test]
     fn test_site_replication_peer_payload_encryption_matches_minio_contract() {
-        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
+        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/join"));
         assert!(site_replication_peer_payload_encrypted(
-            "/minio/admin/v3/site-replication/join?replicateILMExpiry=true"
+            "/minio/admin/v3/site-replication/peer/join?bootstrapToken=token"
         ));
+        // The outbound rewrite no longer produces the legacy `/site-replication/join`
+        // path; it must not be treated as an encrypted MinIO route.
+        assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
         assert!(!site_replication_peer_payload_encrypted(
             "/minio/admin/v3/site-replication/peer/bucket-meta"
         ));
