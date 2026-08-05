@@ -14,6 +14,57 @@
 
 use super::*;
 
+pub(super) fn validate_namespace_entry_object(
+    paths: &TableCatalogObjectPaths,
+    object: &str,
+    entry: &NamespaceEntry,
+) -> TableCatalogStoreResult<()> {
+    let namespace = validate_namespace_entry_identity(entry)?;
+    if paths.namespace_entry_path(&entry.table_bucket, &namespace) != object {
+        return Err(TableCatalogStoreError::Invalid(
+            "catalog namespace entry identity does not match its object path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_table_entry_object(
+    paths: &TableCatalogObjectPaths,
+    object: &str,
+    entry: &TableEntry,
+) -> TableCatalogStoreResult<Namespace> {
+    validate_catalog_entry_version("table", entry.version)?;
+    let namespace = parse_namespace_for_store(&entry.namespace)?;
+    let table = parse_table_for_store(&entry.table)?;
+    if paths.table_entry_path(&entry.table_bucket, &namespace, &table) != object {
+        return Err(TableCatalogStoreError::Invalid(
+            "catalog table entry identity does not match its object path".to_string(),
+        ));
+    }
+    Ok(namespace)
+}
+
+pub(super) fn validate_view_entry_object(
+    paths: &TableCatalogObjectPaths,
+    object: &str,
+    entry: &ViewEntry,
+) -> TableCatalogStoreResult<Namespace> {
+    validate_catalog_entry_version("view", entry.version)?;
+    let namespace = parse_namespace_for_store(&entry.namespace)?;
+    let view = parse_table_for_store(&entry.view)?;
+    if paths.view_entry_path(&entry.table_bucket, &namespace, &view) != object {
+        return Err(TableCatalogStoreError::Invalid(
+            "catalog view entry identity does not match its object path".to_string(),
+        ));
+    }
+    Ok(namespace)
+}
+
+struct ActiveNamespaceEvidence {
+    namespace: Namespace,
+    explicit_entry: Option<NamespaceEntry>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ObjectTableCatalogStore<B> {
     pub(in crate::table_catalog) backend: B,
@@ -35,15 +86,19 @@ where
         RUSTFS_META_BUCKET
     }
 
-    async fn list_entry_page<T>(
+    async fn list_entry_page<T, P, V>(
         &self,
         prefix: &str,
         entry_file: &str,
         cursor: Option<&str>,
         limit: NonZeroUsize,
+        include: P,
+        validate: V,
     ) -> TableCatalogStoreResult<TableCatalogListPage<T>>
     where
         T: DeserializeOwned,
+        P: Fn(&T) -> bool,
+        V: Fn(&str, &T) -> TableCatalogStoreResult<()>,
     {
         let cursor = catalog_list_cursor(cursor, OBJECT_CATALOG_LIST_CURSOR_PREFIX)?;
         if cursor.is_some_and(|cursor| !cursor.starts_with(prefix)) {
@@ -88,6 +143,10 @@ where
             let Some((entry, _)) = self.read_entry::<T>(self.catalog_bucket(), &object).await? else {
                 continue;
             };
+            validate(&object, &entry)?;
+            if !include(&entry) {
+                continue;
+            }
             last_entry_path = Some(object);
             entries.push(entry);
         }
@@ -98,6 +157,281 @@ where
             None
         };
         Ok(TableCatalogListPage { entries, next_cursor })
+    }
+
+    async fn read_active_namespace_evidence(&self, object: &str) -> TableCatalogStoreResult<Option<ActiveNamespaceEvidence>> {
+        if object.ends_with(NAMESPACE_ENTRY_FILE) {
+            let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), object).await? else {
+                return Ok(None);
+            };
+            validate_namespace_entry_object(&self.paths, object, &entry)?;
+            if entry.state != TableCatalogEntryState::Active {
+                return Ok(None);
+            }
+            return Ok(Some(ActiveNamespaceEvidence {
+                namespace: parse_namespace_for_store(&entry.namespace)?,
+                explicit_entry: Some(entry),
+            }));
+        }
+        if object.ends_with(TABLE_ENTRY_FILE) {
+            let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), object).await? else {
+                return Ok(None);
+            };
+            let namespace = validate_table_entry_object(&self.paths, object, &entry)?;
+            return Ok((entry.state == TableCatalogEntryState::Active).then_some(ActiveNamespaceEvidence {
+                namespace,
+                explicit_entry: None,
+            }));
+        }
+        if object.ends_with(VIEW_ENTRY_FILE) {
+            let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), object).await? else {
+                return Ok(None);
+            };
+            let namespace = validate_view_entry_object(&self.paths, object, &entry)?;
+            return Ok((entry.state == TableCatalogEntryState::Active).then_some(ActiveNamespaceEvidence {
+                namespace,
+                explicit_entry: None,
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn has_active_namespace_object(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
+        let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
+        for prefix in [
+            self.paths.table_entries_prefix(table_bucket, namespace),
+            self.paths.view_entries_prefix(table_bucket, namespace),
+        ] {
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .backend
+                    .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), scan_limit)
+                    .await?;
+                let last_scanned = page.objects.last().cloned();
+                for object in page.objects {
+                    if self
+                        .read_active_namespace_evidence(&object)
+                        .await?
+                        .is_some_and(|evidence| evidence.namespace == *namespace)
+                    {
+                        return Ok(true);
+                    }
+                }
+                if !page.is_truncated {
+                    break;
+                }
+                let next = last_scanned.ok_or_else(|| {
+                    TableCatalogStoreError::Internal("catalog namespace object scan made no progress".to_string())
+                })?;
+                if cursor.as_deref().is_some_and(|cursor| next.as_str() <= cursor) {
+                    return Err(TableCatalogStoreError::Internal(
+                        "catalog namespace object scan did not advance".to_string(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn has_active_namespace_descendant(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
+        let parent = namespace.public_name();
+        let descendant_prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), namespace.storage_id());
+        let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
+        let mut cursor = None;
+        loop {
+            let page = self
+                .backend
+                .list_objects_page(self.catalog_bucket(), &descendant_prefix, cursor.as_deref(), scan_limit)
+                .await?;
+            let last_scanned = page.objects.last().cloned();
+            for object in page.objects {
+                if self
+                    .read_active_namespace_evidence(&object)
+                    .await?
+                    .is_some_and(|evidence| namespace_is_descendant(&evidence.namespace.public_name(), &parent))
+                {
+                    return Ok(true);
+                }
+            }
+            if !page.is_truncated {
+                return Ok(false);
+            }
+            let next = last_scanned.ok_or_else(|| {
+                TableCatalogStoreError::Internal("catalog namespace descendant scan made no progress".to_string())
+            })?;
+            if cursor.as_deref().is_some_and(|cursor| next.as_str() <= cursor) {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog namespace descendant scan did not advance".to_string(),
+                ));
+            }
+            cursor = Some(next);
+        }
+    }
+
+    async fn require_active_namespace_unlocked(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        namespace_path: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let current = self
+            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), namespace_path)
+            .await?;
+        if let Some((entry, _)) = current.as_ref() {
+            validate_namespace_entry_object(&self.paths, namespace_path, entry)?;
+            if entry.state == TableCatalogEntryState::Active {
+                return Ok(());
+            }
+        }
+        if !self.has_active_namespace_object(table_bucket, namespace).await?
+            && !self.has_active_namespace_descendant(table_bucket, namespace).await?
+        {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {table_bucket}/{}",
+                namespace.public_name()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_namespace_children_page_inner(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        let parent = parent.map(parse_namespace_for_store).transpose()?;
+        if let Some(parent) = parent.as_ref()
+            && self
+                .get_namespace(table_bucket, &parent.public_name())
+                .await?
+                .is_none_or(|entry| entry.state != TableCatalogEntryState::Active)
+        {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {table_bucket}/{}",
+                parent.public_name()
+            )));
+        }
+
+        let namespace_prefix = self.paths.namespace_entries_prefix(table_bucket);
+        let scan_prefix = match parent.as_ref() {
+            Some(parent) => format!("{namespace_prefix}{}/", parent.storage_id()),
+            None => namespace_prefix,
+        };
+        let mut scan_cursor = catalog_list_cursor(cursor, OBJECT_CATALOG_LIST_CURSOR_PREFIX)?.map(str::to_string);
+        if scan_cursor.as_ref().is_some_and(|cursor| !cursor.starts_with(&scan_prefix)) {
+            return Err(TableCatalogStoreError::Invalid(
+                "page cursor does not match this namespace child list operation".to_string(),
+            ));
+        }
+        let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
+        let mut children = Vec::with_capacity(limit.get().saturating_add(1));
+
+        loop {
+            let page = self
+                .backend
+                .list_objects_page(self.catalog_bucket(), &scan_prefix, scan_cursor.as_deref(), scan_limit)
+                .await?;
+            let last_scanned = page.objects.last().cloned();
+            let mut current_segment = None;
+            let mut current_segment_visible = false;
+
+            for object in page.objects {
+                let Some(relative) = object.strip_prefix(&scan_prefix) else {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "catalog namespace child object is outside its list prefix".to_string(),
+                    ));
+                };
+                let Some((segment, _)) = relative.split_once('/') else {
+                    continue;
+                };
+                if current_segment.as_deref() != Some(segment) {
+                    current_segment = Some(segment.to_string());
+                    current_segment_visible = false;
+                }
+                if current_segment_visible {
+                    continue;
+                }
+                let Some(evidence) = self.read_active_namespace_evidence(&object).await? else {
+                    continue;
+                };
+                let namespace = evidence.namespace;
+                if parent
+                    .as_ref()
+                    .is_some_and(|parent| !namespace.segments().starts_with(parent.segments()))
+                {
+                    continue;
+                }
+                let parent_depth = parent.as_ref().map_or(0, |parent| parent.segments().len());
+                if namespace.segments().len() <= parent_depth || namespace.segments()[parent_depth].as_str() != segment {
+                    continue;
+                }
+                let child = Namespace::from_segments(
+                    namespace.segments()[..=parent_depth]
+                        .iter()
+                        .map(|segment| segment.as_str().to_string())
+                        .collect(),
+                )
+                .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid catalog namespace child: {err}")))?;
+                let child_entry = evidence
+                    .explicit_entry
+                    .filter(|_| namespace == child)
+                    .unwrap_or_else(|| synthetic_namespace_entry(table_bucket, &child));
+                let child_cursor = format!("{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{scan_prefix}{segment}/\u{10ffff}");
+                children.push((child_entry, child_cursor));
+                current_segment_visible = true;
+                if children.len() > limit.get() {
+                    let next_cursor = children.get(limit.get().saturating_sub(1)).map(|(_, cursor)| cursor.clone());
+                    children.truncate(limit.get());
+                    return Ok(TableCatalogListPage {
+                        entries: children.into_iter().map(|(entry, _)| entry).collect(),
+                        next_cursor,
+                    });
+                }
+            }
+
+            if !page.is_truncated {
+                return Ok(TableCatalogListPage {
+                    entries: children.into_iter().map(|(entry, _)| entry).collect(),
+                    next_cursor: None,
+                });
+            }
+            let next = match (current_segment_visible, current_segment) {
+                (true, Some(segment)) => format!("{scan_prefix}{segment}/\u{10ffff}"),
+                _ => last_scanned.ok_or_else(|| {
+                    TableCatalogStoreError::Internal("catalog namespace child scan made no progress".to_string())
+                })?,
+            };
+            if scan_cursor.as_deref().is_some_and(|cursor| next.as_str() <= cursor) {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog namespace child scan did not advance".to_string(),
+                ));
+            }
+            scan_cursor = Some(next);
+        }
+    }
+
+    async fn list_active_namespaces_with_prefix(&self, prefix: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let mut entries = Vec::new();
+        for object in self.backend.list_objects(self.catalog_bucket(), prefix).await? {
+            if !object.ends_with(NAMESPACE_ENTRY_FILE) {
+                continue;
+            }
+            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await? {
+                validate_namespace_entry_object(&self.paths, &object, &entry)?;
+                if entry.state == TableCatalogEntryState::Active {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        Ok(entries)
     }
 
     pub(in crate::table_catalog) async fn read_entry<T>(
@@ -534,31 +868,26 @@ where
         if self.read_warehouse_index_state_unlocked(table_bucket).await? {
             return Ok(());
         }
-        for namespace in self.list_namespaces(table_bucket).await? {
-            if namespace.state != TableCatalogEntryState::Active {
+        for table in self.list_all_tables(table_bucket).await? {
+            if table.state != TableCatalogEntryState::Active {
                 continue;
             }
-            for table in self.list_tables(table_bucket, &namespace.namespace).await? {
-                if table.state != TableCatalogEntryState::Active {
+            if let Err(err) = self
+                .backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
+                .await
+            {
+                if matches!(&err, TableCatalogStoreError::Invalid(_)) {
+                    tracing::warn!(
+                        table_bucket = %table.table_bucket,
+                        namespace = %table.namespace,
+                        table = %table.table,
+                        table_id = %table.table_id,
+                        error = %err,
+                        "skipping invalid table warehouse location while backfilling warehouse index"
+                    );
                     continue;
                 }
-                if let Err(err) = self
-                    .backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
-                    .await
-                {
-                    if matches!(&err, TableCatalogStoreError::Invalid(_)) {
-                        tracing::warn!(
-                            table_bucket = %table.table_bucket,
-                            namespace = %table.namespace,
-                            table = %table.table,
-                            table_id = %table.table_id,
-                            error = %err,
-                            "skipping invalid table warehouse location while backfilling warehouse index"
-                        );
-                        continue;
-                    }
-                    return Err(err);
-                }
+                return Err(err);
             }
         }
         self.write_warehouse_index_state_unlocked(table_bucket).await
@@ -641,16 +970,8 @@ where
             .backend
             .acquire_write_lock(self.catalog_bucket(), &namespace_path)
             .await?;
-        if self
-            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
-            .await?
-            .is_none()
-        {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                entry.table_bucket, entry.namespace
-            )));
-        }
+        self.require_active_namespace_unlocked(&entry.table_bucket, &namespace, &namespace_path)
+            .await?;
         let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
         let _table_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
         let reservation = self.reserve_table_warehouse_index(&entry).await?;
@@ -676,16 +997,8 @@ where
             .backend
             .acquire_write_lock(self.catalog_bucket(), &namespace_path)
             .await?;
-        if self
-            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
-            .await?
-            .is_none()
-        {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                entry.table_bucket, entry.namespace
-            )));
-        }
+        self.require_active_namespace_unlocked(&entry.table_bucket, &namespace, &namespace_path)
+            .await?;
         let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &view);
         let _view_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &view_path).await?;
         self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
@@ -3164,33 +3477,38 @@ where
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
-        validate_catalog_entry_version("namespace", entry.version)?;
+        let namespace = validate_namespace_entry_identity(&entry)?;
+        validate_namespace_properties(&entry.properties)?;
         self.require_table_bucket(&entry.table_bucket).await?;
-        let namespace = parse_namespace_for_store(&entry.namespace)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
         let bucket_path = self.paths.table_bucket_entry_path(&entry.table_bucket);
         let _bucket_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?;
         let object = self.paths.namespace_entry_path(&entry.table_bucket, &namespace);
-        self.write_entry(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
+        let _namespace_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
+        let precondition = match self
+            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &object)
+            .await?
+        {
+            Some((current, etag)) => {
+                validate_namespace_entry_object(&self.paths, &object, &current)?;
+                if current.state == TableCatalogEntryState::Active {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "catalog object already exists: namespace {}/{}",
+                        entry.table_bucket, entry.namespace
+                    )));
+                }
+                etag.map(TableCatalogPutPrecondition::IfMatch)
+                    .ok_or_else(|| TableCatalogStoreError::Internal(format!("catalog namespace entry has no etag: {object}")))?
+            }
+            None => TableCatalogPutPrecondition::IfAbsent,
+        };
+        self.write_entry_unlocked(self.catalog_bucket(), &object, &entry, precondition)
             .await
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
-        let mut entries = Vec::new();
-        for object in self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
-            .await?
-        {
-            if !object.ends_with(NAMESPACE_ENTRY_FILE) {
-                continue;
-            }
-            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await? {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-        Ok(entries)
+        self.list_active_namespaces_with_prefix(&self.paths.namespace_entries_prefix(table_bucket))
+            .await
     }
 
     async fn list_namespaces_page(
@@ -3199,15 +3517,82 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
-        self.list_entry_page(&self.paths.namespace_entries_prefix(table_bucket), NAMESPACE_ENTRY_FILE, cursor, limit)
-            .await
+        self.list_entry_page(
+            &self.paths.namespace_entries_prefix(table_bucket),
+            NAMESPACE_ENTRY_FILE,
+            cursor,
+            limit,
+            |entry: &NamespaceEntry| entry.state == TableCatalogEntryState::Active,
+            |object, entry: &NamespaceEntry| validate_namespace_entry_object(&self.paths, object, entry),
+        )
+        .await
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
-        self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, &namespace);
+        let exact = self
+            .read_entry::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
+            .await?
+            .map(|(entry, _)| entry);
+        if let Some(entry) = exact.as_ref() {
+            validate_namespace_entry_object(&self.paths, &namespace_path, entry)?;
+        }
+        if exact
+            .as_ref()
+            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+        {
+            return Ok(exact);
+        }
+        if self.has_active_namespace_object(table_bucket, &namespace).await?
+            || self.has_active_namespace_descendant(table_bucket, &namespace).await?
+        {
+            return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
+        }
+        Ok(None)
+    }
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let parent = parse_namespace_for_store(parent)?;
+        let prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), parent.storage_id());
+        self.list_active_namespaces_with_prefix(&prefix).await
+    }
+
+    async fn list_namespace_children(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+    ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog namespace list limit must be positive".to_string()))?;
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_namespace_children_page_inner(table_bucket, parent, cursor.as_deref(), limit)
+                .await?;
+            entries.extend(page.entries);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(entries);
+            };
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog namespace child pagination did not advance".to_string(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+
+    async fn list_namespace_children_page(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        self.list_namespace_children_page_inner(table_bucket, parent, cursor, limit)
             .await
-            .map(|entry| entry.map(|(namespace, _)| namespace))
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
@@ -3221,11 +3606,30 @@ where
             .backend
             .acquire_write_lock(self.catalog_bucket(), &namespace_path)
             .await?;
-        if self
+        if self.has_active_namespace_descendant(table_bucket, &namespace).await? {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "namespace {table_bucket}/{} has child namespaces",
+                namespace.public_name()
+            )));
+        }
+        if self.has_active_namespace_object(table_bucket, &namespace).await? {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "namespace {table_bucket}/{} is not empty",
+                namespace.public_name()
+            )));
+        }
+        let current = self
             .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
-            .await?
-            .is_none()
-        {
+            .await?;
+        let Some((current, _)) = current else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {}/{}",
+                table_bucket,
+                namespace.public_name()
+            )));
+        };
+        validate_namespace_entry_object(&self.paths, &namespace_path, &current)?;
+        if current.state != TableCatalogEntryState::Active {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
                 table_bucket,
@@ -3278,6 +3682,26 @@ where
         Ok(entries)
     }
 
+    async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        let mut entries = Vec::new();
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
+            .await?
+        {
+            if !object.ends_with(TABLE_ENTRY_FILE) {
+                continue;
+            }
+            let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            validate_table_entry_object(&self.paths, &object, &entry)?;
+            entries.push(entry);
+        }
+        entries.sort_by(|left, right| (&left.namespace, &left.table).cmp(&(&right.namespace, &right.table)));
+        Ok(entries)
+    }
+
     async fn list_tables_page(
         &self,
         table_bucket: &str,
@@ -3291,6 +3715,8 @@ where
             TABLE_ENTRY_FILE,
             cursor,
             limit,
+            |_: &TableEntry| true,
+            |_, _: &TableEntry| Ok(()),
         )
         .await
     }
@@ -3698,8 +4124,15 @@ where
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
-        self.list_entry_page(&self.paths.view_entries_prefix(table_bucket, &namespace), VIEW_ENTRY_FILE, cursor, limit)
-            .await
+        self.list_entry_page(
+            &self.paths.view_entries_prefix(table_bucket, &namespace),
+            VIEW_ENTRY_FILE,
+            cursor,
+            limit,
+            |_: &ViewEntry| true,
+            |_, _: &ViewEntry| Ok(()),
+        )
+        .await
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {

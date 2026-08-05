@@ -40,18 +40,28 @@ impl Namespace {
     pub const MAX_LEN: usize = 512;
 
     pub fn parse(value: &str) -> Result<Self, CatalogIdentifierError> {
-        if value.is_empty() {
-            return Err(CatalogIdentifierError::Empty);
-        }
         if value.len() > Self::MAX_LEN {
             return Err(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN });
         }
+        Self::from_segments(value.split('.').map(str::to_string).collect())
+    }
 
-        let mut segments = Vec::new();
-        for segment in value.split('.') {
-            segments.push(IdentifierSegment::parse(segment.to_string())?);
+    pub(crate) fn from_segments(values: Vec<String>) -> Result<Self, CatalogIdentifierError> {
+        if values.is_empty() {
+            return Err(CatalogIdentifierError::Empty);
+        }
+        let value_len = values
+            .iter()
+            .try_fold(values.len().saturating_sub(1), |length, value| length.checked_add(value.len()))
+            .ok_or(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN })?;
+        if value_len > Self::MAX_LEN {
+            return Err(CatalogIdentifierError::NamespaceTooLong { max: Self::MAX_LEN });
         }
 
+        let segments = values
+            .into_iter()
+            .map(IdentifierSegment::parse)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { segments })
     }
 

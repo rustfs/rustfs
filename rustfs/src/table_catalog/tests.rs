@@ -234,6 +234,10 @@ impl TableCatalogStore for NoopTableCatalogStore {
         Ok(Vec::new())
     }
 
+    async fn list_all_tables(&self, _table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        Ok(Vec::new())
+    }
+
     async fn load_table(
         &self,
         _table_bucket: &str,
@@ -1455,6 +1459,50 @@ async fn table_data_plane_resource_skips_stale_deeper_index_and_matches_parent()
     assert_eq!(resource.table, "orders");
     assert_eq!(resource.warehouse_object_prefix, "tables/table-id/");
     assert_eq!(backend.list_call_count().await, 0);
+}
+
+#[tokio::test]
+async fn object_catalog_rebuilds_warehouse_index_for_table_backed_namespace() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.namespace_entry_path(bucket, &namespace))
+        .await
+        .expect("namespace marker should be removed");
+
+    let scanned = scan_table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("resource scan should succeed")
+        .expect("table entry should keep its namespace discoverable");
+    assert_eq!(scanned.table, "orders");
+
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+        .await
+        .expect("warehouse index entry should be removed");
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_state_path(bucket))
+        .await
+        .expect("warehouse index state should be removed");
+
+    let rebuilt = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("resource lookup should rebuild the index")
+        .expect("rebuilt index should resolve the table");
+    assert_eq!(rebuilt.table, "orders");
+    assert!(
+        store
+            .warehouse_index_ready(bucket)
+            .await
+            .expect("warehouse index state should load")
+    );
 }
 
 #[tokio::test]
@@ -6055,7 +6103,7 @@ async fn durable_strong_migration_dry_run_reports_ready_catalog_inventory() {
 }
 
 #[tokio::test]
-async fn durable_strong_migration_rejects_orphan_table_without_namespace() {
+async fn durable_strong_migration_preserves_table_backed_namespace() {
     let backend = TestCatalogObjectBackend::default();
     let object_store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -6073,27 +6121,51 @@ async fn durable_strong_migration_rejects_orphan_table_without_namespace() {
         object_store
             .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
-            .unwrap()
+            .expect("table-backed namespace lookup should succeed")
             .is_some()
     );
+    let dry_run = object_store
+        .plan_durable_strong_backing_migration(bucket)
+        .await
+        .expect("table-backed namespace dry run should succeed");
+    assert_eq!(dry_run.namespace_count, 0);
+    assert_eq!(dry_run.table_count, 1);
 
-    let error = object_store
+    let materialized = object_store
         .materialize_durable_strong_backing_migration(bucket)
         .await
-        .unwrap_err();
-    assert_matches!(
-        error,
-        TableCatalogStoreError::Invalid(message) if message.contains("table entry has no namespace entry")
+        .expect("table-backed namespace should migrate");
+    assert_eq!(materialized.namespace_count, 0);
+    assert_eq!(materialized.table_count, 1);
+    let strong_store = StrongTableCatalogStore::new(backend);
+    assert!(
+        strong_store
+            .get_namespace(bucket, &namespace.public_name())
+            .await
+            .expect("table-backed namespace should load")
+            .is_some()
     );
-    object_store
-        .create_namespace(test_namespace_entry(bucket, &namespace))
-        .await
-        .expect("failed migration must leave source catalog writable");
-    object_store.put_table_bucket(test_bucket_entry("research")).await.unwrap();
+    assert!(
+        strong_store
+            .load_table(bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("migrated table should load")
+            .is_some()
+    );
+    assert_eq!(
+        strong_store
+            .list_namespace_children(bucket, None)
+            .await
+            .expect("table-backed namespace children should list")
+            .iter()
+            .map(|entry| entry.namespace.as_str())
+            .collect::<Vec<_>>(),
+        ["sales"]
+    );
 }
 
 #[tokio::test]
-async fn durable_strong_migration_rejects_orphan_view_without_namespace() {
+async fn durable_strong_migration_preserves_view_backed_namespace() {
     let backend = TestCatalogObjectBackend::default();
     let object_store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -6121,22 +6193,37 @@ async fn durable_strong_migration_rejects_orphan_view_without_namespace() {
         object_store
             .load_view(bucket, &namespace.public_name(), view.as_str())
             .await
-            .unwrap()
+            .expect("view-backed namespace lookup should succeed")
             .is_some()
     );
+    let dry_run = object_store
+        .plan_durable_strong_backing_migration(bucket)
+        .await
+        .expect("view-backed namespace dry run should succeed");
+    assert_eq!(dry_run.namespace_count, 0);
+    assert_eq!(dry_run.view_count, 1);
 
-    let error = object_store
+    let materialized = object_store
         .materialize_durable_strong_backing_migration(bucket)
         .await
-        .unwrap_err();
-    assert_matches!(
-        error,
-        TableCatalogStoreError::Invalid(message) if message.contains("view entry has no namespace entry")
+        .expect("view-backed namespace should migrate");
+    assert_eq!(materialized.namespace_count, 0);
+    assert_eq!(materialized.view_count, 1);
+    let strong_store = StrongTableCatalogStore::new(backend);
+    assert!(
+        strong_store
+            .get_namespace(bucket, &namespace.public_name())
+            .await
+            .expect("view-backed namespace should load")
+            .is_some()
     );
-    object_store
-        .create_namespace(test_namespace_entry(bucket, &namespace))
-        .await
-        .expect("failed migration must leave source catalog writable");
+    assert!(
+        strong_store
+            .load_view(bucket, &namespace.public_name(), view.as_str())
+            .await
+            .expect("migrated view should load")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -6558,10 +6645,16 @@ async fn durable_strong_migration_dry_run_reports_recovery_blockers() {
         .paths
         .commit_idempotency_entry_path(bucket, "table-id", "client-request");
     backend.delete_object(RUSTFS_META_BUCKET, &idempotency_path).await.unwrap();
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.namespace_entry_path(bucket, &namespace))
+        .await
+        .unwrap();
 
     let report = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
 
     assert_eq!(report.status, TableCatalogBackingMigrationStatus::RecoveryRequired);
+    assert_eq!(report.namespace_count, 0);
+    assert_eq!(report.table_count, 1);
     assert_eq!(report.commit_log_count, 1);
     assert_eq!(report.idempotency_index_count, 0);
     assert!(
@@ -8558,6 +8651,800 @@ fn namespace_length_is_bounded_for_catalog_paths_and_page_tokens() {
         Namespace::parse(&namespace),
         Err(CatalogIdentifierError::NamespaceTooLong { max: Namespace::MAX_LEN })
     );
+}
+
+#[test]
+fn namespace_from_segments_preserves_rest_boundaries_and_length_limit() {
+    let namespace = Namespace::from_segments(vec!["analytics".to_string(), "daily_events".to_string()])
+        .expect("multipart namespace should parse");
+    assert_eq!(namespace.public_name(), "analytics.daily_events");
+    assert_eq!(synthetic_namespace_entry("warehouse", &namespace).namespace_id, "analytics/daily_events");
+    assert!(Namespace::from_segments(vec!["analytics.daily_events".to_string()]).is_err());
+
+    let mut segments = vec!["a".repeat(63); 8];
+    segments[0].push('a');
+    Namespace::from_segments(segments.clone()).expect("namespace at the maximum length should parse");
+    segments.push("a".to_string());
+    assert_eq!(
+        Namespace::from_segments(segments),
+        Err(CatalogIdentifierError::NamespaceTooLong { max: Namespace::MAX_LEN })
+    );
+}
+
+#[test]
+fn namespace_property_update_and_limits_reject_ambiguous_or_oversized_state() {
+    let overlap = NamespacePropertiesUpdate::try_new(
+        vec!["owner".to_string()],
+        BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+    )
+    .expect_err("overlapping update should fail");
+    assert_matches!(overlap, NamespacePropertiesUpdateError::Overlap(key) if key == "owner");
+
+    let duplicate = NamespacePropertiesUpdate::try_new(vec!["owner".to_string(), "owner".to_string()], BTreeMap::new())
+        .expect_err("duplicate removal should fail");
+    assert_matches!(duplicate, NamespacePropertiesUpdateError::DuplicateRemoval(key) if key == "owner");
+
+    let mut exact_total = BTreeMap::new();
+    for index in 0..15 {
+        exact_total.insert(format!("k{index:02}"), "v".repeat(NAMESPACE_PROPERTY_VALUE_MAX_LEN));
+    }
+    let used = exact_total.iter().map(|(key, value)| key.len() + value.len()).sum::<usize>();
+    let final_key = "k15".to_string();
+    exact_total.insert(
+        final_key.clone(),
+        "v".repeat(NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES - used - final_key.len()),
+    );
+    assert!(validate_namespace_properties(&exact_total).is_ok());
+
+    exact_total
+        .get_mut(&final_key)
+        .expect("final property should exist")
+        .push('v');
+    assert_matches!(validate_namespace_properties(&exact_total), Err(TableCatalogStoreError::Invalid(_)));
+    assert_matches!(
+        validate_namespace_properties(&BTreeMap::from([(String::new(), "value".to_string())])),
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_matches!(
+        validate_namespace_properties(&BTreeMap::from([("k".repeat(NAMESPACE_PROPERTY_KEY_MAX_LEN + 1), "value".to_string(),)])),
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_matches!(
+        validate_namespace_properties(&BTreeMap::from([
+            ("owner".to_string(), "v".repeat(NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1),)
+        ])),
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    let too_many = (0..=NAMESPACE_PROPERTIES_MAX_ENTRIES)
+        .map(|index| (format!("key{index}"), "value".to_string()))
+        .collect();
+    assert_matches!(validate_namespace_properties(&too_many), Err(TableCatalogStoreError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn configured_object_catalog_rejects_namespace_property_update_without_mutation() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ConfiguredTableCatalogStore::new(backend, TableCatalogBackingMode::ObjectBacked);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let mut entry = test_namespace_entry(bucket, &namespace);
+    entry.properties = BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]);
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+    store.create_namespace(entry).await.expect("namespace should be created");
+
+    let result = store
+        .update_namespace_properties(
+            bucket,
+            "sales",
+            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect_err("object-backed namespace property update should be unsupported");
+    assert_matches!(result, TableCatalogStoreError::Unsupported(_));
+    let stored = store
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("namespace lookup should succeed")
+        .expect("namespace should remain");
+    assert_eq!(stored.properties.get("owner").map(String::as_str), Some("lakehouse"));
+}
+
+#[tokio::test]
+async fn strong_catalog_namespace_property_update_survives_restart_and_failed_write() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket entry should be seeded");
+    let mut entry = test_namespace_entry(bucket, &namespace);
+    entry.properties.insert("owner".to_string(), "lakehouse".to_string());
+    store.create_namespace(entry).await.expect("namespace should be created");
+
+    let result = store
+        .update_namespace_properties(
+            bucket,
+            "sales",
+            NamespacePropertiesUpdate::try_new(
+                vec!["missing".to_string()],
+                BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+            )
+            .expect("namespace update should validate"),
+        )
+        .await
+        .expect("namespace properties should update");
+    assert_eq!(result.updated, vec!["owner".to_string()]);
+    assert_eq!(result.missing, vec!["missing".to_string()]);
+
+    let restarted = StrongTableCatalogStore::new(backend.clone());
+    let stored = restarted
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("namespace lookup after restart should succeed")
+        .expect("namespace should survive restart");
+    assert_eq!(stored.properties.get("owner").map(String::as_str), Some("platform"));
+
+    backend
+        .fail_next_put(
+            RUSTFS_META_BUCKET,
+            &StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+        )
+        .await;
+    let no_op = restarted
+        .update_namespace_properties(
+            bucket,
+            "sales",
+            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect("unchanged namespace properties should not write a snapshot");
+    assert_eq!(no_op.updated, vec!["owner".to_string()]);
+    let error = restarted
+        .update_namespace_properties(
+            bucket,
+            "sales",
+            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "failed-update".to_string())]))
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect_err("failed snapshot write should fail namespace update");
+    assert_matches!(error, TableCatalogStoreError::Internal(_));
+
+    let after_failure = StrongTableCatalogStore::new(backend)
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("namespace lookup after failed write should succeed")
+        .expect("namespace should remain");
+    assert_eq!(after_failure.properties.get("owner").map(String::as_str), Some("platform"));
+}
+
+#[tokio::test]
+async fn namespace_properties_load_legacy_values_but_reject_oversized_writes() {
+    let backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(backend.clone());
+    let strong_store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    object_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("object-backed bucket should be created");
+    strong_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("strong bucket should be created");
+
+    let mut oversized = test_namespace_entry(bucket, &namespace);
+    oversized
+        .properties
+        .insert("owner".to_string(), "x".repeat(NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1));
+    assert_matches!(
+        object_store.create_namespace(oversized.clone()).await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_matches!(
+        strong_store.create_namespace(oversized.clone()).await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &object_store.paths.namespace_entry_path(bucket, &namespace),
+            serde_json::to_vec(&oversized).expect("legacy namespace should serialize"),
+        )
+        .await;
+    let legacy = object_store
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("legacy namespace lookup should succeed")
+        .expect("legacy namespace should remain readable");
+    assert_eq!(
+        legacy.properties.get("owner").map(String::len),
+        Some(NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1)
+    );
+
+    strong_store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    assert_matches!(
+        strong_store
+            .update_namespace_properties(
+                bucket,
+                "sales",
+                NamespacePropertiesUpdate::try_new(Vec::new(), oversized.properties)
+                    .expect("property update request should validate structurally"),
+            )
+            .await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    let stored = strong_store
+        .get_namespace(bucket, "sales")
+        .await
+        .expect("namespace lookup should succeed")
+        .expect("namespace should remain");
+    assert!(stored.properties.is_empty());
+}
+
+#[tokio::test]
+async fn object_catalog_rejects_mismatched_namespace_storage_identity() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales.daily").expect("namespace should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("object-backed bucket should be created");
+    let mut entry = test_namespace_entry(bucket, &namespace);
+    entry.namespace_id = "sales.daily".to_string();
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.namespace_entry_path(bucket, &namespace),
+            serde_json::to_vec(&entry).expect("namespace should serialize"),
+        )
+        .await;
+
+    assert_matches!(store.get_namespace(bucket, "sales.daily").await, Err(TableCatalogStoreError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn strong_catalog_rejects_mismatched_namespace_storage_identity() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales.daily").expect("namespace should parse");
+    let mut entry = test_namespace_entry(bucket, &namespace);
+    entry.namespace_id = "sales.daily".to_string();
+    let snapshot = StrongTableCatalogSnapshot {
+        version: STRONG_TABLE_CATALOG_SNAPSHOT_VERSION,
+        table_buckets: vec![test_bucket_entry(bucket)],
+        namespaces: vec![entry],
+        tables: Vec::new(),
+        views: Vec::new(),
+        commits: Vec::new(),
+        idempotency: Vec::new(),
+    };
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+            serde_json::to_vec(&snapshot).expect("strong snapshot should encode"),
+        )
+        .await;
+
+    assert_matches!(store.get_namespace(bucket, "sales.daily").await, Err(TableCatalogStoreError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn catalog_backings_expose_implicit_parents_and_protect_child_namespaces() {
+    let bucket = "analytics";
+    let parent = Namespace::parse("sales").expect("parent namespace should parse");
+    let child = Namespace::parse("sales.daily").expect("child namespace should parse");
+
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    object_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("object-backed bucket should be created");
+    object_store
+        .create_namespace(test_namespace_entry(bucket, &child))
+        .await
+        .expect("object-backed child namespace should be created");
+    let mut inactive_parent = test_namespace_entry(bucket, &parent);
+    inactive_parent.state = TableCatalogEntryState::Deleted;
+    object_backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &object_store.paths.namespace_entry_path(bucket, &parent),
+            serde_json::to_vec(&inactive_parent).expect("inactive parent should serialize"),
+        )
+        .await;
+    let implicit_parent = object_store
+        .get_namespace(bucket, &parent.public_name())
+        .await
+        .expect("object-backed parent lookup should succeed")
+        .expect("implicit object-backed parent should exist");
+    assert_eq!(implicit_parent.namespace, parent.public_name());
+    assert!(implicit_parent.properties.is_empty());
+    assert_matches!(
+        object_store.drop_namespace(bucket, &parent.public_name()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    object_store
+        .create_namespace(test_namespace_entry(bucket, &parent))
+        .await
+        .expect("inactive object-backed parent should be replaceable");
+    assert_eq!(
+        object_store
+            .list_namespaces_under(bucket, &parent.public_name())
+            .await
+            .expect("object-backed descendants should list")
+            .len(),
+        2
+    );
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
+    strong_store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("strong bucket should be created");
+    strong_store
+        .create_namespace(test_namespace_entry(bucket, &child))
+        .await
+        .expect("strong child namespace should be created");
+    let implicit_parent = strong_store
+        .get_namespace(bucket, &parent.public_name())
+        .await
+        .expect("strong parent lookup should succeed")
+        .expect("implicit strong parent should exist");
+    assert_eq!(implicit_parent.namespace, parent.public_name());
+    strong_store
+        .update_namespace_properties(
+            bucket,
+            &parent.public_name(),
+            NamespacePropertiesUpdate::try_new(Vec::new(), BTreeMap::from([("owner".to_string(), "platform".to_string())]))
+                .expect("namespace update should validate"),
+        )
+        .await
+        .expect("implicit strong parent should materialize on property update");
+    let restarted = StrongTableCatalogStore::new(strong_backend);
+    let materialized_parent = restarted
+        .get_namespace(bucket, &parent.public_name())
+        .await
+        .expect("materialized parent lookup should succeed")
+        .expect("materialized parent should exist");
+    assert_eq!(materialized_parent.properties.get("owner").map(String::as_str), Some("platform"));
+    assert_matches!(
+        restarted.drop_namespace(bucket, &parent.public_name()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+}
+
+#[tokio::test]
+async fn object_catalog_namespace_replacement_is_fenced_by_observed_etag() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+
+    let recreated = Namespace::parse("recreated").expect("namespace should parse");
+    let recreated_path = store.paths.namespace_entry_path(bucket, &recreated);
+    let mut inactive = test_namespace_entry(bucket, &recreated);
+    inactive.state = TableCatalogEntryState::Deleted;
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &recreated_path,
+            serde_json::to_vec(&inactive).expect("inactive namespace should serialize"),
+        )
+        .await;
+    let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &recreated_path).await;
+    let stale_store = store.clone();
+    let stale_entry = test_namespace_entry(bucket, &recreated);
+    let stale_recreate = tokio::spawn(async move { stale_store.create_namespace(stale_entry).await });
+    pause.wait_started().await;
+
+    let mut winner = test_namespace_entry(bucket, &recreated);
+    winner.properties.insert("owner".to_string(), "winner".to_string());
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &recreated_path,
+            serde_json::to_vec(&winner).expect("winning namespace should serialize"),
+        )
+        .await;
+    pause.release();
+    assert_matches!(
+        stale_recreate.await.expect("stale namespace recreation task should finish"),
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    let stored = store
+        .get_namespace(bucket, &recreated.public_name())
+        .await
+        .expect("winning namespace should load")
+        .expect("winning namespace should remain");
+    assert_eq!(stored.properties.get("owner").map(String::as_str), Some("winner"));
+}
+
+async fn assert_direct_namespace_child_contract<S>(store: &S, bucket: &str, cursor_prefix: &str)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    for name in ["alpha.deep.leaf", "alpha-beta", "beta", "sales.daily"] {
+        let namespace = Namespace::parse(name).expect("namespace should parse");
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+    }
+
+    let one = NonZeroUsize::new(1).expect("page size should be non-zero");
+    let first = store
+        .list_namespace_children_page(bucket, None, None, one)
+        .await
+        .expect("first root child page should load");
+    assert_eq!(
+        first.entries.iter().map(|entry| entry.namespace.as_str()).collect::<Vec<_>>(),
+        ["alpha-beta"]
+    );
+    let cursor = first.next_cursor.expect("first root child page should continue");
+    assert!(cursor.starts_with(cursor_prefix));
+    let second = store
+        .list_namespace_children_page(bucket, None, Some(&cursor), one)
+        .await
+        .expect("second root child page should load");
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| entry.namespace.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"]
+    );
+
+    let exact = store
+        .list_namespace_children_page(bucket, None, None, NonZeroUsize::new(4).expect("page size should be non-zero"))
+        .await
+        .expect("exact root child page should load");
+    assert_eq!(
+        exact.entries.iter().map(|entry| entry.namespace.as_str()).collect::<Vec<_>>(),
+        ["alpha-beta", "alpha", "beta", "sales"]
+    );
+    assert!(exact.next_cursor.is_none());
+
+    let truncated = store
+        .list_namespace_children_page(bucket, None, None, NonZeroUsize::new(3).expect("page size should be non-zero"))
+        .await
+        .expect("truncated root child page should load");
+    assert_eq!(truncated.entries.len(), 3);
+    let final_page = store
+        .list_namespace_children_page(bucket, None, truncated.next_cursor.as_deref(), one)
+        .await
+        .expect("final root child page should load");
+    assert_eq!(
+        final_page
+            .entries
+            .iter()
+            .map(|entry| entry.namespace.as_str())
+            .collect::<Vec<_>>(),
+        ["sales"]
+    );
+    assert!(final_page.next_cursor.is_none());
+
+    let children = store
+        .list_namespace_children(bucket, Some("alpha"))
+        .await
+        .expect("implicit parent children should list");
+    assert_eq!(children.iter().map(|entry| entry.namespace.as_str()).collect::<Vec<_>>(), ["alpha.deep"]);
+    let exact_child = store
+        .list_namespace_children_page(bucket, Some("alpha"), None, one)
+        .await
+        .expect("exact parent child page should load");
+    assert_eq!(exact_child.entries.len(), 1);
+    assert!(exact_child.next_cursor.is_none());
+    assert_matches!(
+        store
+            .list_namespace_children_page(bucket, Some("alpha"), Some(&cursor), one)
+            .await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_matches!(
+        store.list_namespace_children(bucket, Some("missing")).await,
+        Err(TableCatalogStoreError::NotFound(_))
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_page_direct_namespace_children_with_scoped_cursors() {
+    assert_direct_namespace_child_contract(
+        &ObjectTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "object-catalog",
+        OBJECT_CATALOG_LIST_CURSOR_PREFIX,
+    )
+    .await;
+    assert_direct_namespace_child_contract(
+        &StrongTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "strong-catalog",
+        STRONG_CATALOG_LIST_CURSOR_PREFIX,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn object_catalog_direct_child_page_skips_the_rest_of_a_visible_subtree() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+
+    for index in 0..=TABLE_CATALOG_LIST_MAX_KEYS {
+        let namespace = Namespace::parse(&format!("alpha.n{index:04}.leaf")).expect("namespace should parse");
+        let path = store.paths.namespace_entry_path(bucket, &namespace);
+        backend
+            .seed_object(
+                RUSTFS_META_BUCKET,
+                &path,
+                serde_json::to_vec(&test_namespace_entry(bucket, &namespace)).expect("namespace should serialize"),
+            )
+            .await;
+    }
+    let beta = Namespace::parse("beta").expect("namespace should parse");
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.namespace_entry_path(bucket, &beta),
+            serde_json::to_vec(&test_namespace_entry(bucket, &beta)).expect("namespace should serialize"),
+        )
+        .await;
+    backend.reset_call_counts().await;
+
+    let page = store
+        .list_namespace_children_page(bucket, None, None, NonZeroUsize::new(1).expect("page size should be non-zero"))
+        .await
+        .expect("direct child page should load");
+    assert_eq!(page.entries.iter().map(|entry| entry.namespace.as_str()).collect::<Vec<_>>(), ["alpha"]);
+    assert!(page.next_cursor.is_some());
+    assert_eq!(backend.read_call_count().await, 2);
+    assert_eq!(backend.list_call_count().await, 2);
+}
+
+async fn assert_implicit_parent_resources<S>(store: &S, bucket: &str)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    let table_parent = Namespace::parse("sales").expect("table parent should parse");
+    let view_parent = Namespace::parse("reports").expect("view parent should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+    let namespaces = store.list_namespaces(bucket).await.expect("explicit namespaces should list");
+    assert!(!namespaces.iter().any(|entry| entry.namespace == table_parent.public_name()));
+    assert!(!namespaces.iter().any(|entry| entry.namespace == view_parent.public_name()));
+    assert!(
+        store
+            .get_namespace(bucket, &table_parent.public_name())
+            .await
+            .expect("implicit table parent should load")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_namespace(bucket, &view_parent.public_name())
+            .await
+            .expect("implicit view parent should load")
+            .is_some()
+    );
+    assert!(
+        store
+            .load_table(bucket, &table_parent.public_name(), table.as_str())
+            .await
+            .expect("implicit parent table should load")
+            .is_some()
+    );
+    assert!(
+        store
+            .load_view(bucket, &view_parent.public_name(), view.as_str())
+            .await
+            .expect("implicit parent view should load")
+            .is_some()
+    );
+    let tables = store
+        .list_all_tables(bucket)
+        .await
+        .expect("table-backed namespaces should not hide tables");
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].namespace, table_parent.public_name());
+    assert_eq!(tables[0].table, table.as_str());
+}
+
+async fn create_resources_in_implicit_parents<S>(store: &S, bucket: &str)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    let table_parent = Namespace::parse("sales").expect("table parent should parse");
+    let table_child = Namespace::parse("sales.daily").expect("table child should parse");
+    let view_parent = Namespace::parse("reports").expect("view parent should parse");
+    let view_child = Namespace::parse("reports.daily").expect("view child should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &table_child))
+        .await
+        .expect("table child namespace should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &view_child))
+        .await
+        .expect("view child namespace should be created");
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &table_parent,
+            &table,
+            default_table_metadata_file_path(&table_parent, &table, "00001.metadata.json"),
+        ))
+        .await
+        .expect("table creation should accept its implicit parent");
+    store
+        .create_view(test_view_entry(
+            bucket,
+            &view_parent,
+            &view,
+            default_view_metadata_file_path(&view_parent, &view, "00001.view.json"),
+        ))
+        .await
+        .expect("view creation should accept its implicit parent");
+    assert_implicit_parent_resources(store, bucket).await;
+
+    store
+        .drop_namespace(bucket, &table_child.public_name())
+        .await
+        .expect("table child namespace should be removable");
+    store
+        .drop_namespace(bucket, &view_child.public_name())
+        .await
+        .expect("view child namespace should be removable");
+    assert_implicit_parent_resources(store, bucket).await;
+    let roots = store
+        .list_namespace_children(bucket, None)
+        .await
+        .expect("resource-backed root namespaces should list");
+    assert_eq!(
+        roots.iter().map(|entry| entry.namespace.as_str()).collect::<Vec<_>>(),
+        ["reports", "sales"]
+    );
+    assert_matches!(
+        store.drop_namespace(bucket, &table_parent.public_name()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+}
+
+async fn assert_inactive_namespace_rejects_resource_creation<S>(store: &S, bucket: &str)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    let namespace = Namespace::parse("inactive").expect("inactive namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+    let mut entry = test_namespace_entry(bucket, &namespace);
+    entry.state = TableCatalogEntryState::Deleted;
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(entry)
+        .await
+        .expect("inactive namespace marker should be seeded");
+    let table_error = store
+        .create_table(test_table_entry(
+            bucket,
+            &namespace,
+            &table,
+            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+        ))
+        .await
+        .expect_err("inactive namespace must reject table creation");
+    assert_matches!(table_error, TableCatalogStoreError::NotFound(_));
+    let view_error = store
+        .create_view(test_view_entry(
+            bucket,
+            &namespace,
+            &view,
+            default_view_metadata_file_path(&namespace, &view, "00001.view.json"),
+        ))
+        .await
+        .expect_err("inactive namespace must reject view creation");
+    assert_matches!(view_error, TableCatalogStoreError::NotFound(_));
+    assert!(
+        store
+            .list_namespaces(bucket)
+            .await
+            .expect("namespaces should list")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_keep_implicit_parents_implicit_during_resource_creation() {
+    let bucket = "analytics";
+    let object_store = ObjectTableCatalogStore::new(TestCatalogObjectBackend::default());
+    create_resources_in_implicit_parents(&object_store, bucket).await;
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
+    create_resources_in_implicit_parents(&strong_store, bucket).await;
+    let restarted = StrongTableCatalogStore::new(strong_backend);
+    assert_implicit_parent_resources(&restarted, bucket).await;
+}
+
+#[tokio::test]
+async fn strong_catalog_namespace_drop_rejects_retained_inactive_resources() {
+    let store = StrongTableCatalogStore::new(TestCatalogObjectBackend::default());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    let mut entry = test_table_entry(
+        bucket,
+        &namespace,
+        &table,
+        default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+    );
+    entry.state = TableCatalogEntryState::Deleted;
+    store.create_table(entry).await.expect("inactive table should be retained");
+
+    assert_matches!(
+        store.drop_namespace(bucket, &namespace.public_name()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_resource_creation_in_inactive_namespace() {
+    assert_inactive_namespace_rejects_resource_creation(
+        &ObjectTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "object-catalog",
+    )
+    .await;
+    assert_inactive_namespace_rejects_resource_creation(
+        &StrongTableCatalogStore::new(TestCatalogObjectBackend::default()),
+        "strong-catalog",
+    )
+    .await;
 }
 
 #[test]

@@ -17,6 +17,7 @@ use super::*;
 pub(in crate::table_catalog) type StrongNamespaceKey = (String, String);
 type StrongResourceKey = (String, String, String);
 type StrongCommitKey = (String, String, String);
+type StrongNamespaceChildKey = (String, String, String);
 type StrongWarehouseIndex = BTreeMap<String, BTreeMap<String, StrongResourceKey>>;
 
 #[derive(Clone, Default)]
@@ -25,6 +26,8 @@ pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) snapshot_etag: Option<String>,
     pub(super) table_buckets: BTreeMap<String, TableBucketEntry>,
     pub(in crate::table_catalog) namespaces: BTreeMap<StrongNamespaceKey, NamespaceEntry>,
+    namespace_children: BTreeMap<StrongNamespaceChildKey, String>,
+    namespace_objects: BTreeSet<StrongNamespaceKey>,
     pub(super) tables: BTreeMap<StrongResourceKey, TableEntry>,
     pub(super) views: BTreeMap<StrongResourceKey, ViewEntry>,
     pub(super) commits: BTreeMap<StrongCommitKey, CommitLogEntry>,
@@ -126,6 +129,93 @@ where
         (table_bucket.to_string(), namespace.public_name())
     }
 
+    fn has_active_namespace_descendant_locked(state: &StrongTableCatalogState, table_bucket: &str, parent: &str) -> bool {
+        let range_start = (table_bucket.to_string(), parent.to_string(), String::new());
+        state
+            .namespace_children
+            .range(range_start..)
+            .next()
+            .is_some_and(|((bucket, candidate_parent, _), _)| bucket == table_bucket && candidate_parent == parent)
+    }
+
+    fn namespace_exists_locked(state: &StrongTableCatalogState, table_bucket: &str, namespace: &Namespace) -> bool {
+        let key = Self::namespace_key(table_bucket, namespace);
+        state
+            .namespaces
+            .get(&key)
+            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            || state.namespace_objects.contains(&key)
+            || Self::has_active_namespace_descendant_locked(state, table_bucket, &namespace.public_name())
+    }
+
+    fn require_active_namespace_locked(
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+        namespace: &Namespace,
+    ) -> TableCatalogStoreResult<()> {
+        if Self::namespace_exists_locked(state, table_bucket, namespace) {
+            return Ok(());
+        }
+        Err(TableCatalogStoreError::NotFound(format!(
+            "namespace {table_bucket}/{}",
+            namespace.public_name()
+        )))
+    }
+
+    fn list_namespace_children_page_locked(
+        state: &StrongTableCatalogState,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        let parent = parent.map(parse_namespace_for_store).transpose()?;
+        let parent_name = parent.as_ref().map_or_else(String::new, Namespace::public_name);
+        if let Some(parent) = parent.as_ref() {
+            if !Self::namespace_exists_locked(state, table_bucket, parent) {
+                return Err(TableCatalogStoreError::NotFound(format!("namespace {table_bucket}/{parent_name}")));
+            }
+        }
+
+        let cursor = catalog_list_cursor(cursor, STRONG_CATALOG_LIST_CURSOR_PREFIX)?;
+        let start = match cursor {
+            Some(cursor) => {
+                let child = parse_namespace_for_store(cursor)?;
+                let parent_depth = parent.as_ref().map_or(0, |parent| parent.segments().len());
+                if child.segments().len() != parent_depth.saturating_add(1)
+                    || parent
+                        .as_ref()
+                        .is_some_and(|parent| !child.segments().starts_with(parent.segments()))
+                {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "page cursor does not match this namespace child list operation".to_string(),
+                    ));
+                }
+                let sort_key = format!("{}/", child.segments()[parent_depth].as_str());
+                Bound::Excluded((table_bucket.to_string(), parent_name.clone(), sort_key))
+            }
+            None => Bound::Included((table_bucket.to_string(), parent_name.clone(), String::new())),
+        };
+        let entries = state
+            .namespace_children
+            .range((start, Bound::Unbounded))
+            .take_while(|((bucket, candidate_parent, _), _)| bucket == table_bucket && candidate_parent == &parent_name)
+            .take(limit.get().saturating_add(1))
+            .map(|(_, child_name)| {
+                let child = parse_namespace_for_store(child_name)?;
+                Ok(state
+                    .namespaces
+                    .get(&Self::namespace_key(table_bucket, &child))
+                    .filter(|entry| entry.state == TableCatalogEntryState::Active)
+                    .cloned()
+                    .unwrap_or_else(|| synthetic_namespace_entry(table_bucket, &child)))
+            })
+            .collect::<TableCatalogStoreResult<Vec<_>>>()?;
+        Ok(finish_catalog_list_page(entries, limit, STRONG_CATALOG_LIST_CURSOR_PREFIX, |entry| {
+            &entry.namespace
+        }))
+    }
+
     fn table_key(table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> StrongResourceKey {
         (table_bucket.to_string(), namespace.public_name(), table.as_str().to_string())
     }
@@ -225,6 +315,12 @@ where
     fn remove_bucket_from_state_locked(state: &mut StrongTableCatalogState, table_bucket: &str) {
         state.table_buckets.remove(table_bucket);
         state.namespaces.retain(|(entry_bucket, _), _| entry_bucket != table_bucket);
+        state
+            .namespace_children
+            .retain(|(entry_bucket, _, _), _| entry_bucket != table_bucket);
+        state
+            .namespace_objects
+            .retain(|(entry_bucket, _)| entry_bucket != table_bucket);
         state.tables.retain(|(entry_bucket, _, _), _| entry_bucket != table_bucket);
         state.views.retain(|(entry_bucket, _, _), _| entry_bucket != table_bucket);
         state.commits.retain(|(entry_bucket, _, _), _| entry_bucket != table_bucket);
@@ -242,7 +338,7 @@ where
         Self::remove_bucket_from_state_locked(state, &table_bucket);
         state.table_buckets.insert(table_bucket.clone(), snapshot.table_bucket);
         for entry in snapshot.namespaces {
-            let namespace = parse_namespace_for_store(&entry.namespace)?;
+            let namespace = validate_namespace_entry_identity(&entry)?;
             state.namespaces.insert(Self::namespace_key(&table_bucket, &namespace), entry);
         }
         for entry in snapshot.tables {
@@ -267,7 +363,63 @@ where
                 record.commit,
             );
         }
+        Self::rebuild_namespace_indexes_locked(state)?;
         Self::rebuild_warehouse_index_locked(state)
+    }
+
+    fn index_namespace_children(
+        children: &mut BTreeMap<StrongNamespaceChildKey, String>,
+        table_bucket: &str,
+        namespace: &Namespace,
+    ) {
+        for depth in 0..namespace.segments().len() {
+            let parent = namespace.segments()[..depth]
+                .iter()
+                .map(IdentifierSegment::as_str)
+                .collect::<Vec<_>>()
+                .join(".");
+            let child = namespace.segments()[..=depth]
+                .iter()
+                .map(IdentifierSegment::as_str)
+                .collect::<Vec<_>>()
+                .join(".");
+            let sort_key = format!("{}/", namespace.segments()[depth].as_str());
+            children.insert((table_bucket.to_string(), parent, sort_key), child);
+        }
+    }
+
+    fn rebuild_namespace_indexes_locked(state: &mut StrongTableCatalogState) -> TableCatalogStoreResult<()> {
+        let mut children = BTreeMap::new();
+        for entry in state
+            .namespaces
+            .values()
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+        {
+            let namespace = validate_namespace_entry_identity(entry)?;
+            Self::index_namespace_children(&mut children, &entry.table_bucket, &namespace);
+        }
+
+        let mut objects = BTreeSet::new();
+        for (table_bucket, namespace_name) in state
+            .tables
+            .values()
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .map(|entry| (&entry.table_bucket, &entry.namespace))
+            .chain(
+                state
+                    .views
+                    .values()
+                    .filter(|entry| entry.state == TableCatalogEntryState::Active)
+                    .map(|entry| (&entry.table_bucket, &entry.namespace)),
+            )
+        {
+            let namespace = parse_namespace_for_store(namespace_name)?;
+            objects.insert(Self::namespace_key(table_bucket, &namespace));
+            Self::index_namespace_children(&mut children, table_bucket, &namespace);
+        }
+        state.namespace_children = children;
+        state.namespace_objects = objects;
+        Ok(())
     }
 
     fn rebuild_warehouse_index_locked(state: &mut StrongTableCatalogState) -> TableCatalogStoreResult<()> {
@@ -283,11 +435,8 @@ where
             {
                 continue;
             }
-            if !state
-                .namespaces
-                .get(&(table_bucket.clone(), namespace.clone()))
-                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
-            {
+            let namespace_identity = parse_namespace_for_store(namespace)?;
+            if !Self::namespace_exists_locked(state, table_bucket, &namespace_identity) {
                 continue;
             }
             let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(entry) else {
@@ -312,6 +461,7 @@ where
     fn snapshot_from_mutated_state_locked(
         state: &mut StrongTableCatalogState,
     ) -> TableCatalogStoreResult<StrongTableCatalogSnapshot> {
+        Self::rebuild_namespace_indexes_locked(state)?;
         Self::rebuild_warehouse_index_locked(state)?;
         Ok(Self::snapshot_from_state_locked(state))
     }
@@ -336,7 +486,7 @@ where
             state.table_buckets.insert(entry.table_bucket.clone(), entry);
         }
         for entry in snapshot.namespaces {
-            let namespace = parse_namespace_for_store(&entry.namespace)?;
+            let namespace = validate_namespace_entry_identity(&entry)?;
             state
                 .namespaces
                 .insert(Self::namespace_key(&entry.table_bucket, &namespace), entry);
@@ -367,6 +517,7 @@ where
                 record.commit,
             );
         }
+        Self::rebuild_namespace_indexes_locked(&mut state)?;
         Self::rebuild_warehouse_index_locked(&mut state)?;
         Ok(state)
     }
@@ -812,13 +963,17 @@ where
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
-        validate_catalog_entry_version("namespace", entry.version)?;
-        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let namespace = validate_namespace_entry_identity(&entry)?;
+        validate_namespace_properties(&entry.properties)?;
         let key = Self::namespace_key(&entry.table_bucket, &namespace);
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
-            if state.namespaces.contains_key(&key) {
+            if state
+                .namespaces
+                .get(&key)
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "catalog object already exists: namespace {}/{}",
                     entry.table_bucket, entry.namespace
@@ -837,11 +992,69 @@ where
         let mut entries = state
             .namespaces
             .iter()
-            .filter(|((bucket, _), _)| bucket == table_bucket)
+            .filter(|((bucket, _), entry)| bucket == table_bucket && entry.state == TableCatalogEntryState::Active)
             .map(|(_, entry)| entry.clone())
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
         Ok(entries)
+    }
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        self.hydrate_state().await?;
+        let parent = parse_namespace_for_store(parent)?.public_name();
+        let state = self.state.lock().await;
+        let exact = state
+            .namespaces
+            .get(&(table_bucket.to_string(), parent.clone()))
+            .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            .cloned();
+        let descendant_start = (table_bucket.to_string(), format!("{parent}."));
+        let descendants = state
+            .namespaces
+            .range(descendant_start..)
+            .take_while(|((bucket, namespace), _)| bucket == table_bucket && namespace_is_descendant(namespace, &parent))
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
+        Ok(exact.into_iter().chain(descendants).collect())
+    }
+
+    async fn list_namespace_children(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+    ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog namespace list limit must be positive".to_string()))?;
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_namespace_children_page(table_bucket, parent, cursor.as_deref(), limit)
+                .await?;
+            entries.extend(page.entries);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(entries);
+            };
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(TableCatalogStoreError::Internal(
+                    "catalog namespace child pagination did not advance".to_string(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+
+    async fn list_namespace_children_page(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        Self::list_namespace_children_page_locked(&state, table_bucket, parent, cursor, limit)
     }
 
     async fn list_namespaces_page(
@@ -865,6 +1078,7 @@ where
             .namespaces
             .range((start, Bound::Unbounded))
             .take_while(|((bucket, _), _)| bucket == table_bucket)
+            .filter(|(_, entry)| entry.state == TableCatalogEntryState::Active)
             .take(limit.get().saturating_add(1))
             .map(|(_, entry)| entry.clone())
             .collect();
@@ -877,7 +1091,60 @@ where
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let state = self.state.lock().await;
-        Ok(state.namespaces.get(&Self::namespace_key(table_bucket, &namespace)).cloned())
+        let exact = state.namespaces.get(&Self::namespace_key(table_bucket, &namespace)).cloned();
+        if exact
+            .as_ref()
+            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+        {
+            return Ok(exact);
+        }
+        if Self::namespace_exists_locked(&state, table_bucket, &namespace) {
+            return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
+        }
+        Ok(None)
+    }
+
+    async fn update_namespace_properties(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        update: NamespacePropertiesUpdate,
+    ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
+        let namespace = parse_namespace_for_store(namespace)?;
+        let key = Self::namespace_key(table_bucket, &namespace);
+        let (snapshot, precondition, result) = {
+            let state = self.state.lock().await;
+            let current = state
+                .namespaces
+                .get(&key)
+                .filter(|entry| entry.state == TableCatalogEntryState::Active);
+            let mut next = match current {
+                Some(current) => current.clone(),
+                None if Self::namespace_exists_locked(&state, table_bucket, &namespace) => {
+                    synthetic_namespace_entry(table_bucket, &namespace)
+                }
+                None => {
+                    return Err(TableCatalogStoreError::NotFound(format!(
+                        "namespace {table_bucket}/{}",
+                        namespace.public_name()
+                    )));
+                }
+            };
+            let result = update.apply_to(&mut next);
+            validate_namespace_properties(&next.properties)?;
+            let unchanged =
+                current.map_or_else(|| next == synthetic_namespace_entry(table_bucket, &namespace), |current| &next == current);
+            if unchanged {
+                return Ok(result);
+            }
+            let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+            draft_state.namespaces.insert(key, next);
+            (Self::snapshot_from_mutated_state_locked(&mut draft_state)?, precondition, result)
+        };
+        self.finalize_snapshot_write(snapshot, precondition).await?;
+        Ok(result)
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
@@ -887,7 +1154,22 @@ where
         let key = Self::namespace_key(table_bucket, &namespace);
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
-            if !state.namespaces.contains_key(&key) {
+            let parent = namespace.public_name();
+            if Self::has_active_namespace_descendant_locked(&state, table_bucket, &parent) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "namespace {table_bucket}/{parent} has child namespaces"
+                )));
+            }
+            if state.namespace_objects.contains(&key) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "namespace {table_bucket}/{parent} is not empty"
+                )));
+            }
+            if !state
+                .namespaces
+                .get(&key)
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
                 return Err(TableCatalogStoreError::NotFound(format!(
                     "namespace {}/{}",
                     table_bucket,
@@ -931,15 +1213,7 @@ where
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
-            if !state
-                .namespaces
-                .contains_key(&Self::namespace_key(&entry.table_bucket, &namespace))
-            {
-                return Err(TableCatalogStoreError::NotFound(format!(
-                    "namespace {}/{}",
-                    entry.table_bucket, entry.namespace
-                )));
-            }
+            Self::require_active_namespace_locked(&state, &entry.table_bucket, &namespace)?;
             if state.tables.contains_key(&key) {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "catalog object already exists: table {}/{}/{}",
@@ -966,6 +1240,17 @@ where
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.table.cmp(&right.table));
         Ok(entries)
+    }
+
+    async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        Ok(state
+            .tables
+            .range((table_bucket.to_string(), String::new(), String::new())..)
+            .take_while(|((bucket, _, _), _)| bucket == table_bucket)
+            .map(|(_, entry)| entry.clone())
+            .collect())
     }
 
     async fn list_tables_page(
@@ -1177,15 +1462,7 @@ where
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
-            if !state
-                .namespaces
-                .contains_key(&Self::namespace_key(&entry.table_bucket, &namespace))
-            {
-                return Err(TableCatalogStoreError::NotFound(format!(
-                    "namespace {}/{}",
-                    entry.table_bucket, entry.namespace
-                )));
-            }
+            Self::require_active_namespace_locked(&state, &entry.table_bucket, &namespace)?;
             if state.views.contains_key(&key) {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "catalog object already exists: view {}/{}/{}",
