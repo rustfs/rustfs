@@ -113,6 +113,25 @@ fn redacted_target_config(config: &KVS) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Scrubs a free-form error message against an instance's merged configuration:
+/// every non-empty config value whose field is redacted in debug logs (secrets,
+/// endpoint URLs, DSNs) has its occurrences in the message replaced by the same
+/// redacted form, so a construction error can surface its underlying detail
+/// without leaking credential-bearing configuration values.
+pub(crate) fn redact_error_detail_with_config(message: &str, config: &KVS) -> String {
+    let mut redacted = message.to_string();
+    for kv in &config.0 {
+        if kv.value.is_empty() {
+            continue;
+        }
+        let replacement = redact_target_field_value(&kv.key, &kv.value);
+        if replacement != kv.value {
+            redacted = redacted.replace(&kv.value, &replacement);
+        }
+    }
+    redacted
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergedTargetConfigRecord {
     pub instance_id: String,
@@ -392,7 +411,7 @@ where
 mod tests {
     use super::{
         collect_env_target_instance_ids_from_env, collect_target_config_results_from_env, collect_target_configs_from_env,
-        redact_target_field_value, redacted_target_config, try_collect_target_configs_from_env,
+        redact_error_detail_with_config, redact_target_field_value, redacted_target_config, try_collect_target_configs_from_env,
     };
     use crate::TargetError;
     use rustfs_config::notify::{
@@ -633,6 +652,33 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].0, "primary");
         assert_eq!(configs[0].1.lookup(ENABLE_KEY).as_deref(), Some(" on "));
+    }
+
+    #[test]
+    fn redact_error_detail_with_config_scrubs_sensitive_values_from_message() {
+        let mut config = KVS::new();
+        config.insert("endpoint".to_string(), "https://example.com/private/hook?sig=hunter2".to_string());
+        config.insert("auth_token".to_string(), "hook-secret-token".to_string());
+        config.insert("queue_limit".to_string(), "1000".to_string());
+
+        let detail = redact_error_detail_with_config(
+            "webhook endpoint is not allowed: https://example.com/private/hook?sig=hunter2 (auth_token hook-secret-token, queue_limit 1000)",
+            &config,
+        );
+
+        assert_eq!(
+            detail,
+            "webhook endpoint is not allowed: https://example.com (auth_token ***redacted***, queue_limit 1000)"
+        );
+    }
+
+    #[test]
+    fn redact_error_detail_with_config_leaves_untainted_message_intact() {
+        let mut config = KVS::new();
+        config.insert("auth_token".to_string(), "hook-secret-token".to_string());
+
+        let detail = redact_error_detail_with_config("queue store open failed: permission denied", &config);
+        assert_eq!(detail, "queue store open failed: permission denied");
     }
 
     #[test]

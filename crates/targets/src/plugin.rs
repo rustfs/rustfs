@@ -14,7 +14,7 @@
 
 use crate::{
     PluginRuntimeAdapter, RuntimeActivation, Target, TargetError,
-    config::collect_target_config_results,
+    config::{collect_target_config_results, redact_error_detail_with_config},
     manifest::{TargetPluginManifest, builtin_target_manifest},
     target::with_deferred_queue_store_open,
 };
@@ -368,9 +368,14 @@ where
                         info!(target_type = %target.id().name, instance_id = %id, "Create target successfully");
                         successful_targets.push(target);
                     }
-                    Err(_) => {
-                        failures.push(format!("{target_type}/{id}: target construction failed"));
-                        error!(target_type = %target_type, instance_id = %id, reason = "construction_failed", "Failed to create target");
+                    Err(err) => {
+                        // The underlying error names the root cause (egress policy
+                        // rejection, queue-store open failure, ...); scrub it against
+                        // the instance config so credential-bearing values never
+                        // reach the log or the Admin-visible failure summary.
+                        let detail = redact_error_detail_with_config(&err.to_string(), &merged_config);
+                        failures.push(format!("{target_type}/{id}: target construction failed: {detail}"));
+                        error!(target_type = %target_type, instance_id = %id, reason = "construction_failed", detail = %detail, "Failed to create target");
                     }
                 }
             }
@@ -570,5 +575,52 @@ mod tests {
         // false success) rather than silently dropped or fatally aborting.
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("alpha/bad"), "unexpected failure summary: {}", failures[0]);
+    }
+
+    // Regression (#5115 debugging): a construction failure must carry the
+    // underlying error detail (e.g. an egress-policy rejection) in the failure
+    // summary instead of an opaque "target construction failed", while
+    // credential-bearing config values stay redacted.
+    #[tokio::test]
+    async fn construction_failure_surfaces_redacted_error_detail() {
+        let mut registry = TargetPluginRegistry::<String>::new();
+        registry.register(TargetPluginDescriptor::new(
+            "gamma",
+            &[ENABLE_KEY, "endpoint", "auth_token"],
+            |_config| Ok(()),
+            |_id, config| {
+                let endpoint = config.lookup("endpoint").unwrap_or_default();
+                let token = config.lookup("auth_token").unwrap_or_default();
+                Err(TargetError::Configuration(format!(
+                    "webhook endpoint is not allowed: {endpoint} (auth_token {token})"
+                )))
+            },
+        ));
+
+        let mut cfg = Config(HashMap::new());
+        let mut section = HashMap::new();
+        let mut primary = KVS::new();
+        primary.insert(ENABLE_KEY.to_string(), "on".to_string());
+        primary.insert("endpoint".to_string(), "https://example.com/private/hook?sig=hunter2".to_string());
+        primary.insert("auth_token".to_string(), "hook-secret-token".to_string());
+        section.insert("primary".to_string(), primary);
+        cfg.0.insert("notify_gamma".to_string(), section);
+
+        let (targets, failures) = registry
+            .create_dormant_targets_from_config(&cfg, "notify_")
+            .await
+            .expect("a failing instance must not abort target creation");
+
+        assert!(targets.is_empty());
+        assert_eq!(failures.len(), 1);
+        let failure = &failures[0];
+        assert!(failure.contains("gamma/primary"), "unexpected failure summary: {failure}");
+        // The root cause is surfaced instead of an opaque generic message.
+        assert!(failure.contains("webhook endpoint is not allowed"), "missing error detail: {failure}");
+        // The endpoint is reduced to its origin; path, query, and token are gone.
+        assert!(failure.contains("https://example.com"), "endpoint origin should stay visible: {failure}");
+        assert!(!failure.contains("/private/hook"), "endpoint path must be redacted: {failure}");
+        assert!(!failure.contains("hunter2"), "endpoint query must be redacted: {failure}");
+        assert!(!failure.contains("hook-secret-token"), "auth token must be redacted: {failure}");
     }
 }
