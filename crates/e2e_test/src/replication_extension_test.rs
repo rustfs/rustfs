@@ -2435,6 +2435,107 @@ async fn build_replication_pair(
     Ok((source_env, target_env, source_bucket.to_string()))
 }
 
+/// P0-6: CopyObject creates a new object on the destination key, so it must be
+/// scheduled for bucket replication exactly like PutObject (MinIO
+/// CopyObjectHandler parity). Before the fix the copy path never consulted the
+/// replication config: the destination object stayed local forever (its status
+/// metadata was inherited wholesale from the source, so the scanner heal pass
+/// skipped it too — no PENDING/FAILED marker meant nothing to re-drive).
+#[tokio::test]
+#[serial]
+async fn test_copy_object_replicates_to_target() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket) = build_replication_pair(true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let target_bucket = "replication-check-dst";
+
+    let src_key = "copy-repl-source.txt";
+    let dst_key = "copy-repl-destination.txt";
+    let payload = b"copy object replication payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(src_key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&target_client, target_bucket, src_key).await?, payload);
+    // Wait for the source object's terminal COMPLETED status so the copy below
+    // starts from metadata that carries a stale terminal replication state; the
+    // copy must not inherit it (MinIO filterReplicationStatusMetadata parity)
+    // and must drive its own PENDING -> COMPLETED cycle.
+    wait_for_source_replication_status(&source_client, &source_bucket, src_key, "COMPLETED", false).await?;
+
+    source_client
+        .copy_object()
+        .bucket(&source_bucket)
+        .key(dst_key)
+        .copy_source(format!("{source_bucket}/{src_key}"))
+        .send()
+        .await?;
+
+    assert_eq!(
+        wait_for_object_on_target(&target_client, target_bucket, dst_key).await?,
+        payload,
+        "CopyObject destination must replicate to the remote target"
+    );
+    wait_for_source_replication_status(&source_client, &source_bucket, dst_key, "COMPLETED", false).await?;
+
+    Ok(())
+}
+
+/// P0-6 companion: snowball auto-extract writes each archive member as an
+/// independent object; every member must replicate to the remote target like a
+/// regular PUT (MinIO PutObjectExtract parity).
+#[tokio::test]
+#[serial]
+async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket) = build_replication_pair(true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let target_bucket = "replication-check-dst";
+
+    let members: [(&str, &[u8]); 2] = [
+        ("snowball/member-one.txt", b"first member payload"),
+        ("snowball/member-two.txt", b"second member payload"),
+    ];
+
+    let mut builder = tokio_tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    for (path, data) in members {
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, std::io::Cursor::new(data)).await?;
+    }
+    let archive = builder.into_inner().await?.into_inner();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key("members.tar")
+        .metadata("Snowball-Auto-Extract", "true")
+        .body(ByteStream::from(archive))
+        .send()
+        .await?;
+
+    for (key, data) in members {
+        assert_eq!(
+            wait_for_object_on_target(&target_client, target_bucket, key).await?,
+            data,
+            "snowball-extracted member {key} must replicate to the remote target"
+        );
+        wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
