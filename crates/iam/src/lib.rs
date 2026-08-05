@@ -102,7 +102,49 @@ pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificat
     }
 }
 
+#[cfg(test)]
+pub(crate) struct LoadUserNotificationProbe {
+    pub(crate) observed: std::sync::Mutex<Option<(String, bool)>>,
+    pub(crate) remaining_failures: std::sync::atomic::AtomicUsize,
+    pub(crate) attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) panic: bool,
+    pub(crate) started: tokio::sync::Notify,
+    pub(crate) release: Option<tokio::sync::Notify>,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static LOAD_USER_NOTIFICATION_PROBE: std::sync::Arc<LoadUserNotificationProbe>;
+}
+
 pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
+    #[cfg(test)]
+    if let Ok(probe) = LOAD_USER_NOTIFICATION_PROBE.try_with(std::sync::Arc::clone) {
+        probe.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *probe.observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((access_key.to_string(), temp));
+        probe.started.notify_one();
+        if let Some(release) = &probe.release {
+            release.notified().await;
+        }
+        assert!(!probe.panic, "notification probe panic");
+        let should_fail = probe
+            .remaining_failures
+            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        let result = if should_fail {
+            vec![IamNotificationPeerErr {
+                err: Some(IamEcstoreError::other("peer notification failed")),
+            }]
+        } else {
+            Vec::new()
+        };
+        probe.completed.notify_one();
+        return result;
+    }
+
     match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_user(access_key, temp)

@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     ptr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use arc_swap::{ArcSwap, Guard};
@@ -65,6 +65,29 @@ pub struct Cache {
     state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
     service_account_mutation_lock: AsyncMutex<()>,
+    sts_account_mutation_locks: Arc<StsMutationLockRegistry>,
+}
+
+struct StsMutationLockRegistry {
+    locks: Mutex<HashMap<String, Weak<AsyncMutex<StsMutationLockState>>>>,
+}
+
+pub(crate) struct StsMutationLockState {
+    access_key: String,
+    registry: Weak<StsMutationLockRegistry>,
+    lock: Weak<AsyncMutex<StsMutationLockState>>,
+}
+
+impl Drop for StsMutationLockState {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut locks = registry.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if locks.get(&self.access_key).is_some_and(|current| current.ptr_eq(&self.lock)) {
+            locks.remove(&self.access_key);
+        }
+    }
 }
 
 impl Default for Cache {
@@ -73,6 +96,9 @@ impl Default for Cache {
             state: ArcSwap::new(Arc::new(CacheState::default())),
             write_lock: Mutex::new(()),
             service_account_mutation_lock: AsyncMutex::new(()),
+            sts_account_mutation_locks: Arc::new(StsMutationLockRegistry {
+                locks: Mutex::new(HashMap::new()),
+            }),
         }
     }
 }
@@ -82,6 +108,29 @@ pub(crate) type CacheSnapshot = Guard<Arc<CacheState>>;
 impl Cache {
     pub(crate) fn service_account_mutation_lock(&self) -> &AsyncMutex<()> {
         &self.service_account_mutation_lock
+    }
+
+    pub(crate) fn sts_account_mutation_lock(&self, access_key: &str) -> Arc<AsyncMutex<StsMutationLockState>> {
+        let mut locks = self
+            .sts_account_mutation_locks
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lock) = locks.get(access_key).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let registry = Arc::downgrade(&self.sts_account_mutation_locks);
+        let access_key_owned = access_key.to_string();
+        let lock = Arc::new_cyclic(|lock| {
+            AsyncMutex::new(StsMutationLockState {
+                access_key: access_key_owned,
+                registry,
+                lock: lock.clone(),
+            })
+        });
+        locks.insert(access_key.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     pub(crate) fn snapshot(&self) -> CacheSnapshot {
@@ -444,6 +493,30 @@ mod tests {
 
     use crate::cache::Cache;
     use crate::store::MappedPolicy;
+
+    #[test]
+    fn sts_mutation_locks_are_keyed_and_prune_unused_entries() {
+        let cache = Cache::default();
+        let first = cache.sts_account_mutation_lock("first");
+        let same = cache.sts_account_mutation_lock("first");
+        let different = cache.sts_account_mutation_lock("different");
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &different));
+        drop(first);
+        drop(same);
+        drop(different);
+
+        let _next = cache.sts_account_mutation_lock("next");
+        let locks = cache
+            .sts_account_mutation_locks
+            .locks
+            .lock()
+            .expect("STS mutation lock registry mutex poisoned");
+        assert!(!locks.contains_key("first"));
+        assert!(!locks.contains_key("different"));
+        assert!(locks.contains_key("next"));
+    }
 
     #[tokio::test]
     async fn test_cache_entity_add() {
