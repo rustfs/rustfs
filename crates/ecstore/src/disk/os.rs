@@ -1328,7 +1328,7 @@ fn rename_into_existing_parent(
             NtSetInformationFile,
         },
         Win32::{
-            Foundation::{ERROR_ACCESS_DENIED, RtlNtStatusToDosError},
+            Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError},
             System::IO::IO_STATUS_BLOCK,
         },
     };
@@ -1403,7 +1403,7 @@ fn rename_into_existing_parent(
         (code, error)
     };
     let (legacy_error_code, legacy_error) = status_error(status);
-    if legacy_error_code != ERROR_ACCESS_DENIED {
+    if !matches!(legacy_error_code, ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) {
         return Err(legacy_error);
     }
 
