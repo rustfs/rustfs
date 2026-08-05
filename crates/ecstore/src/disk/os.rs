@@ -2129,9 +2129,10 @@ fn create_windows_staged_file(parent: &winapi_util::Handle, component: &std::ffi
         },
     };
 
-    // Keep writing and namespace mutation on separate handles. Their share
-    // modes admit each other while jointly excluding third-party writers and
-    // deleters until publication finishes.
+    // Keep writing and namespace mutation on separate handles. Both handles
+    // must share deletion because Windows requires every open source handle to
+    // allow deletion before a rename. The random staging name and publication
+    // handle retain the exact file identity while excluding other writers.
     let writer = open_windows_relative(
         parent,
         component,
@@ -2148,7 +2149,7 @@ fn create_windows_staged_file(parent: &winapi_util::Handle, component: &std::ffi
         parent,
         component,
         DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         0,
