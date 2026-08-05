@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(item).expect("replication item should serialize"),
             serde_json::json!({
-                "type": "sts-credential",
+                "type": "sts-account",
                 "name": "",
                 "stsCredential": {
                     "accessKey": "<access-key>",

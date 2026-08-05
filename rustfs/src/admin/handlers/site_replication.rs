@@ -9569,6 +9569,98 @@ mod tests {
         assert_eq!(sts_replication_compatibility_policy(&legacy_claims, "readonly"), Some("readonly"));
     }
 
+    /// Publish a ready IAM app context so `apply_iam_item` gets past its IAM guard.
+    async fn publish_ready_iam_context() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        if current_iam_handle().is_none() {
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .prefix("site_replication_iam_item")
+                .disk_count(1)
+                .init_bucket_metadata(false)
+                .build()
+                .await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+                .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+                .await
+                .expect("build test IAM");
+            publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+                env.ecstore,
+                iam,
+                Arc::new(rustfs_kms::KmsServiceManager::new()),
+            )));
+        }
+        assert!(current_iam_handle().is_some(), "test IAM should be published");
+    }
+
+    fn replicated_sts_item(item_type: &str) -> SRIAMItem {
+        SRIAMItem {
+            r#type: item_type.to_string(),
+            sts_credential: Some(rustfs_madmin::SRSTSCredential {
+                access_key: "REPLICATEDSTSACCESS".to_string(),
+                secret_key: "replicatedStsSecret123".to_string(),
+                session_token: "not-a-valid-session-token".to_string(),
+                parent_user: "replicated-sts-parent".to_string(),
+                parent_policy_mapping: String::new(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_accepts_minio_sts_account_item_type() {
+        publish_ready_iam_context().await;
+
+        // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The bogus session token
+        // must reach token verification — falling into the unknown-type NotImplemented arm
+        // means MinIO-originated STS replication would be rejected.
+        let err = apply_iam_item(replicated_sts_item("sts-account"))
+            .await
+            .expect_err("bogus session token must fail verification");
+        assert_ne!(
+            *err.code(),
+            S3ErrorCode::NotImplemented,
+            "sts-account must be dispatched to the STS credential arm, got: {err:?}"
+        );
+        assert!(
+            err.message().unwrap_or_default().contains("invalid STS session token"),
+            "expected a token verification error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_still_accepts_legacy_sts_credential_item_type() {
+        publish_ready_iam_context().await;
+
+        // Older RustFS peers emit `sts-credential`; the alias stays accepted permanently
+        // so mixed-version RustFS sites keep replicating STS credentials.
+        let err = apply_iam_item(replicated_sts_item("sts-credential"))
+            .await
+            .expect_err("bogus session token must fail verification");
+        assert_ne!(
+            *err.code(),
+            S3ErrorCode::NotImplemented,
+            "legacy sts-credential must stay accepted, got: {err:?}"
+        );
+        assert!(
+            err.message().unwrap_or_default().contains("invalid STS session token"),
+            "expected a token verification error, got: {err:?}"
+        );
+    }
+
     #[test]
     fn oidc_service_account_envelope_round_trips_actual_policy() {
         let actual_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"]}]}"#;
