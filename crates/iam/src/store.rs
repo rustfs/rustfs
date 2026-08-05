@@ -214,7 +214,17 @@ impl GroupInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupInfo, MappedPolicy};
+    use super::{GroupInfo, MappedPolicy, UserType};
+
+    /// Site-replication inbound decode of `SRPolicyMapping.userType` must
+    /// follow MinIO IAMUserType wire semantics (cmd/iam.go): stsUser = 1.
+    /// The SR inbound path currently reuses `UserType::from_u64`, whose
+    /// internal RPC table maps 1 to Svc — a federated STS mapping from a
+    /// MinIO peer lands under the wrong prefix and silently loses effect.
+    #[test]
+    fn sr_inbound_decodes_minio_sts_wire_value_as_sts() {
+        assert_eq!(UserType::from_u64(1), Some(UserType::Sts));
+    }
 
     /// uses RFC3339 for updatedAt. MappedPolicy must serialize as RFC3339.
     #[test]
