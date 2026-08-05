@@ -859,7 +859,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action == Action::S3Action(S3Action::ListAllMyBucketsAction) {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+            return Err(ApiError::access_denied().into());
         }
 
         let policy_allowed_fallback = PolicySys::try_is_allowed(&BucketPolicyArgs {
