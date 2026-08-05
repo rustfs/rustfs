@@ -171,10 +171,10 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
         let parent = parent.map(parse_namespace_for_store).transpose()?;
         let parent_name = parent.as_ref().map_or_else(String::new, Namespace::public_name);
-        if let Some(parent) = parent.as_ref() {
-            if !Self::namespace_exists_locked(state, table_bucket, parent) {
-                return Err(TableCatalogStoreError::NotFound(format!("namespace {table_bucket}/{parent_name}")));
-            }
+        if let Some(parent) = parent.as_ref()
+            && !Self::namespace_exists_locked(state, table_bucket, parent)
+        {
+            return Err(TableCatalogStoreError::NotFound(format!("namespace {table_bucket}/{parent_name}")));
         }
 
         let cursor = catalog_list_cursor(cursor, STRONG_CATALOG_LIST_CURSOR_PREFIX)?;
