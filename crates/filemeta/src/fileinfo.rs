@@ -19,6 +19,7 @@ use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID,
     SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
+    is_encryption_metadata_key, starts_with_ignore_ascii_case,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
@@ -231,7 +232,7 @@ pub enum TransitionVersionState {
     Exact,
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub volume: String,
     pub name: String,
@@ -269,6 +270,117 @@ pub struct FileInfo {
     pub versioned: bool,
     /// True when version meta was parsed via rmp_serde fallback (legacy format).
     pub uses_legacy_checksum: bool,
+}
+
+/// Metadata keys whose values carry sealed encryption material (KEK-wrapped DEK,
+/// IV) under either the `x-rustfs-internal-` or `x-minio-internal-` prefix.
+/// Values of these keys must never reach logs at any level.
+fn is_sensitive_metadata_key(key: &str) -> bool {
+    // `is_encryption_metadata_key` covers the x-minio-internal- SSE prefix but not
+    // its x-rustfs-internal- twin, which the dual-key invariant writes alongside it.
+    is_encryption_metadata_key(key) || starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+}
+
+struct RedactedMetadata<'a>(&'a HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedMetadata<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for (key, value) in self.0 {
+            if is_sensitive_metadata_key(key) {
+                map.entry(key, &format_args!("<redacted {} bytes>", value.len()));
+            } else {
+                map.entry(key, value);
+            }
+        }
+        map.finish()
+    }
+}
+
+struct ElidedBytes<'a>(&'a Option<Bytes>);
+
+impl std::fmt::Debug for ElidedBytes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(bytes) => write!(f, "Some(<{} bytes elided>)", bytes.len()),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+// Manual Debug: `data` holds full inline object bytes (plaintext user content for
+// non-SSE objects) and `metadata` holds sealed key material — both must stay out
+// of Debug output so whole-struct log dumps cannot leak them. `checksum` is elided
+// too: for non-SSE objects it fingerprints plaintext content, and its raw bytes
+// carry no diagnostic value. The exhaustive destructuring (no `..`) forces every
+// future field through an explicit show/redact decision here.
+impl std::fmt::Debug for FileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            volume,
+            name,
+            version_id,
+            is_latest,
+            deleted,
+            transition_status,
+            transitioned_objname,
+            transition_tier,
+            transition_version_id,
+            transition_version,
+            transition_version_state,
+            expire_restored,
+            data_dir,
+            mod_time,
+            size,
+            mode,
+            written_by_version,
+            metadata,
+            parts,
+            erasure,
+            mark_deleted,
+            replication_state_internal,
+            data,
+            num_versions,
+            successor_mod_time,
+            fresh,
+            idx,
+            checksum,
+            versioned,
+            uses_legacy_checksum,
+        } = self;
+        f.debug_struct("FileInfo")
+            .field("volume", volume)
+            .field("name", name)
+            .field("version_id", version_id)
+            .field("is_latest", is_latest)
+            .field("deleted", deleted)
+            .field("transition_status", transition_status)
+            .field("transitioned_objname", transitioned_objname)
+            .field("transition_tier", transition_tier)
+            .field("transition_version_id", transition_version_id)
+            .field("transition_version", transition_version)
+            .field("transition_version_state", transition_version_state)
+            .field("expire_restored", expire_restored)
+            .field("data_dir", data_dir)
+            .field("mod_time", mod_time)
+            .field("size", size)
+            .field("mode", mode)
+            .field("written_by_version", written_by_version)
+            .field("metadata", &RedactedMetadata(metadata))
+            .field("parts", parts)
+            .field("erasure", erasure)
+            .field("mark_deleted", mark_deleted)
+            .field("replication_state_internal", replication_state_internal)
+            .field("data", &ElidedBytes(data))
+            .field("num_versions", num_versions)
+            .field("successor_mod_time", successor_mod_time)
+            .field("fresh", fresh)
+            .field("idx", idx)
+            .field("checksum", &ElidedBytes(checksum))
+            .field("versioned", versioned)
+            .field("uses_legacy_checksum", uses_legacy_checksum)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -2409,5 +2521,55 @@ mod tests {
             ..Default::default()
         };
         assert!(with_state.replication_info_equals(&with_state_clone));
+    }
+
+    #[test]
+    fn debug_redacts_sealed_encryption_metadata_values() {
+        let sealed_key = "IAAfANqt7wIJfVSgFAG3f5S6HuC2eyM5DdJlx7RSJKw2ZakSb3d5";
+        let sealed_iv = "0Vr8QLGvQThk8gIWFCUnBOTUwZgs7TTBteRnAK9avD0=";
+        let mut fi = FileInfo::default();
+        for key in [
+            "X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key",
+            "X-Minio-Internal-Server-Side-Encryption-Sealed-Key",
+        ] {
+            fi.metadata.insert(key.to_string(), sealed_key.to_string());
+        }
+        for key in [
+            "X-Rustfs-Internal-Server-Side-Encryption-Iv",
+            "X-Minio-Internal-Server-Side-Encryption-Iv",
+            "x-rustfs-encryption-iv",
+        ] {
+            fi.metadata.insert(key.to_string(), sealed_iv.to_string());
+        }
+        fi.metadata.insert("content-type".to_string(), "text/plain".to_string());
+
+        let dump = format!("{fi:?}");
+        assert!(!dump.contains(sealed_key), "sealed key leaked into Debug output: {dump}");
+        assert!(!dump.contains(sealed_iv), "sealed IV leaked into Debug output: {dump}");
+        // Keys stay visible so operators can still see which metadata is present.
+        assert!(dump.contains("X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key"));
+        assert!(dump.contains(&format!("<redacted {} bytes>", sealed_key.len())));
+        // Non-sensitive metadata values keep their diagnostic value.
+        assert!(dump.contains("text/plain"));
+    }
+
+    #[test]
+    fn debug_elides_inline_data_bytes() {
+        let fi = FileInfo {
+            data: Some(Bytes::from_static(b"plaintext user object content")),
+            checksum: Some(Bytes::from_static(b"\x01\x02checksumblob")),
+            ..Default::default()
+        };
+
+        let dump = format!("{fi:?}");
+        assert!(
+            !dump.contains("plaintext user object content"),
+            "inline data leaked into Debug output: {dump}"
+        );
+        assert!(!dump.contains("checksumblob"), "checksum bytes leaked into Debug output: {dump}");
+        assert!(dump.contains("data: Some(<29 bytes elided>)"), "missing data length summary: {dump}");
+
+        let empty = FileInfo::default();
+        assert!(format!("{empty:?}").contains("data: None"));
     }
 }

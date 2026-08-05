@@ -25,6 +25,7 @@ pub use instance::{
     normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
     try_normalize_target_plugin_instances, try_normalize_target_plugin_instances_from_env,
 };
+pub(crate) use loader::redact_error_detail_with_config;
 pub use loader::{
     collect_env_target_instance_ids, collect_env_target_instance_ids_from_env, collect_target_config_results,
     collect_target_config_results_from_env, collect_target_configs, collect_target_configs_from_env, try_collect_target_configs,

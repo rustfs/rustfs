@@ -24,7 +24,11 @@ use std::io;
 use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::io::AsyncRead;
-use tracing::{info, warn};
+use tracing::{trace, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
+const EVENT_ERASURE_HEAL_STARTED: &str = "erasure_heal_started";
 
 async fn read_heal_shards<R>(
     readers: &mut [Option<BitrotReader<R>>],
@@ -115,11 +119,14 @@ impl super::Erasure {
     where
         R: AsyncRead + Unpin + Send + Sync,
     {
-        info!(
-            "Erasure heal, writers len: {}, readers len: {}, total_length: {}",
-            writers.len(),
-            readers.len(),
-            total_length
+        trace!(
+            event = EVENT_ERASURE_HEAL_STARTED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ERASURE,
+            writer_count = writers.len(),
+            reader_count = readers.len(),
+            total_length,
+            "Erasure heal started"
         );
         if writers.len() != self.parity_shards + self.data_shards {
             return Err(Error::other("invalid argument"));

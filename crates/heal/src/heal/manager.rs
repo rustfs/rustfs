@@ -15,7 +15,7 @@
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
     storage::HealStorageAPI,
-    task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
+    task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
 use crate::{Error, Result};
 use metrics::{counter, gauge};
@@ -53,6 +53,13 @@ const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+// Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
+// ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
+// recovery loops submit those per object, so a full queue or a retry storm
+// would otherwise emit one warn! per object (rustfs/rustfs#5716). The
+// `rustfs_heal_admission_total` metric and the `heal_queue_state` backlog
+// event keep the aggregate signal at operator-visible levels.
 
 #[cfg(test)]
 struct RetryOwnershipTestHook {
@@ -976,6 +983,7 @@ impl HealManager {
         let queue_len = queue.len();
         publish_heal_queue_length(queue);
         let queue_capacity = config.queue_size;
+        let per_object_request = request.heal_type.is_per_object();
 
         if queue_len >= queue_capacity && !request.force_start {
             if Self::can_displace_queued_work(&request) && queue.can_displace_lower_priority(request.priority) {
@@ -985,8 +993,7 @@ impl HealManager {
                 if let Some(displaced) = queue.push_displacing_lower_priority(request) {
                     publish_heal_queue_length(queue);
                     Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
-                    warn!(
-                        target: "rustfs::heal::manager",
+                    demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
                         event = EVENT_HEAL_QUEUE_ADMISSION,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -1000,12 +1007,11 @@ impl HealManager {
                         queue_capacity,
                         result = "accepted_by_displacement",
                         "Heal queue request accepted by displacement"
-                    );
+                    });
                     return HealAdmissionResult::Accepted;
                 }
 
-                warn!(
-                    target: "rustfs::heal::manager",
+                demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
                     event = EVENT_HEAL_QUEUE_ADMISSION,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -1017,7 +1023,7 @@ impl HealManager {
                     queue_capacity,
                     result = "full_no_displacement_candidate",
                     "Heal queue request rejected without displacement"
-                );
+                });
                 Self::record_admission_metric(source, HealAdmissionResult::Full, context);
                 return HealAdmissionResult::Full;
             }
@@ -1026,8 +1032,7 @@ impl HealManager {
             Self::record_admission_metric(request.source, admission, context);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
-                    warn!(
-                        target: "rustfs::heal::manager",
+                    demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
                         event = EVENT_HEAL_QUEUE_ADMISSION,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -1040,11 +1045,10 @@ impl HealManager {
                         reason = reason.as_str(),
                         result = "dropped_full",
                         "Heal queue request dropped"
-                    );
+                    });
                 }
                 HealAdmissionResult::Full => {
-                    warn!(
-                        target: "rustfs::heal::manager",
+                    demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
                         event = EVENT_HEAL_QUEUE_ADMISSION,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -1056,7 +1060,7 @@ impl HealManager {
                         queue_capacity,
                         result = "rejected_full",
                         "Heal queue request rejected"
-                    );
+                    });
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
             }
@@ -1481,6 +1485,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
+            Self::record_admission_metric(request.source, admission, "duplicate");
 
             match admission {
                 HealAdmissionResult::Merged => {
@@ -1501,8 +1506,7 @@ impl HealManager {
                     );
                 }
                 HealAdmissionResult::Dropped(reason) => {
-                    warn!(
-                        target: "rustfs::heal::manager",
+                    demote_to_debug_when!(request.heal_type.is_per_object(), warn, target: "rustfs::heal::manager", {
                         event = EVENT_HEAL_QUEUE_ADMISSION,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -1512,7 +1516,7 @@ impl HealManager {
                         duplicate_state,
                         result = "dropped_duplicate",
                         "Heal queue admission decided"
-                    );
+                    });
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
             }
@@ -2554,8 +2558,7 @@ impl HealManager {
                         Err(e) => {
                             let will_retry = retry_request.is_some();
                             if will_retry {
-                                warn!(
-                                    target: "rustfs::heal::manager",
+                                demote_to_debug_when!(task.heal_type.is_per_object(), warn, target: "rustfs::heal::manager", {
                                     event = EVENT_HEAL_SCHEDULER_STATE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
@@ -2566,7 +2569,7 @@ impl HealManager {
                                     retry_attempt = task.retry_attempts.saturating_add(1),
                                     error = %e,
                                     "Heal scheduler task retrying"
-                                );
+                                });
                             } else {
                                 error!(
                                     target: "rustfs::heal::manager",
@@ -2669,7 +2672,7 @@ impl HealManager {
                             loop {
                                 tokio::select! {
                                     _ = retry_cancel_token.cancelled() => {
-                                        info!(
+                                        debug!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
@@ -2702,7 +2705,7 @@ impl HealManager {
                                 };
                                 if active_duplicate {
                                     retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
-                                    info!(
+                                    debug!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_QUEUE_ADMISSION,
                                         component = LOG_COMPONENT_HEAL,
@@ -2730,7 +2733,7 @@ impl HealManager {
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
                                         drop(queue);
                                         retry_completed_heals.lock().await.remove(&retry_request_id);
-                                        info!(
+                                        debug!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
@@ -2751,7 +2754,7 @@ impl HealManager {
                                     HealAdmissionResult::Merged => {
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
                                         drop(queue);
-                                        info!(
+                                        debug!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
@@ -2765,7 +2768,11 @@ impl HealManager {
                                         return;
                                     }
                                     HealAdmissionResult::Full => {
-                                        warn!(
+                                        // admit_request_to_queue already logged the
+                                        // rejection (context = "retry"); this repeats
+                                        // every backoff cycle while the queue stays
+                                        // full, so keep it at debug!.
+                                        debug!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,

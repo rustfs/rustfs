@@ -787,7 +787,7 @@ impl crate::storage_api_contracts::heal::HealOperations for ECStore {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         self.handle_heal_bucket(bucket, opts).await
     }
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     async fn heal_object(
         &self,
         bucket: &str,

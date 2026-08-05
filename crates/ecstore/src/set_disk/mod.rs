@@ -3964,9 +3964,15 @@ async fn disks_with_all_parts(
         };
 
         if corrupted {
-            info!(
-                "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
-                object_name
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object = %object_name,
+                disk_index = index,
+                state = "metadata_corrupt",
+                "Set disk object metadata is corrupt"
             );
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
@@ -3977,9 +3983,15 @@ async fn disks_with_all_parts(
 
         if erasure_distribution_reliable {
             if !file_info_is_valid_for_metadata(meta) {
-                info!(
-                    "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
-                    object_name
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object = %object_name,
+                    disk_index = index,
+                    state = "metadata_invalid",
+                    "Set disk object metadata is invalid"
                 );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
@@ -3991,9 +4003,15 @@ async fn disks_with_all_parts(
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
-                info!(
-                    "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
-                    object_name
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object = %object_name,
+                    disk_index = index,
+                    state = "erasure_distribution_mismatch",
+                    "Set disk erasure distribution mismatched online disks"
                 );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
@@ -4066,6 +4084,7 @@ async fn disks_with_all_parts(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
                         object = %object_name,
                         disk_index = index,
                         state = "verify_failed",
@@ -4085,6 +4104,7 @@ async fn disks_with_all_parts(
                         event = EVENT_SET_DISK_HEAL,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
                         object = %object_name,
                         disk_index = index,
                         state = "check_parts_failed",
@@ -4153,9 +4173,13 @@ pub fn should_heal_object_on_disk(
     }
 
     if !meta.equals(latest_meta) {
-        warn!(
-            "should_heal_object_on_disk: metadata is outdated, object_name={}, meta: {:?}, latest_meta: {:?}",
-            meta.name, meta, latest_meta
+        debug!(
+            event = EVENT_SET_DISK_HEAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            object = %meta.name,
+            state = "metadata_outdated",
+            "Set disk object metadata is outdated"
         );
         return (true, true, Some(DiskError::OutdatedXLMeta));
     }
@@ -6283,6 +6307,136 @@ mod tests {
             .await
             .expect("committed object must be readable after a failed cleanup");
         assert_eq!(read_back.size, 9, "HEAD must observe the new version, not stale metadata");
+    }
+
+    // Regression for the inline-overwrite rollback backup leak: #5703 stopped
+    // reporting the synthetic rollback dir for recursive post-commit cleanup,
+    // which stranded `object/<synthetic>/xl.meta.bkp` after every inline
+    // overwrite. The object dir then never emptied, so the s3-tests teardown
+    // sequence (delete object, delete bucket) failed with BucketNotEmpty
+    // forever. After a committed overwrite the backup must be reclaimed and a
+    // subsequent delete must leave nothing behind.
+    #[tokio::test]
+    async fn inline_overwrite_reclaims_synthetic_rollback_backup() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-inline-rollback-leak";
+        let object = "obj";
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        for body in [b"hello".to_vec(), b"goodbye".to_vec()] {
+            let mut reader = PutObjReader::from_vec(body);
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..ObjectOptions::default()
+                    },
+                )
+                .await
+                .expect("inline write should succeed");
+        }
+
+        // The committed overwrite must leave only xl.meta in the object dir on
+        // every disk; a stranded rollback dir keeps the bucket undeletable.
+        for endpoint in &set_disks.set_endpoints {
+            let object_dir = std::path::PathBuf::from(endpoint.get_file_path()).join(bucket).join(object);
+            let mut entries: Vec<String> = std::fs::read_dir(&object_dir)
+                .expect("object dir should exist")
+                .map(|entry| entry.expect("entry should read").file_name().to_string_lossy().into_owned())
+                .collect();
+            entries.sort();
+            assert_eq!(
+                entries,
+                vec![STORAGE_FORMAT_FILE.to_string()],
+                "only xl.meta may remain after an inline overwrite in {object_dir:?}"
+            );
+        }
+
+        // With only xl.meta left, the s3-tests teardown (delete object, delete
+        // bucket) empties the dir; the delete paths themselves are covered by
+        // their own tests. This harness has no bucket metadata sys, so the
+        // full delete_object flow cannot run here.
+    }
+
+    // #5703's security property must survive the backup reclamation: the
+    // synthetic rollback dir of key K maps to the directory `K/<uuid>`, which
+    // can simultaneously be a legitimate child key. Reclaiming the backup must
+    // remove exactly the backup file — never the child key's metadata.
+    #[tokio::test]
+    async fn inline_overwrite_backup_reclaim_spares_child_key_dir() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-inline-rollback-child";
+        let object = "obj";
+        let synthetic = crate::disk::local::inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
+        let child_object = format!("{object}/{synthetic}");
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut reader = PutObjReader::from_vec(b"child".to_vec());
+        set_disks
+            .put_object(
+                bucket,
+                &child_object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..ObjectOptions::default()
+                },
+            )
+            .await
+            .expect("child write should succeed");
+
+        // Create then overwrite the parent key: the overwrite writes its
+        // rollback backup into the child's directory and must afterwards
+        // reclaim only that file.
+        for body in [b"first".to_vec(), b"second".to_vec()] {
+            let mut reader = PutObjReader::from_vec(body);
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..ObjectOptions::default()
+                    },
+                )
+                .await
+                .expect("parent write should succeed");
+        }
+
+        let child_info = set_disks
+            .get_object_info(bucket, &child_object, &ObjectOptions::default())
+            .await
+            .expect("child key must survive the parent's rollback backup reclamation");
+        assert_eq!(child_info.size, 5, "child key content must be untouched");
+
+        for endpoint in &set_disks.set_endpoints {
+            let child_dir = std::path::PathBuf::from(endpoint.get_file_path())
+                .join(bucket)
+                .join(object)
+                .join(synthetic.to_string());
+            let mut entries: Vec<String> = std::fs::read_dir(&child_dir)
+                .expect("child object dir should exist")
+                .map(|entry| entry.expect("entry should read").file_name().to_string_lossy().into_owned())
+                .collect();
+            entries.sort();
+            assert_eq!(
+                entries,
+                vec![STORAGE_FORMAT_FILE.to_string()],
+                "the child dir must keep its xl.meta and lose only the stray backup in {child_dir:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

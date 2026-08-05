@@ -47,6 +47,25 @@ const MAX_RETAINED_HEAL_RESULT_ITEMS: usize = 1024;
 const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
 const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
 const MAX_BUCKET_FAILURE_LOG_SAMPLES: u64 = 5;
+
+/// Emits at `$level`, demoted to `debug!` when `$demote` is true. Keeps
+/// per-object heal work — Object/Metadata/MRF/ECDecode tasks queued per
+/// object by MRF/autoheal/scanner loops, and per-object sweep failures past
+/// a sample cap — from amplifying into one info!/warn!/error! line per
+/// object during mass recovery (rustfs/rustfs#5716). Aggregate task kinds
+/// and foreground (admin/internal) requests keep operator-visible levels;
+/// metrics and end-of-sweep summaries carry the aggregate signal for the
+/// demoted paths.
+macro_rules! demote_to_debug_when {
+    ($demote:expr, $level:ident, target: $target:expr, { $($fields:tt)* }) => {
+        if $demote {
+            tracing::debug!(target: $target, $($fields)*);
+        } else {
+            tracing::$level!(target: $target, $($fields)*);
+        }
+    };
+}
+pub(crate) use demote_to_debug_when;
 const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
 const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
 const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
@@ -100,6 +119,18 @@ impl HealType {
             Self::ECDecode { .. } => "ec_decode",
         }
     }
+
+    /// Task kinds enqueued at per-object granularity (MRF, autoheal, scanner,
+    /// read-repair loops). Their lifecycle and admission logs stay at `debug!`
+    /// so a recovery loop queuing hundreds of thousands of object heal tasks
+    /// cannot amplify into per-object `info!`/`warn!` lines; aggregate kinds
+    /// (cluster/bucket/prefix/erasure-set) keep operator-visible levels.
+    pub(crate) fn is_per_object(&self) -> bool {
+        matches!(
+            self,
+            Self::Object { .. } | Self::Metadata { .. } | Self::MRF { .. } | Self::ECDecode { .. }
+        )
+    }
 }
 
 fn is_object_level_not_found_error(err: &Error) -> bool {
@@ -113,6 +144,20 @@ fn is_object_level_not_found_error(err: &Error) -> bool {
 
 pub(crate) fn is_missing_object_dir_heal_result(object: &str, err: &Error) -> bool {
     object.ends_with(SLASH_SEPARATOR) && is_object_level_not_found_error(err)
+}
+
+/// Sample cap for per-object failure logs during a sweep: returns true (and
+/// consumes a sample slot) for the first [`MAX_BUCKET_FAILURE_LOG_SAMPLES`]
+/// calls, false afterwards so callers demote the remaining occurrences to
+/// `debug!`. Aggregate failed/skipped counts still surface in end-of-sweep
+/// summaries.
+pub(crate) fn take_failure_log_sample(samples_logged: &mut u64) -> bool {
+    if *samples_logged < MAX_BUCKET_FAILURE_LOG_SAMPLES {
+        *samples_logged = samples_logged.saturating_add(1);
+        true
+    } else {
+        false
+    }
 }
 
 /// Heal priority
@@ -618,8 +663,7 @@ impl HealTask {
         )
         .increment(1);
 
-        info!(
-            target: "rustfs::heal::task",
+        demote_to_debug_when!(self.heal_type.is_per_object(), info, target: "rustfs::heal::task", {
             event = EVENT_HEAL_TASK_STATE,
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_TASK,
@@ -628,7 +672,7 @@ impl HealTask {
             state = "started",
             queue_delay = ?queue_delay,
             "Heal task started"
-        );
+        });
 
         let result = match &self.heal_type {
             HealType::Cluster => self.heal_cluster().await,
@@ -660,8 +704,7 @@ impl HealTask {
             Ok(_) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
-                info!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(self.heal_type.is_per_object(), info, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_TASK_STATE,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
@@ -669,7 +712,7 @@ impl HealTask {
                     heal_type = self.heal_type.log_kind(),
                     state = "completed",
                     "Heal task completed"
-                );
+                });
             }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
@@ -688,8 +731,7 @@ impl HealTask {
             Err(Error::TaskTimeout) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Timeout;
-                warn!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(self.heal_type.is_per_object(), warn, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_TASK_STATE,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
@@ -697,13 +739,16 @@ impl HealTask {
                     heal_type = self.heal_type.log_kind(),
                     state = "timed_out",
                     "Heal task timed out"
-                );
+                });
             }
             Err(e) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Failed { error: e.to_string() };
-                error!(
-                    target: "rustfs::heal::task",
+                // Per-object failures are already logged with full object
+                // context by the heal_* implementations and terminally by the
+                // scheduler's task_failed error!; this generic duplicate would
+                // multiply every failed object by the retry count.
+                demote_to_debug_when!(self.heal_type.is_per_object(), error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_TASK_STATE,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
@@ -712,7 +757,7 @@ impl HealTask {
                     state = "failed",
                     error = %e,
                     "Heal task failed"
-                );
+                });
             }
         }
 
@@ -830,17 +875,21 @@ impl HealTask {
         };
 
         if !object_exists {
-            warn!(
-                target: "rustfs::heal::task",
+            // Background loops (scanner/MRF/autoheal/read-repair) routinely
+            // race object deletion, so a missing target is per-object noise
+            // for them; only foreground admin/internal requests keep the warn.
+            let background_source = !matches!(self.source, HealRequestSource::Admin | HealRequestSource::Internal);
+            demote_to_debug_when!(background_source, warn, target: "rustfs::heal::task", {
                 event = EVENT_HEAL_OBJECT_MISSING,
                 component = LOG_COMPONENT_HEAL,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
                 task_id = %self.id,
                 bucket,
                 object,
+                source = self.source.as_str(),
                 recreate_missing = self.options.recreate_missing,
                 "Heal target object is missing"
-            );
+            });
             if self.options.recreate_missing {
                 debug!(
                     target: "rustfs::heal::task",
@@ -1536,8 +1585,7 @@ impl HealTask {
                             }
                             first_failed_object.get_or_insert_with(|| object.to_string());
                             first_error.get_or_insert_with(|| err.to_string());
-                            if failure_samples_logged < MAX_BUCKET_FAILURE_LOG_SAMPLES {
-                                failure_samples_logged = failure_samples_logged.saturating_add(1);
+                            if take_failure_log_sample(&mut failure_samples_logged) {
                                 warn!(
                                     target: "rustfs::heal::task",
                                     event = EVENT_HEAL_BUCKET_RESULT,
@@ -2394,6 +2442,66 @@ mod tests {
         bucket_heal_calls: Mutex<Vec<String>>,
         block_heal_object: Mutex<bool>,
         resume_disk: Mutex<Option<DiskStore>>,
+    }
+
+    #[test]
+    fn per_object_heal_types_are_classified_for_log_demotion() {
+        assert!(
+            HealType::Object {
+                bucket: "b".to_string(),
+                object: "o".to_string(),
+                version_id: None,
+            }
+            .is_per_object()
+        );
+        assert!(
+            HealType::Metadata {
+                bucket: "b".to_string(),
+                object: "o".to_string(),
+            }
+            .is_per_object()
+        );
+        assert!(
+            HealType::MRF {
+                meta_path: "p".to_string(),
+            }
+            .is_per_object()
+        );
+        assert!(
+            HealType::ECDecode {
+                bucket: "b".to_string(),
+                object: "o".to_string(),
+                version_id: None,
+            }
+            .is_per_object()
+        );
+        assert!(!HealType::Cluster.is_per_object());
+        assert!(!HealType::Bucket { bucket: "b".to_string() }.is_per_object());
+        assert!(
+            !HealType::Prefix {
+                bucket: "b".to_string(),
+                prefix: "p".to_string(),
+            }
+            .is_per_object()
+        );
+        assert!(
+            !HealType::ErasureSet {
+                buckets: Vec::new(),
+                set_disk_id: "s".to_string(),
+            }
+            .is_per_object()
+        );
+    }
+
+    #[test]
+    fn failure_log_sampling_caps_at_max_samples() {
+        let mut samples_logged = 0_u64;
+        for _ in 0..MAX_BUCKET_FAILURE_LOG_SAMPLES {
+            assert!(take_failure_log_sample(&mut samples_logged));
+        }
+        assert!(!take_failure_log_sample(&mut samples_logged));
+        assert!(!take_failure_log_sample(&mut samples_logged));
+        assert_eq!(samples_logged, MAX_BUCKET_FAILURE_LOG_SAMPLES);
     }
 
     /// Build a latest, non-delete-marker heal list item with no version id.
