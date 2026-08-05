@@ -27,6 +27,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use metrics::{counter, histogram};
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_policy::{
@@ -69,8 +70,11 @@ const ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: &str = "RUSTFS_TABLE_CATALOG_CRE
 const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
+const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
+const NAMESPACE_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const PREFIX_PROPERTY: &str = "prefix";
+const NAMESPACE_SEPARATOR_PROPERTY: &str = "namespace-separator";
 const ICEBERG_ERROR_ALREADY_EXISTS: &str = "AlreadyExistsException";
 const ICEBERG_ERROR_BAD_REQUEST: &str = "BadRequestException";
 const ICEBERG_ERROR_COMMIT_FAILED: &str = "CommitFailedException";
@@ -80,12 +84,16 @@ const ICEBERG_ERROR_NO_SUCH_RESOURCE: &str = "NoSuchResourceException";
 const ICEBERG_ERROR_NO_SUCH_TABLE: &str = "NoSuchTableException";
 const ICEBERG_ERROR_NO_SUCH_VIEW: &str = "NoSuchViewException";
 const ICEBERG_ERROR_REST: &str = "RESTException";
+const ICEBERG_ERROR_UNPROCESSABLE_ENTITY: &str = "UnprocessableEntityException";
+const ICEBERG_ERROR_UNSUPPORTED_OPERATION: &str = "UnsupportedOperationException";
 const REST_PAGE_TOKEN_VERSION: u8 = 1;
 const REST_PAGE_TOKEN_MAX_LENGTH: usize = 16 * 1024;
 const REST_DEFAULT_PAGE_SIZE: usize = 1000;
 const REST_MAX_PAGE_SIZE: usize = 1000;
 const REST_PAGE_TOKEN_QUERY_PARAMETER: &str = "pageToken";
 const REST_PAGE_SIZE_QUERY_PARAMETER: &str = "pageSize";
+const REST_NAMESPACE_SEPARATOR: char = '\u{1f}';
+const REST_NAMESPACE_SEPARATOR_URL_ENCODED: &str = "%1F";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
@@ -188,6 +196,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
 ];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &["POST /v1/{prefix}/namespaces/{namespace}/properties"];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
@@ -200,6 +209,7 @@ static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHa
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
 static NAMESPACE_EXISTS_HANDLER: RestNamespaceExistsHandler = RestNamespaceExistsHandler {};
+static UPDATE_NAMESPACE_PROPERTIES_HANDLER: RestUpdateNamespacePropertiesHandler = RestUpdateNamespacePropertiesHandler {};
 static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandler {};
 static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
@@ -262,6 +272,15 @@ struct CreateNamespaceRequest {
     namespace: Vec<String>,
     #[serde(default)]
     properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateNamespacePropertiesRequest {
+    #[serde(default)]
+    removals: Vec<String>,
+    #[serde(default)]
+    updates: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,7 +907,8 @@ struct TableMetadataLocationResponse {
 fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigResponse> {
     let usecase = default_admin_usecase();
     let backing_mode = crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
-    let mut overrides = BTreeMap::new();
+    let mut overrides =
+        BTreeMap::from([(NAMESPACE_SEPARATOR_PROPERTY.to_string(), REST_NAMESPACE_SEPARATOR_URL_ENCODED.to_string())]);
     if backing_mode != crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
         overrides.insert(CATALOG_BACKING_CONFIG_KEY.to_string(), backing_mode.as_str().to_string());
     }
@@ -907,10 +927,14 @@ fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigRes
     if let Some(warehouse) = warehouse {
         defaults.insert(PREFIX_PROPERTY.to_string(), warehouse.to_string());
     }
+    let mut endpoints = TABLE_CATALOG_ENDPOINTS.to_vec();
+    if backing_mode == crate::table_catalog::TableCatalogBackingMode::DurableStrong {
+        endpoints.extend_from_slice(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS);
+    }
     Ok(CatalogConfigResponse {
         defaults,
         overrides,
-        endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
+        endpoints,
         admin_discovery: CatalogAdminDiscovery {
             runtime_capabilities: usecase.runtime_capabilities_route(),
             cluster_snapshot: usecase.cluster_snapshot_route(),
@@ -1114,6 +1138,33 @@ async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
     serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
 }
 
+async fn read_bounded_json_body<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    mut input: Body,
+    max_size: usize,
+    timeout: StdDuration,
+    operation: &str,
+) -> S3Result<T> {
+    if let Some(content_length) = headers.get(http::header::CONTENT_LENGTH) {
+        let content_length = content_length
+            .to_str()
+            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be valid ASCII"))?
+            .parse::<usize>()
+            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be a non-negative integer"))?;
+        if content_length > max_size {
+            return Err(s3_error!(InvalidRequest, "{operation} request body is too large"));
+        }
+    }
+    let body = tokio::time::timeout(timeout, input.store_all_limited(max_size))
+        .await
+        .map_err(|_| s3_error!(InvalidRequest, "timed out reading {operation} request body"))?
+        .map_err(|err| s3_error!(InvalidRequest, "failed to read request body: {}", err))?;
+    if body.is_empty() {
+        return Err(s3_error!(InvalidRequest, "request body is required"));
+    }
+    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+}
+
 async fn read_json_body_or_default<T>(mut input: Body) -> S3Result<T>
 where
     T: Default + DeserializeOwned,
@@ -1294,7 +1345,69 @@ fn encode_rest_page_token(cursor: &str, context: &str) -> S3Result<String> {
 
 fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
     let namespace = params.get("namespace").unwrap_or("");
-    crate::table_catalog::Namespace::parse(namespace).map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+    namespace_from_path_value(namespace)
+}
+
+fn namespace_from_path_value(value: &str) -> S3Result<crate::table_catalog::Namespace> {
+    let legacy_dotted = value.contains('.')
+        && !value.contains(REST_NAMESPACE_SEPARATOR)
+        && !value.contains(REST_NAMESPACE_SEPARATOR_URL_ENCODED)
+        && !value.contains("%1f");
+    // RUSTFS_COMPAT_TODO(table-catalog-dotted-namespace): Remove after the minimum supported release
+    // advertises %1F; until then, keep dotted paths for clients using the legacy namespace contract.
+    let segments = if legacy_dotted {
+        value
+            .split('.')
+            .map(|segment| {
+                percent_decode_str(segment)
+                    .decode_utf8()
+                    .map(|decoded| decoded.into_owned())
+                    .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))
+            })
+            .collect::<S3Result<Vec<_>>>()?
+    } else {
+        let decoded = percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidRequest, "namespace path must be valid UTF-8"))?;
+        decoded.split(REST_NAMESPACE_SEPARATOR).map(str::to_string).collect()
+    };
+    crate::table_catalog::Namespace::from_segments(segments)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+}
+
+fn rest_namespace_parent_from_query(uri: &http::Uri) -> S3Result<Option<crate::table_catalog::Namespace>> {
+    let mut parent = None;
+    let mut parent_seen = false;
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key != "parent" {
+                continue;
+            }
+            if parent_seen {
+                return Err(iceberg_rest_error(
+                    ICEBERG_ERROR_BAD_REQUEST,
+                    StatusCode::BAD_REQUEST,
+                    "parent query parameter must not be repeated",
+                ));
+            }
+            parent_seen = true;
+            if !value.is_empty() {
+                parent = Some(
+                    crate::table_catalog::Namespace::from_segments(
+                        value.split(REST_NAMESPACE_SEPARATOR).map(str::to_string).collect(),
+                    )
+                    .map_err(|err| {
+                        iceberg_rest_error(
+                            ICEBERG_ERROR_BAD_REQUEST,
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid parent namespace: {err}"),
+                        )
+                    })?,
+                );
+            }
+        }
+    }
+    Ok(parent)
 }
 
 fn table_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
@@ -1460,12 +1573,8 @@ fn namespace_segments(namespace: &crate::table_catalog::Namespace) -> Vec<String
 }
 
 fn namespace_from_segments(segments: &[String]) -> S3Result<crate::table_catalog::Namespace> {
-    if segments.is_empty() {
-        return Err(s3_error!(InvalidRequest, "namespace cannot be empty"));
-    }
-
-    let namespace = segments.join(".");
-    crate::table_catalog::Namespace::parse(&namespace).map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+    crate::table_catalog::Namespace::from_segments(segments.to_vec())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
 }
 
 fn namespace_response_from_entry(entry: crate::table_catalog::NamespaceEntry) -> S3Result<RestNamespaceResponse> {
@@ -1474,24 +1583,6 @@ fn namespace_response_from_entry(entry: crate::table_catalog::NamespaceEntry) ->
     Ok(RestNamespaceResponse {
         namespace: namespace_segments(&namespace),
         properties: entry.properties,
-    })
-}
-
-fn list_namespaces_response_from_entries(
-    entries: Vec<crate::table_catalog::NamespaceEntry>,
-    next_page_token: Option<String>,
-) -> S3Result<RestListNamespacesResponse> {
-    let namespaces = entries
-        .into_iter()
-        .map(|entry| {
-            let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
-                .map_err(|err| s3_error!(InternalError, "persisted namespace entry is invalid: {}", err))?;
-            Ok(namespace_segments(&namespace))
-        })
-        .collect::<S3Result<Vec<_>>>()?;
-    Ok(RestListNamespacesResponse {
-        namespaces,
-        next_page_token,
     })
 }
 
@@ -3511,6 +3602,7 @@ fn namespace_entry_from_create_request(
     request: CreateNamespaceRequest,
 ) -> S3Result<crate::table_catalog::NamespaceEntry> {
     let namespace = namespace_from_segments(&request.namespace)?;
+    crate::table_catalog::validate_namespace_properties(&request.properties).map_err(catalog_store_error)?;
     Ok(crate::table_catalog::NamespaceEntry {
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
@@ -3539,6 +3631,9 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         }
         crate::table_catalog::TableCatalogStoreError::Invalid(message) => {
             iceberg_rest_error(ICEBERG_ERROR_BAD_REQUEST, StatusCode::BAD_REQUEST, message)
+        }
+        crate::table_catalog::TableCatalogStoreError::Unsupported(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_UNSUPPORTED_OPERATION, StatusCode::NOT_ACCEPTABLE, message)
         }
         crate::table_catalog::TableCatalogStoreError::Internal(message) => {
             iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -3586,28 +3681,61 @@ where
     namespace_response_from_entry(entry)
 }
 
-async fn list_namespaces_response<S>(store: &S, bucket: &str, uri: &http::Uri) -> S3Result<RestListNamespacesResponse>
+async fn list_namespaces_response<S>(
+    store: &S,
+    bucket: &str,
+    parent: Option<&crate::table_catalog::Namespace>,
+    uri: &http::Uri,
+) -> S3Result<RestListNamespacesResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let parent_name = parent.map(crate::table_catalog::Namespace::public_name);
     let context = RestPageContext {
         resource: TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT,
         warehouse: bucket,
-        namespace: None,
+        namespace: parent_name.as_deref(),
     };
     let pagination = rest_pagination_from_query(uri, context)?;
+    let map_list_error = |err| match err {
+        crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_NAMESPACE, StatusCode::NOT_FOUND, message)
+        }
+        err => catalog_store_error(err),
+    };
     let page = match pagination.page_request() {
         Some((cursor, limit)) => store
-            .list_namespaces_page(bucket, cursor, limit)
+            .list_namespace_children_page(bucket, parent_name.as_deref(), cursor, limit)
             .await
-            .map_err(catalog_store_error)?,
+            .map_err(map_list_error)?,
         None => crate::table_catalog::TableCatalogListPage {
-            entries: store.list_namespaces(bucket).await.map_err(catalog_store_error)?,
+            entries: store
+                .list_namespace_children(bucket, parent_name.as_deref())
+                .await
+                .map_err(map_list_error)?,
             next_cursor: None,
         },
     };
     let next_page_token = pagination.next_page_token(page.next_cursor)?;
-    list_namespaces_response_from_entries(page.entries, next_page_token)
+    let namespaces = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            crate::table_catalog::Namespace::parse(&entry.namespace)
+                .map(|namespace| namespace_segments(&namespace))
+                .map_err(|err| {
+                    iceberg_rest_error(
+                        ICEBERG_ERROR_REST,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("catalog namespace is invalid: {err}"),
+                    )
+                })
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    Ok(RestListNamespacesResponse {
+        namespaces,
+        next_page_token,
+    })
 }
 
 async fn get_namespace_response<S>(
@@ -3622,6 +3750,7 @@ where
         .get_namespace(bucket, &namespace.public_name())
         .await
         .map_err(catalog_store_error)?
+        .filter(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active)
     else {
         return Err(iceberg_rest_error(
             ICEBERG_ERROR_NO_SUCH_NAMESPACE,
@@ -3632,6 +3761,44 @@ where
     namespace_response_from_entry(entry)
 }
 
+fn namespace_properties_update_from_request(
+    request: UpdateNamespacePropertiesRequest,
+) -> S3Result<crate::table_catalog::NamespacePropertiesUpdate> {
+    crate::table_catalog::NamespacePropertiesUpdate::try_new(request.removals, request.updates).map_err(|err| match err {
+        crate::table_catalog::NamespacePropertiesUpdateError::DuplicateRemoval(key) => iceberg_rest_error(
+            ICEBERG_ERROR_BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            format!("namespace property removal is repeated: {key}"),
+        ),
+        crate::table_catalog::NamespacePropertiesUpdateError::Overlap(key) => iceberg_rest_error(
+            ICEBERG_ERROR_UNPROCESSABLE_ENTITY,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("namespace property cannot be removed and updated in the same request: {key}"),
+        ),
+    })
+}
+
+async fn update_namespace_properties_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    request: UpdateNamespacePropertiesRequest,
+) -> S3Result<crate::table_catalog::NamespacePropertiesUpdateResult>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let update = namespace_properties_update_from_request(request)?;
+    store
+        .update_namespace_properties(bucket, &namespace.public_name(), update)
+        .await
+        .map_err(|err| match err {
+            crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
+                iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_NAMESPACE, StatusCode::NOT_FOUND, message)
+            }
+            err => catalog_store_error(err),
+        })
+}
+
 async fn namespace_exists_status<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace) -> S3Result<StatusCode>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -3640,7 +3807,7 @@ where
         .get_namespace(bucket, &namespace.public_name())
         .await
         .map_err(catalog_store_error)?
-        .is_some();
+        .is_some_and(|entry| entry.state == crate::table_catalog::TableCatalogEntryState::Active);
     Ok(exists_status(exists))
 }
 

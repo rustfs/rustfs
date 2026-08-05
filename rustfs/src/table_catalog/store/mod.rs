@@ -24,6 +24,56 @@ pub(crate) use object::ObjectTableCatalogStore;
 pub(super) use strong::StrongTableCatalogSnapshot;
 pub(crate) use strong::StrongTableCatalogStore;
 
+fn validate_namespace_entry_identity(entry: &NamespaceEntry) -> TableCatalogStoreResult<Namespace> {
+    validate_catalog_entry_version("namespace", entry.version)?;
+    let namespace = parse_namespace_for_store(&entry.namespace)?;
+    if entry.namespace_id != namespace.storage_id() {
+        return Err(TableCatalogStoreError::Invalid(
+            "catalog namespace entry storage identity does not match its namespace".to_string(),
+        ));
+    }
+    Ok(namespace)
+}
+
+fn direct_namespace_children(
+    table_bucket: &str,
+    parent: Option<&Namespace>,
+    entries: Vec<NamespaceEntry>,
+) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+    let parent_depth = parent.map_or(0, |parent| parent.segments().len());
+    let mut children = BTreeMap::new();
+    for entry in entries {
+        if entry.table_bucket != table_bucket {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog namespace entry belongs to a different table bucket".to_string(),
+            ));
+        }
+        let namespace = validate_namespace_entry_identity(&entry)?;
+        if entry.state != TableCatalogEntryState::Active
+            || parent.is_some_and(|parent| !namespace.segments().starts_with(parent.segments()))
+            || namespace.segments().len() <= parent_depth
+        {
+            continue;
+        }
+        let child = Namespace::from_segments(
+            namespace.segments()[..=parent_depth]
+                .iter()
+                .map(|segment| segment.as_str().to_string())
+                .collect(),
+        )
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid catalog namespace child: {err}")))?;
+        let child_name = child.public_name();
+        if namespace == child {
+            children.insert(child_name, entry);
+        } else {
+            children
+                .entry(child_name)
+                .or_insert_with(|| synthetic_namespace_entry(table_bucket, &child));
+        }
+    }
+    Ok(children.into_values().collect())
+}
+
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogStore: Send + Sync {
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>>;
@@ -33,6 +83,55 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()>;
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>>;
+
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let parent = parse_namespace_for_store(parent)?.public_name();
+        Ok(self
+            .list_namespaces(table_bucket)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.namespace == parent || namespace_is_descendant(&entry.namespace, &parent))
+            .collect())
+    }
+
+    async fn list_namespace_children(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+    ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        let parent = parent.map(parse_namespace_for_store).transpose()?;
+        if let Some(parent) = parent.as_ref()
+            && self
+                .get_namespace(table_bucket, &parent.public_name())
+                .await?
+                .is_none_or(|entry| entry.state != TableCatalogEntryState::Active)
+        {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "namespace {table_bucket}/{}",
+                parent.public_name()
+            )));
+        }
+        let entries = match parent.as_ref() {
+            Some(parent) => self.list_namespaces_under(table_bucket, &parent.public_name()).await?,
+            None => self.list_namespaces(table_bucket).await?,
+        };
+        direct_namespace_children(table_bucket, parent.as_ref(), entries)
+    }
+
+    async fn list_namespace_children_page(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        Ok(catalog_list_page_from_entries(
+            self.list_namespace_children(table_bucket, parent).await?,
+            cursor,
+            limit,
+            |entry| &entry.namespace,
+        ))
+    }
 
     async fn list_namespaces_page(
         &self,
@@ -50,6 +149,17 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>>;
 
+    async fn update_namespace_properties(
+        &self,
+        _table_bucket: &str,
+        _namespace: &str,
+        _update: NamespacePropertiesUpdate,
+    ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
+        Err(TableCatalogStoreError::Unsupported(
+            "namespace property updates are not supported by this catalog store".to_string(),
+        ))
+    }
+
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()>;
 
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
@@ -57,6 +167,8 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
+
+    async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
     async fn list_tables_page(
         &self,
@@ -548,6 +660,37 @@ where
         }
     }
 
+    async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespaces_under(table_bucket, parent).await,
+            Self::DurableStrong(store) => store.list_namespaces_under(table_bucket, parent).await,
+        }
+    }
+
+    async fn list_namespace_children(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+    ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespace_children(table_bucket, parent).await,
+            Self::DurableStrong(store) => store.list_namespace_children(table_bucket, parent).await,
+        }
+    }
+
+    async fn list_namespace_children_page(
+        &self,
+        table_bucket: &str,
+        parent: Option<&str>,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
+            Self::DurableStrong(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
+        }
+    }
+
     async fn list_namespaces_page(
         &self,
         table_bucket: &str,
@@ -564,6 +707,20 @@ where
         match self {
             Self::ObjectBacked(store) => store.get_namespace(table_bucket, namespace).await,
             Self::DurableStrong(store) => store.get_namespace(table_bucket, namespace).await,
+        }
+    }
+
+    async fn update_namespace_properties(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        update: NamespacePropertiesUpdate,
+    ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "namespace property updates require durable-strong catalog backing".to_string(),
+            )),
+            Self::DurableStrong(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
         }
     }
 
@@ -592,6 +749,13 @@ where
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
             Self::DurableStrong(store) => store.list_tables(table_bucket, namespace).await,
+        }
+    }
+
+    async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_all_tables(table_bucket).await,
+            Self::DurableStrong(store) => store.list_all_tables(table_bucket).await,
         }
     }
 

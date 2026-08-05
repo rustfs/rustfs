@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::object::ObjectTableCatalogStore;
+use super::object::{
+    ObjectTableCatalogStore, validate_namespace_entry_object, validate_table_entry_object, validate_view_entry_object,
+};
 use super::strong::{
     StrongCommitSnapshotRecord, StrongTableCatalogBucketSnapshot, StrongTableCatalogState, TableCatalogBackingMigrationFence,
     TableCatalogBackingMigrationFenceStatus, TableCatalogBackingMigrationGlobalFence, table_catalog_bucket_snapshot_fingerprint,
@@ -233,16 +235,6 @@ where
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
             .await?;
-        let mut unmatched_table_objects = namespace_objects
-            .iter()
-            .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut unmatched_view_objects = namespace_objects
-            .iter()
-            .filter(|object| object.ends_with(VIEW_ENTRY_FILE))
-            .cloned()
-            .collect::<BTreeSet<_>>();
         for namespace_object in namespace_objects
             .iter()
             .filter(|object| object.ends_with(NAMESPACE_ENTRY_FILE))
@@ -260,128 +252,92 @@ where
                     "namespace changed while preparing durable strong snapshot: {namespace_object}"
                 )));
             };
-            if namespace_entry.table_bucket != table_bucket {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "namespace {} belongs to a different table bucket",
-                    namespace_entry.namespace
-                )));
-            }
-            let namespace = parse_namespace_for_store(&namespace_entry.namespace)?;
-
-            let table_objects = self
-                .backend
-                .list_objects(self.catalog_bucket(), &self.paths.table_entries_prefix(table_bucket, &namespace))
-                .await?;
-            for table_object in table_objects.iter().filter(|object| object.ends_with(TABLE_ENTRY_FILE)) {
-                unmatched_table_objects.remove(table_object);
-                guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), table_object).await?);
-                let Some((table_entry, _)) = self
-                    .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), table_object)
-                    .await?
-                else {
-                    return Err(TableCatalogStoreError::Conflict(format!(
-                        "table changed while preparing durable strong snapshot: {table_object}"
-                    )));
-                };
-                if table_entry.table_bucket != table_bucket || table_entry.namespace != namespace_entry.namespace {
-                    return Err(TableCatalogStoreError::Invalid(format!(
-                        "table {} does not match its catalog namespace",
-                        table_entry.table
-                    )));
-                }
-
-                for commit_object in self
-                    .backend
-                    .list_objects(
-                        self.catalog_bucket(),
-                        &self.paths.commit_log_entries_prefix(table_bucket, &table_entry.table_id),
-                    )
-                    .await?
-                    .into_iter()
-                    .filter(|object| object.ends_with(".json"))
-                {
-                    let Some((commit, _)) = self
-                        .read_entry_unlocked::<CommitLogEntry>(self.catalog_bucket(), &commit_object)
-                        .await?
-                    else {
-                        return Err(TableCatalogStoreError::Conflict(format!(
-                            "commit log changed while preparing durable strong snapshot: {commit_object}"
-                        )));
-                    };
-                    commits.push(StrongCommitSnapshotRecord {
-                        table_bucket: table_bucket.to_string(),
-                        table_id: table_entry.table_id.clone(),
-                        lookup_key: commit.commit_id.clone(),
-                        commit,
-                    });
-                }
-                for idempotency_object in self
-                    .backend
-                    .list_objects(
-                        self.catalog_bucket(),
-                        &self
-                            .paths
-                            .commit_idempotency_entries_prefix(table_bucket, &table_entry.table_id),
-                    )
-                    .await?
-                    .into_iter()
-                    .filter(|object| object.ends_with(".json"))
-                {
-                    let Some((commit, _)) = self
-                        .read_entry_unlocked::<CommitLogEntry>(self.catalog_bucket(), &idempotency_object)
-                        .await?
-                    else {
-                        return Err(TableCatalogStoreError::Conflict(format!(
-                            "idempotency index changed while preparing durable strong snapshot: {idempotency_object}"
-                        )));
-                    };
-                    let lookup_key = commit.idempotency_key.clone().ok_or_else(|| {
-                        TableCatalogStoreError::Invalid(format!("idempotency index {idempotency_object} has no idempotency key"))
-                    })?;
-                    idempotency.push(StrongCommitSnapshotRecord {
-                        table_bucket: table_bucket.to_string(),
-                        table_id: table_entry.table_id.clone(),
-                        lookup_key,
-                        commit,
-                    });
-                }
-                tables.push(table_entry);
-            }
-
-            let view_objects = self
-                .backend
-                .list_objects(self.catalog_bucket(), &self.paths.view_entries_prefix(table_bucket, &namespace))
-                .await?;
-            for view_object in view_objects.iter().filter(|object| object.ends_with(VIEW_ENTRY_FILE)) {
-                unmatched_view_objects.remove(view_object);
-                guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), view_object).await?);
-                let Some((view_entry, _)) = self
-                    .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), view_object)
-                    .await?
-                else {
-                    return Err(TableCatalogStoreError::Conflict(format!(
-                        "view changed while preparing durable strong snapshot: {view_object}"
-                    )));
-                };
-                if view_entry.table_bucket != table_bucket || view_entry.namespace != namespace_entry.namespace {
-                    return Err(TableCatalogStoreError::Invalid(format!(
-                        "view {} does not match its catalog namespace",
-                        view_entry.view
-                    )));
-                }
-                views.push(view_entry);
-            }
+            validate_namespace_entry_object(&self.paths, namespace_object, &namespace_entry)?;
             namespaces.push(namespace_entry);
         }
-        if let Some(object) = unmatched_table_objects.first() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "table entry has no namespace entry during durable strong migration: {object}"
-            )));
+
+        for table_object in namespace_objects.iter().filter(|object| object.ends_with(TABLE_ENTRY_FILE)) {
+            guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), table_object).await?);
+            let Some((table_entry, _)) = self
+                .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), table_object)
+                .await?
+            else {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table changed while preparing durable strong snapshot: {table_object}"
+                )));
+            };
+            validate_table_entry_object(&self.paths, table_object, &table_entry)?;
+
+            for commit_object in self
+                .backend
+                .list_objects(
+                    self.catalog_bucket(),
+                    &self.paths.commit_log_entries_prefix(table_bucket, &table_entry.table_id),
+                )
+                .await?
+                .into_iter()
+                .filter(|object| object.ends_with(".json"))
+            {
+                let Some((commit, _)) = self
+                    .read_entry_unlocked::<CommitLogEntry>(self.catalog_bucket(), &commit_object)
+                    .await?
+                else {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "commit log changed while preparing durable strong snapshot: {commit_object}"
+                    )));
+                };
+                commits.push(StrongCommitSnapshotRecord {
+                    table_bucket: table_bucket.to_string(),
+                    table_id: table_entry.table_id.clone(),
+                    lookup_key: commit.commit_id.clone(),
+                    commit,
+                });
+            }
+            for idempotency_object in self
+                .backend
+                .list_objects(
+                    self.catalog_bucket(),
+                    &self
+                        .paths
+                        .commit_idempotency_entries_prefix(table_bucket, &table_entry.table_id),
+                )
+                .await?
+                .into_iter()
+                .filter(|object| object.ends_with(".json"))
+            {
+                let Some((commit, _)) = self
+                    .read_entry_unlocked::<CommitLogEntry>(self.catalog_bucket(), &idempotency_object)
+                    .await?
+                else {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "idempotency index changed while preparing durable strong snapshot: {idempotency_object}"
+                    )));
+                };
+                let lookup_key = commit.idempotency_key.clone().ok_or_else(|| {
+                    TableCatalogStoreError::Invalid(format!("idempotency index {idempotency_object} has no idempotency key"))
+                })?;
+                idempotency.push(StrongCommitSnapshotRecord {
+                    table_bucket: table_bucket.to_string(),
+                    table_id: table_entry.table_id.clone(),
+                    lookup_key,
+                    commit,
+                });
+            }
+            tables.push(table_entry);
         }
-        if let Some(object) = unmatched_view_objects.first() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "view entry has no namespace entry during durable strong migration: {object}"
-            )));
+
+        for view_object in namespace_objects.iter().filter(|object| object.ends_with(VIEW_ENTRY_FILE)) {
+            guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), view_object).await?);
+            let Some((view_entry, _)) = self
+                .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), view_object)
+                .await?
+            else {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "view changed while preparing durable strong snapshot: {view_object}"
+                )));
+            };
+            validate_view_entry_object(&self.paths, view_object, &view_entry)?;
+            views.push(view_entry);
         }
 
         namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
@@ -495,10 +451,8 @@ where
             }
         }
 
-        let mut state = StrongTableCatalogState {
-            hydrated: true,
-            ..StrongTableCatalogState::default()
-        };
+        let mut state = StrongTableCatalogState::default();
+        state.hydrated = true;
         StrongTableCatalogStore::<B>::insert_bucket_snapshot_locked(&mut state, snapshot.clone())?;
         if state.namespaces.len() != snapshot.namespaces.len()
             || state.tables.len() != snapshot.tables.len()
@@ -521,7 +475,11 @@ where
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
         }
 
-        let namespaces = self.list_namespaces(table_bucket).await?;
+        let namespace_objects = self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
+            .await?;
+        let mut namespace_count: usize = 0;
         let mut table_count: usize = 0;
         let mut view_count: usize = 0;
         let mut commit_log_count: usize = 0;
@@ -530,38 +488,58 @@ where
         let mut manual_review_count: usize = 0;
         let mut warehouse_prefix_owners = BTreeMap::<String, usize>::new();
 
-        for namespace in &namespaces {
-            let tables = self.list_tables(table_bucket, &namespace.namespace).await?;
-            for table in tables {
-                table_count += 1;
-                if table.state == TableCatalogEntryState::Active {
-                    let warehouse_prefix = table_warehouse_object_prefix(&table)?;
-                    warehouse_prefix_owners
-                        .entry(warehouse_prefix)
-                        .and_modify(|count| *count = count.saturating_add(1))
-                        .or_insert(1);
-                }
-
-                let recovery = self.table_commit_recovery_report_for_entry(&table, 0).await?;
-                commit_log_count = commit_log_count.saturating_add(recovery.commits.len());
-                idempotency_index_count = idempotency_index_count.saturating_add(
-                    self.backend
-                        .list_objects(
-                            self.catalog_bucket(),
-                            &self.paths.commit_idempotency_entries_prefix(table_bucket, &table.table_id),
-                        )
-                        .await?
-                        .into_iter()
-                        .filter(|object| object.ends_with(".json"))
-                        .count(),
-                );
-                recovery_required_count = recovery_required_count
-                    .saturating_add(recovery.staged_before_table_update_count)
-                    .saturating_add(recovery.finalization_required_count)
-                    .saturating_add(recovery.idempotency_repair_required_count);
-                manual_review_count = manual_review_count.saturating_add(recovery.manual_review_count);
+        for object in namespace_objects {
+            if object.ends_with(NAMESPACE_ENTRY_FILE) {
+                let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await? else {
+                    continue;
+                };
+                validate_namespace_entry_object(&self.paths, &object, &entry)?;
+                namespace_count = namespace_count.saturating_add(1);
+                continue;
             }
-            view_count = view_count.saturating_add(self.list_views(table_bucket, &namespace.namespace).await?.len());
+            if object.ends_with(VIEW_ENTRY_FILE) {
+                let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? else {
+                    continue;
+                };
+                validate_view_entry_object(&self.paths, &object, &entry)?;
+                view_count = view_count.saturating_add(1);
+                continue;
+            }
+            if !object.ends_with(TABLE_ENTRY_FILE) {
+                continue;
+            }
+
+            let Some((table, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            validate_table_entry_object(&self.paths, &object, &table)?;
+            table_count = table_count.saturating_add(1);
+            if table.state == TableCatalogEntryState::Active {
+                let warehouse_prefix = table_warehouse_object_prefix(&table)?;
+                warehouse_prefix_owners
+                    .entry(warehouse_prefix)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
+
+            let recovery = self.table_commit_recovery_report_for_entry(&table, 0).await?;
+            commit_log_count = commit_log_count.saturating_add(recovery.commits.len());
+            idempotency_index_count = idempotency_index_count.saturating_add(
+                self.backend
+                    .list_objects(
+                        self.catalog_bucket(),
+                        &self.paths.commit_idempotency_entries_prefix(table_bucket, &table.table_id),
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|object| object.ends_with(".json"))
+                    .count(),
+            );
+            recovery_required_count = recovery_required_count
+                .saturating_add(recovery.staged_before_table_update_count)
+                .saturating_add(recovery.finalization_required_count)
+                .saturating_add(recovery.idempotency_repair_required_count);
+            manual_review_count = manual_review_count.saturating_add(recovery.manual_review_count);
         }
 
         let warehouse_index_ready = self.warehouse_index_ready(table_bucket).await?;
@@ -633,7 +611,7 @@ where
             source_kind: TableCatalogBackingKind::ObjectBacked,
             target_kind: TableCatalogBackingKind::StrongKvWal,
             status,
-            namespace_count: namespaces.len(),
+            namespace_count,
             table_count,
             view_count,
             commit_log_count,

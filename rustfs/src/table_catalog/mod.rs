@@ -275,7 +275,7 @@ where
     TableCatalogListPage { entries, next_cursor }
 }
 
-fn catalog_list_page_from_entries<T, F>(
+pub(crate) fn catalog_list_page_from_entries<T, F>(
     mut entries: Vec<T>,
     cursor: Option<&str>,
     limit: NonZeroUsize,

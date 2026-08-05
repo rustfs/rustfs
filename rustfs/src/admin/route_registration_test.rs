@@ -383,6 +383,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/properties",
+            "/analytics/namespaces/sales/properties",
+        ),
         table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         table_route_sample(
             Method::GET,
@@ -574,6 +579,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         compat_table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/properties",
+            "/analytics/namespaces/sales/properties",
+        ),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
         compat_table_route_sample(
             Method::GET,
