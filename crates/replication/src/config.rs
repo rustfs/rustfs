@@ -20,7 +20,7 @@ use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
 use s3s::dto::{
     ExistingObjectReplicationStatus, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, ReplicationRules,
+    ReplicationRuleStatus, ReplicationRules, StorageClass,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,6 +28,10 @@ use uuid::Uuid;
 
 pub const REPLICATION_CAPABILITY_CONTRACT_VERSION: u32 = 1;
 
+// `Rule.Destination.StorageClass` is deliberately absent from both lists below:
+// clients should keep omitting it, but the validator tolerates an explicit
+// `STANDARD` as a no-op (see `unsupported_replication_config_field`) because the
+// console's rule form always sends it.
 pub const REPLICATION_WRITABLE_FIELDS: &[&str] = &[
     "Role",
     "Rule.ID",
@@ -164,7 +168,18 @@ pub fn unsupported_replication_config_field(config: &ReplicationConfiguration) -
         if rule.destination.replication_time.is_some() {
             return Some("Destination.ReplicationTime");
         }
-        if rule.destination.storage_class.is_some() {
+        // The replication engine never reads this field (replica placement comes from
+        // the bucket-target config or the source object), so an explicit STANDARD —
+        // which the console's rule form always sends — is indistinguishable from
+        // omitting it and is tolerated as a no-op. Any other value would be silently
+        // ignored rather than honored, so it stays rejected. Exact match: S3 storage
+        // class enums are case-sensitive.
+        if rule
+            .destination
+            .storage_class
+            .as_ref()
+            .is_some_and(|class| class.as_str() != StorageClass::STANDARD)
+        {
             return Some("Destination.StorageClass");
         }
     }
@@ -952,6 +967,47 @@ mod tests {
         config.rules[0].destination.storage_class =
             Some(s3s::dto::StorageClass::from_static(s3s::dto::StorageClass::STANDARD_IA));
         assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
+
+        // The exact-match contract is deliberate: S3 storage class enums are
+        // case-sensitive, so a lowercase variant must stay rejected.
+        config.rules[0].destination.storage_class = Some(StorageClass::from("standard".to_string()));
+        assert_eq!(unsupported_replication_config_field(&config), Some("Destination.StorageClass"));
+
+        // Explicit STANDARD is a no-op (the engine never reads the field) and must
+        // pass: the console's rule form always sends it, and rejecting it makes the
+        // form unusable.
+        config.rules[0].destination.storage_class = Some(StorageClass::from_static(StorageClass::STANDARD));
+        assert_eq!(unsupported_replication_config_field(&config), None);
+    }
+
+    #[test]
+    fn explicit_standard_storage_class_is_accepted_from_wire_xml() {
+        // The exact request shape the console's add-replication-rule form sends:
+        // a rule whose Destination carries <StorageClass>STANDARD</StorageClass>.
+        let xml = br#"
+            <ReplicationConfiguration>
+              <Role></Role>
+              <Rule>
+                <ID>console-rule</ID>
+                <Status>Enabled</Status>
+                <Priority>1</Priority>
+                <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+                <Destination>
+                  <Bucket>arn:aws:s3:::destination</Bucket>
+                  <StorageClass>STANDARD</StorageClass>
+                </Destination>
+              </Rule>
+            </ReplicationConfiguration>
+        "#;
+        let mut deserializer = Deserializer::new(xml);
+        let config = <ReplicationConfiguration as s3s::xml::Deserialize>::deserialize(&mut deserializer)
+            .expect("console-shaped config should parse");
+        deserializer
+            .expect_eof()
+            .expect("console-shaped config should consume the whole body");
+
+        assert_eq!(config.rules[0].destination.storage_class.as_ref().map(|c| c.as_str()), Some("STANDARD"));
+        assert_eq!(unsupported_replication_config_field(&config), None);
     }
 
     #[test]

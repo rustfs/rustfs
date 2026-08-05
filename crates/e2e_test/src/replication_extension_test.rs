@@ -2754,7 +2754,7 @@ async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Erro
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
-    assert!(body.to_ascii_lowercase().contains("arn is empty"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("arn is required"), "unexpected response: {body}");
 
     Ok(())
 }
@@ -2808,6 +2808,128 @@ async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Bo
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
     assert!(body.to_ascii_lowercase().contains("target not found"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+async fn send_set_replication_target_update_request(
+    source_env: &RustFSTestEnvironment,
+    source_bucket: &str,
+    ops: &[&str],
+    body: serde_json::Value,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let mut url = format!(
+        "{}/rustfs/admin/v3/set-remote-target?bucket={}&update=true",
+        source_env.url,
+        urlencoding::encode(source_bucket)
+    );
+    for op in ops {
+        url.push_str(&format!("&{op}=true"));
+    }
+    signed_request(
+        http::Method::PUT,
+        &url,
+        &source_env.access_key,
+        &source_env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await
+}
+
+async fn fetch_single_target(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let response = list_replication_targets_request(env, Some(bucket)).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut targets: Vec<serde_json::Value> = response.json().await?;
+    assert_eq!(targets.len(), 1, "expected exactly one remote target");
+    Ok(targets.remove(0))
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_partial_update_preserves_credentials() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-partial-update-src";
+    let target_bucket = "replication-partial-update-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+
+    // A sync-only update whose body omits credentials entirely must succeed and
+    // leave the stored connection settings untouched.
+    let response = send_set_replication_target_update_request(
+        &source_env,
+        source_bucket,
+        &["sync"],
+        serde_json::json!({
+            "arn": arn,
+            "type": "replication",
+            "replicationSync": true
+        }),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK, "sync-only update failed: {}", response.text().await?);
+
+    let target = fetch_single_target(&source_env, source_bucket).await?;
+    assert_eq!(target["replicationSync"], serde_json::json!(true));
+    assert_eq!(target["endpoint"], serde_json::json!(target_env.address));
+    assert_eq!(target["credentials"]["accessKey"], serde_json::json!(target_env.access_key));
+
+    // An update naming no field groups is a no-op: a body carrying a different
+    // endpoint and credentials must not leak into the stored target.
+    let response = send_set_replication_target_update_request(
+        &source_env,
+        source_bucket,
+        &[],
+        serde_json::json!({
+            "arn": arn,
+            "type": "replication",
+            "endpoint": "203.0.113.1:9000",
+            "credentials": { "accessKey": "other-access", "secretKey": "other-secret" },
+            "targetbucket": "elsewhere",
+            "secure": false,
+            "replicationSync": false
+        }),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK, "no-op update failed: {}", response.text().await?);
+
+    let target = fetch_single_target(&source_env, source_bucket).await?;
+    assert_eq!(
+        target["replicationSync"],
+        serde_json::json!(true),
+        "no-op update must not change sync mode"
+    );
+    assert_eq!(
+        target["endpoint"],
+        serde_json::json!(target_env.address),
+        "no-op update must not change endpoint"
+    );
+    assert_eq!(
+        target["credentials"]["accessKey"],
+        serde_json::json!(target_env.access_key),
+        "no-op update must not change credentials"
+    );
 
     Ok(())
 }
