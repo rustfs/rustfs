@@ -94,6 +94,21 @@ mod duration_milliseconds {
     }
 }
 
+/// Defensive decode for the two integer wire encodings of these duration
+/// fields: RustFS persists (and legacy RustFS clients sent) plain seconds,
+/// while Go `time.Duration` JSON — madmin/mc requests and MinIO-written
+/// bucket-targets metadata — is nanoseconds. No meaningful interval lies
+/// between 10^7 seconds (~115 days) and 10^7 nanoseconds (10ms), so the
+/// magnitude disambiguates the unit.
+pub fn duration_from_secs_or_nanos(value: u64) -> Duration {
+    const NANOS_THRESHOLD: u64 = 10_000_000;
+    if value < NANOS_THRESHOLD {
+        Duration::from_secs(value)
+    } else {
+        Duration::from_nanos(value)
+    }
+}
+
 mod duration_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -109,8 +124,8 @@ mod duration_seconds {
     where
         D: Deserializer<'de>,
     {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(Duration::from_secs(secs))
+        let value = u64::deserialize(deserializer)?;
+        Ok(super::duration_from_secs_or_nanos(value))
     }
 }
 

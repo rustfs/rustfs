@@ -26,7 +26,9 @@ use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FI
 #[cfg(test)]
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
 use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
-use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat};
+use crate::admin::storage_api::bucket::target::{
+    BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
+};
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
@@ -295,12 +297,12 @@ impl RemoteTargetRequest {
             ));
         }
 
-        for (unsupported, configured) in REMOTE_TARGET_UNSUPPORTED_FIELDS.iter().copied().zip([
-            self.disable_proxy,
-            self.health_check_duration != 0,
-            self.edge,
-            self.edge_sync_before_expiry,
-        ]) {
+        for (unsupported, configured) in
+            REMOTE_TARGET_UNSUPPORTED_FIELDS
+                .iter()
+                .copied()
+                .zip([self.disable_proxy, self.edge, self.edge_sync_before_expiry])
+        {
             if configured {
                 return Err(s3_error!(
                     InvalidRequest,
@@ -325,11 +327,15 @@ impl RemoteTargetRequest {
             storage_class: self.storage_class,
             skip_tls_verify: self.skip_tls_verify,
             ca_cert_pem: self.ca_cert_pem,
-            health_check_duration: Duration::from_secs(self.health_check_duration),
+            // madmin/mc encode these Go `time.Duration` fields as nanoseconds;
+            // legacy RustFS clients sent seconds. Accepted for mc compatibility;
+            // the per-target health-check interval is not yet applied — the
+            // heartbeat keeps its global env-configured interval.
+            health_check_duration: duration_from_secs_or_nanos(self.health_check_duration),
             disable_proxy: self.disable_proxy,
             reset_before_date: self.reset_before_date,
             reset_id: self.reset_id,
-            total_downtime: Duration::from_secs(self.total_downtime),
+            total_downtime: duration_from_secs_or_nanos(self.total_downtime),
             last_online: self.last_online,
             online: self.online,
             latency: self.latency,
@@ -339,6 +345,23 @@ impl RemoteTargetRequest {
             offline_count: self.offline_count,
         })
     }
+}
+
+/// Admin-response encoding of a remote target: the persisted bucket-targets
+/// format keeps `healthCheckDuration`/`totalDowntime` in seconds, but madmin
+/// decodes them as Go `time.Duration` (nanoseconds) — re-encode just those
+/// fields without touching the persistence wire format.
+fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, serde_json::Error> {
+    fn go_duration_nanos(duration: Duration) -> serde_json::Value {
+        // Saturate instead of truncating: >u64::MAX nanoseconds (~584 years)
+        // is unrepresentable for a Go time.Duration reader anyway.
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX).into()
+    }
+
+    let mut value = serde_json::to_value(target)?;
+    value["healthCheckDuration"] = go_duration_nanos(target.health_check_duration);
+    value["totalDowntime"] = go_duration_nanos(target.total_downtime);
+    Ok(value)
 }
 
 fn validate_remote_target_tls_settings(remote_target: &BucketTarget) -> S3Result<()> {
@@ -732,7 +755,14 @@ impl Operation for ListRemoteTargetHandler {
             let sys = BucketTargetSys::get();
             let targets = sys.list_targets(bucket, "").await;
 
-            let targets: Vec<_> = targets.iter().map(|target| target.redacted_credentials()).collect();
+            let targets: Vec<_> = targets
+                .iter()
+                .map(|target| remote_target_admin_json(&target.redacted_credentials()))
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    error!("Serialization error: {}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+                })?;
             let json_targets = serde_json::to_vec(&targets).map_err(|e| {
                 error!("Serialization error: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -1707,6 +1737,28 @@ mod tests {
             .expect("legacy seconds healthCheckDuration must be accepted");
 
         assert_eq!(target.health_check_duration, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn list_remote_targets_response_encodes_go_durations_as_nanoseconds() {
+        // madmin (and therefore mc) decode healthCheckDuration/totalDowntime
+        // as Go time.Duration nanoseconds; the persisted format stays seconds.
+        let target = BucketTarget {
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target".to_string(),
+            health_check_duration: std::time::Duration::from_secs(60),
+            total_downtime: std::time::Duration::from_secs(90),
+            ..Default::default()
+        };
+
+        let value = super::remote_target_admin_json(&target).expect("admin response should serialize");
+
+        assert_eq!(value["healthCheckDuration"], 60_000_000_000u64);
+        assert_eq!(value["totalDowntime"], 90_000_000_000u64);
+        // Persistence keeps seconds: the response path must not leak into it.
+        let persisted = serde_json::to_value(&target).expect("persisted form should serialize");
+        assert_eq!(persisted["healthCheckDuration"], 60);
+        assert_eq!(persisted["totalDowntime"], 90);
     }
 
     #[test]

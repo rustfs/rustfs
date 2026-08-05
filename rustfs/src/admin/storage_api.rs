@@ -599,6 +599,7 @@ pub(crate) mod replication {
 }
 
 pub(crate) mod target {
+    pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
     #[allow(clippy::upper_case_acronyms)]
     pub(crate) type ARN = super::ecstore_bucket::target::ARN;
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
