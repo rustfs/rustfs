@@ -639,31 +639,71 @@ pub struct SRStateInfo {
     pub api_version: Option<String>,
 }
 
+// madmin-go's SRInfo top-level fields carry no json tags (except APIVersion),
+// so MinIO emits them in PascalCase; the aliases below accept that on
+// deserialization while serialization stays camelCase. Nested structs
+// (SRBucketInfo, SRStateInfo, ...) do have lowercase tags in madmin-go —
+// do not spread aliases to them.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SRInfo {
-    #[serde(default)]
+    #[serde(alias = "Enabled", default)]
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "Name", default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(rename = "deploymentID", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "deploymentID",
+        alias = "DeploymentID",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub deployment_id: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(alias = "Buckets", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub buckets: BTreeMap<String, SRBucketInfo>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(alias = "Policies", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policies: BTreeMap<String, SRIAMPolicy>,
-    #[serde(rename = "userPolicies", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "userPolicies",
+        alias = "UserPolicies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub user_policies: BTreeMap<String, SRPolicyMapping>,
-    #[serde(rename = "userInfoMap", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "userInfoMap",
+        alias = "UserInfoMap",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub user_info_map: BTreeMap<String, UserInfo>,
-    #[serde(rename = "groupDescMap", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "groupDescMap",
+        alias = "GroupDescMap",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub group_desc_map: BTreeMap<String, GroupDesc>,
-    #[serde(rename = "groupPolicies", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "groupPolicies",
+        alias = "GroupPolicies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub group_policies: BTreeMap<String, SRPolicyMapping>,
-    #[serde(rename = "replicationCfg", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "replicationCfg",
+        alias = "ReplicationCfg",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub replication_cfg: BTreeMap<String, Value>,
-    #[serde(rename = "ilmExpiryRules", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "ilmExpiryRules",
+        alias = "ILMExpiryRules",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub ilm_expiry_rules: BTreeMap<String, ILMExpiryRule>,
-    #[serde(default)]
+    #[serde(alias = "State", default)]
     pub state: SRStateInfo,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
@@ -1551,7 +1591,8 @@ mod tests {
                     "name": "devs",
                     "status": "enabled",
                     "members": ["alice"],
-                    "policy": "readonly"
+                    "policy": "readonly",
+                    "updatedAt": "2026-07-22T01:00:00Z"
                 }
             },
             "GroupPolicies": {
@@ -1601,7 +1642,10 @@ mod tests {
         assert!(info.group_desc_map.contains_key("devs"), "GroupDescMap must map to group_desc_map");
         assert!(info.group_policies.contains_key("devs"), "GroupPolicies must map to group_policies");
         assert!(info.replication_cfg.contains_key("photos"), "ReplicationCfg must map to replication_cfg");
-        assert!(info.ilm_expiry_rules.contains_key("rule-1"), "ILMExpiryRules must map to ilm_expiry_rules");
+        assert!(
+            info.ilm_expiry_rules.contains_key("rule-1"),
+            "ILMExpiryRules must map to ilm_expiry_rules"
+        );
         assert!(
             info.state.peers.contains_key("minio-deploy-1"),
             "State must map to state with populated peers"
