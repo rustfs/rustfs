@@ -848,4 +848,38 @@ if [[ "$stdout_sink_calls" != "2" ]]; then
   exit 1
 fi
 
+# Heal log amplification guards (rustfs/rustfs#5716 follow-up): per-object heal
+# work (Object/Metadata/MRF/ECDecode tasks queued by MRF/autoheal/scanner loops)
+# must not emit info!/warn!/error! lines per object during mass recovery.
+# The 1000-char window covers the measured 541-710 chars of structured fields
+# between the macro open and the message at every retry-admission site.
+if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Heal retry admission decided"' crates/heal/src/heal/manager.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal retry admission decisions repeat per retrying task (per-object under MRF retry storms) and must stay at DEBUG" >&2
+  exit 1
+fi
+
+demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
+if [[ "$demoted_task_sites" -lt 4 ]]; then
+  echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2
+  exit 1
+fi
+
+demoted_task_total_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/task.rs || echo 0)"
+if [[ "$demoted_task_total_sites" -lt 5 ]]; then
+  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites, found $demoted_task_total_sites)" >&2
+  exit 1
+fi
+
+erasure_sampled_sites="$(rg -c -F 'take_failure_log_sample(' crates/heal/src/heal/erasure_healer.rs || echo 0)"
+if [[ "$erasure_sampled_sites" -lt 2 ]]; then
+  echo "❌ logging guardrail violation: erasure-set per-object failure/skip warns must stay sample-capped via take_failure_log_sample (expected >= 2 sites in crates/heal/src/heal/erasure_healer.rs, found $erasure_sampled_sites)" >&2
+  exit 1
+fi
+
+demoted_admission_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/manager.rs || echo 0)"
+if [[ "$demoted_admission_sites" -lt 6 ]]; then
+  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 sites in crates/heal/src/heal/manager.rs, found $demoted_admission_sites)" >&2
+  exit 1
+fi
+
 echo "✅ Logging guardrails check passed"

@@ -16,7 +16,7 @@ use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils, compose_key},
     storage::{HealStorageAPI, next_heal_listing_token},
-    task::is_missing_object_dir_heal_result,
+    task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
 };
 use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -612,6 +612,12 @@ impl ErasureSetHealer {
         let page_concurrency_limit =
             Self::effective_heal_page_object_concurrency_for_source(self.source, self.heal_opts.scan_mode);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
+        // disk can fail/skip hundreds of thousands of versions in one sweep, so
+        // only the first few occurrences warn and the rest demote to debug!.
+        // The end-of-pass summary reports the full failed/skipped counts.
+        let mut transient_skip_samples_logged = 0_u64;
+        let mut failure_samples_logged = 0_u64;
 
         // backlog#920: select the per-erasure-set DISK-WALK union enumerator when
         // the scan is Deep OR the request came from AutoHeal — these are the paths
@@ -748,8 +754,7 @@ impl ErasureSetHealer {
                     Err(Error::TransientSkip { message }) => {
                         *skipped_objects += 1;
                         checkpoint_manager.add_skipped_object(key).await?;
-                        warn!(
-                            target: "rustfs::heal::erasure_healer",
+                        demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
                             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
@@ -760,13 +765,12 @@ impl ErasureSetHealer {
                             state = "transient_skip",
                             error = %message,
                             "Erasure set object heal skipped due to transient error"
-                        );
+                        });
                     }
                     Err(err) => {
                         *failed_objects += 1;
                         checkpoint_manager.add_failed_object(key).await?;
-                        warn!(
-                            target: "rustfs::heal::erasure_healer",
+                        demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
                             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
@@ -777,7 +781,7 @@ impl ErasureSetHealer {
                             state = "failed",
                             error = %err,
                             "Erasure set object heal failed"
-                        );
+                        });
                     }
                 }
 
