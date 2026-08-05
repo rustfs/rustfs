@@ -1021,7 +1021,7 @@ fn rename_with_commit_guard_std(src_file_path: &Path, dst_file_path: &Path, comm
 #[cfg(windows)]
 fn prepare_windows_rename_source(
     src_file_path: &Path,
-    dst_file_path: &Path,
+    _dst_file_path: &Path,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<winapi_util::Handle> {
     if src_file_path.parent() != Some(commit_guard.source_parent.as_path()) {
@@ -1038,7 +1038,7 @@ fn prepare_windows_rename_source(
             Ok(source) => break source,
             Err(err) if should_retry_rename(&err, attempt) => {
                 #[cfg(test)]
-                windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
+                windows_rename_test_hooks::run_before_rename_retry(_dst_file_path);
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -2074,7 +2074,7 @@ fn open_windows_relative(
 
 #[cfg(windows)]
 fn create_windows_superseding_file(
-    parent: &WindowsDirectoryHandle,
+    parent: &winapi_util::Handle,
     component: &std::ffi::OsStr,
 ) -> io::Result<winapi_util::Handle> {
     use windows_sys::{
@@ -2091,7 +2091,7 @@ fn create_windows_superseding_file(
     // object instead of truncating the object behind a hard link. Opening
     // relative to the retained parent also prevents final-component traversal.
     let file = open_windows_relative(
-        &parent.handle,
+        parent,
         component,
         DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
         FILE_SHARE_READ,
