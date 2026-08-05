@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! Regression test for rustfs#4304: IAM bootstrap must not depend on the
 //! distributed namespace-lock quorum.
 //!

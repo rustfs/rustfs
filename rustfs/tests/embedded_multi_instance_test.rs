@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! End-to-end acceptance for backlog#1052: two embedded RustFS servers coexist
 //! in one process, on different ports and volumes, and their S3 data planes
 //! stay isolated.
@@ -455,17 +457,30 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
     let b_access_key = "startup-window-access-b";
     let b_secret_key = "startup-window-secret-b";
     let mut barrier = pause_embedded_startup_after_http_bind(port_b);
-    let startup_b = tokio::spawn(async move {
-        RustFSServerBuilder::new()
-            .address(format!("127.0.0.1:{port_b}"))
-            .access_key(b_access_key)
-            .secret_key(b_secret_key)
-            .build()
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_http_bound())
-        .await
-        .expect("server B must bind HTTP before installing its context slot");
+    let startup_b = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_b}"))
+        .access_key(b_access_key)
+        .secret_key(b_secret_key)
+        .build();
+    tokio::pin!(startup_b);
+    {
+        let bound = tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_http_bound());
+        tokio::pin!(bound);
+        tokio::select! {
+            bound = &mut bound => {
+                bound.expect("server B must bind HTTP before installing its context slot");
+            }
+            startup = startup_b.as_mut() => {
+                match startup {
+                    Ok(server) => {
+                        server.shutdown().await;
+                        panic!("server B startup completed before the HTTP-bind barrier fired");
+                    }
+                    Err(err) => panic!("server B startup failed before the HTTP-bind barrier fired: {err}"),
+                }
+            }
+        }
+    }
 
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -487,10 +502,9 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
     );
 
     barrier.release();
-    let server_b = tokio::time::timeout(Duration::from_secs(20), startup_b)
+    let server_b = tokio::time::timeout(Duration::from_secs(20), startup_b.as_mut())
         .await
         .expect("server B startup must complete after releasing the barrier")
-        .expect("server B startup task must not panic")
         .expect("start embedded server B");
     let client_b = s3_client(&server_b.endpoint(), server_b.access_key(), server_b.secret_key());
     client_b
