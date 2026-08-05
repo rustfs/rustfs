@@ -3976,6 +3976,9 @@ mod tests {
         }
 
         // Start more in-progress uploads on the same object than a single page holds.
+        // Track only the decoded `<uuid>x<timestamp>` suffixes: the full upload id
+        // embeds the process-global deployment id, which a concurrently running
+        // test can swap between create and list time.
         let total = 5usize;
         let mut created = HashSet::new();
         for _ in 0..total {
@@ -3983,7 +3986,10 @@ mod tests {
                 .new_multipart_upload(bucket, object, &ObjectOptions::default())
                 .await
                 .expect("multipart upload should be created");
-            assert!(created.insert(res.upload_id), "each upload id must be unique");
+            assert!(
+                created.insert(runtime_sources::upload_uuid_suffix(&res.upload_id)),
+                "each upload id must be unique"
+            );
         }
 
         // A single page must never return more than max_uploads entries.
@@ -4038,7 +4044,7 @@ mod tests {
             assert!(page.uploads.len() <= 1, "max_uploads=1 must never return more than one upload");
             for upload in &page.uploads {
                 assert!(
-                    seen.insert(upload.upload_id.clone()),
+                    seen.insert(runtime_sources::upload_uuid_suffix(&upload.upload_id)),
                     "upload {} was returned more than once across pages",
                     upload.upload_id
                 );
@@ -4067,13 +4073,16 @@ mod tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
+        // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+        // upload id embeds the process-global deployment id, which a
+        // concurrently running test can swap between create and list time.
         let mut expected = Vec::new();
         for object in ["logs/a.bin", "logs/a.bin", "logs/b.bin", "other/c.bin"] {
             let upload = set_disks
                 .new_multipart_upload(bucket, object, &ObjectOptions::default())
                 .await
                 .expect("multipart upload should be created");
-            expected.push((object.to_string(), upload.upload_id));
+            expected.push((object.to_string(), runtime_sources::upload_uuid_suffix(&upload.upload_id)));
         }
         expected.sort();
 
@@ -4081,11 +4090,12 @@ mod tests {
             .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
             .await
             .expect("bucket-wide multipart listing should succeed");
-        let listed = all
+        let mut listed = all
             .uploads
             .iter()
-            .map(|upload| (upload.object.clone(), upload.upload_id.clone()))
+            .map(|upload| (upload.object.clone(), runtime_sources::upload_uuid_suffix(&upload.upload_id)))
             .collect::<Vec<_>>();
+        listed.sort();
         assert_eq!(listed, expected);
         assert!(!all.is_truncated);
 
@@ -4149,7 +4159,18 @@ mod tests {
             assert!(upload_id_marker.is_some());
         }
 
-        assert_eq!(listed, expected);
+        // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+        // upload id embeds the process-global deployment id, which a
+        // concurrently running test can swap between create and list time.
+        let normalize = |uploads: &[(String, String)]| {
+            let mut normalized = uploads
+                .iter()
+                .map(|(object, upload_id)| (object.clone(), runtime_sources::upload_uuid_suffix(upload_id)))
+                .collect::<Vec<_>>();
+            normalized.sort();
+            normalized
+        };
+        assert_eq!(normalize(&listed), normalize(&expected));
 
         let key_only = set_disks
             .list_multipart_uploads_for_incarnation(bucket, "logs/", Some("logs/a.bin".to_string()), None, None, 1000, None)
@@ -4268,7 +4289,13 @@ mod tests {
             .await
             .expect("incarnation-scoped multipart listing should succeed");
         assert_eq!(scoped.uploads.len(), 1);
-        assert_eq!(scoped.uploads[0].upload_id, current.upload_id);
+        // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+        // upload id embeds the process-global deployment id, which a
+        // concurrently running test can swap between create and list time.
+        assert_eq!(
+            runtime_sources::upload_uuid_suffix(&scoped.uploads[0].upload_id),
+            runtime_sources::upload_uuid_suffix(&current.upload_id)
+        );
     }
 
     /// Recursively collect every file named `file_name` under the multipart
@@ -4755,7 +4782,13 @@ mod tests {
                 .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, None)
                 .await
                 .expect("listing multipart uploads should succeed");
-            page.uploads.iter().any(|u| u.upload_id == upload_id)
+            // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+            // upload id embeds the process-global deployment id, which a
+            // concurrently running test can swap between create and list time.
+            let expected_suffix = runtime_sources::upload_uuid_suffix(upload_id);
+            page.uploads
+                .iter()
+                .any(|u| runtime_sources::upload_uuid_suffix(&u.upload_id) == expected_suffix)
         }
 
         #[tokio::test]

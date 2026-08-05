@@ -246,6 +246,22 @@ pub fn deployment_id() -> Option<String> {
     get_global_deployment_id()
 }
 
+/// Test-only inverse of [`deployment_upload_id`]: returns the raw
+/// `<uuid>x<timestamp>` suffix without the deployment-id prefix. Under plain
+/// `cargo test` (thread-parallel, shared process globals) a concurrently
+/// running test that re-initializes a store can swap the global deployment id
+/// between create time and list time, so assertions must compare only this
+/// suffix, never the full encoded upload id.
+#[cfg(test)]
+pub(crate) fn upload_uuid_suffix(upload_id: &str) -> String {
+    base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(upload_id.as_bytes())
+        .ok()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|decoded| decoded.split_once('.').map(|(_, suffix)| suffix.to_owned()))
+        .unwrap_or_else(|| upload_id.to_owned())
+}
+
 pub(crate) fn replication_pool() -> Option<Arc<DynReplicationPool>> {
     crate::runtime::global::current_ctx().replication_pool()
 }

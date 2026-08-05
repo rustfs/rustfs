@@ -1749,7 +1749,19 @@ mod tests {
             upload_id_marker = page.next_upload_id_marker;
         }
 
-        assert_eq!(actual, expected, "set-level merge must return every upload exactly once");
+        // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+        // upload id embeds the process-global deployment id, which a
+        // concurrently running test can swap between create and list time.
+        let normalize = |uploads: &[(String, String)]| {
+            let mut normalized = uploads
+                .iter()
+                .map(|(key, upload_id)| (key.clone(), runtime_sources::upload_uuid_suffix(upload_id)))
+                .collect::<Vec<_>>();
+            normalized.sort();
+            normalized
+        };
+        let actual = normalize(&actual);
+        assert_eq!(actual, normalize(&expected), "set-level merge must return every upload exactly once");
         let mut deduped = actual.clone();
         deduped.dedup();
         assert_eq!(deduped.len(), actual.len(), "set-level pagination must not duplicate uploads");
