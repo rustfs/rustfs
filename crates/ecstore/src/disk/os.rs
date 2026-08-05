@@ -1606,7 +1606,7 @@ impl RenameDestinationPathGuard {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
             let staging_name = format!(".rustfs-write-{}", uuid::Uuid::new_v4());
             let mut file = create_windows_new_file(self._directory_guard.last_handle()?, staging_name.as_ref())?;
-            let write_result = (|| {
+            let write_result: io::Result<()> = (|| {
                 std::io::Write::write_all(file.as_file_mut(), data)?;
                 if sync_file {
                     file.as_file().sync_data()?;
