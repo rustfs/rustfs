@@ -34,6 +34,7 @@ their issue closes.
 | `check_migration_gate_count.sh` | ci-gate | Migration-critical test gate with committed count floor (`.config/migration-gate-floor.txt`) | ci.yml Test and Lint; `docs/testing/README.md` |
 | `check_no_planning_docs.sh` | ci-gate | Blocks committed planning-type documents | ci.yml Quick Checks; `make pre-commit` |
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
+| `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | arch-checks skill |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
