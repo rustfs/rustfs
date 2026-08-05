@@ -2550,6 +2550,12 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
+                // Unsupported source metadata (e.g. managed SSE) is a fail-closed
+                // condition: report FAILED so the composite status and the
+                // OperationFailedReplication event reflect that nothing reached
+                // the target, instead of leaking the optimistic Completed above.
+                rinfo.replication_status = ReplicationStatusType::Failed;
+                rinfo.error = Some(e.to_string());
                 warn!(
                     event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2954,6 +2960,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
+                // Unsupported source metadata (e.g. managed SSE) is a fail-closed
+                // condition: report FAILED so the composite status and the
+                // OperationFailedReplication event reflect that nothing reached
+                // the target, instead of leaking the optimistic Completed above.
+                rinfo.replication_status = ReplicationStatusType::Failed;
                 rinfo.error = Some(e.to_string());
                 warn!(
                     event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
