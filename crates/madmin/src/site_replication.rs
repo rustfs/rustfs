@@ -171,8 +171,12 @@ impl fmt::Debug for PeerInfo {
 pub struct SRPolicyMapping {
     #[serde(rename = "userOrGroup", default)]
     pub user_or_group: String,
+    /// MinIO IAMUserType wire value (cmd/iam.go): unknown = -1, regUser = 0,
+    /// stsUser = 1, svcUser = 2. Signed because MinIO sends -1 for group
+    /// mappings. This is NOT the RustFS-internal `UserType` encoding; translate
+    /// at the boundary with `rustfs_iam::store::{sr_wire_user_type, user_type_from_sr_wire}`.
     #[serde(rename = "userType", default)]
-    pub user_type: u64,
+    pub user_type: i64,
     #[serde(rename = "isGroup", default)]
     pub is_group: bool,
     #[serde(default)]
@@ -330,8 +334,10 @@ pub struct SRSvcAccChange {
 pub struct SRCredInfo {
     #[serde(rename = "accessKey", default)]
     pub access_key: String,
+    /// MinIO IAMUserType wire value (same table as `SRPolicyMapping::user_type`);
+    /// signed because MinIO's unknown is -1.
     #[serde(rename = "iamUserType", default)]
-    pub iam_user_type: u64,
+    pub iam_user_type: i64,
     #[serde(rename = "isDeleteReq", default)]
     pub is_delete_req: bool,
     #[serde(rename = "userIdentityJSON", default, skip_serializing_if = "Option::is_none")]
@@ -1512,6 +1518,7 @@ mod tests {
             "policy": "readwrite"
         }))
         .expect("MinIO group mapping with userType -1 must deserialize");
+        assert_eq!(mapping.user_type, -1);
         assert!(mapping.is_group);
         assert_eq!(mapping.policy, "readwrite");
     }
@@ -1524,6 +1531,7 @@ mod tests {
             "iamUserType": -1
         }))
         .expect("SRCredInfo with iamUserType -1 must deserialize");
+        assert_eq!(cred.iam_user_type, -1);
         assert_eq!(cred.access_key, "replicated-user");
     }
 
