@@ -84,7 +84,7 @@ uuid = { workspace = true, features = ["v4", "v7", "serde", "fast-rng", "macro-d
 sysinfo = { workspace = true, features = ["multithread"] }
 rustfs-kafka-async = { workspace = true }
 mysql_async = { workspace = true, default-features = false, features = ["default-rustls", "tracing"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true }
 parking_lot = { workspace = true }
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
 arc-swap = { workspace = true }

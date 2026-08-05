@@ -65,7 +65,7 @@ pub const SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX: &str = "replicati
 /// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
 /// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
 /// but without allocating.
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+pub fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 

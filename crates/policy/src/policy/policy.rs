@@ -2136,6 +2136,87 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_kms_bundle_actions_require_an_unscoped_statement() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }
+  ]
+}"#,
+        )?;
+        let unscoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    }
+  ]
+}"#,
+        )?;
+        let partially_scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "NotResource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let scoped_deny = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "Resource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        for action in [KmsAction::BackupAction, KmsAction::RestoreAction] {
+            let args = kms_args(Action::KmsAction(action), "", &conditions, &claims);
+            assert!(
+                !scoped.is_allowed(&args).await,
+                "a single-key grant must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                !partially_scoped.is_allowed(&args).await,
+                "a grant excluding one key must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                unscoped.is_allowed(&args).await,
+                "an action-only grant must continue authorizing {action:?}"
+            );
+            assert!(
+                !scoped_deny.is_allowed(&args).await,
+                "a deny for included key material must block the all-key {action:?} operation"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_kms_statement_without_resource_matches_every_key() -> Result<()> {
         use crate::policy::action::{Action, KmsAction};
 

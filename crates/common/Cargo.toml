@@ -39,11 +39,15 @@ tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 rmp-serde = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lib]
 doctest = false

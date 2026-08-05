@@ -15,6 +15,7 @@
 use crate::heal_channel::HealScanMode;
 use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -669,7 +670,7 @@ impl LockedLastMinuteLatency {
 #[derive(Clone, Debug)]
 struct CurrentPathState {
     path: String,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 }
 
 struct CurrentPathTracker {
@@ -678,10 +679,10 @@ struct CurrentPathTracker {
 
 impl CurrentPathTracker {
     fn new(initial_path: String) -> Self {
-        Self::new_at(initial_path, Utc::now())
+        Self::new_at(initial_path, Timestamp::now())
     }
 
-    fn new_at(initial_path: String, updated_at: DateTime<Utc>) -> Self {
+    fn new_at(initial_path: String, updated_at: Timestamp) -> Self {
         Self {
             state: Arc::new(RwLock::new(CurrentPathState {
                 path: initial_path,
@@ -693,12 +694,42 @@ impl CurrentPathTracker {
     async fn update_path(&self, path: String) {
         let mut state = self.state.write().await;
         state.path = path;
-        state.updated_at = Utc::now();
+        state.updated_at = Timestamp::now();
     }
 
     async fn get_state(&self) -> CurrentPathState {
         self.state.read().await.clone()
     }
+}
+
+fn chrono_to_jiff_timestamp(dt: DateTime<Utc>) -> Timestamp {
+    let seconds = dt.timestamp();
+    let nanoseconds = match i32::try_from(dt.timestamp_subsec_nanos()) {
+        Ok(nanoseconds) => nanoseconds,
+        Err(_) => {
+            return if seconds < 0 { Timestamp::MIN } else { Timestamp::MAX };
+        }
+    };
+
+    match Timestamp::new(seconds, nanoseconds) {
+        Ok(timestamp) => timestamp,
+        Err(_) => {
+            if seconds < 0 {
+                Timestamp::MIN
+            } else {
+                Timestamp::MAX
+            }
+        }
+    }
+}
+
+fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
+    let duration = now.duration_since(earlier);
+    if duration.is_negative() {
+        return 0;
+    }
+
+    u64::try_from(duration.as_secs()).map_or(u64::MAX, |seconds| seconds)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1166,12 +1197,12 @@ pub struct ScannerLastMinute {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetricsReport {
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     pub current_cycle: u64,
     #[serde(default)]
     pub current_cycle_active: bool,
-    pub current_started: DateTime<Utc>,
-    pub cycles_completed_at: Vec<DateTime<Utc>>,
+    pub current_started: Timestamp,
+    pub cycles_completed_at: Vec<Timestamp>,
     pub ongoing_buckets: usize,
     #[serde(default)]
     pub active_scan_paths: usize,
@@ -2988,8 +3019,8 @@ impl Metrics {
             let cycle = self.cycle_info.read().await;
             let has_cycle = if let Some(cycle) = cycle.as_ref() {
                 m.current_cycle = cycle.current;
-                m.cycles_completed_at = cycle.cycle_completed.clone();
-                m.current_started = cycle.started;
+                m.cycles_completed_at = cycle.cycle_completed.iter().copied().map(chrono_to_jiff_timestamp).collect();
+                m.current_started = chrono_to_jiff_timestamp(cycle.started);
                 true
             } else {
                 false
@@ -3024,15 +3055,15 @@ impl Metrics {
         };
 
         if !has_cycle && let Some(init_time) = crate::get_global_init_time().await {
-            m.current_started = init_time;
+            m.current_started = chrono_to_jiff_timestamp(init_time);
         }
 
-        m.collected_at = Utc::now();
+        m.collected_at = Timestamp::now();
         let current_path_snapshots = self.current_path_snapshots().await;
         m.active_scan_paths = current_path_snapshots.len();
         m.oldest_active_path_age_seconds = current_path_snapshots
             .iter()
-            .map(|(_, state)| m.collected_at.signed_duration_since(state.updated_at).num_seconds().max(0) as u64)
+            .map(|(_, state)| timestamp_elapsed_seconds_since(m.collected_at, state.updated_at))
             .max()
             .unwrap_or_default();
         m.active_paths = current_path_snapshots
@@ -3308,6 +3339,22 @@ impl Drop for CloseDiskGuard {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scanner_metrics_report_timestamps_serialize_as_rfc3339_utc() {
+        let report = ScannerMetricsReport {
+            collected_at: Timestamp::constant(1_700_000_000, 123_456_000),
+            current_started: Timestamp::constant(1_699_999_940, 0),
+            cycles_completed_at: vec![Timestamp::constant(1_700_000_060, 987_654_000)],
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&report).expect("scanner metrics report should serialize");
+
+        assert_eq!(value["collected_at"].as_str(), Some("2023-11-14T22:13:20.123456Z"));
+        assert_eq!(value["current_started"].as_str(), Some("2023-11-14T22:12:20Z"));
+        assert_eq!(value["cycles_completed_at"][0].as_str(), Some("2023-11-14T22:14:20.987654Z"));
+    }
+
     #[tokio::test]
     async fn close_disk_guard_runs_cleanup_when_an_early_return_drops_it() {
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
@@ -3366,7 +3413,7 @@ mod tests {
     #[tokio::test]
     async fn report_counts_active_scan_paths() {
         let metrics = Metrics::new();
-        let updated_at = Utc::now() - chrono::Duration::seconds(12);
+        let updated_at = Timestamp::now() - jiff::SignedDuration::from_secs(12);
         metrics.current_paths.write().await.insert(
             "disk-a".to_string(),
             Arc::new(CurrentPathTracker::new_at("bucket-a".to_string(), updated_at)),
@@ -3388,7 +3435,7 @@ mod tests {
         let metrics = Metrics::new();
         let tracker = Arc::new(CurrentPathTracker::new_at(
             "bucket-a".to_string(),
-            Utc::now() - chrono::Duration::hours(1),
+            Timestamp::now() - jiff::SignedDuration::from_secs(60 * 60),
         ));
         metrics
             .current_paths
@@ -4161,7 +4208,7 @@ mod tests {
         let report = metrics.report().await;
         *crate::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
 
-        assert_eq!(report.current_started, cycle_started);
+        assert_eq!(report.current_started, chrono_to_jiff_timestamp(cycle_started));
     }
 
     #[tokio::test]
@@ -4584,7 +4631,7 @@ mod tests {
         let active = metrics.report().await;
         assert!(active.current_cycle_active);
         assert_eq!(active.current_cycle, 12);
-        assert_eq!(active.current_started, cycle_started);
+        assert_eq!(active.current_started, chrono_to_jiff_timestamp(cycle_started));
 
         let idle_cycle = CurrentCycle {
             current: 0,

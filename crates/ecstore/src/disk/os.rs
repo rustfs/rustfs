@@ -25,7 +25,9 @@ use std::{
     sync::{Arc, LazyLock, Weak},
 };
 use tokio::fs;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit,
+};
 use tracing::warn;
 
 /// Check path length according to OS limits.
@@ -96,9 +98,20 @@ pub(crate) mod windows_rename_test_hooks {
 
     type Hook = Box<dyn FnOnce() + Send>;
 
+    static BEFORE_SOURCE_WRITE: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_PUBLICATION: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_RENAME_RETRY: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     static GUARD_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Vec<u64>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) fn install_before_source_write(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        BEFORE_SOURCE_WRITE.lock().insert(path.to_path_buf(), Box::new(hook));
+    }
+
+    pub(crate) fn run_before_source_write(path: &Path) {
+        if let Some(hook) = BEFORE_SOURCE_WRITE.lock().remove(path) {
+            hook();
+        }
+    }
 
     pub(crate) fn install_before_publication(path: &Path, hook: impl FnOnce() + Send + 'static) {
         BEFORE_PUBLICATION.lock().insert(path.to_path_buf(), Box::new(hook));
@@ -178,6 +191,10 @@ static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(
 static DISK_FILE_SYNC_LIMITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+type NamespaceMutationLock = AsyncMutex<()>;
+type NamespaceMutationLockRegistry = HashMap<PathBuf, Weak<NamespaceMutationLock>>;
+static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize) -> usize {
     let cpu_scaled = cpu_count
@@ -228,6 +245,47 @@ pub(crate) fn disk_volume_mutation_lock(root: &Path, volume: &str) -> Arc<RwLock
     let lock = Arc::new(RwLock::new(()));
     locks.insert(key, Arc::downgrade(&lock));
     lock
+}
+
+fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
+    let mut locks = DISK_NAMESPACE_MUTATION_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Keeps a namespace transaction serialized even when its async waiter is
+/// cancelled while a blocking filesystem call is still running.
+pub(crate) struct NamespaceMutationLease {
+    _namespace_guard: OwnedMutexGuard<()>,
+    _volume_guard: Option<OwnedRwLockReadGuard<()>>,
+}
+
+async fn acquire_namespace_mutation_lease(path: &Path) -> Arc<NamespaceMutationLease> {
+    Arc::new(NamespaceMutationLease {
+        _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
+        _volume_guard: None,
+    })
+}
+
+/// Acquire object serialization before the volume read lock. Bucket deletion
+/// only acquires the volume write lock, so this order cannot form a lock cycle.
+pub(crate) async fn acquire_rename_data_mutation_lease(
+    root: &Path,
+    volume: &str,
+    destination_object: &Path,
+) -> Arc<NamespaceMutationLease> {
+    let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
+    let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
+    Arc::new(NamespaceMutationLease {
+        _namespace_guard: namespace_guard,
+        _volume_guard: Some(volume_guard),
+    })
 }
 
 /// Always acquire the per-disk permit before the process-wide permit. Keeping
@@ -619,6 +677,26 @@ pub async fn rename_all(
     Ok(())
 }
 
+pub(crate) async fn rename_all_with_lease(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    lease: Arc<NamespaceMutationLease>,
+) -> Result<()> {
+    reliable_rename_inner_with_lease(
+        src_file_path.as_ref().to_path_buf(),
+        dst_file_path.as_ref().to_path_buf(),
+        base_dir.as_ref().to_path_buf(),
+        publication_root.clone(),
+        true,
+        lease,
+    )
+    .await
+    .map_err(to_file_error)?;
+    Ok(())
+}
+
 #[cfg(windows)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn rename_all_with_commit_guard(
@@ -627,12 +705,174 @@ pub(crate) async fn rename_all_with_commit_guard(
     base_dir: impl AsRef<Path>,
     _publication_root: &PublicationRoot,
     commit_guard: &RenameCommitGuard,
+    lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
-    let operation = || rename_with_commit_guard_std(&src_file_path, &dst_file_path, commit_guard);
-    let result = run_blocking_namespace_operation(operation);
+    let commit_guard = commit_guard.clone();
+    let operation = {
+        let src_file_path = src_file_path.clone();
+        let dst_file_path = dst_file_path.clone();
+        move || rename_with_commit_guard_std(&src_file_path, &dst_file_path, &commit_guard)
+    };
+    let result = run_blocking_namespace_operation(lease, operation).await;
+    if let Err(err) = &result {
+        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
+    }
+    result.map_err(to_file_error)?;
+    Ok(())
+}
+
+pub(crate) struct PreparedRenameSource {
+    path: PathBuf,
+    #[cfg(windows)]
+    source: winapi_util::Handle,
+    #[cfg(not(windows))]
+    source: std::fs::File,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl PreparedRenameSource {
+    pub(crate) fn write_all(&mut self, data: &[u8], sync: bool) -> io::Result<()> {
+        #[cfg(all(test, windows))]
+        windows_rename_test_hooks::run_before_source_write(&self.path);
+        #[cfg(windows)]
+        std::io::Write::write_all(self.source.as_file_mut(), data)?;
+        #[cfg(not(windows))]
+        std::io::Write::write_all(&mut self.source, data)?;
+        if sync {
+            #[cfg(windows)]
+            self.source.as_file().sync_data()?;
+            #[cfg(not(windows))]
+            self.source.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn create_prepared_rename_source_with_commit_guard(
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<PreparedRenameSource> {
+    #[cfg(windows)]
+    {
+        if src_file_path.parent() != Some(commit_guard.source_parent.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename source parent does not match its commit guard",
+            ));
+        }
+        if dst_file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename destination parent does not match its commit guard",
+            ));
+        }
+        let source_name = src_file_path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a file name"))?;
+        let source = create_windows_superseding_file(commit_guard.source_parent_guard.last_handle()?, source_name)?;
+        return Ok(PreparedRenameSource {
+            path: src_file_path.to_path_buf(),
+            source,
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (dst_file_path, commit_guard);
+        let source = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(src_file_path)?;
+        #[cfg(unix)]
+        let metadata = source.metadata()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(PreparedRenameSource {
+            path: src_file_path.to_path_buf(),
+            source,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn read_destination_file_with_commit_guard(
+    file_path: &Path,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<Option<Vec<u8>>> {
+    if file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination file parent does not match its commit guard",
+        ));
+    }
+    read_windows_relative_file(file_path, &commit_guard.destination_parent_guard)
+}
+
+#[cfg(windows)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn rename_all_with_prepared_source(
+    prepared_source: PreparedRenameSource,
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    _publication_root: &PublicationRoot,
+    commit_guard: &RenameCommitGuard,
+    lease: Arc<NamespaceMutationLease>,
+) -> Result<()> {
+    let src_file_path = src_file_path.as_ref().to_path_buf();
+    let dst_file_path = dst_file_path.as_ref().to_path_buf();
+    let base_dir = base_dir.as_ref().to_path_buf();
+    let commit_guard = commit_guard.clone();
+    let operation = {
+        let src_file_path = src_file_path.clone();
+        let dst_file_path = dst_file_path.clone();
+        move || rename_prepared_source_with_commit_guard_std(&prepared_source, &src_file_path, &dst_file_path, &commit_guard)
+    };
+    let result = run_blocking_namespace_operation(lease, operation).await;
+    if let Err(err) = &result {
+        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
+    }
+    result.map_err(to_file_error)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn rename_all_with_prepared_source(
+    prepared_source: PreparedRenameSource,
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    _commit_guard: &RenameCommitGuard,
+    lease: Arc<NamespaceMutationLease>,
+) -> Result<()> {
+    let src_file_path = src_file_path.as_ref().to_path_buf();
+    let dst_file_path = dst_file_path.as_ref().to_path_buf();
+    let base_dir = base_dir.as_ref().to_path_buf();
+    let publication_root = publication_root.clone();
+    let operation = {
+        let src_file_path = src_file_path.clone();
+        let dst_file_path = dst_file_path.clone();
+        let base_dir = base_dir.clone();
+        move || {
+            validate_prepared_rename_source(&prepared_source, &src_file_path)?;
+            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+        }
+    };
+    let result = run_blocking_namespace_operation(lease, operation).await;
     if let Err(err) = &result {
         warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
     }
@@ -647,8 +887,9 @@ pub(crate) async fn rename_all_with_commit_guard(
     base_dir: impl AsRef<Path>,
     publication_root: &PublicationRoot,
     _commit_guard: &RenameCommitGuard,
+    lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
-    rename_all(src_file_path, dst_file_path, base_dir, publication_root).await
+    rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
 }
 
 #[tracing::instrument(level = "debug", skip_all)]
@@ -658,11 +899,32 @@ pub async fn rename_all_ignore_missing_source(
     base_dir: impl AsRef<Path>,
     publication_root: &PublicationRoot,
 ) -> Result<()> {
+    let src_file_path = src_file_path.as_ref();
     match reliable_rename_inner(src_file_path, dst_file_path.as_ref(), base_dir, publication_root, false).await {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && rename_source_is_missing(src_file_path, publication_root) => Ok(()),
         Err(err) => Err(to_file_error(err).into()),
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_source_is_missing(src_file_path: &Path, publication_root: &PublicationRoot) -> bool {
+    let Some(source_parent) = src_file_path.parent() else {
+        return false;
+    };
+    let source_parent_guard = match lock_windows_directory_tree(source_parent, None, publication_root) {
+        Ok(guard) => guard,
+        Err(err) => return err.kind() == io::ErrorKind::NotFound,
+    };
+    match open_windows_rename_source_identity(src_file_path, &source_parent_guard) {
+        Ok(_) => false,
+        Err(err) => err.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn rename_source_is_missing(src_file_path: &Path, _publication_root: &PublicationRoot) -> bool {
+    matches!(std::fs::symlink_metadata(src_file_path), Err(err) if err.kind() == io::ErrorKind::NotFound)
 }
 
 async fn reliable_rename(
@@ -684,11 +946,36 @@ async fn reliable_rename_inner(
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
-    let operation = || {
-        let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, publication_root)?;
-        rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+    let lease = acquire_namespace_mutation_lease(&dst_file_path).await;
+    reliable_rename_inner_with_lease(
+        src_file_path,
+        dst_file_path,
+        base_dir,
+        publication_root.clone(),
+        warn_on_missing_source,
+        lease,
+    )
+    .await
+}
+
+async fn reliable_rename_inner_with_lease(
+    src_file_path: PathBuf,
+    dst_file_path: PathBuf,
+    base_dir: PathBuf,
+    publication_root: PublicationRoot,
+    warn_on_missing_source: bool,
+    lease: Arc<NamespaceMutationLease>,
+) -> io::Result<()> {
+    let operation = {
+        let src_file_path = src_file_path.clone();
+        let dst_file_path = dst_file_path.clone();
+        let base_dir = base_dir.clone();
+        move || {
+            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+        }
     };
-    let result = run_blocking_namespace_operation(operation);
+    let result = run_blocking_namespace_operation(lease, operation).await;
     if let Err(err) = &result
         && (warn_on_missing_source || err.kind() != io::ErrorKind::NotFound)
     {
@@ -697,21 +984,52 @@ async fn reliable_rename_inner(
     result
 }
 
+#[cfg(not(windows))]
+fn validate_prepared_rename_source(prepared_source: &PreparedRenameSource, src_file_path: &Path) -> io::Result<()> {
+    if prepared_source.path != src_file_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared rename source does not match the requested source path",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(src_file_path)?;
+        if metadata.dev() != prepared_source.device || metadata.ino() != prepared_source.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rename source identity changed while publication was prepared",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(windows)]
 fn rename_with_commit_guard_std(src_file_path: &Path, dst_file_path: &Path, commit_guard: &RenameCommitGuard) -> io::Result<()> {
+    let prepared_source = PreparedRenameSource {
+        path: src_file_path.to_path_buf(),
+        source: prepare_windows_rename_source(src_file_path, dst_file_path, commit_guard)?,
+    };
+    rename_prepared_source_with_commit_guard_std(&prepared_source, src_file_path, dst_file_path, commit_guard)
+}
+
+#[cfg(windows)]
+fn prepare_windows_rename_source(
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<winapi_util::Handle> {
     if src_file_path.parent() != Some(commit_guard.source_parent.as_path()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "rename source parent does not match its commit guard",
         ));
     }
-    if dst_file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rename destination parent does not match its commit guard",
-        ));
-    }
-
     let (source_identity_anchor, expected_source_identity) =
         open_windows_rename_source_identity(src_file_path, &commit_guard.source_parent_guard)?;
     let mut attempt = 0;
@@ -734,21 +1052,51 @@ fn rename_with_commit_guard_std(src_file_path: &Path, dst_file_path: &Path, comm
     }
     drop(source_identity_anchor);
 
-    rename_windows_prepared(dst_file_path, &commit_guard.destination_parent_guard, &source, attempt)
+    Ok(source)
 }
 
-/// Run one blocking namespace transaction without detaching it from its task.
-///
-/// A cancelled `spawn_blocking` future leaves its closure running after the
-/// caller's namespace lock has been released. Keep directory preparation and
-/// publication in the operation task; a multi-thread runtime can replace the
-/// blocked worker while a current-thread runtime must finish the short local
-/// filesystem transaction before observing cancellation.
-pub(crate) fn run_blocking_namespace_operation<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    match tokio::runtime::Handle::current().runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(operation),
-        _ => operation(),
+#[cfg(windows)]
+fn rename_prepared_source_with_commit_guard_std(
+    prepared_source: &PreparedRenameSource,
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<()> {
+    if prepared_source.path != src_file_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared rename source does not match the requested source path",
+        ));
     }
+    if src_file_path.parent() != Some(commit_guard.source_parent.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename source parent does not match its commit guard",
+        ));
+    }
+    if dst_file_path.parent() != Some(commit_guard.destination_parent.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination parent does not match its commit guard",
+        ));
+    }
+
+    rename_windows_prepared(dst_file_path, &commit_guard.destination_parent_guard, &prepared_source.source, 0)
+}
+
+/// Run a blocking namespace operation without making its async waiter
+/// uncancellable. The owned lease moves into the closure, so a timed-out task
+/// cannot release transaction serialization before the syscall returns.
+pub(crate) async fn run_blocking_namespace_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        operation()
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
 }
 
 struct RenamePreparation {
@@ -788,24 +1136,45 @@ fn prepare_rename_with_retry(
     let source_parent = src_file_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a parent directory"))?;
-    let source_parent_guard = lock_windows_directory_tree(source_parent, publication_root)?;
-    let (source_identity_anchor, expected_source_identity) =
-        open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
+    let destination_parent = dst_file_path.parent();
     let mut attempt = 0;
-    let parent_guard = loop {
-        let result = dst_file_path
-            .parent()
-            .map(|parent| mkdir_all_below_existing_base_std(parent, base_dir, publication_root))
-            .transpose();
-        match result {
-            Ok(parent_guard) => break parent_guard,
-            Err(err) if should_retry_rename(&err, attempt) => {
-                #[cfg(test)]
-                windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
-                attempt += 1;
+    let prepare_destination_parent = |attempt: &mut usize| -> io::Result<Option<ExistingBaseDirectoryGuard>> {
+        loop {
+            let result = destination_parent
+                .map(|parent| mkdir_all_below_existing_base_std(parent, base_dir, publication_root))
+                .transpose();
+            match result {
+                Ok(parent_guard) => break Ok(parent_guard),
+                Err(err) if should_retry_rename(&err, *attempt) => {
+                    #[cfg(test)]
+                    windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
+                    *attempt += 1;
+                }
+                Err(err) => break Err(err),
             }
-            Err(err) => return Err(err),
         }
+    };
+    let same_parent = match destination_parent {
+        Some(destination_parent) => {
+            publication_root.relative_path(source_parent)? == publication_root.relative_path(destination_parent)?
+        }
+        None => false,
+    };
+    let (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity) = if same_parent {
+        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        let source_parent_guard = parent_guard
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a parent directory"))?
+            .clone();
+        let (source_identity_anchor, expected_source_identity) =
+            open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
+        (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity)
+    } else {
+        let source_parent_guard = lock_windows_directory_tree(source_parent, destination_parent, publication_root)?;
+        let (source_identity_anchor, expected_source_identity) =
+            open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
+        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity)
     };
     let source = loop {
         match open_windows_rename_source(src_file_path, &source_parent_guard) {
@@ -955,7 +1324,7 @@ fn rename_into_existing_parent(
             NtSetInformationFile,
         },
         Win32::{
-            Foundation::{ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, RtlNtStatusToDosError},
+            Foundation::{ERROR_ACCESS_DENIED, RtlNtStatusToDosError},
             System::IO::IO_STATUS_BLOCK,
         },
     };
@@ -1039,7 +1408,7 @@ fn rename_into_existing_parent(
     // FileRenameInformationEx implementations reject IGNORE_READONLY; retry
     // without only that optional flag so open-destination replacement remains
     // compatible while read-only destinations still fail explicitly there.
-    let extended_result = windows_extended_rename_with_compatibility_fallback(|flags| {
+    windows_extended_rename_with_compatibility_fallback(legacy_error, |flags| {
         unsafe {
             (*rename_info).Anonymous = FILE_RENAME_INFORMATION_0 { Flags: flags };
         }
@@ -1053,20 +1422,14 @@ fn rename_into_existing_parent(
             )
         };
         if status >= 0 { Ok(()) } else { Err(status_error(status).1) }
-    });
-    let extended_error = match extended_result {
-        Ok(()) => return Ok(()),
-        Err(err) => err,
-    };
-    if extended_error.raw_os_error().and_then(|code| u32::try_from(code).ok()) == Some(ERROR_DIR_NOT_EMPTY) {
-        Err(extended_error)
-    } else {
-        Err(legacy_error)
-    }
+    })
 }
 
 #[cfg(windows)]
-fn windows_extended_rename_with_compatibility_fallback(mut rename: impl FnMut(u32) -> io::Result<()>) -> io::Result<()> {
+fn windows_extended_rename_with_compatibility_fallback(
+    legacy_error: io::Error,
+    mut rename: impl FnMut(u32) -> io::Result<()>,
+) -> io::Result<()> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{
             FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
@@ -1075,7 +1438,7 @@ fn windows_extended_rename_with_compatibility_fallback(mut rename: impl FnMut(u3
     };
 
     let compatible_flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
-    match rename(compatible_flags | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE) {
+    let result = match rename(compatible_flags | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE) {
         Err(err)
             if err
                 .raw_os_error()
@@ -1083,6 +1446,17 @@ fn windows_extended_rename_with_compatibility_fallback(mut rename: impl FnMut(u3
                 .is_some_and(|code| matches!(code, ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED)) =>
         {
             rename(compatible_flags)
+        }
+        result => result,
+    };
+    match result {
+        Err(err)
+            if err
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+                .is_some_and(|code| matches!(code, ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED)) =>
+        {
+            Err(legacy_error)
         }
         result => result,
     }
@@ -1154,6 +1528,7 @@ impl PublicationRoot {
 }
 
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct ExistingBaseDirectoryGuard {
     handles: Vec<WindowsDirectoryHandle>,
     #[cfg(test)]
@@ -1187,6 +1562,7 @@ pub(crate) type ExistingBaseDirectoryGuard = Vec<std::os::fd::OwnedFd>;
 #[cfg(all(not(unix), not(windows)))]
 pub(crate) type ExistingBaseDirectoryGuard = ();
 
+#[derive(Clone)]
 pub(crate) struct RenameCommitGuard {
     #[cfg(windows)]
     source_parent: PathBuf,
@@ -1198,6 +1574,154 @@ pub(crate) struct RenameCommitGuard {
     destination_parent_guard: ExistingBaseDirectoryGuard,
 }
 
+pub(crate) struct RenameDestinationPathGuard {
+    #[cfg(windows)]
+    directory: PathBuf,
+    #[cfg(windows)]
+    _directory_guard: ExistingBaseDirectoryGuard,
+}
+
+impl RenameDestinationPathGuard {
+    pub(crate) fn write_file_for_path_access(
+        &self,
+        file_path: &Path,
+        data: &[u8],
+        sync_file: bool,
+        sync_parent: bool,
+    ) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            if file_path.parent() != Some(self.directory.as_path()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "guarded destination file must be an immediate child of its directory",
+                ));
+            }
+            let file_name = file_path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guarded destination file must have a name"))?;
+            let mut file = create_windows_superseding_file(self._directory_guard.last_handle()?, file_name)?;
+            std::io::Write::write_all(file.as_file_mut(), data)?;
+            if sync_file {
+                file.as_file().sync_data()?;
+            }
+            drop(file);
+            if sync_parent {
+                fsync_dir_std(&self.directory)?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(file_path)?;
+            std::io::Write::write_all(&mut file, data)?;
+            if sync_file {
+                file.sync_data()?;
+            }
+            if sync_parent && let Some(parent) = file_path.parent() {
+                fsync_dir_std(parent)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl RenameCommitGuard {
+    #[cfg(windows)]
+    pub(crate) fn lock_source_directory_for_path_access(&self, directory: &Path) -> io::Result<RenameDestinationPathGuard> {
+        if directory != self.source_parent {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "guarded source directory does not match the rename source parent",
+            ));
+        }
+        Ok(RenameDestinationPathGuard {
+            directory: directory.to_path_buf(),
+            _directory_guard: self.source_parent_guard.clone(),
+        })
+    }
+
+    pub(crate) fn lock_destination_directory_for_path_access(&self, directory: &Path) -> io::Result<RenameDestinationPathGuard> {
+        self.destination_directory_guard(directory, false)
+    }
+
+    pub(crate) fn create_destination_directory_for_path_access(
+        &self,
+        directory: &Path,
+    ) -> io::Result<RenameDestinationPathGuard> {
+        self.destination_directory_guard(directory, true)
+    }
+
+    /// Reopen a destination directory without write sharing before a
+    /// pathname-based operation. The returned owned tree rejects an active
+    /// writer or reparse mutation for the full requested subtree.
+    fn destination_directory_guard(&self, directory: &Path, create_missing: bool) -> io::Result<RenameDestinationPathGuard> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
+
+            let relative = directory.strip_prefix(&self.destination_parent).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "guarded path must remain below the rename destination parent",
+                )
+            })?;
+            for component in relative.components() {
+                if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "guarded destination path contains an invalid component",
+                    ));
+                }
+            }
+
+            let component = self.destination_parent.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot safely reopen the publication root for pathname access",
+                )
+            })?;
+            let parent_index = self.destination_parent_guard.handles.len().checked_sub(2).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot safely reopen the publication root for pathname access",
+                )
+            })?;
+            let mut handles = self.destination_parent_guard.handles[..=parent_index].to_vec();
+            let parent = handles
+                .last()
+                .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
+            handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
+            for component in relative.components() {
+                let Component::Normal(component) = component else {
+                    continue;
+                };
+                let parent = handles
+                    .last()
+                    .ok_or_else(|| io::Error::other("Windows destination path guard lost its parent handle"))?;
+                let disposition = if create_missing { FILE_OPEN_IF } else { FILE_OPEN };
+                handles.push(open_windows_directory_component(parent, component, disposition)?);
+            }
+            Ok(RenameDestinationPathGuard {
+                directory: directory.to_path_buf(),
+                _directory_guard: ExistingBaseDirectoryGuard::new(handles),
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = (self, directory, create_missing);
+            Ok(RenameDestinationPathGuard {})
+        }
+    }
+}
+
 pub(crate) fn prepare_rename_commit_guard(
     source_parent: &Path,
     destination_parent: &Path,
@@ -1206,8 +1730,21 @@ pub(crate) fn prepare_rename_commit_guard(
 ) -> io::Result<RenameCommitGuard> {
     #[cfg(windows)]
     {
-        let source_parent_guard = lock_windows_directory_tree(source_parent, publication_root)?;
-        let destination_parent_guard = mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
+        // A same-directory rename must use one shared-write parent handle:
+        // retaining a second read-only-share handle would block the kernel's
+        // relative target open. Delete sharing stays excluded, so identity is
+        // still pinned. Distinct source trees remain strict.
+        let same_parent = publication_root.relative_path(source_parent)? == publication_root.relative_path(destination_parent)?;
+        let (source_parent_guard, destination_parent_guard) = if same_parent {
+            let destination_parent_guard =
+                mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
+            (destination_parent_guard.clone(), destination_parent_guard)
+        } else {
+            let source_parent_guard = lock_windows_directory_tree(source_parent, None, publication_root)?;
+            let destination_parent_guard =
+                mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
+            (source_parent_guard, destination_parent_guard)
+        };
         Ok(RenameCommitGuard {
             source_parent: source_parent.to_path_buf(),
             destination_parent: destination_parent.to_path_buf(),
@@ -1406,12 +1943,22 @@ fn windows_file_attribute_tag(
 }
 
 #[cfg(windows)]
-fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) -> io::Result<ExistingBaseDirectoryGuard> {
+fn lock_windows_directory_tree(
+    path: &Path,
+    shared_write_ancestor: Option<&Path>,
+    publication_root: &PublicationRoot,
+) -> io::Result<ExistingBaseDirectoryGuard> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     let relative = publication_root.relative_path(path)?;
+    let shared_write_relative = shared_write_ancestor
+        .map(|ancestor| publication_root.relative_path(ancestor))
+        .transpose()?
+        .filter(|ancestor| relative.starts_with(*ancestor));
     let mut handles = Vec::with_capacity(relative.components().count().saturating_add(1));
     handles.push(publication_root.directory.clone());
+    let mut opened_relative = PathBuf::new();
 
     for component in relative.components() {
         let Component::Normal(component) = component else {
@@ -1426,7 +1973,17 @@ fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) 
         let parent = handles
             .last()
             .ok_or_else(|| io::Error::other("Windows directory guard lost its root handle"))?;
-        handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
+        opened_relative.push(component);
+        let child = if shared_write_relative.is_some_and(|ancestor| opened_relative.as_path() == ancestor) {
+            // A handle-relative rename opens the target parent for write. When
+            // that parent is also a source ancestor, this source-side handle
+            // must share write access or the transaction blocks itself. Delete
+            // sharing remains omitted, so the directory identity stays pinned.
+            open_windows_relative_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?
+        } else {
+            open_windows_directory_component(parent, component, FILE_OPEN)?
+        };
+        handles.push(child);
     }
 
     Ok(ExistingBaseDirectoryGuard::new(handles))
@@ -1516,6 +2073,113 @@ fn open_windows_relative(
 }
 
 #[cfg(windows)]
+fn create_windows_superseding_file(
+    parent: &WindowsDirectoryHandle,
+    component: &std::ffi::OsStr,
+) -> io::Result<winapi_util::Handle> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+        Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_WRITE_DATA, SYNCHRONIZE,
+        },
+    };
+
+    // FILE_SUPERSEDE replaces an existing directory entry with a new file
+    // object instead of truncating the object behind a hard link. Opening
+    // relative to the retained parent also prevents final-component traversal.
+    let file = open_windows_relative(
+        &parent.handle,
+        component,
+        DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
+        FILE_SHARE_READ,
+        FILE_SUPERSEDE,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_ATTRIBUTE_NORMAL,
+        true,
+    )?;
+    let info = windows_file_attribute_tag(&file)?;
+    if info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "superseded Windows metadata entry is not an ordinary file",
+        ));
+    }
+    if winapi_util::file::information(&file)?.number_of_links() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "superseded Windows metadata entry retained an unexpected hard link",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn read_windows_relative_file(file_path: &Path, parent_guard: &ExistingBaseDirectoryGuard) -> io::Result<Option<Vec<u8>>> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT},
+        Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        },
+    };
+
+    let file_name = file_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination metadata must have a file name"))?;
+    let identity_anchor = match open_windows_relative(
+        parent_guard.last_handle()?,
+        file_name,
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        0,
+        false,
+    ) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let anchor_info = windows_file_attribute_tag(&identity_anchor)?;
+    if !windows_rename_source_is_allowed(anchor_info.FileAttributes, anchor_info.ReparseTag) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, WINDOWS_RENAME_SOURCE_REPARSE_ERROR));
+    }
+    let expected_identity = windows_file_identity(&identity_anchor)?;
+
+    // Data Dedup entries must be opened normally for reads. The reparse-point
+    // anchor above validates the tag first, and the identity comparison below
+    // rejects any final-entry substitution between the two opens.
+    let mut file = open_windows_relative(
+        parent_guard.last_handle()?,
+        file_name,
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        0,
+        false,
+    )?;
+    if windows_file_identity(&file)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination metadata identity changed while it was opened",
+        ));
+    }
+    drop(identity_anchor);
+
+    let file_size = winapi_util::file::information(&file)?.file_size();
+    let capacity = usize::try_from(file_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "destination metadata size exceeds usize"))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(capacity)
+        .map_err(|err| io::Error::other(format!("failed to reserve destination metadata buffer: {err}")))?;
+    std::io::Read::read_to_end(file.as_file_mut(), &mut data)?;
+    Ok(Some(data))
+}
+
+#[cfg(windows)]
 fn open_windows_directory_component(
     parent: &WindowsDirectoryHandle,
     component: &std::ffi::OsStr,
@@ -1566,6 +2230,9 @@ fn open_windows_relative_directory_component(
 }
 
 #[cfg(windows)]
+const WINDOWS_RENAME_SOURCE_REPARSE_ERROR: &str = "rename source must be an ordinary file or a Windows data-dedup entry";
+
+#[cfg(windows)]
 fn open_windows_rename_source(
     src_file_path: &Path,
     source_parent_guard: &ExistingBaseDirectoryGuard,
@@ -1578,6 +2245,8 @@ fn open_windows_rename_source(
     let src_name = src_file_path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a file name"))?;
+    // The parent tree is already pinned and reparse-free. Open the final entry
+    // itself so an approved Data Dedup reparse point can be tag-validated below.
     let source = open_windows_relative(
         source_parent_guard.last_handle()?,
         src_name,
@@ -1586,14 +2255,11 @@ fn open_windows_rename_source(
         FILE_OPEN,
         FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         0,
-        true,
+        false,
     )?;
     let source_info = windows_file_attribute_tag(&source)?;
     if !windows_rename_source_is_allowed(source_info.FileAttributes, source_info.ReparseTag) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "rename source must be an ordinary file or a Windows data-dedup entry",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, WINDOWS_RENAME_SOURCE_REPARSE_ERROR));
     }
     Ok(source)
 }
@@ -1611,6 +2277,8 @@ fn open_windows_rename_source_identity(
     let src_name = src_file_path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a file name"))?;
+    // Match the rename handle: bypass final-entry reparse processing, then
+    // admit only ordinary files or the Data Dedup tag below.
     let source = open_windows_relative(
         source_parent_guard.last_handle()?,
         src_name,
@@ -1619,14 +2287,11 @@ fn open_windows_rename_source_identity(
         FILE_OPEN,
         FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         0,
-        true,
+        false,
     )?;
     let source_info = windows_file_attribute_tag(&source)?;
     if !windows_rename_source_is_allowed(source_info.FileAttributes, source_info.ReparseTag) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "rename source must be an ordinary file or a Windows data-dedup entry",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, WINDOWS_RENAME_SOURCE_REPARSE_ERROR));
     }
     let identity = windows_file_identity(&source)?;
     Ok((source, identity))
@@ -2268,6 +2933,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_all_ignore_missing_source_preserves_a_source_when_the_destination_base_is_missing() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("source");
+        let base = temp_dir.path().join("missing-base");
+        let dst = base.join("destination");
+        std::fs::write(&src, b"payload").expect("write source");
+
+        let err = rename_all_ignore_missing_source(&src, &dst, &base)
+            .await
+            .expect_err("a missing destination base must not masquerade as a missing source");
+
+        assert!(matches!(err, DiskError::FileNotFound));
+        assert_eq!(std::fs::read(&src).expect("source must remain readable"), b"payload");
+        assert!(!base.exists());
+    }
+
+    #[tokio::test]
     async fn rename_all_missing_source_still_warns() {
         let temp_dir = tempdir().expect("create temp dir");
         let src = temp_dir.path().join("missing");
@@ -2663,6 +3345,7 @@ mod tests {
         let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
         let commit_guard = prepare_rename_commit_guard(&source_parent, &destination_parent, &destination_base, &publication_root)
             .expect("prepare shared commit guard");
+        let mutation_lease = acquire_namespace_mutation_lease(&destination_parent).await;
 
         let first_src = source_parent.join("part.1");
         let second_src = source_parent.join("xl.meta");
@@ -2673,12 +3356,26 @@ mod tests {
         windows_rename_test_hooks::observe_guard_generations(&first_dst);
         windows_rename_test_hooks::observe_guard_generations(&second_dst);
 
-        super::rename_all_with_commit_guard(&first_src, &first_dst, &destination_base, &publication_root, &commit_guard)
-            .await
-            .expect("publish first entry with shared guards");
-        super::rename_all_with_commit_guard(&second_src, &second_dst, &destination_base, &publication_root, &commit_guard)
-            .await
-            .expect("publish second entry with shared guards");
+        super::rename_all_with_commit_guard(
+            &first_src,
+            &first_dst,
+            &destination_base,
+            &publication_root,
+            &commit_guard,
+            mutation_lease.clone(),
+        )
+        .await
+        .expect("publish first entry with shared guards");
+        super::rename_all_with_commit_guard(
+            &second_src,
+            &second_dst,
+            &destination_base,
+            &publication_root,
+            &commit_guard,
+            mutation_lease,
+        )
+        .await
+        .expect("publish second entry with shared guards");
 
         let first_generation = windows_rename_test_hooks::take_guard_generations(&first_dst);
         let second_generation = windows_rename_test_hooks::take_guard_generations(&second_dst);
@@ -2694,6 +3391,72 @@ mod tests {
             .expect("source replacement should succeed after guard release");
         std::fs::rename(&destination_parent, destination_base.join("replacement-object"))
             .expect("destination replacement should succeed after guard release");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_commit_guard_shares_a_same_parent_handle() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let destination_base = temp_dir.path().join("bucket");
+        let parent = destination_base.join("object");
+        let src = parent.join("staged-xl.meta");
+        let dst = parent.join("xl.meta");
+        std::fs::create_dir_all(&parent).expect("create shared parent");
+        std::fs::write(&src, b"metadata").expect("write staged metadata");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+        let commit_guard = prepare_rename_commit_guard(&parent, &parent, &destination_base, &publication_root)
+            .expect("prepare same-parent commit guard");
+        let mutation_lease = acquire_namespace_mutation_lease(&parent).await;
+        assert_eq!(
+            commit_guard.source_parent_guard.generation, commit_guard.destination_parent_guard.generation,
+            "same-parent publication must reuse one guarded directory identity"
+        );
+
+        super::rename_all_with_commit_guard(&src, &dst, &destination_base, &publication_root, &commit_guard, mutation_lease)
+            .await
+            .expect("same-parent commit rename must not conflict with its own guard");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst).expect("read committed metadata"), b"metadata");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_all_supports_same_parent_publication() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let parent = temp_dir.path().join("metadata");
+        let src = parent.join("temporary-format.json");
+        let dst = parent.join("format.json");
+        std::fs::create_dir(&parent).expect("create metadata directory");
+        std::fs::write(&src, b"format").expect("write temporary format");
+
+        rename_all(&src, &dst, &parent)
+            .await
+            .expect("same-parent reliable rename must not conflict with its source guard");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst).expect("read published format"), b"format");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_all_supports_child_to_parent_rollback_publication() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let object_dir = temp_dir.path().join("bucket/object");
+        let rollback_dir = object_dir.join("rollback-id");
+        let src = rollback_dir.join("xl.meta.backup");
+        let dst = object_dir.join("xl.meta");
+        std::fs::create_dir_all(&rollback_dir).expect("create rollback directory");
+        std::fs::write(&src, b"old-metadata").expect("write rollback metadata");
+        std::fs::write(&dst, b"uncommitted-metadata").expect("write metadata to replace");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root above the object tree");
+
+        super::rename_all(&src, &dst, &object_dir, &publication_root)
+            .await
+            .expect("a rollback source below its destination parent must not conflict with its own guards");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst).expect("read restored metadata"), b"old-metadata");
     }
 
     #[cfg(windows)]
@@ -2716,12 +3479,14 @@ mod tests {
             Wdk::Storage::FileSystem::{
                 FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
             },
-            Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER},
+            Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_INVALID_PARAMETER},
         };
 
         let invalid_parameter = i32::try_from(ERROR_INVALID_PARAMETER).expect("Windows error code should fit i32");
+        let access_denied = i32::try_from(ERROR_ACCESS_DENIED).expect("Windows error code should fit i32");
+        let disk_full = i32::try_from(ERROR_DISK_FULL).expect("Windows error code should fit i32");
         let mut attempts = Vec::new();
-        windows_extended_rename_with_compatibility_fallback(|flags| {
+        windows_extended_rename_with_compatibility_fallback(io::Error::from_raw_os_error(access_denied), |flags| {
             attempts.push(flags);
             if attempts.len() == 1 {
                 Err(io::Error::from_raw_os_error(invalid_parameter))
@@ -2738,14 +3503,36 @@ mod tests {
             ]
         );
 
-        let access_denied = i32::try_from(ERROR_ACCESS_DENIED).expect("Windows error code should fit i32");
         let mut attempts = 0;
-        windows_extended_rename_with_compatibility_fallback(|_| {
+        let err = windows_extended_rename_with_compatibility_fallback(io::Error::from_raw_os_error(invalid_parameter), |_| {
             attempts += 1;
             Err(io::Error::from_raw_os_error(access_denied))
         })
         .expect_err("ordinary rename failures must not be retried with weaker flags");
         assert_eq!(attempts, 1);
+        assert_eq!(err.raw_os_error(), Some(access_denied));
+
+        let mut attempts = 0;
+        let err = windows_extended_rename_with_compatibility_fallback(io::Error::from_raw_os_error(access_denied), |_| {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(invalid_parameter))
+        })
+        .expect_err("an unsupported extended rename must preserve the legacy error");
+        assert_eq!(attempts, 2);
+        assert_eq!(err.raw_os_error(), Some(access_denied));
+
+        let mut attempts = 0;
+        let err = windows_extended_rename_with_compatibility_fallback(io::Error::from_raw_os_error(access_denied), |_| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from_raw_os_error(invalid_parameter))
+            } else {
+                Err(io::Error::from_raw_os_error(disk_full))
+            }
+        })
+        .expect_err("a supported extended rename failure must replace the stale legacy error");
+        assert_eq!(attempts, 2);
+        assert_eq!(err.raw_os_error(), Some(disk_full));
     }
 
     #[cfg(windows)]
@@ -3182,7 +3969,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn windows_rename_all_does_not_detach_preparation_after_cancellation() {
+    async fn windows_cancelled_rename_serializes_retry_until_preparation_finishes() {
         use std::os::windows::fs::OpenOptionsExt;
         use std::sync::mpsc;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -3190,9 +3977,11 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         let src = temp_dir.path().join("staged-object");
+        let retry_src = temp_dir.path().join("retry-staged-object");
         let dst = base.join("object");
         std::fs::create_dir(&base).expect("create destination base");
         std::fs::write(&src, b"payload").expect("write staged object");
+        std::fs::write(&retry_src, b"retry-payload").expect("write retry staged object");
         let writer = std::fs::OpenOptions::new()
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -3207,45 +3996,54 @@ mod tests {
             drop(writer);
         });
 
-        let source = src.clone();
         let destination = dst.clone();
-        let mut rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
+        let retry_destination = dst.clone();
+        let retry_base = base.clone();
+        let rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
         tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
             .await
             .expect("timed out waiting for preparation to start before cancellation")
             .expect("preparation hook sender dropped before cancellation");
         rename.abort();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        let cancellation = tokio::time::timeout(std::time::Duration::from_secs(1), rename)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for the blocking syscall")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
+
+        let mut retry = tokio::spawn(async move { rename_all(&retry_src, &retry_destination, &retry_base).await });
         assert!(
-            !rename.is_finished(),
-            "cancellation must not detach preparation that can still create destination parents"
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut retry)
+                .await
+                .is_err(),
+            "a retry must wait while cancelled preparation still owns the destination namespace"
         );
         release_tx.send(()).expect("release preparation after cancellation");
-
-        match (&mut rename).await {
-            Ok(Ok(())) => assert_eq!(std::fs::read(destination).expect("read published object"), b"payload"),
-            Ok(Err(err)) => panic!("an uncancelled preparation must not fail: {err:?}"),
-            Err(err) if err.is_cancelled() => {
-                assert!(source.exists(), "cancellation before publication must retain the source");
-                assert!(!destination.exists(), "cancellation before publication must not create the destination");
-            }
-            Err(err) => panic!("preparation task failed unexpectedly: {err}"),
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), retry)
+            .await
+            .expect("retry should finish after cancelled preparation releases the namespace")
+            .expect("retry task should not panic")
+            .expect("retry publication should succeed");
+        assert_eq!(
+            std::fs::read(destination).expect("read retried publication"),
+            b"retry-payload",
+            "the serialized retry must be the final destination value"
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn windows_rename_all_does_not_detach_started_publication_after_cancellation() {
+    async fn windows_cancelled_rename_serializes_retry_until_publication_finishes() {
         use std::sync::mpsc;
 
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         let src = temp_dir.path().join("staged-object");
+        let retry_src = temp_dir.path().join("retry-staged-object");
         let dst = base.join("object");
         std::fs::create_dir(&base).expect("create destination base");
         std::fs::write(&src, b"payload").expect("write staged object");
+        std::fs::write(&retry_src, b"retry-payload").expect("write retry staged object");
 
         let (release_tx, release_rx) = mpsc::channel();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -3255,23 +4053,38 @@ mod tests {
         });
 
         let destination = dst.clone();
-        let mut rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
+        let retry_destination = dst.clone();
+        let retry_base = base.clone();
+        let rename = tokio::spawn(async move { rename_all(&src, &dst, &base).await });
         tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
             .await
             .expect("timed out waiting for publication to start before cancellation")
             .expect("publication hook sender dropped before cancellation");
         rename.abort();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        let cancellation = tokio::time::timeout(std::time::Duration::from_secs(1), rename)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for publication")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
+
+        let mut retry = tokio::spawn(async move { rename_all(&retry_src, &retry_destination, &retry_base).await });
         assert!(
-            !rename.is_finished(),
-            "cancellation must not detach a namespace mutation that has already started"
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut retry)
+                .await
+                .is_err(),
+            "a retry must wait while cancelled publication still owns the destination namespace"
         );
         release_tx.send(()).expect("release publication after cancellation");
-
-        let _ = (&mut rename).await;
-        assert_eq!(std::fs::read(destination).expect("read published object"), b"payload");
+        tokio::time::timeout(std::time::Duration::from_secs(10), retry)
+            .await
+            .expect("retry should finish after cancelled publication releases the namespace")
+            .expect("retry task should not panic")
+            .expect("retry publication should succeed");
+        assert_eq!(
+            std::fs::read(destination).expect("read retried publication"),
+            b"retry-payload",
+            "the serialized retry must be the final destination value"
+        );
     }
 
     #[cfg(windows)]
@@ -3301,6 +4114,21 @@ mod tests {
             .expect("open source reparse entry");
         try_set_windows_mount_point(&source_reparse, &outside).expect("redirect the staged source");
         drop(source_reparse);
+
+        let publication_root = test_publication_root(&[&src, &dst, &base]);
+        let source_parent_guard =
+            lock_windows_directory_tree(src.parent().expect("source reparse entry must have a parent"), None, &publication_root)
+                .expect("pin the source parent tree");
+        let identity_error = match open_windows_rename_source_identity(&src, &source_parent_guard) {
+            Ok(_) => panic!("a non-dedup source reparse entry must be rejected by its tag"),
+            Err(err) => err,
+        };
+        assert_eq!(identity_error.to_string(), WINDOWS_RENAME_SOURCE_REPARSE_ERROR);
+        let rename_error = match open_windows_rename_source(&src, &source_parent_guard) {
+            Ok(_) => panic!("the rename handle must apply the same final-entry tag policy"),
+            Err(err) => err,
+        };
+        assert_eq!(rename_error.to_string(), WINDOWS_RENAME_SOURCE_REPARSE_ERROR);
 
         let err = rename_all(&src, &dst, &base)
             .await
@@ -3434,7 +4262,7 @@ mod tests {
         let guard = mkdir_all_below_existing_base_std(&base, &base).expect("guard destination base");
         let publication_root = test_publication_root(&[&src, &dst, &base]);
         let source_parent_guard =
-            lock_windows_directory_tree(src.parent().expect("source path must have a parent"), &publication_root)
+            lock_windows_directory_tree(src.parent().expect("source path must have a parent"), None, &publication_root)
                 .expect("anchor source parent");
         let source = open_windows_rename_source(&src, &source_parent_guard).expect("anchor source entry");
 

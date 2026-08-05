@@ -264,7 +264,7 @@ fn create_sample_audit_entry() -> AuditEntry {
 }
 
 fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rustfs_targets::EventName;
     use serde_json::json;
 
@@ -301,7 +301,7 @@ fn create_sample_audit_entry_with_id(id: u32) -> AuditEntry {
         version: "1".to_string(),
         deployment_id: Some(format!("test-deployment-{id}")),
         site_name: Some("test-site".to_string()),
-        time: Utc::now(),
+        time: Timestamp::now(),
         event: EventName::ObjectCreatedPut,
         entry_type: Some("object".to_string()),
         trigger: "api".to_string(),

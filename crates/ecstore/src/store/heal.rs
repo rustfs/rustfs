@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::storage_api_contracts::heal::HealOperations as _;
+use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
@@ -83,7 +84,7 @@ impl ECStore {
         Ok(res)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(super) async fn handle_heal_object(
         &self,
         bucket: &str,
@@ -91,7 +92,7 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        info!(
+        trace!(
             event = EVENT_HEAL_OBJECT_STARTED,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_HEAL,

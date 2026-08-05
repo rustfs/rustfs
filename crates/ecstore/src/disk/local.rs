@@ -119,7 +119,7 @@ fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<Offse
     Ok((bytes, modtime))
 }
 
-fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
+pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
     let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
     let base = version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR;
     let mut salt = 0u128;
@@ -245,26 +245,135 @@ async fn restore_metadata_backup(
     rollback_dir: Uuid,
     publication_root: &os::PublicationRoot,
 ) -> Result<()> {
-    let backup_path = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
-    rename_all(&backup_path, xl_path, object_dir, publication_root).await
+    let rollback_path = object_dir.join(rollback_dir.to_string());
+    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
+    rename_all(&backup_path, xl_path, object_dir, publication_root).await?;
+    // A synthetic inline rollback dir held only the backup the rename above
+    // just consumed; reclaim it so the object dir can empty out. A real data
+    // dir still holds its parts, so the non-recursive remove is a benign
+    // no-op there (mirrors restore_delete_rollback).
+    let _ = fs::remove_dir(&rollback_path).await;
+    Ok(())
 }
 
-fn lock_rename_commit_directories(
+async fn lock_rename_commit_directories(
     source_parent: &Path,
     destination_parent: &Path,
     base_dir: &Path,
     publication_root: &os::PublicationRoot,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
 ) -> Result<os::RenameCommitGuard> {
     #[cfg(windows)]
-    let result = os::run_blocking_namespace_operation(|| {
-        #[cfg(test)]
-        run_destination_commit_directory_preparation(destination_parent);
-        os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root)
-    });
+    let result = {
+        let source_parent = source_parent.to_path_buf();
+        let destination_parent = destination_parent.to_path_buf();
+        let base_dir = base_dir.to_path_buf();
+        let publication_root = publication_root.clone();
+        os::run_blocking_namespace_operation(mutation_lease, move || {
+            let result = os::prepare_rename_commit_guard(&source_parent, &destination_parent, &base_dir, &publication_root);
+            #[cfg(test)]
+            if result.is_ok() {
+                run_destination_commit_directory_preparation(&destination_parent);
+            }
+            result
+        })
+        .await
+    };
     #[cfg(not(windows))]
-    let result = os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root);
+    let result = {
+        let _ = mutation_lease;
+        os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root)
+    };
+
+    let result = result.map_err(|err| match std::fs::symlink_metadata(base_dir) {
+        Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+        _ => err,
+    });
 
     result.map_err(to_file_error).map_err(DiskError::from)
+}
+
+async fn read_rename_destination_metadata(
+    file_path: &Path,
+    rename_commit_guard: &os::RenameCommitGuard,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
+) -> Result<Option<Bytes>> {
+    #[cfg(windows)]
+    let result = {
+        let file_path = file_path.to_path_buf();
+        let rename_commit_guard = rename_commit_guard.clone();
+        os::run_blocking_namespace_operation(mutation_lease, move || {
+            os::read_destination_file_with_commit_guard(&file_path, &rename_commit_guard)
+        })
+        .await
+    };
+    #[cfg(not(windows))]
+    let _ = (rename_commit_guard, mutation_lease);
+    #[cfg(not(windows))]
+    let result = match super::fs::read_file(file_path).await {
+        Ok(data) => Ok(Some(data)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    };
+
+    result
+        .map(|data| data.map(Bytes::from))
+        .map_err(to_file_error)
+        .map_err(DiskError::from)
+}
+
+async fn restore_renamed_data_source(
+    src_volume_dir: &Path,
+    src_data_path: &Path,
+    dst_data_path: &Path,
+    publication_root: &os::PublicationRoot,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
+) -> Result<()> {
+    if fs::symlink_metadata(src_data_path).await.is_ok() {
+        return Ok(());
+    }
+    let result =
+        match os::rename_all_with_lease(dst_data_path, src_data_path, src_volume_dir, publication_root, mutation_lease).await {
+            Ok(()) => Ok(()),
+            Err(DiskError::FileNotFound) => {
+                let source_exists = fs::symlink_metadata(src_data_path).await.is_ok();
+                let destination_missing = matches!(
+                    fs::symlink_metadata(dst_data_path).await,
+                    Err(err) if err.kind() == ErrorKind::NotFound
+                );
+                if source_exists && destination_missing {
+                    Ok(())
+                } else {
+                    Err(DiskError::FileNotFound)
+                }
+            }
+            Err(err) => Err(err),
+        };
+    if let Err(err) = &result {
+        warn!(
+            event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            reason = "restore_staged_data_source_failed",
+            src_path = ?src_data_path,
+            dst_path = ?dst_data_path,
+            error = ?err,
+            "Failed to restore staged data after a metadata commit was rejected"
+        );
+    }
+    result
+}
+
+async fn restore_published_data_source(
+    data_paths: Option<&(PathBuf, PathBuf)>,
+    src_volume_dir: &Path,
+    publication_root: &os::PublicationRoot,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
+) -> Result<()> {
+    let Some((src_data_path, dst_data_path)) = data_paths else {
+        return Ok(());
+    };
+    restore_renamed_data_source(src_volume_dir, src_data_path, dst_data_path, publication_root, mutation_lease).await
 }
 
 async fn restore_delete_rollback(
@@ -1869,7 +1978,7 @@ fn mmap_page_size() -> Result<u64> {
 #[cfg(test)]
 static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(test)]
-static RENAME_DATA_FAIL_AFTER_METADATA_COMMIT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static RENAME_DATA_FAIL_AFTER_METADATA_COMMIT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 static RENAME_DATA_FAIL_COMMIT_RENAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -1885,6 +1994,9 @@ static INLINE_PREPARATION_BEFORE_BACKUP: std::sync::LazyLock<std::sync::Mutex<Ha
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
 static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
+static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(all(test, windows))]
 static DESTINATION_COMMIT_DIRECTORY_PREPARATION: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
@@ -1903,9 +2015,10 @@ fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
 
 #[cfg(test)]
 fn set_rename_data_fail_after_metadata_commit(dst_path: &str) {
-    *RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+    RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
-        .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
+        .expect("test failpoint lock should not be poisoned")
+        .push(dst_path.to_string());
 }
 
 #[cfg(test)]
@@ -1952,6 +2065,14 @@ fn set_rename_data_after_first_publication(dst_path: &str, hook: impl FnOnce() +
         .insert(dst_path.to_string(), Box::new(hook));
 }
 
+#[cfg(test)]
+fn set_owned_file_write_before_open(path: &Path, hook: impl FnOnce() + Send + 'static) {
+    OWNED_FILE_WRITE_BEFORE_OPEN
+        .lock()
+        .expect("test file write hook lock should not be poisoned")
+        .insert(path.to_path_buf(), Box::new(hook));
+}
+
 #[cfg(all(test, windows))]
 fn set_destination_commit_directory_preparation(path: &Path, hook: impl FnOnce() + Send + 'static) {
     DESTINATION_COMMIT_DIRECTORY_PREPARATION
@@ -1991,11 +2112,11 @@ fn should_fail_before_old_metadata_backup(dst_path: &str) -> bool {
 
 #[cfg(test)]
 fn should_fail_after_metadata_commit(dst_path: &str) -> bool {
-    let mut target = RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+    let mut targets = RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
         .expect("test failpoint lock should not be poisoned");
-    if target.as_deref() == Some(dst_path) {
-        target.take();
+    if let Some(index) = targets.iter().position(|target| target == dst_path) {
+        targets.remove(index);
         true
     } else {
         false
@@ -2016,15 +2137,15 @@ fn should_fail_commit_rename(dst_path: &str) -> bool {
 }
 
 #[cfg(test)]
-fn remove_staged_meta_before_commit(dst_path: &str, staged_meta: &Path) -> std::io::Result<()> {
+fn should_remove_staged_meta_before_commit(dst_path: &str) -> bool {
     let mut target = RENAME_DATA_REMOVE_STAGED_META_BEFORE_COMMIT
         .lock()
         .expect("test failpoint lock should not be poisoned");
     if target.as_deref() != Some(dst_path) {
-        return Ok(());
+        return false;
     }
     target.take();
-    std::fs::remove_file(staged_meta)
+    true
 }
 
 #[cfg(test)]
@@ -2041,16 +2162,33 @@ fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
 }
 
 #[cfg(test)]
-fn remove_dst_base_before_commit(dst_path: &str) -> std::io::Result<()> {
-    let mut target = RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
-        .lock()
-        .expect("test failpoint lock should not be poisoned");
-    let Some((_, base)) = target.as_ref().filter(|(target_path, _)| target_path == dst_path) else {
-        return Ok(());
+async fn remove_dst_base_before_commit(
+    dst_path: &str,
+    guard: os::RenameCommitGuard,
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_base: &Path,
+    publication_root: &os::PublicationRoot,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
+) -> Result<os::RenameCommitGuard> {
+    let base = {
+        let mut target = RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned");
+        if target.as_ref().is_some_and(|(target_path, _)| target_path == dst_path) {
+            target.take().map(|(_, base)| base)
+        } else {
+            None
+        }
     };
-    std::fs::remove_dir_all(base)?;
-    target.take();
-    Ok(())
+    let Some(base) = base else {
+        return Ok(guard);
+    };
+
+    #[cfg(windows)]
+    drop(guard);
+    std::fs::remove_dir_all(base).map_err(to_file_error)?;
+    lock_rename_commit_directories(source_parent, destination_parent, destination_base, publication_root, mutation_lease).await
 }
 
 #[cfg(test)]
@@ -2070,6 +2208,17 @@ fn run_rename_data_after_first_publication(dst_path: &str) {
         .lock()
         .expect("test publication hook lock should not be poisoned")
         .remove(dst_path);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn run_owned_file_write_before_open(path: &Path) {
+    let hook = OWNED_FILE_WRITE_BEFORE_OPEN
+        .lock()
+        .expect("test file write hook lock should not be poisoned")
+        .remove(path);
     if let Some(hook) = hook {
         hook();
     }
@@ -2131,8 +2280,8 @@ fn should_fail_commit_rename(_dst_path: &str) -> bool {
 }
 
 #[cfg(not(test))]
-fn remove_staged_meta_before_commit(_dst_path: &str, _staged_meta: &Path) -> std::io::Result<()> {
-    Ok(())
+fn should_remove_staged_meta_before_commit(_dst_path: &str) -> bool {
+    false
 }
 
 #[cfg(not(test))]
@@ -2141,8 +2290,16 @@ fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
 }
 
 #[cfg(not(test))]
-fn remove_dst_base_before_commit(_dst_path: &str) -> std::io::Result<()> {
-    Ok(())
+async fn remove_dst_base_before_commit(
+    _dst_path: &str,
+    guard: os::RenameCommitGuard,
+    _source_parent: &Path,
+    _destination_parent: &Path,
+    _destination_base: &Path,
+    _publication_root: &os::PublicationRoot,
+    _mutation_lease: Arc<os::NamespaceMutationLease>,
+) -> Result<os::RenameCommitGuard> {
+    Ok(guard)
 }
 
 #[cfg(not(test))]
@@ -5057,7 +5214,11 @@ impl LocalDisk {
         } else {
             match rename(&delete_path, &trash_path).await {
                 Ok(()) => None,
-                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err)
+                    if err.kind() == ErrorKind::NotFound && os::rename_source_is_missing(delete_path, &self.publication_root) =>
+                {
+                    None
+                }
                 Err(err) => Some(to_file_error(err).into()),
             }
         };
@@ -5086,18 +5247,8 @@ impl LocalDisk {
                 return Ok(());
             }
 
-            // A missing source is benign (the object is already gone). Both the
-            // recursive path (rename_all_ignore_missing_source) and the
-            // non-recursive NotFound arm above already fold that case into `None`,
-            // but keep the guard explicit so a genuine rename failure is never
-            // reported as success. Every other error is a real failure: propagate
-            // it (already mapped by to_file_error, e.g. I/O -> FaultyDisk,
-            // permission -> FileAccessDenied) so callers can surface a faulty disk
-            // and trigger heal, matching MinIO's deleteFile.
-            if err == Error::FileNotFound {
-                return Ok(());
-            }
-
+            // Missing sources are folded into `None` above. Any remaining error is
+            // a real failure, including a missing destination base.
             return Err(err);
         }
 
@@ -5840,27 +5991,27 @@ impl LocalDisk {
                 }
 
                 tokio::task::spawn_blocking(move || {
-                    let mut f = std::fs::OpenOptions::new()
+                    #[cfg(test)]
+                    run_owned_file_write_before_open(&path);
+
+                    let mut file = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
                         .truncate(true)
                         .open(&path)
                         .map_err(to_file_error)?;
-
-                    std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+                    std::io::Write::write_all(&mut file, buf.as_ref()).map_err(to_file_error)?;
                     if sync != SyncMode::None {
-                        f.sync_data().map_err(to_file_error)?;
-                        // See the Ref branch above: FileOnly callers rename the
-                        // file away, so the tmp directory entry never needs to
-                        // become durable.
+                        file.sync_data().map_err(to_file_error)?;
+                        // FileOnly callers rename the file away, so the tmp
+                        // directory entry never needs to become durable.
                         if sync == SyncMode::FileAndDir
                             && let Some(parent) = path.parent()
                         {
                             os::fsync_dir_std(parent).map_err(to_file_error)?;
                         }
                     }
-
-                    Ok::<(), std::io::Error>(())
+                    Ok::<_, std::io::Error>(())
                 })
                 .await
                 .map_err(DiskError::from)??;
@@ -7966,8 +8117,10 @@ impl DiskAPI for LocalDisk {
         crate::hp_guard!("LocalDisk::rename_data");
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
-        // optimistic; this guard establishes the local commit/delete order.
-        let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, dst_volume).read_owned().await;
+        // optimistic; this lease establishes the local commit/delete order and
+        // remains owned by any blocking syscall that outlives async cancellation.
+        let destination_object_path = self.get_object_path(dst_volume, dst_path)?;
+        let mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, dst_volume, &destination_object_path).await;
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
         }
@@ -8059,19 +8212,30 @@ impl DiskAPI for LocalDisk {
         // pinned to strict.
         let durability = effective_durability(dst_volume);
 
+        let src_file_parent = src_file_path
+            .parent()
+            .ok_or_else(|| DiskError::other("missing staged metadata parent"))?;
+        let dst_file_parent = dst_file_path
+            .parent()
+            .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
+        if !no_inline {
+            fs::create_dir_all(src_file_parent).await.map_err(to_file_error)?;
+        }
+        // Acquire the common trees before reading destination metadata. On
+        // Windows this pins the object directory identity across metadata
+        // preparation, data publication, rollback backup, and final commit.
+        let rename_commit_guard = lock_rename_commit_directories(
+            src_file_parent,
+            dst_file_parent,
+            &dst_volume_dir,
+            &self.publication_root,
+            mutation_lease.clone(),
+        )
+        .await?;
+        let has_dst_buf = read_rename_destination_metadata(&dst_file_path, &rename_commit_guard, mutation_lease.clone()).await?;
+
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
-            let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
-                Ok(res) => Some(res),
-                Err(e) => {
-                    let e: DiskError = to_file_error(e).into();
-                    if e != DiskError::FileNotFound {
-                        return Err(e);
-                    }
-                    None
-                }
-            };
-
             let mut xlmeta = FileMeta::new();
             // An existing dst xl.meta that fails to parse leaves `xlmeta` empty
             // and gets overwritten by the commit below (pre-existing behavior);
@@ -8118,7 +8282,6 @@ impl DiskAPI for LocalDisk {
             let version_signature = rename_data_versions_signature(&xlmeta);
             let new_dst_buf = xlmeta.marshal_msg()?;
 
-            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
             // This tmp xl.meta is renamed onto dst_file_path at the commit
             // point below, so only its contents must be durable before the
             // rename (SyncMode::FileOnly); the dst parent directory is fsynced
@@ -8144,10 +8307,28 @@ impl DiskAPI for LocalDisk {
             // fdatasync here is a cheap no-op. A missing source dir is left for the
             // rename below to report through the existing rollback path. Payload
             // durability is kept by both strict and relaxed.
-            // Bound to a local so the borrow lives across the join! below.
-            let tmp_meta_rel_path = format!("{}/{}", src_path, STORAGE_FORMAT_FILE);
-            let tmp_meta_write =
-                self.write_all_private(src_volume, &tmp_meta_rel_path, new_dst_buf.into(), tmp_meta_sync, src_file_parent);
+            let tmp_meta_write = {
+                let src_file_path = src_file_path.clone();
+                let dst_file_path = dst_file_path.clone();
+                let rename_commit_guard = rename_commit_guard.clone();
+                let mutation_lease = mutation_lease.clone();
+                async move {
+                    os::run_blocking_namespace_operation(mutation_lease, move || {
+                        #[cfg(test)]
+                        run_owned_file_write_before_open(&src_file_path);
+                        let mut prepared_metadata_source = os::create_prepared_rename_source_with_commit_guard(
+                            &src_file_path,
+                            &dst_file_path,
+                            &rename_commit_guard,
+                        )?;
+                        prepared_metadata_source.write_all(&new_dst_buf, tmp_meta_sync != SyncMode::None)?;
+                        Ok(prepared_metadata_source)
+                    })
+                    .await
+                    .map_err(to_file_error)
+                    .map_err(DiskError::from)
+                }
+            };
             let shard_sync = async {
                 if durability.syncs_data_shards()
                     && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
@@ -8162,23 +8343,23 @@ impl DiskAPI for LocalDisk {
             // Surface a tmp-meta failure first (its prior serial position), then a
             // shard-sync failure; either aborts before any rename, exactly as the
             // sequential version did.
-            tmp_meta_res?;
+            let prepared_metadata_source = tmp_meta_res?;
             shard_sync_res?;
-            remove_dst_base_before_commit(dst_path).map_err(to_file_error)?;
-            // Windows acquisition order is the volume mutation lock above,
-            // then the common source and destination directory trees, then each
-            // source entry. Reuse the trees across data and xl.meta publication.
-            let rename_commit_guard = lock_rename_commit_directories(
-                src_file_path
-                    .parent()
-                    .ok_or_else(|| DiskError::other("missing staged metadata parent"))?,
-                dst_file_path
-                    .parent()
-                    .ok_or_else(|| DiskError::other("missing object metadata parent"))?,
+            let rename_commit_guard = remove_dst_base_before_commit(
+                dst_path,
+                rename_commit_guard,
+                src_file_parent,
+                dst_file_parent,
                 &dst_volume_dir,
                 &self.publication_root,
-            )?;
-
+                mutation_lease.clone(),
+            )
+            .await?;
+            if should_remove_staged_meta_before_commit(dst_path) {
+                drop(prepared_metadata_source);
+                std::fs::remove_file(&src_file_path).map_err(to_file_error)?;
+                return Err(DiskError::FileNotFound);
+            }
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = os::rename_all_with_commit_guard(
                     src_data_path,
@@ -8186,10 +8367,10 @@ impl DiskAPI for LocalDisk {
                     &skip_parent,
                     &self.publication_root,
                     &rename_commit_guard,
+                    mutation_lease.clone(),
                 )
                 .await
             {
-                let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
                     event = EVENT_DISK_LOCAL_RENAME_REJECTED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -8200,6 +8381,13 @@ impl DiskAPI for LocalDisk {
                     error = ?err,
                     "Disk local rename flow failed"
                 );
+                restore_published_data_source(
+                    has_data_dir_path.as_ref(),
+                    &src_volume_dir,
+                    &self.publication_root,
+                    mutation_lease.clone(),
+                )
+                .await?;
                 return Err(err);
             }
             if has_data_dir_path.is_some() {
@@ -8215,9 +8403,6 @@ impl DiskAPI for LocalDisk {
             }
 
             if should_fail_before_old_metadata_backup(dst_path) {
-                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
-                }
                 info!(
                     event = EVENT_DISK_LOCAL_RENAME_REJECTED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -8225,6 +8410,13 @@ impl DiskAPI for LocalDisk {
                     reason = "test_fail_before_old_metadata_backup",
                     "Disk local rename flow failed before metadata commit"
                 );
+                restore_published_data_source(
+                    has_data_dir_path.as_ref(),
+                    &src_volume_dir,
+                    &self.publication_root,
+                    mutation_lease.clone(),
+                )
+                .await?;
                 return Err(DiskError::Unexpected);
             }
 
@@ -8238,30 +8430,82 @@ impl DiskAPI for LocalDisk {
             } else {
                 SyncMode::None
             };
-            if let Some(old_data_dir) = rollback_data_dir
-                && let Some(dst_buf) = has_dst_buf.as_ref()
-                && let Err(err) = self
-                    .write_all_private(
-                        dst_volume,
-                        &format!("{}/{}/{}", dst_path, old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
-                        dst_buf.clone().into(),
-                        backup_sync,
-                        &skip_parent,
+            if let (Some(old_data_dir), Some(dst_buf)) = (rollback_data_dir, has_dst_buf.as_ref()) {
+                let backup_parent = dst_file_parent.join(old_data_dir.to_string());
+                #[cfg(not(windows))]
+                if let Err(err) = os::make_dir_all(&backup_parent, &skip_parent).await {
+                    restore_published_data_source(
+                        has_data_dir_path.as_ref(),
+                        &src_volume_dir,
+                        &self.publication_root,
+                        mutation_lease.clone(),
                     )
-                    .await
-            {
-                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                    .await?;
+                    return Err(err);
                 }
-                info!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "write_old_metadata_backup_failed",
-                    error = ?err,
-                    "Disk local rename flow failed"
-                );
-                return Err(err);
+                let backup_path_guard = match rename_commit_guard.create_destination_directory_for_path_access(&backup_parent) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        restore_published_data_source(
+                            has_data_dir_path.as_ref(),
+                            &src_volume_dir,
+                            &self.publication_root,
+                            mutation_lease.clone(),
+                        )
+                        .await?;
+                        return Err(DiskError::from(to_file_error(err)));
+                    }
+                };
+                let backup_path = backup_parent.join(STORAGE_FORMAT_FILE_BACKUP);
+                if let Err(err) = check_path_length(backup_path.to_string_lossy().as_ref()) {
+                    #[cfg(windows)]
+                    drop(backup_path_guard);
+                    restore_published_data_source(
+                        has_data_dir_path.as_ref(),
+                        &src_volume_dir,
+                        &self.publication_root,
+                        mutation_lease.clone(),
+                    )
+                    .await?;
+                    return Err(err);
+                }
+                let backup_bytes = dst_buf.clone();
+                // Keep the volume, commit-tree, and exact destination-path
+                // guards in this task until the backup write and durability
+                // sync finish. A detached spawn_blocking writer could survive
+                // cancellation and later truncate a newer transaction's
+                // deterministic rollback backup.
+                let write_result = os::run_blocking_namespace_operation(mutation_lease.clone(), move || {
+                    #[cfg(test)]
+                    run_owned_file_write_before_open(&backup_path);
+                    backup_path_guard.write_file_for_path_access(
+                        &backup_path,
+                        backup_bytes.as_ref(),
+                        backup_sync != SyncMode::None,
+                        backup_sync == SyncMode::FileAndDir,
+                    )
+                })
+                .await
+                .map_err(to_file_error)
+                .map_err(DiskError::from);
+                if let Err(err) = write_result {
+                    info!(
+                        event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        reason = "write_old_metadata_backup_failed",
+                        error = ?err,
+                        "Disk local rename flow failed"
+                    );
+                    restore_published_data_source(
+                        has_data_dir_path.as_ref(),
+                        &src_volume_dir,
+                        &self.publication_root,
+                        mutation_lease.clone(),
+                    )
+                    .await?;
+                    return Err(err);
+                }
             }
 
             // Crash-consistency injection: hard power loss after the rollback
@@ -8272,18 +8516,17 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::Unexpected);
             }
 
-            if let Err(err) = os::rename_all_with_commit_guard(
+            if let Err(err) = os::rename_all_with_prepared_source(
+                prepared_metadata_source,
                 &src_file_path,
                 &dst_file_path,
                 &skip_parent,
                 &self.publication_root,
                 &rename_commit_guard,
+                mutation_lease.clone(),
             )
             .await
             {
-                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
-                }
                 info!(
                     event = EVENT_DISK_LOCAL_RENAME_REJECTED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -8294,6 +8537,13 @@ impl DiskAPI for LocalDisk {
                     error = ?err,
                     "Disk local rename flow failed"
                 );
+                restore_published_data_source(
+                    has_data_dir_path.as_ref(),
+                    &src_volume_dir,
+                    &self.publication_root,
+                    mutation_lease.clone(),
+                )
+                .await?;
                 return Err(err);
             }
 
@@ -8397,15 +8647,16 @@ impl DiskAPI for LocalDisk {
             }
 
             Ok(RenameDataResp {
-                old_data_dir: rollback_data_dir,
+                old_data_dir: has_old_data_dir,
+                rollback_data_dir,
+                cleanup_data_dir: has_old_data_dir,
                 sign: version_signature,
                 old_current_size,
             })
         } else {
-            // Inline metadata preparation is blocking, but publication must remain
-            // in this operation task. A timed-out spawn_blocking task keeps running;
-            // allowing that detached task to rename would let an old commit overwrite
-            // a newer xl.meta after the namespace lock has been released.
+            // Inline metadata preparation is blocking. The transaction lease is
+            // moved into that work so a timeout can release the async waiter without
+            // allowing a retry to reuse the deterministic staging path too early.
             let src = src_file_path.clone();
             let dst = dst_file_path.clone();
             let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
@@ -8413,16 +8664,16 @@ impl DiskAPI for LocalDisk {
             } else {
                 None
             };
-
             let dst_path_for_failpoint = dst_path.to_string();
-            let inline_preparation = tokio::task::spawn_blocking(move || {
-                // Read existing xl.meta
-                let has_dst_buf = match std::fs::read(&dst) {
-                    Ok(buf) => Some(Bytes::from(buf)),
-                    Err(e) if e.kind() == ErrorKind::NotFound => None,
-                    Err(e) => return Err(to_file_error(e)),
-                };
-
+            #[cfg(windows)]
+            let source_parent = src_file_parent.to_path_buf();
+            let rename_commit_guard_for_preparation = rename_commit_guard.clone();
+            let inline_preparation = os::run_blocking_namespace_operation(mutation_lease.clone(), move || {
+                let mut prepared_metadata_source =
+                    os::create_prepared_rename_source_with_commit_guard(&src, &dst, &rename_commit_guard_for_preparation)?;
+                #[cfg(windows)]
+                let source_metadata_guard =
+                    rename_commit_guard_for_preparation.lock_source_directory_for_path_access(&source_parent)?;
                 let mut xlmeta = FileMeta::new();
                 // Same as the non-inline branch: an unparsable existing dst
                 // xl.meta must surface as unknown, not `Absent`
@@ -8467,24 +8718,23 @@ impl DiskAPI for LocalDisk {
                 // relaxed tiers do no per-object fsync here at all (aligned
                 // with MinIO's default), trading a documented power-loss
                 // window for latency.
-                if let Some(parent) = src.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&src)?;
-                std::io::Write::write_all(&mut f, &new_buf)?;
-                if sync {
-                    f.sync_data()?;
-                }
-                drop(f);
+                prepared_metadata_source.write_all(&new_buf, sync)?;
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
                 if let Some(ref old_metadata) = has_dst_buf
                     && (rollback_data_dir.is_some() || sync || cfg!(test))
                 {
+                    #[cfg(windows)]
+                    let backup_path = {
+                        let backup_path = src
+                            .parent()
+                            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing staging metadata parent"))?
+                            .join(STORAGE_FORMAT_FILE_BACKUP);
+                        source_metadata_guard.write_file_for_path_access(&backup_path, old_metadata, sync, false)?;
+                        backup_path
+                    };
+                    #[cfg(not(windows))]
                     let backup_path = create_local_inline_rollback_backup(&dst, &src, old_metadata)?;
+                    #[cfg(not(windows))]
                     if sync {
                         std::fs::File::open(&backup_path)?.sync_data()?;
                     }
@@ -8493,45 +8743,64 @@ impl DiskAPI for LocalDisk {
 
                 Ok::<_, std::io::Error>((
                     rollback_data_dir,
+                    old_data_dir,
                     version_signature,
                     old_current_size,
                     staged_rollback_path,
                     has_dst_buf.is_none(),
+                    prepared_metadata_source,
                 ))
             })
             .await
-            .map_err(DiskError::from)?;
+            .map_err(to_file_error)
+            .map_err(DiskError::from);
 
-            let (old_data_dir, version_signature, old_current_size, mut local_rollback_path, destination_was_absent) =
-                match inline_preparation {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        for part_path in &invalidate_part_paths {
-                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
-                        }
-                        return Err(DiskError::from(err));
+            let (
+                rollback_data_dir,
+                cleanup_data_dir,
+                version_signature,
+                old_current_size,
+                mut local_rollback_path,
+                destination_was_absent,
+                prepared_metadata_source,
+            ) = match inline_preparation {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
                     }
-                };
+                    return Err(err);
+                }
+            };
 
-            remove_dst_base_before_commit(dst_path).map_err(to_file_error)?;
-            // Match the non-inline commit order and pin the common staging and
-            // destination directory identities through xl.meta publication.
-            let rename_commit_guard = lock_rename_commit_directories(
-                src_file_path
-                    .parent()
-                    .ok_or_else(|| DiskError::other("missing staged metadata parent"))?,
-                dst_file_path
-                    .parent()
-                    .ok_or_else(|| DiskError::other("missing object metadata parent"))?,
+            let rename_commit_guard = remove_dst_base_before_commit(
+                dst_path,
+                rename_commit_guard,
+                src_file_parent,
+                dst_file_parent,
                 &dst_volume_dir,
                 &self.publication_root,
-            )?;
+                mutation_lease.clone(),
+            )
+            .await?;
 
-            if let (Some(old_data_dir), Some(staged_backup)) = (old_data_dir, local_rollback_path.as_deref()) {
+            if should_remove_staged_meta_before_commit(dst_path) {
+                drop(prepared_metadata_source);
+                let remove_result = std::fs::remove_file(&src_file_path);
+                if let Some(backup_path) = local_rollback_path.as_deref() {
+                    let _ = remove_file_if_exists(backup_path);
+                }
+                remove_result.map_err(to_file_error)?;
+                return Err(DiskError::FileNotFound);
+            }
+
+            if let (Some(rollback_data_dir), Some(staged_backup)) = (rollback_data_dir, local_rollback_path.as_deref()) {
                 let Some(dst_parent) = dst_file_path.parent() else {
                     return Err(DiskError::other("missing object metadata parent"));
                 };
-                let backup_path = dst_parent.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+                let backup_path = dst_parent
+                    .join(rollback_data_dir.to_string())
+                    .join(STORAGE_FORMAT_FILE_BACKUP);
                 if let Err(err) = rename_all(staged_backup, &backup_path, &dst_volume_dir, &self.publication_root).await {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
@@ -8546,19 +8815,19 @@ impl DiskAPI for LocalDisk {
                 local_rollback_path = None;
             }
 
-            let commit_result = match remove_staged_meta_before_commit(dst_path, &src_file_path) {
-                Err(err) => Err(DiskError::from(to_file_error(err))),
-                Ok(()) if should_fail_commit_rename(dst_path) => Err(DiskError::other("test fail during metadata commit rename")),
-                Ok(()) => {
-                    os::rename_all_with_commit_guard(
-                        &src_file_path,
-                        &dst_file_path,
-                        &dst_volume_dir,
-                        &self.publication_root,
-                        &rename_commit_guard,
-                    )
-                    .await
-                }
+            let commit_result = if should_fail_commit_rename(dst_path) {
+                Err(DiskError::other("test fail during metadata commit rename"))
+            } else {
+                os::rename_all_with_prepared_source(
+                    prepared_metadata_source,
+                    &src_file_path,
+                    &dst_file_path,
+                    &dst_volume_dir,
+                    &self.publication_root,
+                    &rename_commit_guard,
+                    mutation_lease.clone(),
+                )
+                .await
             };
             if let Err(err) = commit_result {
                 if let Some(backup_path) = local_rollback_path.as_deref() {
@@ -8572,7 +8841,7 @@ impl DiskAPI for LocalDisk {
 
             let post_commit = async {
                 if should_fail_after_metadata_commit(dst_path) {
-                    rollback_inline_metadata_commit_std(&dst_file_path, old_data_dir, local_rollback_path.as_deref())?;
+                    rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
                     return Err(std::io::Error::other("test fail after metadata commit"));
                 }
 
@@ -8581,7 +8850,7 @@ impl DiskAPI for LocalDisk {
                     && let Some(dst_parent) = dst_file_path.parent()
                     && let Err(err) = os::fsync_dir(dst_parent).await
                 {
-                    rollback_inline_metadata_commit_std(&dst_file_path, old_data_dir, local_rollback_path.as_deref())?;
+                    rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
                     return Err(err);
                 }
 
@@ -8599,7 +8868,11 @@ impl DiskAPI for LocalDisk {
                             break;
                         }
                         if let Err(err) = os::fsync_dir(ancestor_dir).await {
-                            rollback_inline_metadata_commit_std(&dst_file_path, old_data_dir, local_rollback_path.as_deref())?;
+                            rollback_inline_metadata_commit_std(
+                                &dst_file_path,
+                                rollback_data_dir,
+                                local_rollback_path.as_deref(),
+                            )?;
                             return Err(err);
                         }
                         if ancestor_dir == dst_volume_dir.as_path() {
@@ -8657,7 +8930,9 @@ impl DiskAPI for LocalDisk {
             }
 
             Ok(RenameDataResp {
-                old_data_dir,
+                old_data_dir: cleanup_data_dir,
+                rollback_data_dir,
+                cleanup_data_dir,
                 sign: version_signature,
                 old_current_size,
             })
@@ -9706,6 +9981,53 @@ mod test {
         assert!(!rollback_dir.is_nil());
     }
 
+    #[tokio::test]
+    async fn inline_overwrite_does_not_report_rollback_dir_for_cleanup() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "parent";
+        let tmp_object = "tmp-write";
+        let version_id = Uuid::nil();
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        fs::create_dir_all(dir.path().join(bucket).join(object))
+            .await
+            .expect("destination object directory should be created");
+        fs::write(
+            dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE),
+            test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"old")))),
+        )
+        .await
+        .expect("old inline metadata should be written");
+        fs::create_dir_all(dir.path().join(RUSTFS_META_TMP_BUCKET).join(tmp_object))
+            .await
+            .expect("staging object directory should be created");
+
+        let response = disk
+            .rename_data(
+                RUSTFS_META_TMP_BUCKET,
+                tmp_object,
+                test_file_info(object, version_id, None, Some(Bytes::from_static(b"new"))),
+                bucket,
+                object,
+            )
+            .await
+            .expect("inline overwrite should commit");
+
+        assert_eq!(response.old_data_dir, None);
+        assert_eq!(
+            response.rollback_data_dir,
+            Some(inline_metadata_rollback_dir(version_id, &FileMeta::new()))
+        );
+        assert_eq!(
+            response.cleanup_data_dir, None,
+            "synthetic rollback state must not be recursively reclaimed"
+        );
+    }
+
     #[test]
     fn local_inline_rollback_backup_falls_back_when_hardlink_fails() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -9977,7 +10299,7 @@ mod test {
 
         // #948: a genuinely missing source is benign and must still return Ok.
         #[tokio::test]
-        async fn move_to_trash_missing_source_is_ok() {
+        async fn windows_and_unix_move_to_trash_missing_source_is_ok() {
             let (disk, dir) = new_disk().await;
             let missing = dir.path().join("bucket").join("does-not-exist");
 
@@ -9989,11 +10311,52 @@ mod test {
                 .expect("missing source must be treated as benign (non-recursive)");
         }
 
+        #[tokio::test]
+        async fn windows_and_unix_move_to_trash_missing_destination_base_preserves_the_source() {
+            let (disk, dir) = new_disk().await;
+            let source = dir.path().join("bucket/object");
+            let source_file = dir.path().join("bucket/object-file");
+            fs::create_dir_all(&source).await.expect("source directory should be created");
+            fs::write(source.join("part.1"), b"payload")
+                .await
+                .expect("source payload should be written");
+            fs::write(&source_file, b"file-payload")
+                .await
+                .expect("source file should be written");
+            let trash = disk
+                .get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)
+                .expect("trash path should resolve");
+            if let Err(err) = fs::remove_dir_all(&trash).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                panic!("trash directory should be removable: {err}");
+            }
+
+            let err = disk
+                .move_to_trash(&source, true, false)
+                .await
+                .expect_err("a missing trash base must not be reported as a successful delete");
+
+            assert_eq!(err, DiskError::FileNotFound);
+            let err = disk
+                .move_to_trash(&source_file, false, false)
+                .await
+                .expect_err("a missing trash base must not be reported as a successful non-recursive delete");
+            assert_eq!(err, DiskError::FileNotFound);
+            assert_eq!(
+                fs::read(source.join("part.1"))
+                    .await
+                    .expect("source payload must remain readable"),
+                b"payload"
+            );
+            assert_eq!(fs::read(&source_file).await.expect("source file must remain readable"), b"file-payload");
+        }
+
         // #948: a real rename failure (here ENOTDIR, because a path component is a
         // regular file) must propagate instead of being swallowed as Ok(()). Before
         // the fix every non-DiskFull error fell through to `return Ok(())`.
         #[tokio::test]
-        async fn move_to_trash_propagates_real_rename_error() {
+        async fn windows_and_unix_move_to_trash_propagates_real_rename_error() {
             let (disk, dir) = new_disk().await;
             let bucket_dir = dir.path().join("bucket");
             fs::create_dir_all(&bucket_dir).await.expect("bucket dir should be created");
@@ -10013,7 +10376,7 @@ mod test {
         // #948: the happy path is unchanged — an existing object is moved out of its
         // original location and the call succeeds.
         #[tokio::test]
-        async fn move_to_trash_moves_existing_object() {
+        async fn windows_and_unix_move_to_trash_moves_existing_object() {
             let (disk, dir) = new_disk().await;
             let object_dir = dir.path().join("bucket").join("obj-dir");
             fs::create_dir_all(&object_dir).await.expect("object dir should be created");
@@ -10031,7 +10394,7 @@ mod test {
         // succeed. Before the fix the unconditional pre-rename remove returned
         // FileNotFound and aborted the whole rename.
         #[tokio::test]
-        async fn rename_file_directory_to_missing_destination_succeeds() {
+        async fn windows_and_unix_rename_file_directory_to_missing_destination_succeeds() {
             let (disk, dir) = new_disk().await;
             ensure_test_volume(&disk, "vol").await;
 
@@ -10053,7 +10416,7 @@ mod test {
 
         // #960: the same NotFound-tolerance fix applied to rename_part.
         #[tokio::test]
-        async fn rename_part_directory_to_missing_destination_succeeds() {
+        async fn windows_and_unix_rename_part_directory_to_missing_destination_succeeds() {
             let (disk, dir) = new_disk().await;
             ensure_test_volume(&disk, "vol").await;
 
@@ -11570,11 +11933,27 @@ mod test {
         let replacement_dir = disk
             .get_object_path(bucket, "prefix/replacement-object")
             .expect("replacement object path should resolve");
+        let staging_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, tmp_object)
+            .expect("staging parent should resolve");
+        let replacement_staging_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, "replacement-non-inline-stage")
+            .expect("replacement staging parent should resolve");
+        let staged_metadata = staging_parent.join(STORAGE_FORMAT_FILE);
+        let replacement_staged_metadata = staging_parent.join("replacement-xl.meta");
         let object_dir_for_hook = object_dir.clone();
         let replacement_dir_for_hook = replacement_dir.clone();
+        let staging_parent_for_hook = staging_parent.clone();
+        let replacement_staging_parent_for_hook = replacement_staging_parent.clone();
+        let staged_metadata_for_hook = staged_metadata.clone();
+        let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
         set_rename_data_after_first_publication(object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned until xl.meta commits");
+            std::fs::rename(&staging_parent_for_hook, &replacement_staging_parent_for_hook)
+                .expect_err("the staging identity must remain pinned across data and xl.meta publication");
+            std::fs::rename(&staged_metadata_for_hook, &replacement_staged_metadata_for_hook)
+                .expect_err("the prepared xl.meta entry must not be replaceable after data publication");
         });
 
         let fi = test_file_info(object, version_id, Some(data_dir), None);
@@ -11583,6 +11962,15 @@ mod test {
             .expect("non-inline rename_data should commit");
 
         assert!(!replacement_dir.exists(), "the destination object directory must not be replaced");
+        assert!(staging_parent.exists(), "the guarded staging parent must retain its identity");
+        assert!(
+            !replacement_staging_parent.exists(),
+            "the staging parent must not be replaced between data and metadata publication"
+        );
+        assert!(
+            !replacement_staged_metadata.exists(),
+            "the prepared metadata source must remain the committed entry"
+        );
         assert_eq!(
             fs::read(object_dir.join(data_dir.to_string()).join("part.1"))
                 .await
@@ -11598,6 +11986,123 @@ mod test {
                 .await
                 .expect("rollback metadata should be written while the destination guard is held"),
             old_meta
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_data_replaces_hard_linked_legacy_destination_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "windows-hard-linked-destination-bucket";
+        let object = "prefix/inline-object";
+        let tmp_object = "windows-hard-linked-destination-stage";
+        let version_id = Uuid::parse_str("aaaaaaaa-7777-8888-9999-bbbbbbbbbbbb").expect("version id should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let object_dir = disk
+            .get_object_path(bucket, object)
+            .expect("destination object path should resolve");
+        fs::create_dir_all(&object_dir)
+            .await
+            .expect("destination object directory should be created");
+        let destination = object_dir.join(STORAGE_FORMAT_FILE);
+        let old_meta = test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"old-inline-payload"))));
+        fs::write(&destination, &old_meta)
+            .await
+            .expect("destination metadata should be written");
+        let legacy_backup = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("legacy-inline-rollback/{STORAGE_FORMAT_FILE_BACKUP}"))
+            .expect("legacy rollback backup path should resolve");
+        fs::create_dir_all(legacy_backup.parent().expect("legacy rollback backup should have a parent"))
+            .await
+            .expect("legacy rollback directory should be created");
+        std::fs::hard_link(&destination, &legacy_backup).expect("legacy rollback backup hard link should be created");
+
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"new-inline-payload")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("a legacy hard-linked destination must be safely replaced");
+
+        assert_eq!(
+            fs::read(&legacy_backup)
+                .await
+                .expect("legacy rollback backup should remain readable"),
+            old_meta,
+            "replacing the destination must not mutate its legacy rollback backup"
+        );
+        let raw = fs::read(&destination).await.expect("published metadata should be readable");
+        assert_ne!(raw, old_meta, "the new metadata must replace the legacy hard-linked destination");
+        FileMeta::load(&raw)
+            .expect("published metadata should parse")
+            .find_version(Some(version_id))
+            .expect("published metadata must contain the committed version");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rename_data_supersedes_a_hard_linked_rollback_backup() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "windows-hard-linked-backup-bucket";
+        let object = "prefix/non-inline-object";
+        let tmp_object = "windows-hard-linked-backup-stage";
+        let version_id = Uuid::parse_str("cccccccc-7777-8888-9999-dddddddddddd").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("eeeeeeee-1111-2222-3333-aaaaaaaaaaaa").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("ffffffff-4444-5555-6666-bbbbbbbbbbbb").expect("new data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let object_dir = disk
+            .get_object_path(bucket, object)
+            .expect("destination object path should resolve");
+        let old_data_path = object_dir.join(old_data_dir.to_string());
+        fs::create_dir_all(&old_data_path)
+            .await
+            .expect("old data directory should be created");
+        fs::write(old_data_path.join("part.1"), b"old-payload")
+            .await
+            .expect("old part should be written");
+        let old_meta = test_meta(test_file_info(object, version_id, Some(old_data_dir), None));
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &old_meta)
+            .await
+            .expect("old metadata should be written");
+
+        let victim = dir.path().join("hard-link-victim-backup");
+        let victim_bytes = b"must-not-be-truncated";
+        fs::write(&victim, victim_bytes)
+            .await
+            .expect("backup victim should be written");
+        let backup_path = old_data_path.join(STORAGE_FORMAT_FILE_BACKUP);
+        std::fs::hard_link(&victim, &backup_path).expect("rollback backup hard link should be created");
+
+        let staged_part = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}/part.1"))
+            .expect("staged part path should resolve");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"new-payload")
+            .await
+            .expect("staged part should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("the rollback backup entry should be safely superseded");
+
+        assert_eq!(
+            fs::read(&victim).await.expect("backup victim should remain readable"),
+            victim_bytes,
+            "publishing the rollback backup must not truncate another hard link"
+        );
+        assert_eq!(
+            fs::read(&backup_path).await.expect("rollback backup should be readable"),
+            old_meta,
+            "the superseded backup entry must contain the exact previous metadata"
         );
     }
 
@@ -11624,7 +12129,21 @@ mod test {
         let destination = disk
             .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
             .expect("destination metadata path should resolve");
+        let replacement_source = source.with_file_name("replacement-xl.meta");
         let fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-payload")));
+        let source_pinned_before_write = Arc::new(AtomicBool::new(false));
+        let source_pinned_before_write_in_hook = Arc::clone(&source_pinned_before_write);
+        let source_for_hook = source.clone();
+        let replacement_source_for_hook = replacement_source.clone();
+        os::windows_rename_test_hooks::install_before_source_write(&source, move || {
+            source_pinned_before_write_in_hook.store(true, Ordering::Release);
+            std::fs::rename(&source_for_hook, &replacement_source_for_hook)
+                .expect_err("the staged metadata entry must be pinned before its first write");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source_for_hook)
+                .expect_err("the staged metadata entry must reject a second writer before its first write");
+        });
         let guarded_commit_seen = Arc::new(AtomicBool::new(false));
         let guarded_commit_seen_in_hook = Arc::clone(&guarded_commit_seen);
         os::windows_rename_test_hooks::install_before_publication(&destination, move || {
@@ -11636,10 +12155,18 @@ mod test {
             .expect("inline metadata must publish after its writer is closed");
 
         assert!(
+            source_pinned_before_write.load(Ordering::Acquire),
+            "the production inline writer must pin the staged metadata entry before writing"
+        );
+        assert!(
             guarded_commit_seen.load(Ordering::Acquire),
             "the production inline commit must use guarded handle-relative publication"
         );
         assert!(!source.exists(), "successful publication must remove the staged metadata path");
+        assert!(
+            !replacement_source.exists(),
+            "the pinned staged metadata entry must not be replaceable before its first write"
+        );
         let raw = std::fs::read(&destination).expect("read published metadata");
         let metadata = FileMeta::load(&raw).expect("published metadata must parse");
         metadata
@@ -11675,11 +12202,20 @@ mod test {
         let replacement_dir = disk
             .get_object_path(bucket, "prefix/replacement-inline-object")
             .expect("replacement object path should resolve");
+        let staging_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, tmp_object)
+            .expect("staging parent should resolve");
+        let staged_metadata = staging_parent.join(STORAGE_FORMAT_FILE);
+        let replacement_staged_metadata = staging_parent.join("replacement-xl.meta");
         let object_dir_for_hook = object_dir.clone();
         let replacement_dir_for_hook = replacement_dir.clone();
+        let staged_metadata_for_hook = staged_metadata.clone();
+        let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
         set_rename_data_after_first_publication(object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned after publishing its rollback backup");
+            std::fs::rename(&staged_metadata_for_hook, &replacement_staged_metadata_for_hook)
+                .expect_err("the prepared inline xl.meta must not be replaceable after backup publication");
         });
 
         let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"new-inline-payload")));
@@ -11688,6 +12224,10 @@ mod test {
             .expect("inline rename_data should commit");
 
         assert!(!replacement_dir.exists(), "the destination object directory must not be replaced");
+        assert!(
+            !replacement_staged_metadata.exists(),
+            "the prepared inline metadata source must remain the committed entry"
+        );
         let raw = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
             .await
             .expect("published metadata should be readable");
@@ -11700,7 +12240,7 @@ mod test {
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn windows_cancelled_destination_preparation_retains_its_volume_guard() {
+    async fn windows_cancelled_destination_preparation_releases_waiter_but_retains_volume_guard() {
         use std::sync::{Arc, mpsc};
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -11737,34 +12277,130 @@ mod test {
             .expect("rename_data must reach destination preparation");
 
         rename.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), rename)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for destination preparation")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
         let volume_lock = os::disk_volume_mutation_lock(&disk.root, bucket);
         let volume_guard_released_early = Arc::clone(&volume_lock).try_write_owned().is_ok();
         release_tx
             .send(())
             .expect("release destination preparation after cancellation");
-        let _ = tokio::time::timeout(Duration::from_secs(10), rename)
-            .await
-            .expect("cancelled preparation task must stop after its namespace transaction");
 
         assert!(
             !volume_guard_released_early,
             "cancellation must not release the volume guard while destination preparation can still mutate the namespace"
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !destination.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("publication should complete before the cancelled task releases its guard");
         let _exclusive = tokio::time::timeout(Duration::from_secs(5), volume_lock.write_owned())
             .await
-            .expect("volume guard must be released after destination preparation and publication finish");
+            .expect("volume guard must be released after cancelled destination preparation finishes");
+        assert!(
+            !destination.exists(),
+            "cancellation during preparation must prevent the outer transaction from publishing metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_and_unix_cancelled_staged_metadata_write_serializes_same_object_retry() {
+        use std::sync::{Arc, mpsc};
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "cancelled-staged-metadata-bucket";
+        let object = "prefix/non-inline-object";
+        let tmp_object = "cancelled-staged-metadata-stage";
+        let version_id = Uuid::parse_str("dddddddd-1111-2222-3333-eeeeeeeeeeee").expect("version id should parse");
+        let data_dir = Uuid::parse_str("ffffffff-1111-2222-3333-aaaaaaaaaaaa").expect("data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let staged_part = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}/part.1"))
+            .expect("staged data path should resolve");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"new-payload")
+            .await
+            .expect("staged part should be written");
+        let staged_metadata = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+            .expect("staged metadata path should resolve");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_owned_file_write_before_open(&staged_metadata, move || {
+            entered_tx.send(()).expect("signal staged metadata write entry");
+            release_rx.recv().expect("wait until cancellation has been observed");
+        });
+
+        let mut cancelled_fi = test_file_info(object, version_id, Some(data_dir), None);
+        cancelled_fi
+            .metadata
+            .insert("test-generation".to_string(), "cancelled".to_string());
+        let cancelled_disk = Arc::clone(&disk);
+        let cancelled = tokio::spawn(async move {
+            cancelled_disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, cancelled_fi, bucket, object)
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("staged metadata waiter should run")
+            .expect("rename_data must reach the staged metadata write");
+        cancelled.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), cancelled)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for the staged writer")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
+
+        let mut retry_fi = test_file_info(object, version_id, Some(data_dir), None);
+        retry_fi.metadata.insert("test-generation".to_string(), "retry".to_string());
+        let retry_disk = Arc::clone(&disk);
+        let mut retry = tokio::spawn(async move {
+            retry_disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, retry_fi, bucket, object)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut retry).await.is_err(),
+            "the retry must wait while the cancelled staged writer still owns the object namespace"
+        );
+        release_tx.send(()).expect("release cancelled staged metadata writer");
+        tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("retry should finish after the cancelled writer releases the namespace")
+            .expect("retry task should not panic")
+            .expect("same-object retry should commit successfully");
+
+        let destination_metadata = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("destination metadata path should resolve");
+        let raw = fs::read(destination_metadata)
+            .await
+            .expect("retried metadata should be readable");
+        let metadata = FileMeta::load(&raw).expect("retried metadata should parse");
+        let (_, version) = metadata
+            .find_version(Some(version_id))
+            .expect("retried metadata should contain the requested version");
+        assert_eq!(
+            version
+                .object
+                .expect("non-inline version should contain object metadata")
+                .meta_user
+                .get("test-generation")
+                .map(String::as_str),
+            Some("retry"),
+            "the cancelled writer must not overwrite metadata committed by the retry"
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn windows_cancelled_inline_publication_retains_its_volume_guard() {
+    async fn windows_cancelled_inline_publication_releases_waiter_but_retains_volume_guard() {
         use std::sync::{Arc, mpsc};
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -11800,12 +12436,14 @@ mod test {
             .expect("publication must reach its guarded commit");
 
         rename.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), rename)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for publication")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
         let volume_lock = os::disk_volume_mutation_lock(&disk.root, bucket);
         let volume_guard_released_early = Arc::clone(&volume_lock).try_write_owned().is_ok();
         release_tx.send(()).expect("release publication after cancellation");
-        let _ = tokio::time::timeout(Duration::from_secs(10), rename)
-            .await
-            .expect("cancelled publication task must stop after leaving the commit syscall");
 
         assert!(
             !volume_guard_released_early,
@@ -11821,6 +12459,161 @@ mod test {
         let _exclusive = tokio::time::timeout(Duration::from_secs(5), volume_lock.write_owned())
             .await
             .expect("volume guard must be released after publication finishes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_and_unix_cancelled_non_inline_backup_write_retains_its_volume_guard() {
+        use std::sync::{Arc, mpsc};
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "cancelled-backup-write-bucket";
+        let object = "prefix/non-inline-object";
+        let tmp_object = "cancelled-backup-write-stage";
+        let version_id = Uuid::parse_str("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("cccccccc-1111-2222-3333-dddddddddddd").expect("data dir should parse");
+        let new_data_dir = Uuid::parse_str("eeeeeeee-1111-2222-3333-ffffffffffff").expect("data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let object_dir = disk
+            .get_object_path(bucket, object)
+            .expect("destination object path should resolve");
+        let old_meta = test_meta(test_file_info(object, version_id, Some(old_data_dir), None));
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data directory should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let staged_part = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}/part.1"))
+            .expect("staged data path should resolve");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"new-payload")
+            .await
+            .expect("staged part should be written");
+
+        let backup_path = object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_owned_file_write_before_open(&backup_path, move || {
+            entered_tx.send(()).expect("signal backup write entry");
+            release_rx.recv().expect("wait until cancellation has been observed");
+        });
+
+        let operation_disk = Arc::clone(&disk);
+        let rename = tokio::spawn(async move {
+            operation_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    tmp_object,
+                    test_file_info(object, version_id, Some(new_data_dir), None),
+                    bucket,
+                    object,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("backup write waiter should run")
+            .expect("rename_data must reach the rollback backup write");
+
+        rename.abort();
+        let cancellation = tokio::time::timeout(Duration::from_secs(1), rename)
+            .await
+            .expect("the async waiter should observe cancellation without waiting for the backup write")
+            .expect_err("the aborted rename task should be cancelled");
+        assert!(cancellation.is_cancelled(), "the rename waiter should report cancellation");
+        let volume_lock = os::disk_volume_mutation_lock(&disk.root, bucket);
+        let volume_guard_released_early = Arc::clone(&volume_lock).try_write_owned().is_ok();
+        release_tx.send(()).expect("release rollback backup write after cancellation");
+
+        assert!(
+            !volume_guard_released_early,
+            "cancellation must not release the volume guard while a rollback backup can still be written"
+        );
+        let _exclusive = tokio::time::timeout(Duration::from_secs(5), volume_lock.write_owned())
+            .await
+            .expect("volume guard must be released after the rollback backup write finishes");
+        assert_eq!(
+            fs::read(&backup_path).await.expect("rollback backup should be readable"),
+            old_meta,
+            "the guarded write must preserve the exact old metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_and_unix_delete_volume_waits_for_in_flight_rename_data_commit() {
+        use std::sync::{Arc, mpsc};
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "delete-volume-commit-order-bucket";
+        let object = "prefix/non-inline-object";
+        let tmp_object = "delete-volume-commit-order-stage";
+        let version_id = Uuid::parse_str("aaaaaaaa-2222-3333-4444-bbbbbbbbbbbb").expect("version id should parse");
+        let data_dir = Uuid::parse_str("cccccccc-2222-3333-4444-dddddddddddd").expect("data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let staged_part = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}/part.1"))
+            .expect("staged data path should resolve");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"new-payload")
+            .await
+            .expect("staged part should be written");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_rename_data_after_first_publication(object, move || {
+            entered_tx.send(()).expect("signal first publication");
+            release_rx.recv().expect("wait while delete_volume is blocked");
+        });
+
+        let rename_disk = Arc::clone(&disk);
+        let rename = tokio::spawn(async move {
+            rename_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    tmp_object,
+                    test_file_info(object, version_id, Some(data_dir), None),
+                    bucket,
+                    object,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("publication entry waiter should run")
+            .expect("rename_data must publish its data before metadata commit");
+
+        let delete_disk = Arc::clone(&disk);
+        let mut delete = tokio::spawn(async move { delete_disk.delete_volume(bucket, false).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            "delete_volume must wait for the in-flight metadata commit"
+        );
+
+        release_tx.send(()).expect("release metadata commit");
+        rename
+            .await
+            .expect("rename_data task should finish")
+            .expect("rename_data should commit successfully");
+        let delete_err = tokio::time::timeout(Duration::from_secs(5), delete)
+            .await
+            .expect("delete_volume should finish after the commit")
+            .expect("delete_volume task should not panic")
+            .expect_err("the committed object must keep the bucket non-empty");
+        assert_eq!(delete_err, DiskError::VolumeNotEmpty);
     }
 
     #[tokio::test]
@@ -12666,7 +13459,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_rename_data_inline_post_commit_error_restores_old_metadata() {
+    async fn windows_and_unix_rename_data_inline_post_commit_error_restores_old_metadata() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -12698,15 +13491,84 @@ mod test {
 
         set_rename_data_fail_after_metadata_commit(object);
         let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-new")));
-        let result = disk
+        let err = disk
             .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
-            .await;
+            .await
+            .expect_err("post-commit failure must be returned");
 
-        assert!(result.is_err());
+        assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == ErrorKind::Other));
         let restored_meta = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
             .await
             .expect("old metadata should still be readable");
         assert_eq!(restored_meta, old_meta);
+    }
+
+    #[tokio::test]
+    async fn windows_and_unix_rename_data_inline_post_commit_error_removes_fresh_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "fresh-inline-post-commit-bucket";
+        let object = "fresh-inline-post-commit-object";
+        let tmp_object = "tmp-fresh-inline-post-commit";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        set_rename_data_fail_after_metadata_commit(object);
+        let fi = test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"inline")));
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+            .await
+            .expect_err("post-commit failure must reject a fresh inline object");
+
+        assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == ErrorKind::Other));
+        assert!(
+            !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+            "failed fresh inline commit must remove published metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_and_unix_rename_data_non_inline_post_commit_error_removes_fresh_object() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "fresh-non-inline-post-commit-bucket";
+        let object = "fresh-non-inline-post-commit-object";
+        let tmp_object = "tmp-fresh-non-inline-post-commit";
+        let data_dir = Uuid::new_v4();
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let staged_part = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(data_dir.to_string())
+            .join("part.1");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"payload")
+            .await
+            .expect("staged part should be written");
+
+        set_rename_data_fail_after_metadata_commit(object);
+        let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+            .await
+            .expect_err("post-commit failure must reject a fresh non-inline object");
+
+        assert!(matches!(err, DiskError::Unexpected));
+        let destination = dir.path().join(bucket).join(object);
+        assert!(
+            !destination.join(STORAGE_FORMAT_FILE).exists(),
+            "failed fresh non-inline commit must remove published metadata"
+        );
+        assert!(
+            !destination.join(data_dir.to_string()).exists(),
+            "failed fresh non-inline commit must remove published data"
+        );
     }
 
     #[tokio::test]
@@ -12770,6 +13632,55 @@ mod test {
         );
     }
 
+    // The undo_write restore consumes `<rollback>/xl.meta.bkp` by rename; a
+    // synthetic rollback dir is then empty and must be reclaimed so the object
+    // dir can empty out (BucketNotEmpty leak). A real data dir still holds its
+    // parts and must survive the non-recursive remove.
+    #[tokio::test]
+    async fn restore_metadata_backup_reclaims_empty_rollback_dir_only() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let publication_root = os::PublicationRoot::new(dir.path()).expect("publication root should open");
+        let object_dir = dir.path().join("bucket").join("obj");
+        let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let rollback_dir = Uuid::new_v4();
+        let rollback_path = object_dir.join(rollback_dir.to_string());
+        fs::create_dir_all(&rollback_path)
+            .await
+            .expect("rollback dir should be created");
+        fs::write(rollback_path.join(STORAGE_FORMAT_FILE_BACKUP), b"old-meta")
+            .await
+            .expect("backup should be written");
+
+        restore_metadata_backup(&object_dir, &xl_path, rollback_dir, &publication_root)
+            .await
+            .expect("restore should succeed");
+        assert_eq!(
+            fs::read(&xl_path).await.expect("xl.meta should be restored"),
+            b"old-meta",
+            "restore must move the backup back onto xl.meta"
+        );
+        assert!(!rollback_path.exists(), "an emptied synthetic rollback dir must be reclaimed");
+
+        // Real data dir: parts remain, the dir must survive.
+        let real_dir = Uuid::new_v4();
+        let real_path = object_dir.join(real_dir.to_string());
+        fs::create_dir_all(&real_path).await.expect("real data dir should be created");
+        fs::write(real_path.join(STORAGE_FORMAT_FILE_BACKUP), b"older-meta")
+            .await
+            .expect("backup should be written");
+        fs::write(real_path.join("part.1"), b"data")
+            .await
+            .expect("part should be written");
+
+        restore_metadata_backup(&object_dir, &xl_path, real_dir, &publication_root)
+            .await
+            .expect("restore should succeed");
+        assert!(real_path.join("part.1").exists(), "a real data dir must keep its parts");
+        assert!(real_path.exists(), "a non-empty data dir must not be removed");
+    }
+
     #[tokio::test]
     async fn rename_commit_failure_cleans_local_rollback_backup() {
         use tempfile::tempdir;
@@ -12825,7 +13736,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn inline_rename_missing_staged_metadata_fails_without_replacing_destination() {
+    async fn windows_and_unix_inline_rename_missing_staged_metadata_fails_without_replacing_destination() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -12867,7 +13778,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_inline_preparation_cannot_overwrite_a_newer_rollback_backup() {
+    async fn windows_and_unix_cancelled_inline_preparation_serializes_newer_commit() {
         use std::sync::mpsc;
         use tempfile::tempdir;
 
@@ -12882,12 +13793,10 @@ mod test {
 
         let object_dir = dir.path().join(bucket).join(object);
         fs::create_dir_all(&object_dir).await.expect("object dir should be created");
-        fs::write(
-            object_dir.join(STORAGE_FORMAT_FILE),
-            test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"v0")))),
-        )
-        .await
-        .expect("initial metadata should be written");
+        let initial_meta = test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"v0"))));
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &initial_meta)
+            .await
+            .expect("initial metadata should be written");
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -12914,15 +13823,29 @@ mod test {
         cancelled.abort();
         assert!(cancelled.await.expect_err("operation should be cancelled").is_cancelled());
 
-        disk.rename_data(
-            RUSTFS_META_TMP_BUCKET,
-            "newer-inline-stage",
-            test_file_info(object, version_id, None, Some(Bytes::from_static(b"v1"))),
-            bucket,
-            object,
-        )
-        .await
-        .expect("newer inline metadata should commit");
+        let newer_disk = Arc::clone(&disk);
+        let mut newer = tokio::spawn(async move {
+            newer_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    "newer-inline-stage",
+                    test_file_info(object, version_id, None, Some(Bytes::from_static(b"v1"))),
+                    bucket,
+                    object,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut newer).await.is_err(),
+            "a newer commit must wait while cancelled preparation owns the object namespace"
+        );
+        release_tx.send(()).expect("release cancelled preparation");
+        tokio::time::timeout(Duration::from_secs(10), newer)
+            .await
+            .expect("newer commit should finish after cancelled preparation releases the namespace")
+            .expect("newer commit task should not panic")
+            .expect("newer inline metadata should commit");
+
         let current_v1 = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
             .await
             .expect("newer metadata should be readable");
@@ -12942,26 +13865,25 @@ mod test {
         .expect_err("the latest commit should stop after publishing its rollback backup");
         assert_eq!(fs::read(&shared_backup).await.expect("latest rollback backup should exist"), current_v1);
 
-        release_tx.send(()).expect("release cancelled preparation");
         let cancelled_backup = dir
             .path()
             .join(RUSTFS_META_TMP_BUCKET)
             .join("cancelled-inline-stage")
             .join(STORAGE_FORMAT_FILE_BACKUP);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !cancelled_backup.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("detached preparation should finish its private backup");
+        assert_eq!(
+            fs::read(&cancelled_backup)
+                .await
+                .expect("cancelled preparation should finish its private backup"),
+            initial_meta,
+            "the cancelled preparation must retain the metadata snapshot it observed"
+        );
 
         assert_eq!(
             fs::read(&shared_backup)
                 .await
                 .expect("shared rollback backup should remain readable"),
             current_v1,
-            "detached preparation must not overwrite the newer shared rollback backup"
+            "cancelled preparation must not overwrite the newer shared rollback backup"
         );
         assert_eq!(
             fs::read(object_dir.join(STORAGE_FORMAT_FILE))
@@ -13796,7 +14718,7 @@ mod test {
         set_rename_data_fail_before_old_metadata_backup(object);
         let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
         let result = disk
-            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi.clone(), bucket, object)
             .await;
 
         assert!(result.is_err());
@@ -13804,7 +14726,42 @@ mod test {
             .await
             .expect("old metadata should still be readable");
         assert_eq!(current_meta, old_meta);
-        assert!(!object_dir.join("object").join(STORAGE_FORMAT_FILE).exists());
+        assert_eq!(
+            fs::read(tmp_data_dir.join("part.1"))
+                .await
+                .expect("failed commit must restore the staged data directory"),
+            b"new-data",
+            "recursive rollback must preserve the staged shard payload"
+        );
+        assert!(
+            !object_dir.join(new_data_dir.to_string()).exists(),
+            "failed commit must not strand the new data directory at the destination"
+        );
+
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("the same staged request should succeed on its first retry");
+        assert_eq!(
+            fs::read(object_dir.join(new_data_dir.to_string()).join("part.1"))
+                .await
+                .expect("retried commit should publish the staged shard"),
+            b"new-data"
+        );
+        assert!(!tmp_data_dir.exists(), "successful retry must consume the restored staging directory");
+        let committed_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("retried metadata should be readable");
+        let committed_meta = FileMeta::load(&committed_meta).expect("retried metadata should parse");
+        let (_, committed_version) = committed_meta
+            .find_version(Some(version_id))
+            .expect("retried metadata should contain the requested version");
+        assert_eq!(
+            committed_version
+                .object
+                .expect("retried non-inline version should contain object metadata")
+                .data_dir,
+            Some(new_data_dir)
+        );
     }
 
     #[tokio::test]

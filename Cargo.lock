@@ -97,9 +97,9 @@ dependencies = [
 
 [[package]]
 name = "aho-corasick"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
 dependencies = [
  "memchr",
 ]
@@ -145,9 +145,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amq-protocol"
-version = "10.6.2"
+version = "10.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eab68e8836c5812a01b34c5364d28db50bf686b442e902d9d93e4472318d86e"
+checksum = "b63f30a81ad95c7a278080be6d993d5b3e971d93e1b00bd894067220fc756804"
 dependencies = [
  "amq-protocol-tcp",
  "amq-protocol-types",
@@ -159,9 +159,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-tcp"
-version = "10.6.2"
+version = "10.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8689f976dbd9864922f4f53e01ad2b43700ed3eb1bb5667b260522f291434dae"
+checksum = "2b1bcecdd743111f05c26294d26b887ba6b2e4789c27515aa48f0fe32066e96c"
 dependencies = [
  "amq-protocol-uri",
  "async-rs",
@@ -172,9 +172,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-types"
-version = "10.6.2"
+version = "10.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27894e9e57d07f701251aeee3d2ab3d7d114bc830bf722d6626027eb55f3b222"
+checksum = "8a268a50e97bd5d52292a8b96636f6436215def6f3d128fb8218318f5feb4c33"
 dependencies = [
  "cookie-factory",
  "nom 8.0.0",
@@ -184,9 +184,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-uri"
-version = "10.6.2"
+version = "10.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64fd5ca63f1b8cba2309aaec8595483c36f3a671225d5ab9fe8265adb9213514"
+checksum = "8a34581b010818ef3da6b5a853e94f6438b3903914baba77a15f7fb2c7ad8958"
 dependencies = [
  "amq-protocol-types",
  "percent-encoding",
@@ -1490,9 +1490,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -2677,9 +2677,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.11.0"
+version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "datafusion"
@@ -3744,7 +3744,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sts",
  "aws-smithy-http-client",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
@@ -5915,7 +5915,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libmimalloc-sys"
 version = "0.1.49"
-source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=1cdadea43e9c5a0f054b65be21200ce580e4eb13#1cdadea43e9c5a0f054b65be21200ce580e4eb13"
+source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=ce6338661179c8be22e516b00af7483f151485a7#ce6338661179c8be22e516b00af7483f151485a7"
 dependencies = [
  "cc",
  "cty",
@@ -6029,9 +6029,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -6324,7 +6324,7 @@ dependencies = [
 [[package]]
 name = "mimalloc"
 version = "0.1.52"
-source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=1cdadea43e9c5a0f054b65be21200ce580e4eb13#1cdadea43e9c5a0f054b65be21200ce580e4eb13"
+source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=ce6338661179c8be22e516b00af7483f151485a7#ce6338661179c8be22e516b00af7483f151485a7"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -6480,7 +6480,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "keyed_priority_queue",
- "lru 0.18.1",
+ "lru 0.18.2",
  "mysql_common",
  "percent-encoding",
  "rand 0.10.2",
@@ -8573,9 +8573,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -8906,9 +8906,9 @@ dependencies = [
 
 [[package]]
 name = "russh-sftp"
-version = "2.3.0"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed8949eca4163c18a8f59ff96d32cf61e9c13b9735e21ef32b3907f4aafa1a9"
+checksum = "9de67aace74530a29086db0671fa200c470a58eb380081f28ad512ffb0c5356b"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
@@ -9008,7 +9008,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "base64-simd",
  "bytes",
  "chacha20poly1305",
@@ -9135,11 +9135,11 @@ name = "rustfs-audit"
 version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
- "chrono",
  "const-str",
  "futures",
  "hashbrown 0.17.1",
  "hotpath",
+ "jiff",
  "metrics",
  "rustfs-config",
  "rustfs-s3-types",
@@ -9175,10 +9175,12 @@ version = "1.0.0-beta.12"
 dependencies = [
  "chrono",
  "hotpath",
+ "jiff",
  "metrics",
  "rmp-serde",
  "s3s",
  "serde",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -9268,7 +9270,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.23.0",
+ "base64 0.23.1",
  "base64-simd",
  "byteorder",
  "bytes",
@@ -9294,6 +9296,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "insta",
+ "jiff",
  "lazy_static",
  "libc",
  "md-5 0.11.0",
@@ -9417,6 +9420,7 @@ dependencies = [
  "rustfs-utils",
  "s3s",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "time",
@@ -9431,7 +9435,7 @@ name = "rustfs-heal"
 version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "futures",
  "hotpath",
  "http 1.5.0",
@@ -9615,7 +9619,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chacha20poly1305",
  "hex",
  "hotpath",
@@ -9718,10 +9722,10 @@ dependencies = [
 name = "rustfs-madmin"
 version = "1.0.0-beta.12"
 dependencies = [
- "chrono",
  "hotpath",
  "humantime",
  "hyper",
+ "jiff",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -9736,11 +9740,11 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "chrono",
  "criterion",
  "form_urlencoded",
  "hashbrown 0.17.1",
  "hotpath",
+ "jiff",
  "metrics",
  "percent-encoding",
  "quick-xml",
@@ -9861,10 +9865,10 @@ version = "1.0.0-beta.12"
 dependencies = [
  "async-trait",
  "base64-simd",
- "chrono",
  "futures",
  "hotpath",
  "ipnetwork",
+ "jiff",
  "jsonwebtoken 11.0.0",
  "moka",
  "pollster",
@@ -9894,7 +9898,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "dav-server",
  "futures",
@@ -9998,7 +10002,7 @@ dependencies = [
  "aes-gcm",
  "arc-swap",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "crc-fast",
  "faster-hex",
@@ -10090,7 +10094,6 @@ dependencies = [
  "s3s",
  "serde_json",
  "serial_test",
- "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
@@ -10204,7 +10207,6 @@ dependencies = [
  "arc-swap",
  "async-nats",
  "async-trait",
- "chrono",
  "criterion",
  "deadpool-postgres",
  "futures-util",
@@ -10212,6 +10214,7 @@ dependencies = [
  "hotpath",
  "hyper",
  "hyper-rustls",
+ "jiff",
  "lapin",
  "libc",
  "metrics",
@@ -10455,9 +10458,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-connector"
-version = "0.23.6"
+version = "0.23.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7664e32b0ffbec386bdf1d7cbca51a89551a90d3278f135186cd6cb3cfa889c"
+checksum = "09a5abe04eec18f8b9fbe87885bcaee6426de80bbc579958c0bc064b728ee617"
 dependencies = [
  "futures-io",
  "futures-rustls",
@@ -13313,9 +13316,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.6"
+version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

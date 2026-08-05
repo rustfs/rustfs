@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! End-to-end acceptance for backlog#1052: two embedded RustFS servers coexist
 //! in one process, on different ports and volumes, and their S3 data planes
 //! stay isolated.
@@ -71,22 +73,27 @@ fn hmac(key: &[u8], value: &str) -> Vec<u8> {
 fn signed_admin_request(
     client: &reqwest::Client,
     endpoint: &str,
+    method: reqwest::Method,
     request_path: &str,
     access_key: &str,
     secret_key: &str,
+    body: &[u8],
 ) -> reqwest::RequestBuilder {
     let host = endpoint
         .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
         .expect("embedded endpoint scheme");
-    let payload_hash = sha256_hex(b"");
+    let payload_hash = sha256_hex(body);
     let now = Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date = now.format("%Y%m%d").to_string();
     let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let (path, query) = request_path.split_once('?').unwrap_or((request_path, ""));
-    let canonical_request = format!("GET\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_request = format!(
+        "{}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        method.as_str()
+    );
     let scope = format!("{date}/us-east-1/s3/aws4_request");
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
     let date_key = hmac(format!("AWS4{secret_key}").as_bytes(), &date);
@@ -99,11 +106,12 @@ fn signed_admin_request(
     );
 
     client
-        .get(format!("{endpoint}{request_path}"))
+        .request(method, format!("{endpoint}{request_path}"))
         .header("host", host)
         .header("x-amz-content-sha256", payload_hash)
         .header("x-amz-date", amz_date)
         .header("authorization", authorization)
+        .body(body.to_vec())
 }
 
 // backlog#1052 acceptance: a second embedded server in the same process no
@@ -330,6 +338,81 @@ async fn two_embedded_servers_isolate_auth_and_data_planes_body() {
 
 #[cfg(feature = "e2e-test-hooks")]
 #[tokio::test]
+async fn embedded_servers_isolate_iam_users_and_policies() {
+    let port_a = find_available_port().expect("find free port for server A");
+    let server_a = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_a}"))
+        .access_key("iam-root-a")
+        .secret_key("iam-root-secret-a")
+        .build()
+        .await
+        .expect("start embedded server A");
+    let port_b = find_available_port().expect("find free port for server B");
+    let server_b = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_b}"))
+        .access_key("iam-root-b")
+        .secret_key("iam-root-secret-b")
+        .build()
+        .await
+        .expect("start embedded server B");
+
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local admin client");
+    let user_body = serde_json::json!({"secretKey": "iam-user-secret-a", "status": "enabled"}).to_string();
+    for (path, body) in [
+        ("/rustfs/admin/v3/add-user?accessKey=iam-user-a", user_body.as_bytes()),
+        (
+            "/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=iam-user-a&isGroup=false",
+            b"".as_slice(),
+        ),
+    ] {
+        let response = signed_admin_request(
+            &http,
+            &server_a.endpoint(),
+            reqwest::Method::PUT,
+            path,
+            server_a.access_key(),
+            server_a.secret_key(),
+            body,
+        )
+        .send()
+        .await
+        .expect("send server A IAM request");
+        assert!(response.status().is_success(), "server A IAM setup failed: {}", response.status());
+    }
+
+    let client_b = s3_client(&server_b.endpoint(), server_b.access_key(), server_b.secret_key());
+    client_b
+        .create_bucket()
+        .bucket("private-to-b")
+        .send()
+        .await
+        .expect("create server B bucket");
+    client_b
+        .put_object()
+        .bucket("private-to-b")
+        .key("secret.txt")
+        .body(ByteStream::from_static(b"server B data"))
+        .send()
+        .await
+        .expect("write server B object");
+
+    let cross_instance = s3_client(&server_b.endpoint(), "iam-user-a", "iam-user-secret-a")
+        .get_object()
+        .bucket("private-to-b")
+        .key("secret.txt")
+        .send()
+        .await;
+    assert!(cross_instance.is_err(), "server A IAM user must not authorize against server B");
+
+    server_b.shutdown().await;
+    server_a.shutdown().await;
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+#[tokio::test]
 async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed() {
     let port_a = match find_available_port() {
         Ok(port) => port,
@@ -374,17 +457,30 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
     let b_access_key = "startup-window-access-b";
     let b_secret_key = "startup-window-secret-b";
     let mut barrier = pause_embedded_startup_after_http_bind(port_b);
-    let startup_b = tokio::spawn(async move {
-        RustFSServerBuilder::new()
-            .address(format!("127.0.0.1:{port_b}"))
-            .access_key(b_access_key)
-            .secret_key(b_secret_key)
-            .build()
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_http_bound())
-        .await
-        .expect("server B must bind HTTP before installing its context slot");
+    let startup_b = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_b}"))
+        .access_key(b_access_key)
+        .secret_key(b_secret_key)
+        .build();
+    tokio::pin!(startup_b);
+    {
+        let bound = tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_http_bound());
+        tokio::pin!(bound);
+        tokio::select! {
+            bound = &mut bound => {
+                bound.expect("server B must bind HTTP before installing its context slot");
+            }
+            startup = startup_b.as_mut() => {
+                match startup {
+                    Ok(server) => {
+                        server.shutdown().await;
+                        panic!("server B startup completed before the HTTP-bind barrier fired");
+                    }
+                    Err(err) => panic!("server B startup failed before the HTTP-bind barrier fired: {err}"),
+                }
+            }
+        }
+    }
 
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -392,10 +488,11 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
         .build()
         .expect("build local admin client without proxy");
     let inspect_path = "/rustfs/admin/v3/inspect-data?file=marker.txt&volume=startup-window";
-    let before_install = signed_admin_request(&http, &endpoint_b, inspect_path, b_access_key, b_secret_key)
-        .send()
-        .await
-        .expect("server B HTTP listener must accept the paused request");
+    let before_install =
+        signed_admin_request(&http, &endpoint_b, reqwest::Method::GET, inspect_path, b_access_key, b_secret_key, b"")
+            .send()
+            .await
+            .expect("server B HTTP listener must accept the paused request");
     let before_install_status = before_install.status();
     let before_install_body = before_install.text().await.expect("read paused response body");
     assert_eq!(before_install_status, StatusCode::SERVICE_UNAVAILABLE, "{before_install_body}");
@@ -405,10 +502,9 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
     );
 
     barrier.release();
-    let server_b = tokio::time::timeout(Duration::from_secs(20), startup_b)
+    let server_b = tokio::time::timeout(Duration::from_secs(20), startup_b.as_mut())
         .await
         .expect("server B startup must complete after releasing the barrier")
-        .expect("server B startup task must not panic")
         .expect("start embedded server B");
     let client_b = s3_client(&server_b.endpoint(), server_b.access_key(), server_b.secret_key());
     client_b
@@ -426,10 +522,18 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
         .await
         .expect("server B writes its marker");
 
-    let after_install = signed_admin_request(&http, &server_b.endpoint(), inspect_path, b_access_key, b_secret_key)
-        .send()
-        .await
-        .expect("server B admin request after context installation");
+    let after_install = signed_admin_request(
+        &http,
+        &server_b.endpoint(),
+        reqwest::Method::GET,
+        inspect_path,
+        b_access_key,
+        b_secret_key,
+        b"",
+    )
+    .send()
+    .await
+    .expect("server B admin request after context installation");
     assert_eq!(after_install.status(), StatusCode::OK);
     assert_eq!(after_install.bytes().await.expect("read server B marker"), b"from B".as_slice());
 

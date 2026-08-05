@@ -503,10 +503,35 @@ pub(crate) fn extract_event_time(body: &[u8]) -> Result<String, TargetError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| TargetError::Serialization("event_data is missing Records[0].eventTime".to_string()))?;
 
-    let dt = chrono::DateTime::parse_from_rfc3339(event_time)
+    let pieces = jiff::fmt::temporal::Pieces::parse(event_time)
         .map_err(|e| TargetError::Serialization(format!("Failed to parse eventTime '{}': {}", event_time, e)))?;
+    let time = pieces
+        .time()
+        .ok_or_else(|| TargetError::Serialization(format!("Failed to parse eventTime '{}': missing RFC3339 time", event_time)))?;
+    if pieces.offset().is_none() {
+        return Err(TargetError::Serialization(format!(
+            "Failed to parse eventTime '{}': missing RFC3339 offset",
+            event_time
+        )));
+    }
+    if pieces.time_zone_annotation().is_some() {
+        return Err(TargetError::Serialization(format!(
+            "Failed to parse eventTime '{}': RFC3339 timestamp must not include a time zone annotation",
+            event_time
+        )));
+    }
+    let date = pieces.date();
 
-    Ok(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+    Ok(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+        date.year(),
+        date.month(),
+        date.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+        time.subsec_nanosecond() / 1_000
+    ))
 }
 
 /// Validates the required `event_time`/`event_data` columns and reports whether
@@ -1366,7 +1391,14 @@ mod tests {
         let body =
             br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#;
         let result = extract_event_time(body).expect("valid event_time");
-        assert!(result.starts_with("2026-05-03 10:00:00"));
+        assert_eq!(result, "2026-05-03 10:00:00.000000");
+    }
+
+    #[test]
+    fn extract_event_time_preserves_input_offset_wall_time() {
+        let body = br#"{"EventName":"s3:ObjectCreated:Put","Records":[{"eventTime":"2026-05-03T10:00:00.123456789+08:00"}]}"#;
+        let result = extract_event_time(body).expect("valid event_time");
+        assert_eq!(result, "2026-05-03 10:00:00.123456");
     }
 
     #[test]
@@ -1388,6 +1420,20 @@ mod tests {
         let body = br#"{"Records":[{"eventTime":"not-a-date"}]}"#;
         let err = extract_event_time(body).expect_err("malformed date should fail");
         assert!(err.to_string().contains("Failed to parse eventTime"));
+    }
+
+    #[test]
+    fn extract_event_time_without_offset_errors() {
+        let body = br#"{"Records":[{"eventTime":"2026-05-03T10:00:00"}]}"#;
+        let err = extract_event_time(body).expect_err("missing offset should fail");
+        assert!(err.to_string().contains("missing RFC3339 offset"));
+    }
+
+    #[test]
+    fn extract_event_time_with_time_zone_annotation_errors() {
+        let body = br#"{"Records":[{"eventTime":"2026-05-03T10:00:00+08:00[Asia/Shanghai]"}]}"#;
+        let err = extract_event_time(body).expect_err("time zone annotation should fail");
+        assert!(err.to_string().contains("must not include a time zone annotation"));
     }
 
     #[test]

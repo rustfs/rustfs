@@ -21,7 +21,7 @@ use crate::storage_api::server::event::{
     EventArgs as EcstoreEventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
     with_server_config_read_lock,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rustfs_notify::{
     EventArgs as NotifyEventArgs, NotificationError, NotificationRuntimeState, NotificationSystem, NotifyObjectInfo,
 };
@@ -94,15 +94,16 @@ pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyOb
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         version_id: object.version_id.map(|version_id| version_id.to_string()),
-        mod_time: object
-            .mod_time
-            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
-        restore_expires: object
-            .restore_expires
-            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
+        mod_time: object.mod_time.and_then(offset_date_time_to_timestamp),
+        restore_expires: object.restore_expires.and_then(offset_date_time_to_timestamp),
         storage_class: object.storage_class,
         transitioned_tier: (!object.transitioned_object.tier.is_empty()).then_some(object.transitioned_object.tier),
     }
+}
+
+fn offset_date_time_to_timestamp(value: time::OffsetDateTime) -> Option<Timestamp> {
+    let nanosecond = value.nanosecond().try_into().ok()?;
+    Timestamp::new(value.unix_timestamp(), nanosecond).ok()
 }
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs> {
@@ -440,7 +441,7 @@ mod tests {
     use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
     use crate::storage_api::server::event::contract::lifecycle::TransitionedObject;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use rustfs_notify::NotificationError;
     use rustfs_notify::NotificationRuntimeState;
     use serial_test::serial;
@@ -557,8 +558,8 @@ mod tests {
         assert_eq!(converted.etag.as_deref(), Some("etag"));
         assert_eq!(converted.content_type.as_deref(), Some("text/plain"));
         assert_eq!(converted.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
-        assert_eq!(converted.mod_time, DateTime::<Utc>::from_timestamp(42, 0));
-        assert_eq!(converted.restore_expires, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
+        assert_eq!(converted.mod_time, Timestamp::new(42, 0).ok());
+        assert_eq!(converted.restore_expires, Timestamp::new(1_700_000_000, 0).ok());
         assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
         assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
     }

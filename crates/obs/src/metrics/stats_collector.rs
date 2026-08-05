@@ -38,7 +38,7 @@ use crate::metrics::{
     obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
 };
 use crate::node_identity::current_local_node_identity;
-use chrono::Utc;
+use jiff::Timestamp;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -320,16 +320,21 @@ async fn obs_site_replication_stats() -> ReplicationStats {
     }
 }
 
-fn current_scanner_cycle_age_seconds(
-    current_cycle_active: bool,
-    current_started: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
-) -> u64 {
+fn current_scanner_cycle_age_seconds(current_cycle_active: bool, current_started: Timestamp, now: Timestamp) -> u64 {
     if !current_cycle_active {
         0
     } else {
-        now.signed_duration_since(current_started).num_seconds().max(0) as u64
+        timestamp_elapsed_seconds_since(now, current_started)
     }
+}
+
+fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
+    let duration = now.duration_since(earlier);
+    if duration.is_negative() {
+        return 0;
+    }
+
+    u64::try_from(duration.as_secs()).map_or(u64::MAX, |seconds| seconds)
 }
 
 fn scanner_scan_mode_code(scan_mode: &str) -> u64 {
@@ -1377,7 +1382,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
 
 pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRuntimeStats> {
     let (metrics, runtime_details) = global_metrics().report_with_runtime_details().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
     let bucket_scans_started = scanner_bucket_scans_started(&metrics.life_time_ops, bucket_scans_finished);
     let bucket_scans_failed = metrics
@@ -1395,7 +1400,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
     // rules report zero here while objects_scanned keeps climbing.
     let versions_scanned = metrics.versions_scanned;
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
-    let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
+    let last_activity_seconds = timestamp_elapsed_seconds_since(now, reference_time);
     let active_paths = metrics.active_scan_paths as u64;
     let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle_active, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
@@ -1858,23 +1863,29 @@ mod tests {
 
     #[test]
     fn current_scanner_cycle_age_seconds_returns_zero_when_idle() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(false, now - chrono::Duration::seconds(30), now), 0);
+        assert_eq!(
+            current_scanner_cycle_age_seconds(false, now - jiff::SignedDuration::from_secs(30), now),
+            0
+        );
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_clamps_future_start() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(true, now + chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now + jiff::SignedDuration::from_secs(30), now), 0);
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_reports_active_first_cycle_elapsed_time() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(true, now - chrono::Duration::seconds(45), now), 45);
+        assert_eq!(
+            current_scanner_cycle_age_seconds(true, now - jiff::SignedDuration::from_secs(45), now),
+            45
+        );
     }
 
     #[test]

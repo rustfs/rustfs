@@ -845,21 +845,21 @@ pub struct SseKmsPrincipal {
 }
 
 impl SseKmsPrincipal {
-    /// Build a principal from an authenticated S3 request.
+    /// Build a principal from an S3 request.
     ///
-    /// Returns `None` for unauthenticated requests: an anonymous caller has no identity
-    /// policy to evaluate, and denying it outright would break public buckets holding
-    /// SSE-KMS objects. Such requests remain governed by bucket policy alone.
+    /// Anonymous requests use an empty account, matching the bucket-policy authorization
+    /// path. This keeps every request that crossed the S3 boundary distinct from trusted
+    /// internal callers, which are represented by `None`.
     pub(crate) fn from_request<T>(req: &S3Request<T>) -> Option<Self> {
         let req_info = req.extensions.get::<ReqInfo>()?;
-        let cred = req_info.cred.as_ref()?;
+        let cred = req_info.cred.as_ref();
 
         Some(Self {
-            account: cred.access_key.clone(),
-            groups: cred.groups.clone(),
+            account: cred.map(|cred| cred.access_key.clone()).unwrap_or_default(),
+            groups: cred.and_then(|cred| cred.groups.clone()),
             is_owner: req_info.is_owner,
-            claims: cred.claims_or_empty().clone(),
-            conditions: resource_free_condition_values(req, cred),
+            claims: cred.map(|cred| cred.claims_or_empty().clone()).unwrap_or_default(),
+            conditions: cred.map(|cred| resource_free_condition_values(req, cred)).unwrap_or_default(),
             request_audit: request_context_from_req(req).and_then(|context| kms_request_audit(&context.request_id)),
             #[cfg(test)]
             test_hooks: None,
@@ -3431,6 +3431,28 @@ mod tests {
         SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
     };
     use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
+
+    #[test]
+    fn anonymous_s3_request_builds_kms_principal() {
+        let mut request = s3s::S3Request {
+            input: (),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/bucket/object"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        request.extensions.insert(crate::storage::access::ReqInfo::default());
+
+        let principal = SseKmsPrincipal::from_request(&request).expect("S3-boundary request should build a principal");
+
+        assert!(principal.account.is_empty());
+        assert!(principal.groups.is_none());
+        assert!(principal.claims.is_empty());
+    }
 
     #[test]
     fn parse_simple_sse_cmk_rejects_bad_keys_without_crashing() {

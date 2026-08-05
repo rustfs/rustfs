@@ -85,12 +85,57 @@ static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
 static USAGE_MEMORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Best-available persisted usage for `bucket` when no authoritative source
+/// exists yet (issue #5716): after an upgrade from a pre-v2 release the only
+/// persisted usage data is the legacy `.usage.json`, which is demoted to
+/// non-authoritative, and the authoritative caches stay empty until the
+/// scanner's first complete cycle lands. Quota admission degrades to the
+/// pre-discard per-bucket sizes retained on the cached snapshot instead of
+/// failing every write closed.
+///
+/// The baseline is static between snapshot loads — live writes do not advance
+/// it — so hard-quota enforcement during the degraded window is advisory: the
+/// overrun is bounded only by the writes issued before the next complete
+/// scanner cycle replaces the baseline with authoritative usage. That is
+/// strictly tighter than beta.11 (usage treated as 0) and strictly more
+/// available than a blanket 503. The fallback applies to any window without
+/// authoritative usage, not only pre-v2 upgrades; the values always come from
+/// the last persisted scanner output. Loads go through the TTL-bounded
+/// snapshot cache, so the quota path adds at most one backend read per
+/// [`DATA_USAGE_CACHE_TTL_SECS`] window. Returns `None` for buckets absent
+/// from every persisted snapshot — those still fail closed.
+pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+    {
+        let cache = data_usage_snapshot_cache().read().await;
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| tokio::time::Instant::now().duration_since(cached.loaded_at) < ttl)
+        {
+            return cached.degraded_baseline.get(bucket).copied();
+        }
+    }
+
+    // Stale or empty cache: refresh through the TTL-bounded loader. A failed
+    // refresh carries the previous baseline forward, so quota admission keeps
+    // its last grounded values through a backend read outage.
+    let _ = load_data_usage_from_backend_cached(store).await;
+    let cache = data_usage_snapshot_cache().read().await;
+    cache
+        .as_ref()
+        .and_then(|cached| cached.degraded_baseline.get(bucket).copied())
+}
+
 /// Cached copy of the last persisted data usage snapshot, served to admin
 /// endpoints for up to `DATA_USAGE_CACHE_TTL_SECS` between backend reads.
 #[derive(Debug, Clone)]
 struct CachedDataUsageSnapshot {
     info: Option<DataUsageInfo>,
     loaded_at: tokio::time::Instant,
+    /// Pre-discard per-bucket sizes from the same load, retained even when the
+    /// snapshot is incomplete and its bucket data is discarded. Consumed only
+    /// by [`lookup_degraded_bucket_usage_baseline`] for quota admission.
+    degraded_baseline: HashMap<String, u64>,
 }
 
 impl CachedDataUsageSnapshot {
@@ -114,7 +159,7 @@ fn fresh_cached_data_usage_snapshot(
 
 fn cache_data_usage_snapshot_result(
     cache: &mut Option<CachedDataUsageSnapshot>,
-    result: Result<DataUsageInfo, Error>,
+    result: Result<(DataUsageInfo, HashMap<String, u64>), Error>,
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
 ) -> Option<Result<DataUsageInfo, Error>> {
@@ -123,15 +168,24 @@ fn cache_data_usage_snapshot_result(
     }
 
     Some(match result {
-        Ok(info) => {
+        Ok((info, degraded_baseline)) => {
             *cache = Some(CachedDataUsageSnapshot {
                 info: Some(info.clone()),
                 loaded_at,
+                degraded_baseline,
             });
             Ok(info)
         }
         Err(e) => {
-            *cache = Some(CachedDataUsageSnapshot { info: None, loaded_at });
+            // Keep the previous baseline through a failed refresh: quota
+            // admission must not lose its last grounded values because one
+            // backend read errored.
+            let degraded_baseline = cache.take().map(|cached| cached.degraded_baseline).unwrap_or_default();
+            *cache = Some(CachedDataUsageSnapshot {
+                info: None,
+                loaded_at,
+                degraded_baseline,
+            });
             Err(e)
         }
     })
@@ -761,6 +815,13 @@ async fn load_data_usage_snapshot(store: Arc<ECStore>) -> Result<(DataUsageInfo,
 /// Load data usage info from backend storage
 #[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    Ok(load_data_usage_from_backend_with_baseline(store).await?.0)
+}
+
+/// Like [`load_data_usage_from_backend`], but also returns the pre-discard
+/// per-bucket sizes so the cached loader can retain them as the degraded
+/// quota-admission baseline (issue #5716).
+async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Result<(DataUsageInfo, HashMap<String, u64>), Error> {
     let (data_usage_info, source) = load_data_usage_snapshot(store).await?;
     Ok(normalize_loaded_data_usage(data_usage_info, source.is_authoritative()).await)
 }
@@ -807,7 +868,13 @@ fn populate_backward_compatible_usage_maps(data_usage_info: &mut DataUsageInfo) 
     }
 }
 
-async fn normalize_loaded_data_usage(mut data_usage_info: DataUsageInfo, authoritative_format: bool) -> DataUsageInfo {
+/// Returns the normalized snapshot plus the pre-discard per-bucket sizes: the
+/// degraded quota-admission baseline captured before an incomplete snapshot
+/// drops its bucket data (issue #5716).
+async fn normalize_loaded_data_usage(
+    mut data_usage_info: DataUsageInfo,
+    authoritative_format: bool,
+) -> (DataUsageInfo, HashMap<String, u64>) {
     info!("Loaded data usage info from backend with {} buckets", data_usage_info.buckets_count);
 
     if !authoritative_format {
@@ -815,6 +882,7 @@ async fn normalize_loaded_data_usage(mut data_usage_info: DataUsageInfo, authori
     }
     populate_backward_compatible_usage_maps(&mut data_usage_info);
     validate_complete_usage_snapshot(&mut data_usage_info);
+    let degraded_baseline = data_usage_info.bucket_sizes.clone();
     discard_incomplete_bucket_usage(&mut data_usage_info);
 
     // Handle replication info
@@ -840,7 +908,7 @@ async fn normalize_loaded_data_usage(mut data_usage_info: DataUsageInfo, authori
         }
     }
 
-    data_usage_info
+    (data_usage_info, degraded_baseline)
 }
 
 /// Load the persisted data usage snapshot through a small in-process cache.
@@ -873,7 +941,7 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
         }
 
         let refresh_generation = data_usage_snapshot_generation();
-        let result = load_data_usage_from_backend(store.clone()).await;
+        let result = load_data_usage_from_backend_with_baseline(store.clone()).await;
         let loaded_at = tokio::time::Instant::now();
         let mut cache = data_usage_snapshot_cache().write().await;
         if let Some(result) = cache_data_usage_snapshot_result(&mut cache, result, loaded_at, refresh_generation) {
@@ -2361,7 +2429,7 @@ mod tests {
         legacy.bucket_sizes.insert("large".to_string(), 0);
         legacy.buckets_count = 2;
 
-        let normalized = normalize_loaded_data_usage(legacy, false).await;
+        let (normalized, degraded_baseline) = normalize_loaded_data_usage(legacy, false).await;
 
         assert_eq!(normalized.buckets_count, 0);
         assert!(normalized.buckets_usage.is_empty());
@@ -2369,6 +2437,10 @@ mod tests {
         assert_eq!(normalized.objects_total_count, 0);
         assert_eq!(normalized.objects_total_size, 0);
         assert!(!normalized.usage_snapshot_complete);
+        // Issue #5716: the discarded sizes must survive as the degraded
+        // quota-admission baseline.
+        assert_eq!(degraded_baseline.get("control").copied(), Some(10_285));
+        assert_eq!(degraded_baseline.get("large").copied(), Some(0));
     }
 
     #[test]
@@ -2404,7 +2476,7 @@ mod tests {
         info.buckets_usage.insert("empty".to_string(), BucketUsageInfo::default());
         info.buckets_count = 2;
 
-        let normalized = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
 
         assert_eq!(normalized.buckets_count, 2);
         assert!(normalized.usage_snapshot_complete);
@@ -2439,7 +2511,7 @@ mod tests {
         info.bucket_sizes.insert("partial".to_string(), 196_870_144);
         info.buckets_count = 1;
 
-        let normalized = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
 
         assert_eq!(normalized.buckets_count, 0);
         assert!(!normalized.buckets_usage.contains_key("control"));
@@ -2454,7 +2526,7 @@ mod tests {
         info.buckets_count = 2;
 
         assert!(!data_usage_contains_bucket(&info, "missing"));
-        let normalized = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
 
         assert!(!normalized.usage_snapshot_complete);
         assert!(normalized.buckets_usage.is_empty());
@@ -2463,7 +2535,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_empty_snapshot_remains_authoritative() {
-        let normalized = normalize_loaded_data_usage(
+        let (normalized, _) = normalize_loaded_data_usage(
             DataUsageInfo {
                 last_update: Some(SystemTime::UNIX_EPOCH),
                 usage_snapshot_complete: true,
@@ -2504,7 +2576,7 @@ mod tests {
         let mut cache = None;
         let refresh_generation = data_usage_snapshot_generation();
 
-        let first = cache_data_usage_snapshot_result(&mut cache, Ok(expected), loaded_at, refresh_generation)
+        let first = cache_data_usage_snapshot_result(&mut cache, Ok((expected, HashMap::new())), loaded_at, refresh_generation)
             .expect("an uninterrupted refresh should populate the cache")
             .expect("successful load must be returned");
         assert_snapshot_bucket(&first, "bucket");
@@ -2523,12 +2595,13 @@ mod tests {
         let mut cache = Some(CachedDataUsageSnapshot {
             info: Some(data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH)),
             loaded_at,
+            degraded_baseline: HashMap::new(),
         });
         clear_data_usage_snapshot_cache(&mut cache);
 
         let stale_result = cache_data_usage_snapshot_result(
             &mut cache,
-            Ok(data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH)),
+            Ok((data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH), HashMap::new())),
             loaded_at,
             refresh_generation,
         );
@@ -3533,6 +3606,7 @@ mod tests {
         *snapshot_cache = Some(CachedDataUsageSnapshot {
             info: Some(successor),
             loaded_at: tokio::time::Instant::now(),
+            degraded_baseline: HashMap::new(),
         });
         memory_cache()
             .write()
@@ -3595,6 +3669,7 @@ mod tests {
         *snapshot_cache = Some(CachedDataUsageSnapshot {
             info: Some(successor),
             loaded_at: tokio::time::Instant::now(),
+            degraded_baseline: HashMap::new(),
         });
 
         let store_for_cleanup = store.clone();
@@ -3646,6 +3721,7 @@ mod tests {
         *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
             info: Some(stale),
             loaded_at: tokio::time::Instant::now(),
+            degraded_baseline: HashMap::new(),
         });
 
         remove_bucket_usage_from_backend_with_guard(&store, BUCKET, None)

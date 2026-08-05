@@ -84,6 +84,7 @@ pub(crate) const RATE_LIMIT_SCOPE_CONSOLE: &str = "console";
 pub(crate) const LABEL_RATE_LIMIT_DIMENSION: &str = "dimension";
 pub(crate) const RATE_LIMIT_DIMENSION_CLIENT_IP: &str = "client_ip";
 const RATE_LIMIT_DIMENSION_BUCKET: &str = "bucket";
+const MAX_BUCKET_NAME_LENGTH: usize = 63;
 
 // Header names shared with the Swift error mapping (crates/protocols swift/errors.rs).
 const X_RATE_LIMIT_LIMIT: &str = "x-ratelimit-limit";
@@ -332,6 +333,10 @@ fn strip_vh_prefix<'a>(host: &'a str, domain: &str) -> Option<&'a str> {
     }
 }
 
+fn bounded_bucket_name(bucket: &str) -> Option<&str> {
+    (!bucket.is_empty() && bucket.len() <= MAX_BUCKET_NAME_LENGTH).then_some(bucket)
+}
+
 /// Extract the bucket a request addresses, if any.
 ///
 /// Mirrors s3s host routing: on a configured virtual-hosted-style domain the
@@ -355,13 +360,13 @@ fn request_bucket<'a, B>(req: &'a Request<B>, vh_domains: &[String]) -> Option<&
                 break;
             }
             if let Some(bucket) = strip_vh_prefix(host, domain) {
-                return Some(bucket);
+                return bounded_bucket_name(bucket);
             }
         }
     }
 
     let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    (!bucket.is_empty()).then_some(bucket)
+    bounded_bucket_name(bucket)
 }
 
 /// Paths exempt from S3 API rate limiting.
@@ -797,6 +802,19 @@ mod tests {
     }
 
     #[test]
+    fn request_bucket_rejects_oversized_path_segment() {
+        let domains: Vec<String> = vec![];
+        let maximum = "a".repeat(MAX_BUCKET_NAME_LENGTH);
+        let maximum_path = format!("/{maximum}/object");
+        let maximum_req = request_with_host("s3.example.com", &maximum_path);
+        assert_eq!(request_bucket(&maximum_req, &domains), Some(maximum.as_str()));
+
+        let oversized_path = format!("/{}/object", "a".repeat(MAX_BUCKET_NAME_LENGTH + 1));
+        let oversized_req = request_with_host("s3.example.com", &oversized_path);
+        assert_eq!(request_bucket(&oversized_req, &domains), None);
+    }
+
+    #[test]
     fn request_bucket_resolves_virtual_hosted_style_against_domains() {
         let domains = vec!["s3.example.com".to_string(), "s3.example.com:9000".to_string()];
 
@@ -816,6 +834,18 @@ mod tests {
         // Unrelated hosts fall back to path-style extraction.
         let other = request_with_host("cdn.other.net", "/photos/cat.jpg");
         assert_eq!(request_bucket(&other, &domains), Some("photos"));
+    }
+
+    #[test]
+    fn request_bucket_rejects_oversized_virtual_host_prefix() {
+        let domains = vec!["s3.example.com".to_string()];
+        let maximum = "a".repeat(MAX_BUCKET_NAME_LENGTH);
+        let maximum_req = request_with_host(&format!("{maximum}.s3.example.com"), "/object");
+        assert_eq!(request_bucket(&maximum_req, &domains), Some(maximum.as_str()));
+
+        let oversized = "a".repeat(MAX_BUCKET_NAME_LENGTH + 1);
+        let oversized_req = request_with_host(&format!("{oversized}.s3.example.com"), "/object");
+        assert_eq!(request_bucket(&oversized_req, &domains), None);
     }
 
     #[test]

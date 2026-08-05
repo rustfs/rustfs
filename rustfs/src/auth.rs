@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::{AppContext, current_action_credentials, current_ready_iam_handle};
+use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
@@ -113,6 +113,7 @@ pub struct IAMAuth {
     simple_auth: SimpleAuth,
     access_key: String,
     secret_key: SecretKey,
+    server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
 }
 
 impl Clone for IAMAuth {
@@ -121,6 +122,7 @@ impl Clone for IAMAuth {
             simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
+            server_ctx: self.server_ctx.clone(),
         }
     }
 }
@@ -134,7 +136,18 @@ impl IAMAuth {
             simple_auth,
             access_key,
             secret_key,
+            server_ctx: None,
         }
+    }
+
+    pub(crate) fn with_server_context(
+        ak: impl Into<String>,
+        sk: impl Into<SecretKey>,
+        server_ctx: std::sync::Arc<ServerContextSlot>,
+    ) -> Self {
+        let mut auth = Self::new(ak, sk);
+        auth.server_ctx = Some(server_ctx);
+        auth
     }
 }
 
@@ -186,7 +199,15 @@ impl S3Auth for IAMAuth {
             return Ok(key);
         }
 
-        if let Ok(iam_store) = current_ready_iam_handle() {
+        let iam_store = match &self.server_ctx {
+            Some(server_ctx) => server_ctx
+                .installed_app_context()
+                .filter(|context| context.iam().is_ready())
+                .map(|context| context.iam().handle())
+                .ok_or(()),
+            None => current_ready_iam_handle().map_err(|_| ()),
+        };
+        if let Ok(iam_store) = iam_store {
             // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
             // This is important for newly created users that may not be in cache yet.
             // check_key will automatically attempt to load the user from disk if not found in cache.

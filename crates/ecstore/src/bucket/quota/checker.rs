@@ -198,11 +198,36 @@ impl QuotaChecker {
     }
 
     pub async fn get_real_time_usage(&self, bucket: &str) -> Result<u64, QuotaError> {
-        get_bucket_usage_memory(bucket)
-            .await
-            .ok_or_else(|| QuotaError::UsageUnavailable {
-                bucket: bucket.to_string(),
-            })
+        if let Some(usage) = get_bucket_usage_memory(bucket).await {
+            return Ok(usage);
+        }
+
+        // Degraded window (issue #5716): with no authoritative usage — most
+        // prominently after upgrading from a pre-v2 release, whose legacy
+        // `.usage.json` is demoted to non-authoritative until the scanner's
+        // first complete cycle persists `.usage.v2.json` — failing closed
+        // turned every write to a quota-enabled bucket into a retryable 503
+        // for the whole window. Quota admission instead degrades to the last
+        // persisted per-bucket size. That baseline is static between snapshot
+        // loads (live writes do not advance it), so hard-quota enforcement is
+        // advisory for the duration of the window: the overrun is bounded by
+        // the writes issued before the next complete scanner cycle. Buckets
+        // with no persisted baseline anywhere keep failing closed.
+        let store = self.metadata_sys.read().await.object_store();
+        // Box the fallback: it embeds the whole snapshot-load future, and every
+        // object write nests a quota check several futures deep, so keeping it
+        // inline would grow each write's state machine by the loader's full
+        // size — the debug-build 2MiB worker-stack overflow class fixed for
+        // bucket-config writes in #5648. The allocation only happens on the
+        // degraded path; the authoritative fast path returns above.
+        if let Some(baseline) = Box::pin(crate::data_usage::lookup_degraded_bucket_usage_baseline(store, bucket)).await {
+            debug!(bucket, baseline, "Bucket quota admission using degraded persisted usage baseline");
+            return Ok(baseline);
+        }
+
+        Err(QuotaError::UsageUnavailable {
+            bucket: bucket.to_string(),
+        })
     }
 }
 
@@ -230,6 +255,76 @@ mod tests {
             .expect("a bucket with no persisted metadata has no quota and must not fail the check");
         assert!(result.allowed);
         assert_eq!(result.quota_limit, None);
+    }
+
+    /// Regression (issue #5716): an upgrade from a pre-v2 release leaves only
+    /// the legacy `.usage.json` snapshot, which has no completeness marker and
+    /// is demoted to non-authoritative, and the scanner's first complete cycle
+    /// can be a long way off. Quota admission must degrade to that persisted
+    /// baseline instead of failing every write to a quota-enabled bucket with
+    /// a retryable 503 for the whole window.
+    #[tokio::test]
+    #[serial]
+    async fn quota_admission_falls_back_to_legacy_snapshot_baseline() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore.clone())));
+        let checker = QuotaChecker::new(sys);
+        let bucket = format!("quota-legacy-{}", Uuid::new_v4().simple());
+
+        let mut legacy = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            buckets_count: 1,
+            ..Default::default()
+        };
+        legacy.buckets_usage.insert(
+            bucket.clone(),
+            rustfs_data_usage::BucketUsageInfo {
+                size: 1_234,
+                ..Default::default()
+            },
+        );
+        legacy.bucket_sizes.insert(bucket.clone(), 1_234);
+        // usage_snapshot_complete stays false: pre-v2 snapshots do not carry
+        // the field at all, so they always deserialize as incomplete.
+        let legacy_path = format!("{}/{}", crate::disk::BUCKET_META_PREFIX, rustfs_data_usage::LEGACY_DATA_USAGE_OBJECT_NAME);
+        crate::config::com::save_config(
+            ecstore.clone(),
+            &legacy_path,
+            serde_json::to_vec(&legacy).expect("legacy snapshot should encode"),
+        )
+        .await
+        .expect("legacy snapshot fixture should be stored");
+        crate::data_usage::invalidate_data_usage_snapshot_cache().await;
+
+        let usage = checker
+            .get_real_time_usage(&bucket)
+            .await
+            .expect("quota admission must degrade to the persisted legacy baseline");
+        assert_eq!(usage, 1_234);
+
+        // A bucket absent from every persisted snapshot still has no grounded
+        // baseline and must keep failing closed.
+        let unknown = format!("quota-unknown-{}", Uuid::new_v4().simple());
+        assert!(matches!(
+            checker.get_real_time_usage(&unknown).await,
+            Err(QuotaError::UsageUnavailable { .. })
+        ));
+
+        // Deleting the bucket's usage from the backend must purge the
+        // baseline: a recreated bucket may not inherit the dead incarnation's
+        // size, so with no persisted trace left it fails closed again.
+        crate::data_usage::remove_bucket_usage_from_backend(ecstore.clone(), &bucket)
+            .await
+            .expect("bucket usage removal should succeed");
+        assert!(matches!(
+            checker.get_real_time_usage(&bucket).await,
+            Err(QuotaError::UsageUnavailable { .. })
+        ));
+
+        crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
+            .await
+            .expect("test usage cache cleanup should succeed");
+        crate::data_usage::invalidate_data_usage_snapshot_cache().await;
     }
 
     #[tokio::test]

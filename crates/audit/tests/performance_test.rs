@@ -97,7 +97,7 @@ async fn test_audit_log_dispatch_performance() {
         return; // Alternatively: assert!(false, "AuditSystem failed to start");
     }
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use rustfs_targets::EventName;
     use serde_json::json;
     use std::collections::HashMap;
@@ -136,7 +136,7 @@ async fn test_audit_log_dispatch_performance() {
         version: "1".to_string(),
         deployment_id: Some(format!("test-deployment-{id}")),
         site_name: Some("test-site".to_string()),
-        time: Utc::now(),
+        time: Timestamp::now(),
         event: EventName::ObjectCreatedPut,
         entry_type: Some("object".to_string()),
         trigger: "api".to_string(),
@@ -298,7 +298,7 @@ fn test_performance_requirements() {
     for i in 0..3000 {
         // Simulate event name parsing and processing
         let _event_id = format!("s3:ObjectCreated:Put_{i}");
-        let _timestamp = chrono::Utc::now().to_rfc3339();
+        let _timestamp = jiff::Timestamp::now().to_string();
 
         // Simulate basic audit entry creation overhead
         let _entry_size = 512; // bytes

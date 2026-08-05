@@ -14,7 +14,7 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::{Action, S3Action},
+    action::{Action, KmsAction, S3Action},
     function::key_name::{KeyName, S3KeyName},
     resource::Resource,
     variables::{VariableContext, VariableResolver},
@@ -182,6 +182,14 @@ impl Statement {
     /// left empty. An empty `args.object` means the caller did not scope the request to a
     /// key, which preserves the legacy match-every-key behaviour.
     async fn kms_key_scope_matches(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        if matches!(args.action, Action::KmsAction(KmsAction::BackupAction | KmsAction::RestoreAction))
+            && (!self.resources.is_empty() || !self.not_resources.is_empty())
+        {
+            // Global bundle operations require an unscoped Allow, while a Deny
+            // covering any key must still block an operation covering every key.
+            return matches!(self.effect, Effect::Deny);
+        }
+
         let kms_resources: Vec<&Resource> = self.resources.iter().filter(|resource| resource.is_kms()).collect();
         let kms_not_resources: Vec<&Resource> = self.not_resources.iter().filter(|resource| resource.is_kms()).collect();
 

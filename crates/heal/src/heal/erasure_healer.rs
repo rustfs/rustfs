@@ -16,7 +16,7 @@ use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils, compose_key},
     storage::{HealStorageAPI, next_heal_listing_token},
-    task::is_missing_object_dir_heal_result,
+    task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
 };
 use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -41,6 +41,34 @@ enum HealObjectOutcome {
     Transient,
     /// A real heal failure that should be recorded as failed.
     Failed,
+}
+
+struct PageConcurrencyGuard {
+    in_flight: Arc<AtomicUsize>,
+    set_label: String,
+}
+
+impl PageConcurrencyGuard {
+    fn new(in_flight: Arc<AtomicUsize>, set_label: String) -> Self {
+        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        gauge!(
+            "rustfs_heal_page_concurrency_current",
+            "set" => set_label.clone()
+        )
+        .set(current as f64);
+        Self { in_flight, set_label }
+    }
+}
+
+impl Drop for PageConcurrencyGuard {
+    fn drop(&mut self) {
+        let current = self.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+        gauge!(
+            "rustfs_heal_page_concurrency_current",
+            "set" => self.set_label.clone()
+        )
+        .set(current as f64);
+    }
 }
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -183,35 +211,13 @@ impl ErasureSetHealer {
             .execute_heal_with_resume(buckets, set_disk_id, &resume_manager, &checkpoint_manager)
             .await;
 
-        // 4. cleanup resume state
-        if result.is_ok() {
-            if let Err(e) = resume_manager.cleanup().await {
-                warn!(
-                    target: "rustfs::heal::erasure_healer",
-                    event = EVENT_HEAL_ERASURE_RESUME_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
-                    set_disk_id,
-                    state = "resume_cleanup_failed",
-                    error = %e,
-                    "Erasure set resume cleanup failed"
-                );
-            }
-            if let Err(e) = checkpoint_manager.cleanup().await {
-                warn!(
-                    target: "rustfs::heal::erasure_healer",
-                    event = EVENT_HEAL_ERASURE_RESUME_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
-                    set_disk_id,
-                    state = "checkpoint_cleanup_failed",
-                    error = %e,
-                    "Erasure set checkpoint cleanup failed"
-                );
-            }
-        }
+        result?;
 
-        result
+        // The healing marker is cleared by the caller only after both cleanup
+        // operations succeed. Cleanup is idempotent, so a retry is safe.
+        checkpoint_manager.cleanup().await?;
+        resume_manager.cleanup().await?;
+        Ok(())
     }
 
     /// get or create task id
@@ -223,7 +229,10 @@ impl ErasureSetHealer {
             match ResumeManager::load_from_disk(self.disk.clone(), &task_id).await {
                 Ok(manager) => {
                     let state = manager.get_state().await;
-                    if state.set_disk_id == set_disk_id && ResumeUtils::can_resume_task(&self.disk, &task_id).await {
+                    if !state.completed
+                        && state.set_disk_id == set_disk_id
+                        && ResumeUtils::can_resume_task(&self.disk, &task_id).await
+                    {
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -295,6 +304,21 @@ impl ErasureSetHealer {
                 CheckpointManager::new(self.disk.clone(), task_id.to_string()).await?
             };
 
+            let state = resume_manager.get_state().await;
+            if state.retry_count > 0
+                && state.completed_buckets.is_empty()
+                && state.resume_cursor.is_none()
+                && state.processed_objects == 0
+                && state.successful_objects == 0
+                && state.failed_objects == 0
+                && state.skipped_objects == 0
+            {
+                // schedule_retry persists the authoritative resume reset before
+                // resetting the checkpoint. Reapply the checkpoint reset after
+                // a crash in that window so stale positions cannot skip work.
+                checkpoint_manager.reset_for_retry().await?;
+            }
+
             Ok((resume_manager, checkpoint_manager))
         } else {
             debug!(
@@ -358,6 +382,7 @@ impl ErasureSetHealer {
         let mut successful_objects = state.successful_objects;
         let mut failed_objects = state.failed_objects;
         let mut skipped_objects = state.skipped_objects;
+        let mut failed_buckets = 0u64;
 
         // 4. process remaining buckets
         for (bucket_idx, bucket) in buckets.iter().enumerate().skip(current_bucket_index) {
@@ -384,6 +409,10 @@ impl ErasureSetHealer {
                     checkpoint_manager,
                 )
                 .await;
+
+            if matches!(bucket_result, Err(Error::TaskCancelled | Error::TaskTimeout)) {
+                return bucket_result;
+            }
 
             // update checkpoint position
             checkpoint_manager.update_position(bucket_idx, current_object_index).await?;
@@ -422,7 +451,9 @@ impl ErasureSetHealer {
                         "Erasure set bucket completed"
                     );
                 }
+                Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                 Err(e) => {
+                    failed_buckets = failed_buckets.saturating_add(1);
                     error!(
                         target: "rustfs::heal::erasure_healer",
                         event = EVENT_HEAL_ERASURE_BUCKET_STATE,
@@ -453,7 +484,7 @@ impl ErasureSetHealer {
         // skip may be because the disk is still down, so these are deferred to a
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
-        if failed_objects > 0 || skipped_objects > 0 {
+        if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
                 // rewinds the resume state (cursor + counters), and the
@@ -471,13 +502,14 @@ impl ErasureSetHealer {
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
                     set_disk_id,
+                    failed_buckets,
                     failed_objects,
                     skipped_objects,
                     state = "retry_scheduled",
                     "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
                 return Err(Error::other(format!(
-                    "Erasure set heal incomplete: {failed_objects} failed, {skipped_objects} skipped object(s); retry scheduled"
+                    "Erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
                 )));
             }
 
@@ -491,15 +523,16 @@ impl ErasureSetHealer {
                 component = LOG_COMPONENT_HEAL,
                 subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
                 set_disk_id,
+                failed_buckets,
                 failed_objects,
                 skipped_objects,
                 state = "failed_after_retries",
                 "Erasure set heal exhausted retries with unrecovered versions"
             );
-            let _ = resume_manager.cleanup().await;
-            let _ = checkpoint_manager.cleanup().await;
+            checkpoint_manager.cleanup().await?;
+            resume_manager.cleanup().await?;
             return Err(Error::other(format!(
-                "Erasure set heal exhausted retries with {failed_objects} failed, {skipped_objects} skipped object(s)"
+                "Erasure set heal exhausted retries with {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped"
             )));
         }
 
@@ -579,6 +612,12 @@ impl ErasureSetHealer {
         let page_concurrency_limit =
             Self::effective_heal_page_object_concurrency_for_source(self.source, self.heal_opts.scan_mode);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
+        // disk can fail/skip hundreds of thousands of versions in one sweep, so
+        // only the first few occurrences warn and the rest demote to debug!.
+        // The end-of-pass summary reports the full failed/skipped counts.
+        let mut transient_skip_samples_logged = 0_u64;
+        let mut failure_samples_logged = 0_u64;
 
         // backlog#920: select the per-erasure-set DISK-WALK union enumerator when
         // the scan is Deep OR the request came from AutoHeal — these are the paths
@@ -646,12 +685,7 @@ impl ErasureSetHealer {
                         Err(err) => return (dedup_key, object_name, version_id, Err(err)),
                     };
 
-                    let current_in_flight = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    gauge!(
-                        "rustfs_heal_page_concurrency_current",
-                        "set" => set_label.clone()
-                    )
-                    .set(current_in_flight as f64);
+                    let _in_flight_guard = PageConcurrencyGuard::new(in_flight, set_label);
 
                     // Always go through heal_object. Genuine absence flows through
                     // heal_object -> FileVersionNotFound/FileNotFound ->
@@ -676,13 +710,6 @@ impl ErasureSetHealer {
                             },
                         }
                     };
-
-                    let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-                    gauge!(
-                        "rustfs_heal_page_concurrency_current",
-                        "set" => set_label.clone()
-                    )
-                    .set(current as f64);
 
                     (dedup_key, object_name, version_id, result)
                 });
@@ -723,19 +750,11 @@ impl ErasureSetHealer {
                             "Erasure set missing object treated as ok"
                         );
                     }
-                    Err(Error::TaskCancelled) => {
-                        gauge!(
-                            "rustfs_heal_page_concurrency_current",
-                            "set" => set_disk_id.to_string()
-                        )
-                        .set(0.0);
-                        return Err(Error::TaskCancelled);
-                    }
+                    Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(Error::TransientSkip { message }) => {
                         *skipped_objects += 1;
                         checkpoint_manager.add_skipped_object(key).await?;
-                        warn!(
-                            target: "rustfs::heal::erasure_healer",
+                        demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
                             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
@@ -746,13 +765,12 @@ impl ErasureSetHealer {
                             state = "transient_skip",
                             error = %message,
                             "Erasure set object heal skipped due to transient error"
-                        );
+                        });
                     }
                     Err(err) => {
                         *failed_objects += 1;
                         checkpoint_manager.add_failed_object(key).await?;
-                        warn!(
-                            target: "rustfs::heal::erasure_healer",
+                        demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
                             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
@@ -763,7 +781,7 @@ impl ErasureSetHealer {
                             state = "failed",
                             error = %err,
                             "Erasure set object heal failed"
-                        );
+                        });
                     }
                 }
 
@@ -783,12 +801,6 @@ impl ErasureSetHealer {
             let next_cursor = if is_truncated { next_token.clone() } else { None };
             resume_manager.set_resume_cursor(next_cursor.clone()).await?;
             checkpoint_manager.complete_page(bucket_index, *current_object_index).await?;
-            gauge!(
-                "rustfs_heal_page_concurrency_current",
-                "set" => set_disk_id.to_string()
-            )
-            .set(0.0);
-
             // Check if there are more pages
             if !is_truncated {
                 break;
@@ -835,8 +847,30 @@ impl ErasureSetHealer {
 
 #[cfg(test)]
 mod tests {
-    use super::ErasureSetHealer;
+    use super::{ErasureSetHealer, PageConcurrencyGuard};
     use rustfs_common::heal_channel::{HealRequestSource, HealScanMode};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn dropping_pending_page_heal_releases_concurrency_slot() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut pending_heal = Box::pin({
+            let in_flight = in_flight.clone();
+            async move {
+                let _guard = PageConcurrencyGuard::new(in_flight, "pool_0_set_0".to_string());
+                std::future::pending::<()>().await;
+            }
+        });
+
+        assert!(futures::poll!(pending_heal.as_mut()).is_pending());
+        assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+
+        drop(pending_heal);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn heal_page_object_concurrency_uses_default_when_env_is_unset() {
@@ -979,7 +1013,7 @@ mod resume_loop_tests {
     //! handling) — not merely a mock's own output.
     use super::ErasureSetHealer;
     use crate::heal::progress::HealProgress;
-    use crate::heal::resume::{CheckpointManager, ResumeManager, compose_key};
+    use crate::heal::resume::{CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, compose_key};
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
@@ -989,6 +1023,7 @@ mod resume_loop_tests {
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -1017,6 +1052,7 @@ mod resume_loop_tests {
         /// A transient infrastructure condition (offline disk / unmet quorum):
         /// the version must be recorded as skipped and retried on a later pass.
         Transient,
+        Timeout,
     }
 
     #[derive(Default)]
@@ -1027,6 +1063,7 @@ mod resume_loop_tests {
         outcomes: Mutex<HashMap<String, HealOutcome>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
+        fail_listing: AtomicBool,
     }
 
     impl FakeStorage {
@@ -1038,6 +1075,9 @@ mod resume_loop_tests {
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
+        }
+        fn fail_listing(&self) {
+            self.fail_listing.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1108,6 +1148,7 @@ mod resume_loop_tests {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
                 HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
+                HealOutcome::Timeout => Err(Error::TaskTimeout),
             }
         }
         async fn heal_bucket(&self, _b: &str, _o: &HealOpts) -> Result<HealResultItem> {
@@ -1125,6 +1166,9 @@ mod resume_loop_tests {
             _prefix: &str,
             continuation_token: Option<&str>,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+            if self.fail_listing.load(Ordering::SeqCst) {
+                return Err(Error::other("injected listing failure"));
+            }
             let key = continuation_token.map(str::to_string);
             let page = self.pages.lock().unwrap().get(&key).cloned();
             match page {
@@ -1231,6 +1275,126 @@ mod resume_loop_tests {
         assert_eq!(skipped, 0);
         assert!(env.storage.calls().is_empty());
         assert_eq!(env.resume.resume_cursor().await, None);
+    }
+
+    #[tokio::test]
+    async fn object_timeout_aborts_the_bucket_page_immediately() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("timed-out", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("timed-out", None, HealOutcome::Timeout);
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+
+        assert!(matches!(result, Err(Error::TaskTimeout)));
+        assert_eq!(processed, 0);
+        assert_eq!(successful, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_listing_failure_does_not_mark_set_completed() {
+        let env = make_env().await;
+        env.storage.fail_listing();
+
+        let result = env
+            .healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        assert!(result.is_err(), "a bucket listing failure must fail the set heal pass");
+        let state = env.resume.get_state().await;
+        assert!(!state.completed, "a failed bucket must not mark the set completed");
+        assert_eq!(state.retry_count, 1, "the failed bucket must schedule a bounded retry");
+        assert!(state.completed_buckets.is_empty(), "the failed bucket must remain resumable");
+    }
+
+    #[tokio::test]
+    async fn completed_resume_state_is_not_selected_for_a_new_heal() {
+        let env = make_env().await;
+        env.resume
+            .mark_completed()
+            .await
+            .expect("completed resume state should persist");
+
+        let task_id = env
+            .healer
+            .get_or_create_task_id("pool_0_set_0")
+            .await
+            .expect("new heal should allocate a task id");
+
+        assert_ne!(task_id, "task", "a completed resume state must not suppress a new heal");
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_keeps_erasure_set_heal_incomplete() {
+        let env = make_env().await;
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/task_{RESUME_CHECKPOINT_FILE}");
+        let _failure = ResumeDeleteFailure::install(checkpoint_path, crate::heal::DiskError::DiskAccessDenied);
+
+        let error = env
+            .healer
+            .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
+            .await
+            .expect_err("checkpoint cleanup failure must fail the erasure-set heal");
+
+        assert!(matches!(error, Error::Disk(crate::heal::DiskError::DiskAccessDenied)));
+        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), "task")
+            .await
+            .expect("completed state must remain discoverable after cleanup failure")
+            .get_state()
+            .await;
+        assert!(state.completed, "successful data heal must be persisted before cleanup is attempted");
+    }
+
+    #[tokio::test]
+    async fn retry_resume_repairs_checkpoint_after_crash_between_resets() {
+        let env = make_env().await;
+        env.resume
+            .update_progress(3, 1, 1, 1)
+            .await
+            .expect("dirty resume progress should persist");
+        env.resume
+            .complete_bucket("b")
+            .await
+            .expect("dirty completed bucket should persist");
+        env.resume
+            .set_resume_cursor(Some("stale-cursor".to_string()))
+            .await
+            .expect("dirty resume cursor should persist");
+        env.checkpoint
+            .add_skipped_object(compose_key("stale-object", None))
+            .await
+            .expect("dirty checkpoint object should be recorded");
+        env.checkpoint
+            .update_position(4, 9)
+            .await
+            .expect("dirty checkpoint position should persist");
+
+        assert!(
+            env.resume.schedule_retry().await.expect("resume retry reset should persist"),
+            "retry budget should remain"
+        );
+
+        let (_, checkpoint) = env
+            .healer
+            .initialize_resume_state("task", "pool_0_set_0", &["b".to_string()])
+            .await
+            .expect("resume initialization should repair a stale checkpoint");
+        let checkpoint = checkpoint.get_checkpoint().await;
+
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
     }
 
     #[tokio::test]

@@ -677,7 +677,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let version_id = req_info.version_id.clone();
 
     if let Some(cred) = &cred {
-        let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
+        let iam_store = match req.extensions.get::<std::sync::Arc<ServerContextSlot>>() {
+            Some(server_ctx) => server_ctx
+                .installed_app_context()
+                .filter(|context| context.iam().is_ready())
+                .map(|context| context.iam().handle())
+                .ok_or(()),
+            None => runtime_sources::current_ready_iam_handle().map_err(|_| ()),
+        };
+        let Ok(iam_store) = iam_store else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),
@@ -2320,20 +2328,9 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
         req.extensions.insert(bucket_generation?);
 
-        // POST-object form uploads (s3s routes them through this hook with the
-        // original POST method before the dedicated post_object hook) are
-        // governed by the POST policy document instead of the retention /
-        // legal-hold IAM actions: s3s validates every x-amz-object-lock-* form
-        // field against the policy conditions before dispatch, and signed POSTs
-        // sign the policy itself. Anonymous POSTs author their own policy, so
-        // requiring these PUT-header IAM actions here only breaks the
-        // policy-covered accept path (rustfs#4845) without adding a boundary —
-        // the same MinIO handler applies no per-field lock permission either.
-        if req.method == http::Method::POST {
-            return Ok(());
+        if req.method != http::Method::POST {
+            authorize_replication_only_put_headers(req).await?;
         }
-
-        authorize_replication_only_put_headers(req).await?;
 
         if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
             authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;

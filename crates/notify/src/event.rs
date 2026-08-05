@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
+use jiff::{Timestamp, tz::TimeZone};
 use rustfs_s3_ops::is_object_removed_event;
 use rustfs_s3_types::{EventName, event_schema_version};
 use rustfs_utils::http::{is_encryption_metadata_key, is_internal_key};
@@ -91,8 +91,8 @@ pub struct NotifyObjectInfo {
     pub content_type: Option<String>,
     pub user_defined: HashMap<String, String>,
     pub version_id: Option<String>,
-    pub mod_time: Option<DateTime<Utc>>,
-    pub restore_expires: Option<DateTime<Utc>>,
+    pub mod_time: Option<Timestamp>,
+    pub restore_expires: Option<Timestamp>,
     pub storage_class: Option<String>,
     pub transitioned_tier: Option<String>,
 }
@@ -150,8 +150,11 @@ pub struct Event {
     /// The AWS region where the event occurred
     pub aws_region: String,
     /// The time when the event occurred
-    #[serde(serialize_with = "serialize_event_time_millis")]
-    pub event_time: DateTime<Utc>,
+    #[serde(
+        serialize_with = "serialize_event_time_millis",
+        deserialize_with = "deserialize_event_time_millis"
+    )]
+    pub event_time: Timestamp,
     /// The name of the event
     pub event_name: EventName,
     /// The identity of the user who triggered the event
@@ -189,13 +192,13 @@ impl Event {
         user_metadata.insert("x-rustfs-object-size".to_string(), "1024".to_string());
         user_metadata.insert("x-rustfs-object-etag".to_string(), "etag123".to_string());
         user_metadata.insert("x-rustfs-object-version-id".to_string(), "1".to_string());
-        user_metadata.insert("x-request-time".to_string(), Utc::now().to_rfc3339());
+        user_metadata.insert("x-request-time".to_string(), format_timestamp_rfc3339_millis(&Timestamp::now()));
 
         Event {
             event_version: event_schema_version(event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: "us-east-1".to_string(),
-            event_time: Utc::now(),
+            event_time: Timestamp::now(),
             event_name,
             user_identity: Identity {
                 principal_id: "rustfs".to_string(),
@@ -236,10 +239,10 @@ impl Event {
     }
 
     pub fn new(args: EventArgs) -> Self {
-        let event_time = Utc::now().naive_local();
+        let event_time = Timestamp::now();
         let sequencer = match args.object.mod_time {
-            Some(t) => format!("{:X}", t.timestamp_nanos_opt().unwrap_or(0)),
-            None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
+            Some(t) => sequencer_from_timestamp(t),
+            None => sequencer_from_timestamp(event_time),
         };
 
         let mut resp_elements = args.resp_elements.clone();
@@ -312,7 +315,7 @@ impl Event {
                     .or_else(|| args.object.transitioned_tier.clone())?;
                 Some(GlacierEventData {
                     restore_event_data: RestoreEventData {
-                        lifecycle_restoration_expiry_time: expiry_time.to_rfc3339_opts(SecondsFormat::Millis, true),
+                        lifecycle_restoration_expiry_time: format_timestamp_rfc3339_millis(&expiry_time),
                         lifecycle_restore_storage_class: storage_class,
                     },
                 })
@@ -325,7 +328,7 @@ impl Event {
             event_version: event_schema_version(args.event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
-            event_time: event_time.and_utc(),
+            event_time,
             event_name: args.event_name,
             user_identity: Identity { principal_id },
             request_parameters: args.req_params,
@@ -345,11 +348,40 @@ impl Event {
     }
 }
 
-fn serialize_event_time_millis<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_event_time_millis<S>(value: &Timestamp, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
+    serializer.serialize_str(&format_timestamp_rfc3339_millis(value))
+}
+
+fn deserialize_event_time_millis<'de, D>(deserializer: D) -> Result<Timestamp, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    value.parse::<Timestamp>().map_err(serde::de::Error::custom)
+}
+
+fn format_timestamp_rfc3339_millis(value: &Timestamp) -> String {
+    let utc = value.to_zoned(TimeZone::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year(),
+        utc.month(),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.millisecond()
+    )
+}
+
+fn sequencer_from_timestamp(value: Timestamp) -> String {
+    match i64::try_from(value.as_nanosecond()) {
+        Ok(nanosecond) => format!("{nanosecond:X}"),
+        Err(_) => "0".to_string(),
+    }
 }
 
 fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[&str]) {
@@ -551,6 +583,23 @@ mod tests {
     }
 
     #[test]
+    fn event_new_preserves_legacy_sequencer_overflow_fallback() {
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                mod_time: Some(Timestamp::new(10_000_000_000, 0).expect("timestamp should be valid")),
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.sequencer, "0");
+    }
+
+    #[test]
     fn object_restore_completed_includes_glacier_event_data() {
         let args = EventArgsBuilder::new(
             EventName::ObjectRestoreCompleted,
@@ -558,7 +607,7 @@ mod tests {
             NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
-                restore_expires: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
+                restore_expires: Timestamp::new(1_700_000_000, 0).ok(),
                 storage_class: Some("GLACIER".to_string()),
                 ..Default::default()
             },
@@ -696,7 +745,7 @@ mod tests {
     #[test]
     fn event_time_serializes_with_millisecond_precision() {
         let mut event = Event::new_test_event("bucket", "key", EventName::ObjectCreatedPut);
-        event.event_time = DateTime::<Utc>::from_timestamp(1_711_423_698, 870_816_000).expect("timestamp should be valid");
+        event.event_time = Timestamp::new(1_711_423_698, 870_816_000).expect("timestamp should be valid");
 
         let json = serde_json::to_value(&event).expect("event should serialize");
         assert_eq!(json.get("eventTime").and_then(|value| value.as_str()), Some("2024-03-26T03:28:18.870Z"));

@@ -293,6 +293,8 @@ where
     }
 
     pub async fn load_user(&self, access_key: &str) -> Result<()> {
+        let sts_mutation_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _sts_mutation_guard = sts_mutation_lock.lock().await;
         let mut users_map: HashMap<String, UserIdentity> = HashMap::new();
         let mut user_policy_map = HashMap::new();
         let mut sts_users_map = HashMap::new();
@@ -1207,6 +1209,9 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let mutation_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _mutation_guard = mutation_lock.lock().await;
+
         let sts_policy_update = if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
@@ -1433,6 +1438,11 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let sts_mutation_lock = (utype == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(access_key));
+        let _sts_mutation_guard = match &sts_mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let _service_account_guard = if utype == UserType::Svc {
             Some(self.cache.service_account_mutation_lock().lock().await)
         } else {
@@ -1493,9 +1503,13 @@ where
             });
         }
 
-        let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
+        if utype != UserType::Sts {
+            let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
+        }
 
-        self.cache.delete_user_policy(access_key, OffsetDateTime::now_utc());
+        if utype != UserType::Sts {
+            self.cache.delete_user_policy(access_key, OffsetDateTime::now_utc());
+        }
 
         if let Err(err) = self.api.delete_user_identity(access_key, utype).await
             && !is_err_no_such_user(&err)
@@ -1507,8 +1521,17 @@ where
         self.cache.with_write_lock(|cache| {
             if utype == UserType::Sts {
                 cache.delete_sts_account(access_key, deleted_at);
+                if cache
+                    .state()
+                    .users
+                    .get(access_key)
+                    .is_some_and(|identity| identity.credentials.is_temp())
+                {
+                    cache.delete_user(access_key, deleted_at);
+                }
+            } else {
+                cache.delete_user(access_key, deleted_at);
             }
-            cache.delete_user(access_key, deleted_at);
         });
 
         Ok(deleted_at)
@@ -2032,6 +2055,11 @@ where
         Ok(())
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
+        let sts_mutation_lock = (user_type == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(name));
+        let _sts_mutation_guard = match &sts_mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let _service_account_guard = if user_type == UserType::Svc {
             Some(self.cache.service_account_mutation_lock().lock().await)
         } else {
@@ -2077,7 +2105,9 @@ where
                     UserType::Reg | UserType::Svc => cache.delete_user(name, now),
                     UserType::None => {}
                 }
-                self.remove_user_from_cached_groups(cache, name, now);
+                if user_type != UserType::Sts {
+                    self.remove_user_from_cached_groups(cache, name, now);
+                }
                 if user_type == UserType::Reg {
                     for access_key in service_accounts_to_delete.iter() {
                         cache.delete_user(access_key, now);
@@ -2087,7 +2117,9 @@ where
                         cache.delete_user(access_key, now);
                     }
                 }
-                cache.delete_user_policy(name, now);
+                if user_type != UserType::Sts {
+                    cache.delete_user_policy(name, now);
+                }
             });
 
             return Ok(());
@@ -2446,12 +2478,12 @@ mod tests {
         saved_user: Arc<Mutex<Option<UserIdentity>>>,
         load_attempts: Arc<AtomicUsize>,
         visible_after_attempt: usize,
-        block_service_save: Arc<AtomicBool>,
-        service_save_started: Arc<Notify>,
-        release_service_save: Arc<Notify>,
-        block_service_load: Arc<AtomicBool>,
-        service_load_started: Arc<Notify>,
-        release_service_load: Arc<Notify>,
+        block_account_save: Arc<AtomicBool>,
+        account_save_started: Arc<Notify>,
+        release_account_save: Arc<Notify>,
+        block_account_load: Arc<AtomicBool>,
+        account_load_started: Arc<Notify>,
+        release_account_load: Arc<Notify>,
     }
 
     impl DelayedTempUserVisibilityStore {
@@ -2460,12 +2492,12 @@ mod tests {
                 saved_user: Arc::new(Mutex::new(None)),
                 load_attempts: Arc::new(AtomicUsize::new(0)),
                 visible_after_attempt,
-                block_service_save: Arc::new(AtomicBool::new(false)),
-                service_save_started: Arc::new(Notify::new()),
-                release_service_save: Arc::new(Notify::new()),
-                block_service_load: Arc::new(AtomicBool::new(false)),
-                service_load_started: Arc::new(Notify::new()),
-                release_service_load: Arc::new(Notify::new()),
+                block_account_save: Arc::new(AtomicBool::new(false)),
+                account_save_started: Arc::new(Notify::new()),
+                release_account_save: Arc::new(Notify::new()),
+                block_account_load: Arc::new(AtomicBool::new(false)),
+                account_load_started: Arc::new(Notify::new()),
+                release_account_load: Arc::new(Notify::new()),
             }
         }
     }
@@ -2495,9 +2527,9 @@ mod tests {
             item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
-            if user_type == UserType::Svc && self.block_service_save.load(Ordering::SeqCst) {
-                self.service_save_started.notify_one();
-                self.release_service_save.notified().await;
+            if matches!(user_type, UserType::Svc | UserType::Sts) && self.block_account_save.load(Ordering::SeqCst) {
+                self.account_save_started.notify_one();
+                self.release_account_save.notified().await;
             }
             *self.saved_user.lock().expect("saved_user mutex poisoned") = Some(item);
             Ok(())
@@ -2528,9 +2560,18 @@ mod tests {
                 .expect("saved_user mutex poisoned")
                 .clone()
                 .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
-            if user_type == UserType::Svc && self.block_service_load.load(Ordering::SeqCst) {
-                self.service_load_started.notify_one();
-                self.release_service_load.notified().await;
+            let matches_user_type = match user_type {
+                UserType::Sts => loaded.credentials.is_temp(),
+                UserType::Svc => loaded.credentials.is_service_account(),
+                UserType::Reg => !loaded.credentials.is_temp() && !loaded.credentials.is_service_account(),
+                UserType::None => false,
+            };
+            if !matches_user_type {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
+            if self.block_account_load.load(Ordering::SeqCst) {
+                self.account_load_started.notify_one();
+                self.release_account_load.notified().await;
             }
             m.insert(name.to_string(), loaded);
             Ok(())
@@ -2746,12 +2787,12 @@ mod tests {
         };
         cache.add_service_account(credentials).await.expect("seed service account");
 
-        store.block_service_load.store(true, Ordering::SeqCst);
+        store.block_account_load.store(true, Ordering::SeqCst);
         let notification = {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
         };
-        store.service_load_started.notified().await;
+        store.account_load_started.notified().await;
 
         let update = {
             let cache = Arc::clone(&cache);
@@ -2776,7 +2817,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!update.is_finished(), "update must wait for the in-flight cache refresh");
 
-        store.release_service_load.notify_one();
+        store.release_account_load.notify_one();
         notification.await.expect("notification task").expect("notification refresh");
         update.await.expect("update task").expect("service account update");
 
@@ -2793,7 +2834,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_service_account_create_cannot_overwrite_first_writer() {
         let store = DelayedTempUserVisibilityStore::new(0);
-        store.block_service_save.store(true, Ordering::SeqCst);
+        store.block_account_save.store(true, Ordering::SeqCst);
         let cache = Arc::new(build_test_iam_cache(store.clone()));
         let access_key = "SERIALIZEDSERVICE00";
         let credentials = |secret_key: &str| Credentials {
@@ -2808,7 +2849,7 @@ mod tests {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move { cache.add_service_account(credentials("firstServiceSecret123")).await })
         };
-        store.service_save_started.notified().await;
+        store.account_save_started.notified().await;
 
         let second = {
             let cache = Arc::clone(&cache);
@@ -2817,8 +2858,8 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!second.is_finished(), "second create must wait for the first writer");
 
-        store.block_service_save.store(false, Ordering::SeqCst);
-        store.release_service_save.notify_waiters();
+        store.block_account_save.store(false, Ordering::SeqCst);
+        store.release_account_save.notify_waiters();
         first.await.expect("first create task").expect("first create");
         let err = second
             .await
@@ -2862,12 +2903,12 @@ mod tests {
         };
         cache.add_service_account(credentials).await.expect("seed service account");
 
-        store.block_service_load.store(true, Ordering::SeqCst);
+        store.block_account_load.store(true, Ordering::SeqCst);
         let notification = {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
         };
-        store.service_load_started.notified().await;
+        store.account_load_started.notified().await;
 
         let delete = {
             let cache = Arc::clone(&cache);
@@ -2876,11 +2917,135 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!delete.is_finished(), "delete must wait for the in-flight cache refresh");
 
-        store.release_service_load.notify_one();
+        store.release_account_load.notify_one();
         notification.await.expect("notification task").expect("notification refresh");
         delete.await.expect("delete task").expect("service account delete");
 
         assert!(!cache.cache.snapshot().users.contains_key(access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_notification_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+        cache
+            .set_temp_user(&access_key, &credentials, None)
+            .await
+            .expect("seed temporary account");
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.user_notification_handler(&access_key, UserType::Sts).await })
+        };
+        store.account_load_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_notification = !delete.is_finished();
+
+        store.release_account_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_notification, "delete must wait for the in-flight STS cache refresh");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_auth_reload_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+        cache
+            .set_temp_user(&access_key, &credentials, None)
+            .await
+            .expect("seed temporary account");
+        cache.cache.delete_sts_account(&access_key, OffsetDateTime::now_utc());
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let reload = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.load_user(&access_key).await })
+        };
+        store.account_load_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_reload = !delete.is_finished();
+
+        store.release_account_load.notify_one();
+        reload.await.expect("reload task").expect("authentication cache reload");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_reload, "delete must wait for the in-flight authentication reload");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_create_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        store.block_account_save.store(true, Ordering::SeqCst);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+
+        let create = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.set_temp_user(&access_key, &credentials, None).await })
+        };
+        store.account_save_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_create = !delete.is_finished();
+
+        store.block_account_save.store(false, Ordering::SeqCst);
+        store.release_account_save.notify_one();
+        create.await.expect("create task").expect("temporary account create");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_create, "delete must wait for the in-flight STS create");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
         assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
     }
 

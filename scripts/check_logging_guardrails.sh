@@ -12,7 +12,16 @@ checked_files=(
   "rustfs/src/auth.rs"
   "rustfs/src/protocols/client.rs"
   "rustfs/src/admin/router.rs"
-  "rustfs/src/admin/handlers/table_catalog.rs"
+  "rustfs/src/admin/handlers/table_catalog/config.rs"
+  "rustfs/src/admin/handlers/table_catalog/credentials.rs"
+  "rustfs/src/admin/handlers/table_catalog/maintenance.rs"
+  "rustfs/src/admin/handlers/table_catalog/mod.rs"
+  "rustfs/src/admin/handlers/table_catalog/namespace.rs"
+  "rustfs/src/admin/handlers/table_catalog/refs.rs"
+  "rustfs/src/admin/handlers/table_catalog/routes.rs"
+  "rustfs/src/admin/handlers/table_catalog/table.rs"
+  "rustfs/src/admin/handlers/table_catalog/tests.rs"
+  "rustfs/src/admin/handlers/table_catalog/view.rs"
   "rustfs/src/admin/handlers/service_account.rs"
   "rustfs/src/admin/handlers/kms_audit.rs"
   "rustfs/src/admin/handlers/kms_dynamic.rs"
@@ -662,6 +671,120 @@ for pattern in "${forbidden_patterns[@]}"; do
   fi
 done
 
+if rg -n -F -- 'warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing")' crates/iam/src/store/object.rs >/dev/null; then
+  echo "❌ logging guardrail violation: missing IAM identity is an expected debug event, not a warning" >&2
+  exit 1
+fi
+
+unmasked_iam_identity_logs="$(rg -n 'IAM (user identity|JWT claim)' crates/iam/src/store/object.rs | rg -v 'MaskedAccessKey' || true)"
+if [[ -n "$unmasked_iam_identity_logs" ]]; then
+  echo "❌ logging guardrail violation: IAM identity log omits MaskedAccessKey" >&2
+  echo "$unmasked_iam_identity_logs" >&2
+  exit 1
+fi
+
+unmasked_revoke_fields="$(rg -n '(access_key\s*=\s*%\s*&?sts\.access_key|target_user\s*=\s*%\s*&?target_user)' rustfs/src/admin/handlers/idp_compat.rs || true)"
+if [[ -n "$unmasked_revoke_fields" ]]; then
+  echo "❌ logging guardrail violation: revoke-tokens log exposes an unmasked credential identifier" >&2
+  echo "$unmasked_revoke_fields" >&2
+  exit 1
+fi
+
+heal_hotpath_files=(
+  "crates/ecstore/src/store/heal.rs"
+  "crates/ecstore/src/store/mod.rs"
+  "crates/ecstore/src/core/sets.rs"
+  "crates/ecstore/src/set_disk/ops/heal.rs"
+)
+
+heal_function_pattern='async fn (handle_)?heal_object(_dir)?\('
+trace_heal_instrumentation_pattern='#\[(tracing::)?instrument\(\s*level\s*=\s*"trace"[^]]*\)\]\s*(pub(\([^)]*\))?\s+)?async fn (handle_)?heal_object(_dir)?\('
+heal_function_count="$(rg -n "$heal_function_pattern" "${heal_hotpath_files[@]}" | wc -l | tr -d ' ')"
+trace_heal_instrumentation_count="$(
+  rg -U -o "$trace_heal_instrumentation_pattern" "${heal_hotpath_files[@]}" |
+    rg -c 'async fn (handle_)?heal_object' || true
+)"
+if [[ "$heal_function_count" != "$trace_heal_instrumentation_count" ]]; then
+  echo "❌ logging guardrail violation: per-object heal instrumentation must be TRACE-only" >&2
+  echo "found $heal_function_count per-object heal functions but $trace_heal_instrumentation_count TRACE spans" >&2
+  exit 1
+fi
+
+unexpected_heal_info="$(
+  rg -n '\binfo!' crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/erasure/coding/heal.rs || true
+)"
+if [[ -n "$unexpected_heal_info" ]]; then
+  echo "❌ logging guardrail violation: per-object set-disk heal events must not be emitted at INFO" >&2
+  echo "$unexpected_heal_info" >&2
+  exit 1
+fi
+
+heal_info_event_pattern='info!\([^;]*(EVENT_HEAL_OBJECT_STARTED|state\s*=\s*"(metadata_corrupt|metadata_invalid|erasure_distribution_mismatch)"|disks_with_all_partsv2: metadata is corrupted|disks_with_all_partsv2: metadata is not valid|disks_with_all_partsv2: erasure distribution is not the same as onlineDisks)[^;]*\);'
+if rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: per-object heal diagnostics must not be emitted at INFO" >&2
+  rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+raw_heal_metadata_pattern='(\?(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\s*=\s*\?|(?:latest_meta|meta)\s*:\s*\{:#?\?\}|\{(parts_metadata|online_disks|out_dated_disks|latest_meta|meta):#?\?\}|\{:#?\?\}[^;]*(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|unexpected file distribution \(\{:#?\?\}\))'
+if rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal logs must not dump raw object or disk metadata" >&2
+  rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+# Keep the matchers honest. These unsafe equivalents previously bypassed the
+# guard when attributes/macros were multiline, long, or used structured Debug.
+for fixture in \
+  $'#[tracing::instrument(\n    level = "info",\n    skip(self),\n)]\nasync fn heal_object(' \
+  $'#[instrument(skip(self), fields(level = "trace"))]\nasync fn heal_object('; do
+  fixture_function_count="$(printf '%s\n' "$fixture" | rg -c "$heal_function_pattern" || true)"
+  fixture_trace_count="$(
+    printf '%s\n' "$fixture" |
+      rg -U -o "$trace_heal_instrumentation_pattern" |
+      rg -c 'async fn (handle_)?heal_object' || true
+  )"
+  if [[ "$fixture_function_count" == "$fixture_trace_count" ]]; then
+    echo "❌ logging guardrail self-test failed: unsafe heal span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+printf -v heal_info_padding '%*s' 600 ''
+long_info_event_fixture="info!(${heal_info_padding} event = EVENT_HEAL_OBJECT_STARTED);"
+if ! printf '%s\n' "$long_info_event_fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+  echo "❌ logging guardrail self-test failed: long per-object INFO event was not detected" >&2
+  exit 1
+fi
+
+for fixture in \
+  'info!("disks_with_all_partsv2: metadata is corrupted, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: metadata is not valid, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: erasure distribution is not the same as onlineDisks");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: retired per-object INFO event was not detected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  'debug!(latest_meta = ?latest_meta, "raw metadata")' \
+  'trace!("latest_meta: {:#?}", latest_meta)' \
+  'warn!("available disks: {:?}", online_disks)' \
+  'debug!("{:#?}", parts_metadata)' \
+  'debug!("raw metadata: {latest_meta:?}")' \
+  'trace!("raw metadata: {meta:#?}")' \
+  'warn!("raw disks: {online_disks:?}")' \
+  'warn!("unexpected file distribution ({:?})", online_disks)'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$raw_heal_metadata_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: raw heal metadata fixture was not detected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 # Secret material must never be interpolated into log or error strings.
 # Error messages are log content: they propagate via `?` and are printed by
 # startup/error logging far from the construction site, and a value that fails
@@ -721,6 +844,40 @@ fi
 stdout_sink_calls="$(rg -n -F 'validate_stdout_sink(&file_appender)' crates/obs/src/telemetry/local.rs crates/obs/src/telemetry/otel.rs | wc -l | tr -d ' ')"
 if [[ "$stdout_sink_calls" != "2" ]]; then
   echo "❌ logging guardrail violation: local and OTLP file logging must both validate stdout sink ownership" >&2
+  exit 1
+fi
+
+# Heal log amplification guards (rustfs/rustfs#5716 follow-up): per-object heal
+# work (Object/Metadata/MRF/ECDecode tasks queued by MRF/autoheal/scanner loops)
+# must not emit info!/warn!/error! lines per object during mass recovery.
+# The 1000-char window covers the measured 541-710 chars of structured fields
+# between the macro open and the message at every retry-admission site.
+if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Heal retry admission decided"' crates/heal/src/heal/manager.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal retry admission decisions repeat per retrying task (per-object under MRF retry storms) and must stay at DEBUG" >&2
+  exit 1
+fi
+
+demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
+if [[ "$demoted_task_sites" -lt 4 ]]; then
+  echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2
+  exit 1
+fi
+
+demoted_task_total_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/task.rs || echo 0)"
+if [[ "$demoted_task_total_sites" -lt 5 ]]; then
+  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites, found $demoted_task_total_sites)" >&2
+  exit 1
+fi
+
+erasure_sampled_sites="$(rg -c -F 'take_failure_log_sample(' crates/heal/src/heal/erasure_healer.rs || echo 0)"
+if [[ "$erasure_sampled_sites" -lt 2 ]]; then
+  echo "❌ logging guardrail violation: erasure-set per-object failure/skip warns must stay sample-capped via take_failure_log_sample (expected >= 2 sites in crates/heal/src/heal/erasure_healer.rs, found $erasure_sampled_sites)" >&2
+  exit 1
+fi
+
+demoted_admission_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/manager.rs || echo 0)"
+if [[ "$demoted_admission_sites" -lt 6 ]]; then
+  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 sites in crates/heal/src/heal/manager.rs, found $demoted_admission_sites)" >&2
   exit 1
 fi
 

@@ -149,6 +149,7 @@ async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 glob = { workspace = true }
 thiserror.workspace = true
 flatbuffers.workspace = true
