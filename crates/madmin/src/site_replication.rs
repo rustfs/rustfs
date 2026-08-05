@@ -626,7 +626,11 @@ pub struct ILMExpiryRule {
 pub struct SRStateInfo {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub peers: BTreeMap<String, PeerInfo>,
     #[serde(
         rename = "updatedAt",
@@ -657,14 +661,25 @@ pub struct SRInfo {
         skip_serializing_if = "String::is_empty"
     )]
     pub deployment_id: String,
-    #[serde(alias = "Buckets", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        alias = "Buckets",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub buckets: BTreeMap<String, SRBucketInfo>,
-    #[serde(alias = "Policies", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        alias = "Policies",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub policies: BTreeMap<String, SRIAMPolicy>,
     #[serde(
         rename = "userPolicies",
         alias = "UserPolicies",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub user_policies: BTreeMap<String, SRPolicyMapping>,
@@ -672,6 +687,7 @@ pub struct SRInfo {
         rename = "userInfoMap",
         alias = "UserInfoMap",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub user_info_map: BTreeMap<String, UserInfo>,
@@ -679,6 +695,7 @@ pub struct SRInfo {
         rename = "groupDescMap",
         alias = "GroupDescMap",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub group_desc_map: BTreeMap<String, GroupDesc>,
@@ -686,6 +703,7 @@ pub struct SRInfo {
         rename = "groupPolicies",
         alias = "GroupPolicies",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub group_policies: BTreeMap<String, SRPolicyMapping>,
@@ -693,6 +711,7 @@ pub struct SRInfo {
         rename = "replicationCfg",
         alias = "ReplicationCfg",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub replication_cfg: BTreeMap<String, Value>,
@@ -700,10 +719,11 @@ pub struct SRInfo {
         rename = "ilmExpiryRules",
         alias = "ILMExpiryRules",
         default,
+        deserialize_with = "deserialize_null_default",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub ilm_expiry_rules: BTreeMap<String, ILMExpiryRule>,
-    #[serde(alias = "State", default)]
+    #[serde(alias = "State", default, deserialize_with = "deserialize_null_default")]
     pub state: SRStateInfo,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
@@ -1191,6 +1211,16 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+// Go json.Marshal emits nil maps (and nil struct pointers) as null; treat
+// explicit null like a missing field so MinIO SRInfo payloads parse.
+fn deserialize_null_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Deserialize<'de> + Default,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
