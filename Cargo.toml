@@ -233,7 +233,7 @@ aws-sdk-sts = { default-features = false, version = "1.110.0" }
 aws-smithy-http-client = { default-features = false, version = "1.2.0" }
 aws-smithy-runtime-api = { version = "1.14.0" }
 aws-smithy-types = { version = "1.6.1" }
-base64 = "0.23.0"
+base64 = "0.23.1"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
 clap = { version = "4.6.5" }
@@ -341,14 +341,14 @@ unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 russh = { version = "0.62.5" }
-russh-sftp = "2.3.0"
+russh-sftp = "2.4.0"
 
 # WebDAV
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-mimalloc = { version = "0.1.52", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13" }
-libmimalloc-sys = { version = "0.1.49", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "1cdadea43e9c5a0f054b65be21200ce580e4eb13", features = ["extended"] }
+mimalloc = { version = "0.1.52", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "ce6338661179c8be22e516b00af7483f151485a7" }
+libmimalloc-sys = { version = "0.1.49", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "ce6338661179c8be22e516b00af7483f151485a7", features = ["extended"] }
 hotpath = { version = "0.23.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
