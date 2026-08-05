@@ -60,6 +60,11 @@ body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fai
 	@echo "🧱 Checking body-cache whitelist guard..."
 	./scripts/check_body_cache_whitelist.sh
 
+.PHONY: s3s-footprint-check
+s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
+	@echo "📦 Checking s3s footprint ratchet..."
+	./scripts/check_s3s_footprint.sh
+
 .PHONY: fips-wording-check
 fips-wording-check: ## Check outward docs do not make unsupported FIPS claims
 	@echo "📣 Checking FIPS wording guard..."

@@ -290,6 +290,10 @@ mod overwrite_cleanup_regression_test;
 #[cfg(test)]
 mod list_buckets_double_slash_test;
 
+// Regression coverage for bucket-scoped ListBuckets authorization fallback.
+#[cfg(test)]
+mod list_buckets_auth_test;
+
 // Regression test for backlog#629(b): region-aware CreateBucket SigV4.
 #[cfg(test)]
 mod create_bucket_region_test;

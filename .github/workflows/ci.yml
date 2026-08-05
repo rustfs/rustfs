@@ -149,6 +149,9 @@ jobs:
       - name: Check body-cache whitelist guard
         run: ./scripts/check_body_cache_whitelist.sh
 
+      - name: Check s3s footprint ratchet
+        run: ./scripts/check_s3s_footprint.sh
+
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
 

@@ -564,7 +564,12 @@ impl RustFSTestEnvironment {
 
     /// Create an AWS S3 client configured for this RustFS instance
     pub fn create_s3_client(&self) -> Client {
-        Client::from_conf(build_test_s3_config(&self.url, &self.access_key, &self.secret_key, "e2e-test"))
+        self.create_s3_client_with_credentials(&self.access_key, &self.secret_key)
+    }
+
+    /// Create an AWS S3 client with explicit credentials for this RustFS instance.
+    pub fn create_s3_client_with_credentials(&self, access_key: &str, secret_key: &str) -> Client {
+        Client::from_conf(build_test_s3_config(&self.url, access_key, secret_key, "e2e-test"))
     }
 
     /// Create test bucket
