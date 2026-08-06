@@ -136,8 +136,9 @@ use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
-    SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
-    SUFFIX_RESTORE_OPERATION_ID,
+    SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    get_header,
     headers::{
         AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
         AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
@@ -4828,7 +4829,15 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
-        if is_put_object_extract_requested(&req.headers) {
+        // An authorized inbound replication PUT must store the replica verbatim.
+        // A snowball-extracted member object keeps `x-amz-meta-snowball-auto-extract`
+        // in its user metadata, and the replication client replays stored metadata
+        // as headers — re-dispatching that PUT into the extract path would try to
+        // untar the member's own bytes (failing replication for any non-archive
+        // member) instead of writing the replica.
+        let inbound_replication_put = replication_request_authorized(&req)
+            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
 
@@ -6723,6 +6732,43 @@ impl DefaultObjectUsecase {
             user_defined.insert(k, v);
         }
 
+        // The source object's replication bookkeeping (internal status/timestamp,
+        // replica state, and the surfaced x-amz-replication-status) describes the
+        // SOURCE's replication history; carried onto the destination it fakes a
+        // COMPLETED/REPLICA state for an object that never replicated (MinIO
+        // filterReplicationStatusMetadata parity). Inbound replica writes are
+        // exempt: the authorized replication request owns these keys (see
+        // copy_dst_opts_with_replication_authorization above).
+        if !dst_opts.replication_request {
+            user_defined.retain(|k, _| !k.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+            remove_str(&mut user_defined, SUFFIX_REPLICATION_STATUS);
+            remove_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP);
+            remove_str(&mut user_defined, SUFFIX_REPLICA_STATUS);
+            remove_str(&mut user_defined, SUFFIX_REPLICA_TIMESTAMP);
+        }
+
+        // Compute the replication decision exactly once per copy. The same
+        // immutable `dsc` drives both the pending metadata written below and the
+        // post-commit schedule (see the reuse site after copy_object), so a
+        // replication-config hot update cannot split the two phases — same
+        // contract as the PUT path (https://github.com/rustfs/backlog/issues/1320).
+        // `must_replicate_object` itself declines inbound replica writes
+        // (replication_request / REPLICA status), so replicas are never
+        // re-scheduled outbound.
+        let dsc = must_replicate_object(
+            &bucket,
+            &key,
+            &user_defined,
+            "".to_string(),
+            dst_opts.delete_marker_replication_status(),
+            dst_opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut user_defined, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+        }
+
         src_info.user_defined = Arc::new(user_defined);
 
         self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
@@ -6736,6 +6782,13 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
         drop(_self_copy_lock_guard);
+
+        // Reuse the single pre-commit replication decision (see `dsc` above) so
+        // the persisted pending marker and the schedule always agree, mirroring
+        // the PUT path.
+        if dsc.replicate_any() {
+            schedule_object_replication(oi.clone(), store.clone(), dsc).await;
+        }
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
         let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
@@ -8607,6 +8660,31 @@ impl DefaultObjectUsecase {
             }
             hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
+
+            // Each extracted member is an independent user write and joins
+            // bucket replication like a regular PUT (MinIO PutObjectExtract
+            // parity). One immutable decision drives both the pending metadata
+            // and the post-commit schedule below, same contract as the PUT path
+            // (https://github.com/rustfs/backlog/issues/1320); inbound replica
+            // writes are declined inside `must_replicate_object`.
+            let dsc = must_replicate_object(
+                &bucket,
+                &fpath,
+                &opts.user_defined,
+                "".to_string(),
+                opts.delete_marker_replication_status(),
+                opts.clone(),
+            )
+            .await;
+            if dsc.replicate_any() {
+                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+                insert_str(
+                    &mut opts.user_defined,
+                    SUFFIX_REPLICATION_STATUS,
+                    dsc.pending_status().unwrap_or_default(),
+                );
+            }
+
             let mut reader = PutObjReader::new(hrd);
             let cache_adapter = self.object_data_cache();
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
@@ -8640,6 +8718,13 @@ impl DefaultObjectUsecase {
                 }
             }
             let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
+
+            // Reuse the per-entry pre-commit decision (see `dsc` above) so the
+            // persisted pending marker and the schedule always agree.
+            if dsc.replicate_any() {
+                schedule_object_replication(obj_info.clone(), store.clone(), dsc).await;
+            }
+
             if !wrote_any_entry {
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
                 wrote_any_entry = true;
