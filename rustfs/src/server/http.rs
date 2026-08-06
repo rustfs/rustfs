@@ -53,6 +53,10 @@ use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+};
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
 use rustfs_protocols::SwiftService;
@@ -1903,6 +1907,17 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
+        let operation = match rpc_method {
+            "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
+            "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+            "WriteAll" => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            _ => INTERNODE_OPERATION_GRPC_OTHER,
+        };
+        global_internode_metrics().record_rpc_auth_failure_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            failure_reason,
+        );
         error!(
             event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
             component = LOG_COMPONENT_SERVER,
@@ -2025,7 +2040,10 @@ mod tests {
     use http::Request as HttpRequest;
     use http::{HeaderMap, StatusCode};
     use http_body_util::{Empty, Full};
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
     use opentelemetry::propagation::Extractor;
+    use std::collections::HashMap;
     use std::convert::Infallible;
     use std::future::Ready;
     use std::sync::{Arc, Mutex};
@@ -2391,6 +2409,49 @@ mod tests {
         let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_rejection_records_failure_reason_metric() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let mut request = Request::new(());
+            request.extensions_mut().insert(RpcRequestTarget {
+                uri: "http://127.0.0.1:9000/node_service.NodeService/ReadAll"
+                    .parse()
+                    .expect("test RPC URI should parse"),
+                method: Method::POST,
+            });
+            let error = check_auth(request).expect_err("missing signature must be rejected");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            assert_eq!(error.message(), "No valid auth token");
+        });
+
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_system_network_internode_rpc_auth_failures_total")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(labels.get("operation").map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
+        assert_eq!(labels.get("backend").map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(labels.get("failure_reason").map(String::as_str), Some("missing_v1_signature"));
+        assert!(labels.get("server").is_some_and(|value| !value.is_empty()));
+
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
