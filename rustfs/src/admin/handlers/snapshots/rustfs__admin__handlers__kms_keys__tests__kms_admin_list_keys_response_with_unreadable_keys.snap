@@ -14,6 +14,8 @@ expression: "stable_json_value(ListKmsKeysResponse\n{\n    success: true, messag
         "origin": "RUSTFS_KMS"
       },
       "rotated_at": "2026-01-15T00:00:00+00:00[UTC]",
+      "rotation_due": true,
+      "rotation_due_reason": "age",
       "status": "Active",
       "tags": {
         "name": "key-a"

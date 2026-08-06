@@ -503,7 +503,7 @@ mod tests {
     use jiff::Zoned;
     use rustfs_kms::{
         KeyImpactReport, KeyInfo, KeyMetadata, KeyReference, KeyReferenceKind, KeyState, KeyStatus, KeyUsage, KmsError,
-        ReferenceScope,
+        ReferenceScope, RotationDueReason,
     };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use rustfs_policy::policy::{Args, Policy};
@@ -972,6 +972,10 @@ mod tests {
             created_at: fixed_zoned("2026-01-01T00:00:00Z[UTC]"),
             rotated_at: Some(fixed_zoned("2026-01-15T00:00:00Z[UTC]")),
             created_by: Some("admin".to_string()),
+            // Pinned as a key with a verdict: the empty case is already the
+            // default, and only a populated one fixes the wire names.
+            rotation_due: true,
+            rotation_due_reason: Some(RotationDueReason::Age),
         }
     }
 

@@ -204,6 +204,23 @@ pub enum KeyStatus {
     Deleted,
 }
 
+/// Why a key carries the rotation-readiness verdict it does.
+///
+/// Reported alongside [`KeyInfo::rotation_due`] so an operator can tell an
+/// overdue key from one the server cannot judge at all; new variants may be
+/// added, so consumers must treat an unknown value as "no verdict".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationDueReason {
+    /// The key was last rotated longer ago than the configured maximum age.
+    Age,
+    /// The key has never been rotated and has existed longer than the
+    /// configured maximum age.
+    NeverRotated,
+    /// The backend cannot rotate keys at all, so no age makes one due.
+    Unsupported,
+}
+
 /// Information about a key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyInfo {
@@ -229,6 +246,19 @@ pub struct KeyInfo {
     pub rotated_at: Option<Zoned>,
     /// Key creator
     pub created_by: Option<String>,
+    /// Whether the key has outlived the configured rotation age.
+    ///
+    /// Advisory: nothing consults it before encrypting or decrypting, and a key
+    /// reported as due keeps serving traffic unchanged. Backends leave it at
+    /// its default — the verdict is filled in by the manager, which is the only
+    /// place that knows both the configured age and whether the backend can
+    /// rotate at all.
+    #[serde(default)]
+    pub rotation_due: bool,
+    /// Why [`KeyInfo::rotation_due`] holds its value, absent when there is no
+    /// verdict to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_due_reason: Option<RotationDueReason>,
 }
 
 impl From<MasterKeyInfo> for KeyInfo {
@@ -245,6 +275,8 @@ impl From<MasterKeyInfo> for KeyInfo {
             created_at: master_key.created_at,
             rotated_at: master_key.rotated_at,
             created_by: master_key.created_by,
+            rotation_due: false,
+            rotation_due_reason: None,
         }
     }
 }

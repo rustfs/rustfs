@@ -770,6 +770,8 @@ mod tests {
             created_at,
             rotated_at,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
         }
     }
 

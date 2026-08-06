@@ -704,6 +704,8 @@ impl VaultTransitKmsClient {
             created_at: metadata.created_at,
             rotated_at: None,
             created_by: metadata.created_by,
+            rotation_due: false,
+            rotation_due_reason: None,
         })
     }
 
