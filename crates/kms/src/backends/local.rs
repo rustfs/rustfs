@@ -15,8 +15,8 @@
 //! Local file-based KMS backend implementation
 
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits,
-    ensure_tag_keys_are_mutable, paginate_keys,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
+    classify_listed_key_failure, ensure_key_status_permits, ensure_tag_keys_are_mutable, paginate_keys, started_at_the_first_key,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -120,6 +120,16 @@ pub(crate) fn is_orphan_commit_temp_name(file_name: &str) -> bool {
     };
     !prefix.is_empty() && suffix.len() == 36 && uuid::Uuid::try_parse(suffix).is_ok()
 }
+
+/// Mode every key-directory file is written with when the deployment does not
+/// name one.
+///
+/// `file_permissions` is optional in the persisted configuration and stays
+/// optional for compatibility, but "unspecified" must not mean "whatever the
+/// umask says": a `0` umask — the default in a good many container images —
+/// would publish master key records world-readable. Owner-only is the only
+/// defensible reading of an absent value for a file holding key material.
+pub(crate) const DEFAULT_KEY_FILE_MODE: u32 = 0o600;
 
 /// Durable single-file commit protocol for the key directory.
 ///
@@ -253,6 +263,15 @@ pub(crate) mod durable_file {
         .map_err(io::Error::other)?
     }
 
+    /// The mode a key-directory file is published with.
+    ///
+    /// Exposed so the "absent means owner-only" rule can be asserted directly:
+    /// observing it through a written file only proves anything on a host whose
+    /// umask is not already masking the same bits.
+    pub(crate) fn resolved_file_mode(permissions: Option<u32>) -> u32 {
+        permissions.unwrap_or(super::DEFAULT_KEY_FILE_MODE)
+    }
+
     fn commit_blocking(
         temp_path: &Path,
         final_path: &Path,
@@ -260,6 +279,11 @@ pub(crate) mod durable_file {
         permissions: Option<u32>,
         publish: &Publish,
     ) -> Result<(), CommitError> {
+        // Resolved here rather than at each call site so no caller can publish
+        // a key-directory file at the umask's mercy by leaving the mode unset —
+        // the backup restore path did exactly that, and its files landed in the
+        // same directory as records written owner-only by every other path.
+        let permissions = Some(resolved_file_mode(permissions));
         let file = open_temp_exclusive(temp_path, permissions)?;
         match run_protocol(file, temp_path, final_path, content, permissions, publish) {
             // A simulated crash must leave the directory exactly as a real one
@@ -779,9 +803,10 @@ impl LocalKmsClient {
     pub async fn new(config: LocalConfig) -> Result<Self> {
         // Create key directory if it doesn't exist
         if !fs::try_exists(&config.key_dir).await? {
-            fs::create_dir_all(&config.key_dir).await?;
+            Self::create_key_dir(&config.key_dir).await?;
             debug!(path = ?config.key_dir, "KMS key directory created");
         }
+        Self::secure_key_dir(&config.key_dir).await?;
 
         // The restore-marker guard must run before anything else touches the
         // directory (in particular before salt load/creation): a directory
@@ -908,6 +933,95 @@ impl LocalKmsClient {
     /// only valid next steps are re-running the restore with the same bundle
     /// (roll forward) or explicitly aborting it. This mirrors the missing-salt
     /// guard: startup must never paper over a half-applied restore.
+    /// Create the key directory, and every directory leading to it, owner-only.
+    ///
+    /// `DirBuilder::mode` applies to each directory the recursive create makes,
+    /// so an intermediate component cannot be left at the umask's mercy, and it
+    /// closes the window a create-then-chmod pair leaves open — during which
+    /// the directory exists at whatever the umask allowed.
+    async fn create_key_dir(key_dir: &Path) -> Result<()> {
+        let key_dir = key_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(Self::KEY_DIR_MODE);
+            }
+            builder.create(&key_dir)
+        })
+        .await
+        .map_err(|error| KmsError::internal_error(format!("key directory creation task failed: {error}")))??;
+        Ok(())
+    }
+
+    /// Mode the key directory is held at: owner-only.
+    #[cfg(unix)]
+    pub(crate) const KEY_DIR_MODE: u32 = 0o700;
+
+    /// Bring the key directory down to owner-only, and keep it there.
+    ///
+    /// A directory wider than owner-only is rarely a decision anyone made. The
+    /// platform picks it: kubelet creates an `emptyDir` `0o777`, several PVC
+    /// provisioners `mkdir -m 0777`, a `--tmpfs` mount lands at `1777`, and
+    /// `create_dir_all` under a container's `0` umask does the same. Write
+    /// access here is the power to delete a key — destroying every object it
+    /// protects — or to plant a record for a key id that does not exist yet.
+    ///
+    /// So this narrows rather than refuses, matching how the observability
+    /// stack already treats its own directory (`ensure_dir_permissions`).
+    /// Refusing would turn every one of those platform defaults into a server
+    /// that will not start — `init_kms_system` propagates out of startup — and
+    /// would leave the exposure in place on the way out. Narrowing removes it.
+    /// Only a directory this process cannot secure is fatal: at that point the
+    /// mode is both dangerous and outside our control, and proceeding would
+    /// write key material into it anyway.
+    async fn secure_key_dir(key_dir: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The full mode, sticky bit included: reporting `0o777` for a
+            // `1777` directory sends an operator looking for something
+            // `ls -ld` does not show.
+            let before = fs::metadata(key_dir).await?.permissions().mode() & 0o7777;
+            if before == Self::KEY_DIR_MODE {
+                return Ok(());
+            }
+
+            if let Err(error) = fs::set_permissions(key_dir, std::fs::Permissions::from_mode(Self::KEY_DIR_MODE)).await {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS key directory {} has mode {before:#o} and cannot be narrowed to {:#o} ({error}); key material must not be written into a directory this process cannot secure",
+                    key_dir.display(),
+                    Self::KEY_DIR_MODE
+                )));
+            }
+
+            // Verified rather than assumed: a filesystem that ignores `chmod`
+            // would otherwise leave the directory wide open behind a log line
+            // saying it had been narrowed.
+            let after = fs::metadata(key_dir).await?.permissions().mode() & 0o7777;
+            if after != Self::KEY_DIR_MODE {
+                return Err(KmsError::configuration_error(format!(
+                    "Local KMS key directory {} is still mode {after:#o} after being set to {:#o}; this filesystem does not enforce permissions and must not hold key material",
+                    key_dir.display(),
+                    Self::KEY_DIR_MODE
+                )));
+            }
+
+            if before & 0o077 != 0 {
+                warn!(
+                    path = ?key_dir,
+                    previous_mode = format!("{before:#o}"),
+                    "Local KMS key directory was reachable beyond its owner and has been narrowed to 0o700"
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = key_dir;
+        Ok(())
+    }
+
     async fn ensure_no_restore_marker(config: &LocalConfig) -> Result<()> {
         let marker = config.key_dir.join(LOCAL_RESTORE_COMMIT_MARKER_FILE);
         if fs::try_exists(&marker).await? {
@@ -1359,7 +1473,13 @@ impl LocalKmsClient {
                 key_ids.push(key_id.to_string());
                 continue;
             }
-            if entry.file_type().await?.is_file()
+            // `file_type` does not follow symlinks, and a symlink is exactly
+            // as much an orphan of this protocol as a regular file is: the
+            // commit protocol only ever creates temps with `create_new`, so
+            // anything wearing a temp name is either our own leftover or
+            // something planted, and neither belongs in the key directory.
+            // Requiring `is_file` left symlinked temp names behind forever.
+            if !entry.file_type().await?.is_dir()
                 && let Some(file_name) = path.file_name().and_then(|name| name.to_str())
                 && is_orphan_commit_temp_name(file_name)
             {
@@ -1599,22 +1719,25 @@ impl LocalKmsClient {
         // Only the page is read from disk, so the cost of a list stays bounded
         // by the requested limit rather than by the size of the key set.
         let mut keys = Vec::with_capacity(page.items.len());
+        let mut unreadable = UnreadableKeys::default();
         for key_id in page.items {
             let key_info = match self.describe_key(key_id, None).await {
-                Ok(key_info) => key_info,
-                // A key that vanished between the scan and the read is dropped
-                // from the page: concurrent removal is normal, and the cursor
-                // is derived from the identifier list, so the listing still
-                // advances past it.
-                Err(KmsError::KeyNotFound { .. }) => {
-                    debug!(key_id, "skipping key removed while listing");
-                    continue;
+                Ok(key_info) => {
+                    unreadable.saw_readable();
+                    key_info
                 }
-                // Anything else means the record is still there and this build
-                // cannot interpret it. Dropping it would answer "these are
-                // your keys" with a set that silently omits one, and the
-                // deletion sweep would count a census it never fully saw.
-                Err(error) => return Err(error),
+                Err(error) => match classify_listed_key_failure(&error) {
+                    Some(ListedKeyFailure::Vanished) => {
+                        debug!(key_id, "skipping key removed while listing");
+                        continue;
+                    }
+                    Some(ListedKeyFailure::Unreadable) => {
+                        warn!(key_id, %error, "listing a key record this build cannot describe");
+                        unreadable.record(key_id, error);
+                        continue;
+                    }
+                    None => return Err(error),
+                },
             };
 
             if let Some(ref status_filter) = request.status_filter
@@ -1635,6 +1758,7 @@ impl LocalKmsClient {
             keys,
             next_marker: page.next_marker,
             truncated: page.truncated,
+            unreadable_key_ids: unreadable.into_reported_ids(!page.truncated && started_at_the_first_key(request))?,
         })
     }
 
@@ -3625,8 +3749,13 @@ mod tests {
     /// key that is still on disk, and the deletion sweep — which counts the
     /// lifecycle gauges out of the pages it lists — would report a census it
     /// never fully saw as complete.
+    ///
+    /// It must not fail the whole listing either: one damaged record would then
+    /// stop every readable key from ever being listed, and with it every
+    /// scheduled deletion on this node. The identifier is reported alongside the
+    /// keys that did read, so the page is honest and the caller still advances.
     #[tokio::test]
-    async fn list_keys_fails_closed_on_a_record_it_cannot_interpret() {
+    async fn list_keys_reports_a_record_it_cannot_interpret_without_dropping_it() {
         let (client, _temp_dir) = create_test_client().await;
         client.create_key("alpha", "AES_256", None).await.expect("create alpha");
         client.create_key("beta", "AES_256", None).await.expect("create beta");
@@ -3641,16 +3770,137 @@ mod tests {
             .await
             .expect("write record");
 
-        let error = client
+        let response = client
             .list_keys(&ListKeysRequest::default(), None)
             .await
-            .expect_err("a listing must not quietly omit a key it cannot read");
+            .expect("one unreadable record must not fail the whole listing");
+        assert_eq!(
+            response.keys.iter().map(|key| key.key_id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"],
+            "the readable key must still be listed"
+        );
+        assert_eq!(
+            response.unreadable_key_ids,
+            vec!["beta".to_string()],
+            "a key this build cannot read must be named, not quietly omitted"
+        );
+
+        // Describing it directly still fails closed with the typed error, and
+        // the raw marker value stays out of the message.
+        let error = client
+            .describe_key("beta", None)
+            .await
+            .expect_err("describe must fail closed");
         assert!(
             matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
                 if key_id == "beta" && version == UNKNOWN_STORED_KEY_PROTECTION),
             "got {error:?}"
         );
         assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
+    }
+
+    /// Per-key attribution is only honest while some key on the page reads.
+    ///
+    /// When none does, the cause is almost certainly shared — a node reading
+    /// records written in a format it has no reader for, or a policy that
+    /// denies the whole subtree — and answering `200 OK` with an empty `keys`
+    /// list is indistinguishable, to every client that predates
+    /// `unreadable_key_ids`, from a deployment that simply has no keys. The
+    /// operator response to that is to provision a new key, which is the
+    /// destructive move the fail-closed rules exist to prevent.
+    #[tokio::test]
+    async fn a_page_whose_keys_are_all_unreadable_fails_instead_of_looking_empty() {
+        let (client, _temp_dir) = create_test_client().await;
+        for key_id in ["alpha", "beta"] {
+            client.create_key(key_id, "AES_256", None).await.expect("create key");
+            let key_path = client.master_key_path(key_id).expect("valid key id");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+            record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+            fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+                .await
+                .expect("write record");
+        }
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a page with nothing readable must fail, not report an empty key set");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { .. }),
+            "the failure must name what went wrong: {error:?}"
+        );
+
+        // An empty marker is not the same as no marker to a caller, but it is
+        // to the pager: both start at the first key. A generated client that
+        // always emits its cursor parameter must not fall through the guard.
+        let error = client
+            .list_keys(
+                &ListKeysRequest {
+                    marker: Some(String::new()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("an empty marker starts at the first key and must not bypass the guard");
+        assert!(matches!(&error, KmsError::UnsupportedFormatVersion { .. }), "got {error:?}");
+    }
+
+    /// The all-unreadable guard must never become a cursor trap.
+    ///
+    /// It only fires for a listing that both started at the beginning and
+    /// reached the end, because such a page has no successor to advance to.
+    /// Applying it per page instead would mean a caller with `limit=1` gets a
+    /// failure — and a failure carries no `next_marker` — the moment its page
+    /// lands on the damaged key, leaving every key behind it permanently
+    /// unreachable.
+    #[tokio::test]
+    async fn a_damaged_key_never_blocks_paging_past_it() {
+        let (client, _temp_dir) = create_test_client().await;
+        for key_id in ["a-first", "b-damaged", "c-last"] {
+            client.create_key(key_id, "AES_256", None).await.expect("create key");
+        }
+        let key_path = client.master_key_path("b-damaged").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        // Walk the whole key set one key at a time, exactly as a client that
+        // pages until `truncated` is false would.
+        let mut marker = None;
+        let mut seen = Vec::new();
+        let mut reported_unreadable = Vec::new();
+        loop {
+            let page = client
+                .list_keys(
+                    &ListKeysRequest {
+                        limit: Some(1),
+                        marker: marker.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("a one-key page containing the damaged key must still be answerable");
+            seen.extend(page.keys.iter().map(|key| key.key_id.clone()));
+            reported_unreadable.extend(page.unreadable_key_ids.clone());
+            if !page.truncated {
+                break;
+            }
+            marker = page.next_marker;
+            assert!(marker.is_some(), "a truncated page must carry a cursor");
+        }
+
+        assert_eq!(
+            seen,
+            vec!["a-first".to_string(), "c-last".to_string()],
+            "paging must reach past the damage"
+        );
+        assert_eq!(reported_unreadable, vec!["b-damaged".to_string()]);
     }
 
     #[tokio::test]
@@ -4034,5 +4284,239 @@ mod tests {
         assert_eq!(response.keys.len(), 3);
         assert!(!response.truncated);
         assert!(response.next_marker.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Filesystem boundaries (rustfs/backlog#1562 P0.4).
+    //
+    // The commit protocol's durability argument rests on properties of the
+    // filesystem it runs on, and those properties are assumptions until
+    // something exercises them. Each test below pins one boundary the protocol
+    // depends on. Two boundaries in that item cannot be closed here and are
+    // recorded in `docs/operations/kms-backend-security.md` instead: a real
+    // cross-device rename needs a second filesystem (root or a privileged
+    // container), and detecting a key directory swapped between `rename` and
+    // the parent `fsync` needs directory file descriptors the protocol does not
+    // yet hold.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    /// Every file the protocol publishes carries the requested mode, and the
+    /// umask cannot widen it — the mode is applied and re-read on the open file
+    /// before the content becomes durable, not left to the creation mask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_files_carry_the_requested_mode_regardless_of_umask() {
+        let (client, _temp_dir) = create_test_client().await;
+        client.create_key("mode-key", "AES_256", None).await.expect("create key");
+
+        assert_eq!(mode_of(&client.master_key_path("mode-key").expect("valid key id")), 0o600);
+        let salt_path = LocalKmsClient::master_key_salt_path(&client.config);
+        assert_eq!(mode_of(&salt_path), 0o600);
+    }
+
+    /// The key directory ends up owner-only whoever created it and whatever
+    /// mode they left it at.
+    ///
+    /// The platform picks that mode far more often than an operator does:
+    /// kubelet creates an `emptyDir` `0o777`, several PVC provisioners
+    /// `mkdir -m 0777`, and a `--tmpfs` mount lands at `1777`. Each is a
+    /// directory holding every master key that any account on the host can
+    /// delete from. The modes below are exercised explicitly rather than left
+    /// to the umask, so the test keeps its teeth on a host with any umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_key_directory_is_narrowed_to_owner_only_whatever_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Created by this process, including the intermediate component.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let key_dir = temp_dir.path().join("nested").join("keys");
+        assert!(!key_dir.exists());
+        let client = LocalKmsClient::new(LocalConfig {
+            key_dir: key_dir.clone(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("client must create its key directory");
+        client.create_key("nested-key", "AES_256", None).await.expect("create key");
+        assert_eq!(mode_of(&key_dir), 0o700);
+        assert_eq!(
+            mode_of(&temp_dir.path().join("nested")),
+            0o700,
+            "an intermediate directory must not be left at the umask's mercy"
+        );
+        drop(client);
+
+        // Placed by the platform at each mode a real one actually produces,
+        // sticky bit included.
+        for mode in [0o777, 0o1777, 0o770, 0o755] {
+            let placed = TempDir::new().expect("temp dir");
+            std::fs::set_permissions(placed.path(), std::fs::Permissions::from_mode(mode)).expect("widen mode");
+
+            let client = LocalKmsClient::new(LocalConfig {
+                key_dir: placed.path().to_path_buf(),
+                master_key: Some("test-master-key".to_string()),
+                file_permissions: Some(0o600),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("mode {mode:#o} must start, not fail: {error:?}"));
+            client.create_key("placed-key", "AES_256", None).await.expect("create key");
+
+            assert_eq!(mode_of(placed.path()), 0o700, "a {mode:#o} key directory must be narrowed");
+        }
+    }
+
+    /// An absent `file_permissions` means owner-only, not "whatever the umask
+    /// says". A `0` umask is the default in a good many container images, and
+    /// under it an unspecified mode used to publish master key records
+    /// world-readable.
+    ///
+    /// The end-to-end assertion below cannot be the whole guard: on a host
+    /// whose umask already masks the group and other bits, the un-fixed code
+    /// would produce `0o600` by accident and the test would pass while
+    /// protecting nothing. So the resolution the protocol performs is asserted
+    /// directly, where the umask cannot reach it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unspecified_file_permissions_still_publish_owner_only() {
+        assert_eq!(durable_file::resolved_file_mode(None), DEFAULT_KEY_FILE_MODE);
+        assert_eq!(durable_file::resolved_file_mode(Some(0o640)), 0o640, "an explicit mode is still honoured");
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: None,
+        })
+        .await
+        .expect("client with unspecified permissions must still start");
+        client.create_key("default-mode", "AES_256", None).await.expect("create key");
+
+        assert_eq!(
+            mode_of(&client.master_key_path("default-mode").expect("valid key id")),
+            DEFAULT_KEY_FILE_MODE
+        );
+        assert_eq!(mode_of(&LocalKmsClient::master_key_salt_path(&client.config)), DEFAULT_KEY_FILE_MODE);
+    }
+
+    /// Publishing must replace a symlink sitting at the destination, never
+    /// write through it. Following it would let anything with write access to
+    /// the key directory redirect a master key record — or a later read of it —
+    /// outside the confinement `master_key_path` enforces.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publishing_replaces_a_symlink_instead_of_writing_through_it() {
+        let (client, temp_dir) = create_test_client().await;
+        let outside = temp_dir.path().join("outside.txt");
+        fs::write(&outside, b"untouched").await.expect("write decoy");
+
+        // `create_key` publishes with `hard_link`, which refuses a destination
+        // that already exists — including a symlink, dangling or not.
+        let key_path = client.master_key_path("symlinked").expect("valid key id");
+        std::os::unix::fs::symlink(&outside, &key_path).expect("plant symlink");
+        let error = client
+            .create_key("symlinked", "AES_256", None)
+            .await
+            .expect_err("a symlink at the destination must not be written through");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }), "got {error:?}");
+        assert_eq!(fs::read(&outside).await.expect("read decoy"), b"untouched");
+
+        // The update path publishes with `rename`, which replaces the link
+        // itself rather than the file it points at.
+        std::fs::remove_file(&key_path).expect("clear symlink");
+        client.create_key("symlinked", "AES_256", None).await.expect("create key");
+        std::fs::remove_file(&key_path).expect("remove record");
+        std::os::unix::fs::symlink(&outside, &key_path).expect("re-plant symlink");
+        let master_key = MasterKeyInfo::new("symlinked".to_string(), "AES_256".to_string(), None);
+        client
+            .save_master_key(&master_key, &[7u8; 32])
+            .await
+            .expect("save over symlink");
+
+        assert_eq!(fs::read(&outside).await.expect("read decoy"), b"untouched");
+        assert!(
+            !std::fs::symlink_metadata(&key_path).expect("stat").file_type().is_symlink(),
+            "the published record must be a regular file, not a link"
+        );
+    }
+
+    /// A hard link planted at the destination is refused exactly as a regular
+    /// file is: `hard_link` fails on an existing name, so no create can adopt
+    /// an inode it did not write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_hard_link_cannot_be_adopted_as_a_key_record() {
+        let (client, temp_dir) = create_test_client().await;
+        let outside = temp_dir.path().join("outside.txt");
+        fs::write(&outside, b"planted").await.expect("write decoy");
+        let key_path = client.master_key_path("linked").expect("valid key id");
+        std::fs::hard_link(&outside, &key_path).expect("plant hard link");
+
+        let error = client
+            .create_key("linked", "AES_256", None)
+            .await
+            .expect_err("a planted hard link must not be adopted");
+        assert!(matches!(error, KmsError::KeyAlreadyExists { .. }), "got {error:?}");
+        assert_eq!(fs::read(&outside).await.expect("read decoy"), b"planted");
+    }
+
+    /// Startup removes a commit temp that is a symlink, not only a regular
+    /// file. The protocol only ever creates temps with `create_new`, so a temp
+    /// name wearing any other file type is either our own leftover or something
+    /// planted; requiring a regular file left those behind forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_removes_a_symlinked_commit_temp() {
+        let (client, temp_dir) = create_test_client().await;
+        client.create_key("live", "AES_256", None).await.expect("create key");
+        let key_path = client.master_key_path("live").expect("valid key id");
+
+        let symlinked_temp = key_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&key_path, &symlinked_temp).expect("plant symlinked temp");
+        drop(client);
+
+        let client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("restart");
+
+        assert!(
+            std::fs::symlink_metadata(&symlinked_temp).is_err(),
+            "a symlinked commit temp must not survive startup"
+        );
+        // Removing the link must not have touched the key it pointed at.
+        client.describe_key("live", None).await.expect("the key must survive");
+    }
+
+    /// The commit protocol never asks the filesystem to rename or link across a
+    /// device boundary, because the temp file is always created in the
+    /// destination's own directory. That is the invariant that makes `EXDEV`
+    /// unreachable; a real cross-device test needs a second filesystem and
+    /// cannot run here, so the invariant itself is what gets pinned.
+    #[tokio::test]
+    async fn commit_temps_always_share_the_destination_directory() {
+        let (client, temp_dir) = create_test_client().await;
+        client.create_key("same-dir", "AES_256", None).await.expect("create key");
+
+        // Every entry the protocol left behind, temps included, is in the key
+        // directory: nothing was staged anywhere a rename could have to cross a
+        // device to leave.
+        let mut entries = std::fs::read_dir(temp_dir.path()).expect("read key dir");
+        assert!(entries.any(|entry| entry.expect("entry").file_name() == "same-dir.key"));
+
+        let key_path = client.master_key_path("same-dir").expect("valid key id");
+        let salt_path = LocalKmsClient::master_key_salt_path(&client.config);
+        assert_eq!(salt_path.parent(), Some(temp_dir.path()));
+        assert_eq!(key_path.parent(), Some(temp_dir.path()));
     }
 }

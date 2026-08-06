@@ -256,6 +256,9 @@ struct BackendCapacity {
 
 #[derive(Debug)]
 struct BackendRuntime {
+    /// Static backend name, carried so per-operation metrics can be attributed
+    /// to the backend that served them rather than aggregated across all of them.
+    backend: &'static str,
     capacity: Arc<BackendCapacity>,
     capacity_class: CapacityClass,
     queued: Arc<Semaphore>,
@@ -284,6 +287,7 @@ impl BackendRuntime {
         in_flight.increment(0.0);
         circuit_open.increment(0.0);
         Self {
+            backend,
             capacity: active,
             capacity_class: capacity,
             queued: Arc::new(Semaphore::new(DEFAULT_MAX_QUEUED_OPERATIONS)),
@@ -495,16 +499,16 @@ fn equal_jitter(rng: &mut impl RngExt, cap: Duration) -> Duration {
 // ciphertext, and tokens must never reach a metric label.
 // ---------------------------------------------------------------------------
 
-/// Counter: operations executed, by `operation`, `op_class`, and `outcome`.
+/// Counter: operations executed, by `backend`, `operation`, `op_class`, and `outcome`.
 const METRIC_OPERATIONS_TOTAL: &str = "rustfs_kms_backend_operations_total";
-/// Counter: failed attempts, by `operation` and `error_class` (including
-/// `attempt_timeout` for attempts cut off by the per-attempt timeout).
+/// Counter: failed attempts, by `backend`, `operation` and `error_class`
+/// (including `attempt_timeout` for attempts cut off by the per-attempt timeout).
 const METRIC_ATTEMPT_FAILURES_TOTAL: &str = "rustfs_kms_backend_attempt_failures_total";
 /// Histogram: wall-clock duration of a whole operation (attempts plus
-/// backoff), in seconds, by `operation` and `outcome`.
+/// backoff), in seconds, by `backend`, `operation` and `outcome`.
 const METRIC_OPERATION_DURATION_SECONDS: &str = "rustfs_kms_backend_operation_duration_seconds";
-/// Histogram: attempts one operation used before completing, by `operation`
-/// and `outcome`.
+/// Histogram: attempts one operation used before completing, by `backend`,
+/// `operation` and `outcome`.
 const METRIC_OPERATION_ATTEMPTS: &str = "rustfs_kms_backend_operation_attempts";
 /// Gauge: backend attempts currently in flight.
 const METRIC_IN_FLIGHT: &str = "rustfs_kms_backend_in_flight";
@@ -572,19 +576,19 @@ fn describe_metrics() {
     DESCRIBE.call_once(|| {
         metrics::describe_counter!(
             METRIC_OPERATIONS_TOTAL,
-            "Total KMS backend operations executed under the operation policy, by operation, operation class, and outcome"
+            "Total KMS backend operations executed under the operation policy, by backend, operation, operation class, and outcome"
         );
         metrics::describe_counter!(
             METRIC_ATTEMPT_FAILURES_TOTAL,
-            "Total failed KMS backend attempts, by operation and retry classification"
+            "Total failed KMS backend attempts, by backend, operation and retry classification"
         );
         metrics::describe_histogram!(
             METRIC_OPERATION_DURATION_SECONDS,
-            "Wall-clock duration of KMS backend operations including retries and backoff, in seconds"
+            "Wall-clock duration of KMS backend operations including retries and backoff, in seconds, by backend and operation"
         );
         metrics::describe_histogram!(
             METRIC_OPERATION_ATTEMPTS,
-            "Number of attempts a KMS backend operation used before completing"
+            "Number of attempts a KMS backend operation used before completing, by backend and operation"
         );
         metrics::describe_gauge!(METRIC_IN_FLIGHT, "KMS backend attempts currently in flight, by backend and policy scope");
         metrics::describe_gauge!(
@@ -595,9 +599,10 @@ fn describe_metrics() {
 }
 
 /// Record one failed attempt with its retry classification.
-fn record_attempt_failure(operation: &'static str, error_class: &'static str) {
+fn record_attempt_failure(backend: &'static str, operation: &'static str, error_class: &'static str) {
     metrics::counter!(
         METRIC_ATTEMPT_FAILURES_TOTAL,
+        "backend" => backend,
         "operation" => operation,
         "error_class" => error_class
     )
@@ -605,9 +610,17 @@ fn record_attempt_failure(operation: &'static str, error_class: &'static str) {
 }
 
 /// Record the terminal outcome of one policy execution.
-fn record_operation(operation: &'static str, class: OpClass, outcome: Outcome, attempts: u32, elapsed: Duration) {
+fn record_operation(
+    backend: &'static str,
+    operation: &'static str,
+    class: OpClass,
+    outcome: Outcome,
+    attempts: u32,
+    elapsed: Duration,
+) {
     metrics::counter!(
         METRIC_OPERATIONS_TOTAL,
+        "backend" => backend,
         "operation" => operation,
         "op_class" => class.as_label(),
         "outcome" => outcome.as_label()
@@ -615,12 +628,14 @@ fn record_operation(operation: &'static str, class: OpClass, outcome: Outcome, a
     .increment(1);
     metrics::histogram!(
         METRIC_OPERATION_DURATION_SECONDS,
+        "backend" => backend,
         "operation" => operation,
         "outcome" => outcome.as_label()
     )
     .record(elapsed.as_secs_f64());
     metrics::histogram!(
         METRIC_OPERATION_ATTEMPTS,
+        "backend" => backend,
         "operation" => operation,
         "outcome" => outcome.as_label()
     )
@@ -750,7 +765,7 @@ where
     let started = Instant::now();
     let mut attempts_made = 0u32;
     let (outcome, result) = drive_attempts(operation, class, policy, cancel, jitter, attempt, &mut attempts_made).await;
-    record_operation(operation, class, outcome, attempts_made, started.elapsed());
+    record_operation(policy.runtime.backend, operation, class, outcome, attempts_made, started.elapsed());
     result
 }
 
@@ -821,11 +836,11 @@ where
                 return (Outcome::Success, Ok(value));
             }
             Ok(Err(failure)) => {
-                record_attempt_failure(operation, failure.class.as_label());
+                record_attempt_failure(policy.runtime.backend, operation, failure.class.as_label());
                 failure
             }
             Err(_) => {
-                record_attempt_failure(operation, "attempt_timeout");
+                record_attempt_failure(policy.runtime.backend, operation, "attempt_timeout");
                 AttemptError {
                     class: ErrorClass::RetryableConn,
                     error: KmsError::operation_timed_out(format!(
@@ -874,11 +889,16 @@ where
 
 #[cfg(test)]
 fn test_runtime(max_concurrent: usize, max_queued: usize) -> Arc<BackendRuntime> {
+    named_test_runtime("test-backend", max_concurrent, max_queued)
+}
+
+#[cfg(test)]
+fn named_test_runtime(backend: &'static str, max_concurrent: usize, max_queued: usize) -> Arc<BackendRuntime> {
     let capacity = Arc::new(BackendCapacity {
         total: Arc::new(Semaphore::new(max_concurrent)),
         operations: Arc::new(Semaphore::new(max_concurrent)),
     });
-    let mut runtime = BackendRuntime::new("test-backend", "test-scope", capacity, CapacityClass::Credentials);
+    let mut runtime = BackendRuntime::new(backend, "test-scope", capacity, CapacityClass::Credentials);
     runtime.queued = Arc::new(Semaphore::new(max_queued));
     Arc::new(runtime)
 }
@@ -1763,6 +1783,83 @@ mod tests {
         );
         assert_eq!(durations.len(), 1);
         assert!((durations[0] - 0.3).abs() < 1e-9, "expected 0.3s of virtual backoff, got {durations:?}");
+    }
+
+    /// Request, error and latency series must be attributable to one backend.
+    ///
+    /// Operation names are shared across backends (`decrypt` exists on every
+    /// one of them), so without a `backend` label a Vault Transit latency
+    /// regression is indistinguishable from an AWS one in the same series.
+    #[test]
+    fn operation_metrics_separate_series_per_backend() {
+        fn policy_for(backend: &'static str) -> RetryPolicy {
+            let mut policy = policy_of(1_000, 60_000, 2, 100, 2_000);
+            policy.runtime = named_test_runtime(backend, DEFAULT_MAX_CONCURRENT_OPERATIONS, DEFAULT_MAX_QUEUED_OPERATIONS);
+            policy
+        }
+
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let cancel = CancellationToken::new();
+                execute_with_jitter(
+                    "decrypt",
+                    OpClass::ReadIdempotent,
+                    &policy_for("vault-transit"),
+                    &cancel,
+                    full_jitter,
+                    || async { Ok(()) },
+                )
+                .await
+                .expect("transit attempt succeeds");
+
+                let result: Result<()> =
+                    execute_with_jitter("decrypt", OpClass::ReadIdempotent, &policy_for("aws"), &cancel, full_jitter, || async {
+                        Err(AttemptError {
+                            class: ErrorClass::Fatal,
+                            error: KmsError::access_denied("permission denied (403)"),
+                        })
+                    })
+                    .await;
+                assert!(matches!(result, Err(KmsError::AccessDenied { .. })), "got {result:?}");
+            })
+        });
+
+        let succeeded = [("operation", "decrypt"), ("outcome", "success")];
+        let failed = [("operation", "decrypt"), ("outcome", "fatal")];
+
+        assert_eq!(counter_value(&snapshot, METRIC_OPERATIONS_TOTAL, &[("backend", "vault-transit")]), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_OPERATIONS_TOTAL, &[("backend", "aws")]), 1);
+        assert_eq!(
+            counter_value(&snapshot, METRIC_OPERATIONS_TOTAL, &[("backend", "aws"), succeeded[0], succeeded[1]]),
+            0,
+            "the AWS failure must not be counted under the transit success series"
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_ATTEMPT_FAILURES_TOTAL,
+                &[("backend", "aws"), ("operation", "decrypt"), ("error_class", "fatal")]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_ATTEMPT_FAILURES_TOTAL,
+                &[("backend", "vault-transit"), ("operation", "decrypt")]
+            ),
+            0
+        );
+
+        for (backend, labels) in [("vault-transit", succeeded), ("aws", failed)] {
+            let with_backend = [("backend", backend), labels[0], labels[1]];
+            assert_eq!(
+                histogram_values(&snapshot, METRIC_OPERATION_DURATION_SECONDS, &with_backend).len(),
+                1,
+                "{backend} must own a latency series of its own"
+            );
+            assert_eq!(histogram_values(&snapshot, METRIC_OPERATION_ATTEMPTS, &with_backend), vec![1.0]);
+        }
     }
 
     #[test]

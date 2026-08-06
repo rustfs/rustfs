@@ -79,7 +79,7 @@ pub use metrics::{
     MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
     metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
-pub use telemetry::{OtelGuard, Recorder};
+pub use telemetry::{HTTP_SERVER_LOG_TARGET, OtelGuard, Recorder};
 
 // Dial9 Tokio runtime telemetry
 // Re-export dial9 types at crate root level for easier access

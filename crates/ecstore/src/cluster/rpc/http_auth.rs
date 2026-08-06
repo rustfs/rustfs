@@ -847,6 +847,46 @@ pub fn verify_tonic_rpc_signature_with_bootstrap(
     )
 }
 
+pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "Missing RPC audience" => "missing_audience",
+        "Invalid RPC request path" => "invalid_request_path",
+        "RPC replay-scoped authentication required" => "replay_scope_required",
+        "Missing RPC replay scope version" => "missing_replay_scope_version",
+        "Unsupported RPC replay scope version" => "unsupported_replay_scope_version",
+        "Missing RPC replay scope signature" => "missing_replay_scope_signature",
+        "Missing RPC replay scope nonce" => "missing_replay_scope_nonce",
+        "Invalid RPC replay scope nonce" => "invalid_replay_scope_nonce",
+        "Missing RPC boot epoch" => "missing_boot_epoch",
+        "Invalid RPC boot epoch" => "invalid_boot_epoch",
+        "Invalid RPC replay scope signature" => "invalid_replay_scope_signature",
+        "RPC boot epoch is stale" => "stale_boot_epoch",
+        "RPC request replay detected" => "replay_detected",
+        "RPC replay cache capacity exceeded" => "replay_cache_capacity",
+        "RPC replay cache unavailable" => "replay_cache_unavailable",
+        "RPC replay expiry overflow" => "replay_expiry_overflow",
+        "RPC request timestamp expired after clock regression" => "timestamp_expired_after_clock_regression",
+        "RPC v2 authentication required" => "v2_required",
+        "Missing RPC auth version" => "missing_v2_auth_version",
+        "Unsupported RPC auth version" => "unsupported_v2_auth_version",
+        "Missing RPC v2 signature" => "missing_v2_signature",
+        "Invalid RPC v2 signature" => "invalid_v2_signature",
+        "Missing timestamp header" => "missing_timestamp",
+        "Invalid timestamp format" => "invalid_timestamp",
+        "Request timestamp expired" => "timestamp_expired",
+        "Missing RPC nonce" => "missing_v2_nonce",
+        "Invalid RPC nonce" => "invalid_v2_nonce",
+        "Invalid unsigned RPC nonce" => "invalid_unsigned_v2_nonce",
+        "Missing RPC content SHA-256" => "missing_content_sha256",
+        "Invalid RPC content SHA-256" => "invalid_content_sha256",
+        "Missing signature header" => "missing_v1_signature",
+        "Invalid signature" => "invalid_v1_signature",
+        "Invalid RPC HMAC key" => "invalid_hmac_key",
+        message if message.contains(RPC_SECRET_REQUIRED_OPERATOR_MESSAGE) => "missing_rpc_secret",
+        _ => "unknown",
+    }
+}
+
 fn verify_tonic_rpc_signature_with_policy(
     audience: &str,
     path: &str,
@@ -1697,6 +1737,31 @@ mod tests {
         assert_eq!(epoch, tonic_rpc_boot_epoch());
         assert!(verify_tonic_boot_epoch_response("node-b:9000", challenge, &headers).is_err());
         assert!(verify_tonic_boot_epoch_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+    }
+
+    #[test]
+    fn tonic_rpc_auth_failure_reason_maps_security_relevant_errors() {
+        for (message, reason) in [
+            ("Invalid RPC v2 signature", "invalid_v2_signature"),
+            ("RPC replay-scoped authentication required", "replay_scope_required"),
+            ("Missing RPC replay scope signature", "missing_replay_scope_signature"),
+            ("RPC boot epoch is stale", "stale_boot_epoch"),
+            ("RPC request replay detected", "replay_detected"),
+            ("Request timestamp expired", "timestamp_expired"),
+            ("Missing RPC content SHA-256", "missing_content_sha256"),
+            ("Invalid RPC content SHA-256", "invalid_content_sha256"),
+        ] {
+            assert_eq!(
+                tonic_rpc_auth_failure_reason(&std::io::Error::other(message)),
+                reason,
+                "message {message:?} should map to a stable low-cardinality reason"
+            );
+        }
+    }
+
+    #[test]
+    fn tonic_rpc_auth_failure_reason_falls_back_for_unclassified_errors() {
+        assert_eq!(tonic_rpc_auth_failure_reason(&std::io::Error::other("opaque failure")), "unknown");
     }
 
     #[test]

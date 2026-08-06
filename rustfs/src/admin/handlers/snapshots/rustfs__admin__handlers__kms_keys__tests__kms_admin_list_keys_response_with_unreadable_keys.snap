@@ -1,6 +1,6 @@
 ---
 source: rustfs/src/admin/handlers/kms_keys.rs
-expression: "stable_json_value(ListKmsKeysResponse\n{\n    success: true, message: \"keys listed\".to_string(), keys:\n    vec![snapshot_key_info()], truncated: true, next_marker:\n    Some(\"key-b\".to_string()),\n})"
+expression: "stable_json_value(ListKmsKeysResponse\n{\n    success: true, message: \"keys listed\".to_string(), keys:\n    vec![snapshot_key_info()], truncated: false, next_marker: None,\n    unreadable_key_ids: vec![\"key-c\".to_string()],\n})"
 ---
 {
   "keys": [
@@ -25,7 +25,10 @@ expression: "stable_json_value(ListKmsKeysResponse\n{\n    success: true, messag
     }
   ],
   "message": "keys listed",
-  "next_marker": "key-b",
+  "next_marker": null,
   "success": true,
-  "truncated": true
+  "truncated": false,
+  "unreadable_key_ids": [
+    "key-c"
+  ]
 }

@@ -65,8 +65,14 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
-    let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
+pub(crate) fn build_test_s3_config(
+    endpoint_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    provider_name: &'static str,
+) -> Config {
+    let credentials = Credentials::new(access_key, secret_key, session_token.map(str::to_owned), None, provider_name);
     let mut config = Config::builder()
         .credentials_provider(credentials)
         .region(Region::new("us-east-1"))
@@ -79,6 +85,33 @@ fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, 
     }
 
     config.build()
+}
+
+pub(crate) fn build_test_sts_client(
+    endpoint_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    provider_name: &'static str,
+) -> aws_sdk_sts::Client {
+    let mut config = aws_sdk_sts::Config::builder()
+        .credentials_provider(aws_sdk_sts::config::Credentials::new(
+            access_key,
+            secret_key,
+            session_token.map(str::to_owned),
+            None,
+            provider_name,
+        ))
+        .region(aws_sdk_sts::config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .retry_config(aws_sdk_sts::config::retry::RetryConfig::standard().with_max_attempts(1))
+        .behavior_version_latest();
+
+    if endpoint_url.starts_with("http://") {
+        config = config.http_client(SmithyHttpClientBuilder::new().build_http());
+    }
+
+    aws_sdk_sts::Client::from_conf(config.build())
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -569,7 +602,7 @@ impl RustFSTestEnvironment {
 
     /// Create an AWS S3 client with explicit credentials for this RustFS instance.
     pub fn create_s3_client_with_credentials(&self, access_key: &str, secret_key: &str) -> Client {
-        Client::from_conf(build_test_s3_config(&self.url, access_key, secret_key, "e2e-test"))
+        Client::from_conf(build_test_s3_config(&self.url, access_key, secret_key, None, "e2e-test"))
     }
 
     /// Create test bucket
@@ -1301,6 +1334,7 @@ impl RustFSTestClusterEnvironment {
             &self.nodes[node_idx].url,
             &self.access_key,
             &self.secret_key,
+            None,
             "cluster-test",
         )))
     }
