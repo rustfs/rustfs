@@ -150,8 +150,8 @@ The endpoint keeps its full path (`/events`); the allowlist entry is the origin
    providers, tiering endpoints, and Keystone auth URLs.
 2. Add each one to `RUSTFS_OUTBOUND_ALLOW_ORIGINS` as an exact
    `scheme://host:port` origin (no path).
-3. Ensure the endpoint is reachable directly — for webhook and audit targets,
-   proxies are disabled and redirects are not followed.
+3. Ensure the endpoint is reachable directly — for webhook, audit, and OIDC
+   targets, proxies are disabled and redirects are not followed.
 4. Restart RustFS; the policy is read at startup.
 5. Confirm delivery, and check the logs for `... is not allowed` messages if a
    target still fails to activate.

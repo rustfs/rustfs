@@ -52,6 +52,7 @@ const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY: &str = "OIDC provider discovery blocked by outbound policy";
 const OIDC_HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const OIDC_HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const OIDC_PLUGIN_AUTHN_WINDOW: StdDuration = StdDuration::from_secs(60);
@@ -1710,7 +1711,7 @@ impl OidcSys {
                         });
                     }
                     Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
-                        return Err(format!("OIDC provider discovery blocked by outbound policy: {reason}"));
+                        return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
                     }
                     Err(error) => {
                         let error = format!("discovery failed: {error}");
@@ -1775,10 +1776,13 @@ impl OidcSys {
             .body(Vec::new())
             .map_err(|err| format!("failed to prepare discovery request: {err}"))?;
 
-        let response = http_client
-            .call(request)
-            .await
-            .map_err(|err| format!("discovery request failed: {err}"))?;
+        let response = match http_client.call(request).await {
+            Ok(response) => response,
+            Err(OidcHttpError::ForbiddenOutbound(reason)) => {
+                return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
+            }
+            Err(err) => return Err(format!("discovery request failed: {err}")),
+        };
         if response.status() != http::StatusCode::OK {
             return Err(format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url));
         }
@@ -2983,6 +2987,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oidc_explicit_issuer_reports_forbidden_discovery_endpoint() {
+        let config_url = "http://192.168.65.254:8080/realms/rustfs/.well-known/openid-configuration";
+        let mut config = build_mocked_oidc_provider_config("default", config_url);
+        config.issuer = Some("https://idp.example.com/realms/rustfs".to_string());
+        let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::default());
+
+        let error = match OidcSys::discover_provider(&config, &http_client).await {
+            Ok(_) => panic!("private OIDC provider should require an explicit allowlist origin"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
+        assert!(error.contains(&format!("add http://192.168.65.254:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    }
+
+    #[tokio::test]
     async fn oidc_explicit_issuer_reports_forbidden_jwks_endpoint() {
         let Some((base, handle)) = start_mock_oidc_discovery_server(
             |base| {
@@ -3074,6 +3094,32 @@ mod tests {
             "default",
             "http://keycloak.internal:8080/realms/rustfs/.well-known/openid-configuration",
         );
+        let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
+            OutboundPolicy::default(),
+            Arc::new(RejectingDnsResolver {
+                allow_origin_can_recover: true,
+                calls: Some(calls.clone()),
+            }),
+        );
+
+        let error = match OidcSys::discover_provider(&config, &http_client).await {
+            Ok(_) => panic!("private DNS answer should fail discovery"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
+        assert!(error.contains(&format!("add http://keycloak.internal:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "policy rejection must not be retried");
+    }
+
+    #[tokio::test]
+    async fn oidc_explicit_issuer_preserves_dns_policy_rejection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut config = build_mocked_oidc_provider_config(
+            "default",
+            "http://keycloak.internal:8080/realms/rustfs/.well-known/openid-configuration",
+        );
+        config.issuer = Some("https://idp.example.com/realms/rustfs".to_string());
         let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
             OutboundPolicy::default(),
             Arc::new(RejectingDnsResolver {
