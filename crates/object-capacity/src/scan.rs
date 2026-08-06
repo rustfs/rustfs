@@ -92,9 +92,13 @@ impl CapacityScanReport {
                     is_estimated: entry.scan.is_estimated,
                 })
                 .collect();
-            update.expected_disk_count = Some(expected_disk_count);
-            update.replaces_disk_cache = replaces_disk_cache;
-            update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
+            // Skipped metadata or timeout fallback estimates can update an
+            // existing complete cache, but must not establish a new baseline.
+            if !self.summary.timed_out && !self.summary.metadata_incomplete {
+                update.expected_disk_count = Some(expected_disk_count);
+                update.replaces_disk_cache = replaces_disk_cache;
+                update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
+            }
         } else if self.summary.had_partial_errors {
             // Partial failure: mark the reading degraded and surface only the
             // disks whose own scan fully succeeded, so the manager can merge
@@ -204,6 +208,7 @@ async fn calculate_data_dir_used_capacity_report(
     let mut has_success = false;
     let mut is_estimated = false;
     let mut timed_out = false;
+    let mut metadata_incomplete = false;
     #[cfg(test)]
     let mut total_metadata_reads = 0usize;
     let mut per_disk = Vec::with_capacity(disks.len());
@@ -242,6 +247,7 @@ async fn calculate_data_dir_used_capacity_report(
                 total_sampled += scan.sampled_count;
                 is_estimated |= scan.is_estimated;
                 timed_out |= scan.timed_out;
+                metadata_incomplete |= scan.metadata_incomplete;
                 #[cfg(test)]
                 {
                     total_metadata_reads += scan.metadata_reads;
@@ -304,6 +310,7 @@ async fn calculate_data_dir_used_capacity_report(
         scan_duration: start.elapsed(),
         had_partial_errors: false,
         timed_out,
+        metadata_incomplete,
         #[cfg(test)]
         metadata_reads: total_metadata_reads,
     };
@@ -619,6 +626,7 @@ fn timeout_fallback_estimate(
         scan_duration: start_time.elapsed(),
         had_partial_errors,
         timed_out: true,
+        metadata_incomplete: false,
         #[cfg(test)]
         metadata_reads: 0,
     })
@@ -701,6 +709,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         let mut overflow_sampled_bytes = 0u64;
         let mut file_count = 0usize;
         let mut sampled_count = 0usize;
+        let mut metadata_incomplete = false;
         #[cfg(test)]
         let mut metadata_reads = 0usize;
         let mut had_partial_errors = false;
@@ -837,6 +846,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 file_count += 1;
                 let overflow_index = file_count - effective_threshold;
                 if !overflow_entry_is_sampled(overflow_index, effective_sample_rate) {
+                    metadata_incomplete = true;
                     continue;
                 }
             }
@@ -967,6 +977,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
                 timed_out: false,
+                metadata_incomplete,
                 #[cfg(test)]
                 metadata_reads,
             })
@@ -1002,6 +1013,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
                 timed_out: false,
+                metadata_incomplete,
                 #[cfg(test)]
                 metadata_reads,
             })
@@ -1026,6 +1038,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
                 timed_out: false,
+                metadata_incomplete,
                 #[cfg(test)]
                 metadata_reads,
             })
@@ -1040,6 +1053,7 @@ mod tests {
     use crate::capacity_scope::{CapacityScope, CapacityScopeDisk};
     #[cfg(unix)]
     use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
+    use rustfs_config::{ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE};
     use serial_test::serial;
 
     /// Reference implementation using unbounded `u128` arithmetic, clamped to
@@ -1159,6 +1173,7 @@ mod tests {
         assert_eq!(result.metadata_reads, 5);
         assert_eq!(result.used_bytes, 55);
         assert!(result.is_estimated);
+        assert!(result.metadata_incomplete);
         assert!(!result.timed_out);
     }
 
@@ -1564,6 +1579,87 @@ mod tests {
         assert_eq!(update.per_disk[0].disk, clean.disk);
         assert_eq!(update.per_disk[0].used_bytes, 100);
         assert!(!update.replaces_disk_cache);
+    }
+
+    #[test]
+    fn test_into_capacity_update_incomplete_results_do_not_replace_disk_cache() {
+        for scan in [
+            CapacityScanResult {
+                used_bytes: 100,
+                file_count: 10,
+                is_estimated: true,
+                metadata_incomplete: true,
+                ..Default::default()
+            },
+            CapacityScanResult {
+                used_bytes: 100,
+                file_count: 10,
+                is_estimated: true,
+                timed_out: true,
+                ..Default::default()
+            },
+        ] {
+            let disk = CapacityScopeDisk {
+                endpoint: "node-a".to_string(),
+                drive_path: "/tmp/disk-a".to_string(),
+            };
+            let report = CapacityScanReport {
+                summary: scan,
+                per_disk: vec![DiskCapacityScanResult {
+                    disk: disk.clone(),
+                    scan,
+                }],
+            };
+
+            let update = report.into_capacity_update(1, true);
+
+            assert!(!update.degraded);
+            assert_eq!(update.per_disk.len(), 1);
+            assert_eq!(update.per_disk[0].disk, disk);
+            assert_eq!(update.expected_disk_count, None);
+            assert!(!update.replaces_disk_cache);
+            assert!(update.clear_dirty_disks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_metadata_incomplete_aggregate_does_not_replace_disk_cache() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let temp_dir = tempfile::TempDir::new().expect("capacity scan tempdir should be created");
+        for index in 0..11 {
+            let mut file =
+                File::create(temp_dir.path().join(format!("f{index}"))).expect("capacity scan fixture file should be created");
+            file.write_all(b"12345")
+                .expect("capacity scan fixture bytes should be written");
+        }
+
+        let disks = vec![CapacityDiskRef {
+            endpoint: "node-a".to_string(),
+            drive_path: temp_dir.path().display().to_string(),
+        }];
+
+        let report = temp_env::async_with_vars(
+            [
+                (ENV_CAPACITY_MAX_FILES_THRESHOLD, Some("2")),
+                (ENV_CAPACITY_SAMPLE_RATE, Some("3")),
+            ],
+            calculate_data_dir_used_capacity_report(&disks),
+        )
+        .await
+        .expect("sampled capacity report should succeed");
+
+        assert!(report.summary.metadata_incomplete);
+        assert_eq!(report.per_disk.len(), 1);
+        assert!(report.per_disk[0].scan.metadata_incomplete);
+
+        let update = report.into_capacity_update(1, true);
+        assert_eq!(update.per_disk.len(), 1);
+        assert_eq!(update.expected_disk_count, None);
+        assert!(!update.replaces_disk_cache);
+        assert!(update.clear_dirty_disks.is_empty());
     }
 
     #[tokio::test]
