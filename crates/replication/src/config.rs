@@ -73,9 +73,13 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "storage_class",
     "skipTlsVerify",
     "caCertPem",
+    // Accepted for mc compatibility (mc `replicate add` always sends the
+    // madmin default of 60s); the per-target health-check interval is not
+    // yet applied — the heartbeat keeps its global env-configured interval.
+    "healthCheckDuration",
 ];
 
-pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["disableProxy", "healthCheckDuration", "edge", "edgeSyncBeforeExpiry"];
+pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["disableProxy", "edge", "edgeSyncBeforeExpiry"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectOpts {

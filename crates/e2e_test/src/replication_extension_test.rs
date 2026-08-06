@@ -16,6 +16,7 @@ use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
     replication_fast_env, rustfs_binary_path,
 };
+use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
 use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -2433,6 +2434,107 @@ async fn build_replication_pair(
     put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
 
     Ok((source_env, target_env, source_bucket.to_string()))
+}
+
+/// P0-6: CopyObject creates a new object on the destination key, so it must be
+/// scheduled for bucket replication exactly like PutObject (MinIO
+/// CopyObjectHandler parity). Before the fix the copy path never consulted the
+/// replication config: the destination object stayed local forever (its status
+/// metadata was inherited wholesale from the source, so the scanner heal pass
+/// skipped it too — no PENDING/FAILED marker meant nothing to re-drive).
+#[tokio::test]
+#[serial]
+async fn test_copy_object_replicates_to_target() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket) = build_replication_pair(true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let target_bucket = "replication-check-dst";
+
+    let src_key = "copy-repl-source.txt";
+    let dst_key = "copy-repl-destination.txt";
+    let payload = b"copy object replication payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(src_key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&target_client, target_bucket, src_key).await?, payload);
+    // Wait for the source object's terminal COMPLETED status so the copy below
+    // starts from metadata that carries a stale terminal replication state; the
+    // copy must not inherit it (MinIO filterReplicationStatusMetadata parity)
+    // and must drive its own PENDING -> COMPLETED cycle.
+    wait_for_source_replication_status(&source_client, &source_bucket, src_key, "COMPLETED", false).await?;
+
+    source_client
+        .copy_object()
+        .bucket(&source_bucket)
+        .key(dst_key)
+        .copy_source(format!("{source_bucket}/{src_key}"))
+        .send()
+        .await?;
+
+    assert_eq!(
+        wait_for_object_on_target(&target_client, target_bucket, dst_key).await?,
+        payload,
+        "CopyObject destination must replicate to the remote target"
+    );
+    wait_for_source_replication_status(&source_client, &source_bucket, dst_key, "COMPLETED", false).await?;
+
+    Ok(())
+}
+
+/// P0-6 companion: snowball auto-extract writes each archive member as an
+/// independent object; every member must replicate to the remote target like a
+/// regular PUT (MinIO PutObjectExtract parity).
+#[tokio::test]
+#[serial]
+async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket) = build_replication_pair(true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let target_bucket = "replication-check-dst";
+
+    let members: [(&str, &[u8]); 2] = [
+        ("snowball/member-one.txt", b"first member payload"),
+        ("snowball/member-two.txt", b"second member payload"),
+    ];
+
+    let mut builder = tokio_tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    for (path, data) in members {
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, std::io::Cursor::new(data)).await?;
+    }
+    let archive = builder.into_inner().await?.into_inner();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key("members.tar")
+        .metadata("Snowball-Auto-Extract", "true")
+        .body(ByteStream::from(archive))
+        .send()
+        .await?;
+
+    for (key, data) in members {
+        assert_eq!(
+            wait_for_object_on_target(&target_client, target_bucket, key).await?,
+            data,
+            "snowball-extracted member {key} must replicate to the remote target"
+        );
+        wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -6637,5 +6739,142 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
         target_after_second.accounts
     );
 
+    Ok(())
+}
+
+/// Poll the fake target journal until `operation` arrives for `key`, then
+/// return the `versionId` query value the request carried.
+async fn wait_for_target_request_version_id(
+    target: &FakeS3Target,
+    operation: FakeTargetOperation,
+    key: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(record) = target
+            .requests()
+            .into_iter()
+            .find(|record| record.operation == operation && record.key.as_deref() == Some(key))
+        {
+            return Ok(record.version_id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("fake target never received {operation:?} for {key}; journal: {:?}", target.requests()).into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// P0-5: MinIO derives the replicated version exclusively from the `versionId`
+/// query parameter (`putOptsFromReq`); the internal x-*-source-version-id
+/// headers do not exist there. Without the query, a MinIO target mints fresh
+/// version ids and RustFS -> MinIO replication drifts. PutObject and
+/// CreateMultipartUpload (the version is decided at initiate time) must both
+/// carry the source version as `?versionId=`.
+#[tokio::test]
+#[serial]
+async fn test_replication_put_and_create_multipart_carry_source_version_id_query() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "versionid-query-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let source_bucket = "versionid-query-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    // Small object -> replicated through a single PutObject.
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("small.txt")
+        .body(ByteStream::from_static(b"versionid query payload"))
+        .send()
+        .await?;
+    let put_source_version = put
+        .version_id()
+        .ok_or("versioned source PUT must return a version id")?
+        .to_string();
+    let recorded = wait_for_target_request_version_id(&target, FakeTargetOperation::PutObject, "small.txt").await?;
+    assert_eq!(
+        recorded.as_deref(),
+        Some(put_source_version.as_str()),
+        "replication PutObject must carry the source version in the versionId query"
+    );
+
+    // Multipart source object -> replicated through CreateMultipartUpload;
+    // the target version is fixed at initiate time.
+    let create = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key("large.bin")
+        .send()
+        .await?;
+    let upload_id = create
+        .upload_id()
+        .ok_or("multipart initiate must return an upload id")?
+        .to_string();
+    let mut completed_parts = Vec::new();
+    for (part_number, body) in [(1, vec![b'a'; 5 * 1024 * 1024]), (2, vec![b'b'; 1024])] {
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key("large.bin")
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(uploaded.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+    let complete = source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key("large.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .send()
+        .await?;
+    let multipart_source_version = complete
+        .version_id()
+        .ok_or("versioned multipart completion must return a version id")?
+        .to_string();
+    let recorded = wait_for_target_request_version_id(&target, FakeTargetOperation::CreateMultipartUpload, "large.bin").await?;
+    assert_eq!(
+        recorded.as_deref(),
+        Some(multipart_source_version.as_str()),
+        "replication CreateMultipartUpload must carry the source version in the versionId query"
+    );
+
+    target.shutdown().await;
     Ok(())
 }

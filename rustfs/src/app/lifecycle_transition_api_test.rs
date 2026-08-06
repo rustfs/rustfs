@@ -2430,6 +2430,192 @@ async fn put_object_computes_replication_decision_exactly_once() {
     );
 }
 
+/// CopyObject creates a new object on the destination key, so it must join
+/// bucket replication exactly like PutObject: compute one replication decision
+/// that drives both the persisted pending marker and the post-commit schedule
+/// (MinIO CopyObjectHandler parity). A count of 0 means a copied object is
+/// never scheduled for replication and — because the copy path clones the
+/// source metadata wholesale — the destination silently inherits the source's
+/// replication bookkeeping, faking a COMPLETED/REPLICA state for an object
+/// that never replicated. The second half of this test pins the metadata
+/// cleanup (MinIO filterReplicationStatusMetadata parity).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn copy_object_computes_replication_decision_and_strips_stale_status() {
+    use super::storage_api::object_usecase::bucket::replication::MUST_REPLICATE_OBJECT_CALLS;
+    use rustfs_utils::http::{
+        SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_str,
+        insert_str,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+
+    let bucket = format!("test-copy-repl-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "copy/source.txt";
+    let dst_object = "copy/destination.txt";
+    let payload = b"copy replication decision payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    // Seed the source object with stale replication bookkeeping, as if it had
+    // already replicated elsewhere (internal status/timestamp under both
+    // compatibility prefixes, replica state, and the surfaced x-amz header).
+    let mut stale_metadata = HashMap::new();
+    insert_str(
+        &mut stale_metadata,
+        SUFFIX_REPLICATION_STATUS,
+        "arn:minio:replication::stale:dst=COMPLETED;".to_string(),
+    );
+    insert_str(&mut stale_metadata, SUFFIX_REPLICATION_TIMESTAMP, "2024-01-01T00:00:00Z".to_string());
+    insert_str(&mut stale_metadata, SUFFIX_REPLICA_STATUS, "REPLICA".to_string());
+    insert_str(&mut stale_metadata, SUFFIX_REPLICA_TIMESTAMP, "2024-01-01T00:00:00Z".to_string());
+    stale_metadata.insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "COMPLETED".to_string());
+    let mut reader = PutObjReader::from_vec(payload.to_vec());
+    (*ecstore)
+        .put_object(
+            bucket.as_str(),
+            src_object,
+            &mut reader,
+            &ObjectOptions {
+                user_defined: stale_metadata,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to upload source object with stale replication metadata");
+
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: bucket.clone().into(),
+            key: src_object.into(),
+            version_id: None,
+        })
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+    Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+        .await
+        .expect("Failed to copy object through usecase");
+
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        1,
+        "CopyObject must compute the replication decision exactly once; 0 means the copied \
+         object never enters bucket replication (P0-6, MinIO CopyObjectHandler parity)"
+    );
+
+    let copied = ecstore
+        .get_object_info(bucket.as_str(), dst_object, &ObjectOptions::default())
+        .await
+        .expect("Failed to read copied destination object info");
+    assert!(
+        get_str(&copied.user_defined, SUFFIX_REPLICATION_STATUS).is_none(),
+        "destination must not inherit the source's replication status; got {:?}",
+        get_str(&copied.user_defined, SUFFIX_REPLICATION_STATUS)
+    );
+    assert!(
+        get_str(&copied.user_defined, SUFFIX_REPLICATION_TIMESTAMP).is_none(),
+        "destination must not inherit the source's replication timestamp"
+    );
+    assert!(
+        get_str(&copied.user_defined, SUFFIX_REPLICA_STATUS).is_none(),
+        "destination must not inherit the source's replica status"
+    );
+    assert!(
+        !copied
+            .user_defined
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+        "destination must not inherit the surfaced x-amz-replication-status header key"
+    );
+}
+
+/// Snowball auto-extract writes each archive member as an independent object,
+/// so each member must join bucket replication like a regular PUT (MinIO
+/// PutObjectExtract parity). The archive holds two file entries; a count other
+/// than 2 means extracted objects bypass the replication decision entirely and
+/// stay local forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn put_object_extract_computes_replication_decision_per_entry() {
+    use super::storage_api::object_usecase::bucket::replication::MUST_REPLICATE_OBJECT_CALLS;
+    use super::storage_api::test::ReqInfo;
+    use super::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+    use std::io::Cursor;
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+
+    let bucket = format!("test-extract-repl-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    // The extract path re-authorizes every extracted entry internally. The test
+    // harness has no IAM system, so allow anonymous PutObject via bucket policy.
+    let policy_json = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:PutObject"],
+                "Resource": [format!("arn:aws:s3:::{bucket}/*")]
+            }
+        ]
+    })
+    .to_string();
+    metadata_sys::update(bucket.as_str(), BUCKET_POLICY_CONFIG, policy_json.into_bytes())
+        .await
+        .expect("Failed to install anonymous put bucket policy");
+
+    let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+    for (path, data) in [
+        ("member-one.txt", b"first member payload".as_slice()),
+        ("nested/member-two.txt", b"second member payload".as_slice()),
+    ] {
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(data))
+            .await
+            .expect("Failed to append archive member");
+    }
+    let archive = builder.into_inner().await.expect("Failed to finish archive").into_inner();
+
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+
+    let input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key("archive.tar".to_string())
+        .body(Some(streaming_blob_from_bytes(&archive)))
+        .content_length(Some(archive.len() as i64))
+        .build()
+        .unwrap();
+    let mut req = build_request(input, Method::PUT);
+    req.extensions.insert(ReqInfo::default());
+    Box::pin(usecase.execute_put_object_extract(req))
+        .await
+        .expect("Failed to extract archive through usecase");
+
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        2,
+        "snowball auto-extract must compute one replication decision per extracted member \
+         object; 0 means extracted objects bypass bucket replication (P0-6 companion, MinIO \
+         PutObjectExtract parity)"
+    );
+}
+
 /// The object-lock handlers do not go through the object PUT path, so they must schedule
 /// replication themselves. Without it a retention or legal hold applied after upload stays
 /// local and the replica keeps its previous, unprotected state (a WORM object that is still

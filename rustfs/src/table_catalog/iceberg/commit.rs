@@ -196,6 +196,7 @@ fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &
         Err(TableCatalogStoreError::Conflict(_)) => "conflict",
         Err(TableCatalogStoreError::Invalid(_)) => "invalid",
         Err(TableCatalogStoreError::NotFound(_)) => "not_found",
+        Err(TableCatalogStoreError::Unsupported(_)) => "unsupported",
         Err(TableCatalogStoreError::Internal(_)) => "failure",
     }
 }

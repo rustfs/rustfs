@@ -302,7 +302,18 @@ pub async fn put_opts_with_replication_authorization(
         vid
     };
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    // The S3 API addresses the null version as the literal "null"
+    // (MinIO-compatible replication senders, including RustFS itself, put it
+    // in the versionId query); normalize it to the internal nil-UUID
+    // representation exactly like get_opts / del_opts do.
+    let vid = vid.map(|v| {
+        let id = v.as_str().trim();
+        if id.eq_ignore_ascii_case("null") {
+            Uuid::nil().to_string()
+        } else {
+            id.to_owned()
+        }
+    });
 
     if let Some(ref id) = vid
         && *id != Uuid::nil().to_string()
@@ -1349,6 +1360,22 @@ mod tests {
                 _ => panic!("Expected InvalidVersionID error"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_put_opts_normalizes_null_version_id() {
+        // MinIO-compatible replication senders (including RustFS itself since
+        // the P0-5 fix) address the null version as the literal "null" in the
+        // versionId query; the PUT / CreateMultipartUpload receive path must
+        // normalize it to the internal nil-UUID representation, exactly like
+        // get_opts / del_opts already do.
+        let headers = create_test_headers();
+
+        let opts = put_opts("test-bucket", "test-object", Some("null".to_string()), &headers, HashMap::new())
+            .await
+            .expect("PUT with versionId=null must be accepted as the null version");
+
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]

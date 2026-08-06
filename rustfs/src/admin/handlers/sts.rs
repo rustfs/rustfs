@@ -32,7 +32,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
-use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
@@ -73,6 +73,24 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
         STS_DEFAULT_DURATION_SECS
     } else {
         duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
+    }
+}
+
+/// Build the site-replication IAM item that mirrors an AssumeRole temporary credential to peers.
+fn assume_role_site_replication_item(cred: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
+    SRIAMItem {
+        r#type: SR_IAM_ITEM_STS_ACC.to_string(),
+        sts_credential: Some(SRSTSCredential {
+            access_key: cred.access_key.clone(),
+            secret_key: cred.secret_key.clone(),
+            session_token: cred.session_token.clone(),
+            parent_user: cred.parent_user.clone(),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
     }
 }
 
@@ -244,21 +262,7 @@ async fn handle_assume_role(
 
     let root_access_key = current_action_credentials().map(|cred| cred.access_key);
     if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
-        && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-            r#type: "sts-credential".to_string(),
-            sts_credential: Some(SRSTSCredential {
-                access_key: new_cred.access_key.clone(),
-                secret_key: new_cred.secret_key.clone(),
-                session_token: new_cred.session_token.clone(),
-                parent_user: new_cred.parent_user.clone(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            }),
-            updated_at: Some(updated_at),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
-        .await
+        && let Err(err) = site_replication_iam_change_hook(assume_role_site_replication_item(&new_cred, updated_at)).await
     {
         warn!("site replication STS hook failed, err: {err}");
     }
@@ -420,6 +424,30 @@ mod tests {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let exp = now.saturating_add(clamp_assume_role_duration(ten_years_secs) as i64);
         assert!(exp - now <= STS_MAX_DURATION_SECS as i64);
+    }
+
+    #[test]
+    fn assume_role_replication_item_uses_minio_sts_account_type() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "ASSUMEROLETESTACCESS".to_string(),
+            secret_key: "assumeRoleTestSecret123".to_string(),
+            session_token: "assume-role-test-session-token".to_string(),
+            parent_user: "assume-role-parent".to_string(),
+            ..Default::default()
+        };
+
+        let item = assume_role_site_replication_item(&cred, OffsetDateTime::UNIX_EPOCH);
+
+        // MinIO madmin-go `SRIAMItemSTSAcc`: any other value is rejected by MinIO peers.
+        assert_eq!(item.r#type, "sts-account");
+        assert_eq!(item.updated_at, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(item.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
+        let sts = item.sts_credential.expect("replication item should carry the STS credential");
+        assert_eq!(sts.access_key, cred.access_key);
+        assert_eq!(sts.secret_key, cred.secret_key);
+        assert_eq!(sts.session_token, cred.session_token);
+        assert_eq!(sts.parent_user, cred.parent_user);
+        assert_eq!(sts.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
     }
 
     #[test]
