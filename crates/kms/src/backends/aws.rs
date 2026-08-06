@@ -655,6 +655,8 @@ impl KmsBackend for AwsKmsBackend {
                 created_at: metadata.creation_date,
                 rotated_at: None,
                 created_by: None,
+                rotation_due: false,
+                rotation_due_reason: None,
             });
         }
 

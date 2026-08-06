@@ -1225,6 +1225,8 @@ impl VaultKmsClient {
             created_at: key_data.created_at,
             rotated_at: key_data.rotated_at,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
         })
     }
 

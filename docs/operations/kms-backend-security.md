@@ -78,6 +78,23 @@ Notes:
 
 Rotation support differs per backend. Local and Static advertise no `rotate` capability — `capabilities.rotate` is false in the `kms/status` response — and reject rotation with `UnsupportedCapability`; their single key material is never overwritten. Vault Transit delegates rotation to the Transit engine's own key versioning (ciphertext is version-prefixed, e.g. `vault:v1:...`). Vault KV2 rotates by retaining every historical version, as described below. Rotation is reachable through the admin API as `POST /rustfs/admin/v3/kms/keys/rotate`, which the route policy classifies as high risk and gates behind `kms:RotateKey`; it is not exposed through the S3 surface. The upgrade ordering constraint below therefore applies to an operator action, not only to a call from inside the process.
 
+### Rotation readiness: reported, never acted on
+
+RustFS does not rotate keys on a schedule. There is no built-in rotation worker, deliberately: rotation is a policy decision with a per-backend cost and a hard upgrade-ordering constraint (see below), and a server that rotated on its own would make that decision on an operator's behalf at a moment it did not choose. What the server does instead is tell you which keys have outlived a period you configure.
+
+Set `RUSTFS_KMS_ROTATION_MAX_AGE_SECS` to that period in whole seconds. Unset — the default — leaves the verdict unreported rather than assuming a policy: how often keys must be rotated is a compliance decision, and a built-in default would report keys as overdue against a rule nobody wrote. An unparsable value is treated the same way, with a warning, instead of silently falling back to a number the operator did not choose. Values below one hour are raised to one hour, because a threshold of seconds reports every key as overdue moments after it was rotated and teaches operators to ignore the signal.
+
+`GET /rustfs/admin/v3/kms/keys` then carries two additional fields per key:
+
+- `rotation_due` — whether the key has outlived the configured period.
+- `rotation_due_reason` — `age` when the key was rotated but longer ago than the period, `never_rotated` when it has never been rotated and has been in use longer than the period, and `unsupported` when the backend cannot rotate at all. Absent when there is no verdict.
+
+The verdict is advisory in the strongest sense: nothing consults it before encrypting or decrypting, a key reported as due keeps serving traffic unchanged, and it has no effect on readiness or liveness. It is computed in one place, from the backend's declared rotation capability plus the key's own timestamps, so no two backends can disagree about what "overdue" means — and a backend that cannot rotate is reported as `unsupported` rather than being told to do something it cannot.
+
+`GET /rustfs/admin/v3/kms/keys/{key_id}` does **not** carry these fields. Its response type records a creation date but no rotation timestamp, so a verdict computed there could not tell a key rotated last week from one never rotated at all, and reporting `never_rotated` for a key that was in fact rotated would be worse than reporting nothing. Read the verdict from the listing.
+
+Driving the rotation itself remains external: call `POST /rustfs/admin/v3/kms/keys/rotate` from your own scheduler, having first satisfied the upgrade-ordering constraint below.
+
 ### Vault KV2 versioned retention model
 
 Each rotation writes the new version's material to `{prefix}/{key_id}/versions/{N}` as an immutable, create-only record, and only after that material is durably persisted does a check-and-set write move the top-level record (the current-version pointer, which also mirrors the current material as a fast path). The first rotation additionally freezes the pre-rotation material as a version record and pins it as the key's `baseline_version`; DEK envelopes written before versioning existed (no `master_key_version` field) always resolve to that baseline, never to whatever version is current.
