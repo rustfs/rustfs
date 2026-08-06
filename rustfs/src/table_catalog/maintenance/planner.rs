@@ -348,10 +348,18 @@ where
             "compaction manifest list must be inside the table metadata directory".to_string(),
         ));
     }
-    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
+    let Some(manifest_list_object) = backend
+        .read_object_limited(table_bucket, &manifest_list_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+        .await?
+    else {
         return Err(TableCatalogStoreError::NotFound(format!("compaction manifest list {manifest_list_key}")));
     };
-    let manifest_paths = manifest_paths_from_manifest_list_avro(&manifest_list_object.data)?;
+    let manifest_paths = decode_manifest_list_avro_async(manifest_list_object.data)
+        .await?
+        .references
+        .into_iter()
+        .map(|reference| reference.manifest_path)
+        .collect::<Vec<_>>();
     let mut planning = CompactionManifestPlanning::default();
     for manifest_location in manifest_paths {
         let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, &manifest_location) else {
@@ -366,10 +374,13 @@ where
                 "compaction manifest must be inside the table metadata directory".to_string(),
             ));
         }
-        let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
+        let Some(manifest_object) = backend
+            .read_object_limited(table_bucket, &manifest_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+            .await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!("compaction manifest {manifest_key}")));
         };
-        for reference in data_file_references_from_manifest_avro(&manifest_object.data)? {
+        for reference in decode_manifest_avro_async(manifest_object.data).await?.references {
             if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
                 record_compaction_row_level_delete_file(
                     backend,
@@ -552,12 +563,15 @@ where
             "compaction manifest list must be inside the table metadata directory".to_string(),
         ));
     }
-    let Some(manifest_list_object) = backend.read_object(table_bucket, &manifest_list_key).await? else {
+    let Some(manifest_list_object) = backend
+        .read_object_limited(table_bucket, &manifest_list_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+        .await?
+    else {
         return Err(TableCatalogStoreError::NotFound(format!("compaction manifest list {manifest_list_key}")));
     };
 
     let mut data_files = Vec::new();
-    for manifest_reference in manifest_list_references_from_manifest_list_avro(&manifest_list_object.data)? {
+    for manifest_reference in decode_manifest_list_avro_async(manifest_list_object.data).await?.references {
         let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, &manifest_reference.manifest_path) else {
             return Err(TableCatalogStoreError::Invalid(
                 "compaction manifest must be inside the table bucket".to_string(),
@@ -570,10 +584,13 @@ where
                 "compaction manifest must be inside the table metadata directory".to_string(),
             ));
         }
-        let Some(manifest_object) = backend.read_object(table_bucket, &manifest_key).await? else {
+        let Some(manifest_object) = backend
+            .read_object_limited(table_bucket, &manifest_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
+            .await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!("compaction manifest {manifest_key}")));
         };
-        for reference in data_file_references_from_manifest_avro(&manifest_object.data)? {
+        for reference in decode_manifest_avro_async(manifest_object.data).await?.references {
             if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
                 return Err(TableCatalogStoreError::Invalid(
                     "compaction currently does not support delete files".to_string(),

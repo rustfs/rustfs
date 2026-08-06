@@ -12,15 +12,16 @@ All six are emitted at the single operation-policy choke point (`crates/kms/src/
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `rustfs_kms_backend_operations_total` | counter | `operation`, `op_class`, `outcome` | Operations executed under the operation policy, counted once per terminal outcome |
-| `rustfs_kms_backend_attempt_failures_total` | counter | `operation`, `error_class` | Individual failed attempts, including attempts the retry policy later absorbed |
-| `rustfs_kms_backend_operation_duration_seconds` | histogram | `operation`, `outcome` | Wall-clock duration of a whole operation, including retries and backoff sleeps |
-| `rustfs_kms_backend_operation_attempts` | histogram | `operation`, `outcome` | Number of attempts one operation used before completing |
+| `rustfs_kms_backend_operations_total` | counter | `backend`, `operation`, `op_class`, `outcome` | Operations executed under the operation policy, counted once per terminal outcome |
+| `rustfs_kms_backend_attempt_failures_total` | counter | `backend`, `operation`, `error_class` | Individual failed attempts, including attempts the retry policy later absorbed |
+| `rustfs_kms_backend_operation_duration_seconds` | histogram | `backend`, `operation`, `outcome` | Wall-clock duration of a whole operation, including retries and backoff sleeps |
+| `rustfs_kms_backend_operation_attempts` | histogram | `backend`, `operation`, `outcome` | Number of attempts one operation used before completing |
 | `rustfs_kms_backend_in_flight` | gauge | `backend`, `scope` | External backend attempts currently in flight after admission |
 | `rustfs_kms_backend_circuit_open` | gauge | `backend`, `scope` | Open or half-open circuits; `0` means closed |
 
 Label values:
 
+- `backend`: the backend that served the call — `vault-kv2`, `vault-transit`, `aws`, and `vault-restore` for the calls a restore makes against a Vault bundle's trust root. Operation names are shared across backends (every one of them has a `decrypt`), so without this label a Vault Transit latency regression and an AWS one land in the same series. Vault credential logins and renewals report their backend's own name and are told apart by the operation, not by a separate `backend` value; the `scope` label that distinguishes them appears only on the two gauges. Local and Static serve from process memory and never enter the operation policy, so they emit no `backend` series at all.
 - `outcome`: `success`, `fatal` (a non-retryable failure ended the operation on first observation), `budget_exhausted` (the attempt budget ran out on retryable failures), `deadline_exceeded` (the operation deadline ran out before another attempt could complete), `backpressure_timeout` (the deadline elapsed before capacity admission completed), `backpressure_rejected` (active capacity and the bounded queue were full or unavailable), `circuit_open` (a retryable failure opened the breaker or an open breaker rejected the operation), `cancelled` (shutdown or caller cancellation).
 - `op_class`: `read_idempotent` (safe to retry), `mutating_non_idempotent` (never replayed — a retryable failure terminates after a single attempt because the server may have processed the request), `auth` (login and token renewal).
 - `error_class`: `retryable_conn` (connection-level failure: dial, TLS, broken connection), `retryable_status` (retryable backend status, e.g. Vault 5xx or a sealed Vault's 503), `attempt_timeout` (the per-attempt timeout cut the attempt off; retried like a connection failure because the server may still have processed the request), `fatal` (non-retryable: authentication, permissions, malformed request, missing key or version).
@@ -53,9 +54,13 @@ Published by the background deletion worker (`crates/kms/src/deletion_worker.rs`
 | `rustfs_kms_pending_deletion_keys` | gauge | — | Keys scheduled for deletion whose deadline has not passed |
 | `rustfs_kms_deletion_tombstone_keys` | gauge | — | Keys left tombstoned by an interrupted removal, still awaiting the sweep |
 | `rustfs_kms_oldest_key_rotation_age_seconds` | gauge | — | Seconds since the least recently rotated usable key was rotated, counting from creation for keys with no recorded rotation; `0` when there are none |
-| `rustfs_kms_deletion_sweep_keys_total` | counter | `outcome` | Keys the sweep acted on, by outcome |
+| `rustfs_kms_deletion_sweep_keys_total` | counter | `outcome` | Keys the sweep acted on, by outcome: `removed`, `blocked`, `skipped`, `failed`, `unreadable` |
 
-`outcome` is `removed`, `blocked` (live configuration — the default key, or a reference reported by the injected checker — still points at the key, so the sweep refuses to remove it), `skipped` (pending but not yet due, or the state changed between inspection and removal), or `failed` (the removal attempt failed and is retried next sweep). Every series is emitted at zero from the first sweep on, so a `rate()` over it is defined immediately.
+`outcome` is `removed`, `blocked` (live configuration — the default key, or a reference reported by the injected checker — still points at the key, so the sweep refuses to remove it), `skipped` (pending but not yet due, or the state changed between inspection and removal), `failed` (the removal attempt failed and is retried next sweep), or `unreadable` (the backend listed a key record this build cannot describe — a record written by a newer build, or damaged material). Every series is emitted at zero from the first sweep on, so a `rate()` over it is defined immediately.
+
+A non-zero `unreadable` rate does not stop the sweep — the expired keys it *can* read are still destroyed — but it does suppress the three lifecycle gauges for that round, because a census taken over a partially readable key set would quietly undercount. Sustained `unreadable` therefore shows up as gauges that stop advancing; investigate the named key ids from the sweep's log line before trusting a rotation-age or pending-deletion reading again.
+
+Total damage looks different, and it is worth knowing which you are seeing. When *no* key in a complete listing is readable, the backend fails the listing outright rather than returning an empty page (see the key listing contract in the admin contract page), so the sweep never gets a page to count: it reports `outcome="failed"` with the listing error in its `warn!` line and names no key ids. So `failed` climbing while `unreadable` stays at zero and the gauges freeze means the whole key set is unreadable on this node — a mixed-version node, or a credential that cannot open any record — not that individual removals are failing.
 
 The three gauges are republished only by a sweep that saw the whole key set; a sweep that could not finish listing leaves the previous, complete values standing rather than understating them. Keys already on their way out are excluded from the rotation-age gauge, so it does not stay pinned high by a key that will never be rotated again.
 
@@ -140,7 +145,7 @@ Meaning: the p99 wall-clock duration of KMS operations is sustained above 2s. Th
 Investigation:
 
 1. Compare p50 and p99 on the "Operation Duration p50 / p99" panel. Flat p50 with elevated p99 points at retries; both elevated points at the backend or the network path being uniformly slow.
-2. Split by operation with `histogram_quantile(0.99, sum by (le, operation) (rate(rustfs_kms_backend_operation_duration_seconds_bucket[5m])))` to see whether one backend call or all of them regressed.
+2. Split by backend and operation with `histogram_quantile(0.99, sum by (le, backend, operation) (rate(rustfs_kms_backend_operation_duration_seconds_bucket[5m])))` to see whether one backend call or all of them regressed.
 3. Check the attempts histogram: an average meaningfully above 1 confirms the latency is retry-driven; follow [KmsBackendAttemptFailureSpike](#kmsbackendattemptfailurespike) for the failure classes.
 4. If latency is not retry-driven, check the network path to Vault (TLS handshakes, DNS, proxies) and Vault's own telemetry (storage backend latency, load).
 5. Remember that this latency sits inside S3 request latency for encrypted objects: sustained p99 near the operation deadline will start converting into `deadline_exceeded` outcomes.

@@ -4343,7 +4343,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         Ok(obj_info)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         crate::hp_guard!("SetDisks::get_object_info");
         // Acquire a shared read-lock to protect consistency during info fetch

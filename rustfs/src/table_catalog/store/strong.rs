@@ -1380,7 +1380,7 @@ where
 
         let Some(new_metadata_object) = self
             .object_backend
-            .read_object(&request.table_bucket, &request.new_metadata_location)
+            .read_object_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return table_commit_result(
@@ -1396,8 +1396,13 @@ where
                 ))),
             );
         };
-        let next_warehouse_location =
-            table_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+        let table_bucket = request.table_bucket.clone();
+        let metadata_location = request.new_metadata_location.clone();
+        let next_warehouse_location = tokio::task::spawn_blocking(move || {
+            table_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        })
+        .await
+        .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
 
         let cas_started = Instant::now();
         let prepared_result = {
@@ -1540,7 +1545,7 @@ where
         }
         let Some(new_metadata_object) = self
             .object_backend
-            .read_object(&request.table_bucket, &request.new_metadata_location)
+            .read_object_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -1548,8 +1553,13 @@ where
                 request.new_metadata_location
             )));
         };
-        let next_warehouse_location =
-            view_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+        let table_bucket = request.table_bucket.clone();
+        let metadata_location = request.new_metadata_location.clone();
+        let next_warehouse_location = tokio::task::spawn_blocking(move || {
+            view_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        })
+        .await
+        .map_err(|err| TableCatalogStoreError::Internal(format!("view metadata parser task failed: {err}")))??;
 
         let key = Self::table_key(&request.table_bucket, &namespace, &view);
         let (snapshot, precondition, next) = {

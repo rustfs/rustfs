@@ -69,6 +69,18 @@ fn kms_clear_cache_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ClearCacheAction)]
 }
 
+/// Response of `POST /kms/clear-cache`.
+///
+/// Declared rather than built inline so the shape the console already depends
+/// on is pinned by a type and a snapshot instead of by a `json!` literal that
+/// any edit can silently reshape. The field names and values are exactly what
+/// the inline literal produced.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KmsClearCacheResponse {
+    pub status: String,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KmsStatusResponse {
     pub backend_type: String,
@@ -387,10 +399,10 @@ impl Operation for KmsClearCacheHandler {
         match service.clear_cache().await {
             Ok(()) => {
                 info!("KMS cache cleared successfully");
-                let response = serde_json::json!({
-                    "status": "success",
-                    "message": "cache cleared successfully"
-                });
+                let response = KmsClearCacheResponse {
+                    status: "success".to_string(),
+                    message: "cache cleared successfully".to_string(),
+                };
 
                 let data =
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -410,7 +422,8 @@ impl Operation for KmsClearCacheHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{kms_clear_cache_actions, kms_configure_actions, kms_service_control_actions};
+    use super::{KmsClearCacheResponse, kms_clear_cache_actions, kms_configure_actions, kms_service_control_actions};
+    use crate::admin::handlers::kms_keys::stable_json_value;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
 
     fn assert_has_action(actions: &[Action], action: Action) {
@@ -426,6 +439,39 @@ mod tests {
         assert_has_action(&kms_service_control_actions(), Action::KmsAction(KmsAction::ServiceControlAction));
         assert_has_action(&kms_configure_actions(), Action::KmsAction(KmsAction::ConfigureAction));
         assert_has_action(&kms_clear_cache_actions(), Action::KmsAction(KmsAction::ClearCacheAction));
+    }
+
+    /// The clear-cache body is a published client contract, so the shape is
+    /// pinned rather than left to whatever the handler happens to build.
+    #[test]
+    fn kms_clear_cache_response_has_a_stable_json_shape() {
+        insta::assert_json_snapshot!(
+            "kms_admin_clear_cache_response",
+            stable_json_value(KmsClearCacheResponse {
+                status: "success".to_string(),
+                message: "cache cleared successfully".to_string(),
+            })
+        );
+    }
+
+    /// The snapshot above pins the *type*; this pins that the handler actually
+    /// serves it. Without this, reverting the handler body to a `json!` literal
+    /// with any field names at all leaves the snapshot green — which is exactly
+    /// the silent reshaping the named type was introduced to prevent.
+    #[test]
+    fn the_clear_cache_handler_serves_the_named_response_type() {
+        let src = include_str!("kms_management.rs");
+        let marker = "impl Operation for KmsClearCacheHandler";
+        let block = src.split_once(marker).expect("clear-cache handler impl should exist").1;
+        let block = &block[..block.find("\n#[cfg(test)]").unwrap_or(block.len())];
+        assert!(
+            block.contains("KmsClearCacheResponse {"),
+            "the clear-cache handler must build its response from the named type"
+        );
+        assert!(
+            !block.contains("serde_json::json!"),
+            "the clear-cache handler must not rebuild its response as an inline literal"
+        );
     }
 
     #[test]

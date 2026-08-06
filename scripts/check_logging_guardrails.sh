@@ -875,6 +875,43 @@ if [[ "$erasure_sampled_sites" -lt 2 ]]; then
   exit 1
 fi
 
+# Object-read request fan-out crosses several thin wrappers. These spans are
+# useful for opt-in latency attribution, but default INFO turns one S3 request
+# into many redundant span-close records. Keep only the measured hot wrappers
+# TRACE-only; write, heal, rebalance, and admin operations are intentionally not
+# included here.
+trace_hot_spans=(
+  "crates/ecstore/src/set_disk/ops/locking.rs:new_ns_lock"
+  "crates/ecstore/src/store/rebalance.rs:handle_new_ns_lock"
+  "crates/ecstore/src/store/object.rs:handle_get_object_info"
+  "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
+  "crates/ecstore/src/store/mod.rs:list_objects_v2"
+  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  "crates/ecstore/src/core/sets.rs:list_objects_v2"
+  "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
+  "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+)
+
+for hot_span in "${trace_hot_spans[@]}"; do
+  file="${hot_span%%:*}"
+  function="${hot_span##*:}"
+  trace_span_pattern="#\\[(tracing::)?instrument\\([^]]*level = \\\"trace\\\"[^]]*\\)\\]([[:space:]]+#\\[[^]]+\\])*[[:space:]]+(pub(\\([^)]*\\))?[[:space:]]+)?(super[[:space:]]+)?async fn ${function}\\b"
+  if ! rg -U "$trace_span_pattern" "$file" >/dev/null; then
+    echo "❌ logging guardrail violation: $file::$function must remain TRACE-only" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U 'info!\([[:space:]]+target: HTTP_SERVER_LOG_TARGET,[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful HTTP completion events must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: HTTP request log target must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
 demoted_admission_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/manager.rs || echo 0)"
 if [[ "$demoted_admission_sites" -lt 6 ]]; then
   echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 sites in crates/heal/src/heal/manager.rs, found $demoted_admission_sites)" >&2

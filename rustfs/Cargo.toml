@@ -267,6 +267,7 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 apache-avro = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
+flate2 = { workspace = true }
 flatbuffers.workspace = true
 rmp-serde.workspace = true
 quick-xml.workspace = true
