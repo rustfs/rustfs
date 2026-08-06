@@ -15,8 +15,8 @@
 //! Local file-based KMS backend implementation
 
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, ensure_key_status_permits,
-    ensure_tag_keys_are_mutable, paginate_keys,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
+    classify_listed_key_failure, ensure_key_status_permits, ensure_tag_keys_are_mutable, paginate_keys, started_at_the_first_key,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -1599,22 +1599,25 @@ impl LocalKmsClient {
         // Only the page is read from disk, so the cost of a list stays bounded
         // by the requested limit rather than by the size of the key set.
         let mut keys = Vec::with_capacity(page.items.len());
+        let mut unreadable = UnreadableKeys::default();
         for key_id in page.items {
             let key_info = match self.describe_key(key_id, None).await {
-                Ok(key_info) => key_info,
-                // A key that vanished between the scan and the read is dropped
-                // from the page: concurrent removal is normal, and the cursor
-                // is derived from the identifier list, so the listing still
-                // advances past it.
-                Err(KmsError::KeyNotFound { .. }) => {
-                    debug!(key_id, "skipping key removed while listing");
-                    continue;
+                Ok(key_info) => {
+                    unreadable.saw_readable();
+                    key_info
                 }
-                // Anything else means the record is still there and this build
-                // cannot interpret it. Dropping it would answer "these are
-                // your keys" with a set that silently omits one, and the
-                // deletion sweep would count a census it never fully saw.
-                Err(error) => return Err(error),
+                Err(error) => match classify_listed_key_failure(&error) {
+                    Some(ListedKeyFailure::Vanished) => {
+                        debug!(key_id, "skipping key removed while listing");
+                        continue;
+                    }
+                    Some(ListedKeyFailure::Unreadable) => {
+                        warn!(key_id, %error, "listing a key record this build cannot describe");
+                        unreadable.record(key_id, error);
+                        continue;
+                    }
+                    None => return Err(error),
+                },
             };
 
             if let Some(ref status_filter) = request.status_filter
@@ -1635,6 +1638,7 @@ impl LocalKmsClient {
             keys,
             next_marker: page.next_marker,
             truncated: page.truncated,
+            unreadable_key_ids: unreadable.into_reported_ids(!page.truncated && started_at_the_first_key(request))?,
         })
     }
 
@@ -3625,8 +3629,13 @@ mod tests {
     /// key that is still on disk, and the deletion sweep — which counts the
     /// lifecycle gauges out of the pages it lists — would report a census it
     /// never fully saw as complete.
+    ///
+    /// It must not fail the whole listing either: one damaged record would then
+    /// stop every readable key from ever being listed, and with it every
+    /// scheduled deletion on this node. The identifier is reported alongside the
+    /// keys that did read, so the page is honest and the caller still advances.
     #[tokio::test]
-    async fn list_keys_fails_closed_on_a_record_it_cannot_interpret() {
+    async fn list_keys_reports_a_record_it_cannot_interpret_without_dropping_it() {
         let (client, _temp_dir) = create_test_client().await;
         client.create_key("alpha", "AES_256", None).await.expect("create alpha");
         client.create_key("beta", "AES_256", None).await.expect("create beta");
@@ -3641,16 +3650,137 @@ mod tests {
             .await
             .expect("write record");
 
-        let error = client
+        let response = client
             .list_keys(&ListKeysRequest::default(), None)
             .await
-            .expect_err("a listing must not quietly omit a key it cannot read");
+            .expect("one unreadable record must not fail the whole listing");
+        assert_eq!(
+            response.keys.iter().map(|key| key.key_id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"],
+            "the readable key must still be listed"
+        );
+        assert_eq!(
+            response.unreadable_key_ids,
+            vec!["beta".to_string()],
+            "a key this build cannot read must be named, not quietly omitted"
+        );
+
+        // Describing it directly still fails closed with the typed error, and
+        // the raw marker value stays out of the message.
+        let error = client
+            .describe_key("beta", None)
+            .await
+            .expect_err("describe must fail closed");
         assert!(
             matches!(&error, KmsError::UnsupportedFormatVersion { key_id, version }
                 if key_id == "beta" && version == UNKNOWN_STORED_KEY_PROTECTION),
             "got {error:?}"
         );
         assert!(!error.to_string().contains("secret-marker-value-must-not-leak"));
+    }
+
+    /// Per-key attribution is only honest while some key on the page reads.
+    ///
+    /// When none does, the cause is almost certainly shared — a node reading
+    /// records written in a format it has no reader for, or a policy that
+    /// denies the whole subtree — and answering `200 OK` with an empty `keys`
+    /// list is indistinguishable, to every client that predates
+    /// `unreadable_key_ids`, from a deployment that simply has no keys. The
+    /// operator response to that is to provision a new key, which is the
+    /// destructive move the fail-closed rules exist to prevent.
+    #[tokio::test]
+    async fn a_page_whose_keys_are_all_unreadable_fails_instead_of_looking_empty() {
+        let (client, _temp_dir) = create_test_client().await;
+        for key_id in ["alpha", "beta"] {
+            client.create_key(key_id, "AES_256", None).await.expect("create key");
+            let key_path = client.master_key_path(key_id).expect("valid key id");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+            record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+            fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+                .await
+                .expect("write record");
+        }
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a page with nothing readable must fail, not report an empty key set");
+        assert!(
+            matches!(&error, KmsError::UnsupportedFormatVersion { .. }),
+            "the failure must name what went wrong: {error:?}"
+        );
+
+        // An empty marker is not the same as no marker to a caller, but it is
+        // to the pager: both start at the first key. A generated client that
+        // always emits its cursor parameter must not fall through the guard.
+        let error = client
+            .list_keys(
+                &ListKeysRequest {
+                    marker: Some(String::new()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("an empty marker starts at the first key and must not bypass the guard");
+        assert!(matches!(&error, KmsError::UnsupportedFormatVersion { .. }), "got {error:?}");
+    }
+
+    /// The all-unreadable guard must never become a cursor trap.
+    ///
+    /// It only fires for a listing that both started at the beginning and
+    /// reached the end, because such a page has no successor to advance to.
+    /// Applying it per page instead would mean a caller with `limit=1` gets a
+    /// failure — and a failure carries no `next_marker` — the moment its page
+    /// lands on the damaged key, leaving every key behind it permanently
+    /// unreachable.
+    #[tokio::test]
+    async fn a_damaged_key_never_blocks_paging_past_it() {
+        let (client, _temp_dir) = create_test_client().await;
+        for key_id in ["a-first", "b-damaged", "c-last"] {
+            client.create_key(key_id, "AES_256", None).await.expect("create key");
+        }
+        let key_path = client.master_key_path("b-damaged").expect("valid key id");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("read record")).expect("decode record");
+        record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+        fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+            .await
+            .expect("write record");
+
+        // Walk the whole key set one key at a time, exactly as a client that
+        // pages until `truncated` is false would.
+        let mut marker = None;
+        let mut seen = Vec::new();
+        let mut reported_unreadable = Vec::new();
+        loop {
+            let page = client
+                .list_keys(
+                    &ListKeysRequest {
+                        limit: Some(1),
+                        marker: marker.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("a one-key page containing the damaged key must still be answerable");
+            seen.extend(page.keys.iter().map(|key| key.key_id.clone()));
+            reported_unreadable.extend(page.unreadable_key_ids.clone());
+            if !page.truncated {
+                break;
+            }
+            marker = page.next_marker;
+            assert!(marker.is_some(), "a truncated page must carry a cursor");
+        }
+
+        assert_eq!(
+            seen,
+            vec!["a-first".to_string(), "c-last".to_string()],
+            "paging must reach past the damage"
+        );
+        assert_eq!(reported_unreadable, vec!["b-damaged".to_string()]);
     }
 
     #[tokio::test]

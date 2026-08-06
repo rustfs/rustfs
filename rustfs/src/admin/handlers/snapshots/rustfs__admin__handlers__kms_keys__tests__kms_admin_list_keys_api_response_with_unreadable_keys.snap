@@ -1,0 +1,30 @@
+---
+source: rustfs/src/admin/handlers/kms_keys.rs
+expression: "stable_json_value(ListKeysApiResponse\n{\n    keys: vec![snapshot_key_info()], truncated: false, next_marker: None,\n    unreadable_key_ids: vec![\"key-c\".to_string()],\n})"
+---
+{
+  "keys": [
+    {
+      "algorithm": "AES_256",
+      "created_at": "2026-01-01T00:00:00+00:00[UTC]",
+      "created_by": "admin",
+      "description": "snapshot key",
+      "key_id": "key-a",
+      "metadata": {
+        "origin": "RUSTFS_KMS"
+      },
+      "rotated_at": "2026-01-15T00:00:00+00:00[UTC]",
+      "status": "Active",
+      "tags": {
+        "name": "key-a"
+      },
+      "usage": "EncryptDecrypt",
+      "version": 1
+    }
+  ],
+  "next_marker": null,
+  "truncated": false,
+  "unreadable_key_ids": [
+    "key-c"
+  ]
+}
