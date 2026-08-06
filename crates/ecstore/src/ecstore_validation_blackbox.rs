@@ -220,6 +220,126 @@ async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard(
     let mut heal_rx = rustfs_common::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
 
+    // Ordinary PUTs use the same admission channel as read repair. A single
+    // rename target failure still satisfies write quorum, so the committed
+    // version must be queued for convergence without delaying the PUT ACK.
+    let (_put_dirs, put_set) = make_local_set_disks(4, 2).await;
+    let put_bucket = "bb-put-partial-convergence";
+    let put_object = "object.bin";
+    put_set
+        .make_bucket(put_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("PUT bucket should be created");
+    let offline_disk = {
+        let mut disks = put_set.disks.write().await;
+        disks[0].take()
+    };
+    let mut put_reader = PutObjReader::from_vec(vec![0x42; BLOCK_SIZE_V2 + 1024]);
+    let committed = put_set
+        .put_object(
+            put_bucket,
+            put_object,
+            &mut put_reader,
+            &ObjectOptions {
+                no_lock: true,
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("partial ordinary PUT should succeed at write quorum");
+    let committed_version = committed
+        .version_id
+        .expect("versioned PUT should return a version id")
+        .to_string();
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == put_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break request;
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("partial ordinary PUT should enqueue convergence heal");
+    assert_eq!(request.object_version_id.as_deref(), Some(committed_version.as_str()));
+    assert_eq!(request.pool_index, Some(0));
+    assert_eq!(request.set_index, Some(0));
+
+    let duplicate_request = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == put_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break Some(request);
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(duplicate_request.is_none(), "partial ordinary PUT must enqueue exactly one heal request");
+
+    {
+        let mut disks = put_set.disks.write().await;
+        disks[0] = offline_disk;
+    }
+
+    let healthy_bucket = "bb-put-healthy-convergence";
+    put_set
+        .make_bucket(healthy_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("healthy PUT bucket should be created");
+    let mut healthy_reader = PutObjReader::from_vec(b"healthy".to_vec());
+    put_set
+        .put_object(
+            healthy_bucket,
+            put_object,
+            &mut healthy_reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("healthy ordinary PUT should succeed");
+    let healthy_request = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == healthy_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break Some(request);
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(healthy_request.is_none(), "fully converged ordinary PUT must not enqueue heal");
+
     // Keep data-blocks-first reader setup explicit for this deterministic
     // repair assertion (see ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP in
     // set_disk/core/io_primitives.rs): if a caller opts back into all-shards,
