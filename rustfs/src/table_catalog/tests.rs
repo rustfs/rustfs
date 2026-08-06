@@ -2658,8 +2658,8 @@ async fn object_table_catalog_store_restores_table_when_drop_index_delete_fails(
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
-    let namespace = Namespace::parse("sales").unwrap();
-    let table = IdentifierSegment::parse("orders").unwrap();
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
     let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
 
@@ -2718,11 +2718,14 @@ async fn object_table_catalog_store_rejects_invalid_table_warehouse_location() {
     let table = IdentifierSegment::parse("orders").unwrap();
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
-    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
     store
         .create_namespace(test_namespace_entry(bucket, &namespace))
         .await
-        .unwrap();
+        .expect("namespace should be created");
 
     let mut entry = test_table_entry(bucket, &namespace, &table, current);
     entry.warehouse_location = format!("s3://{bucket}/tables/../table-id");
@@ -2751,7 +2754,7 @@ async fn object_table_catalog_store_rejects_deep_table_warehouse_location() {
     store
         .create_namespace(test_namespace_entry(bucket, &namespace))
         .await
-        .unwrap();
+        .expect("table should be created");
 
     let mut entry = test_table_entry(bucket, &namespace, &table, current);
     entry.warehouse_location = format!("s3://{bucket}/{deep_prefix}");
@@ -8504,6 +8507,86 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
     );
 }
 
+async fn assert_catalog_rejects_metadata_changed_after_validation<S>(store: &S, backend: &TestCatalogObjectBackend, bucket: &str)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    let validated_metadata = serde_json::json!({"format-version": 2, "properties": {"owner": "validated"}});
+    let changed_metadata = serde_json::json!({"format-version": 2, "properties": {"owner": "replaced"}});
+    backend
+        .seed_object(
+            bucket,
+            &new_metadata,
+            serde_json::to_vec(&changed_metadata).expect("changed metadata should encode"),
+        )
+        .await;
+
+    let error = store
+        .commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "digest-commit".to_string(),
+            idempotency_key: Some("digest-request".to_string()),
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata.clone(),
+            new_metadata_location: new_metadata,
+            requirements: vec![serde_json::json!({
+                "type": TABLE_METADATA_DIGEST_REQUIREMENT_TYPE,
+                "sha256": canonical_json_sha256(&validated_metadata).expect("metadata digest should build")
+            })],
+            writer: Some("test-client".to_string()),
+        })
+        .await
+        .expect_err("metadata changed after validation must not publish");
+
+    assert_matches!(error, TableCatalogStoreError::Conflict(_));
+    let unchanged = store
+        .load_table(bucket, "sales", "orders")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should remain");
+    assert_eq!(unchanged.metadata_location, current_metadata);
+    assert_eq!(unchanged.version_token, "token-v1");
+    assert_eq!(unchanged.generation, 1);
+}
+
+#[tokio::test]
+async fn catalog_backings_reject_metadata_changed_after_validation() {
+    let object_backend = TestCatalogObjectBackend::default();
+    assert_catalog_rejects_metadata_changed_after_validation(
+        &ObjectTableCatalogStore::new(object_backend.clone()),
+        &object_backend,
+        "object-catalog",
+    )
+    .await;
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    assert_catalog_rejects_metadata_changed_after_validation(
+        &StrongTableCatalogStore::new(strong_backend.clone()),
+        &strong_backend,
+        "strong-catalog",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn object_table_catalog_store_syncs_warehouse_location_from_committed_metadata() {
     let backend = TestCatalogObjectBackend::default();
@@ -8748,6 +8831,162 @@ async fn object_table_catalog_store_recovers_staged_commit_after_post_cas_finali
     assert_eq!(retry.commit_log.status, CommitLogStatus::Committed);
     let committed = store.get_commit_by_id(bucket, "table-id", "commit-1").await.unwrap().unwrap();
     assert_eq!(committed.status, CommitLogStatus::Committed);
+}
+
+#[test]
+fn failed_commit_does_not_prove_historical_staged_commit() {
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table_name = IdentifierSegment::parse("orders").expect("table should parse");
+    let mut table = test_table_entry(
+        "analytics",
+        &namespace,
+        &table_name,
+        default_table_metadata_file_path(&namespace, &table_name, "00003.metadata.json"),
+    );
+    table.version_token = "token-v3".to_string();
+    table.generation = 3;
+    let target = CommitLogEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        commit_id: "commit-1".to_string(),
+        idempotency_key: None,
+        table_id: table.table_id.clone(),
+        operation: "append".to_string(),
+        expected_version_token: "token-v1".to_string(),
+        new_version_token: "token-v2".to_string(),
+        previous_metadata_location: default_table_metadata_file_path(&namespace, &table_name, "00001.metadata.json"),
+        new_metadata_location: default_table_metadata_file_path(&namespace, &table_name, "00002.metadata.json"),
+        requirements: Vec::new(),
+        status: CommitLogStatus::Staged,
+        writer: None,
+        created_at: None,
+        updated_at: None,
+    };
+    let failed = CommitLogEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        commit_id: "commit-2".to_string(),
+        idempotency_key: None,
+        table_id: table.table_id.clone(),
+        operation: "append".to_string(),
+        expected_version_token: "token-v2".to_string(),
+        new_version_token: "token-v3".to_string(),
+        previous_metadata_location: target.new_metadata_location.clone(),
+        new_metadata_location: table.metadata_location.clone(),
+        requirements: Vec::new(),
+        status: CommitLogStatus::Failed,
+        writer: None,
+        created_at: None,
+        updated_at: None,
+    };
+
+    assert!(!table_commit_history_proves_committed(&table, &target, &[target.clone(), failed.clone()]));
+    let recovery = table_commit_recovery_entry(&table, &failed, None, false);
+    assert_eq!(recovery.recovery_state, TableCommitRecoveryState::ManualReview);
+}
+
+#[tokio::test]
+async fn object_table_catalog_store_recovers_historical_staged_commit_after_later_commit() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let first_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let second_metadata = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+    let first_commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    backend.seed_object(bucket, &first_metadata, b"{}".to_vec()).await;
+    backend.seed_object(bucket, &second_metadata, b"{}".to_vec()).await;
+    backend.fail_put_attempt(RUSTFS_META_BUCKET, &first_commit_path, 2).await;
+
+    let first_request = TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        commit_id: "commit-1".to_string(),
+        idempotency_key: Some("request-1".to_string()),
+        operation: "append".to_string(),
+        expected_version_token: "token-v1".to_string(),
+        expected_metadata_location: current_metadata,
+        new_metadata_location: first_metadata.clone(),
+        requirements: Vec::new(),
+        writer: None,
+    };
+    let first = store
+        .commit_table(first_request.clone())
+        .await
+        .expect("first commit should publish despite finalization failure");
+    assert_eq!(
+        store
+            .get_commit_by_id(bucket, "table-id", "commit-1")
+            .await
+            .expect("first commit lookup should succeed")
+            .expect("first commit record should exist")
+            .status,
+        CommitLogStatus::Staged
+    );
+
+    let second = store
+        .commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "commit-2".to_string(),
+            idempotency_key: Some("request-2".to_string()),
+            operation: "append".to_string(),
+            expected_version_token: first.table.version_token,
+            expected_metadata_location: first_metadata,
+            new_metadata_location: second_metadata.clone(),
+            requirements: Vec::new(),
+            writer: None,
+        })
+        .await
+        .expect("second commit should succeed");
+
+    let report = store
+        .plan_table_commit_recovery(bucket, "sales", "orders")
+        .await
+        .expect("commit recovery plan should succeed");
+    assert_eq!(report.finalization_required_count, 1);
+    assert_eq!(report.manual_review_count, 0);
+    assert_eq!(
+        report
+            .commits
+            .iter()
+            .find(|commit| commit.commit_id == "commit-1")
+            .expect("first commit should be reported")
+            .recovery_state,
+        TableCommitRecoveryState::FinalizationRequired
+    );
+
+    let replay = store
+        .commit_table(first_request)
+        .await
+        .expect("historical commit retry should finalize");
+    assert_eq!(replay.table.metadata_location, second_metadata);
+    assert_eq!(replay.table.version_token, second.table.version_token);
+    assert_eq!(replay.commit_log.status, CommitLogStatus::Committed);
+    assert_eq!(
+        store
+            .get_commit_by_id(bucket, "table-id", "commit-1")
+            .await
+            .expect("first commit lookup should succeed")
+            .expect("first commit record should exist")
+            .status,
+        CommitLogStatus::Committed
+    );
 }
 
 #[tokio::test]
@@ -9021,6 +9260,109 @@ async fn table_commit_recovery_repairs_stale_idempotency_index_after_partial_fin
         .unwrap()
         .unwrap();
     assert_eq!(repaired_index.status, CommitLogStatus::Committed);
+}
+
+#[tokio::test]
+async fn table_commit_recovery_does_not_overwrite_conflicting_idempotency_index() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let paths = TableCatalogObjectPaths::default();
+    let commit_path = paths.commit_log_entry_path(bucket, "table-id", "commit-1");
+    let idempotency_path = paths.commit_idempotency_entry_path(bucket, "table-id", "client-request-1");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    let request = TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        commit_id: "commit-1".to_string(),
+        idempotency_key: Some("client-request-1".to_string()),
+        operation: "append".to_string(),
+        expected_version_token: "token-v1".to_string(),
+        expected_metadata_location: current_metadata,
+        new_metadata_location: new_metadata,
+        requirements: Vec::new(),
+        writer: None,
+    };
+    let committed = store.commit_table(request.clone()).await.expect("commit should succeed");
+    let mut conflicting_index = committed.commit_log;
+    conflicting_index.new_metadata_location = "different/metadata.json".to_string();
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &idempotency_path,
+            serde_json::to_vec(&conflicting_index).expect("conflicting index should encode"),
+        )
+        .await;
+    let commit_before = backend
+        .read_object(RUSTFS_META_BUCKET, &commit_path)
+        .await
+        .expect("commit record lookup should succeed")
+        .expect("commit record should exist")
+        .data;
+    let index_before = backend
+        .read_object(RUSTFS_META_BUCKET, &idempotency_path)
+        .await
+        .expect("idempotency index lookup should succeed")
+        .expect("idempotency index should exist")
+        .data;
+
+    let retry_error = store
+        .commit_table(request)
+        .await
+        .expect_err("conflicting index must fail closed");
+    assert_matches!(retry_error, TableCatalogStoreError::Conflict(_));
+    let planned = store
+        .plan_table_commit_recovery(bucket, "sales", "orders")
+        .await
+        .expect("commit recovery plan should succeed");
+    assert_eq!(planned.manual_review_count, 1);
+    assert_eq!(planned.commits[0].recovery_state, TableCommitRecoveryState::ManualReview);
+    assert_eq!(
+        planned.commits[0].idempotency_index_status,
+        TableCommitIdempotencyIndexStatus::Conflicting
+    );
+
+    let recovered = store
+        .recover_table_commits(bucket, "sales", "orders")
+        .await
+        .expect("commit recovery should succeed");
+    assert_eq!(recovered.manual_review_count, 1);
+    assert_eq!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &commit_path)
+            .await
+            .expect("commit record lookup should succeed")
+            .expect("commit record should remain")
+            .data,
+        commit_before
+    );
+    assert_eq!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &idempotency_path)
+            .await
+            .expect("idempotency index lookup should succeed")
+            .expect("conflicting index should remain")
+            .data,
+        index_before
+    );
 }
 
 #[tokio::test]

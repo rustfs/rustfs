@@ -109,6 +109,9 @@ pub(crate) fn recursive_force_delete_is_authorized(headers: &HeaderMap, is_owner
 pub(crate) struct PostObjectRequestMarker;
 
 #[derive(Clone, Debug)]
+struct InternalObjectAuthorization;
+
+#[derive(Clone, Debug)]
 pub(crate) struct BucketGenerationGuard {
     bucket: String,
     incarnation_id: uuid::Uuid,
@@ -566,9 +569,43 @@ fn authorization_conditions<T>(
         req.uri.query(),
         client_info,
     );
+    if req.extensions.get::<InternalObjectAuthorization>().is_some() {
+        retain_internal_object_authorization_conditions(&mut conditions, cred);
+        return Ok(conditions);
+    }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
     Ok(conditions)
+}
+
+fn retain_internal_object_authorization_conditions(
+    conditions: &mut HashMap<String, Vec<String>>,
+    cred: &rustfs_credentials::Credentials,
+) {
+    conditions.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "CurrentTime"
+                | "EpochTime"
+                | "SecureTransport"
+                | "SourceIp"
+                | "UserAgent"
+                | "Referer"
+                | "userid"
+                | "username"
+                | "principaltype"
+                | "signatureversion"
+                | "signatureAge"
+                | "authType"
+                | "LocationConstraint"
+                | "groups"
+                | "roles"
+        ) || cred.claims.as_ref().is_some_and(|claims| {
+            claims
+                .keys()
+                .any(|claim| claim.trim_start_matches("ldap").to_lowercase() == *key)
+        })
+    });
 }
 
 /// Condition values for an authorization decision that is not scoped to a bucket or object.
@@ -846,6 +883,7 @@ impl DenialContext<'_> {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let req_info = req_info_ref(req)?;
     let cred = req_info.cred.clone();
@@ -1027,8 +1065,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         };
 
         if iam_allowed {
-            authorize_table_data_plane_if_needed(action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions, claims)
+            if !internal_object_authorization {
+                authorize_table_data_plane_if_needed(
+                    action,
+                    bucket.as_str(),
+                    object.as_str(),
+                    cred,
+                    is_owner,
+                    &conditions,
+                    claims,
+                )
                 .await?;
+            }
             return Ok(());
         }
 
@@ -1050,8 +1098,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         .map_err(ApiError::from)?;
 
         if policy_allowed_fallback {
-            authorize_table_data_plane_if_needed(action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions, claims)
+            if !internal_object_authorization {
+                authorize_table_data_plane_if_needed(
+                    action,
+                    bucket.as_str(),
+                    object.as_str(),
+                    cred,
+                    is_owner,
+                    &conditions,
+                    claims,
+                )
                 .await?;
+            }
             return Ok(());
         }
 
@@ -1423,6 +1481,14 @@ async fn authorize_table_data_plane_if_needed(
         "table data-plane access denied by table resource policy"
     );
     Err(s3_error!(AccessDenied, "Access Denied"))
+}
+
+/// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
+pub(crate) async fn authorize_internal_object_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    req.extensions.insert(InternalObjectAuthorization);
+    let result = authorize_request(req, action).await;
+    req.extensions.remove::<InternalObjectAuthorization>();
+    result
 }
 
 async fn deny_anonymous_table_data_plane_if_needed(action: Action, bucket: &str, object: &str) -> S3Result<()> {
@@ -2698,15 +2764,16 @@ impl S3Access for FS {
 mod tests {
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
-        BucketPolicyRawLoadErrorKind, DenialContext, FS, ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access,
-        StorageError, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        bucket_policy_needs_existing_object_tag_from_hint, bucket_website_config_authorize_action,
-        classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action,
-        has_write_offset_bytes_header, install_restore_authorization_test_hook, legal_hold_write_requested,
-        list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions,
-        merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
-        post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested,
-        secondary_tag_hint_action, table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
+        BucketPolicyRawLoadErrorKind, DenialContext, FS, InternalObjectAuthorization, ObjectTagConditions,
+        PostObjectRequestMarker, ReqInfo, S3Access, StorageError, apply_bucket_generation_guard,
+        apply_copy_source_bucket_generation_guard, authorization_conditions, bucket_policy_needs_existing_object_tag_from_hint,
+        bucket_website_config_authorize_action, classify_bucket_policy_raw_load_error,
+        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
+        install_restore_authorization_test_hook, legal_hold_write_requested, list_parts_authorize_action,
+        load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions,
+        merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
+        put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
+        table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -2985,6 +3052,34 @@ mod tests {
             destination_conditions.get("RequestObjectTagKeys"),
             Some(&vec!["classification".to_string(), "label".to_string()])
         );
+    }
+
+    #[test]
+    fn internal_object_authorization_ignores_unapplied_request_options() {
+        let mut req = build_request((), Method::POST);
+        req.headers.insert(
+            "authorization",
+            HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test/20260801/us-east-1/s3tables/aws4_request"),
+        );
+        req.headers.insert("user-agent", HeaderValue::from_static("pyiceberg/test"));
+        req.headers
+            .insert("x-amz-server-side-encryption", HeaderValue::from_static("AES256"));
+        req.headers
+            .insert("x-amz-tagging", HeaderValue::from_static("classification=%ZZ"));
+        req.extensions.insert(InternalObjectAuthorization);
+
+        let credentials = rustfs_credentials::Credentials::default();
+        let conditions =
+            authorization_conditions(&req, &credentials, None, None, None, None, Action::S3Action(S3Action::PutObjectAction))
+                .expect("internal object authorization conditions should build");
+
+        assert_eq!(conditions.get("authType"), Some(&vec!["REST-HEADER".to_string()]));
+        assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_string()]));
+        assert_eq!(conditions.get("UserAgent"), Some(&vec!["pyiceberg/test".to_string()]));
+        assert!(!conditions.contains_key("authorization"));
+        assert!(!conditions.contains_key("x-amz-server-side-encryption"));
+        assert!(!conditions.contains_key("RequestObjectTag/classification"));
+        assert!(!conditions.contains_key("RequestObjectTagKeys"));
     }
 
     #[tokio::test]

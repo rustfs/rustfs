@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::super::*;
 
 pub(crate) fn commit_log_matches_request(commit_log: &CommitLogEntry, request: &TableCommitRequest, table_id: &str) -> bool {
@@ -37,6 +39,44 @@ pub(crate) fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitL
     table.table_id == commit_log.table_id
         && table.metadata_location == commit_log.previous_metadata_location
         && table.version_token == commit_log.expected_version_token
+}
+
+pub(crate) fn table_commit_history_proves_committed(
+    table: &TableEntry,
+    target: &CommitLogEntry,
+    commits: &[CommitLogEntry],
+) -> bool {
+    if table.table_id != target.table_id || matches!(target.status, CommitLogStatus::Failed) {
+        return false;
+    }
+    let target_state = (target.new_metadata_location.as_str(), target.new_version_token.as_str());
+    let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
+    if state == target_state {
+        return true;
+    }
+
+    let mut by_new_state = BTreeMap::<(&str, &str), Option<&CommitLogEntry>>::new();
+    for commit in commits
+        .iter()
+        .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
+    {
+        let key = (commit.new_metadata_location.as_str(), commit.new_version_token.as_str());
+        by_new_state
+            .entry(key)
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(commit));
+    }
+    let mut visited = BTreeSet::new();
+    while visited.insert(state) {
+        let Some(Some(commit)) = by_new_state.get(&state) else {
+            return false;
+        };
+        state = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
+        if state == target_state {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn table_catalog_recovery_summary(
@@ -109,6 +149,7 @@ pub(crate) fn table_commit_recovery_entry(
     table: &TableEntry,
     commit_log: &CommitLogEntry,
     idempotency_commit: Option<&CommitLogEntry>,
+    historically_committed: bool,
 ) -> TableCommitRecoveryEntry {
     let idempotency_index_status = commit_idempotency_index_status(commit_log, idempotency_commit);
     let idempotency_index_present = matches!(
@@ -126,6 +167,11 @@ pub(crate) fn table_commit_recovery_entry(
         (
             TableCommitRecoveryState::ManualReview,
             "idempotency index points at a different commit payload".to_string(),
+        )
+    } else if matches!(commit_log.status, CommitLogStatus::Failed) {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "failed commit log cannot be finalized automatically".to_string(),
         )
     } else if table_matches_committed_log(table, commit_log) {
         if matches!(commit_log.status, CommitLogStatus::Committed) {
@@ -146,6 +192,11 @@ pub(crate) fn table_commit_recovery_entry(
                 "current table pointer already advanced but commit log is not finalized".to_string(),
             )
         }
+    } else if matches!(commit_log.status, CommitLogStatus::Staged) && historically_committed {
+        (
+            TableCommitRecoveryState::FinalizationRequired,
+            "a later committed pointer proves this staged commit is part of table history".to_string(),
+        )
     } else if matches!(commit_log.status, CommitLogStatus::Committed) {
         if idempotency_index_repair_required {
             (

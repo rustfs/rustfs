@@ -279,7 +279,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action}).await?;")),
+            block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action})")),
             "{handler} should require {action} with catalog resource auth"
         );
         assert!(
@@ -353,7 +353,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
             "{handler} should build a table-aware catalog resource"
         );
         assert!(
-            block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action}).await?;")),
+            block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action})")),
             "{handler} should authorize against the table-aware catalog resource"
         );
     }
@@ -1936,6 +1936,7 @@ async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct
     let metadata_backend = TestTableCatalogObjectBackend {
         objects: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         put_object_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        ..Default::default()
     };
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
@@ -2197,6 +2198,329 @@ async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_m
 }
 
 #[tokio::test]
+async fn commit_publication_uses_idempotency_key_as_retry_identity() {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let idempotency_key = Uuid::now_v7().to_string();
+    let request = serde_json::from_value(serde_json::json!({
+        "idempotency-key": idempotency_key,
+        "requirements": [],
+        "updates": [{
+            "action": "set-properties",
+            "updates": {"owner": "lakehouse"}
+        }]
+    }))
+    .expect("standard commit request should parse");
+
+    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", request)
+        .await
+        .expect("standard commit should succeed");
+
+    assert_eq!(commit.commit_id, idempotency_key);
+    assert!(commit.metadata_location.contains(&idempotency_key));
+}
+
+#[tokio::test]
+async fn commit_publication_replays_historical_standard_commit_across_backings() {
+    for mode in [
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
+    ] {
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let first_request = serde_json::json!({
+            "commit-id": "commit-a",
+            "idempotency-key": "request-a",
+            "writer": "test-client",
+            "requirements": [],
+            "updates": [{
+                "action": "set-properties",
+                "updates": {"owner": "first"}
+            }]
+        });
+        standard_commit_table_response(
+            &store,
+            &metadata_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(first_request.clone()).expect("first commit request should parse"),
+        )
+        .await
+        .expect("first commit should update the table");
+
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let second = standard_commit_table_response(
+            &store,
+            &metadata_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(serde_json::json!({
+                "commit-id": "commit-b",
+                "idempotency-key": "request-b",
+                "requirements": [],
+                "updates": [{
+                    "action": "set-properties",
+                    "updates": {"owner": "current"}
+                }]
+            }))
+            .expect("second commit request should parse"),
+        )
+        .await
+        .expect("second commit should advance the table");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("current table lookup should succeed")
+            .expect("current table should exist");
+
+        let replay = standard_commit_table_response(
+            &store,
+            &metadata_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(first_request.clone()).expect("first commit retry should parse"),
+        )
+        .await
+        .expect("an exact old commit retry should succeed");
+
+        assert_eq!(replay.commit_id, "commit-a", "{mode:?}");
+        assert_eq!(replay.metadata_location, second.metadata_location, "{mode:?}");
+        assert_eq!(replay.version_token, second.version_token, "{mode:?}");
+        assert_eq!(replay.generation, second.generation, "{mode:?}");
+        assert_eq!(replay.metadata["properties"]["owner"], "current", "{mode:?}");
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup after replay should succeed")
+            .expect("table should remain present");
+        assert_eq!(unchanged.metadata_location, current.metadata_location, "{mode:?}");
+        assert_eq!(unchanged.version_token, current.version_token, "{mode:?}");
+
+        let mut mutated_request = first_request;
+        mutated_request["updates"][0]["updates"]["owner"] = serde_json::Value::String("mutated".to_string());
+        let error = standard_commit_table_response(
+            &store,
+            &metadata_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(mutated_request).expect("mutated retry should parse"),
+        )
+        .await
+        .expect_err("mutating updates under a persisted idempotency key must conflict");
+        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn commit_publication_denies_generated_metadata_write_before_pointer_advance() {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let before = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let table_name = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
+        &namespace,
+        &table_name,
+        &next_metadata_file_name(before.generation.saturating_add(1), commit_id),
+    );
+    let request = serde_json::from_value(serde_json::json!({
+        "commit-id": commit_id,
+        "requirements": [],
+        "updates": [{
+            "action": "set-properties",
+            "updates": {"owner": "lakehouse"}
+        }]
+    }))
+    .expect("commit request should parse");
+    let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let commit_backend =
+        TableCommitObjectBackend::test(metadata_backend.clone(), Arc::clone(&authorized), Some(next_metadata_location.clone()));
+
+    let result = commit_table_response(&store, &commit_backend, "warehouse", &namespace, "events", request).await;
+    let error = commit_backend
+        .finish(result)
+        .await
+        .expect_err("denied metadata write should fail the commit");
+
+    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    assert!(
+        authorized
+            .lock()
+            .await
+            .contains(&(next_metadata_location.clone(), S3Action::PutObjectAction))
+    );
+    let after = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should remain");
+    assert_eq!(after.metadata_location, before.metadata_location);
+    assert_eq!(after.version_token, before.version_token);
+    assert_eq!(after.generation, before.generation);
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &next_metadata_location)
+            .await
+            .expect("metadata object lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn commit_publication_authorizes_referenced_objects() {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let entry = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let table_location = created.metadata["location"]
+        .as_str()
+        .expect("created metadata should have table location");
+    let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+    let manifest = format!("{table_location}/metadata/manifest-snap-10.avro");
+    let data_file = format!("{table_location}/data/part-10.parquet");
+    seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
+    let request = serde_json::from_value(serde_json::json!({
+        "commit-id": "22222222-2222-4222-8222-222222222222",
+        "requirements": [],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 10,
+                    "sequence-number": 1,
+                    "timestamp-ms": 1234,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                }
+            },
+            {
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "snapshot-id": 10,
+                "type": "branch"
+            }
+        ]
+    }))
+    .expect("standard commit request should parse");
+    let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let commit_backend = TableCommitObjectBackend::test(metadata_backend.clone(), Arc::clone(&authorized), None);
+
+    let result = commit_table_response(&store, &commit_backend, "warehouse", &namespace, "events", request).await;
+    commit_backend
+        .finish(result)
+        .await
+        .expect("authorized standard commit should succeed");
+
+    let authorizations = authorized.lock().await;
+    let expected_reads = [
+        entry.metadata_location,
+        test_snapshot_object_key("warehouse", &manifest_list),
+        test_snapshot_object_key("warehouse", &manifest),
+        test_snapshot_object_key("warehouse", &data_file),
+    ];
+    for object in expected_reads {
+        assert!(
+            authorizations
+                .iter()
+                .any(|(authorized_object, action)| authorized_object == &object && *action == S3Action::GetObjectAction),
+            "missing GetObject authorization for {object}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_publication_holds_referenced_object_locks_until_pointer_publish() {
+    let pause = TestCatalogPublishPause::default();
+    let store = Arc::new(TestTableCatalogStore {
+        commit_table_pause: Some(pause.clone()),
+        ..Default::default()
+    });
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let created = create_standard_events_table(store.as_ref(), &metadata_backend, &namespace).await;
+    let table_location = created.metadata["location"]
+        .as_str()
+        .expect("created metadata should have table location");
+    let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+    let manifest = format!("{table_location}/metadata/manifest-snap-10.avro");
+    let data_file = format!("{table_location}/data/part-10.parquet");
+    seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
+    let request = serde_json::from_value(serde_json::json!({
+        "requirements": [],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 10,
+                    "sequence-number": 1,
+                    "timestamp-ms": 1234,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                }
+            },
+            {
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "snapshot-id": 10,
+                "type": "branch"
+            }
+        ]
+    }))
+    .expect("standard commit request should parse");
+    let commit_store = Arc::clone(&store);
+    let commit_namespace = namespace.clone();
+    let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+    let commit = tokio::spawn(async move {
+        let result =
+            commit_table_response(commit_store.as_ref(), &commit_backend, "warehouse", &commit_namespace, "events", request)
+                .await;
+        commit_backend.finish(result).await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(2), pause.wait_started())
+        .await
+        .expect("commit should reach catalog publication");
+    for location in [&manifest_list, &manifest, &data_file] {
+        let object = test_snapshot_object_key("warehouse", location);
+        assert!(
+            metadata_backend.write_lock_is_held("warehouse", &object).await,
+            "snapshot object lock must remain held during catalog publication: {location}"
+        );
+    }
+    pause.release();
+    tokio::time::timeout(StdDuration::from_secs(2), commit)
+        .await
+        .expect("commit task should complete")
+        .expect("commit task should join")
+        .expect("standard commit should succeed");
+    for location in [&manifest_list, &manifest, &data_file] {
+        let object = test_snapshot_object_key("warehouse", location);
+        assert!(
+            !metadata_backend.write_lock_is_held("warehouse", &object).await,
+            "snapshot object lock must be released after catalog publication: {location}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
     let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::default();
@@ -2249,6 +2573,7 @@ async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointe
     let metadata_backend = TestTableCatalogObjectBackend {
         objects: Arc::clone(&metadata_backend.objects),
         put_object_barrier: Some(barrier),
+        ..Default::default()
     };
     let first_commit_id = "33333333-3333-4333-8333-333333333333";
     let second_commit_id = "44444444-4444-4444-8444-444444444444";
@@ -5291,12 +5616,32 @@ struct TestTableCatalogStore {
     views: tokio::sync::Mutex<Vec<crate::table_catalog::ViewEntry>>,
     commits: tokio::sync::Mutex<Vec<crate::table_catalog::CommitLogEntry>>,
     fail_put_table_bucket: tokio::sync::Mutex<bool>,
+    commit_table_pause: Option<TestCatalogPublishPause>,
 }
+
+#[derive(Clone, Default)]
+struct TestCatalogPublishPause {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl TestCatalogPublishPause {
+    async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+type TestTableCatalogObjectLocks = Arc<tokio::sync::Mutex<BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
 
 #[derive(Clone, Default)]
 struct TestTableCatalogObjectBackend {
     objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
     put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
+    locks: TestTableCatalogObjectLocks,
 }
 
 impl TestTableCatalogObjectBackend {
@@ -5341,6 +5686,16 @@ impl TestTableCatalogObjectBackend {
                 mod_time,
             },
         );
+    }
+
+    async fn write_lock_is_held(&self, bucket: &str, object: &str) -> bool {
+        let lock = self
+            .locks
+            .lock()
+            .await
+            .get(&(bucket.to_string(), object.to_string()))
+            .cloned();
+        lock.is_some_and(|lock| lock.try_lock_owned().is_err())
     }
 }
 
@@ -5821,10 +6176,17 @@ impl crate::table_catalog::TableCatalogObjectBackend for TestTableCatalogObjectB
 
     async fn acquire_write_lock(
         &self,
-        _bucket: &str,
-        _object: &str,
+        bucket: &str,
+        object: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<Box<dyn Send>> {
-        Ok(Box::new(()))
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks
+                .entry((bucket.to_string(), object.to_string()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        Ok(Box::new(lock.lock_owned().await))
     }
 }
 
@@ -6030,6 +6392,10 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
                 "current table metadata location does not match expected location".to_string(),
             ));
+        }
+        if let Some(pause) = &self.commit_table_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
         }
 
         let mut next = current.clone();
