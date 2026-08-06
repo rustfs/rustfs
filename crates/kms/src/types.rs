@@ -448,6 +448,18 @@ pub struct ListKeysResponse {
     pub next_marker: Option<String>,
     /// Whether there are more keys available
     pub truncated: bool,
+    /// Identifiers that are present in the key store but that this build could
+    /// not describe, in listing order.
+    ///
+    /// A key whose record cannot be interpreted must not simply be missing from
+    /// `keys`: an inventory that silently omits it reads as "you do not have
+    /// this key", and the deletion sweep's census would be taken over a key set
+    /// it never fully saw. Reporting the identifier separately keeps the page
+    /// honest while still letting the caller page past the damage. Errors that
+    /// say nothing about a specific key — timeouts, 5xx, auth failures — still
+    /// fail the whole listing rather than landing here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_key_ids: Vec<String>,
 }
 
 /// Operation context for auditing and access control

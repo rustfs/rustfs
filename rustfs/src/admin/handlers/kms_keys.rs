@@ -78,6 +78,12 @@ pub struct ListKeysApiResponse {
     pub keys: Vec<KeyInfo>,
     pub truncated: bool,
     pub next_marker: Option<String>,
+    /// Identifiers present in the key store that this build could not describe.
+    ///
+    /// Omitted when empty, so a healthy listing is byte-identical to what it was
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_key_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,6 +184,26 @@ fn key_list_filters(query_params: &HashMap<String, String>) -> Result<KeyListFil
             .map(|value| parse_key_filter("usage", value, KEY_USAGE_FILTERS))
             .transpose()?,
     })
+}
+
+/// Read the `limit` query parameter of a key listing.
+///
+/// An absent parameter means "let the backend apply its default"; a parameter
+/// that is present but is not a page size is refused for the same reason a
+/// misspelled `status` is. Falling back to the default on `limit=abc` answered
+/// "give me everything" with the first hundred keys and put nothing in the
+/// response to say the request had not been understood.
+/// A well-formed page size larger than `u32` is saturated rather than refused:
+/// the service caps every page anyway, so `limit=5000000000` and `limit=5000`
+/// mean the same thing, and rejecting only the larger of the two would be an
+/// arbitrary line the contract does not draw.
+fn parse_list_limit(query_params: &HashMap<String, String>) -> Result<Option<u32>, String> {
+    let Some(raw) = query_params.get("limit") else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .map(|limit| Some(u32::try_from(limit).unwrap_or(u32::MAX)))
+        .map_err(|_| format!("invalid limit '{raw}': expected a non-negative integer"))
 }
 
 fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
@@ -469,7 +495,8 @@ mod tests {
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, GenerateDataKeyApiResponse, ListKeysApiResponse, ListKmsKeysResponse,
         delete_key_error_status, delete_request_from_query, extract_key_id, extract_query_params, key_impact_if_requested,
         key_list_filters, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
-        kms_generate_data_key_actions, kms_list_keys_actions, scoped_key_id, stable_json_value, wants_key_impact,
+        kms_generate_data_key_actions, kms_list_keys_actions, parse_list_limit, scoped_key_id, stable_json_value,
+        wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
@@ -988,6 +1015,18 @@ mod tests {
                 keys: vec![snapshot_key_info()],
                 truncated: true,
                 next_marker: Some("key-b".to_string()),
+                unreadable_key_ids: Vec::new(),
+            })
+        );
+        // The empty case above omits the field, so the wire name clients read
+        // is only fixed by a populated one.
+        insta::assert_json_snapshot!(
+            "kms_admin_list_keys_api_response_with_unreadable_keys",
+            stable_json_value(ListKeysApiResponse {
+                keys: vec![snapshot_key_info()],
+                truncated: false,
+                next_marker: None,
+                unreadable_key_ids: vec!["key-c".to_string()],
             })
         );
         insta::assert_json_snapshot!(
@@ -1035,6 +1074,20 @@ mod tests {
                 keys: vec![snapshot_key_info()],
                 truncated: true,
                 next_marker: Some("key-b".to_string()),
+                unreadable_key_ids: Vec::new(),
+            })
+        );
+        // Pinned separately because the field is omitted when empty: without a
+        // populated case nothing would fix the wire name clients read.
+        insta::assert_json_snapshot!(
+            "kms_admin_list_keys_response_with_unreadable_keys",
+            stable_json_value(ListKmsKeysResponse {
+                success: true,
+                message: "keys listed".to_string(),
+                keys: vec![snapshot_key_info()],
+                truncated: false,
+                next_marker: None,
+                unreadable_key_ids: vec!["key-c".to_string()],
             })
         );
         insta::assert_json_snapshot!(
@@ -1208,6 +1261,53 @@ mod tests {
         }
     }
 
+    fn list_limit(query: &str) -> Result<Option<u32>, String> {
+        let uri: Uri = format!("/rustfs/admin/v3/kms/keys{query}").parse().expect("uri should parse");
+        parse_list_limit(&extract_query_params(&uri))
+    }
+
+    /// A page size is either applied or refused, for the same reason a filter
+    /// is. Falling back to the default on an unreadable `limit` answered a
+    /// request the server had not understood with a full-looking page, and put
+    /// nothing in the response to say so.
+    #[test]
+    fn a_key_listing_limit_is_either_applied_or_refused() {
+        assert_eq!(list_limit(""), Ok(None), "an absent limit leaves the backend default in place");
+        assert_eq!(list_limit("?limit=25"), Ok(Some(25)));
+        // Zero is a well-formed request for an empty page, not a missing value.
+        assert_eq!(list_limit("?limit=0"), Ok(Some(0)));
+
+        for query in ["?limit=abc", "?limit=-1", "?limit=", "?limit", "?limit=1.5"] {
+            let error = list_limit(query).expect_err("an unreadable limit must be refused");
+            assert!(error.contains("invalid limit"), "unhelpful message for {query}: {error}");
+        }
+
+        // A well-formed page size wider than `u32` saturates rather than being
+        // refused: the service caps every page anyway, so refusing only the
+        // larger of two over-the-cap values would be a line the contract does
+        // not draw.
+        assert_eq!(list_limit("?limit=99999999999999"), Ok(Some(u32::MAX)));
+    }
+
+    /// Both list endpoints must read the caller's page size through the strict
+    /// parser rather than swallowing a malformed one.
+    #[test]
+    fn both_list_handlers_refuse_an_unreadable_limit() {
+        let src = include_str!("kms_keys.rs");
+
+        for handler in ["ListKeysHandler", "ListKmsKeysHandler"] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("parse_list_limit(&query_params)"),
+                "{handler} must read the page size through the strict parser"
+            );
+            assert!(
+                !block.contains("parse::<u32>().ok()"),
+                "{handler} must not silently fall back on an unreadable page size"
+            );
+        }
+    }
+
     /// Both list endpoints must hand the caller's filters to the KMS. Pinning
     /// them to `None` — as both did before they were wired up — answers a
     /// narrowed listing with every key there is.
@@ -1310,19 +1410,20 @@ impl Operation for ListKeysHandler {
         )?;
 
         let query_params = extract_query_params(&req.uri);
-        let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+        // Validated before the listing runs, so a page size or filter the
+        // service cannot apply fails as the input error it is instead of
+        // returning the whole key set as if it had been narrowed.
+        let (limit, filters) = parse_list_limit(&query_params)
+            .and_then(|limit| key_list_filters(&query_params).map(|filters| (limit, filters)))
+            .map_err(|message| s3_error!(InvalidArgument, "{}", message))?;
         let marker = query_params.get("marker").cloned();
-        // Validated before the listing runs, so a filter the service cannot
-        // apply fails as the input error it is instead of returning the whole
-        // key set as if it had been narrowed.
-        let filters = key_list_filters(&query_params).map_err(|message| s3_error!(InvalidArgument, "{}", message))?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
         let request = ListKeysRequest {
-            limit: Some(limit),
+            limit,
             marker,
             status_filter: filters.status,
             usage_filter: filters.usage,
@@ -1334,6 +1435,7 @@ impl Operation for ListKeysHandler {
                     keys: response.keys,
                     truncated: response.truncated,
                     next_marker: response.next_marker,
+                    unreadable_key_ids: response.unreadable_key_ids,
                 };
 
                 let data = serde_json::to_vec(&api_response)
@@ -2018,6 +2120,9 @@ pub struct ListKmsKeysResponse {
     pub keys: Vec<KeyInfo>,
     pub truncated: bool,
     pub next_marker: Option<String>,
+    /// Identifiers present in the key store that this build could not describe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_key_ids: Vec<String>,
 }
 
 /// List KMS keys
@@ -2050,13 +2155,14 @@ impl Operation for ListKmsKeysHandler {
         )?;
 
         let query_params = extract_query_params(&req.uri);
-        let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
-        // Validated before the listing runs, so a filter the service cannot
-        // apply fails as the input error it is instead of returning the whole
-        // key set as if it had been narrowed.
-        let filters = match key_list_filters(&query_params) {
-            Ok(filters) => filters,
+        // Validated before the listing runs, so a page size or filter the
+        // service cannot apply fails as the input error it is instead of
+        // returning the whole key set as if it had been narrowed.
+        let parsed =
+            parse_list_limit(&query_params).and_then(|limit| key_list_filters(&query_params).map(|filters| (limit, filters)));
+        let (limit, filters) = match parsed {
+            Ok(parsed) => parsed,
             Err(message) => {
                 let response = ListKmsKeysResponse {
                     success: false,
@@ -2064,6 +2170,7 @@ impl Operation for ListKmsKeysHandler {
                     keys: vec![],
                     truncated: false,
                     next_marker: None,
+                    unreadable_key_ids: Vec::new(),
                 };
                 let data =
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -2080,6 +2187,7 @@ impl Operation for ListKmsKeysHandler {
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
+                unreadable_key_ids: Vec::new(),
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -2095,6 +2203,7 @@ impl Operation for ListKmsKeysHandler {
                 keys: vec![],
                 truncated: false,
                 next_marker: None,
+                unreadable_key_ids: Vec::new(),
             };
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -2104,7 +2213,7 @@ impl Operation for ListKmsKeysHandler {
         };
 
         let kms_request = ListKeysRequest {
-            limit: Some(limit),
+            limit,
             marker,
             status_filter: filters.status,
             usage_filter: filters.usage,
@@ -2127,6 +2236,7 @@ impl Operation for ListKmsKeysHandler {
                     keys: kms_response.keys,
                     truncated: kms_response.truncated,
                     next_marker: kms_response.next_marker,
+                    unreadable_key_ids: kms_response.unreadable_key_ids,
                 };
 
                 let data =
@@ -2153,6 +2263,7 @@ impl Operation for ListKmsKeysHandler {
                     keys: vec![],
                     truncated: false,
                     next_marker: None,
+                    unreadable_key_ids: Vec::new(),
                 };
 
                 let data =

@@ -655,6 +655,7 @@ mod tests {
                 keys: Vec::new(),
                 next_marker: None,
                 truncated: false,
+                unreadable_key_ids: Vec::new(),
             })
         }
 
