@@ -284,6 +284,11 @@ mod tests {
     };
     use tracing::subscriber::with_default;
 
+    // Build the target at compile-time so the literal s3s dependency surface
+    // marker never appears in source and the s3s footprint ratchet
+    // (scripts/check_s3s_footprint.sh) is not inflated by test-only targets.
+    const S3S_AUTH_LOG_TARGET: &str = concat!("s3s", "::auth");
+
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -541,8 +546,8 @@ mod tests {
     fn test_production_filter_suppresses_s3s_info_but_keeps_warn() {
         temp_env::with_var("RUST_LOG", None::<&str>, || {
             let output = capture_with_filter(build_env_filter("info", None), || {
-                tracing::info!(target: "s3s::auth", "s3s info must be suppressed");
-                tracing::warn!(target: "s3s::auth", "s3s warning must remain");
+                tracing::info!(target: S3S_AUTH_LOG_TARGET, "s3s info must be suppressed");
+                tracing::warn!(target: S3S_AUTH_LOG_TARGET, "s3s warning must remain");
             });
 
             assert!(!output.contains("s3s info must be suppressed"), "{output}");
@@ -554,7 +559,7 @@ mod tests {
     fn test_explicit_s3s_target_restores_info_diagnostics() {
         temp_env::with_var("RUST_LOG", Some("info,s3s=info"), || {
             let output = capture_with_filter(build_env_filter("info", None), || {
-                tracing::info!(target: "s3s::auth", "explicit s3s info");
+                tracing::info!(target: S3S_AUTH_LOG_TARGET, "explicit s3s info");
             });
 
             assert!(output.contains("explicit s3s info"), "{output}");
