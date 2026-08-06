@@ -72,7 +72,9 @@ fn should_fail_heal_rename(bucket: &str, object: &str, disk_index: usize) -> boo
         .expect("heal rename failure registry should not poison");
     if let Some(position) = failures
         .iter()
-        .position(|entry| entry == &(bucket.to_string(), object.to_string(), disk_index))
+        .position(|(registered_bucket, registered_object, registered_index)| {
+            registered_bucket == bucket && registered_object == object && *registered_index == disk_index
+        })
     {
         failures.swap_remove(position);
         true
