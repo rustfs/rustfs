@@ -209,6 +209,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             replication_request_authorized: false,
             region: current_region(),
             request_context: None,
+            suppress_denial_log: false,
         }
     }
 }
@@ -1428,6 +1429,7 @@ mod tests {
             replication_request_authorized: false,
             region: current_region(),
             request_context: None,
+            suppress_denial_log: false,
         }
     }
 

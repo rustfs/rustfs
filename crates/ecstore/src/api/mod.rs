@@ -206,7 +206,9 @@ pub mod bucket {
     }
 
     pub mod target {
-        pub use crate::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials, LatencyStat};
+        pub use crate::bucket::target::{
+            ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials, LatencyStat, duration_from_secs_or_nanos,
+        };
     }
 
     pub mod utils {

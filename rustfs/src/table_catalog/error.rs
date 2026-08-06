@@ -60,6 +60,7 @@ pub(crate) enum TableCatalogStoreError {
     NotFound(String),
     Conflict(String),
     Invalid(String),
+    Unsupported(String),
     Internal(String),
 }
 
@@ -69,6 +70,7 @@ impl fmt::Display for TableCatalogStoreError {
             Self::NotFound(message) => write!(f, "table catalog entry not found: {message}"),
             Self::Conflict(message) => write!(f, "table catalog conflict: {message}"),
             Self::Invalid(message) => write!(f, "invalid table catalog entry: {message}"),
+            Self::Unsupported(message) => write!(f, "unsupported table catalog operation: {message}"),
             Self::Internal(message) => write!(f, "table catalog store error: {message}"),
         }
     }

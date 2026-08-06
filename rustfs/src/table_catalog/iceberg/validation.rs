@@ -191,28 +191,23 @@ where
     }
 
     let mut matched: Option<TableDataPlaneResource> = None;
-    for namespace in store.list_namespaces(bucket).await? {
-        if namespace.state != TableCatalogEntryState::Active {
+    for table in store.list_all_tables(bucket).await? {
+        if table.state != TableCatalogEntryState::Active {
             continue;
         }
-        for table in store.list_tables(bucket, &namespace.namespace).await? {
-            if table.state != TableCatalogEntryState::Active {
-                continue;
-            }
-            let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
-                continue;
-            };
-            if !object.starts_with(&warehouse_object_prefix) {
-                continue;
-            }
-            if matched
-                .as_ref()
-                .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
-            {
-                continue;
-            }
-            matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
+        let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
+            continue;
+        };
+        if !object.starts_with(&warehouse_object_prefix) {
+            continue;
         }
+        if matched
+            .as_ref()
+            .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
+        {
+            continue;
+        }
+        matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
     }
 
     Ok(matched)

@@ -71,6 +71,119 @@ pub(crate) struct NamespaceEntry {
     pub updated_at: Option<String>,
 }
 
+pub(crate) const NAMESPACE_PROPERTIES_MAX_ENTRIES: usize = 256;
+pub(crate) const NAMESPACE_PROPERTY_KEY_MAX_LEN: usize = 256;
+pub(crate) const NAMESPACE_PROPERTY_VALUE_MAX_LEN: usize = 4096;
+pub(crate) const NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamespacePropertiesUpdate {
+    removals: Vec<String>,
+    updates: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamespacePropertiesUpdateError {
+    DuplicateRemoval(String),
+    Overlap(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct NamespacePropertiesUpdateResult {
+    pub updated: Vec<String>,
+    pub removed: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+impl NamespacePropertiesUpdate {
+    pub(crate) fn try_new(
+        removals: Vec<String>,
+        updates: BTreeMap<String, String>,
+    ) -> Result<Self, NamespacePropertiesUpdateError> {
+        let mut removal_keys = BTreeSet::new();
+        for key in &removals {
+            if !removal_keys.insert(key.as_str()) {
+                return Err(NamespacePropertiesUpdateError::DuplicateRemoval(key.clone()));
+            }
+            if updates.contains_key(key) {
+                return Err(NamespacePropertiesUpdateError::Overlap(key.clone()));
+            }
+        }
+        Ok(Self { removals, updates })
+    }
+
+    pub(crate) fn apply_to(self, entry: &mut NamespaceEntry) -> NamespacePropertiesUpdateResult {
+        let updated = self.updates.keys().cloned().collect::<Vec<_>>();
+        for (key, value) in self.updates {
+            entry.properties.insert(key, value);
+        }
+
+        let mut removed = Vec::new();
+        let mut missing = Vec::new();
+        for key in self.removals {
+            if entry.properties.remove(&key).is_some() {
+                removed.push(key);
+            } else {
+                missing.push(key);
+            }
+        }
+
+        NamespacePropertiesUpdateResult {
+            updated,
+            removed,
+            missing,
+        }
+    }
+}
+
+pub(crate) fn validate_namespace_properties(properties: &BTreeMap<String, String>) -> TableCatalogStoreResult<()> {
+    if properties.len() > NAMESPACE_PROPERTIES_MAX_ENTRIES {
+        return Err(TableCatalogStoreError::Invalid(format!(
+            "namespace properties exceed the maximum of {NAMESPACE_PROPERTIES_MAX_ENTRIES} entries"
+        )));
+    }
+
+    let mut total_bytes = 0usize;
+    for (key, value) in properties {
+        if key.is_empty() || key.len() > NAMESPACE_PROPERTY_KEY_MAX_LEN {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "namespace property key length must be between 1 and {NAMESPACE_PROPERTY_KEY_MAX_LEN} bytes"
+            )));
+        }
+        if value.len() > NAMESPACE_PROPERTY_VALUE_MAX_LEN {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "namespace property value exceeds {NAMESPACE_PROPERTY_VALUE_MAX_LEN} bytes"
+            )));
+        }
+        total_bytes += key.len() + value.len();
+        if total_bytes > NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "namespace properties exceed {NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn namespace_is_descendant(candidate: &str, parent: &str) -> bool {
+    candidate.strip_prefix(parent).is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+pub(crate) fn synthetic_namespace_entry(table_bucket: &str, namespace: &Namespace) -> NamespaceEntry {
+    let namespace_id = namespace.storage_id();
+    let namespace = namespace.public_name();
+    NamespaceEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: table_bucket.to_string(),
+        namespace,
+        namespace_id,
+        state: TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TableEntry {
