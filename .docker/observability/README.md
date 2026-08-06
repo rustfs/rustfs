@@ -170,6 +170,10 @@ Important behavior notes:
 
 - Logs and metrics usually appear during startup, so seeing those two signals
   first is expected.
+- The OpenTelemetry bridge sends `tracing` fields as log attributes. Loki stores
+  those attributes as structured metadata, and the Collector also mirrors the
+  common troubleshooting fields into the log line so simple line filters can
+  find them.
 - Visible trace data usually requires real HTTP/S3/gRPC request traffic after
   startup, because request-path spans are created on demand.
 - `RUSTFS_OBS_LOGGER_LEVEL=info` keeps the top-level request span but filters
@@ -193,6 +197,17 @@ curl -I http://127.0.0.1:9000/health/ready
 # 4. Inspect Grafana or Jaeger.
 # Grafana: http://localhost:3000
 # Jaeger:  http://localhost:16686
+```
+
+For a structured RustFS log such as an inter-node RPC authentication failure,
+the Loki line now includes fields such as `event`, `component`, `subsystem`,
+`failure_reason`, `rpc_service`, `rpc_method`, and `expected_audience`. Useful
+LogQL checks:
+
+```logql
+{service_name="RustFS"} |= "RPC signature verification failed"
+{service_name="RustFS"} |= "failure_reason="
+{service_name="RustFS"} | failure_reason != ""
 ```
 
 If logs and metrics are present but traces are sparse, the most common cause is
