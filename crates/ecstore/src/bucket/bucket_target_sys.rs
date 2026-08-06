@@ -1424,6 +1424,37 @@ fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObject
     }
 }
 
+/// Resolve the S3 `versionId` query parameter for a replication PUT /
+/// CreateMultipartUpload against a remote target.
+///
+/// MinIO reads the replicated version only from the query string
+/// (`putOptsFromReq`); the internal `x-*-source-version-id` headers do not
+/// exist there, so without the query a MinIO target mints fresh version ids
+/// and the deployments drift apart. RustFS represents the null version
+/// internally as the nil UUID while the S3 API addresses it as the literal
+/// "null" (the delete path already maps it via `target_delete_version_id`),
+/// and an empty id means the source object carries no version: send no query
+/// so an unversioned target stays valid.
+fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
+    if source_version_id.is_empty() {
+        None
+    } else if Uuid::parse_str(source_version_id).is_ok_and(|uuid| uuid.is_nil()) {
+        Some(rustfs_filemeta::NULL_VERSION_ID)
+    } else {
+        Some(source_version_id)
+    }
+}
+
+/// Append `versionId=<id>` to an already-built request URI. aws-sdk-s3's
+/// `PutObjectInput` / `CreateMultipartUploadInput` expose no version id
+/// member, so the query is spliced in via `map_request`, which runs at
+/// `modify_before_signing`: the parameter becomes part of the SigV4 canonical
+/// request.
+fn append_version_id_query(uri: &str, version_id: &str) -> String {
+    let separator = if uri.contains('?') { '&' } else { '?' };
+    format!("{uri}{separator}versionId={}", urlencoding::encode(version_id))
+}
+
 #[derive(Debug, Clone)]
 pub struct AdvancedPutOptions {
     pub source_version_id: String,
@@ -1831,6 +1862,7 @@ impl TargetClient {
         if !version_id.is_empty() {
             insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
+        let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
 
         match builder
             .bucket(bucket)
@@ -1844,6 +1876,11 @@ impl TargetClient {
                         let value_str = v.to_str().unwrap_or("").to_string();
                         req.headers_mut().insert(key_str, value_str);
                     }
+                }
+                if let Some(version_id) = &api_version_id {
+                    let uri = append_version_id_query(req.uri(), version_id);
+                    req.set_uri(uri)
+                        .map_err(aws_smithy_types::error::operation::BuildError::other)?;
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
@@ -1893,6 +1930,9 @@ impl TargetClient {
         if opts.internal.replication_request {
             insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
+        // The remote version of a multipart replication is decided at initiate
+        // time; CompleteMultipartUpload does not read a versionId.
+        let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
 
         match self
             .client
@@ -1906,6 +1946,11 @@ impl TargetClient {
                         let value_str = v.to_str().unwrap_or("").to_string();
                         req.headers_mut().insert(key_str, value_str);
                     }
+                }
+                if let Some(version_id) = &api_version_id {
+                    let uri = append_version_id_query(req.uri(), version_id);
+                    req.set_uri(uri)
+                        .map_err(aws_smithy_types::error::operation::BuildError::other)?;
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -2676,6 +2721,91 @@ mod tests {
             !request_uris[1].contains("versionId="),
             "delete marker creation must omit the target versionId query: {}",
             request_uris[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_sends_source_version_id_query_to_target() {
+        // MinIO reads the replicated version only from the `versionId` query
+        // parameter (its receive path ignores the x-*-source-version-id
+        // headers), so the query must carry the source version: a real UUID
+        // as-is, the internal nil-UUID null-version representation as the
+        // literal "null", and no query at all when the source object has no
+        // version (P0-5 RustFS->MinIO version drift).
+        let (client, request_uris) = recording_target_client();
+        let version_id = Uuid::new_v4().to_string();
+        let nil_version = Uuid::nil().to_string();
+        for source_version in [version_id.as_str(), nil_version.as_str(), ""] {
+            let mut opts = PutObjectOptions::default();
+            opts.internal.source_version_id = source_version.to_string();
+            opts.internal.replication_request = true;
+            client
+                .put_object("target-bucket", "object", 4, ByteStream::from_static(b"data"), &opts)
+                .await
+                .expect("recorded put_object should succeed");
+        }
+
+        let request_uris = request_uris.lock().expect("recorded request lock should not be poisoned");
+        assert_eq!(request_uris.len(), 3);
+        assert!(
+            request_uris[0].contains(&format!("versionId={version_id}")),
+            "replication put_object must carry the source version as a versionId query: {}",
+            request_uris[0]
+        );
+        assert!(
+            request_uris[1].contains("versionId=null"),
+            "a nil-UUID (null) source version must be sent as the literal null: {}",
+            request_uris[1]
+        );
+        assert!(
+            !request_uris[2].contains("versionId="),
+            "put_object without a source version must omit the versionId query: {}",
+            request_uris[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_sends_source_version_id_query_to_target() {
+        // The remote version of a multipart replication is decided at initiate
+        // time: CreateMultipartUpload must carry the source version in the
+        // `versionId` query (CompleteMultipartUpload does not read one).
+        let (client, request_uris) = recording_target_client();
+        let version_id = Uuid::new_v4().to_string();
+        let nil_version = Uuid::nil().to_string();
+        for source_version in [version_id.as_str(), nil_version.as_str()] {
+            let mut opts = PutObjectOptions::default();
+            opts.internal.source_version_id = source_version.to_string();
+            opts.internal.replication_request = true;
+            let _ = client.create_multipart_upload("target-bucket", "object", &opts).await;
+        }
+
+        let request_uris = request_uris.lock().expect("recorded request lock should not be poisoned");
+        assert_eq!(request_uris.len(), 2);
+        assert!(
+            request_uris[0].contains(&format!("versionId={version_id}")),
+            "replication create_multipart_upload must carry the source version as a versionId query: {}",
+            request_uris[0]
+        );
+        assert!(
+            request_uris[1].contains("versionId=null"),
+            "a nil-UUID (null) source version must be sent as the literal null: {}",
+            request_uris[1]
+        );
+    }
+
+    #[test]
+    fn put_object_headers_keep_source_version_id_for_legacy_receivers() {
+        // Older RustFS receivers have no versionId query support and fall back
+        // to the internal source-version-id headers (rolling-upgrade path);
+        // the query addition must never remove them.
+        let mut opts = PutObjectOptions::default();
+        let version_id = Uuid::new_v4().to_string();
+        opts.internal.source_version_id = version_id.clone();
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_VERSION_ID).as_deref(),
+            Some(version_id.as_str()),
+            "replication put requests must keep the internal source-version-id headers"
         );
     }
 

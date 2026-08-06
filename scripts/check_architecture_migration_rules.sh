@@ -1856,7 +1856,7 @@ fi
   rg -n --with-filename 'crate::storage::.*ecstore_|^\s*ecstore_[a-z_]+(?:::|,|\})' \
     rustfs/src/startup_bucket_metadata.rs \
     rustfs/src/startup_shutdown.rs \
-    rustfs/src/table_catalog.rs \
+    rustfs/src/table_catalog \
     rustfs/src/storage/s3_api/bucket.rs \
     rustfs/src/storage/s3_api/multipart.rs \
     rustfs/src/config/config_test.rs || true
@@ -4515,7 +4515,7 @@ fi
     rustfs/src/init.rs \
     rustfs/src/runtime_capabilities.rs \
     rustfs/src/workload_admission.rs \
-    rustfs/src/table_catalog.rs \
+    rustfs/src/table_catalog \
     rustfs/src/error.rs || true
 ) >"$RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE"
 

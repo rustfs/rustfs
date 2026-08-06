@@ -33,6 +33,24 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
+    /// Access-denied error with the exact message emitted by the authorization
+    /// paths in `storage::access`; callers there match on the code only.
+    pub fn access_denied() -> Self {
+        ApiError {
+            code: S3ErrorCode::AccessDenied,
+            message: "Access Denied".to_string(),
+            source: None,
+        }
+    }
+
+    pub fn invalid_request(message: impl std::fmt::Display) -> Self {
+        ApiError {
+            code: S3ErrorCode::InvalidRequest,
+            message: message.to_string(),
+            source: None,
+        }
+    }
+
     pub fn other<E>(error: E) -> Self
     where
         E: std::fmt::Display + Into<Box<dyn std::error::Error + Send + Sync>>,

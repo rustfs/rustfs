@@ -70,6 +70,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&NAMESPACE_EXISTS_HANDLER),
     )?;
     r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/properties").as_str(),
+        AdminOperation(&UPDATE_NAMESPACE_PROPERTIES_HANDLER),
+    )?;
+    r.insert(
         Method::DELETE,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
         AdminOperation(&DROP_NAMESPACE_HANDLER),

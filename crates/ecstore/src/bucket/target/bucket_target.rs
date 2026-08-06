@@ -94,6 +94,21 @@ mod duration_milliseconds {
     }
 }
 
+/// Defensive decode for the two integer wire encodings of these duration
+/// fields: RustFS persists (and legacy RustFS clients sent) plain seconds,
+/// while Go `time.Duration` JSON — madmin/mc requests and MinIO-written
+/// bucket-targets metadata — is nanoseconds. No meaningful interval lies
+/// between 10^7 seconds (~115 days) and 10^7 nanoseconds (10ms), so the
+/// magnitude disambiguates the unit.
+pub fn duration_from_secs_or_nanos(value: u64) -> Duration {
+    const NANOS_THRESHOLD: u64 = 10_000_000;
+    if value < NANOS_THRESHOLD {
+        Duration::from_secs(value)
+    } else {
+        Duration::from_nanos(value)
+    }
+}
+
 mod duration_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -109,8 +124,8 @@ mod duration_seconds {
     where
         D: Deserializer<'de>,
     {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(Duration::from_secs(secs))
+        let value = u64::deserialize(deserializer)?;
+        Ok(super::duration_from_secs_or_nanos(value))
     }
 }
 
@@ -487,6 +502,29 @@ mod tests {
         assert_eq!(original.online, deserialized.online);
         assert_eq!(original.edge, deserialized.edge);
         assert_eq!(original.offline_count, deserialized.offline_count);
+    }
+
+    #[test]
+    fn bucket_target_reads_go_nanosecond_durations_defensively() {
+        // MinIO-written bucket-targets metadata and madmin clients encode
+        // these fields as Go `time.Duration` nanoseconds; RustFS has always
+        // persisted seconds. Both encodings must decode to the same interval.
+        let target: BucketTarget = serde_json::from_value(serde_json::json!({
+            "endpoint": "localhost:9000",
+            "targetbucket": "target",
+            "type": "replication",
+            "healthCheckDuration": 60_000_000_000u64,
+            "totalDowntime": 90_000_000_000u64
+        }))
+        .expect("nanosecond durations should deserialize");
+
+        assert_eq!(target.health_check_duration, Duration::from_secs(60));
+        assert_eq!(target.total_downtime, Duration::from_secs(90));
+
+        // The persisted wire format stays seconds for existing RustFS readers.
+        let value = serde_json::to_value(&target).expect("target should serialize");
+        assert_eq!(value["healthCheckDuration"], 60);
+        assert_eq!(value["totalDowntime"], 90);
     }
 
     #[test]

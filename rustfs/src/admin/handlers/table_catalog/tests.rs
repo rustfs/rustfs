@@ -25,7 +25,15 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
         Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
     );
     assert!(!response.defaults.contains_key(PREFIX_PROPERTY));
-    assert!(response.overrides.is_empty());
+    assert_eq!(
+        response.overrides.get(NAMESPACE_SEPARATOR_PROPERTY).map(String::as_str),
+        Some(REST_NAMESPACE_SEPARATOR_URL_ENCODED)
+    );
+    assert!(
+        !response
+            .endpoints
+            .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
+    );
     assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
     assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
     assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
@@ -145,6 +153,11 @@ fn catalog_config_response_reports_durable_strong_backing_override() {
         response.overrides.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
         Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
     );
+    assert!(
+        response
+            .endpoints
+            .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
+    );
 }
 
 #[test]
@@ -189,6 +202,12 @@ fn catalog_conflicts_use_operation_specific_iceberg_errors() {
     ));
     assert_eq!(namespace_not_found.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
     assert_eq!(namespace_not_found.status_code(), Some(StatusCode::NOT_FOUND));
+
+    let unsupported = catalog_store_error(crate::table_catalog::TableCatalogStoreError::Unsupported(
+        "operation is unavailable".to_string(),
+    ));
+    assert_eq!(unsupported.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_UNSUPPORTED_OPERATION.into()));
+    assert_eq!(unsupported.status_code(), Some(StatusCode::NOT_ACCEPTABLE));
 }
 
 #[test]
@@ -221,6 +240,10 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
         ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
         ("RestNamespaceExistsHandler", "AdminAction::GetTableNamespaceAction"),
+        (
+            "RestUpdateNamespacePropertiesHandler",
+            "AdminAction::UpdateTableNamespacePropertiesAction",
+        ),
         ("RestDropNamespaceHandler", "AdminAction::DeleteTableNamespaceAction"),
         ("RestListTablesHandler", "AdminAction::GetTableAction"),
         ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
@@ -342,7 +365,7 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
     for (handler, helper_call) in [
         (
             "RestListNamespacesHandler",
-            "list_namespaces_response(&store, &warehouse, &req.uri).await?",
+            "list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?",
         ),
         (
             "RestListTablesHandler",
@@ -362,6 +385,18 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
 }
 
 #[test]
+fn namespace_write_handlers_bound_request_bodies() {
+    let src = table_catalog_handler_source();
+    for handler in ["RestCreateNamespaceHandler", "RestUpdateNamespacePropertiesHandler"] {
+        let block = operation_block(&src, handler);
+        assert!(
+            block.contains("read_bounded_json_body::<"),
+            "{handler} should enforce the namespace request body limit and timeout"
+        );
+    }
+}
+
+#[test]
 fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_state() {
     let src = table_catalog_handler_source();
 
@@ -373,6 +408,7 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
         "RestCreateNamespaceHandler",
         "RestGetNamespaceHandler",
         "RestNamespaceExistsHandler",
+        "RestUpdateNamespacePropertiesHandler",
         "RestDropNamespaceHandler",
         "RestListTablesHandler",
         "RestCreateTableHandler",
@@ -504,6 +540,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
     let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
     let _: &RestNamespaceExistsHandler = &NAMESPACE_EXISTS_HANDLER;
+    let _: &RestUpdateNamespacePropertiesHandler = &UPDATE_NAMESPACE_PROPERTIES_HANDLER;
     let _: &RestDropNamespaceHandler = &DROP_NAMESPACE_HANDLER;
     let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
     let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
@@ -546,6 +583,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<RestCreateNamespaceHandler>();
     assert_operation::<RestGetNamespaceHandler>();
     assert_operation::<RestNamespaceExistsHandler>();
+    assert_operation::<RestUpdateNamespacePropertiesHandler>();
     assert_operation::<RestDropNamespaceHandler>();
     assert_operation::<RestListTablesHandler>();
     assert_operation::<RestCreateTableHandler>();
@@ -730,6 +768,13 @@ fn table_catalog_ingress_requests_reject_unknown_fields() {
             "unexpected": true
         }),
     );
+    assert_rejects_unknown_field::<UpdateNamespacePropertiesRequest>(
+        "UpdateNamespacePropertiesRequest",
+        serde_json::json!({
+            "updates": {},
+            "unexpected": true
+        }),
+    );
     assert_rejects_unknown_field::<RegisterTableRequest>(
         "RegisterTableRequest",
         serde_json::json!({
@@ -849,6 +894,187 @@ fn create_namespace_request_uses_rest_namespace_segments_and_properties() {
     assert_eq!(namespace.public_name(), "analytics.daily_events");
     assert_eq!(response.namespace, vec!["analytics".to_string(), "daily_events".to_string()]);
     assert_eq!(response.properties.get("owner").map(String::as_str), Some("lakehouse"));
+    assert!(namespace_from_segments(&["analytics.daily_events".to_string()]).is_err());
+}
+
+#[tokio::test]
+async fn invalid_namespace_properties_fail_before_catalog_state_changes() {
+    let store = TestTableCatalogStore::default();
+    let error = create_namespace_response(
+        &store,
+        "warehouse",
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::from([(
+                "owner".to_string(),
+                "x".repeat(crate::table_catalog::NAMESPACE_PROPERTY_VALUE_MAX_LEN + 1),
+            )]),
+        },
+        true,
+    )
+    .await
+    .expect_err("oversized namespace property must fail");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+    assert!(store.table_buckets.lock().await.is_empty());
+    assert!(store.namespaces.lock().await.is_empty());
+}
+
+#[test]
+fn namespace_parent_query_accepts_standard_and_legacy_path_separators() {
+    let path_namespace = namespace_from_path_value("accounting%1Ftax").expect("encoded path namespace should parse");
+    assert_eq!(path_namespace.public_name(), "accounting.tax");
+    let lowercase_path_namespace =
+        namespace_from_path_value("accounting%1ftax").expect("lowercase encoded path namespace should parse");
+    assert_eq!(lowercase_path_namespace.public_name(), "accounting.tax");
+    let legacy_path_namespace = namespace_from_path_value("accounting.tax").expect("legacy dotted path namespace should parse");
+    assert_eq!(legacy_path_namespace.public_name(), "accounting.tax");
+    assert!(namespace_from_path_value("accounting%2Etax").is_err());
+    assert!(namespace_from_path_value("accounting.tax%2Epaid").is_err());
+    assert!(namespace_from_path_value("accounting%2Ftax").is_err());
+    assert!(namespace_from_path_value("%FF").is_err());
+
+    let uri = "/iceberg/v1/analytics/namespaces?parent=accounting%1Ftax"
+        .parse()
+        .expect("URI");
+    let parent = rest_namespace_parent_from_query(&uri)
+        .expect("parent query should parse")
+        .expect("parent should be present");
+    assert_eq!(parent.public_name(), "accounting.tax");
+
+    let uri = "/iceberg/v1/analytics/namespaces?parent=".parse().expect("URI");
+    assert!(
+        rest_namespace_parent_from_query(&uri)
+            .expect("empty parent should parse")
+            .is_none()
+    );
+
+    let uri = "/iceberg/v1/analytics/namespaces?parent=one&parent=two".parse().expect("URI");
+    let error = rest_namespace_parent_from_query(&uri).expect_err("repeated parent should fail");
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+}
+
+#[test]
+fn namespace_property_update_uses_standard_shape_and_rejects_invalid_key_sets() {
+    let request: UpdateNamespacePropertiesRequest = serde_json::from_value(serde_json::json!({
+        "removals": ["retention"],
+        "updates": {"owner": "platform"}
+    }))
+    .expect("namespace property update should parse");
+    let update = namespace_properties_update_from_request(request).expect("disjoint property update should validate");
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let mut entry = crate::table_catalog::NamespaceEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: "warehouse".to_string(),
+        namespace: namespace.public_name(),
+        namespace_id: namespace.storage_id(),
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: BTreeMap::from([("retention".to_string(), "30d".to_string())]),
+        created_at: None,
+        updated_at: None,
+    };
+    let result = update.apply_to(&mut entry);
+    assert_eq!(result.removed, vec!["retention".to_string()]);
+    assert_eq!(result.updated, vec!["owner".to_string()]);
+    assert_eq!(entry.properties.get("owner").map(String::as_str), Some("platform"));
+
+    let duplicate = namespace_properties_update_from_request(UpdateNamespacePropertiesRequest {
+        removals: vec!["owner".to_string(), "owner".to_string()],
+        updates: BTreeMap::new(),
+    })
+    .expect_err("duplicate removals should fail");
+    assert_eq!(duplicate.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+    assert_eq!(duplicate.status_code(), Some(StatusCode::BAD_REQUEST));
+
+    let overlap = namespace_properties_update_from_request(UpdateNamespacePropertiesRequest {
+        removals: vec!["owner".to_string()],
+        updates: BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+    })
+    .expect_err("overlapping property sets should fail");
+    assert_eq!(overlap.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_UNPROCESSABLE_ENTITY.into()));
+    assert_eq!(overlap.status_code(), Some(StatusCode::UNPROCESSABLE_ENTITY));
+}
+
+#[tokio::test]
+async fn namespace_property_update_body_is_bounded_and_required() {
+    let mut oversized_headers = HeaderMap::new();
+    oversized_headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&(NAMESPACE_REQUEST_BODY_MAX_SIZE + 1).to_string()).expect("content length should parse"),
+    );
+    let error = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
+        &oversized_headers,
+        Body::empty(),
+        NAMESPACE_REQUEST_BODY_MAX_SIZE,
+        NAMESPACE_REQUEST_BODY_TIMEOUT,
+        "namespace properties",
+    )
+    .await
+    .expect_err("oversized declared body should fail before reading");
+    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
+    let error = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
+        &HeaderMap::new(),
+        Body::from(vec![b' '; NAMESPACE_REQUEST_BODY_MAX_SIZE + 1]),
+        NAMESPACE_REQUEST_BODY_MAX_SIZE,
+        NAMESPACE_REQUEST_BODY_TIMEOUT,
+        "namespace properties",
+    )
+    .await
+    .expect_err("oversized streamed body should fail");
+    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
+    let error = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
+        &HeaderMap::new(),
+        Body::empty(),
+        NAMESPACE_REQUEST_BODY_MAX_SIZE,
+        NAMESPACE_REQUEST_BODY_TIMEOUT,
+        "namespace properties",
+    )
+    .await
+    .expect_err("empty body should fail");
+    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+
+    let request = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
+        &HeaderMap::new(),
+        Body::from(r#"{"updates":{"owner":"platform"}}"#.to_string()),
+        NAMESPACE_REQUEST_BODY_MAX_SIZE,
+        NAMESPACE_REQUEST_BODY_TIMEOUT,
+        "namespace properties",
+    )
+    .await
+    .expect("bounded request should parse");
+    assert_eq!(request.updates.get("owner").map(String::as_str), Some("platform"));
+
+    let mut maximum_properties = BTreeMap::new();
+    for index in 0..15 {
+        maximum_properties.insert(format!("k{index:02}"), "v".repeat(crate::table_catalog::NAMESPACE_PROPERTY_VALUE_MAX_LEN));
+    }
+    let used = maximum_properties
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum::<usize>();
+    let final_key = "k15".to_string();
+    maximum_properties.insert(
+        final_key.clone(),
+        "v".repeat(crate::table_catalog::NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES - used - final_key.len()),
+    );
+    let maximum_body = serde_json::to_vec(&serde_json::json!({"updates": maximum_properties}))
+        .expect("maximum namespace properties should encode");
+    assert!(maximum_body.len() > crate::table_catalog::NAMESPACE_PROPERTIES_MAX_TOTAL_BYTES);
+    assert!(maximum_body.len() < NAMESPACE_REQUEST_BODY_MAX_SIZE);
+    let request = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
+        &HeaderMap::new(),
+        Body::from(maximum_body),
+        NAMESPACE_REQUEST_BODY_MAX_SIZE,
+        NAMESPACE_REQUEST_BODY_TIMEOUT,
+        "namespace properties",
+    )
+    .await
+    .expect("maximum valid namespace properties body should parse");
+    crate::table_catalog::validate_namespace_properties(&request.updates)
+        .expect("maximum valid namespace properties should remain within the domain limit");
 }
 
 #[test]
@@ -1045,6 +1271,84 @@ fn rest_pagination_rejects_malformed_token_payloads() {
 }
 
 #[tokio::test]
+async fn namespace_listing_returns_direct_children_and_scopes_pagination_to_parent() {
+    let store = TestTableCatalogStore::default();
+    for name in [
+        "accounting",
+        "accounting.tax.paid",
+        "accounting.ledger",
+        "analytics",
+        "analytics.daily",
+        "sales",
+    ] {
+        let namespace = crate::table_catalog::Namespace::parse(name).expect("namespace should parse");
+        store.namespaces.lock().await.push(crate::table_catalog::NamespaceEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: namespace.public_name(),
+            namespace_id: namespace.storage_id(),
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        });
+    }
+
+    let root_uri = "/".parse::<http::Uri>().expect("root namespace URI should parse");
+    let root = list_namespaces_response(&store, "warehouse", None, &root_uri)
+        .await
+        .expect("root namespace list should load");
+    assert_eq!(
+        root.namespaces,
+        vec![
+            vec!["accounting".to_string()],
+            vec!["analytics".to_string()],
+            vec!["sales".to_string()]
+        ]
+    );
+
+    let parent = crate::table_catalog::Namespace::parse("accounting").expect("parent namespace should parse");
+    let first_uri = "/?pageSize=1".parse::<http::Uri>().expect("first page URI should parse");
+    let first = list_namespaces_response(&store, "warehouse", Some(&parent), &first_uri)
+        .await
+        .expect("first child page should load");
+    assert_eq!(first.namespaces, vec![vec!["accounting".to_string(), "ledger".to_string()]]);
+    let token = first.next_page_token.expect("child continuation token should exist");
+    let second_uri = format!("/?pageSize=1&pageToken={token}")
+        .parse::<http::Uri>()
+        .expect("second page URI should parse");
+    let second = list_namespaces_response(&store, "warehouse", Some(&parent), &second_uri)
+        .await
+        .expect("second child page should load");
+    assert_eq!(second.namespaces, vec![vec!["accounting".to_string(), "tax".to_string()]]);
+    assert!(second.next_page_token.is_none());
+
+    let different_parent = crate::table_catalog::Namespace::parse("analytics").expect("parent namespace should parse");
+    let mismatched_uri = format!("/?pageSize=1&pageToken={token}")
+        .parse::<http::Uri>()
+        .expect("mismatched page URI should parse");
+    assert!(
+        list_namespaces_response(&store, "warehouse", Some(&different_parent), &mismatched_uri)
+            .await
+            .is_err()
+    );
+
+    let missing = crate::table_catalog::Namespace::parse("missing").expect("missing namespace should parse");
+    let error = list_namespaces_response(&store, "warehouse", Some(&missing), &root_uri)
+        .await
+        .expect_err("missing parent should return an Iceberg error");
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::NOT_FOUND));
+
+    let leaf = crate::table_catalog::Namespace::parse("sales").expect("leaf namespace should parse");
+    let empty = list_namespaces_response(&store, "warehouse", Some(&leaf), &root_uri)
+        .await
+        .expect("existing leaf namespace should return an empty child list");
+    assert!(empty.namespaces.is_empty());
+    assert!(empty.next_page_token.is_none());
+}
+
+#[tokio::test]
 async fn rest_list_pagination_covers_namespaces_tables_and_views() {
     let store = TestTableCatalogStore::default();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -1098,7 +1402,7 @@ async fn rest_list_pagination_covers_namespaces_tables_and_views() {
     }
 
     let first_uri = "/?pageSize=1".parse::<http::Uri>().expect("first page URI should parse");
-    let namespaces = list_namespaces_response(&store, "warehouse", &first_uri)
+    let namespaces = list_namespaces_response(&store, "warehouse", None, &first_uri)
         .await
         .expect("namespace first page should load");
     assert_eq!(namespaces.namespaces, vec![vec!["alpha".to_string()]]);
@@ -1106,7 +1410,7 @@ async fn rest_list_pagination_covers_namespaces_tables_and_views() {
     let namespace_uri = format!("/?pageSize=1&pageToken={namespace_token}")
         .parse::<http::Uri>()
         .expect("namespace continuation URI should parse");
-    let namespaces = list_namespaces_response(&store, "warehouse", &namespace_uri)
+    let namespaces = list_namespaces_response(&store, "warehouse", None, &namespace_uri)
         .await
         .expect("namespace second page should load");
     assert_eq!(namespaces.namespaces, vec![vec!["beta".to_string()]]);
@@ -1146,7 +1450,7 @@ async fn rest_list_pagination_covers_namespaces_tables_and_views() {
 
     for uri in ["/", "/?pageSize=2"] {
         let uri = uri.parse::<http::Uri>().expect("list URI should parse");
-        let namespaces = list_namespaces_response(&store, "warehouse", &uri)
+        let namespaces = list_namespaces_response(&store, "warehouse", None, &uri)
             .await
             .expect("namespace exact page should load");
         let tables = list_tables_response(&store, "warehouse", &namespace, &uri)
@@ -5500,6 +5804,22 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             .cloned())
     }
 
+    async fn update_namespace_properties(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        update: crate::table_catalog::NamespacePropertiesUpdate,
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::NamespacePropertiesUpdateResult> {
+        let mut namespaces = self.namespaces.lock().await;
+        let entry = namespaces
+            .iter_mut()
+            .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
+            .ok_or_else(|| {
+                crate::table_catalog::TableCatalogStoreError::NotFound(format!("namespace {table_bucket}/{namespace}"))
+            })?;
+        Ok(update.apply_to(entry))
+    }
+
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.namespaces
             .lock()
@@ -5553,6 +5873,20 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             .await
             .iter()
             .filter(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all_tables(
+        &self,
+        table_bucket: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableEntry>> {
+        Ok(self
+            .tables
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.table_bucket == table_bucket)
             .cloned()
             .collect())
     }
@@ -5820,15 +6154,39 @@ async fn namespace_helpers_call_catalog_store() {
     assert_eq!(create.properties.get("owner").map(String::as_str), Some("lakehouse"));
 
     let unpaginated_uri = "/".parse::<http::Uri>().expect("list URI should parse");
-    let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
+    let list = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
         .await
         .expect("namespace list should load");
     assert_eq!(list.namespaces, vec![vec!["analytics".to_string()]]);
 
+    let update = update_namespace_properties_response(
+        &store,
+        "warehouse",
+        &crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse"),
+        UpdateNamespacePropertiesRequest {
+            removals: vec!["owner".to_string(), "missing".to_string()],
+            updates: BTreeMap::from([("retention".to_string(), "30d".to_string())]),
+        },
+    )
+    .await
+    .expect("namespace properties should update");
+    assert_eq!(update.updated, vec!["retention".to_string()]);
+    assert_eq!(update.removed, vec!["owner".to_string()]);
+    assert_eq!(update.missing, vec!["missing".to_string()]);
+    let updated = get_namespace_response(
+        &store,
+        "warehouse",
+        &crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse"),
+    )
+    .await
+    .expect("updated namespace should load");
+    assert_eq!(updated.properties.get("retention").map(String::as_str), Some("30d"));
+    assert!(!updated.properties.contains_key("owner"));
+
     drop_namespace_in_store(&store, "warehouse", "analytics")
         .await
         .expect("namespace should drop");
-    let list = list_namespaces_response(&store, "warehouse", &unpaginated_uri)
+    let list = list_namespaces_response(&store, "warehouse", None, &unpaginated_uri)
         .await
         .expect("namespace list should load after drop");
     assert!(list.namespaces.is_empty());
