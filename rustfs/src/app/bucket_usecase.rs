@@ -2570,7 +2570,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    #[instrument(level = "info", skip(self, req))]
+    #[instrument(level = "trace", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {

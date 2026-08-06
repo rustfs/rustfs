@@ -43,9 +43,9 @@ pub(super) fn pyroscope_log_filter() -> FilterFn {
 ///
 /// If `default_level` is provided, it is used directly. Otherwise, the
 /// `RUST_LOG` environment variable takes precedence over `logger_level`.
-/// For non-verbose levels (`info`, `warn`, `error`), noisy internal crates
-/// (`hyper`, `tonic`, `h2`, `reqwest`, `tower`) are automatically silenced
-/// based on the effective log configuration.
+/// For non-verbose levels (`info`, `warn`, `error`), noisy dependency targets
+/// are automatically suppressed based on the effective log configuration.
+/// Transport internals are disabled, while `s3s` remains visible at WARN.
 ///
 /// # Arguments
 /// * `logger_level` - The desired log level string (e.g., `"info"`, `"debug"`).
@@ -169,6 +169,25 @@ fn should_demote_http_request_logs(logger_level: &str, default_level: Option<&st
     matches!(level.as_str(), "info" | "warn")
 }
 
+fn should_demote_s3s_logs(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
+    if let Some(level) = default_level {
+        let level = level.trim().to_ascii_lowercase();
+        return matches!(level.as_str(), "info" | "warn");
+    }
+
+    if let Some(rust_log) = rust_log {
+        if let Some(level) = effective_level_for_target(rust_log, "s3s") {
+            let level = level.trim().to_ascii_lowercase();
+            return matches!(level.as_str(), "info" | "warn");
+        }
+
+        return false;
+    }
+
+    let level = logger_level.trim().to_ascii_lowercase();
+    matches!(level.as_str(), "info" | "warn")
+}
+
 fn rust_log_explicitly_names_target(rust_log: &str, target: &str) -> bool {
     rust_log.split(',').map(str::trim).any(|directive| {
         if let Some((directive_target, _)) = directive.rsplit_once('=') {
@@ -217,6 +236,13 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
             directives.push(("rustfs::server::http", LevelFilter::WARN));
         }
 
+        if should_demote_s3s_logs(logger_level, default_level, rust_log_env.as_deref()) {
+            // s3s instruments each authentication request through multiple
+            // nested INFO spans. Keep warnings and errors in normal production
+            // logs without promoting it when the effective base is stricter.
+            directives.push(("s3s", LevelFilter::WARN));
+        }
+
         for (crate_name, level) in directives {
             if rust_log_env
                 .as_deref()
@@ -250,6 +276,50 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+    use tracing::subscriber::with_default;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_with_filter(filter: EnvFilter, emit: impl FnOnce()) -> String {
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .finish();
+
+        with_default(subscriber, emit);
+        let bytes = captured.lock().expect("captured logs").clone();
+        String::from_utf8(bytes).expect("utf8 logs")
+    }
 
     #[test]
     fn test_is_verbose_level() {
@@ -308,6 +378,19 @@ mod tests {
     }
 
     #[test]
+    fn test_should_demote_s3s_logs() {
+        assert!(should_demote_s3s_logs("info", None, None));
+        assert!(should_demote_s3s_logs("warn", None, None));
+        assert!(!should_demote_s3s_logs("error", None, None));
+        assert!(!should_demote_s3s_logs("off", None, None));
+        assert!(!should_demote_s3s_logs("info", None, Some("ERROR")));
+        assert!(should_demote_s3s_logs("error", None, Some("WARN")));
+        assert!(!should_demote_s3s_logs("info", None, Some("foo=warn")));
+        assert!(!should_demote_s3s_logs("info", None, Some("s3s=error")));
+        assert!(should_demote_s3s_logs("error", None, Some("WARN,s3s=warn")));
+    }
+
+    #[test]
     fn test_build_env_filter_injects_suppressions_without_rust_log() {
         // When RUST_LOG is not set and the base level is non-verbose ("info"),
         // build_env_filter should inject suppression directives for noisy crates.
@@ -315,7 +398,7 @@ mod tests {
             let filter = build_env_filter("info", None);
             let filter_str = filter.to_string();
 
-            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower"] {
+            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower", "s3s"] {
                 assert!(
                     filter_str.contains(noisy_crate),
                     "expected EnvFilter to contain suppression directive for `{}`; got `{}`",
@@ -402,6 +485,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_env_filter_does_not_promote_s3s_above_error() {
+        temp_env::with_var("RUST_LOG", Some("ERROR"), || {
+            let filter = build_env_filter("info", None).to_string().to_ascii_lowercase();
+            assert!(!filter.contains("s3s=warn"), "s3s must not be promoted above ERROR: {filter}");
+        });
+
+        temp_env::with_var("RUST_LOG", Some("foo=warn"), || {
+            let filter = build_env_filter("info", None).to_string().to_ascii_lowercase();
+            assert!(!filter.contains("s3s=warn"), "an unrelated target must not enable s3s: {filter}");
+        });
+    }
+
+    #[test]
     fn test_build_env_filter_does_not_fallback_to_logger_level_for_http_demotion() {
         temp_env::with_var("RUST_LOG", Some("foo=warn"), || {
             let filter = build_env_filter("info", None);
@@ -424,6 +520,43 @@ mod tests {
                 !filter_str.contains("hyper=off"),
                 "suppression must not override an explicit target directive: {filter_str}"
             );
+        });
+    }
+
+    #[test]
+    fn test_production_filter_suppresses_s3s_info_but_keeps_warn() {
+        temp_env::with_var("RUST_LOG", None::<&str>, || {
+            let output = capture_with_filter(build_env_filter("info", None), || {
+                tracing::info!(target: "s3s::auth", "s3s info must be suppressed");
+                tracing::warn!(target: "s3s::auth", "s3s warning must remain");
+            });
+
+            assert!(!output.contains("s3s info must be suppressed"), "{output}");
+            assert!(output.contains("s3s warning must remain"), "{output}");
+        });
+    }
+
+    #[test]
+    fn test_explicit_s3s_target_restores_info_diagnostics() {
+        temp_env::with_var("RUST_LOG", Some("info,s3s=info"), || {
+            let output = capture_with_filter(build_env_filter("info", None), || {
+                tracing::info!(target: "s3s::auth", "explicit s3s info");
+            });
+
+            assert!(output.contains("explicit s3s info"), "{output}");
+        });
+    }
+
+    #[test]
+    fn test_http_target_suppresses_success_but_keeps_errors() {
+        temp_env::with_var("RUST_LOG", None::<&str>, || {
+            let output = capture_with_filter(build_env_filter("info", None), || {
+                tracing::info!(target: "rustfs::server::http", "healthy readiness response");
+                tracing::error!(target: "rustfs::server::http", "failed readiness response");
+            });
+
+            assert!(!output.contains("healthy readiness response"), "{output}");
+            assert!(output.contains("failed readiness response"), "{output}");
         });
     }
 }

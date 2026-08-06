@@ -15,7 +15,7 @@
 use super::*;
 
 impl ECStore {
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_list_objects_v2(
         self: Arc<Self>,

@@ -391,6 +391,7 @@ impl RequestLogContext {
 
         if status.is_server_error() {
             error!(
+                target: "rustfs::server::http",
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
@@ -407,6 +408,7 @@ impl RequestLogContext {
             );
         } else {
             info!(
+                target: "rustfs::server::http",
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
@@ -429,6 +431,7 @@ impl RequestLogContext {
         E: std::fmt::Display,
     {
         error!(
+            target: "rustfs::server::http",
             event = HTTP_REQUEST_FAILED_EVENT,
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_HTTP,
