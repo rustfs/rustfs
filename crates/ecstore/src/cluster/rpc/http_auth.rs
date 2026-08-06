@@ -40,12 +40,13 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
     INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
+use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
 use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
-use std::fs;
 use std::sync::{LazyLock, Mutex, Once};
+use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
@@ -148,6 +149,7 @@ struct ReplayCacheCapacityDecision {
     source: ReplayCacheCapacitySource,
     cpu_count: usize,
     memory_limit_bytes: Option<u64>,
+    memory_basis: Option<MemoryBasis>,
     memory_based_capacity: usize,
     cpu_based_capacity: usize,
 }
@@ -177,6 +179,7 @@ fn replay_cache_capacity_decision(
     env: rustfs_utils::EnvParseOutcome<usize>,
     cpu_count: usize,
     memory_limit_bytes: Option<u64>,
+    memory_basis: Option<MemoryBasis>,
 ) -> ReplayCacheCapacityDecision {
     let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
     match env {
@@ -192,6 +195,7 @@ fn replay_cache_capacity_decision(
                 source,
                 cpu_count: cpu_count.max(1),
                 memory_limit_bytes,
+                memory_basis,
                 memory_based_capacity: 0,
                 cpu_based_capacity: 0,
             }
@@ -212,6 +216,7 @@ fn replay_cache_capacity_decision(
                 source,
                 cpu_count: cpu_count.max(1),
                 memory_limit_bytes,
+                memory_basis,
                 memory_based_capacity,
                 cpu_based_capacity,
             }
@@ -219,38 +224,11 @@ fn replay_cache_capacity_decision(
     }
 }
 
-fn parse_cgroup_memory_limit_value(value: &str) -> Option<u64> {
-    let value = value.trim();
-    if value.is_empty() || value == "max" {
-        return None;
-    }
-    let limit = value.parse::<u64>().ok()?;
-    (limit > 0 && limit < u64::MAX / 2).then_some(limit)
-}
-
-fn read_first_memory_limit(paths: &[&str]) -> Option<u64> {
-    paths.iter().find_map(|path| {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|value| parse_cgroup_memory_limit_value(&value))
-    })
-}
-
-fn physical_memory_limit_bytes() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        let Some(rest) = line.strip_prefix("MemTotal:") else {
-            continue;
-        };
-        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-        return kib.checked_mul(1024);
-    }
-    None
-}
-
-fn detected_memory_limit_bytes() -> Option<u64> {
-    read_first_memory_limit(&["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"])
-        .or_else(physical_memory_limit_bytes)
+fn detected_replay_cache_resources() -> (usize, Option<u64>, Option<MemoryBasis>) {
+    let cpu_count = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let memory = resolve_effective_memory();
+    let memory_limit_bytes = (memory.total_bytes > 0).then_some(memory.total_bytes);
+    (cpu_count, memory_limit_bytes, Some(memory.basis))
 }
 
 fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
@@ -290,6 +268,7 @@ fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
             source,
             cpu_count = decision.cpu_count,
             memory_limit_bytes = decision.memory_limit_bytes,
+            memory_basis = decision.memory_basis.map(MemoryBasis::as_str),
             memory_based_capacity = decision.memory_based_capacity,
             cpu_based_capacity = decision.cpu_based_capacity,
             auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
@@ -306,6 +285,7 @@ fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
         source,
         cpu_count = decision.cpu_count,
         memory_limit_bytes = decision.memory_limit_bytes,
+        memory_basis = decision.memory_basis.map(MemoryBasis::as_str),
         memory_based_capacity = decision.memory_based_capacity,
         cpu_based_capacity = decision.cpu_based_capacity,
         auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
@@ -314,10 +294,12 @@ fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
 }
 
 fn resolve_replay_cache_capacity() -> usize {
+    let (cpu_count, memory_limit_bytes, memory_basis) = detected_replay_cache_resources();
     let decision = replay_cache_capacity_decision(
         rustfs_utils::get_env_parse_outcome(rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY),
-        num_cpus::get(),
-        detected_memory_limit_bytes(),
+        cpu_count,
+        memory_limit_bytes,
+        memory_basis,
     );
     global_internode_metrics().record_replay_cache_state(0, decision.capacity);
     log_replay_cache_capacity_decision(decision);
@@ -2292,12 +2274,21 @@ mod tests {
     fn replay_cache_capacity_uses_env_with_default_floor() {
         let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
 
-        let high =
-            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Parsed(default * 16), 2, Some(512 * 1024 * 1024));
+        let high = replay_cache_capacity_decision(
+            rustfs_utils::EnvParseOutcome::Parsed(default * 16),
+            2,
+            Some(512 * 1024 * 1024),
+            Some(MemoryBasis::Host),
+        );
         assert_eq!(high.capacity, default * 16);
         assert_eq!(high.source, ReplayCacheCapacitySource::Env);
 
-        let low = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Parsed(1), 64, Some(128 * 1024 * 1024 * 1024));
+        let low = replay_cache_capacity_decision(
+            rustfs_utils::EnvParseOutcome::Parsed(1),
+            64,
+            Some(128 * 1024 * 1024 * 1024),
+            Some(MemoryBasis::Host),
+        );
         assert_eq!(low.capacity, default);
         assert_eq!(low.source, ReplayCacheCapacitySource::EnvClampedToDefault);
     }
@@ -2305,9 +2296,11 @@ mod tests {
     #[test]
     fn replay_cache_capacity_auto_sizes_from_cpu_and_memory() {
         let gib = 1024_u64 * 1024 * 1024;
-        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 8, Some(16 * gib));
+        let decision =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 8, Some(16 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
+        assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
         assert_eq!(decision.memory_based_capacity, 5_368_709);
         assert_eq!(decision.cpu_based_capacity, 4_923_392);
         assert_eq!(decision.capacity, 4_923_392);
@@ -2315,7 +2308,12 @@ mod tests {
 
     #[test]
     fn replay_cache_capacity_auto_keeps_default_floor_for_small_nodes() {
-        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 1, Some(512 * 1024 * 1024));
+        let decision = replay_cache_capacity_decision(
+            rustfs_utils::EnvParseOutcome::Absent,
+            1,
+            Some(512 * 1024 * 1024),
+            Some(MemoryBasis::Host),
+        );
 
         assert_eq!(decision.capacity, rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoClampedToDefault);
@@ -2324,17 +2322,10 @@ mod tests {
 
     #[test]
     fn replay_cache_capacity_invalid_env_uses_auto_sizing() {
-        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None);
+        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
         assert_eq!(decision.capacity, 4_923_392);
-    }
-
-    #[test]
-    fn replay_cache_memory_limit_parser_ignores_unbounded_cgroups() {
-        assert_eq!(parse_cgroup_memory_limit_value("max\n"), None);
-        assert_eq!(parse_cgroup_memory_limit_value("0"), None);
-        assert_eq!(parse_cgroup_memory_limit_value("1073741824\n"), Some(1_073_741_824));
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
