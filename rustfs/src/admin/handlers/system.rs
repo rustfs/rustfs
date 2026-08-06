@@ -1279,6 +1279,14 @@ mod tests {
                 .iter()
                 .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Unsupported)
         );
+        assert!(
+            response
+                .replication
+                .remote_targets
+                .fields
+                .iter()
+                .any(|field| field.name == "healthCheckDuration" && field.state == super::ReplicationFieldState::Supported)
+        );
         assert_eq!(response.manual_transition_jobs.contract_version, 1);
         assert_eq!(response.manual_transition_jobs.status.state, CapabilityState::Supported);
         assert_eq!(response.manual_transition_jobs.modes, ["enqueue_only", "async"]);
@@ -1360,6 +1368,13 @@ mod tests {
                 .expect("remote target fields should be an array")
                 .iter()
                 .any(|field| field["name"] == "disableProxy" && field["state"] == "unsupported")
+        );
+        assert!(
+            value["replication"]["remote_targets"]["fields"]
+                .as_array()
+                .expect("remote target fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "healthCheckDuration" && field["state"] == "supported")
         );
         assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);
         assert_eq!(value["manual_transition_jobs"]["status"]["state"], "supported");
