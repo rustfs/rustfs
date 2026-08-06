@@ -20,7 +20,7 @@ pub mod local_snapshot;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
     list::{ListOperations as _, StorageListObjectVersionsInfo},
-    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _},
+    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
@@ -405,9 +405,11 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
     // Save to backend using the same mechanism as original code
-    crate::config::com::save_config(store, &DATA_USAGE_OBJ_NAME_PATH, data)
+    crate::config::com::save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data)
         .await
         .map_err(Error::other)?;
+
+    cleanup_observed_data_usage_after_authoritative_save(store.as_ref(), &data_usage_info).await;
 
     // Invalidate the cached snapshot so readers observe the new save on their
     // next request instead of waiting out the remaining TTL. The next cached
@@ -416,6 +418,64 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
     invalidate_data_usage_snapshot_cache().await;
 
     Ok(())
+}
+
+#[async_trait::async_trait]
+trait ObservedDataUsageSnapshotCleanup {
+    async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error>;
+}
+
+#[async_trait::async_trait]
+impl ObservedDataUsageSnapshotCleanup for ECStore {
+    async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error> {
+        self.delete_object(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+            ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some(revision.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+async fn cleanup_observed_data_usage_after_authoritative_save<S>(store: &S, authoritative: &DataUsageInfo)
+where
+    S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
+{
+    let (observed, revision) = match load_data_usage_for_bucket_removal(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(err) => {
+            record_usage_snapshot_failure(
+                "read_observed_before_authoritative_cleanup",
+                DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                &err,
+            );
+            return;
+        }
+    };
+    if observed_data_usage_is_newer(&observed, authoritative) {
+        return;
+    }
+
+    match store.delete_observed_data_usage_snapshot(&revision).await {
+        Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::ObjectNotFound(_, _) | Error::PreconditionFailed) => {}
+        Err(err) => {
+            record_usage_snapshot_failure(
+                "delete_observed_after_authoritative_save",
+                DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                &err,
+            );
+        }
+    }
 }
 
 fn set_buckets_count_from_usage(data_usage_info: &mut DataUsageInfo) {
@@ -2247,6 +2307,7 @@ mod tests {
     struct UsageCasState {
         object: Option<(Vec<u8>, u64)>,
         backup_object: Option<(Vec<u8>, u64)>,
+        observed_object: Option<(Vec<u8>, u64)>,
         legacy_object: Option<(Vec<u8>, u64)>,
         legacy_backup_object: Option<(Vec<u8>, u64)>,
         interleaving_snapshot: Option<Vec<u8>>,
@@ -2266,10 +2327,24 @@ mod tests {
         state: Mutex<UsageCasState>,
     }
 
+    #[async_trait::async_trait]
+    impl ObservedDataUsageSnapshotCleanup for UsageCasStore {
+        async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error> {
+            let mut state = self.state.lock().await;
+            let current = state.observed_object.as_ref().ok_or(Error::FileNotFound)?.1;
+            if revision != format!("usage-{current}") {
+                return Err(Error::PreconditionFailed);
+            }
+            state.observed_object = None;
+            Ok(())
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum UsageObjectSlot {
         Primary,
         Backup,
+        Observed,
         LegacyPrimary,
         LegacyBackup,
     }
@@ -2298,6 +2373,7 @@ mod tests {
             let slot = match object {
                 object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
                 object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Observed,
                 object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
                 object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
                 _ => return Err(Error::FileNotFound),
@@ -2306,6 +2382,7 @@ mod tests {
             let stored = match slot {
                 UsageObjectSlot::Primary => &state.object,
                 UsageObjectSlot::Backup => &state.backup_object,
+                UsageObjectSlot::Observed => &state.observed_object,
                 UsageObjectSlot::LegacyPrimary => &state.legacy_object,
                 UsageObjectSlot::LegacyBackup => &state.legacy_backup_object,
             };
@@ -2345,6 +2422,7 @@ mod tests {
             let slot = match object {
                 object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
                 object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Observed,
                 object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
                 object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
                 _ => return Err(Error::FileNotFound),
@@ -2380,6 +2458,9 @@ mod tests {
                 let revision = state.backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
                 state.backup_object = Some((interleaving, revision));
             }
+            if slot == UsageObjectSlot::Observed {
+                return Err(Error::other("observed test fixture writes are injected directly"));
+            }
             if slot == UsageObjectSlot::LegacyPrimary
                 && let Some(interleaving) = state.interleaving_legacy_snapshot.take()
             {
@@ -2395,6 +2476,7 @@ mod tests {
             let current_revision = match slot {
                 UsageObjectSlot::Primary => state.object.as_ref(),
                 UsageObjectSlot::Backup => state.backup_object.as_ref(),
+                UsageObjectSlot::Observed => state.observed_object.as_ref(),
                 UsageObjectSlot::LegacyPrimary => state.legacy_object.as_ref(),
                 UsageObjectSlot::LegacyBackup => state.legacy_backup_object.as_ref(),
             }
@@ -2425,6 +2507,7 @@ mod tests {
             match slot {
                 UsageObjectSlot::Primary => state.object = Some((buf, revision)),
                 UsageObjectSlot::Backup => state.backup_object = Some((buf, revision)),
+                UsageObjectSlot::Observed => state.observed_object = Some((buf, revision)),
                 UsageObjectSlot::LegacyPrimary => state.legacy_object = Some((buf, revision)),
                 UsageObjectSlot::LegacyBackup => state.legacy_backup_object = Some((buf, revision)),
             }
@@ -2743,6 +2826,43 @@ mod tests {
         namespace_changed.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
         let (selected, _) = select_admin_data_usage_snapshot(namespace_changed, true, Some(observed));
         assert_eq!(selected.usage_snapshot_converged, Some(true));
+    }
+
+    #[tokio::test]
+    async fn authoritative_save_cleanup_removes_observed_snapshot_best_effort() {
+        let store = UsageCasStore::default();
+        let authoritative = data_usage_info_for_test("bucket", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let stale_observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            ..Default::default()
+        };
+        store.state.lock().await.observed_object =
+            Some((serde_json::to_vec(&stale_observed).expect("observed snapshot should encode"), 1));
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_none());
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_none());
+
+        let newer_observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(3)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(11),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+        store.state.lock().await.observed_object =
+            Some((serde_json::to_vec(&newer_observed).expect("observed snapshot should encode"), 2));
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_some());
     }
 
     #[test]

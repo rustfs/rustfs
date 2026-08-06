@@ -18,7 +18,6 @@ use std::future::Future;
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use crate::ScannerObjectIO;
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
     DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_with_revision,
@@ -36,6 +35,7 @@ use crate::scanner_io::{
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO, ScannerObjectOptions};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
@@ -391,7 +391,8 @@ impl ScannerSupersededBackoff {
         let base_interval = configured_interval
             .max(Duration::from_secs(1))
             .min(SUPERSEDED_RETRY_BASE_INTERVAL);
-        Some(base_interval.saturating_mul(multiplier).min(SUPERSEDED_RETRY_MAX_INTERVAL))
+        let cap = SUPERSEDED_RETRY_MAX_INTERVAL.max(configured_interval.max(Duration::from_secs(1)));
+        Some(base_interval.saturating_mul(multiplier).min(cap))
     }
 }
 
@@ -3792,7 +3793,7 @@ fn data_usage_reintroduces_missing_bucket(incoming: &DataUsageInfo, existing: Op
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     receiver: mpsc::Receiver<DataUsageInfo>,
 ) {
     let _ = store_data_usage_in_backend_with_outcome(ctx, storeapi, receiver).await;
@@ -3800,7 +3801,7 @@ pub async fn store_data_usage_in_backend(
 
 async fn store_data_usage_in_backend_with_outcome(
     ctx: CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     receiver: mpsc::Receiver<DataUsageInfo>,
 ) -> DataUsagePersistOutcome {
     store_data_usage_in_backend_with_outcome_for_epoch(ctx, storeapi, receiver, None).await
@@ -3808,7 +3809,7 @@ async fn store_data_usage_in_backend_with_outcome(
 
 async fn store_data_usage_in_backend_with_outcome_for_epoch(
     ctx: CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
 ) -> DataUsagePersistOutcome {
@@ -3817,7 +3818,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch(
 
 async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
     ctx: CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
@@ -4074,6 +4075,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
+                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
                     invalidate_data_usage_snapshot_cache().await;
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
@@ -4084,6 +4086,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
+                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
                     invalidate_data_usage_snapshot_cache().await;
                 }
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
@@ -4098,6 +4101,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
+                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
                     invalidate_data_usage_snapshot_cache().await;
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
@@ -4125,6 +4129,84 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
     }
 
     outcome
+}
+
+async fn cleanup_observed_data_usage_snapshot(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    authoritative: &DataUsageInfo,
+) {
+    let (observed_data, revision) =
+        match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
+            Ok((Some(data), revision)) => (data, revision),
+            Ok((None, _)) => return,
+            Err(err) => {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                    state = "observed_cleanup_read_failed",
+                    error = %err,
+                    "Scanner could not inspect observational data usage snapshot before authoritative cleanup"
+                );
+                return;
+            }
+        };
+    let observed = match serde_json::from_slice::<DataUsageInfo>(&observed_data) {
+        Ok(observed) => observed,
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                state = "observed_cleanup_decode_failed",
+                error = %err,
+                "Scanner refused to remove an invalid observational data usage snapshot after authoritative save"
+            );
+            return;
+        }
+    };
+    if observed_data_usage_is_newer(&observed, authoritative) {
+        return;
+    }
+
+    let result = storeapi
+        .delete_config_object(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+            ScannerObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                http_preconditions: Some(revision.preconditions()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    match result {
+        Ok(_)
+        | Err(
+            EcstoreError::FileNotFound
+            | EcstoreError::ConfigNotFound
+            | EcstoreError::ObjectNotFound(_, _)
+            | EcstoreError::PreconditionFailed,
+        ) => {}
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                state = "observed_cleanup_failed",
+                error = %err,
+                "Scanner could not remove stale observational data usage snapshot after authoritative save"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5173,6 +5255,31 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
+        async fn delete_config_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> EcstoreResult<ObjectInfo> {
+            let key = memory_config_key(bucket, object);
+            let mut objects = self.objects.lock().await;
+            if !objects.contains_key(&key) {
+                return Err(EcstoreError::FileNotFound);
+            }
+            let mut revisions = self.revisions.lock().await;
+            if let Some(expected) = opts
+                .http_preconditions
+                .as_ref()
+                .and_then(|preconditions| preconditions.if_match.as_deref())
+            {
+                let actual = revisions.get(&key).map(|revision| format!("memory-{revision}"));
+                if actual.as_deref() != Some(expected.trim_matches('"')) {
+                    return Err(EcstoreError::PreconditionFailed);
+                }
+            }
+            objects.remove(&key);
+            revisions.remove(&key);
+            Ok(ObjectInfo::default())
+        }
+    }
+
     #[test]
     fn scanner_cycle_advance_fails_before_reserved_exhausted_value() {
         let mut cycle = CurrentCycle {
@@ -6191,6 +6298,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_save() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let authoritative = DataUsageInfo {
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(10),
+            ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 1)
+        };
+        store.objects.lock().await.insert(
+            authoritative_key.clone(),
+            serde_json::to_vec(&authoritative).expect("authoritative snapshot should encode"),
+        );
+        store.revisions.lock().await.insert(authoritative_key, 1);
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                scanner_epoch: Some(7),
+                scanner_cycle: Some(11),
+                usage_snapshot_converged: Some(false),
+                ..complete_usage_with_bucket_count(None, 1)
+            })
+            .await
+            .expect("superseded usage snapshot should enqueue");
+        drop(sender);
+
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await,
+            DataUsagePersistOutcome::Saved
+        );
+        let observed_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str());
+        assert!(store.objects.lock().await.contains_key(&observed_key));
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+                scanner_epoch: Some(7),
+                scanner_cycle: Some(12),
+                usage_snapshot_converged: Some(true),
+                ..complete_usage_with_bucket_count(None, 1)
+            })
+            .await
+            .expect("authoritative usage snapshot should enqueue");
+        drop(sender);
+
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await,
+            DataUsagePersistOutcome::Saved
+        );
+        assert!(
+            !store.objects.lock().await.contains_key(&observed_key),
+            "an authoritative snapshot should retire stale observations"
+        );
+
+        let next_authoritative = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(3)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(13),
+            usage_snapshot_converged: Some(true),
+            ..complete_usage_with_bucket_count(None, 1)
+        };
+        let newer_observed = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(14),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(next_authoritative.snapshot_identity()),
+            ..complete_usage_with_bucket_count(None, 1)
+        };
+        store.objects.lock().await.insert(
+            observed_key.clone(),
+            serde_json::to_vec(&newer_observed).expect("newer observed snapshot should encode"),
+        );
+        store.revisions.lock().await.insert(observed_key.clone(), 3);
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(next_authoritative)
+            .await
+            .expect("next authoritative usage snapshot should enqueue");
+        drop(sender);
+
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await,
+            DataUsagePersistOutcome::Saved
+        );
+        assert!(
+            store.objects.lock().await.contains_key(&observed_key),
+            "a newer observation must survive stale authoritative cleanup"
+        );
+    }
+
     fn mark_usage_snapshot_complete(info: &mut DataUsageInfo) {
         info.usage_snapshot_complete = true;
     }
@@ -6723,13 +6925,20 @@ mod tests {
         let mut backoff = ScannerSupersededBackoff::default();
         assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
-        for expected in [60, 120, 240, 480, 960, 1_800, 1_800] {
+        for expected in [60, 120, 240, 480, 960, 1_920, 3_840] {
             backoff.record_cycle(ScannerCycleOutcome::Superseded);
             assert_eq!(
                 backoff.retry_interval(Duration::from_secs(24 * 60 * 60)),
                 Some(Duration::from_secs(expected))
             );
         }
+        for _ in 0..20 {
+            backoff.record_cycle(ScannerCycleOutcome::Superseded);
+        }
+        assert_eq!(
+            backoff.retry_interval(Duration::from_secs(24 * 60 * 60)),
+            Some(Duration::from_secs(24 * 60 * 60))
+        );
 
         backoff.record_cycle(ScannerCycleOutcome::Completed);
         assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);

@@ -506,6 +506,28 @@ impl<T> ScannerObjectIO for T where
 {
 }
 
+#[async_trait::async_trait]
+pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo>;
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for ECStore {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
