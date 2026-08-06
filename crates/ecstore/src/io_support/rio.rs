@@ -380,6 +380,12 @@ impl WritePlan {
     }
 
     pub fn apply(self, mut reader: HashReader, actual_size: i64) -> std::io::Result<HashReader> {
+        // Transformations create new HashReaders around the plaintext reader. Keep
+        // the request checksum metadata on the final reader for multipart/single
+        // PUT persistence, but leave verification to the plaintext reader.
+        let checksum = reader.content_hash().clone();
+        let trailer = reader.get_trailer().cloned();
+
         let encrypted = self.encryption.is_some();
         if let Some(algorithm) = self.compression {
             reader = HashReader::from_reader(
@@ -438,6 +444,12 @@ impl WritePlan {
             };
         }
 
+        // `ignore_value` deliberately avoids a second hasher over compressed or
+        // encrypted bytes. The inner reader still validates the plaintext request
+        // checksum while this outer reader exposes the request checksum context.
+        reader.add_non_trailing_checksum(checksum, true)?;
+        reader.set_trailer(trailer);
+
         Ok(reader)
     }
 }
@@ -445,9 +457,72 @@ impl WritePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{HeaderMap, HeaderValue};
+    use rustfs_rio::{Checksum, ChecksumType};
     use rustfs_utils::CompressionAlgorithm;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
+
+    async fn assert_non_trailing_checksum_survives(plan: WritePlan) {
+        let plaintext = b"checksum-context-through-write-plan".repeat(256);
+        let actual_size = plaintext.len() as i64;
+        let checksum = Checksum::new_from_data(ChecksumType::CRC32, &plaintext).expect("create CRC32 checksum");
+        let mut reader = HashReader::from_stream(Cursor::new(plaintext), actual_size, actual_size, None, None, false)
+            .expect("create hash reader");
+        reader
+            .add_non_trailing_checksum(Some(checksum.clone()), false)
+            .expect("attach plaintext checksum");
+
+        let mut transformed = plan.apply(reader, actual_size).expect("apply write plan");
+        assert_eq!(transformed.content_crc_type(), Some(ChecksumType::CRC32));
+
+        let mut transformed_bytes = Vec::new();
+        transformed
+            .read_to_end(&mut transformed_bytes)
+            .await
+            .expect("stream transformed data without rehashing ciphertext");
+
+        assert!(!transformed_bytes.is_empty());
+        assert_eq!(transformed.content_crc().get("CRC32"), Some(&checksum.encoded));
+    }
+
+    #[tokio::test]
+    async fn write_plan_preserves_non_trailing_checksum_context_across_transforms() {
+        assert_non_trailing_checksum_survives(WritePlan::new().with_compression(CompressionAlgorithm::default())).await;
+        assert_non_trailing_checksum_survives(
+            WritePlan::new().with_encryption(WriteEncryption::singlepart([0x5Au8; 32], [0xA5u8; 12])),
+        )
+        .await;
+        assert_non_trailing_checksum_survives(
+            WritePlan::new()
+                .with_compression(CompressionAlgorithm::default())
+                .with_encryption(WriteEncryption::singlepart([0x5Au8; 32], [0xA5u8; 12])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn write_plan_preserves_trailing_checksum_type_across_transforms() {
+        let plaintext = b"trailing-checksum-context".to_vec();
+        let actual_size = plaintext.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(plaintext), actual_size, actual_size, None, None, false)
+            .expect("create hash reader");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
+        reader
+            .add_checksum_from_s3s(&headers, None, false)
+            .expect("attach trailing checksum metadata");
+
+        let transformed = WritePlan::new()
+            .with_encryption(WriteEncryption::singlepart([0x5Au8; 32], [0xA5u8; 12]))
+            .apply(reader, actual_size)
+            .expect("apply encryption plan");
+
+        assert_eq!(
+            transformed.content_crc_type(),
+            Some(ChecksumType(ChecksumType::CRC32.0 | ChecksumType::TRAILING.0))
+        );
+    }
 
     #[cfg(feature = "rio-v2")]
     fn s2_chunk_types(stream: &[u8]) -> Vec<u8> {

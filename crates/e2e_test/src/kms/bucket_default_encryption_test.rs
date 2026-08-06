@@ -21,9 +21,12 @@
 
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
+use rustfs_rio::{Checksum, ChecksumType};
 use serial_test::serial;
 use tracing::{debug, info, warn};
 
@@ -273,7 +276,7 @@ async fn test_bucket_default_sse_kms_put_object() -> Result<(), Box<dyn std::err
 /// Test 3: When bucket is configured with default encryption, create_multipart_upload should inherit the configuration
 #[tokio::test]
 #[serial]
-async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_bucket_default_sse_kms_multipart_crc32() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Testing bucket default encryption impact on create_multipart_upload");
 
@@ -309,15 +312,16 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         .await
         .expect("Failed to set bucket encryption");
 
-    // Step 2: Create multipart upload (without specifying encryption parameters)
-    info!("Creating multipart upload (without specifying encryption parameters, should use bucket default configuration)");
-    let test_key = "test-multipart-bucket-default.txt";
+    // Step 2: Declare CRC32 without specifying encryption parameters. The AWS SDK
+    // calculates each UploadPart checksum and sends it as a flexible checksum.
+    info!("Creating CRC32 multipart upload that should use bucket default encryption");
+    let test_key = "test-multipart-bucket-default-crc32.bin";
 
     let create_multipart_response = s3_client
         .create_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(test_key)
-        // Note: No encryption parameters specified here, should use bucket default configuration
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
         .send()
         .await
         .expect("Failed to create multipart upload");
@@ -343,28 +347,61 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         "create_multipart_upload response should contain correct KMS key ID"
     );
 
-    // Step 3: Upload a part and complete multipart upload
-    info!("Uploading part and completing multipart upload");
-    let test_data = b"test-multipart-bucket-default-encryption-data";
+    // Step 3: Upload two parts. The first is exactly the S3 minimum size so this
+    // follows the same managed SSE-KMS multipart path as issue #5756.
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let part1: Vec<u8> = (0..PART_SIZE).map(|i| (i % 251) as u8).collect();
+    let part2: Vec<u8> = (0..1024 * 1024).map(|i| ((i + 17) % 251) as u8).collect();
+    let expected_body: Vec<u8> = part1.iter().chain(&part2).copied().collect();
 
-    // Upload part 1
-    let upload_part_response = s3_client
-        .upload_part()
-        .bucket(TEST_BUCKET)
-        .key(test_key)
-        .upload_id(upload_id)
-        .part_number(1)
-        .body(test_data.to_vec().into())
-        .send()
-        .await
-        .expect("Failed to upload part");
+    let upload_part = |part_number: i32, body: Vec<u8>| {
+        s3_client
+            .upload_part()
+            .bucket(TEST_BUCKET)
+            .key(test_key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(ByteStream::from(body))
+            .send()
+    };
 
-    let etag = upload_part_response.e_tag().unwrap().to_string();
+    let expected_part1_crc32 = Checksum::new_from_data(ChecksumType::CRC32, &part1)
+        .expect("calculate part 1 CRC32")
+        .encoded;
+    let upload1 = upload_part(1, part1).await.expect("Failed to upload part 1 with CRC32");
+    assert_eq!(
+        upload1.checksum_crc32(),
+        Some(expected_part1_crc32.as_str()),
+        "UploadPart must return the CRC32 calculated over plaintext"
+    );
+
+    let expected_part2_crc32 = Checksum::new_from_data(ChecksumType::CRC32, &part2)
+        .expect("calculate part 2 CRC32")
+        .encoded;
+    let upload2 = upload_part(2, part2).await.expect("Failed to upload part 2 with CRC32");
+    assert_eq!(
+        upload2.checksum_crc32(),
+        Some(expected_part2_crc32.as_str()),
+        "UploadPart must return the CRC32 calculated over plaintext"
+    );
 
     // Complete multipart upload
-    let completed_part = aws_sdk_s3::types::CompletedPart::builder()
-        .part_number(1)
-        .e_tag(&etag)
+    let completed_upload = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(upload1.e_tag().expect("No ETag for part 1"))
+                .checksum_crc32(upload1.checksum_crc32().expect("No CRC32 for part 1"))
+                .build(),
+        )
+        .parts(
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag(upload2.e_tag().expect("No ETag for part 2"))
+                .checksum_crc32(upload2.checksum_crc32().expect("No CRC32 for part 2"))
+                .build(),
+        )
         .build();
 
     let complete_multipart_response = s3_client
@@ -372,11 +409,7 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         .bucket(TEST_BUCKET)
         .key(test_key)
         .upload_id(upload_id)
-        .multipart_upload(
-            aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                .parts(completed_part)
-                .build(),
-        )
+        .multipart_upload(completed_upload)
         .send()
         .await
         .expect("Failed to complete multipart upload");
@@ -400,6 +433,7 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         .get_object()
         .bucket(TEST_BUCKET)
         .key(test_key)
+        .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
         .expect("Failed to get object");
@@ -410,6 +444,13 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         Some(&ServerSideEncryption::AwsKms),
         "Final object should contain SSE-KMS encryption information"
     );
+    if let Some(completed_crc32) = complete_multipart_response.checksum_crc32() {
+        assert_eq!(
+            get_response.checksum_crc32(),
+            Some(completed_crc32),
+            "GetObject should return the persisted composite CRC32 when completion reports it"
+        );
+    }
 
     // Verify data integrity
     let downloaded_data = get_response
@@ -418,7 +459,11 @@ async fn test_bucket_default_encryption_multipart_upload() -> Result<(), Box<dyn
         .await
         .expect("Failed to collect body")
         .into_bytes();
-    assert_eq!(&downloaded_data[..], test_data, "Downloaded data should match original data");
+    assert_eq!(
+        downloaded_data.as_ref(),
+        expected_body.as_slice(),
+        "Downloaded data should match the uploaded multipart body"
+    );
 
     // Cleanup is handled automatically when the test environment is dropped
     info!("Test passed: bucket default encryption correctly applied to multipart upload");
