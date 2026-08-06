@@ -21,6 +21,15 @@ use time::OffsetDateTime;
 
 pub const SITE_REPL_API_VERSION: &str = "1";
 
+/// `SRIAMItem` type for replicated STS credentials, matching MinIO madmin-go
+/// `SRIAMItemSTSAcc`. MinIO peers reject any other value as an invalid request.
+pub const SR_IAM_ITEM_STS_ACC: &str = "sts-account";
+
+/// STS item type emitted by RustFS releases prior to the MinIO alignment.
+/// Never emitted anymore, but accepted inbound permanently so mixed-version
+/// RustFS sites keep replicating STS credentials during rolling upgrades.
+pub const SR_IAM_ITEM_STS_ACC_LEGACY: &str = "sts-credential";
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PeerSite {
     #[serde(default)]
