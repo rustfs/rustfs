@@ -1316,6 +1316,7 @@ impl SetDisks {
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
+                    && false // A/B SHORT-CIRCUIT (ab/put-fence-shortcut): disable incarnation fence to isolate its per-PUT cost. NOT FOR MERGE.
                 {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
