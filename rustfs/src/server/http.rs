@@ -1891,10 +1891,29 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         allow_replay_scope_bootstrap,
     )
     .map_err(|e| {
+        let rpc_path = target.uri.path();
+        let rpc_service = rpc_path
+            .strip_prefix('/')
+            .and_then(|path| path.split_once('/'))
+            .map(|(service, _)| service)
+            .unwrap_or("unknown");
+        let peer_addr = req
+            .extensions()
+            .get::<RemoteAddr>()
+            .map(|addr| addr.0.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
         error!(
             event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_HTTP,
+            failure_reason,
+            rpc_path,
+            rpc_service,
+            rpc_method,
+            expected_audience = %audience,
+            peer_addr = %peer_addr,
+            replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
             error = %e,
             "RPC signature verification failed"
         );

@@ -498,8 +498,8 @@ pub(crate) mod ecstore_rpc {
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
         PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX,
         normalize_tonic_rpc_audience, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
-        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
+        tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_rpc_signature,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -1665,6 +1665,10 @@ pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
     allow_replay_scope_bootstrap: bool,
 ) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+}
+
+pub(crate) fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
+    ecstore_rpc::tonic_rpc_auth_failure_reason(error)
 }
 
 pub(crate) fn tonic_boot_epoch_challenge(headers: &http::HeaderMap) -> std::io::Result<Option<uuid::Uuid>> {
