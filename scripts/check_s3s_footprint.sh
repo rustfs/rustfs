@@ -23,8 +23,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Baselines verified on 2026-08-06. Lower-only; see header.
-S3S_IMPORT_FILES_BASELINE=236
-S3_ERROR_LINES_BASELINE=1680
+S3S_IMPORT_FILES_BASELINE=237
+S3_ERROR_LINES_BASELINE=1679
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
