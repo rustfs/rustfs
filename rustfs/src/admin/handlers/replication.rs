@@ -1242,6 +1242,26 @@ mod tests {
         })
     }
 
+    /// Verbatim `encoding/json` marshal of the madmin-go v3.0.109 `BucketTarget`
+    /// that `mc replicate add` builds (path=auto, api=s3v4, 60s healthcheck).
+    /// Field presence follows Go `omitempty` semantics against the v3.0.109 tags:
+    /// zero strings (`sessionToken`, `arn`, `region`, `storageclass`, `resetID`,
+    /// `deploymentID`) and the zero `bandwidthlimit` int are elided; untagged
+    /// fields (`sourcebucket`, `secure`, `type`, `replicationSync`,
+    /// `disableProxy`, `totalDowntime`, `lastOnline`, `isOnline`, `latency`,
+    /// `edge`, `edgeSyncBeforeExpiry`, `offlineCount`) always appear; and
+    /// `omitempty` never elides a struct, so the zero `time.Time` fields
+    /// (`credentials.expiration`, `resetBeforeDate`) still appear as
+    /// `0001-01-01T00:00:00Z`.
+    const MADMIN_REPLICATE_ADD_BODY: &str = r#"{"sourcebucket":"","endpoint":"192.168.1.10:9000","credentials":{"accessKey":"access","secretKey":"secret","expiration":"0001-01-01T00:00:00Z"},"targetbucket":"target","secure":false,"path":"auto","api":"s3v4","type":"replication","replicationSync":false,"healthCheckDuration":60000000000,"disableProxy":false,"resetBeforeDate":"0001-01-01T00:00:00Z","totalDowntime":0,"lastOnline":"0001-01-01T00:00:00Z","isOnline":false,"latency":{"curr":0,"avg":0,"max":0},"edge":false,"edgeSyncBeforeExpiry":false,"offlineCount":0}"#;
+
+    /// Verbatim marshal of the same target after `mc replicate update --sync`:
+    /// mc lists remote targets (latency reported in Go `time.Duration`
+    /// nanoseconds), `BucketTarget::Clone()` strips only the secret key, and the
+    /// mutated clone round-trips every other stored field — including the
+    /// nanosecond latency echo — back to set-remote-target.
+    const MADMIN_REPLICATE_UPDATE_BODY: &str = r#"{"sourcebucket":"src","endpoint":"192.168.1.10:9000","credentials":{"accessKey":"access","expiration":"0001-01-01T00:00:00Z"},"targetbucket":"target","secure":false,"path":"auto","api":"s3v4","arn":"arn:rustfs:replication:us-east-1:dep:target","type":"replication","replicationSync":true,"healthCheckDuration":60000000000,"disableProxy":false,"resetBeforeDate":"0001-01-01T00:00:00Z","totalDowntime":0,"lastOnline":"0001-01-01T00:00:00Z","isOnline":true,"latency":{"curr":60000000000,"avg":45000000000,"max":90000000000},"edge":false,"edgeSyncBeforeExpiry":false,"offlineCount":0}"#;
+
     fn query_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -1672,6 +1692,78 @@ mod tests {
             assert!(err.to_string().contains(field));
             assert!(err.to_string().contains("not supported by this RustFS version"));
         }
+    }
+
+    #[test]
+    fn remote_target_request_accepts_real_madmin_add_marshal() {
+        let request: RemoteTargetRequest =
+            serde_json::from_str(MADMIN_REPLICATE_ADD_BODY).expect("real mc replicate add body should deserialize");
+        let target = request
+            .into_bucket_target()
+            .expect("real mc replicate add body must be accepted");
+
+        assert_eq!(target.endpoint, "192.168.1.10:9000");
+        assert_eq!(target.target_bucket, "target");
+        assert_eq!(target.health_check_duration, std::time::Duration::from_secs(60));
+        let credentials = target.credentials.expect("credentials should be present");
+        assert_eq!(credentials.access_key, "access");
+        assert_eq!(credentials.secret_key, "secret");
+        assert!(
+            credentials.expiration.is_none(),
+            "Go zero-value expiration is an unset sentinel and must not be persisted"
+        );
+    }
+
+    #[test]
+    fn remote_target_request_accepts_go_zero_time_expiration_offset_forms() {
+        // Go marshals the zero time.Time as 0001-01-01T00:00:00Z, but a body
+        // that re-encoded the same instant with an offset is equally "unset".
+        for expiration in ["0001-01-01T00:00:00Z", "0001-01-01T08:00:00+08:00"] {
+            let mut request = valid_remote_target_request();
+            request["credentials"]["expiration"] = serde_json::json!(expiration);
+            let request: RemoteTargetRequest = serde_json::from_value(request).expect("request should deserialize");
+            request
+                .into_bucket_target()
+                .unwrap_or_else(|err| panic!("zero-value expiration {expiration} must be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn remote_target_update_accepts_madmin_clone_round_trip() {
+        let request: RemoteTargetRequest =
+            serde_json::from_str(MADMIN_REPLICATE_UPDATE_BODY).expect("mc replicate update body should deserialize");
+        let target = request
+            .into_update_bucket_target(&[TargetUpdateOp::Sync])
+            .expect("mc replicate update round-trip body must be accepted");
+
+        assert!(target.replication_sync);
+        assert_eq!(
+            target.latency.curr,
+            std::time::Duration::ZERO,
+            "nanosecond latency echoed back by mc must not be persisted as milliseconds"
+        );
+    }
+
+    #[test]
+    fn remote_target_request_ignores_client_supplied_latency() {
+        // Latency is a server-measured runtime stat; mc echoes the
+        // list-remote-targets nanosecond values back on update, while the
+        // request parser historically read them as milliseconds (1e6 blow-up).
+        let mut request = valid_remote_target_request();
+        request["latency"] = serde_json::json!({
+            "curr": 60_000_000_000u64,
+            "avg": 45_000_000_000u64,
+            "max": 90_000_000_000u64
+        });
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect("request should pass semantic validation");
+
+        assert_eq!(target.latency.curr, std::time::Duration::ZERO);
+        assert_eq!(target.latency.avg, std::time::Duration::ZERO);
+        assert_eq!(target.latency.max, std::time::Duration::ZERO);
     }
 
     #[test]
