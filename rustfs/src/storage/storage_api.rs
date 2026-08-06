@@ -108,7 +108,8 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
         authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
+        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, recursive_force_delete_is_authorized,
+        replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 

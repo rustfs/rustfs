@@ -294,6 +294,10 @@ mod list_buckets_double_slash_test;
 #[cfg(test)]
 mod list_buckets_auth_test;
 
+// ListBuckets visibility follows IAM authorization, not bucket policy.
+#[cfg(test)]
+mod list_buckets_iam_filter_test;
+
 // Regression test for backlog#629(b): region-aware CreateBucket SigV4.
 #[cfg(test)]
 mod create_bucket_region_test;

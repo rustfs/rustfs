@@ -32,7 +32,11 @@ use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use http::HeaderMap;
 use metrics::counter;
-use rustfs_iam::error::Error as IamError;
+use rustfs_iam::{
+    error::Error as IamError,
+    store::object::ObjectStore,
+    sys::{IamSys, PreparedIamAuth},
+};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
@@ -47,7 +51,7 @@ use rustfs_utils::http::{
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use url::{Url, form_urlencoded};
 
 #[derive(Default, Clone, Debug)]
@@ -585,6 +589,120 @@ fn auth_fs() -> &'static FS {
     AUTH_FS.get_or_init(FS::new)
 }
 
+fn request_iam_store<T>(req: &S3Request<T>) -> S3Result<Arc<IamSys<ObjectStore>>> {
+    let iam_store = match req.extensions.get::<Arc<ServerContextSlot>>() {
+        Some(server_ctx) => server_ctx
+            .installed_app_context()
+            .filter(|context| context.iam().is_ready())
+            .map(|context| context.iam().handle())
+            .ok_or(IamError::IamSysNotInitialized),
+        None => runtime_sources::current_ready_iam_handle(),
+    };
+    iam_store.map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("authorize_request {:?}", IamError::IamSysNotInitialized),
+        )
+    })
+}
+
+pub(crate) struct ListBucketsIamAuthorization {
+    iam_store: Arc<IamSys<ObjectStore>>,
+    prepared: PreparedIamAuth,
+    account: String,
+    groups: Option<Vec<String>>,
+    claims: HashMap<String, serde_json::Value>,
+    is_owner: bool,
+    base_conditions: HashMap<String, Vec<String>>,
+    bucket_conditions: HashMap<String, Vec<String>>,
+}
+
+impl ListBucketsIamAuthorization {
+    pub(crate) async fn is_allowed(&self, bucket: &str, action: S3Action) -> bool {
+        let conditions = if bucket.is_empty() {
+            &self.base_conditions
+        } else {
+            &self.bucket_conditions
+        };
+        self.iam_store
+            .eval_prepared(
+                &self.prepared,
+                &Args {
+                    account: &self.account,
+                    groups: &self.groups,
+                    action: Action::S3Action(action),
+                    bucket,
+                    conditions,
+                    is_owner: self.is_owner,
+                    object: "",
+                    claims: &self.claims,
+                    deny_only: false,
+                },
+            )
+            .await
+    }
+}
+
+/// Prepare the IAM-only authorization used to decide which buckets are visible in ListBuckets.
+/// Bucket policies are intentionally excluded from this discovery decision, matching MinIO.
+pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>) -> S3Result<ListBucketsIamAuthorization> {
+    let req_info = req_info_ref(req)?;
+    let Some(cred) = req_info.cred.as_ref() else {
+        return Err(ApiError::access_denied().into());
+    };
+    let iam_store = request_iam_store(req)?;
+    let account = cred.access_key.clone();
+    let groups = cred.groups.clone();
+    let claims = cred.claims.clone().unwrap_or_default();
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    let client_info = req.extensions.get::<ClientInfo>();
+    let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
+    let base_conditions = authorization_conditions(req, cred, None, None, remote_addr, client_info, action)?;
+    let mut bucket_conditions = base_conditions.clone();
+    bucket_conditions.insert("prefix".to_string(), vec![String::new()]);
+    bucket_conditions.insert("delimiter".to_string(), vec!["/".to_string()]);
+    let prepared = iam_store
+        .prepare_auth(&Args {
+            account: &account,
+            groups: &groups,
+            action,
+            bucket: "",
+            conditions: &base_conditions,
+            is_owner: req_info.is_owner,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        })
+        .await;
+
+    Ok(ListBucketsIamAuthorization {
+        iam_store,
+        prepared,
+        account,
+        groups,
+        claims,
+        is_owner: req_info.is_owner,
+        base_conditions,
+        bucket_conditions,
+    })
+}
+
+/// Preserve the top-level IAM denial audit emitted before ListBuckets falls back
+/// to bucket-level visibility checks.
+pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Result<()> {
+    let req_info = req_info_ref(req)?;
+    let denial = DenialContext {
+        quiet: true,
+        bucket: req_info.bucket.as_deref().unwrap_or_default(),
+        object: req_info.object.as_deref().unwrap_or_default(),
+        version_id: req_info.version_id.as_deref(),
+        account: req_info.cred.as_ref().map(|cred| cred.access_key.as_str()),
+        is_owner: req_info.is_owner,
+    };
+    denial.log("iam_implicit_deny", Action::S3Action(S3Action::ListAllMyBucketsAction));
+    Ok(())
+}
+
 /// Extra action that may be evaluated in the same authorization flow and can
 /// independently require `ExistingObjectTag` conditions.
 fn secondary_tag_hint_action(action: Action, version_id: Option<&str>) -> Option<Action> {
@@ -746,20 +864,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     };
 
     if let Some(cred) = &cred {
-        let iam_store = match req.extensions.get::<std::sync::Arc<ServerContextSlot>>() {
-            Some(server_ctx) => server_ctx
-                .installed_app_context()
-                .filter(|context| context.iam().is_ready())
-                .map(|context| context.iam().handle())
-                .ok_or(()),
-            None => runtime_sources::current_ready_iam_handle().map_err(|_| ()),
-        };
-        let Ok(iam_store) = iam_store else {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("authorize_request {:?}", IamError::IamSysNotInitialized),
-            ));
-        };
+        let iam_store = request_iam_store(req)?;
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
@@ -2615,8 +2720,7 @@ mod tests {
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use s3s::{S3ErrorCode, S3Request, dto::*};
     use serial_test::serial;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
 
     struct UnreadyIam;
