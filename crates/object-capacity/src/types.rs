@@ -28,6 +28,10 @@ pub(crate) struct CapacityScanResult {
     pub is_estimated: bool,
     pub scan_duration: Duration,
     pub had_partial_errors: bool,
+    pub timed_out: bool,
+    pub metadata_incomplete: bool,
+    #[cfg(test)]
+    pub metadata_reads: usize,
 }
 
 impl CapacityScanResult {
