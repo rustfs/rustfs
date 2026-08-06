@@ -6940,6 +6940,10 @@ impl DefaultObjectUsecase {
         }
 
         let mut authorized_deletes = Vec::with_capacity(delete.objects.len());
+        // Issue #5740: keep the first per-key denial of this bulk request at
+        // warn and demote the rest to debug, so a denied 1000-key DeleteObjects
+        // cannot flood the log.
+        let mut bulk_denial_logged = false;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -6964,6 +6968,10 @@ impl DefaultObjectUsecase {
 
             let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
             if auth_res.is_err() {
+                if !bulk_denial_logged {
+                    bulk_denial_logged = true;
+                    req_info_mut(&mut req)?.suppress_denial_log = true;
+                }
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
@@ -6976,6 +6984,10 @@ impl DefaultObjectUsecase {
             if bypass_governance {
                 let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
                 if auth_res.is_err() {
+                    if !bulk_denial_logged {
+                        bulk_denial_logged = true;
+                        req_info_mut(&mut req)?.suppress_denial_log = true;
+                    }
                     delete_results[idx].error = Some(s3s::dto::Error {
                         code: Some("AccessDenied".to_string()),
                         key: Some(obj_id.key.clone()),
