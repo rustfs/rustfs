@@ -2445,21 +2445,13 @@ where
             ));
         }
 
-        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
-        })?;
-        if !current_metadata.is_object() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "current metadata {} must be a JSON object",
-                entry.metadata_location
-            )));
-        }
 
         Ok(table_snapshot_expiration_report(
             table_bucket,
@@ -2497,21 +2489,13 @@ where
             ));
         }
 
-        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
-        })?;
-        if !current_metadata.is_object() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "current metadata {} must be a JSON object",
-                entry.metadata_location
-            )));
-        }
 
         table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
     }
@@ -2541,21 +2525,13 @@ where
             ));
         }
 
-        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
-        })?;
-        if !current_metadata.is_object() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "current metadata {} must be a JSON object",
-                entry.metadata_location
-            )));
-        }
         let mut report =
             table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config)
                 .await?;
@@ -2769,18 +2745,20 @@ where
         let current_metadata_status =
             if is_valid_table_metadata_location(&parsed_namespace, &parsed_table, &current_metadata_location) {
                 retained.insert(current_metadata_location.clone());
-                match self.backend.read_object(table_bucket, &current_metadata_location).await? {
-                    Some(current_metadata_object) => {
-                        match serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data) {
-                            Ok(current_metadata) if current_metadata.is_object() => {
-                                retained.extend(metadata_log_locations(&current_metadata, &parsed_namespace, &parsed_table));
-                                current_metadata_for_refs = Some(current_metadata);
-                                TableMetadataPointerStatus::Valid
-                            }
-                            Ok(_) | Err(_) => TableMetadataPointerStatus::InvalidJson,
-                        }
+                match read_table_metadata_value(&self.backend, table_bucket, &current_metadata_location).await {
+                    Ok(Some(current_metadata)) => {
+                        retained.extend(metadata_log_locations(
+                            &current_metadata,
+                            table_bucket,
+                            &parsed_namespace,
+                            &parsed_table,
+                        ));
+                        current_metadata_for_refs = Some(current_metadata);
+                        TableMetadataPointerStatus::Valid
                     }
-                    None => TableMetadataPointerStatus::MissingObject,
+                    Ok(None) => TableMetadataPointerStatus::MissingObject,
+                    Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
+                    Err(err) => return Err(err),
                 }
             } else {
                 TableMetadataPointerStatus::InvalidLocation
@@ -2859,25 +2837,17 @@ where
             ));
         }
 
-        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
-        })?;
-        if !current_metadata.is_object() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "current metadata {} must be a JSON object",
-                entry.metadata_location
-            )));
-        }
 
         let mut retained = BTreeSet::new();
         let mut maintenance_reasons = BTreeMap::<String, BTreeSet<TableMetadataMaintenanceReason>>::new();
-        for metadata_location in metadata_log_locations(&current_metadata, &namespace, &table) {
+        for metadata_location in metadata_log_locations(&current_metadata, table_bucket, &namespace, &table) {
             retained.insert(metadata_location.clone());
             insert_metadata_maintenance_reason(
                 &mut maintenance_reasons,
@@ -2945,7 +2915,7 @@ where
                 metadata_location.clone(),
                 TableMetadataMaintenanceReason::NoCurrentReachability,
             );
-            let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
+            let Some(candidate_object) = self.backend.object_metadata(table_bucket, metadata_location).await? else {
                 insert_metadata_maintenance_reason(
                     &mut maintenance_reasons,
                     metadata_location.clone(),
@@ -3290,23 +3260,15 @@ where
         }
         let warehouse_object_prefix = table_warehouse_object_prefix(&entry).ok();
 
-        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
-        })?;
-        if !current_metadata.is_object() {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "current metadata {} must be a JSON object",
-                entry.metadata_location
-            )));
-        }
 
-        let mut protected = metadata_log_locations(&current_metadata, &namespace, &table);
+        let mut protected = metadata_log_locations(&current_metadata, table_bucket, &namespace, &table);
         protected.insert(entry.metadata_location.clone());
         protected.extend(report.retained_metadata_locations.iter().cloned());
         protected.extend(
@@ -3336,7 +3298,7 @@ where
                     "cleanup candidate {metadata_location} is retained by current metadata"
                 )));
             }
-            let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
+            let Some(candidate_object) = self.backend.object_metadata(table_bucket, metadata_location).await? else {
                 continue;
             };
             if !planned_deletable_locations.contains(metadata_location.as_str()) {
@@ -3927,7 +3889,7 @@ where
         }
         let Some(new_metadata_object) = self
             .backend
-            .read_object(&request.table_bucket, &request.new_metadata_location)
+            .read_object_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return table_commit_result(
@@ -3943,8 +3905,13 @@ where
                 ))),
             );
         };
-        let next_warehouse_location =
-            table_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+        let table_bucket = request.table_bucket.clone();
+        let metadata_location = request.new_metadata_location.clone();
+        let next_warehouse_location = tokio::task::spawn_blocking(move || {
+            table_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        })
+        .await
+        .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
 
         let has_existing_commit = existing_commit.is_some();
         let mut staged_commit_log = existing_commit.unwrap_or_else(|| CommitLogEntry {
@@ -4190,7 +4157,7 @@ where
         }
         let Some(new_metadata_object) = self
             .backend
-            .read_object(&request.table_bucket, &request.new_metadata_location)
+            .read_object_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -4198,8 +4165,13 @@ where
                 request.new_metadata_location
             )));
         };
-        let next_warehouse_location =
-            view_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+        let table_bucket = request.table_bucket.clone();
+        let metadata_location = request.new_metadata_location.clone();
+        let next_warehouse_location = tokio::task::spawn_blocking(move || {
+            view_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        })
+        .await
+        .map_err(|err| TableCatalogStoreError::Internal(format!("view metadata parser task failed: {err}")))??;
 
         let mut next = current;
         next.metadata_location = request.new_metadata_location;

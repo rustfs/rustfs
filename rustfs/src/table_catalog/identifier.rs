@@ -289,7 +289,7 @@ pub(crate) fn is_valid_view_metadata_location(namespace: &Namespace, view: &Iden
 pub(crate) fn is_valid_table_metadata_file_name(metadata_file_name: &str) -> bool {
     if metadata_file_name.is_empty()
         || metadata_file_name.len() > TABLE_METADATA_FILE_NAME_MAX_LEN
-        || !metadata_file_name.ends_with(".json")
+        || !(metadata_file_name.ends_with(".json") || metadata_file_name.ends_with(".json.gz"))
         || metadata_file_name.contains("..")
         || metadata_file_name.contains('%')
         || metadata_file_name.contains('/')
