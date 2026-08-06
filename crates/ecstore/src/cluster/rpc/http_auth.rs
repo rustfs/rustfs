@@ -44,10 +44,11 @@ use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
+use std::fs;
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tracing::error;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,6 +74,11 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
+const REPLAY_CACHE_RETENTION_SECS: usize = 601;
+const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
+const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 4;
+const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 1024;
+const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 8_388_608;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
@@ -94,17 +100,229 @@ static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     )
 });
 // Sized for peak legitimate authenticated RPC RPS x the retention window once replay scope is
-// active; overflow fails closed and increments the replay-cache overflow counter. Clamped to at
-// least 1 so a misconfigured zero cannot disable replay protection by rejecting every request.
-static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
-    rustfs_utils::get_env_usize(
-        rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
-        rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
-    )
-    .max(1)
-});
+// active; overflow fails closed and increments the replay-cache overflow counter. Explicit operator
+// values and auto-sizing are both floored at the historical default so under-sizing cannot turn
+// legitimate high-throughput traffic into `No valid auth token` failures.
+static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(resolve_replay_cache_capacity);
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 static RPC_BOOT_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayCacheCapacitySource {
+    Env,
+    EnvClampedToDefault,
+    Auto,
+    AutoClampedToDefault,
+    AutoInvalidEnv,
+    AutoInvalidEnvClampedToDefault,
+}
+
+impl ReplayCacheCapacitySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::EnvClampedToDefault => "env_clamped_to_default",
+            Self::Auto => "auto",
+            Self::AutoClampedToDefault => "auto_clamped_to_default",
+            Self::AutoInvalidEnv => "auto_invalid_env",
+            Self::AutoInvalidEnvClampedToDefault => "auto_invalid_env_clamped_to_default",
+        }
+    }
+
+    fn is_env_clamped(self) -> bool {
+        matches!(self, Self::EnvClampedToDefault)
+    }
+
+    fn is_env(self) -> bool {
+        matches!(self, Self::Env)
+    }
+
+    fn is_invalid_env(self) -> bool {
+        matches!(self, Self::AutoInvalidEnv | Self::AutoInvalidEnvClampedToDefault)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayCacheCapacityDecision {
+    capacity: usize,
+    source: ReplayCacheCapacitySource,
+    cpu_count: usize,
+    memory_limit_bytes: Option<u64>,
+    memory_based_capacity: usize,
+    cpu_based_capacity: usize,
+}
+
+fn saturating_usize_from_u64(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Option<u64>) -> (usize, usize, usize) {
+    let cpu_count = cpu_count.max(1);
+    let cpu_based_capacity = cpu_count
+        .saturating_mul(REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU)
+        .saturating_mul(REPLAY_CACHE_RETENTION_SECS);
+    let memory_based_capacity = memory_limit_bytes
+        .map(|bytes| {
+            let budget = bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
+            saturating_usize_from_u64(budget / REPLAY_CACHE_ENTRY_BYTES_ESTIMATE)
+        })
+        .unwrap_or(REPLAY_CACHE_AUTO_MAX_CAPACITY);
+    let capacity = memory_based_capacity
+        .min(cpu_based_capacity)
+        .clamp(rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, REPLAY_CACHE_AUTO_MAX_CAPACITY);
+    (capacity, memory_based_capacity, cpu_based_capacity)
+}
+
+fn replay_cache_capacity_decision(
+    env: rustfs_utils::EnvParseOutcome<usize>,
+    cpu_count: usize,
+    memory_limit_bytes: Option<u64>,
+) -> ReplayCacheCapacityDecision {
+    let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
+    match env {
+        rustfs_utils::EnvParseOutcome::Parsed(configured) => {
+            let capacity = configured.max(default);
+            let source = if configured < default {
+                ReplayCacheCapacitySource::EnvClampedToDefault
+            } else {
+                ReplayCacheCapacitySource::Env
+            };
+            ReplayCacheCapacityDecision {
+                capacity,
+                source,
+                cpu_count: cpu_count.max(1),
+                memory_limit_bytes,
+                memory_based_capacity: 0,
+                cpu_based_capacity: 0,
+            }
+        }
+        rustfs_utils::EnvParseOutcome::Absent | rustfs_utils::EnvParseOutcome::Invalid => {
+            let (capacity, memory_based_capacity, cpu_based_capacity) =
+                replay_cache_capacity_from_resources(cpu_count, memory_limit_bytes);
+            let clamped_to_default = capacity == default && memory_based_capacity.min(cpu_based_capacity) < default;
+            let invalid_env = matches!(env, rustfs_utils::EnvParseOutcome::Invalid);
+            let source = match (invalid_env, clamped_to_default) {
+                (true, true) => ReplayCacheCapacitySource::AutoInvalidEnvClampedToDefault,
+                (true, false) => ReplayCacheCapacitySource::AutoInvalidEnv,
+                (false, true) => ReplayCacheCapacitySource::AutoClampedToDefault,
+                (false, false) => ReplayCacheCapacitySource::Auto,
+            };
+            ReplayCacheCapacityDecision {
+                capacity,
+                source,
+                cpu_count: cpu_count.max(1),
+                memory_limit_bytes,
+                memory_based_capacity,
+                cpu_based_capacity,
+            }
+        }
+    }
+}
+
+fn parse_cgroup_memory_limit_value(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value == "max" {
+        return None;
+    }
+    let limit = value.parse::<u64>().ok()?;
+    (limit > 0 && limit < u64::MAX / 2).then_some(limit)
+}
+
+fn read_first_memory_limit(paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| parse_cgroup_memory_limit_value(&value))
+    })
+}
+
+fn physical_memory_limit_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kib.checked_mul(1024);
+    }
+    None
+}
+
+fn detected_memory_limit_bytes() -> Option<u64> {
+    read_first_memory_limit(&["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"])
+        .or_else(physical_memory_limit_bytes)
+}
+
+fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
+    let source = decision.source.as_str();
+    if decision.source.is_env_clamped() {
+        warn!(
+            event = "internode_rpc_replay_cache_capacity_resolved",
+            component = "ecstore",
+            subsystem = "rpc_auth",
+            capacity = decision.capacity,
+            source,
+            default_capacity = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            env = rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            "internode rpc replay cache capacity clamped to default"
+        );
+        return;
+    }
+    if decision.source.is_env() {
+        info!(
+            event = "internode_rpc_replay_cache_capacity_resolved",
+            component = "ecstore",
+            subsystem = "rpc_auth",
+            capacity = decision.capacity,
+            source,
+            default_capacity = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            env = rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            "internode rpc replay cache capacity resolved from env"
+        );
+        return;
+    }
+    if decision.source.is_invalid_env() {
+        warn!(
+            event = "internode_rpc_replay_cache_capacity_resolved",
+            component = "ecstore",
+            subsystem = "rpc_auth",
+            capacity = decision.capacity,
+            source,
+            cpu_count = decision.cpu_count,
+            memory_limit_bytes = decision.memory_limit_bytes,
+            memory_based_capacity = decision.memory_based_capacity,
+            cpu_based_capacity = decision.cpu_based_capacity,
+            auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
+            env = rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            "internode rpc replay cache capacity auto-sized after invalid env"
+        );
+        return;
+    }
+    info!(
+        event = "internode_rpc_replay_cache_capacity_resolved",
+        component = "ecstore",
+        subsystem = "rpc_auth",
+        capacity = decision.capacity,
+        source,
+        cpu_count = decision.cpu_count,
+        memory_limit_bytes = decision.memory_limit_bytes,
+        memory_based_capacity = decision.memory_based_capacity,
+        cpu_based_capacity = decision.cpu_based_capacity,
+        auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
+        "internode rpc replay cache capacity resolved"
+    );
+}
+
+fn resolve_replay_cache_capacity() -> usize {
+    let decision = replay_cache_capacity_decision(
+        rustfs_utils::get_env_parse_outcome(rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY),
+        num_cpus::get(),
+        detected_memory_limit_bytes(),
+    );
+    global_internode_metrics().record_replay_cache_state(0, decision.capacity);
+    log_replay_cache_capacity_decision(decision);
+    decision.capacity
+}
 
 #[derive(Default)]
 struct RpcNonceCache {
@@ -2068,6 +2286,55 @@ mod tests {
             INTERNODE_OPERATION_GRPC_OTHER
         );
         assert_eq!(tonic_rpc_metric_operation("not-a-grpc-path"), INTERNODE_OPERATION_GRPC_OTHER);
+    }
+
+    #[test]
+    fn replay_cache_capacity_uses_env_with_default_floor() {
+        let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
+
+        let high =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Parsed(default * 16), 2, Some(512 * 1024 * 1024));
+        assert_eq!(high.capacity, default * 16);
+        assert_eq!(high.source, ReplayCacheCapacitySource::Env);
+
+        let low = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Parsed(1), 64, Some(128 * 1024 * 1024 * 1024));
+        assert_eq!(low.capacity, default);
+        assert_eq!(low.source, ReplayCacheCapacitySource::EnvClampedToDefault);
+    }
+
+    #[test]
+    fn replay_cache_capacity_auto_sizes_from_cpu_and_memory() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 8, Some(16 * gib));
+
+        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
+        assert_eq!(decision.memory_based_capacity, 5_368_709);
+        assert_eq!(decision.cpu_based_capacity, 4_923_392);
+        assert_eq!(decision.capacity, 4_923_392);
+    }
+
+    #[test]
+    fn replay_cache_capacity_auto_keeps_default_floor_for_small_nodes() {
+        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 1, Some(512 * 1024 * 1024));
+
+        assert_eq!(decision.capacity, rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
+        assert_eq!(decision.source, ReplayCacheCapacitySource::AutoClampedToDefault);
+        assert!(decision.memory_based_capacity < rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn replay_cache_capacity_invalid_env_uses_auto_sizing() {
+        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None);
+
+        assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
+        assert_eq!(decision.capacity, 4_923_392);
+    }
+
+    #[test]
+    fn replay_cache_memory_limit_parser_ignores_unbounded_cgroups() {
+        assert_eq!(parse_cgroup_memory_limit_value("max\n"), None);
+        assert_eq!(parse_cgroup_memory_limit_value("0"), None);
+        assert_eq!(parse_cgroup_memory_limit_value("1073741824\n"), Some(1_073_741_824));
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
