@@ -43,6 +43,14 @@ impl ApiError {
         }
     }
 
+    pub fn invalid_request(message: impl std::fmt::Display) -> Self {
+        ApiError {
+            code: S3ErrorCode::InvalidRequest,
+            message: message.to_string(),
+            source: None,
+        }
+    }
+
     pub fn other<E>(error: E) -> Self
     where
         E: std::fmt::Display + Into<Box<dyn std::error::Error + Send + Sync>>,

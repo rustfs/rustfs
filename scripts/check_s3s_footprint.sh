@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 # Baselines verified on 2026-08-05. Lower-only; see header.
 S3S_IMPORT_FILES_BASELINE=236
-S3_ERROR_LINES_BASELINE=1687
+S3_ERROR_LINES_BASELINE=1686
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
