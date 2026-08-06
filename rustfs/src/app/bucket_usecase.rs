@@ -800,6 +800,8 @@ async fn is_list_objects_metadata_action_allowed<T>(
     req_info.bucket = Some(bucket.to_string());
     req_info.object = Some(object.to_string());
     req_info.version_id = None;
+    // Denial here is an expected filter outcome, not an error (issue #5740).
+    req_info.suppress_denial_log = true;
     auth_req.extensions.insert(req_info);
 
     match authorize_request(&mut auth_req, Action::S3Action(action)).await {
@@ -1390,6 +1392,12 @@ impl DefaultBucketUsecase {
 
         if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        }
+
+        // The ListAllMyBuckets probe and the per-bucket probes cloned from this
+        // request treat denial as an expected filter outcome (issue #5740).
+        if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
+            req_info.suppress_denial_log = true;
         }
 
         let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {

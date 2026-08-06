@@ -61,6 +61,11 @@ pub(crate) struct ReqInfo {
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
     pub request_context: Option<RequestContext>,
+    /// Set by probe-style callers that treat AccessDenied as an expected filter
+    /// outcome (ListBuckets per-bucket fallback, ListObjects metadata permission
+    /// collection) so `authorize_request` logs those routine denials at `debug`
+    /// instead of `warn` (issue #5740).
+    pub suppress_denial_log: bool,
 }
 
 pub(crate) fn replication_request_authorized<T>(req: &S3Request<T>) -> bool {
@@ -666,6 +671,61 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
         )
 }
 
+/// Context shared by every denial exit of [`authorize_request`] (issue #5740).
+///
+/// The wire response intentionally stays the bare "Access Denied" so no policy
+/// detail leaks to clients; the structured server-side event emitted here is
+/// the only place the denial reason is recorded. Probe-style callers that use
+/// denial as an expected filter outcome (per-bucket ListBuckets fallback,
+/// per-object metadata permission collection) set
+/// [`ReqInfo::suppress_denial_log`] so their routine denials log at `debug`
+/// instead of `warn`.
+struct DenialContext<'a> {
+    quiet: bool,
+    bucket: &'a str,
+    object: &'a str,
+    version_id: Option<&'a str>,
+    account: Option<&'a str>,
+    is_owner: bool,
+}
+
+impl DenialContext<'_> {
+    fn log(&self, reason: &'static str, action: Action) {
+        if self.quiet {
+            tracing::debug!(
+                event = "s3_authorization_denied",
+                reason,
+                action = ?action,
+                bucket = %self.bucket,
+                object = %self.object,
+                version_id = ?self.version_id,
+                account = self.account.unwrap_or("<anonymous>"),
+                is_owner = self.is_owner,
+                "authorization probe denied"
+            );
+            return;
+        }
+        tracing::warn!(
+            event = "s3_authorization_denied",
+            reason,
+            action = ?action,
+            bucket = %self.bucket,
+            object = %self.object,
+            version_id = ?self.version_id,
+            account = self.account.unwrap_or("<anonymous>"),
+            is_owner = self.is_owner,
+            "request denied by authorization layer"
+        );
+    }
+
+    /// Build the generic AccessDenied response after recording the structured
+    /// denial event.
+    fn deny(&self, reason: &'static str, action: Action) -> S3Error {
+        self.log(reason, action);
+        s3_error!(AccessDenied, "Access Denied")
+    }
+}
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
@@ -675,6 +735,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let bucket = req_info.bucket.clone().unwrap_or_default();
     let object = req_info.object.clone().unwrap_or_default();
     let version_id = req_info.version_id.clone();
+    let quiet_denial = req_info.suppress_denial_log;
+    let denial = DenialContext {
+        quiet: quiet_denial,
+        bucket: bucket.as_str(),
+        object: object.as_str(),
+        version_id: version_id.as_deref(),
+        account: cred.as_ref().map(|c| c.access_key.as_str()),
+        is_owner,
+    };
 
     if let Some(cred) = &cred {
         let iam_store = match req.extensions.get::<std::sync::Arc<ServerContextSlot>>() {
@@ -804,7 +873,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?
         {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+            return Err(denial.deny("bucket_policy_explicit_deny", action));
         }
 
         if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
@@ -833,7 +902,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 .await
                 .map_err(ApiError::from)?
             {
-                return Err(s3_error!(AccessDenied, "Access Denied"));
+                return Err(denial.deny("delete_object_version_denied", Action::S3Action(S3Action::DeleteObjectVersionAction)));
             }
         }
 
@@ -859,6 +928,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action == Action::S3Action(S3Action::ListAllMyBucketsAction) {
+            denial.log("iam_implicit_deny", action);
             return Err(ApiError::access_denied().into());
         }
 
@@ -994,7 +1064,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?
         {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+            return Err(denial.deny("bucket_policy_explicit_deny", action));
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
@@ -1011,7 +1081,9 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 .await
                 .map_err(ApiError::from)?;
                 if !delete_version_allowed {
-                    return Err(s3_error!(AccessDenied, "Access Denied"));
+                    return Err(
+                        denial.deny("delete_object_version_denied", Action::S3Action(S3Action::DeleteObjectVersionAction))
+                    );
                 }
             }
 
@@ -1051,12 +1123,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 match get_public_access_block_config(bucket_name).await {
                     Ok((config, _)) => {
                         if config.restrict_public_buckets.unwrap_or(false) {
-                            return Err(s3_error!(AccessDenied, "Access Denied"));
+                            return Err(denial.deny("restrict_public_buckets", action));
                         }
                     }
                     Err(StorageError::ConfigNotFound) => {}
                     Err(_) => {
-                        return Err(s3_error!(AccessDenied, "Access Denied"));
+                        return Err(denial.deny("public_access_block_unavailable", action));
                     }
                 }
                 return Ok(());
@@ -1064,7 +1136,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
     }
 
-    Err(s3_error!(AccessDenied, "Access Denied"))
+    Err(denial.deny("no_policy_allows_action", action))
 }
 
 /// Check if the request has the x-amz-bypass-governance-retention header set to true
@@ -2521,8 +2593,8 @@ impl S3Access for FS {
 mod tests {
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
-        BucketPolicyRawLoadErrorKind, FS, ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
-        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        BucketPolicyRawLoadErrorKind, DenialContext, FS, ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access,
+        StorageError, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
         bucket_policy_needs_existing_object_tag_from_hint, bucket_website_config_authorize_action,
         classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action,
         has_write_offset_bytes_header, install_restore_authorization_test_hook, legal_hold_write_requested,
@@ -2958,6 +3030,23 @@ mod tests {
             false,
             &Action::S3Action(S3Action::DeleteBucketPolicyAction)
         ));
+    }
+
+    /// Issue #5740: the denial helper must keep the client-facing error identical
+    /// to the historical bare response — the added diagnostics are log-only.
+    #[test]
+    fn test_access_denied_helper_keeps_generic_wire_response() {
+        let denial = DenialContext {
+            quiet: false,
+            bucket: "bucket",
+            object: "object",
+            version_id: Some("version"),
+            account: Some("account"),
+            is_owner: false,
+        };
+        let err = denial.deny("bucket_policy_explicit_deny", Action::S3Action(S3Action::GetObjectAction));
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Access Denied"));
     }
 
     #[test]

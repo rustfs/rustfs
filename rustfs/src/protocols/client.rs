@@ -171,6 +171,7 @@ impl ProtocolStorageClient {
             replication_request_authorized: false,
             region: None,
             request_context: Some(RequestContext::fallback()),
+            suppress_denial_log: false,
         });
 
         let req = S3Request {
