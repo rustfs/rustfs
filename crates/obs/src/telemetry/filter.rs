@@ -24,6 +24,8 @@ use tracing_subscriber::{
     filter::{FilterFn, LevelFilter, filter_fn},
 };
 
+pub const HTTP_SERVER_LOG_TARGET: &str = "rustfs::server::http";
+
 /// Pyroscope emits raw reqwest errors from its background session manager.
 /// Those errors can include the configured endpoint, so they must never reach
 /// a RustFS logging sink even when an operator enables verbose dependency logs.
@@ -157,7 +159,7 @@ fn should_demote_http_request_logs(logger_level: &str, default_level: Option<&st
     }
 
     if let Some(rust_log) = rust_log {
-        if let Some(level) = effective_level_for_target(rust_log, "rustfs::server::http") {
+        if let Some(level) = effective_level_for_target(rust_log, HTTP_SERVER_LOG_TARGET) {
             let level = level.trim().to_ascii_lowercase();
             return matches!(level.as_str(), "info" | "warn");
         }
@@ -233,7 +235,7 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
         if should_demote_http_request_logs(logger_level, default_level, rust_log_env.as_deref()) {
             // HTTP request logs are demoted to WARN to reduce volume in production,
             // but only when the effective log level is not stricter than WARN.
-            directives.push(("rustfs::server::http", LevelFilter::WARN));
+            directives.push((HTTP_SERVER_LOG_TARGET, LevelFilter::WARN));
         }
 
         if should_demote_s3s_logs(logger_level, default_level, rust_log_env.as_deref()) {
@@ -321,6 +323,10 @@ mod tests {
         String::from_utf8(bytes).expect("utf8 logs")
     }
 
+    fn http_log_directive(level: &str) -> String {
+        format!("{HTTP_SERVER_LOG_TARGET}={level}")
+    }
+
     #[test]
     fn test_is_verbose_level() {
         assert!(is_verbose_level("debug"));
@@ -372,9 +378,17 @@ mod tests {
         assert!(!should_demote_http_request_logs("info", None, Some("foo=warn")));
         assert!(!should_demote_http_request_logs("info", None, Some("rustfs=error")));
         assert!(!should_demote_http_request_logs("info", None, Some("rustfs::server=error")));
-        assert!(!should_demote_http_request_logs("info", None, Some("rustfs::server::http=error")));
-        assert!(!should_demote_http_request_logs("info", None, Some("WARN,rustfs::server::http=error")));
-        assert!(should_demote_http_request_logs("error", None, Some("WARN,rustfs::server::http=warn")));
+        assert!(!should_demote_http_request_logs("info", None, Some(&http_log_directive("error"))));
+        assert!(!should_demote_http_request_logs(
+            "info",
+            None,
+            Some(&format!("WARN,{}", http_log_directive("error")))
+        ));
+        assert!(should_demote_http_request_logs(
+            "error",
+            None,
+            Some(&format!("WARN,{}", http_log_directive("warn")))
+        ));
     }
 
     #[test]
@@ -468,7 +482,7 @@ mod tests {
             let filter_str = filter.to_string().to_ascii_lowercase();
 
             assert!(
-                !filter_str.contains("rustfs::server::http=warn"),
+                !filter_str.contains(&http_log_directive("warn")),
                 "http logs must not be promoted above error level when RUST_LOG=ERROR overrides logger_level=info: {filter_str}"
             );
         });
@@ -478,7 +492,7 @@ mod tests {
             let filter_str = filter.to_string().to_ascii_lowercase();
 
             assert!(
-                !filter_str.contains("rustfs::server::http=warn"),
+                !filter_str.contains(&http_log_directive("warn")),
                 "http logs must not be promoted above error level when RUST_LOG=rustfs=error overrides logger_level=info: {filter_str}"
             );
         });
@@ -504,7 +518,7 @@ mod tests {
             let filter_str = filter.to_string().to_ascii_lowercase();
 
             assert!(
-                !filter_str.contains("rustfs::server::http=warn"),
+                !filter_str.contains(&http_log_directive("warn")),
                 "http log demotion must not fall back to logger_level when RUST_LOG only defines unrelated targets: {filter_str}"
             );
         });
@@ -551,8 +565,8 @@ mod tests {
     fn test_http_target_suppresses_success_but_keeps_errors() {
         temp_env::with_var("RUST_LOG", None::<&str>, || {
             let output = capture_with_filter(build_env_filter("info", None), || {
-                tracing::info!(target: "rustfs::server::http", "healthy readiness response");
-                tracing::error!(target: "rustfs::server::http", "failed readiness response");
+                tracing::info!(target: HTTP_SERVER_LOG_TARGET, "healthy readiness response");
+                tracing::error!(target: HTTP_SERVER_LOG_TARGET, "failed readiness response");
             });
 
             assert!(!output.contains("healthy readiness response"), "{output}");

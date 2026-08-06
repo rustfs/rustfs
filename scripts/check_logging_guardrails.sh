@@ -902,8 +902,13 @@ for hot_span in "${trace_hot_spans[@]}"; do
   fi
 done
 
-if ! rg -U 'info!\([[:space:]]+target: "rustfs::server::http",[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
-  echo "❌ logging guardrail violation: successful HTTP completion events must use the filterable rustfs::server::http target" >&2
+if ! rg -U 'info!\([[:space:]]+target: HTTP_SERVER_LOG_TARGET,[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful HTTP completion events must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: HTTP request log target must use HTTP_SERVER_LOG_TARGET" >&2
   exit 1
 fi
 
