@@ -117,6 +117,8 @@ impl CapacityScanReport {
             update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
         }
 
+        update.timed_out = self.summary.timed_out;
+
         update
     }
 }
@@ -143,6 +145,10 @@ fn estimate_overflow_bytes(overflow_sampled_bytes: u64, overflow_count: u64, sam
     let denom = (sampled_count.max(1)) as u128;
     let scaled = (overflow_sampled_bytes as u128 * overflow_count as u128) / denom;
     scaled.min(u64::MAX as u128) as u64
+}
+
+fn overflow_entry_is_sampled(overflow_index: usize, sample_rate: usize) -> bool {
+    overflow_index.is_multiple_of(sample_rate)
 }
 
 fn disk_scope_key(disk: &CapacityDiskRef) -> CapacityScopeDisk {
@@ -197,6 +203,9 @@ async fn calculate_data_dir_used_capacity_report(
     let mut has_failure = false;
     let mut has_success = false;
     let mut is_estimated = false;
+    let mut timed_out = false;
+    #[cfg(test)]
+    let mut total_metadata_reads = 0usize;
     let mut per_disk = Vec::with_capacity(disks.len());
 
     let concurrency_limit = disks.len().clamp(1, MAX_CAPACITY_SCAN_CONCURRENCY);
@@ -232,6 +241,11 @@ async fn calculate_data_dir_used_capacity_report(
                 total_files += scan.file_count;
                 total_sampled += scan.sampled_count;
                 is_estimated |= scan.is_estimated;
+                timed_out |= scan.timed_out;
+                #[cfg(test)]
+                {
+                    total_metadata_reads += scan.metadata_reads;
+                }
                 has_failure |= scan.had_partial_errors;
                 has_success = true;
                 if let Some(disk) = disks
@@ -289,6 +303,9 @@ async fn calculate_data_dir_used_capacity_report(
         is_estimated,
         scan_duration: start.elapsed(),
         had_partial_errors: false,
+        timed_out,
+        #[cfg(test)]
+        metadata_reads: total_metadata_reads,
     };
 
     if has_failure {
@@ -601,6 +618,9 @@ fn timeout_fallback_estimate(
         is_estimated: true,
         scan_duration: start_time.elapsed(),
         had_partial_errors,
+        timed_out: true,
+        #[cfg(test)]
+        metadata_reads: 0,
     })
 }
 
@@ -681,6 +701,8 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         let mut overflow_sampled_bytes = 0u64;
         let mut file_count = 0usize;
         let mut sampled_count = 0usize;
+        #[cfg(test)]
+        let mut metadata_reads = 0usize;
         let mut had_partial_errors = false;
         let mut entries_visited = 0usize;
         let mut last_progress_check_entries = 0usize;
@@ -810,6 +832,19 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 continue;
             }
 
+            let exact_entry = file_count < effective_threshold;
+            if !exact_entry {
+                file_count += 1;
+                let overflow_index = file_count - effective_threshold;
+                if !overflow_entry_is_sampled(overflow_index, effective_sample_rate) {
+                    continue;
+                }
+            }
+
+            #[cfg(test)]
+            {
+                metadata_reads += 1;
+            }
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -854,15 +889,12 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 }
             };
 
-            file_count += 1;
-            if file_count <= effective_threshold {
+            if exact_entry {
+                file_count += 1;
                 exact_prefix_bytes += metadata.len();
             } else {
-                let overflow_index = file_count - effective_threshold;
-                if overflow_index.is_multiple_of(effective_sample_rate) {
-                    overflow_sampled_bytes += metadata.len();
-                    sampled_count += 1;
-                }
+                overflow_sampled_bytes += metadata.len();
+                sampled_count += 1;
 
                 if file_count.is_multiple_of(100_000) {
                     debug!(
@@ -934,6 +966,9 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 is_estimated: true,
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
+                timed_out: false,
+                #[cfg(test)]
+                metadata_reads,
             })
         } else if file_count > effective_threshold {
             let overflow_count = file_count - effective_threshold;
@@ -966,6 +1001,9 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 is_estimated: true,
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
+                timed_out: false,
+                #[cfg(test)]
+                metadata_reads,
             })
         } else {
             record_capacity_scan_sampling(0, false);
@@ -987,6 +1025,9 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 is_estimated: false,
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
+                timed_out: false,
+                #[cfg(test)]
+                metadata_reads,
             })
         }
     }
@@ -1073,6 +1114,62 @@ mod tests {
         // `sampled_count == 0` must not divide by zero; `.max(1)` guards it.
         assert_eq!(estimate_overflow_bytes(100, 10, 0), 1_000);
         assert_eq!(estimate_overflow_bytes(0, 10, 0), 0);
+    }
+
+    #[test]
+    fn test_overflow_sampling_avoids_unsampled_metadata_reads() {
+        let threshold = 200_000usize;
+        let file_count = 1_000_000usize;
+        let sample_rate = 200usize;
+        let metadata_reads = threshold
+            + (1..=file_count - threshold)
+                .filter(|index| overflow_entry_is_sampled(*index, sample_rate))
+                .count();
+
+        assert_eq!(metadata_reads, 204_000);
+        assert!(metadata_reads < file_count / 4);
+    }
+
+    #[test]
+    fn test_sample_before_metadata_preserves_uniform_file_estimate() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let temp_dir = tempfile::TempDir::new().expect("capacity scan tempdir should be created");
+        for index in 0..11 {
+            let mut file =
+                File::create(temp_dir.path().join(format!("f{index}"))).expect("capacity scan fixture file should be created");
+            file.write_all(b"12345")
+                .expect("capacity scan fixture bytes should be written");
+        }
+        let limits = ScanLimits {
+            max_files_threshold: 2,
+            base_timeout: Duration::from_secs(600),
+            min_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(600),
+            sample_rate: 3,
+            enable_dynamic_timeout: false,
+            follow_symlinks: false,
+        };
+
+        let result =
+            scan_dir_blocking(temp_dir.path(), &limits, &AtomicBool::new(false)).expect("sampled capacity scan should succeed");
+        assert_eq!(result.file_count, 11);
+        assert_eq!(result.sampled_count, 3);
+        assert_eq!(result.metadata_reads, 5);
+        assert_eq!(result.used_bytes, 55);
+        assert!(result.is_estimated);
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn test_timeout_fallback_is_marked_for_scheduler_backoff() {
+        let temp_dir = tempfile::TempDir::new().expect("capacity scan tempdir should be created");
+        let result = timeout_fallback_estimate(temp_dir.path(), "timeout", 10, 5, 2, 1, 1, false, Instant::now())
+            .expect("sampled timeout should produce a fallback estimate");
+
+        assert!(result.timed_out);
+        assert!(result.is_estimated);
     }
 
     #[tokio::test]
@@ -1507,6 +1604,7 @@ mod tests {
                     file_count: 3,
                     is_estimated: false,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
