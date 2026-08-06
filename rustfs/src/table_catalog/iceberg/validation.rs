@@ -411,6 +411,11 @@ pub(crate) fn synchronize_table_metadata_version_fields(metadata: &mut serde_jso
 }
 
 pub(crate) fn validate_supported_table_metadata(metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
+    validate_supported_table_metadata_fields(metadata)?;
+    validate_table_metadata_references(metadata)
+}
+
+fn validate_supported_table_metadata_fields(metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
     table_metadata_uuid(metadata)?;
     table_metadata_location(metadata)?;
     require_metadata_i64(metadata, "last-updated-ms")?;
@@ -481,7 +486,7 @@ pub(crate) fn validate_supported_table_metadata(metadata: &serde_json::Value) ->
             )));
         }
     }
-    validate_table_metadata_references(metadata)
+    Ok(())
 }
 
 pub(crate) fn validate_table_metadata_references(metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
@@ -924,7 +929,7 @@ pub(crate) async fn validate_table_snapshot_changes<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    validate_supported_table_metadata(metadata)?;
+    validate_supported_table_metadata_fields(metadata)?;
     let format_version = table_metadata_format_version(metadata)?;
     let snapshots = snapshots_requiring_graph_validation(current_metadata, metadata)?;
     let mut budget = SnapshotGraphReadBudget::default();

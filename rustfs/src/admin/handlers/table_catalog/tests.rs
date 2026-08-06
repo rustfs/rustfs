@@ -1661,7 +1661,8 @@ fn create_table_request_honors_supported_format_version_property() {
     assert!(metadata.get("schemas").is_some());
     assert_eq!(metadata["current-schema-id"], 0);
     assert!(metadata.get("partition-specs").is_some());
-    assert_eq!(metadata["last-sequence-number"], 0);
+    assert!(metadata.get("sort-orders").is_some());
+    assert!(metadata.get("last-sequence-number").is_none());
 }
 
 #[test]
@@ -2619,11 +2620,16 @@ async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
                 "last-sequence-number": 2,
                 "last-updated-ms": 2000,
                 "last-column-id": 1,
-                "schemas": [],
+                "schemas": [{
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+                }],
                 "current-schema-id": 0,
-                "partition-specs": [],
+                "partition-specs": [{"spec-id": 0, "fields": []}],
                 "default-spec-id": 0,
-                "sort-orders": [],
+                "last-partition-id": 999,
+                "sort-orders": [{"order-id": 0, "fields": []}],
                 "default-sort-order-id": 0,
                 "current-snapshot-id": 20,
                 "metadata-log": [],
@@ -2640,13 +2646,17 @@ async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
                 "snapshots": [
                     {
                         "snapshot-id": 10,
+                        "sequence-number": 1,
                         "timestamp-ms": 1000,
-                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro"
+                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                        "summary": {"operation": "append"}
                     },
                     {
                         "snapshot-id": 20,
+                        "sequence-number": 2,
                         "timestamp-ms": 2000,
-                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro"
+                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-20.avro",
+                        "summary": {"operation": "append"}
                     }
                 ],
                 "refs": {
@@ -5634,11 +5644,14 @@ async fn seed_test_manifest_data_files(
     }
 }
 
-async fn create_standard_events_table(
-    store: &TestTableCatalogStore,
+async fn create_standard_events_table<S>(
+    store: &S,
     metadata_backend: &TestTableCatalogObjectBackend,
     namespace: &crate::table_catalog::Namespace,
-) -> RestLoadTableResponse {
+) -> RestLoadTableResponse
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
     ensure_table_bucket_entry(store, "warehouse", true)
         .await
         .expect("table bucket entry should be seeded");
@@ -6673,8 +6686,8 @@ async fn metadata_location_api_validates_snapshot_graph_before_commit() {
 
 #[tokio::test]
 async fn metadata_location_api_validates_relocated_snapshot_graph_under_target_warehouse() {
-    let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let current = store

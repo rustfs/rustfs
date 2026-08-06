@@ -1981,8 +1981,17 @@ fn validate_metadata_matches_current_metadata(
 ) -> S3Result<()> {
     crate::table_catalog::validate_supported_table_metadata(current_metadata).map_err(catalog_store_error)?;
     crate::table_catalog::validate_supported_table_metadata(target_metadata).map_err(catalog_store_error)?;
+    validate_metadata_identity_matches_current_metadata(current_metadata, target_metadata)
+}
+
+fn validate_metadata_identity_matches_current_metadata(
+    current_metadata: &serde_json::Value,
+    target_metadata: &serde_json::Value,
+) -> S3Result<()> {
     let expected_table_uuid = metadata_table_uuid(current_metadata)?;
+    metadata_format_version(current_metadata)?;
     let target_table_uuid = metadata_table_uuid(target_metadata)?;
+    metadata_format_version(target_metadata)?;
     if target_table_uuid != expected_table_uuid {
         return Err(s3_error!(
             InvalidRequest,
@@ -2571,7 +2580,6 @@ fn apply_table_commit_updates(
     if metadata.get("format-version").is_some() {
         crate::table_catalog::synchronize_table_metadata_version_fields(&mut metadata).map_err(catalog_store_error)?;
     }
-    crate::table_catalog::validate_table_metadata_references(&metadata).map_err(catalog_store_error)?;
     append_previous_metadata_log(&mut metadata, previous_metadata_location)?;
     metadata_object_mut(&mut metadata)?.insert("last-updated-ms".to_string(), serde_json::Value::from(current_time_millis()));
     Ok(metadata)
@@ -3962,13 +3970,28 @@ async fn validate_table_metadata_snapshot_graph<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let mut target_entry = entry.clone();
-    target_entry.warehouse_location = metadata_table_location(metadata)?.to_string();
-    let context =
-        crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, namespace, table, &target_entry);
-    crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata)
+    validate_table_metadata_snapshot_graph_result(metadata_backend, bucket, namespace, table, entry, current_metadata, metadata)
         .await
         .map_err(catalog_store_error)
+}
+
+async fn validate_table_metadata_snapshot_graph_result<B>(
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &crate::table_catalog::IdentifierSegment,
+    entry: &crate::table_catalog::TableEntry,
+    current_metadata: Option<&serde_json::Value>,
+    metadata: &serde_json::Value,
+) -> crate::table_catalog::TableCatalogStoreResult<()>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    let mut target_entry = entry.clone();
+    target_entry.warehouse_location = crate::table_catalog::table_metadata_location(metadata)?.to_string();
+    let context =
+        crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, namespace, table, &target_entry);
+    crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata).await
 }
 
 async fn list_tables_response<S>(
@@ -4349,8 +4372,8 @@ where
     let previous_metadata_location = table_metadata_location_for_client(bucket, &current.metadata_location);
     let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &previous_metadata_location)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
-    validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
-    validate_table_metadata_snapshot_graph(
+    validate_metadata_identity_matches_current_metadata(&expected_metadata, &next_metadata)?;
+    validate_table_metadata_snapshot_graph_result(
         metadata_backend,
         bucket,
         namespace,
@@ -4359,7 +4382,11 @@ where
         Some(&expected_metadata),
         &next_metadata,
     )
-    .await?;
+    .await
+    .map_err(|err| match err {
+        crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
+        err => catalog_store_error(err),
+    })?;
     validate_table_snapshot_commit_conflicts(
         metadata_backend,
         bucket,
@@ -4370,6 +4397,7 @@ where
         &request.updates,
     )
     .await?;
+    validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id);
     let next_generation = current.generation.saturating_add(1);
     let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
