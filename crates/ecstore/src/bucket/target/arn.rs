@@ -56,10 +56,12 @@ impl FromStr for ARN {
         if parts.len() != 6 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid ARN format"));
         }
+        // Display emits `arn:rustfs:{type}:{region}:{id}:{bucket}`; read the
+        // segments back in the same order so parse(display(a)) == a.
         Ok(ARN {
             arn_type: BucketTargetType::from_str(parts[2]).unwrap_or_default(),
-            id: parts[3].to_string(),
-            region: parts[4].to_string(),
+            region: parts[3].to_string(),
+            id: parts[4].to_string(),
             bucket: parts[5].to_string(),
         })
     }
