@@ -342,15 +342,6 @@ pub(crate) fn synchronize_table_metadata_version_fields(metadata: &mut serde_jso
                     })?;
                 metadata_object_mut(metadata)?.insert("partition-spec".to_string(), fields);
             }
-            let object = metadata_object_mut(metadata)?;
-            object.remove("schemas");
-            object.remove("current-schema-id");
-            object.remove("partition-specs");
-            object.remove("default-spec-id");
-            object.remove("last-partition-id");
-            object.remove("sort-orders");
-            object.remove("default-sort-order-id");
-            object.remove("last-sequence-number");
         }
         2 => {
             if metadata.get("schemas").is_none() {
@@ -635,10 +626,10 @@ fn validate_table_snapshot_fields(snapshot: &serde_json::Value, format_version: 
             if !summary
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|operation| matches!(operation, "append" | "replace" | "overwrite" | "delete"))
+                .is_some_and(|operation| !operation.is_empty())
             {
                 return Err(TableCatalogStoreError::Invalid(
-                    "Iceberg v2 snapshot summary has an unsupported operation".to_string(),
+                    "Iceberg v2 snapshot summary requires a non-empty operation".to_string(),
                 ));
             }
         }
@@ -925,8 +916,9 @@ struct SnapshotGraphManifestLocation {
     from_manifest_list: bool,
 }
 
-pub(crate) async fn validate_table_snapshot_graph<B>(
+pub(crate) async fn validate_table_snapshot_changes<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
+    current_metadata: Option<&serde_json::Value>,
     metadata: &serde_json::Value,
 ) -> TableCatalogStoreResult<()>
 where
@@ -934,12 +926,7 @@ where
 {
     validate_supported_table_metadata(metadata)?;
     let format_version = table_metadata_format_version(metadata)?;
-    let Some(snapshots) = metadata.get("snapshots") else {
-        return Ok(());
-    };
-    let snapshots = snapshots
-        .as_array()
-        .ok_or_else(|| TableCatalogStoreError::Invalid("snapshots must be an array".to_string()))?;
+    let snapshots = snapshots_requiring_graph_validation(current_metadata, metadata)?;
     let mut budget = SnapshotGraphReadBudget::default();
     for snapshot in snapshots {
         snapshot
@@ -973,6 +960,64 @@ where
     Ok(())
 }
 
+fn snapshots_requiring_graph_validation<'a>(
+    current_metadata: Option<&serde_json::Value>,
+    metadata: &'a serde_json::Value,
+) -> TableCatalogStoreResult<Vec<&'a serde_json::Value>> {
+    let Some(snapshots) = metadata.get("snapshots") else {
+        return Ok(Vec::new());
+    };
+    let snapshots = snapshots
+        .as_array()
+        .ok_or_else(|| TableCatalogStoreError::Invalid("snapshots must be an array".to_string()))?;
+
+    if let Some(current_metadata) = current_metadata {
+        let current_snapshots = current_metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|snapshot| {
+                snapshot
+                    .get("snapshot-id")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|snapshot_id| (snapshot_id, snapshot))
+            })
+            .collect::<BTreeMap<_, _>>();
+        return Ok(snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let snapshot_id = snapshot.get("snapshot-id").and_then(serde_json::Value::as_i64)?;
+                (current_snapshots.get(&snapshot_id).copied() != Some(snapshot)).then_some(snapshot)
+            })
+            .collect());
+    }
+
+    let mut active_snapshot_ids = BTreeSet::new();
+    if let Some(snapshot_id) = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|snapshot_id| *snapshot_id != -1)
+    {
+        active_snapshot_ids.insert(snapshot_id);
+    }
+    if let Some(refs) = metadata.get("refs").and_then(serde_json::Value::as_object) {
+        active_snapshot_ids.extend(
+            refs.values()
+                .filter_map(|reference| reference.get("snapshot-id").and_then(serde_json::Value::as_i64)),
+        );
+    }
+    Ok(snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot
+                .get("snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|snapshot_id| active_snapshot_ids.contains(&snapshot_id))
+        })
+        .collect())
+}
+
 async fn snapshot_graph_manifest_references<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
     metadata: &serde_json::Value,
@@ -984,7 +1029,8 @@ async fn snapshot_graph_manifest_references<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    let manifest_locations = snapshot_graph_manifest_locations(context, snapshot, budget).await?;
+    let manifest_locations =
+        snapshot_graph_manifest_locations(context, snapshot, format_version, snapshot_sequence_number, budget).await?;
     let partition_spec_ids = table_metadata_partition_spec_ids(metadata)?;
     let mut manifests = Vec::with_capacity(manifest_locations.len());
     let mut seen_manifest_paths = BTreeSet::new();
@@ -1016,6 +1062,7 @@ where
         let references = if let Some(references) = budget.manifests.get(&manifest_key).cloned() {
             references
         } else {
+            budget.charge_manifests(1)?;
             let manifest_object = context
                 .backend
                 .read_object_limited(context.table_bucket, &manifest_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
@@ -1025,16 +1072,16 @@ where
             budget.charge_avro_bytes(manifest_size)?;
             let decoded_manifest = decode_manifest_avro_async(manifest_object.data).await?;
             budget.charge_decoded_avro_bytes(decoded_manifest.decoded_size)?;
+            budget.charge_file_references(decoded_manifest.references.len())?;
             budget.manifests.insert(manifest_key, decoded_manifest.references.clone());
             decoded_manifest.references
         };
-        budget.charge_file_references(references.len())?;
         validate_snapshot_graph_data_files(
             context,
             &references,
             budget,
             format_version,
-            if manifest_location.format_version == 1 {
+            if manifest_location.from_manifest_list && manifest_location.format_version == 1 {
                 0
             } else {
                 manifest_location.sequence_number.unwrap_or(snapshot_sequence_number)
@@ -1049,6 +1096,8 @@ where
 async fn snapshot_graph_manifest_locations<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
     snapshot: &serde_json::Value,
+    format_version: u16,
+    snapshot_sequence_number: i64,
     budget: &mut SnapshotGraphReadBudget,
 ) -> TableCatalogStoreResult<Vec<SnapshotGraphManifestLocation>>
 where
@@ -1073,7 +1122,6 @@ where
                 .insert(manifest_list_key, decoded_manifest_list.references.clone());
             decoded_manifest_list.references
         };
-        budget.charge_manifests(references.len())?;
         return Ok(references
             .into_iter()
             .map(|reference| SnapshotGraphManifestLocation {
@@ -1099,7 +1147,6 @@ where
     let Some(manifests) = snapshot.get("manifests").and_then(serde_json::Value::as_array) else {
         return Err(TableCatalogStoreError::Invalid("snapshot manifest-list is required".to_string()));
     };
-    budget.charge_manifests(manifests.len())?;
     manifests
         .iter()
         .map(|manifest| {
@@ -1108,11 +1155,11 @@ where
                 .filter(|manifest| !manifest.is_empty())
                 .map(|manifest| SnapshotGraphManifestLocation {
                     manifest_path: manifest.to_string(),
-                    format_version: 1,
+                    format_version,
                     manifest_length: None,
                     partition_spec_id: None,
                     content: None,
-                    sequence_number: None,
+                    sequence_number: Some(snapshot_sequence_number),
                     min_sequence_number: None,
                     added_snapshot_id: None,
                     added_files_count: None,
@@ -1347,7 +1394,7 @@ fn snapshot_graph_object_key<B>(
     let object_kind =
         table_maintenance_object_kind(context.namespace, context.table, Some(&warehouse_object_prefix), &object_key)
             .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot object is outside the table warehouse".to_string()))?;
-    if object_kind != expected_kind {
+    if !table_maintenance_object_kind_matches_reference(&object_kind, &expected_kind) {
         return Err(TableCatalogStoreError::Invalid(
             "snapshot object kind does not match manifest metadata".to_string(),
         ));

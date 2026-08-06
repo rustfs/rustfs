@@ -195,6 +195,10 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         scan_table_data_plane_resource_for_object(self, table_bucket, object).await
     }
 
+    /// Atomically advances a validated table metadata pointer.
+    ///
+    /// Callers publishing client-supplied Iceberg metadata must validate its logical shape and the physical graph of
+    /// newly introduced or changed snapshots before invoking this persistence boundary.
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;

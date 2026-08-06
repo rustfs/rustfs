@@ -217,9 +217,9 @@ where
         );
         return Ok(());
     };
-    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key)
-        != Some(TableMetadataMaintenanceObjectKind::ManifestList)
-    {
+    if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key).is_some_and(|kind| {
+        table_maintenance_object_kind_matches_reference(&kind, &TableMetadataMaintenanceObjectKind::ManifestList)
+    }) {
         insert_referenced_object_report(
             reports,
             manifest_list_key,
@@ -306,9 +306,9 @@ where
         );
         return Ok(());
     };
-    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key)
-        != Some(TableMetadataMaintenanceObjectKind::ManifestFile)
-    {
+    if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key).is_some_and(|kind| {
+        table_maintenance_object_kind_matches_reference(&kind, &TableMetadataMaintenanceObjectKind::ManifestFile)
+    }) {
         insert_referenced_object_report(
             reports,
             manifest_key,
@@ -360,7 +360,9 @@ where
             );
             continue;
         };
-        if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &file_key) != Some(object_kind.clone()) {
+        if !table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &file_key)
+            .is_some_and(|kind| table_maintenance_object_kind_matches_reference(&kind, &object_kind))
+        {
             insert_referenced_object_report(
                 reports,
                 file_key,
@@ -467,6 +469,23 @@ pub(crate) fn table_maintenance_object_kind(
     }
 
     None
+}
+
+pub(crate) fn table_maintenance_object_kind_matches_reference(
+    actual: &TableMetadataMaintenanceObjectKind,
+    referenced: &TableMetadataMaintenanceObjectKind,
+) -> bool {
+    match referenced {
+        TableMetadataMaintenanceObjectKind::ManifestList | TableMetadataMaintenanceObjectKind::ManifestFile => matches!(
+            actual,
+            TableMetadataMaintenanceObjectKind::ManifestList | TableMetadataMaintenanceObjectKind::ManifestFile
+        ),
+        TableMetadataMaintenanceObjectKind::DeleteFile => matches!(
+            actual,
+            TableMetadataMaintenanceObjectKind::DataFile | TableMetadataMaintenanceObjectKind::DeleteFile
+        ),
+        _ => actual == referenced,
+    }
 }
 
 fn table_maintenance_metadata_object_kind(

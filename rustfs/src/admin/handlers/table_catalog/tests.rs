@@ -1654,10 +1654,14 @@ fn create_table_request_honors_supported_format_version_property() {
 
     assert_eq!(entry.format_version, 1);
     assert_eq!(metadata["format-version"], 1);
+    assert!(!entry.properties.contains_key("format-version"));
+    assert!(metadata["properties"].get("format-version").is_none());
     assert!(metadata.get("schema").is_some());
     assert!(metadata.get("partition-spec").is_some());
-    assert!(metadata.get("schemas").is_none());
-    assert!(metadata.get("last-sequence-number").is_none());
+    assert!(metadata.get("schemas").is_some());
+    assert_eq!(metadata["current-schema-id"], 0);
+    assert!(metadata.get("partition-specs").is_some());
+    assert_eq!(metadata["last-sequence-number"], 0);
 }
 
 #[test]

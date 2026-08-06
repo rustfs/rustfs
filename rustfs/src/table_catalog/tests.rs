@@ -860,6 +860,13 @@ fn iceberg_metadata_validation_enforces_snapshot_and_ref_contracts() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     validate_supported_table_metadata(&metadata).expect("complete snapshot and main ref should validate");
 
+    metadata["snapshots"][0]["summary"]["operation"] = serde_json::Value::from("rewrite-manifests");
+    validate_supported_table_metadata(&metadata).expect("Iceberg snapshot operations are extensible strings");
+
+    let mut empty_operation = metadata.clone();
+    empty_operation["snapshots"][0]["summary"]["operation"] = serde_json::Value::from("");
+    validate_supported_table_metadata(&empty_operation).expect_err("snapshot operation must not be empty");
+
     let mut missing_timestamp = metadata.clone();
     missing_timestamp["snapshots"][0]
         .as_object_mut()
@@ -1080,7 +1087,7 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
 
-    let error = validate_table_snapshot_graph(&context, &metadata)
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect_err("manifest partition specs absent from table metadata must be rejected");
     assert_eq!(
@@ -1125,7 +1132,7 @@ async fn iceberg_snapshot_graph_allows_missing_deleted_files() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
 
-    validate_table_snapshot_graph(&context, &metadata)
+    validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect("deleted manifest entries may reference files that have already been removed");
 }
@@ -1153,7 +1160,7 @@ async fn iceberg_snapshot_graph_accepts_empty_manifest_lists() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
 
-    validate_table_snapshot_graph(&context, &metadata)
+    validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect("an empty Iceberg snapshot may have an empty manifest list");
 }
@@ -1197,9 +1204,222 @@ async fn iceberg_v2_snapshot_graph_accepts_reused_v1_manifests() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
 
-    validate_table_snapshot_graph(&context, &metadata)
+    validate_table_snapshot_changes(&context, None, &metadata)
         .await
         .expect("v2 tables may retain v1 manifest lists and manifests after upgrade");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_change_validation_skips_unchanged_history() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let historical_manifest_list = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
+    let new_manifest_list = "s3://warehouse/tables/table-id/metadata/snap-11.avro";
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-11.avro", manifest_list_avro_bytes(&[]))
+        .await;
+
+    let mut current_metadata = table_metadata_json_for_validation();
+    current_metadata["last-sequence-number"] = serde_json::Value::from(7);
+    current_metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": historical_manifest_list,
+        "summary": {"operation": "append"}
+    }]);
+    current_metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    current_metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut next_metadata = current_metadata.clone();
+    next_metadata
+        .get_mut("snapshots")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("snapshots should be an array")
+        .push(serde_json::json!({
+            "snapshot-id": 11,
+            "sequence-number": 7,
+            "timestamp-ms": 2,
+            "manifest-list": new_manifest_list,
+            "summary": {"operation": "append"}
+        }));
+    next_metadata["current-snapshot-id"] = serde_json::Value::from(11);
+    next_metadata["refs"]["main"]["snapshot-id"] = serde_json::Value::from(11);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, Some(&current_metadata), &next_metadata)
+        .await
+        .expect("an unchanged historical snapshot must not be reread during commit validation");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_registration_validates_only_active_snapshot_heads() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-11.avro", manifest_list_avro_bytes(&[]))
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([
+        {
+            "snapshot-id": 10,
+            "sequence-number": 7,
+            "timestamp-ms": 1,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/missing-history.avro",
+            "summary": {"operation": "append"}
+        },
+        {
+            "snapshot-id": 11,
+            "sequence-number": 7,
+            "timestamp-ms": 2,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-11.avro",
+            "summary": {"operation": "append"}
+        }
+    ]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(11);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect("registration should validate active snapshot heads without traversing all history");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/shared-list.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/shared-list.avro",
+            manifest_list_avro_bytes(&[manifest]),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/shared-manifest.avro",
+            manifest_avro_bytes(&[(data_file, 0)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/shared.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::Value::Array(
+        (0..=TABLE_COMMIT_MAX_MANIFESTS)
+            .map(|index| {
+                let snapshot_id = i64::try_from(index + 1).expect("snapshot id should fit in i64");
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "sequence-number": 7,
+                    "timestamp-ms": snapshot_id,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                })
+            })
+            .collect(),
+    );
+    let current_snapshot_id = i64::try_from(TABLE_COMMIT_MAX_MANIFESTS + 1).expect("snapshot id should fit in i64");
+    metadata["current-snapshot-id"] = serde_json::Value::from(current_snapshot_id);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": current_snapshot_id}});
+    let current_metadata = table_metadata_json_for_validation();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect("shared manifest objects must consume the commit budget only once");
+}
+
+#[tokio::test]
+async fn iceberg_v2_snapshot_graph_accepts_embedded_v2_manifests() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest = "s3://warehouse/tables/table-id/metadata/embedded.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/embedded.parquet";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/embedded.avro",
+            manifest_avro_bytes(&[(data_file, 0)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/embedded.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifests": [manifest],
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect("embedded v2 manifests should use the enclosing snapshot sequence bound");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/list-10.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/snap-delete-manifest.avro";
+    let delete_file = "s3://warehouse/tables/table-id/data/position-deletes.parquet";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-10.avro",
+            manifest_list_avro_bytes(&[manifest]),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-delete-manifest.avro",
+            manifest_avro_bytes(&[(delete_file, 1)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/position-deletes.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "delete"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect("manifest content should identify delete files stored under the data directory");
 }
 
 #[tokio::test]

@@ -301,7 +301,7 @@ fn validate_avro_container(data: &[u8]) -> TableCatalogStoreResult<usize> {
         b"null" => AvroContainerCodec::Null,
         b"deflate" => AvroContainerCodec::Deflate,
         codec => {
-            return Err(TableCatalogStoreError::Invalid(format!(
+            return Err(TableCatalogStoreError::Unsupported(format!(
                 "Avro codec {} is not supported for table commit validation",
                 String::from_utf8_lossy(codec)
             )));
