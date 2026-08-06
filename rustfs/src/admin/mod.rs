@@ -30,6 +30,8 @@ pub mod utils;
 #[cfg(test)]
 mod console_test;
 #[cfg(test)]
+mod kms_contract;
+#[cfg(test)]
 mod route_registration_test;
 
 use handlers::{
