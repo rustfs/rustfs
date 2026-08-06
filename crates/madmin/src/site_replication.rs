@@ -171,8 +171,12 @@ impl fmt::Debug for PeerInfo {
 pub struct SRPolicyMapping {
     #[serde(rename = "userOrGroup", default)]
     pub user_or_group: String,
+    /// MinIO IAMUserType wire value (cmd/iam.go): unknown = -1, regUser = 0,
+    /// stsUser = 1, svcUser = 2. Signed because MinIO sends -1 for group
+    /// mappings. This is NOT the RustFS-internal `UserType` encoding; translate
+    /// at the boundary with `rustfs_iam::store::{sr_wire_user_type, user_type_from_sr_wire}`.
     #[serde(rename = "userType", default)]
-    pub user_type: u64,
+    pub user_type: i64,
     #[serde(rename = "isGroup", default)]
     pub is_group: bool,
     #[serde(default)]
@@ -330,8 +334,10 @@ pub struct SRSvcAccChange {
 pub struct SRCredInfo {
     #[serde(rename = "accessKey", default)]
     pub access_key: String,
+    /// MinIO IAMUserType wire value (same table as `SRPolicyMapping::user_type`);
+    /// signed because MinIO's unknown is -1.
     #[serde(rename = "iamUserType", default)]
-    pub iam_user_type: u64,
+    pub iam_user_type: i64,
     #[serde(rename = "isDeleteReq", default)]
     pub is_delete_req: bool,
     #[serde(rename = "userIdentityJSON", default, skip_serializing_if = "Option::is_none")]
@@ -1399,7 +1405,7 @@ pub struct SiteNetPerfResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerInfo, PeerSite, SRInfo, SRResyncOpStatus};
+    use super::{PeerInfo, PeerSite, SRCredInfo, SRInfo, SRPolicyMapping, SRResyncOpStatus};
     use serde_json::{Value, json};
 
     const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
@@ -1498,6 +1504,35 @@ mod tests {
         assert!(!peer_debug.contains("BEGIN CERTIFICATE"));
         assert!(peer_debug.contains("skip_tls_verify: false"));
         assert!(peer_debug.contains("has_custom_ca: true"));
+    }
+
+    /// MinIO IAMUserType wire semantics (cmd/iam.go): unknown = -1,
+    /// regUser = 0, stsUser = 1, svcUser = 2. MinIO group policy mappings
+    /// arrive with `userType: -1`; the wire field must accept negatives.
+    #[test]
+    fn sr_policy_mapping_accepts_minio_negative_user_type() {
+        let mapping: SRPolicyMapping = serde_json::from_value(json!({
+            "userOrGroup": "devs",
+            "userType": -1,
+            "isGroup": true,
+            "policy": "readwrite"
+        }))
+        .expect("MinIO group mapping with userType -1 must deserialize");
+        assert_eq!(mapping.user_type, -1);
+        assert!(mapping.is_group);
+        assert_eq!(mapping.policy, "readwrite");
+    }
+
+    /// Same IAMUserType family as SRPolicyMapping: MinIO may send -1 (unknown).
+    #[test]
+    fn sr_cred_info_accepts_minio_negative_iam_user_type() {
+        let cred: SRCredInfo = serde_json::from_value(json!({
+            "accessKey": "replicated-user",
+            "iamUserType": -1
+        }))
+        .expect("SRCredInfo with iamUserType -1 must deserialize");
+        assert_eq!(cred.iam_user_type, -1);
+        assert_eq!(cred.access_key, "replicated-user");
     }
 
     #[test]

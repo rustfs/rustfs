@@ -571,7 +571,7 @@ impl Operation for SetPolicyForUserOrGroup {
             r#type: "policy-mapping".to_string(),
             policy_mapping: Some(SRPolicyMapping {
                 user_or_group: query.user_or_group.clone(),
-                user_type: rustfs_iam::store::UserType::Reg.to_u64(),
+                user_type: rustfs_iam::store::sr_wire_user_type(rustfs_iam::store::UserType::Reg, query.is_group),
                 is_group: query.is_group,
                 policy: query.policy_name.clone(),
                 updated_at: Some(updated_at),
@@ -1060,7 +1060,7 @@ pub(crate) async fn handle_builtin_policy_association(
         r#type: "policy-mapping".to_string(),
         policy_mapping: Some(SRPolicyMapping {
             user_or_group: target_name.clone(),
-            user_type: rustfs_iam::store::UserType::Reg.to_u64(),
+            user_type: rustfs_iam::store::sr_wire_user_type(rustfs_iam::store::UserType::Reg, is_group),
             is_group,
             policy: updated_policies.join(","),
             updated_at: Some(updated_at),
