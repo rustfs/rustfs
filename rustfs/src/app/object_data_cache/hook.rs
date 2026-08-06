@@ -26,13 +26,14 @@ use crate::app::object_data_cache::{
 use crate::app::storage_api::object_usecase::StorageObjectInfo;
 use crate::app::storage_api::object_usecase::StorageObjectOptions;
 use crate::app::storage_api::object_usecase::contract::range::HTTPRangeSpec;
-use crate::storage::sse::contains_managed_encryption_metadata;
+use crate::storage::sse::contains_encryption_metadata;
 use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps as _;
 use crate::storage::storage_api::ecstore_object::{
     GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
     unregister_get_object_body_cache_hook,
 };
 use bytes::Bytes;
+#[cfg(test)]
 use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
 use std::sync::Arc;
 
@@ -82,7 +83,7 @@ fn object_metadata_indicates_encryption(metadata: &std::collections::HashMap<Str
     // SSE-C or managed SSE bodies are decrypted on the normal read path, so
     // the cached plaintext identity used by the planner would not match what
     // ecstore returns here (pre-decryption). Skip them entirely.
-    metadata.contains_key(SSEC_ALGORITHM_HEADER) || contains_managed_encryption_metadata(metadata)
+    contains_encryption_metadata(metadata)
 }
 
 #[async_trait::async_trait]
@@ -266,14 +267,14 @@ mod tests {
     #[tokio::test]
     async fn hook_lookup_skips_encrypted_objects() {
         let adapter = hit_only_adapter();
-        let mut info = plain_info(5);
-        info.user_defined = std::sync::Arc::new(
-            [(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]
-                .into_iter()
-                .collect(),
-        );
-
         let hook = ObjectDataCacheBodyHook { adapter };
-        assert!(hook.lookup("b", "k", &info).await.is_none());
+        for key in [
+            SSEC_ALGORITHM_HEADER.to_string(),
+            "x-minio-internal-server-side-encryption-s3-sealed-key".to_string(),
+        ] {
+            let mut info = plain_info(5);
+            info.user_defined = std::sync::Arc::new([(key, "AES256".to_string())].into_iter().collect());
+            assert!(hook.lookup("b", "k", &info).await.is_none());
+        }
     }
 }

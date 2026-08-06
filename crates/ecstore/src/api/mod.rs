@@ -414,7 +414,10 @@ pub mod object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
-    pub use crate::store::PreparedGetObjectReader;
+    pub use crate::store::{
+        PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
+        SnapshotConsistencyError,
+    };
 }
 
 pub mod rebalance {
@@ -448,6 +451,11 @@ pub mod rpc {
 
 pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+    }
 }
 
 pub mod store_list {

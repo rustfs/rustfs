@@ -30,13 +30,37 @@ mod ecstore_test_compat;
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
 
+#[cfg(feature = "put-object-commit-barrier")]
+use ecstore_test_compat::fixture::ecstore_set_disk;
 use ecstore_test_compat::fixture::{
-    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, PoolEndpoints,
-    init_bucket_metadata_sys, init_local_disks,
+    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, ObjectIO as _,
+    PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
 };
 use tokio_util::sync::CancellationToken;
 
 static INIT_TRACING: Once = Once::new();
+
+#[cfg(feature = "put-object-commit-barrier")]
+pub struct PutObjectCommitBarrier(ecstore_set_disk::test_util::PutObjectCommitBarrier);
+
+#[cfg(feature = "put-object-commit-barrier")]
+impl PutObjectCommitBarrier {
+    pub fn before_namespace(bucket: &str, object: &str) -> Self {
+        Self(ecstore_set_disk::test_util::PutObjectCommitBarrier::install(
+            bucket,
+            object,
+            ecstore_set_disk::test_util::PutObjectCommitPause::BeforeNamespace,
+        ))
+    }
+
+    pub async fn wait_until_paused(&self) {
+        self.0.wait_until_paused().await;
+    }
+
+    pub async fn release_and_wait_until_namespace_pending(&self) {
+        self.0.release_and_wait_until_namespace_pending().await;
+    }
+}
 
 /// Install the standard test tracing subscriber once per process
 /// (`RUST_LOG`-driven). Safe to call from every test; later calls are no-ops.
@@ -89,6 +113,29 @@ impl TestECStoreEnv {
             )
             .await
             .unwrap_or_else(|e| panic!("failed to create test bucket {bucket}: {e:?}"));
+    }
+
+    /// Write one complete object body through the real ECStore test backend.
+    pub async fn put_object_bytes(&self, bucket: &str, object: &str, bytes: Vec<u8>) {
+        let mut reader = PutObjReader::from_vec(bytes);
+        self.ecstore
+            .put_object(bucket, object, &mut reader, &Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("failed to write test object {bucket}/{object}: {e:?}"));
+    }
+
+    /// Prepare the lock-backed object snapshot used by SelectObjectContent tests.
+    ///
+    /// The concrete ECStore snapshot type stays behind this crate's test
+    /// compatibility boundary; consumers can pass the inferred value directly
+    /// to the S3 Select API without importing ECStore facade paths.
+    pub async fn prepare_select_object_snapshot(&self, bucket: &str, object: &str) -> Arc<SelectObjectSnapshot> {
+        Arc::new(
+            self.ecstore
+                .prepare_select_object_snapshot(bucket, object, &Default::default(), &Default::default())
+                .await
+                .unwrap_or_else(|e| panic!("failed to prepare test object snapshot {bucket}/{object}: {e:?}")),
+        )
     }
 }
 

@@ -93,6 +93,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes = { workspace = true, features = ["serde"] }

@@ -3798,6 +3798,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -9391,6 +9392,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tower",
@@ -10131,6 +10133,7 @@ dependencies = [
  "tracing",
  "transform-stream",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -10146,6 +10149,7 @@ dependencies = [
  "hotpath",
  "parking_lot",
  "rustfs-s3select-api",
+ "rustfs-test-utils",
  "s3s",
  "tokio",
  "tracing",

@@ -208,6 +208,11 @@ impl InstanceContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_lock_manager_for_test(lock_manager: Arc<GlobalLockManager>) -> Self {
+        Self::with_lock_manager(lock_manager)
+    }
+
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
