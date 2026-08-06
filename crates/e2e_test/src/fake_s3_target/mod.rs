@@ -574,7 +574,8 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
         (&Method::POST, true) if query.contains_key("uploads") => Operation::CreateMultipartUpload,
         (&Method::POST, true) if upload_id.is_some() => Operation::CompleteMultipartUpload,
         (&Method::DELETE, true) if upload_id.is_some() => Operation::AbortMultipartUpload,
-        (&Method::PUT, true) if only_query_keys(&[]) => Operation::PutObject,
+        // A replication PUT addresses the source version via `?versionId=`.
+        (&Method::PUT, true) if only_query_keys(&["versionId"]) => Operation::PutObject,
         (&Method::GET, true) if only_query_keys(&["versionId"]) => Operation::GetObject,
         (&Method::HEAD, true) if only_query_keys(&["versionId"]) => Operation::HeadObject,
         (&Method::DELETE, true) if only_query_keys(&["versionId"]) => Operation::DeleteObject,
