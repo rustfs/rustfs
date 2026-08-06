@@ -58,6 +58,13 @@ use url::Host;
 
 const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
 
+/// Go encodes the zero `time.Time` as the year-1 instant
+/// (`0001-01-01T00:00:00Z`, possibly re-encoded with an offset); no real
+/// credential expiry lives in year 1, so any such timestamp means "unset".
+fn is_go_zero_time(timestamp: Timestamp) -> bool {
+    timestamp.to_zoned(jiff::tz::TimeZone::UTC).year() == 1
+}
+
 /// Field groups a `set-remote-target?update=true` request may modify, mirroring
 /// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
 /// overlays only the requested groups onto the stored target, so a client can
@@ -214,8 +221,10 @@ struct RemoteTargetRequest {
     last_online: Option<OffsetDateTime>,
     #[serde(rename = "isOnline", default)]
     online: bool,
-    #[serde(default)]
-    latency: LatencyStat,
+    // Accepted so mc's round-tripped runtime latency still deserializes under
+    // deny_unknown_fields, but deliberately unread: it is never persisted.
+    #[serde(rename = "latency", default)]
+    _latency: LatencyStat,
     #[serde(alias = "deploymentID", default)]
     deployment_id: String,
     #[serde(default)]
@@ -283,7 +292,14 @@ impl RemoteTargetRequest {
             ));
         }
 
-        if self.credentials.expiration.is_some() {
+        // Go's `omitempty` never elides a zero `time.Time`, so every madmin
+        // marshal carries `"expiration":"0001-01-01T00:00:00Z"`; only a real
+        // (non-year-1) expiry means the client wants expiring credentials.
+        if self
+            .credentials
+            .expiration
+            .is_some_and(|expiration| !is_go_zero_time(expiration))
+        {
             return Err(s3_error!(
                 InvalidRequest,
                 "remote target field credentials.expiration is not supported by this RustFS version"
@@ -311,10 +327,15 @@ impl RemoteTargetRequest {
             }
         }
 
+        let mut credentials = TargetCredentials::from(self.credentials);
+        // Past the check above the expiration can only be the zero-value
+        // sentinel, i.e. "no expiration" — never persist it.
+        credentials.expiration = None;
+
         Ok(BucketTarget {
             source_bucket: self.source_bucket,
             endpoint: self.endpoint,
-            credentials: Some(self.credentials.into()),
+            credentials: Some(credentials),
             target_bucket: self.target_bucket,
             secure: self.secure,
             path: self.path,
@@ -338,7 +359,11 @@ impl RemoteTargetRequest {
             total_downtime: duration_from_secs_or_nanos(self.total_downtime),
             last_online: self.last_online,
             online: self.online,
-            latency: self.latency,
+            // Latency is a server-measured runtime stat that mc echoes back
+            // from list-remote-targets (Go time.Duration nanoseconds), while
+            // the persisted format is milliseconds — never store the client
+            // value.
+            latency: LatencyStat::default(),
             deployment_id: self.deployment_id,
             edge: self.edge,
             edge_sync_before_expiry: self.edge_sync_before_expiry,
