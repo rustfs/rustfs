@@ -661,7 +661,7 @@ impl ECStore {
         unique_disks.into_values().collect()
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub(super) async fn handle_new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.pools[0].new_ns_lock(bucket, object).await
     }

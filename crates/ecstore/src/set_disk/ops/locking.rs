@@ -28,7 +28,7 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         // Resolved from this set's own instance context (backlog#1052), not the
         // ambient facade: the facade tracks whichever context is currently

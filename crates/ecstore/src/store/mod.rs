@@ -582,7 +582,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
     // @start_after as marker when continuation_token empty
     // @delimiter default="/", empty when recursive
     // @max_keys limit
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
         bucket: &str,

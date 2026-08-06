@@ -134,7 +134,7 @@ impl crate::storage_api_contracts::list::ListOperations for SetDisks {
     type WalkCancellation = CancellationToken;
     type WalkResultSender = Sender<ObjectInfoOrErr>;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
         bucket: &str,
