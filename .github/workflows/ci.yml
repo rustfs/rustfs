@@ -777,11 +777,24 @@ jobs:
 
       - name: Install awscurl
         run: |
-          python3 -m pip install --user --upgrade pip awscurl
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
           echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
 
       - name: Verify awscurl
         run: test -x "$AWSCURL_PATH"
+
+      - name: Install Vault
+        run: |
+          VAULT_VERSION="1.17.6"
+          VAULT_ARCHIVE="vault_${VAULT_VERSION}_linux_amd64.zip"
+          curl -fsSLo "$RUNNER_TEMP/$VAULT_ARCHIVE" "https://releases.hashicorp.com/vault/${VAULT_VERSION}/${VAULT_ARCHIVE}"
+          echo "0cddc1fbbb88583b5ba5b845f9f8fae47c6fb39a6d48cd543c6ba6fd3ac1a669  $RUNNER_TEMP/$VAULT_ARCHIVE" | sha256sum --check --status
+          unzip -q "$RUNNER_TEMP/$VAULT_ARCHIVE" -d "$RUNNER_TEMP/vault-bin"
+          echo "RUSTFS_TEST_VAULT_BIN=$RUNNER_TEMP/vault-bin/vault" >> "$GITHUB_ENV"
+
+      - name: Verify Vault
+        run: |
+          "$RUSTFS_TEST_VAULT_BIN" version
 
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
