@@ -1,0 +1,8 @@
+---
+source: rustfs/src/admin/handlers/kms_management.rs
+expression: "stable_json_value(KmsClearCacheResponse\n{\n    status: \"success\".to_string(), message:\n    \"cache cleared successfully\".to_string(),\n})"
+---
+{
+  "message": "cache cleared successfully",
+  "status": "success"
+}

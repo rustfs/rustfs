@@ -348,9 +348,10 @@ impl RemoteTargetRequest {
 }
 
 /// Admin-response encoding of a remote target: the persisted bucket-targets
-/// format keeps `healthCheckDuration`/`totalDowntime` in seconds, but madmin
-/// decodes them as Go `time.Duration` (nanoseconds) — re-encode just those
-/// fields without touching the persistence wire format.
+/// format keeps `healthCheckDuration`/`totalDowntime` in seconds and the
+/// `latency` stats in milliseconds, but madmin decodes all of them as Go
+/// `time.Duration` (nanoseconds) — re-encode just those fields without
+/// touching the persistence wire format.
 fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, serde_json::Error> {
     fn go_duration_nanos(duration: Duration) -> serde_json::Value {
         // Saturate instead of truncating: >u64::MAX nanoseconds (~584 years)
@@ -361,6 +362,11 @@ fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, 
     let mut value = serde_json::to_value(target)?;
     value["healthCheckDuration"] = go_duration_nanos(target.health_check_duration);
     value["totalDowntime"] = go_duration_nanos(target.total_downtime);
+    value["latency"] = serde_json::json!({
+        "curr": go_duration_nanos(target.latency.curr),
+        "avg": go_duration_nanos(target.latency.avg),
+        "max": go_duration_nanos(target.latency.max),
+    });
     Ok(value)
 }
 
@@ -1219,7 +1225,7 @@ mod tests {
         SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops,
         unique_replication_peers, validate_remote_target_tls_settings,
     };
-    use crate::admin::storage_api::bucket::target::BucketTarget;
+    use crate::admin::storage_api::bucket::target::{BucketTarget, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
     use http::Uri;
 
@@ -1748,6 +1754,11 @@ mod tests {
             target_bucket: "target".to_string(),
             health_check_duration: std::time::Duration::from_secs(60),
             total_downtime: std::time::Duration::from_secs(90),
+            latency: LatencyStat {
+                curr: std::time::Duration::from_millis(12),
+                avg: std::time::Duration::from_millis(34),
+                max: std::time::Duration::from_millis(250),
+            },
             ..Default::default()
         };
 
@@ -1755,10 +1766,43 @@ mod tests {
 
         assert_eq!(value["healthCheckDuration"], 60_000_000_000u64);
         assert_eq!(value["totalDowntime"], 90_000_000_000u64);
-        // Persistence keeps seconds: the response path must not leak into it.
+        assert_eq!(value["latency"]["curr"], 12_000_000u64);
+        assert_eq!(value["latency"]["avg"], 34_000_000u64);
+        assert_eq!(value["latency"]["max"], 250_000_000u64);
+        // Persistence keeps seconds/milliseconds: the response path must not
+        // leak into it.
         let persisted = serde_json::to_value(&target).expect("persisted form should serialize");
         assert_eq!(persisted["healthCheckDuration"], 60);
         assert_eq!(persisted["totalDowntime"], 90);
+        assert_eq!(persisted["latency"]["curr"], 12);
+        assert_eq!(persisted["latency"]["avg"], 34);
+        assert_eq!(persisted["latency"]["max"], 250);
+    }
+
+    #[test]
+    fn remote_target_admin_json_latency_round_trips_through_go_duration() {
+        // Round trip: a madmin reader decodes the latency values as Go
+        // time.Duration nanoseconds — decoding must recover the exact
+        // durations the server reported.
+        let target = BucketTarget {
+            latency: LatencyStat {
+                curr: std::time::Duration::from_micros(1_500),
+                avg: std::time::Duration::from_millis(87),
+                max: std::time::Duration::from_secs(2),
+            },
+            ..Default::default()
+        };
+
+        let value = super::remote_target_admin_json(&target).expect("admin response should serialize");
+
+        for (field, expected) in [
+            ("curr", target.latency.curr),
+            ("avg", target.latency.avg),
+            ("max", target.latency.max),
+        ] {
+            let nanos = value["latency"][field].as_u64().expect("latency field must be a u64");
+            assert_eq!(std::time::Duration::from_nanos(nanos), expected, "latency.{field} must round-trip");
+        }
     }
 
     #[test]

@@ -1445,7 +1445,7 @@ impl SetDisks {
             }
 
             let rename_stage_start = Instant::now();
-            let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
+            let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
@@ -1455,6 +1455,23 @@ impl SetDisks {
                 write_quorum,
             )
             .await?;
+            // Do this before any post-commit await so request cancellation cannot
+            // bypass best-effort admission. A process crash before admission
+            // remains subject to the existing scanner reconciliation path.
+            if convergence.needs_heal() {
+                let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    bucket.to_string(),
+                    Some(object.to_string()),
+                    false,
+                    Some(HealChannelPriority::Normal),
+                    Some(self.pool_index),
+                    Some(self.set_index),
+                );
+                request.object_version_id = fi.version_id.map(|version_id| version_id.to_string());
+                tokio::spawn(async move {
+                    let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                });
+            }
             let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
             rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
             if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -4343,7 +4360,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         Ok(obj_info)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         crate::hp_guard!("SetDisks::get_object_info");
         // Acquire a shared read-lock to protect consistency during info fetch
@@ -4368,17 +4385,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        if let Err(e) =
-            rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                bucket.to_string(),
-                Some(object.to_string()),
-                false,
-                Some(HealChannelPriority::Normal),
-                Some(self.pool_index),
-                Some(self.set_index),
-            ))
-            .await
-        {
+        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+            bucket.to_string(),
+            Some(object.to_string()),
+            false,
+            Some(HealChannelPriority::Normal),
+            Some(self.pool_index),
+            Some(self.set_index),
+        );
+        request.object_version_id = (!version_id.is_empty()).then(|| version_id.to_string());
+        if let Err(e) = rustfs_common::heal_channel::send_heal_request(request).await {
             warn!(
                 bucket,
                 object,

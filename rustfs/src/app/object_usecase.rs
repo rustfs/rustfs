@@ -3864,6 +3864,8 @@ static IO_QUEUE_CONGESTION_WARN_THROTTLE: IoQueueCongestionWarnThrottle = IoQueu
 #[derive(Clone, Default)]
 pub struct DefaultObjectUsecase {
     context: Option<Arc<AppContext>>,
+    #[cfg(test)]
+    get_object_timeout_policy: Option<GetObjectTimeoutPolicy>,
 }
 
 impl DefaultObjectUsecase {
@@ -3873,12 +3875,17 @@ impl DefaultObjectUsecase {
 
     #[cfg(test)]
     pub fn without_context() -> Self {
-        Self { context: None }
+        Self {
+            context: None,
+            get_object_timeout_policy: None,
+        }
     }
 
     pub fn from_global() -> Self {
         Self {
             context: current_app_context(),
+            #[cfg(test)]
+            get_object_timeout_policy: None,
         }
     }
 
@@ -3887,7 +3894,22 @@ impl DefaultObjectUsecase {
     /// so the use-case resolves that server's store; `None` falls back to the
     /// ambient default.
     pub fn with_context(context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>) -> Self {
-        Self { context }
+        Self {
+            context,
+            #[cfg(test)]
+            get_object_timeout_policy: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_context_and_get_object_timeout_policy(
+        context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>,
+        get_object_timeout_policy: GetObjectTimeoutPolicy,
+    ) -> Self {
+        Self {
+            context,
+            get_object_timeout_policy: Some(get_object_timeout_policy),
+        }
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
@@ -4030,7 +4052,13 @@ impl DefaultObjectUsecase {
         blob
     }
 
-    fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
+    fn init_get_object_bootstrap(&self, bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
+        #[cfg(test)]
+        let timeout_config = self
+            .get_object_timeout_policy
+            .clone()
+            .unwrap_or_else(GetObjectTimeoutPolicy::cached_from_env);
+        #[cfg(not(test))]
         let timeout_config = GetObjectTimeoutPolicy::cached_from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
@@ -6244,7 +6272,7 @@ impl DefaultObjectUsecase {
                 context.start_time.elapsed().as_secs_f64(),
             );
         }
-        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
+        let bootstrap = self.init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
@@ -11228,7 +11256,17 @@ mod tests {
             .key(object.to_string())
             .build()
             .expect("real cold-fill GET input must build");
-        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        // The request is intentionally held behind the first producer while a
+        // 1.3 MiB replacement write changes its generation. Disable dynamic
+        // sizing for this test so runner I/O load cannot consume the five-second
+        // production minimum before the behavior under test is released.
+        let usecase = DefaultObjectUsecase::with_context_and_get_object_timeout_policy(
+            Some(context),
+            GetObjectTimeoutPolicy {
+                enable_dynamic_timeout: false,
+                ..GetObjectTimeoutPolicy::default()
+            },
+        );
         let request = tokio::spawn(async move { usecase.execute_get_object(build_request(input, Method::GET)).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while coordinator.global_waiter_count_for_test() != 1 {

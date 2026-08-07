@@ -235,7 +235,7 @@ rustfs-zip = { workspace = true }
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-object-capacity = { workspace = true }
-rustfs-object-data-cache = { workspace = true }
+rustfs-object-data-cache = { workspace = true, features = ["cache"] }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
@@ -267,6 +267,7 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 apache-avro = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
+flate2 = { workspace = true }
 flatbuffers.workspace = true
 rmp-serde.workspace = true
 quick-xml.workspace = true

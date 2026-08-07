@@ -169,6 +169,7 @@ RustFS 会自动在该基础 URL 后补全：
 需要注意：
 
 - 启动阶段通常会先看到日志和指标，因此“先有日志/指标、后有 trace”是正常现象。
+- OpenTelemetry bridge 会把 `tracing` 字段作为日志 attributes 发送。Loki 会将这些 attributes 存为 structured metadata，同时 Collector 会把常用排障字段镜像进日志行，方便用简单的行内容过滤直接查到。
 - 可见的 trace 数据通常依赖启动后的真实 HTTP/S3/gRPC 请求流量，因为请求路径上的 span 是按需创建的。
 - `RUSTFS_OBS_LOGGER_LEVEL=info` 会保留顶层请求 span，但会过滤掉很多 `debug` 级别的嵌套 span。
   如果 Tempo 或 Jaeger 中的 trace 看起来很稀疏，建议先改成 `RUSTFS_OBS_LOGGER_LEVEL=debug`，再判断是否是 collector 或 Tempo 问题。
@@ -190,6 +191,14 @@ curl -I http://127.0.0.1:9000/health/ready
 # 4. 到 Grafana 或 Jaeger 中检查。
 # Grafana: http://localhost:3000
 # Jaeger:  http://localhost:16686
+```
+
+对于 RustFS 结构化日志，例如节点间 RPC 鉴权失败，Loki 日志行现在会包含 `event`、`component`、`subsystem`、`failure_reason`、`rpc_service`、`rpc_method`、`expected_audience` 等字段。常用 LogQL 检查：
+
+```logql
+{service_name="RustFS"} |= "RPC signature verification failed"
+{service_name="RustFS"} |= "failure_reason="
+{service_name="RustFS"} | failure_reason != ""
 ```
 
 如果日志和指标已经正常，但 trace 仍然稀疏，最常见的原因通常是

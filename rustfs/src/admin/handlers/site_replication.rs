@@ -63,7 +63,7 @@ use rustfs_config::{
 };
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
-use rustfs_iam::store::{MappedPolicy, UserType};
+use rustfs_iam::store::{MappedPolicy, UserType, sr_wire_user_type, user_type_from_sr_wire};
 use rustfs_iam::sys::{
     NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
 };
@@ -4303,7 +4303,7 @@ fn local_idp_settings() -> IDPSettings {
 fn mapped_policy_to_sr_mapping(name: String, is_group: bool, user_type: UserType, mapping: MappedPolicy) -> SRPolicyMapping {
     SRPolicyMapping {
         user_or_group: name,
-        user_type: user_type.to_u64(),
+        user_type: sr_wire_user_type(user_type, is_group),
         is_group,
         policy: mapping.policies,
         updated_at: Some(mapping.update_at),
@@ -7824,7 +7824,8 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             let Some(mapping) = item.policy_mapping else {
                 return Err(s3_error!(InvalidRequest, "policyMapping is required"));
             };
-            let user_type = UserType::from_u64(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
+            let user_type =
+                user_type_from_sr_wire(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
             iam_sys
                 .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
                 .await
@@ -11910,7 +11911,7 @@ mod tests {
             "alice".to_string(),
             SRPolicyMapping {
                 user_or_group: "alice".to_string(),
-                user_type: UserType::Reg.to_u64(),
+                user_type: sr_wire_user_type(UserType::Reg, false),
                 policy: "readwrite".to_string(),
                 updated_at: Some(OffsetDateTime::UNIX_EPOCH),
                 ..Default::default()

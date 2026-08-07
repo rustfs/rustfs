@@ -14,8 +14,30 @@
 
 use super::super::*;
 
+pub(crate) async fn read_table_metadata_value<B>(
+    backend: &B,
+    table_bucket: &str,
+    metadata_location: &str,
+) -> TableCatalogStoreResult<Option<serde_json::Value>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(object) = backend
+        .read_object_limited(table_bucket, metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let metadata_location = metadata_location.to_string();
+    tokio::task::spawn_blocking(move || decode_table_metadata_json(&metadata_location, &object.data))
+        .await
+        .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))?
+        .map(Some)
+}
+
 pub(crate) fn metadata_log_locations(
     current_metadata: &serde_json::Value,
+    table_bucket: &str,
     namespace: &Namespace,
     table: &IdentifierSegment,
 ) -> BTreeSet<String> {
@@ -25,11 +47,15 @@ pub(crate) fn metadata_log_locations(
     };
 
     for entry in metadata_log {
-        let Some(metadata_location) = entry.get("metadata-file").and_then(serde_json::Value::as_str) else {
+        let Some(metadata_location) = entry
+            .get("metadata-file")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|location| table_catalog_object_key_from_location(table_bucket, location))
+        else {
             continue;
         };
-        if is_valid_table_metadata_location(namespace, table, metadata_location) {
-            locations.insert(metadata_location.to_string());
+        if is_valid_table_metadata_location(namespace, table, &metadata_location) {
+            locations.insert(metadata_location);
         }
     }
 
@@ -57,14 +83,15 @@ where
         if !is_valid_table_metadata_location(namespace, table, metadata_location) {
             continue;
         }
-        let Some(metadata_object) = backend.read_object(table_bucket, metadata_location).await? else {
-            continue;
-        };
-        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_object.data) else {
-            continue;
-        };
-        if metadata_contains_protected_snapshot_ref(&metadata, &protected_snapshot_ids) {
-            retained.insert(metadata_location.clone());
+        match read_table_metadata_value(backend, table_bucket, metadata_location).await {
+            Ok(Some(metadata)) if metadata_contains_protected_snapshot_ref(&metadata, &protected_snapshot_ids) => {
+                retained.insert(metadata_location.clone());
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(TableCatalogStoreError::Invalid(_)) => {
+                retained.insert(metadata_location.clone());
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(retained)

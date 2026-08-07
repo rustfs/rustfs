@@ -38,11 +38,25 @@ The wire prefix is `/rustfs/admin/v3`. Request and response field names for the 
 | `POST /kms/restore` | `kms:Restore` / high | no | pending | pending | Require `confirm_backup_id` and `confirm_conflict_policy`; no blanket `--yes`. |
 | `POST /kms/restore/abort` | `kms:Restore` / high | no | pending | pending | Require `confirm_target_key_dir`. |
 
+## Key listing contract
+
+Both listing routes (`GET /kms/keys` and the legacy `GET /kms/list-keys`) share one contract.
+
+`limit` is optional. When it is absent the server applies its own default page size of 100. When it is present it must parse as a non-negative integer: `limit=abc`, `limit=-1` and a value-less `limit` are refused with `400`, not silently read as "use the default". `limit=0` is a well-formed request for an empty page. Any page size above 1000 is served as 1000 — the response is `truncated` with a usable `next_marker`, so a client that pages until `truncated` is false still reaches every key. Clients must not assume a page is the size they asked for.
+
+`marker` is opaque to the client: treat it as a cursor to hand back unchanged, never as a value to construct. On the Local, Vault KV2, Vault Transit and Static backends it happens to be an exclusive lower bound on the key identifier, which is what makes paging survive keys being created or destroyed mid-listing; on the AWS backend it is AWS's own pagination token, and sending a key id there is rejected. An empty `marker` means the same thing as no marker at all. Filters are applied after the page is cut, so a filtered page can be short — even empty — while more keys remain. Page until `truncated` is false, never until a page comes back short.
+
+`unreadable_key_ids` is present only when the server listed a key whose record it could not describe — a record written by a newer build, or damaged material. The identifiers are reported rather than omitted, so a listing never quietly understates the key set; a client displaying an inventory should surface them as damaged rather than dropping them, and paging always advances past a damaged key. A failure that says nothing about a specific key (timeout, `5xx`, permission denied) still fails the whole listing instead of appearing here.
+
+One case is deliberately an error rather than a report: a listing that covered the entire key set — no `marker`, and not `truncated` — in which nothing was readable. An empty `keys` array there would be indistinguishable, to any client written before this field existed, from a deployment that has no keys, and the usual response to that is to provision a new one. Such a listing returns `500` instead, naming the first failure; the individual identifiers are in the server log. A truncated page, or one resumed from a marker, always reports rather than failing, so a damaged key can never strand the keys behind it.
+
 ## Server-side snapshot coverage
 
 The merged #5626 producer snapshots cover the nine modern/legacy key response types and the metadata response type served by `kms_keys.rs` and `kms_key_metadata.rs`: create, describe, list, generate-data-key, delete, cancel-deletion, update-description, tag, and untag. The four dynamic responses served verbatim by `kms_dynamic.rs` are covered in `crates/kms/src/snapshots/`: configure, start, stop, and the `service-status` response.
 
-The remaining wire-shape gaps are intentionally documented rather than duplicated here: the management `KmsStatusResponse` (`GET|POST /kms/status`, pending #1636), `KmsConfigResponse`, the inline clear-cache JSON, all three lifecycle responses, and the backup/restore response family. Adding producer snapshots for those gaps is a separate server test task; it must not be inferred from the client matrix.
+`POST /kms/clear-cache` now has a named `KmsClearCacheResponse` and a producer snapshot beside the others; its serialized bytes are unchanged from the inline JSON it replaced.
+
+The remaining wire-shape gaps are intentionally documented rather than duplicated here: the management `KmsStatusResponse` (`GET|POST /kms/status`, pending #1636), `KmsConfigResponse`, all three lifecycle responses, and the backup/restore response family. Adding producer snapshots for those gaps is a separate server test task; it must not be inferred from the client matrix.
 
 ## Client handoff gaps
 
