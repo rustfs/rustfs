@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::{
-    capacity::capacity_integration::init_capacity_management,
     config::Config,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
@@ -259,7 +258,6 @@ pub(crate) async fn init_startup_http_servers(
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupHttpServers> {
-    init_capacity_management().await;
     let state_manager = Arc::new(ServiceStateManager::new());
     state_manager.update(ServiceState::Starting);
 

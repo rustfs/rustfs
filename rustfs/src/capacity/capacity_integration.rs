@@ -14,12 +14,20 @@
 
 //! Capacity management integration for application startup
 
-use crate::capacity::{get_cached_capacity_with_metrics, init_capacity_management_for_local_disks};
+use crate::capacity::{
+    get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, init_capacity_management_for_local_disks_managed,
+};
+use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
 
 /// Initialize capacity management system
 /// This should be called during application startup after local disks are initialized
 pub async fn init_capacity_management() {
     init_capacity_management_for_local_disks().await;
+}
+
+/// Initialize capacity management with lifecycle ownership.
+pub async fn init_capacity_management_managed() -> Option<CapacityBackgroundTasks> {
+    init_capacity_management_for_local_disks_managed().await
 }
 
 /// Get capacity statistics with metrics
