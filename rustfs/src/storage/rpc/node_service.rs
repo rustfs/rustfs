@@ -153,9 +153,8 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise an authenticated unsupported
-// state during predeployment. Remove after composite acquisition, activation fencing,
-// and fleet proof ship together.
+// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise unsupported during predeployment. Remove after composite acquisition,
+// activation fencing, fleet proof, commit-time proof revalidation, and fail-closed revocation ship together.
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
 
 fn admit_heal_control_replay(
