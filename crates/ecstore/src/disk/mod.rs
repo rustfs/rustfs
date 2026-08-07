@@ -42,6 +42,10 @@ pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
 pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
 pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK: &str = "disk";
+const EVENT_DISK_PART_ERR_UNCLASSIFIED: &str = "disk_part_err_unclassified";
+
 pub fn part_transaction_path(part_path: &str) -> String {
     match part_path.rsplit_once('/') {
         Some((parent, name)) => format!("{parent}/.{name}.rustfs-txn"),
@@ -1196,7 +1200,13 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
         Some(DiskError::DiskNotFound) => CHECK_PART_DISK_NOT_FOUND,
         None => CHECK_PART_SUCCESS,
         _ => {
-            tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");
+            tracing::warn!(
+                event = EVENT_DISK_PART_ERR_UNCLASSIFIED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                error = ?err,
+                "Part error has no check-part code and degrades to unknown"
+            );
             CHECK_PART_UNKNOWN
         }
     }
