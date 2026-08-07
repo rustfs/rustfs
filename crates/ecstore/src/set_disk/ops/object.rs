@@ -972,8 +972,9 @@ impl SetDisks {
 
         let mut object_lock_guard = None;
         let mut bucket_lifecycle_guard = None;
+        let deferred_data_movement_precondition = opts.data_movement && opts.http_preconditions.is_some();
 
-        if opts.http_preconditions.is_some() {
+        if opts.http_preconditions.is_some() && !deferred_data_movement_precondition {
             if !opts.no_lock {
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
@@ -1329,6 +1330,10 @@ impl SetDisks {
             }
             #[cfg(test)]
             pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
+
+            if deferred_data_movement_precondition && let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
 
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
@@ -5780,7 +5785,7 @@ mod transition_commit_failure_tests {
     use http::HeaderMap;
     use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
     use s3s::dto::RestoreRequest;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
@@ -8719,6 +8724,87 @@ mod put_object_tmp_cleanup_tests {
                 .is_err(),
             "object must remain absent after bucket lifecycle lock loss"
         );
+    }
+
+    #[tokio::test]
+    async fn data_movement_precondition_is_rechecked_at_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "data-movement-commit-precondition";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let migration_body = vec![b'm'; 64 * 1024];
+        let split = migration_body.len() / 2;
+        let (mut source, stream) = tokio::io::duplex(64);
+        let hash_reader = HashReader::from_stream(
+            stream,
+            i64::try_from(migration_body.len()).expect("migration body length should fit i64"),
+            i64::try_from(migration_body.len()).expect("migration body length should fit i64"),
+            None,
+            None,
+            false,
+        )
+        .expect("migration hash reader should be created");
+        let migration_store = Arc::clone(&set_disks);
+        let migration = tokio::spawn(async move {
+            let mut reader = PutObjReader::new(hash_reader);
+            migration_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        data_movement: true,
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        source
+            .write_all(&migration_body[..split])
+            .await
+            .expect("migration should consume the first half before commit");
+        let mut client_reader = PutObjReader::from_vec(b"new client body".to_vec());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            set_disks.put_object(bucket, object, &mut client_reader, &ObjectOptions::default()),
+        )
+        .await
+        .expect("client write must not wait for the migration body")
+        .expect("client write should commit while migration waits for the remaining source body");
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        source
+            .write_all(&migration_body[split..])
+            .await
+            .expect("migration should consume the remaining source body");
+        drop(source);
+        barrier.wait_until_paused().await;
+        barrier.release();
+
+        let err = migration
+            .await
+            .expect("migration task should join")
+            .expect_err("migration must recheck the target after acquiring its commit lock");
+        assert_eq!(err, StorageError::PreconditionFailed);
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("client object should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("client object should drain");
+        assert_eq!(body, b"new client body");
     }
 
     #[tokio::test]
