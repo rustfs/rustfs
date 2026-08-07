@@ -100,3 +100,12 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
     let _ = SHARED_GATING_ENV.set((disk_paths, ecstore.clone(), temp_dir));
     ecstore
 }
+
+/// Like [`shared_gating_ecstore`], but also returns the backing disk paths so
+/// tests can remove on-disk shards and simulate the object data vanishing
+/// mid-stream.
+pub(crate) async fn shared_gating_ecstore_and_disk_paths() -> (Vec<PathBuf>, Arc<ECStore>) {
+    let _ = shared_gating_ecstore().await;
+    let (disk_paths, store, _) = SHARED_GATING_ENV.get().expect("gating env must be initialized");
+    (disk_paths.clone(), store.clone())
+}
