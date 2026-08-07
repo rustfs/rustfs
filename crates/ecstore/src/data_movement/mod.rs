@@ -546,6 +546,81 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     ))
 }
 
+#[cfg(test)]
+struct SourceCleanupDeleteBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct SourceCleanupDeleteBarrier {
+    state: Arc<SourceCleanupDeleteBarrierState>,
+}
+
+#[cfg(test)]
+static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SourceCleanupDeleteBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl SourceCleanupDeleteBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(SourceCleanupDeleteBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        assert!(slot.is_none(), "source cleanup delete barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("source cleanup should reach the pre-delete barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SourceCleanupDeleteBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
+    let barrier = SOURCE_CLEANUP_DELETE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("source cleanup delete barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 pub(crate) async fn cleanup_source_entry_if_unchanged(
     set: Arc<SetDisks>,
     bucket: &str,
@@ -560,19 +635,18 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    let result = set
-        .delete_object(
-            bucket,
-            cleanup_key.as_str(),
-            ObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                data_movement: true,
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await;
+    #[cfg(test)]
+    pause_source_cleanup_before_delete(bucket, object).await;
+
+    let mut opts = ObjectOptions {
+        delete_prefix: true,
+        delete_prefix_object: true,
+        data_movement: true,
+        no_lock: true,
+        ..Default::default()
+    };
+    opts.add_namespace_lock_guard(&_guard);
+    let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
