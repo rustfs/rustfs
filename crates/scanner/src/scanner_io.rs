@@ -776,6 +776,34 @@ fn classify_nsscanner_cycle(
     }
 }
 
+fn should_publish_usage_snapshot(status: ScannerCycleStatus) -> bool {
+    matches!(status, ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded)
+}
+
+fn prepare_usage_snapshot_for_publication(
+    status: ScannerCycleStatus,
+    mut data_usage_info: DataUsageInfo,
+) -> Option<DataUsageInfo> {
+    if !should_publish_usage_snapshot(status) {
+        return None;
+    }
+
+    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    Some(data_usage_info)
+}
+
+async fn publish_usage_snapshot(
+    updates: &mpsc::Sender<DataUsageInfo>,
+    status: ScannerCycleStatus,
+    data_usage_info: DataUsageInfo,
+) -> Result<bool> {
+    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
+        return Ok(false);
+    };
+    send_data_usage_update(updates, data_usage_info).await?;
+    Ok(true)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCycleActivityStatus {
     Unchanged,
@@ -2347,22 +2375,29 @@ impl ScannerIOCycle for ECStore {
                 dirty_usage_status,
                 activity_status,
             );
-            if status != ScannerCycleStatus::Complete {
+            if !publish_usage_snapshot(
+                &updates,
+                status,
+                DataUsageInfo {
+                    last_update: Some(SystemTime::now()),
+                    scanner_cycle: Some(want_cycle),
+                    usage_snapshot_complete: true,
+                    ..Default::default()
+                },
+            )
+            .await?
+            {
                 return Ok(ScannerCycleResult::new(status, None));
             }
-            let empty_usage = DataUsageInfo {
-                last_update: Some(SystemTime::now()),
-                scanner_cycle: Some(want_cycle),
-                usage_snapshot_complete: true,
-                ..Default::default()
+            let dirty_usage_clear =
+                (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
+            let remote_dirty_usage_acknowledgements = if status == ScannerCycleStatus::Complete {
+                crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
+            } else {
+                Vec::new()
             };
-            send_data_usage_update(&updates, empty_usage).await?;
-            let dirty_usage_clear = Some(dirty_usage_snapshot.buckets.as_ref().clone());
-            return Ok(
-                ScannerCycleResult::new(status, dirty_usage_clear).with_remote_dirty_usage_acknowledgements(
-                    crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before),
-                ),
-            );
+            return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
+                .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
         }
 
         let total_results = expected_sources.len();
@@ -2576,10 +2611,8 @@ impl ScannerIOCycle for ECStore {
             dirty_usage_status,
             activity_status,
         );
-        if cycle_status == ScannerCycleStatus::Complete
-            && let Some((data_usage_info, _)) = completed_usage
-        {
-            send_data_usage_update(&updates, data_usage_info).await?;
+        if let Some((data_usage_info, _)) = completed_usage {
+            publish_usage_snapshot(&updates, cycle_status, data_usage_info).await?;
         }
         let dirty_usage_clear = should_clear_dirty_usage_snapshot(
             result.is_ok(),
@@ -4595,6 +4628,44 @@ mod tests {
         ] {
             assert_eq!(status, ScannerCycleStatus::Incomplete);
         }
+    }
+
+    #[tokio::test]
+    async fn structurally_complete_superseded_cycles_publish_without_claiming_convergence() {
+        let (updates, mut receiver) = mpsc::channel(2);
+
+        assert!(
+            publish_usage_snapshot(&updates, ScannerCycleStatus::Complete, DataUsageInfo::default())
+                .await
+                .expect("complete snapshot publication should succeed")
+        );
+        assert!(
+            publish_usage_snapshot(&updates, ScannerCycleStatus::Superseded, DataUsageInfo::default())
+                .await
+                .expect("superseded snapshot publication should succeed")
+        );
+        assert!(
+            !publish_usage_snapshot(&updates, ScannerCycleStatus::Incomplete, DataUsageInfo::default())
+                .await
+                .expect("incomplete snapshot suppression should succeed")
+        );
+
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("complete update should be sent")
+                .usage_snapshot_converged,
+            Some(true)
+        );
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("superseded update should be sent")
+                .usage_snapshot_converged,
+            Some(false)
+        );
     }
 
     #[test]

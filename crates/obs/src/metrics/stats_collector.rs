@@ -65,6 +65,7 @@ type ObsBackendInfo = <ObsStore as StorageAdminApi>::BackendInfo;
 struct ObsDataUsageInfo {
     last_update: Option<SystemTime>,
     usage_snapshot_complete: bool,
+    usage_snapshot_converged: bool,
     buckets_count: u64,
     objects_total_count: u64,
     versions_total_count: u64,
@@ -102,6 +103,7 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
     Ok(ObsDataUsageInfo {
         last_update: data_usage.last_update,
         usage_snapshot_complete,
+        usage_snapshot_converged: data_usage.usage_snapshot_converged == Some(true),
         buckets_count: data_usage.buckets_count,
         objects_total_count: data_usage.objects_total_count,
         versions_total_count: data_usage.versions_total_count,
@@ -1204,6 +1206,7 @@ async fn collect_cluster_usage_metric_stats_from_data_usage(
             versions_count: data_usage.versions_total_count,
             delete_markers_count: data_usage.delete_markers_total_count,
             buckets_count: data_usage.buckets_count,
+            snapshot_converged: data_usage.usage_snapshot_converged,
             object_size_distribution: data_usage
                 .buckets_usage
                 .values()
@@ -1579,6 +1582,7 @@ mod tests {
         let (cluster, buckets) = collect_cluster_usage_metric_stats_from_data_usage(
             ObsDataUsageInfo {
                 usage_snapshot_complete: true,
+                usage_snapshot_converged: true,
                 ..Default::default()
             },
             &HashSet::new(),
@@ -1589,7 +1593,24 @@ mod tests {
         assert_eq!(cluster.buckets_count, 0);
         assert_eq!(cluster.objects_count, 0);
         assert_eq!(cluster.total_bytes, 0);
+        assert!(cluster.snapshot_converged);
         assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_publish_unknown_convergence_as_unconverged() {
+        let (cluster, _) = collect_cluster_usage_metric_stats_from_data_usage(
+            ObsDataUsageInfo {
+                usage_snapshot_complete: true,
+                usage_snapshot_converged: false,
+                ..Default::default()
+            },
+            &HashSet::new(),
+        )
+        .await
+        .expect("complete usage with unknown convergence should remain publishable");
+
+        assert!(!cluster.snapshot_converged);
     }
 
     #[tokio::test]

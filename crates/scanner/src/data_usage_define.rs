@@ -27,8 +27,8 @@ use rustfs_common::heal_channel::HealScanMode;
 #[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
-    AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageEntry, DataUsageHash,
-    DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, TierStats, hash_path,
+    AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, TierStats, hash_path,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -172,6 +172,9 @@ pub static DATA_USAGE_BUCKET: LazyLock<String> =
 
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJECT_NAME}"));
+
+pub static DATA_USAGE_OBSERVED_OBJ_NAME_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBSERVED_OBJECT_NAME}"));
 
 pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{LEGACY_DATA_USAGE_OBJECT_NAME}"));
