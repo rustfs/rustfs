@@ -244,7 +244,7 @@ crossbeam-queue = "0.3.13"
 crossbeam-channel = "0.5.16"
 crossbeam-deque = "0.8.7"
 crossbeam-utils = "0.8.22"
-datafusion = { default-features = false, git = "https://github.com/apache/datafusion.git", rev = "dae03ee062b2abf986de8df12ea82fb1578a2d99" }
+datafusion = { default-features = false, git = "https://github.com/apache/datafusion.git", rev = "e08aed1e5de41dcf81d529140dae07723b942a5e" }
 #datafusion = { default-features = false, version = "54.1.0" }
 derive_builder = "0.20.2"
 enumset = "1.1.14"
