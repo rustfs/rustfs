@@ -49,7 +49,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
 use time::{Duration, OffsetDateTime};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
@@ -74,6 +74,15 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
     } else {
         duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
     }
+}
+
+/// Record that AssumeRole assembled its session claims without echoing any claim values.
+///
+/// Claims carry caller-supplied identity material (parent user, session policy, arbitrary
+/// JWT fields); interpolating them into logs repeats the GHSA-r54g-49rx-98cr /
+/// GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata may be logged here.
+fn trace_assume_role_claims(claims: &std::collections::HashMap<String, Value>) {
+    debug!(claim_count = claims.len(), "AssumeRole assembled session claims");
 }
 
 /// Build the site-replication IAM item that mirrors an AssumeRole temporary credential to peers.
@@ -141,7 +150,7 @@ pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AssumeRoleHandle");
+        debug!("handle AssumeRoleHandle");
 
         let mut input = req.input;
 
@@ -241,7 +250,7 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidArgument, "global active sk not init"));
     };
 
-    info!("AssumeRole get claims {:?}", &claims);
+    trace_assume_role_claims(&claims);
 
     let mut new_cred = get_new_credentials_with_metadata(&claims, &secret)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get new cred failed {e}")))?;
@@ -385,6 +394,64 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assume_role_claims_log_never_echoes_claim_values() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("captured log lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+            type Writer = CapturedLogWriter;
+
+            fn make_writer(&'writer self) -> Self::Writer {
+                CapturedLogWriter(self.0.clone())
+            }
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured.clone())
+            .finish();
+
+        let mut claims = std::collections::HashMap::new();
+        claims.insert("parent".to_string(), Value::String("sensitive-parent-user".to_string()));
+        claims.insert("sessionPolicy".to_string(), Value::String("eyJzZWNyZXQtcG9saWN5LWJsb2Ii".to_string()));
+        claims.insert("sub".to_string(), Value::String("sensitive-subject-id".to_string()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            trace_assume_role_claims(&claims);
+        });
+
+        let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8");
+        assert!(
+            logs.contains("claim_count"),
+            "expected the redacted claims log line to be emitted: {logs}"
+        );
+        for secret in [
+            "sensitive-parent-user",
+            "eyJzZWNyZXQtcG9saWN5LWJsb2Ii",
+            "sensitive-subject-id",
+            "sessionPolicy",
+        ] {
+            assert!(!logs.contains(secret), "AssumeRole claims log leaked {secret}: {logs}");
+        }
+    }
 
     #[test]
     fn test_xml_escape() {
