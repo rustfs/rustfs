@@ -137,6 +137,18 @@ pub(crate) async fn admin_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    admin_request_with_session_token(base_url, method, path_and_query, body, access_key, secret_key, None).await
+}
+
+pub(crate) async fn admin_request_with_session_token(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
     let uri = url.parse::<http::Uri>()?;
     let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
@@ -150,7 +162,14 @@ pub(crate) async fn admin_request(
     }
 
     let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
-    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_length,
+        access_key,
+        secret_key,
+        session_token.unwrap_or_default(),
+        "us-east-1",
+    );
 
     let mut request = local_http_client().request(method, &url);
     for (name, value) in signed.headers() {
