@@ -1657,19 +1657,30 @@ async fn wait_for_source_delete_marker_replication_failed(
         if response.status() != StatusCode::OK {
             return Err(format!("replication diff failed with status {}", response.status()).into());
         }
-        let diff: serde_json::Value = response.json().await?;
-        let failed = diff["Entries"].as_array().is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry["Object"].as_str() == Some(key)
-                    && entry["IsDeleteMarker"].as_bool() == Some(true)
-                    && entry["ReplicationStatus"].as_str() == Some("FAILED")
-            })
+        // The default diff response is a madmin-style stream of bare DiffInfo
+        // JSON documents (one per line) with no envelope; assert the envelope
+        // is gone so an aggregate-shaped regression fails loudly here.
+        let body = response.text().await?;
+        let entries = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        for entry in &entries {
+            if entry.get("Entries").is_some() {
+                return Err(format!("replication diff must stream bare DiffInfo documents, got envelope: {entry}").into());
+            }
+        }
+        let failed = entries.iter().any(|entry| {
+            entry["object"].as_str() == Some(key)
+                && entry["deletemarker"].as_bool() == Some(true)
+                && entry["rStatus"].as_str() == Some("FAILED")
         });
         if failed {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("source delete marker {key} never reported FAILED; last diff={diff}").into());
+            return Err(format!("source delete marker {key} never reported FAILED; last diff={body}").into());
         }
         sleep(Duration::from_millis(200)).await;
     }
