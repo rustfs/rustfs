@@ -363,19 +363,21 @@ impl Drop for SlowReplicationTargetGuard {
     }
 }
 
+// Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
+// shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
-    #[serde(rename = "Targets", default)]
+    #[serde(rename = "target", default)]
     targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusTarget {
-    #[serde(rename = "Arn", default)]
+    #[serde(rename = "arn", default)]
     arn: String,
-    #[serde(rename = "ResetID", default)]
+    #[serde(rename = "resetid", default)]
     reset_id: String,
-    #[serde(rename = "Status", default)]
+    #[serde(rename = "resyncStatus", default)]
     status: String,
 }
 

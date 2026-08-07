@@ -123,17 +123,20 @@ enum MiscExtRoute {
     ListenNotification { bucket: Option<String> },
 }
 
+// Wire shape mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags so
+// `mc replicate resync` can decode the response (Go json decoding is
+// case-insensitive per field, but the `target` shell key must match exactly).
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetResponse {
-    #[serde(rename = "Targets")]
+    #[serde(rename = "target")]
     targets: Vec<ReplicationResetTarget>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetTarget {
-    #[serde(rename = "Arn")]
+    #[serde(rename = "arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid")]
     reset_id: String,
 }
 
@@ -149,17 +152,21 @@ struct ReplicationResetStatusRequest {
     arn: Option<String>,
 }
 
+// Wire shape mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags
+// (see `ReplicationResetResponse`). `ResetBeforeDate` and `Error` are RustFS
+// extension keys with no madmin counterpart; Go decoders ignore unknown keys,
+// so they coexist with madmin/mc clients at zero cost.
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetStatusResponse {
-    #[serde(rename = "Targets")]
+    #[serde(rename = "target")]
     targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetStatusTarget {
-    #[serde(rename = "Arn")]
+    #[serde(rename = "arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid")]
     reset_id: String,
     #[serde(
         rename = "ResetBeforeDate",
@@ -168,30 +175,30 @@ struct ReplicationResetStatusTarget {
     )]
     reset_before_date: Option<OffsetDateTime>,
     #[serde(
-        rename = "StartTime",
+        rename = "startTime",
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
     start_time: Option<OffsetDateTime>,
     #[serde(
-        rename = "EndTime",
+        rename = "endTime",
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
     end_time: Option<OffsetDateTime>,
-    #[serde(rename = "Status")]
+    #[serde(rename = "resyncStatus")]
     status: String,
-    #[serde(rename = "ReplicatedCount")]
+    #[serde(rename = "replicationCount")]
     replicated_count: i64,
-    #[serde(rename = "ReplicatedSize")]
+    #[serde(rename = "completedReplicationSize")]
     replicated_size: i64,
-    #[serde(rename = "FailedCount")]
+    #[serde(rename = "failedReplicationCount")]
     failed_count: i64,
-    #[serde(rename = "FailedSize")]
+    #[serde(rename = "failedReplicationSize")]
     failed_size: i64,
-    #[serde(rename = "Bucket", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "bucket", skip_serializing_if = "String::is_empty")]
     bucket: String,
-    #[serde(rename = "Object", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "object", skip_serializing_if = "String::is_empty")]
     object: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -3206,6 +3213,22 @@ mod tests {
     }
 
     #[test]
+    fn replication_reset_response_matches_madmin_resync_targets_info_shape() {
+        let payload = serde_json::to_value(ReplicationResetResponse {
+            targets: vec![ReplicationResetTarget {
+                arn: "arn:minio:replication::depl:bucket".to_string(),
+                reset_id: "rid-1".to_string(),
+            }],
+        })
+        .expect("reset response must serialize");
+
+        // madmin-go `ResyncTargetsInfo` json tags: shell `target`, fields `arn`/`resetid`.
+        assert_eq!(payload["target"][0]["arn"], "arn:minio:replication::depl:bucket");
+        assert_eq!(payload["target"][0]["resetid"], "rid-1");
+        assert!(payload.get("Targets").is_none());
+    }
+
+    #[test]
     fn build_replication_reset_status_response_serializes_sorted_targets() {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
@@ -3240,15 +3263,20 @@ mod tests {
             .to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
 
-        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
-        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-a");
-        assert_eq!(payload["Targets"][0]["Status"], "Completed");
-        assert_eq!(payload["Targets"][0]["EndTime"], "2025-01-02T00:00:00Z");
-        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
-        assert_eq!(payload["Targets"][1]["Bucket"], "bucket-z");
-        assert_eq!(payload["Targets"][1]["Status"], "Failed");
-        assert_eq!(payload["Targets"][1]["EndTime"], "2025-01-03T00:00:00Z");
-        assert_eq!(payload["Targets"][1]["Error"], "boom");
+        assert_eq!(payload["target"][0]["arn"], "arn:a");
+        assert_eq!(payload["target"][0]["resetid"], "rid-a");
+        assert_eq!(payload["target"][0]["bucket"], "bucket-a");
+        assert_eq!(payload["target"][0]["resyncStatus"], "Completed");
+        assert_eq!(payload["target"][0]["endTime"], "2025-01-02T00:00:00Z");
+        assert_eq!(payload["target"][0]["replicationCount"], 3);
+        assert_eq!(payload["target"][0]["completedReplicationSize"], 9);
+        assert_eq!(payload["target"][1]["arn"], "arn:z");
+        assert_eq!(payload["target"][1]["bucket"], "bucket-z");
+        assert_eq!(payload["target"][1]["resyncStatus"], "Failed");
+        assert_eq!(payload["target"][1]["endTime"], "2025-01-03T00:00:00Z");
+        assert_eq!(payload["target"][1]["failedReplicationCount"], 2);
+        assert_eq!(payload["target"][1]["failedReplicationSize"], 4);
+        assert_eq!(payload["target"][1]["Error"], "boom");
     }
 
     #[test]
@@ -3286,12 +3314,12 @@ mod tests {
             .to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
 
-        assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
-        assert_eq!(payload["Targets"][0]["Arn"], "arn:z");
-        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-z");
-        assert_eq!(payload["Targets"][0]["Status"], "Failed");
-        assert_eq!(payload["Targets"][0]["EndTime"], "2025-02-03T00:00:00Z");
-        assert_eq!(payload["Targets"][0]["Error"], "boom");
+        assert_eq!(payload["target"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["target"][0]["arn"], "arn:z");
+        assert_eq!(payload["target"][0]["bucket"], "bucket-z");
+        assert_eq!(payload["target"][0]["resyncStatus"], "Failed");
+        assert_eq!(payload["target"][0]["endTime"], "2025-02-03T00:00:00Z");
+        assert_eq!(payload["target"][0]["Error"], "boom");
     }
 
     fn replication_check_target(arn: &str, status: &str, error: Option<&str>) -> ReplicationCheckTargetStatus {
