@@ -27,8 +27,8 @@ pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity_free as obs_get_total_usable_capacity_free,
 };
 pub(crate) use rustfs_ecstore::api::compression::is_disk_compression_enabled as obs_is_disk_compression_enabled;
+pub(crate) use rustfs_ecstore::api::data_usage::load_admin_data_usage_from_backend_cached as obs_load_data_usage_from_backend;
 pub(crate) use rustfs_ecstore::api::data_usage::load_compression_total_from_memory as obs_load_compression_total_from_memory;
-pub(crate) use rustfs_ecstore::api::data_usage::load_data_usage_from_backend as obs_load_data_usage_from_backend;
 pub(crate) use rustfs_ecstore::api::error::Result as ObsEcstoreResult;
 pub(crate) use rustfs_ecstore::api::runtime::{
     bucket_monitor as obs_get_global_bucket_monitor, expiry_state_handle as obs_expiry_state_handle,

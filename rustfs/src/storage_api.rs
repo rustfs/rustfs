@@ -116,7 +116,7 @@ pub(crate) mod server {
     pub(crate) mod http {
         pub(crate) use crate::storage::storage_api::{
             ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-            tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
+            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {

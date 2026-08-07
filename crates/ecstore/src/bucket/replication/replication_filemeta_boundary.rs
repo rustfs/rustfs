@@ -89,3 +89,116 @@ pub fn replication_state_to_filemeta(state: &ReplicationState) -> rustfs_filemet
         target_delete_marker_version_ids_corrupt: state.target_delete_marker_version_ids_corrupt,
     }
 }
+
+// Reconciliation tests for the deliberately duplicated wire types.
+//
+// `rustfs-filemeta` (xl.meta disk format) and `rustfs-replication` (MRF/resync
+// persistence format) each own a copy of `ReplicationStatusType`,
+// `VersionPurgeStatusType` and `ReplicationState`; the conversions above hop
+// between them via `as_str()`, whose `From<&str>` impls fall back to `Empty`
+// on any unknown token. That fallback silently degrades data the moment one
+// side gains a variant the other lacks, so these tests pin the two sides
+// together:
+//
+// - the `match` statements are exhaustive with no `_` arm — adding a variant
+//   on either side fails compilation here until the mapping is reconsidered;
+// - the round-trips assert the string token survives both directions — a
+//   variant whose token the other side does not recognize fails the assert
+//   instead of quietly becoming `Empty`.
+//
+// Struct-shaped drift on `ReplicationState` is already compile-guarded by the
+// exhaustive struct literals in the two conversion functions above; the
+// round-trip test below additionally pins value fidelity for every field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn replication_status_variants_round_trip_across_boundary() {
+        use rustfs_replication::ReplicationStatusType as Repl;
+
+        let all = [
+            Repl::Pending,
+            Repl::Completed,
+            Repl::CompletedLegacy,
+            Repl::Failed,
+            Repl::Replica,
+            Repl::Empty,
+        ];
+        for status in all {
+            // Exhaustive on the replication side: a new variant breaks this match.
+            match status {
+                Repl::Pending | Repl::Completed | Repl::CompletedLegacy | Repl::Failed | Repl::Replica | Repl::Empty => {}
+            }
+            let filemeta = replication_status_to_filemeta(status.clone());
+            assert_eq!(
+                filemeta.as_str(),
+                status.as_str(),
+                "replication->filemeta conversion must not degrade {status:?} (unknown tokens fall back to Empty)"
+            );
+            assert_eq!(replication_status_from_filemeta(filemeta), status);
+        }
+
+        // Exhaustive on the filemeta side: a new variant breaks this match.
+        fn _filemeta_side_is_covered(status: rustfs_filemeta::ReplicationStatusType) {
+            use rustfs_filemeta::ReplicationStatusType as Meta;
+            match status {
+                Meta::Pending | Meta::Completed | Meta::CompletedLegacy | Meta::Failed | Meta::Replica | Meta::Empty => {}
+            }
+        }
+    }
+
+    #[test]
+    fn version_purge_status_variants_round_trip_across_boundary() {
+        use rustfs_replication::VersionPurgeStatusType as Repl;
+
+        let all = [Repl::Pending, Repl::Complete, Repl::Failed, Repl::Empty];
+        for status in all {
+            // Exhaustive on the replication side: a new variant breaks this match.
+            match status {
+                Repl::Pending | Repl::Complete | Repl::Failed | Repl::Empty => {}
+            }
+            let filemeta = version_purge_status_to_filemeta(status.clone());
+            assert_eq!(
+                filemeta.as_str(),
+                status.as_str(),
+                "replication->filemeta conversion must not degrade {status:?} (unknown tokens fall back to Empty)"
+            );
+            assert_eq!(version_purge_status_from_filemeta(filemeta), status);
+        }
+
+        // Exhaustive on the filemeta side: a new variant breaks this match.
+        fn _filemeta_side_is_covered(status: rustfs_filemeta::VersionPurgeStatusType) {
+            use rustfs_filemeta::VersionPurgeStatusType as Meta;
+            match status {
+                Meta::Pending | Meta::Complete | Meta::Failed | Meta::Empty => {}
+            }
+        }
+    }
+
+    #[test]
+    fn replication_state_round_trips_every_field_across_boundary() {
+        let timestamp = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let state = ReplicationState {
+            replica_timestamp: Some(timestamp),
+            replica_status: ReplicationStatusType::Replica,
+            delete_marker: true,
+            replication_timestamp: Some(timestamp),
+            replication_status_internal: Some("arn:a=PENDING;".to_string()),
+            version_purge_status_internal: Some("arn:a=FAILED;".to_string()),
+            replicate_decision_str: "arn:a=true;false;;".to_string(),
+            targets: HashMap::from([
+                ("arn:a".to_string(), ReplicationStatusType::Completed),
+                ("arn:b".to_string(), ReplicationStatusType::Failed),
+            ]),
+            purge_targets: HashMap::from([("arn:a".to_string(), VersionPurgeStatusType::Pending)]),
+            reset_statuses_map: HashMap::from([("reset-arn:a".to_string(), "reset-id;ts".to_string())]),
+            target_delete_marker_version_ids: HashMap::from([("arn:a".to_string(), "version-1".to_string())]),
+            target_delete_marker_version_ids_corrupt: true,
+        };
+
+        let round_tripped = replication_state_from_filemeta(&replication_state_to_filemeta(&state));
+        assert_eq!(round_tripped, state);
+    }
+}

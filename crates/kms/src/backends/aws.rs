@@ -585,13 +585,16 @@ impl KmsBackend for AwsKmsBackend {
         // AWS rejects a `Limit` of zero, and clamping it up to one would return
         // a key to a caller that asked for none; the empty page is answered
         // here instead.
-        if list_keys_page_size(request.limit).is_none() {
+        let Some(page_size) = list_keys_page_size(request.limit) else {
             return Ok(empty_key_page());
-        }
+        };
 
+        // Taking the remote page size from the shared resolver keeps the AWS
+        // request under the same ceiling every other backend obeys; the AWS API
+        // maximum is the same 1000, so this never widens the remote page.
         let limit = request
             .limit
-            .map(|limit| i32::try_from(limit).unwrap_or(i32::MAX).clamp(1, 1000));
+            .map(|_| i32::try_from(page_size).unwrap_or(i32::MAX).clamp(1, 1000));
         let marker = request.marker.clone();
 
         let output = self
@@ -617,7 +620,17 @@ impl KmsBackend for AwsKmsBackend {
             let Some(key_id) = entry.key_id() else {
                 continue;
             };
-            let metadata = self.describe(key_id).await?;
+            let metadata = match self.describe(key_id).await {
+                Ok(metadata) => metadata,
+                // AWS `ListKeys` is eventually consistent, so a key destroyed
+                // between the listing and the describe is routine: it is
+                // dropped and the remote cursor still advances past it. There
+                // is no local record to be damaged here — key state lives in
+                // AWS — so `unreadable_key_ids` stays empty on this backend and
+                // every other failure fails the listing.
+                Err(KmsError::KeyNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
             if request
                 .usage_filter
                 .as_ref()
@@ -642,6 +655,8 @@ impl KmsBackend for AwsKmsBackend {
                 created_at: metadata.creation_date,
                 rotated_at: None,
                 created_by: None,
+                rotation_due: false,
+                rotation_due_reason: None,
             });
         }
 
@@ -649,6 +664,8 @@ impl KmsBackend for AwsKmsBackend {
             keys,
             next_marker: output.next_marker.clone(),
             truncated: output.truncated,
+            // AWS owns key state; nothing here can be present-but-unreadable.
+            unreadable_key_ids: Vec::new(),
         })
     }
 

@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestEnvironment, admin_ok, init_logging};
-use aws_sdk_sts::config::retry::RetryConfig;
-use aws_sdk_sts::config::{Credentials, Region};
+use crate::common::{RustFSTestEnvironment, admin_ok, build_test_s3_config, build_test_sts_client, init_logging};
+use aws_sdk_sts::Client;
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use aws_sdk_sts::operation::RequestId;
-use aws_sdk_sts::{Client, Config};
-use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{Request, Response};
@@ -32,9 +29,8 @@ use serial_test::serial;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
-use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
 
@@ -43,22 +39,7 @@ type TestResult = Result<(), BoxError>;
 const OPA_AUTH_TOKEN: &str = "sts-opa-token";
 
 fn sts_client(url: &str, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Client {
-    let mut config = Config::builder()
-        .credentials_provider(Credentials::new(
-            access_key,
-            secret_key,
-            session_token.map(str::to_owned),
-            None,
-            "e2e-sts-query-compat",
-        ))
-        .region(Region::new("us-east-1"))
-        .endpoint_url(url)
-        .retry_config(RetryConfig::standard().with_max_attempts(1))
-        .behavior_version_latest();
-    if url.starts_with("http://") {
-        config = config.http_client(SmithyHttpClientBuilder::new().build_http());
-    }
-    Client::from_conf(config.build())
+    build_test_sts_client(url, access_key, secret_key, session_token, "e2e-sts-query-compat")
 }
 
 async fn create_root_service_account(env: &RustFSTestEnvironment) -> Result<(String, String), BoxError> {
@@ -145,6 +126,52 @@ async fn assert_access_denied(client: &Client, context: &str) -> TestResult {
     Ok(())
 }
 
+async fn assert_list_buckets_access_denied(
+    env: &RustFSTestEnvironment,
+    access_key: &str,
+    secret_key: &str,
+    context: &str,
+) -> TestResult {
+    let error = aws_sdk_s3::Client::from_conf(build_test_s3_config(
+        &env.url,
+        access_key,
+        secret_key,
+        None,
+        "e2e-list-buckets-opa-unavailable",
+    ))
+    .list_buckets()
+    .send()
+    .await
+    .expect_err("ListBuckets must be denied while OPA is unavailable");
+    let service_error = error
+        .as_service_error()
+        .ok_or_else(|| format!("{context} should deserialize as an S3 service error: {error:?}"))?;
+
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(403));
+    assert_eq!(service_error.code(), Some("AccessDenied"));
+    Ok(())
+}
+
+async fn assert_opa_unavailable_denies_sts_and_list_buckets(env: &RustFSTestEnvironment, context: &str) -> TestResult {
+    let user = "opaunavailable";
+    let secret = "stsOpaUnavailableSecret123";
+    create_user_with_policy(
+        env,
+        user,
+        secret,
+        "sts-opa-unavailable-local-policy",
+        serde_json::json!([{
+            "Effect": "Allow",
+            "Action": ["s3:ListAllMyBuckets"],
+            "Resource": ["arn:aws:s3:::*"],
+        }]),
+    )
+    .await?;
+
+    assert_access_denied(&sts_client(&env.url, user, secret, None), context).await?;
+    assert_list_buckets_access_denied(env, user, secret, context).await
+}
+
 async fn handle_opa_request(
     request: Request<Incoming>,
     requests: mpsc::UnboundedSender<Value>,
@@ -186,12 +213,15 @@ async fn handle_opa_request(
     };
     if payload.is_none() {
         let _ = validation_started.send(());
-        if let OpaValidationMode::DelayedUnavailable(release) = validation_mode {
-            release.notified().await;
-            return Ok(Response::builder()
-                .status(503)
-                .body(Full::new(Bytes::new()))
-                .expect("static OPA unavailable response must be valid"));
+        match validation_mode {
+            OpaValidationMode::Blocked => std::future::pending::<()>().await,
+            OpaValidationMode::Unavailable => {
+                return Ok(Response::builder()
+                    .status(503)
+                    .body(Full::new(Bytes::new()))
+                    .expect("static OPA unavailable response must be valid"));
+            }
+            OpaValidationMode::Ready => {}
         }
     }
     let allow = match payload.as_ref().and_then(|value| value.pointer("/input/identity/account")) {
@@ -201,6 +231,25 @@ async fn handle_opa_request(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         Some(Value::String(account)) if account == "opadeny" => false,
+        Some(Value::String(account))
+            if account == "opaunavailable" && matches!(validation_mode, OpaValidationMode::Unavailable) =>
+        {
+            true
+        }
+        Some(Value::String(account)) if account == "opalistbuckets" => {
+            let action = payload
+                .as_ref()
+                .and_then(|value| value.pointer("/input/action"))
+                .and_then(Value::as_str);
+            let bucket = payload
+                .as_ref()
+                .and_then(|value| value.pointer("/input/resource/bucket"))
+                .and_then(Value::as_str);
+            matches!(
+                (action, bucket),
+                (Some("s3:ListBucket"), Some("opa-list-visible")) | (Some("s3:GetBucketLocation"), Some("opa-list-location"))
+            )
+        }
         None => true,
         _ => false,
     };
@@ -215,17 +264,17 @@ async fn handle_opa_request(
         .expect("static OPA response must be valid"))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum OpaValidationMode {
     Ready,
-    DelayedUnavailable(Arc<Notify>),
+    Blocked,
+    Unavailable,
 }
 
 struct OpaMock {
     url: String,
     requests: mpsc::UnboundedReceiver<Value>,
     validation_started: mpsc::UnboundedReceiver<()>,
-    validation_release: Option<Arc<Notify>>,
     task: JoinHandle<()>,
 }
 
@@ -234,9 +283,8 @@ impl OpaMock {
         Self::start_with_mode(OpaValidationMode::Ready, Some(OPA_AUTH_TOKEN)).await
     }
 
-    async fn start_delayed_unavailable() -> Result<Self, BoxError> {
-        let release = Arc::new(Notify::new());
-        Self::start_with_mode(OpaValidationMode::DelayedUnavailable(release), None).await
+    async fn start_blocked() -> Result<Self, BoxError> {
+        Self::start_with_mode(OpaValidationMode::Blocked, None).await
     }
 
     async fn start_with_mode(validation_mode: OpaValidationMode, auth_token: Option<&str>) -> Result<Self, BoxError> {
@@ -245,10 +293,6 @@ impl OpaMock {
         let (requests_tx, requests) = mpsc::unbounded_channel();
         let (validation_started_tx, validation_started) = mpsc::unbounded_channel();
         let expected_authorization = auth_token.map(|token| format!("Bearer {token}"));
-        let validation_release = match &validation_mode {
-            OpaValidationMode::Ready => None,
-            OpaValidationMode::DelayedUnavailable(release) => Some(Arc::clone(release)),
-        };
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -257,7 +301,7 @@ impl OpaMock {
                         let Ok((stream, _)) = accepted else { break };
                         let requests = requests_tx.clone();
                         let validation_started = validation_started_tx.clone();
-                        let validation_mode = validation_mode.clone();
+                        let validation_mode = validation_mode;
                         let expected_authorization = expected_authorization.clone();
                         connections.spawn(async move {
                             let handler = service_fn(move |request| {
@@ -265,7 +309,7 @@ impl OpaMock {
                                     request,
                                     requests.clone(),
                                     validation_started.clone(),
-                                    validation_mode.clone(),
+                                    validation_mode,
                                     expected_authorization.clone(),
                                 )
                             });
@@ -282,7 +326,6 @@ impl OpaMock {
             url,
             requests,
             validation_started,
-            validation_release,
             task,
         })
     }
@@ -297,12 +340,6 @@ impl OpaMock {
         timeout(Duration::from_secs(5), self.validation_started.recv())
             .await?
             .ok_or_else(|| "OPA validation channel closed".into())
-    }
-
-    fn release_validation(&self) {
-        if let Some(release) = &self.validation_release {
-            release.notify_one();
-        }
     }
 }
 
@@ -523,35 +560,119 @@ async fn test_sts_assume_role_opa_contract() -> TestResult {
 
 #[tokio::test]
 #[serial]
-async fn test_sts_assume_role_fails_closed_while_opa_is_unavailable() -> TestResult {
+async fn test_list_buckets_opa_contract() -> TestResult {
     init_logging();
 
-    let mut opa = OpaMock::start_delayed_unavailable().await?;
+    let mut opa = OpaMock::start().await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+            ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
+        ],
+    )
+    .await?;
+
+    let admin_client = env.create_s3_client();
+    for bucket in ["opa-list-hidden", "opa-list-location", "opa-list-visible"] {
+        admin_client.create_bucket().bucket(bucket).send().await?;
+    }
+
+    let user = "opalistbuckets";
+    let secret = "opaListBucketsSecret123";
+    create_user(&env, user, secret).await?;
+
+    let output = aws_sdk_s3::Client::from_conf(build_test_s3_config(&env.url, user, secret, None, "e2e-list-buckets-opa"))
+        .list_buckets()
+        .send()
+        .await?;
+    let mut names = output
+        .buckets()
+        .iter()
+        .filter_map(|bucket| bucket.name().map(str::to_owned))
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["opa-list-location", "opa-list-visible"]);
+
+    let mut evaluations = BTreeSet::new();
+    for _ in 0..6 {
+        let request = opa.next_request().await?;
+        assert_eq!(request.pointer("/input/identity/account").and_then(Value::as_str), Some(user));
+        assert_eq!(request.pointer("/input/context/deny_only").and_then(Value::as_bool), Some(false));
+
+        let action = request
+            .pointer("/input/action")
+            .and_then(Value::as_str)
+            .ok_or("OPA ListBuckets input should include action")?;
+        let bucket = request
+            .pointer("/input/resource/bucket")
+            .and_then(Value::as_str)
+            .ok_or("OPA ListBuckets input should include resource.bucket")?;
+        if bucket.is_empty() {
+            assert_eq!(action, "s3:ListAllMyBuckets");
+            assert!(request.pointer("/input/context/conditions/prefix").is_none());
+            assert!(request.pointer("/input/context/conditions/delimiter").is_none());
+        } else {
+            let expected_arn = format!("arn:aws:s3:::{bucket}");
+            assert_eq!(request.pointer("/input/context/conditions/prefix"), Some(&serde_json::json!([""])));
+            assert_eq!(request.pointer("/input/context/conditions/delimiter"), Some(&serde_json::json!(["/"])));
+            assert_eq!(
+                request.pointer("/input/resource/arn").and_then(Value::as_str),
+                Some(expected_arn.as_str())
+            );
+        }
+        evaluations.insert((action.to_owned(), bucket.to_owned()));
+    }
+    assert_eq!(
+        evaluations,
+        BTreeSet::from([
+            ("s3:GetBucketLocation".to_owned(), "opa-list-hidden".to_owned()),
+            ("s3:GetBucketLocation".to_owned(), "opa-list-location".to_owned()),
+            ("s3:ListAllMyBuckets".to_owned(), String::new()),
+            ("s3:ListBucket".to_owned(), "opa-list-hidden".to_owned()),
+            ("s3:ListBucket".to_owned(), "opa-list-location".to_owned()),
+            ("s3:ListBucket".to_owned(), "opa-list-visible".to_owned()),
+        ])
+    );
+    assert!(
+        matches!(opa.requests.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "ListBuckets should not make redundant OPA evaluations"
+    );
+
+    env.stop_server();
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sts_and_list_buckets_fail_closed_while_opa_is_initializing() -> TestResult {
+    init_logging();
+
+    let mut opa = OpaMock::start_blocked().await?;
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str())])
         .await?;
     opa.wait_for_validation().await?;
 
-    let user = "opaunavailable";
-    let secret = "stsOpaUnavailableSecret123";
-    create_user_with_policy(
-        &env,
-        user,
-        secret,
-        "sts-opa-unavailable-local-policy",
-        serde_json::json!([{
-            "Effect": "Allow",
-            "Action": ["s3:ListAllMyBuckets"],
-            "Resource": ["arn:aws:s3:::*"],
-        }]),
-    )
-    .await?;
+    assert_opa_unavailable_denies_sts_and_list_buckets(&env, "configured OPA initialization").await?;
 
-    assert_access_denied(&sts_client(&env.url, user, secret, None), "configured OPA initialization").await?;
+    env.stop_server();
+    Ok(())
+}
 
-    opa.release_validation();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_access_denied(&sts_client(&env.url, user, secret, None), "configured OPA validation failure").await?;
+#[tokio::test]
+#[serial]
+async fn test_sts_and_list_buckets_fail_closed_after_opa_validation_failure() -> TestResult {
+    init_logging();
+
+    let mut opa = OpaMock::start_with_mode(OpaValidationMode::Unavailable, None).await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str())])
+        .await?;
+    opa.wait_for_validation().await?;
+
+    assert_opa_unavailable_denies_sts_and_list_buckets(&env, "configured OPA validation failure").await?;
 
     env.stop_server();
     Ok(())

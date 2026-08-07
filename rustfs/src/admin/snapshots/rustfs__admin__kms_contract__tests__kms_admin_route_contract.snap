@@ -1,0 +1,192 @@
+---
+source: rustfs/src/admin/kms_contract.rs
+expression: kms_route_contract()
+---
+[
+  {
+    "method": "DELETE",
+    "path": "/rustfs/admin/v3/kms/keys/delete",
+    "action": "kms:DeleteKey",
+    "risk": "Critical"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/backup",
+    "action": "kms:Backup",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/config",
+    "action": "kms:Configure",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/describe-key",
+    "action": "kms:DescribeKey",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/key/status",
+    "action": "kms:DescribeKey",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/keys",
+    "action": "kms:ListKeys",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/keys/{key_id}",
+    "action": "kms:DescribeKey",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/list-keys",
+    "action": "kms:ListKeys",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/service-status",
+    "action": "kms:ServiceControl",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
+    "path": "/rustfs/admin/v3/kms/status",
+    "action": "kms:ServiceControl",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/backup",
+    "action": "kms:Backup",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/clear-cache",
+    "action": "kms:ClearCache",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/configure",
+    "action": "kms:Configure",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/create-key",
+    "action": "kms:Configure",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/generate-data-key",
+    "action": "kms:GenerateDataKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/key/create",
+    "action": "kms:Configure",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys",
+    "action": "kms:Configure",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/cancel-deletion",
+    "action": "kms:DeleteKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/disable",
+    "action": "kms:DisableKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/enable",
+    "action": "kms:EnableKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/rotate",
+    "action": "kms:RotateKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/tag",
+    "action": "kms:TagResource",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/untag",
+    "action": "kms:UntagResource",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/update-description",
+    "action": "kms:UpdateKeyDescription",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/reconfigure",
+    "action": "kms:Configure",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/restore",
+    "action": "kms:Restore",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/restore/abort",
+    "action": "kms:Restore",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/restore/dry-run",
+    "action": "kms:Restore",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/start",
+    "action": "kms:ServiceControl",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/status",
+    "action": "kms:ServiceControl",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/stop",
+    "action": "kms:ServiceControl",
+    "risk": "High"
+  }
+]

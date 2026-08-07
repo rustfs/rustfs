@@ -177,10 +177,9 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 ///
 /// The cache retains each nonce for the ~10-minute signature freshness envelope. Once peers use
 /// replay-scoped v3 authentication, every authenticated RPC consumes one entry, so the steady
-/// state holds roughly `authenticated RPC RPS x 601s` entries. The default sustains about 1,700
-/// authenticated RPCs per second (about 120 MiB worst case, allocated only under sustained load);
-/// operators must size it for the node's aggregate peak RPC rate before enabling strict replay
-/// scope. Overflow fails closed — legitimate signed traffic is the only thing that can fill the
+/// state holds roughly `authenticated RPC RPS x 601s` entries. This default is the minimum floor:
+/// explicit operator values and resource-aware auto sizing both clamp upward to at least this
+/// value. Overflow fails closed — legitimate signed traffic is the only thing that can fill the
 /// cache (replays are rejected before insertion, and an attacker cannot mint valid nonces without
 /// the shared secret) — and increments
 /// `rustfs_system_network_internode_replay_cache_overflow_total`, so a sustained non-zero overflow

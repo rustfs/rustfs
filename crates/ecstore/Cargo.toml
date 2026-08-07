@@ -144,6 +144,7 @@ rustfs-lifecycle.workspace = true
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true
+rustfs-object-data-cache = { workspace = true, features = ["runtime-memory"] }
 arc-swap.workspace = true
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }

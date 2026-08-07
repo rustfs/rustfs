@@ -58,6 +58,13 @@ use url::Host;
 
 const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
 
+/// Go encodes the zero `time.Time` as the year-1 instant
+/// (`0001-01-01T00:00:00Z`, possibly re-encoded with an offset); no real
+/// credential expiry lives in year 1, so any such timestamp means "unset".
+fn is_go_zero_time(timestamp: Timestamp) -> bool {
+    timestamp.to_zoned(jiff::tz::TimeZone::UTC).year() == 1
+}
+
 /// Field groups a `set-remote-target?update=true` request may modify, mirroring
 /// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
 /// overlays only the requested groups onto the stored target, so a client can
@@ -214,8 +221,10 @@ struct RemoteTargetRequest {
     last_online: Option<OffsetDateTime>,
     #[serde(rename = "isOnline", default)]
     online: bool,
-    #[serde(default)]
-    latency: LatencyStat,
+    // Accepted so mc's round-tripped runtime latency still deserializes under
+    // deny_unknown_fields, but deliberately unread: it is never persisted.
+    #[serde(rename = "latency", default)]
+    _latency: LatencyStat,
     #[serde(alias = "deploymentID", default)]
     deployment_id: String,
     #[serde(default)]
@@ -283,7 +292,14 @@ impl RemoteTargetRequest {
             ));
         }
 
-        if self.credentials.expiration.is_some() {
+        // Go's `omitempty` never elides a zero `time.Time`, so every madmin
+        // marshal carries `"expiration":"0001-01-01T00:00:00Z"`; only a real
+        // (non-year-1) expiry means the client wants expiring credentials.
+        if self
+            .credentials
+            .expiration
+            .is_some_and(|expiration| !is_go_zero_time(expiration))
+        {
             return Err(s3_error!(
                 InvalidRequest,
                 "remote target field credentials.expiration is not supported by this RustFS version"
@@ -311,10 +327,15 @@ impl RemoteTargetRequest {
             }
         }
 
+        let mut credentials = TargetCredentials::from(self.credentials);
+        // Past the check above the expiration can only be the zero-value
+        // sentinel, i.e. "no expiration" — never persist it.
+        credentials.expiration = None;
+
         Ok(BucketTarget {
             source_bucket: self.source_bucket,
             endpoint: self.endpoint,
-            credentials: Some(self.credentials.into()),
+            credentials: Some(credentials),
             target_bucket: self.target_bucket,
             secure: self.secure,
             path: self.path,
@@ -338,7 +359,11 @@ impl RemoteTargetRequest {
             total_downtime: duration_from_secs_or_nanos(self.total_downtime),
             last_online: self.last_online,
             online: self.online,
-            latency: self.latency,
+            // Latency is a server-measured runtime stat that mc echoes back
+            // from list-remote-targets (Go time.Duration nanoseconds), while
+            // the persisted format is milliseconds — never store the client
+            // value.
+            latency: LatencyStat::default(),
             deployment_id: self.deployment_id,
             edge: self.edge,
             edge_sync_before_expiry: self.edge_sync_before_expiry,
@@ -348,9 +373,10 @@ impl RemoteTargetRequest {
 }
 
 /// Admin-response encoding of a remote target: the persisted bucket-targets
-/// format keeps `healthCheckDuration`/`totalDowntime` in seconds, but madmin
-/// decodes them as Go `time.Duration` (nanoseconds) — re-encode just those
-/// fields without touching the persistence wire format.
+/// format keeps `healthCheckDuration`/`totalDowntime` in seconds and the
+/// `latency` stats in milliseconds, but madmin decodes all of them as Go
+/// `time.Duration` (nanoseconds) — re-encode just those fields without
+/// touching the persistence wire format.
 fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, serde_json::Error> {
     fn go_duration_nanos(duration: Duration) -> serde_json::Value {
         // Saturate instead of truncating: >u64::MAX nanoseconds (~584 years)
@@ -361,6 +387,11 @@ fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, 
     let mut value = serde_json::to_value(target)?;
     value["healthCheckDuration"] = go_duration_nanos(target.health_check_duration);
     value["totalDowntime"] = go_duration_nanos(target.total_downtime);
+    value["latency"] = serde_json::json!({
+        "curr": go_duration_nanos(target.latency.curr),
+        "avg": go_duration_nanos(target.latency.avg),
+        "max": go_duration_nanos(target.latency.max),
+    });
     Ok(value)
 }
 
@@ -855,30 +886,37 @@ const REPLICATION_DIFF_MAX_SCAN: usize = 10_000;
 const REPLICATION_DIFF_PAGE_SIZE: i32 = 1_000;
 
 /// A single object version whose replication is not yet complete, reported by
-/// `POST /v3/replication/diff`. Field names mirror MinIO's `madmin.DiffInfo`
-/// so MinIO-compatible admin clients can parse the response.
+/// `POST /v3/replication/diff`. Field names are the exact json tags of
+/// madmin-go `DiffInfo` (replication-api.go), which `mc replicate diff`
+/// decodes one JSON document at a time from the response body. `Size` is a
+/// RustFS extension key with no madmin counterpart; Go decoders ignore
+/// unknown keys.
 #[derive(Debug, Serialize)]
 struct ReplicationDiffEntry {
-    #[serde(rename = "Object")]
+    #[serde(rename = "object")]
     object: String,
-    #[serde(rename = "VersionID", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "versionId", skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
     #[serde(rename = "Size")]
     size: i64,
-    #[serde(rename = "IsDeleteMarker")]
+    #[serde(rename = "deletemarker")]
     is_delete_marker: bool,
-    #[serde(rename = "ReplicationStatus")]
+    #[serde(rename = "rStatus")]
     replication_status: String,
-    #[serde(rename = "LastModified", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
     last_modified: Option<String>,
 }
 
-/// Response body for `POST /v3/replication/diff`.
+/// Aggregate response body for `POST /v3/replication/diff?aggregate=true`.
 ///
-/// `entries` lists object versions with a `PENDING` or `FAILED` replication
-/// status. `is_truncated` indicates the on-demand scan hit
-/// [`REPLICATION_DIFF_MAX_SCAN`] before reaching the end of the bucket, so the
-/// diff is partial and should be re-run with a narrower prefix.
+/// This shell is a deliberate RustFS extension: madmin streams bare
+/// `DiffInfo` documents with no envelope (see [`render_replication_diff`]),
+/// so the scan-coverage metadata (`is_truncated`, `scanned_versions`) is only
+/// representable in this opt-in aggregate shape. `entries` lists object
+/// versions with a `PENDING` or `FAILED` replication status. `is_truncated`
+/// indicates the on-demand scan hit [`REPLICATION_DIFF_MAX_SCAN`] before
+/// reaching the end of the bucket, so the diff is partial and should be
+/// re-run with a narrower prefix.
 #[derive(Debug, Serialize)]
 struct ReplicationDiffResponse {
     #[serde(rename = "Entries")]
@@ -887,6 +925,39 @@ struct ReplicationDiffResponse {
     is_truncated: bool,
     #[serde(rename = "ScannedVersions")]
     scanned_versions: usize,
+}
+
+/// Render the diff scan result as a response body.
+///
+/// Default (madmin-compatible) mode emits one `DiffInfo` JSON document per
+/// line with no envelope — madmin's `BucketReplicationDiff` reads the body
+/// with a `json.Decoder` loop, so any envelope object would decode as a
+/// single entry with an empty `object` (a phantom row in `mc replicate
+/// diff`). Scan-truncation info is not representable in that stream and is
+/// reported via the tracing event in the handler instead.
+///
+/// `aggregate=true` (RustFS extension) keeps the enveloped shape including
+/// `IsTruncated`/`ScannedVersions`.
+fn render_replication_diff(
+    entries: Vec<ReplicationDiffEntry>,
+    is_truncated: bool,
+    scanned_versions: usize,
+    aggregate: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    if aggregate {
+        return serde_json::to_vec(&ReplicationDiffResponse {
+            entries,
+            is_truncated,
+            scanned_versions,
+        });
+    }
+
+    let mut data = Vec::new();
+    for entry in &entries {
+        serde_json::to_writer(&mut data, entry)?;
+        data.push(b'\n');
+    }
+    Ok(data)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1005,16 +1076,31 @@ impl Operation for ReplicationDiffHandler {
             truncated = is_truncated,
             "computed replication diff"
         );
+        let aggregate = queries.get("aggregate").map(String::as_str) == Some("true");
+        if is_truncated && !aggregate {
+            // The madmin stream has no envelope to carry truncation info, so
+            // surface the partial-scan condition here instead.
+            tracing::warn!(
+                bucket = %bucket,
+                prefix = %prefix,
+                scanned = scanned_versions,
+                max_scan = REPLICATION_DIFF_MAX_SCAN,
+                "replication diff scan truncated; stream response is partial — re-run with a narrower prefix or use aggregate=true"
+            );
+        }
 
-        let response = ReplicationDiffResponse {
-            entries,
-            is_truncated,
-            scanned_versions,
-        };
-        let data = serde_json::to_vec(&response)
+        let data = render_replication_diff(entries, is_truncated, scanned_versions, aggregate)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // The madmin stream has no envelope to carry truncation info; a
+        // truncated scan would otherwise be indistinguishable from a complete
+        // one (an empty diff on a >MAX_SCAN bucket reads as "healthy"). Signal
+        // it out-of-band so RustFS-aware clients can detect the partial scan;
+        // madmin/mc ignore unknown headers.
+        if is_truncated {
+            headers.insert("x-rustfs-replication-diff-truncated", HeaderValue::from_static("true"));
+        }
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
@@ -1216,10 +1302,10 @@ impl Operation for ReplicationMrfHandler {
 mod tests {
     use super::{
         REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
-        SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops,
-        unique_replication_peers, validate_remote_target_tls_settings,
+        ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
+        parse_remote_target_update_ops, render_replication_diff, unique_replication_peers, validate_remote_target_tls_settings,
     };
-    use crate::admin::storage_api::bucket::target::BucketTarget;
+    use crate::admin::storage_api::bucket::target::{BucketTarget, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
     use http::Uri;
 
@@ -1235,6 +1321,26 @@ mod tests {
             "type": "replication"
         })
     }
+
+    /// Verbatim `encoding/json` marshal of the madmin-go v3.0.109 `BucketTarget`
+    /// that `mc replicate add` builds (path=auto, api=s3v4, 60s healthcheck).
+    /// Field presence follows Go `omitempty` semantics against the v3.0.109 tags:
+    /// zero strings (`sessionToken`, `arn`, `region`, `storageclass`, `resetID`,
+    /// `deploymentID`) and the zero `bandwidthlimit` int are elided; untagged
+    /// fields (`sourcebucket`, `secure`, `type`, `replicationSync`,
+    /// `disableProxy`, `totalDowntime`, `lastOnline`, `isOnline`, `latency`,
+    /// `edge`, `edgeSyncBeforeExpiry`, `offlineCount`) always appear; and
+    /// `omitempty` never elides a struct, so the zero `time.Time` fields
+    /// (`credentials.expiration`, `resetBeforeDate`) still appear as
+    /// `0001-01-01T00:00:00Z`.
+    const MADMIN_REPLICATE_ADD_BODY: &str = r#"{"sourcebucket":"","endpoint":"192.168.1.10:9000","credentials":{"accessKey":"access","secretKey":"secret","expiration":"0001-01-01T00:00:00Z"},"targetbucket":"target","secure":false,"path":"auto","api":"s3v4","type":"replication","replicationSync":false,"healthCheckDuration":60000000000,"disableProxy":false,"resetBeforeDate":"0001-01-01T00:00:00Z","totalDowntime":0,"lastOnline":"0001-01-01T00:00:00Z","isOnline":false,"latency":{"curr":0,"avg":0,"max":0},"edge":false,"edgeSyncBeforeExpiry":false,"offlineCount":0}"#;
+
+    /// Verbatim marshal of the same target after `mc replicate update --sync`:
+    /// mc lists remote targets (latency reported in Go `time.Duration`
+    /// nanoseconds), `BucketTarget::Clone()` strips only the secret key, and the
+    /// mutated clone round-trips every other stored field — including the
+    /// nanosecond latency echo — back to set-remote-target.
+    const MADMIN_REPLICATE_UPDATE_BODY: &str = r#"{"sourcebucket":"src","endpoint":"192.168.1.10:9000","credentials":{"accessKey":"access","expiration":"0001-01-01T00:00:00Z"},"targetbucket":"target","secure":false,"path":"auto","api":"s3v4","arn":"arn:rustfs:replication:us-east-1:dep:target","type":"replication","replicationSync":true,"healthCheckDuration":60000000000,"disableProxy":false,"resetBeforeDate":"0001-01-01T00:00:00Z","totalDowntime":0,"lastOnline":"0001-01-01T00:00:00Z","isOnline":true,"latency":{"curr":60000000000,"avg":45000000000,"max":90000000000},"edge":false,"edgeSyncBeforeExpiry":false,"offlineCount":0}"#;
 
     fn query_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -1669,6 +1775,78 @@ mod tests {
     }
 
     #[test]
+    fn remote_target_request_accepts_real_madmin_add_marshal() {
+        let request: RemoteTargetRequest =
+            serde_json::from_str(MADMIN_REPLICATE_ADD_BODY).expect("real mc replicate add body should deserialize");
+        let target = request
+            .into_bucket_target()
+            .expect("real mc replicate add body must be accepted");
+
+        assert_eq!(target.endpoint, "192.168.1.10:9000");
+        assert_eq!(target.target_bucket, "target");
+        assert_eq!(target.health_check_duration, std::time::Duration::from_secs(60));
+        let credentials = target.credentials.expect("credentials should be present");
+        assert_eq!(credentials.access_key, "access");
+        assert_eq!(credentials.secret_key, "secret");
+        assert!(
+            credentials.expiration.is_none(),
+            "Go zero-value expiration is an unset sentinel and must not be persisted"
+        );
+    }
+
+    #[test]
+    fn remote_target_request_accepts_go_zero_time_expiration_offset_forms() {
+        // Go marshals the zero time.Time as 0001-01-01T00:00:00Z, but a body
+        // that re-encoded the same instant with an offset is equally "unset".
+        for expiration in ["0001-01-01T00:00:00Z", "0001-01-01T08:00:00+08:00"] {
+            let mut request = valid_remote_target_request();
+            request["credentials"]["expiration"] = serde_json::json!(expiration);
+            let request: RemoteTargetRequest = serde_json::from_value(request).expect("request should deserialize");
+            request
+                .into_bucket_target()
+                .unwrap_or_else(|err| panic!("zero-value expiration {expiration} must be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn remote_target_update_accepts_madmin_clone_round_trip() {
+        let request: RemoteTargetRequest =
+            serde_json::from_str(MADMIN_REPLICATE_UPDATE_BODY).expect("mc replicate update body should deserialize");
+        let target = request
+            .into_update_bucket_target(&[TargetUpdateOp::Sync])
+            .expect("mc replicate update round-trip body must be accepted");
+
+        assert!(target.replication_sync);
+        assert_eq!(
+            target.latency.curr,
+            std::time::Duration::ZERO,
+            "nanosecond latency echoed back by mc must not be persisted as milliseconds"
+        );
+    }
+
+    #[test]
+    fn remote_target_request_ignores_client_supplied_latency() {
+        // Latency is a server-measured runtime stat; mc echoes the
+        // list-remote-targets nanosecond values back on update, while the
+        // request parser historically read them as milliseconds (1e6 blow-up).
+        let mut request = valid_remote_target_request();
+        request["latency"] = serde_json::json!({
+            "curr": 60_000_000_000u64,
+            "avg": 45_000_000_000u64,
+            "max": 90_000_000_000u64
+        });
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect("request should pass semantic validation");
+
+        assert_eq!(target.latency.curr, std::time::Duration::ZERO);
+        assert_eq!(target.latency.avg, std::time::Duration::ZERO);
+        assert_eq!(target.latency.max, std::time::Duration::ZERO);
+    }
+
+    #[test]
     fn remote_target_request_accepts_static_credentials_and_supported_api() {
         let mut request = valid_remote_target_request();
         request["api"] = serde_json::json!("s3v4");
@@ -1748,6 +1926,11 @@ mod tests {
             target_bucket: "target".to_string(),
             health_check_duration: std::time::Duration::from_secs(60),
             total_downtime: std::time::Duration::from_secs(90),
+            latency: LatencyStat {
+                curr: std::time::Duration::from_millis(12),
+                avg: std::time::Duration::from_millis(34),
+                max: std::time::Duration::from_millis(250),
+            },
             ..Default::default()
         };
 
@@ -1755,10 +1938,43 @@ mod tests {
 
         assert_eq!(value["healthCheckDuration"], 60_000_000_000u64);
         assert_eq!(value["totalDowntime"], 90_000_000_000u64);
-        // Persistence keeps seconds: the response path must not leak into it.
+        assert_eq!(value["latency"]["curr"], 12_000_000u64);
+        assert_eq!(value["latency"]["avg"], 34_000_000u64);
+        assert_eq!(value["latency"]["max"], 250_000_000u64);
+        // Persistence keeps seconds/milliseconds: the response path must not
+        // leak into it.
         let persisted = serde_json::to_value(&target).expect("persisted form should serialize");
         assert_eq!(persisted["healthCheckDuration"], 60);
         assert_eq!(persisted["totalDowntime"], 90);
+        assert_eq!(persisted["latency"]["curr"], 12);
+        assert_eq!(persisted["latency"]["avg"], 34);
+        assert_eq!(persisted["latency"]["max"], 250);
+    }
+
+    #[test]
+    fn remote_target_admin_json_latency_round_trips_through_go_duration() {
+        // Round trip: a madmin reader decodes the latency values as Go
+        // time.Duration nanoseconds — decoding must recover the exact
+        // durations the server reported.
+        let target = BucketTarget {
+            latency: LatencyStat {
+                curr: std::time::Duration::from_micros(1_500),
+                avg: std::time::Duration::from_millis(87),
+                max: std::time::Duration::from_secs(2),
+            },
+            ..Default::default()
+        };
+
+        let value = super::remote_target_admin_json(&target).expect("admin response should serialize");
+
+        for (field, expected) in [
+            ("curr", target.latency.curr),
+            ("avg", target.latency.avg),
+            ("max", target.latency.max),
+        ] {
+            let nanos = value["latency"][field].as_u64().expect("latency field must be a u64");
+            assert_eq!(std::time::Duration::from_nanos(nanos), expected, "latency.{field} must round-trip");
+        }
     }
 
     #[test]
@@ -1788,5 +2004,72 @@ mod tests {
         assert_eq!(target.target_bucket, "target");
         assert!(target.secure);
         assert_eq!(target.credentials.expect("credentials should be present").access_key, "access");
+    }
+
+    fn sample_diff_entries() -> Vec<ReplicationDiffEntry> {
+        vec![
+            ReplicationDiffEntry {
+                object: "a.txt".to_string(),
+                version_id: Some("v1".to_string()),
+                size: 42,
+                is_delete_marker: false,
+                replication_status: "PENDING".to_string(),
+                last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            ReplicationDiffEntry {
+                object: "b.txt".to_string(),
+                version_id: None,
+                size: 0,
+                is_delete_marker: true,
+                replication_status: "FAILED".to_string(),
+                last_modified: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn replication_diff_stream_emits_bare_madmin_diff_info_documents() {
+        let data = render_replication_diff(sample_diff_entries(), true, 2, false).expect("stream must render");
+        let text = std::str::from_utf8(&data).expect("stream must be utf-8");
+
+        // madmin decodes the body with a json.Decoder loop over DiffInfo — one
+        // bare document per entry, no envelope keys anywhere in the stream.
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line must be a JSON document"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["object"], "a.txt");
+        assert_eq!(lines[0]["versionId"], "v1");
+        assert_eq!(lines[0]["rStatus"], "PENDING");
+        assert_eq!(lines[0]["deletemarker"], false);
+        assert_eq!(lines[0]["lastModified"], "2026-01-01T00:00:00Z");
+        assert_eq!(lines[1]["object"], "b.txt");
+        assert_eq!(lines[1]["deletemarker"], true);
+        assert_eq!(lines[1]["rStatus"], "FAILED");
+        for line in &lines {
+            assert!(line.get("Entries").is_none());
+            assert!(line.get("IsTruncated").is_none());
+            assert!(line.get("ScannedVersions").is_none());
+        }
+    }
+
+    #[test]
+    fn replication_diff_stream_renders_empty_body_for_no_entries() {
+        let data = render_replication_diff(Vec::new(), false, 0, false).expect("stream must render");
+        // An empty body makes madmin's json.Decoder loop end immediately with
+        // io.EOF — zero rows, not one phantom empty row.
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn replication_diff_aggregate_keeps_enveloped_extension_shape() {
+        let data = render_replication_diff(sample_diff_entries(), true, 7, true).expect("aggregate must render");
+        let payload: serde_json::Value = serde_json::from_slice(&data).expect("aggregate must be one JSON object");
+
+        assert_eq!(payload["Entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["Entries"][0]["object"], "a.txt");
+        assert_eq!(payload["IsTruncated"], true);
+        assert_eq!(payload["ScannedVersions"], 7);
     }
 }

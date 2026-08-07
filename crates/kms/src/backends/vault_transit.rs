@@ -14,13 +14,15 @@
 
 //! Vault Transit-based KMS backend.
 
+use crate::backends::vault::map_key_record_read_error;
 use crate::backends::vault_credentials::{
     CredentialTaskHandle, VaultClientHandle, VaultConnectionSettings, VaultCredentialPolicy, VaultCredentialProvider,
     token_source_for,
 };
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
-    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
+    classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_rewrap_context_matches,
+    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
 };
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
@@ -37,7 +39,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info, warn};
 use vaultrs::{
     api::kv2::requests::SetSecretRequestOptions,
     api::transit::{
@@ -434,8 +436,13 @@ impl VaultTransitKmsClient {
                 Ok(persisted) => Ok(Some(persisted.into())),
                 Err(vaultrs::error::ClientError::ResponseWrapError)
                 | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(None),
+                // A metadata record that is present but undecodable is a
+                // property of this one key, so it is reported as such rather
+                // than as a backend outage: otherwise a single record written
+                // by a newer build fails every listing on the node, and with it
+                // every scheduled deletion.
                 Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                    KmsError::backend_error(format!("Failed to read transit key metadata from Vault KV: {e}"))
+                    map_key_record_read_error(key_id, "transit key metadata", e)
                 })),
             }
         })
@@ -697,6 +704,8 @@ impl VaultTransitKmsClient {
             created_at: metadata.created_at,
             rotated_at: None,
             created_by: metadata.created_by,
+            rotation_due: false,
+            rotation_due_reason: None,
         })
     }
 
@@ -1073,8 +1082,26 @@ impl VaultTransitKmsClient {
         // Reading metadata only for the page keeps a list bounded by the
         // requested limit instead of by the size of the transit mount.
         let mut keys = Vec::with_capacity(page.items.len());
+        let mut unreadable = UnreadableKeys::default();
         for key_id in page.items {
-            let key_info = self.key_info(key_id).await?;
+            let key_info = match self.key_info(key_id).await {
+                Ok(key_info) => {
+                    unreadable.saw_readable();
+                    key_info
+                }
+                Err(error) => match classify_listed_key_failure(&error) {
+                    Some(ListedKeyFailure::Vanished) => {
+                        debug!(key_id, "skipping key removed while listing");
+                        continue;
+                    }
+                    Some(ListedKeyFailure::Unreadable) => {
+                        warn!(key_id, %error, "listing a transit key this build cannot describe");
+                        unreadable.record(key_id, error);
+                        continue;
+                    }
+                    None => return Err(error),
+                },
+            };
             let usage_matches = request.usage_filter.as_ref().is_none_or(|usage| usage == &key_info.usage);
             let status_matches = request.status_filter.as_ref().is_none_or(|status| status == &key_info.status);
             if usage_matches && status_matches {
@@ -1086,6 +1113,7 @@ impl VaultTransitKmsClient {
             keys,
             next_marker: page.next_marker,
             truncated: page.truncated,
+            unreadable_key_ids: unreadable.into_reported_ids(!page.truncated && started_at_the_first_key(request))?,
         })
     }
 
@@ -1662,6 +1690,86 @@ mod tests {
             imported: Some(false),
         };
         serde_json::to_value(&response).expect("serialize transit key read response")
+    }
+
+    /// A listing must not silently shrink when the backend is the problem.
+    ///
+    /// Before the per-key classification this path used `?`, so any describe
+    /// failure failed the page; the risk introduced by classifying is the
+    /// opposite one — quietly dropping a key on an error that says nothing
+    /// about it. A transit mount that stops answering must still fail loudly.
+    #[tokio::test]
+    async fn list_fails_when_a_transit_key_read_is_unavailable() {
+        let mut responses = vec![ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a"] }))];
+        for _ in 0..3 {
+            responses.push(ScriptedResponse::error(503, "temporarily unavailable"));
+        }
+        let (_vault, client) = scripted_client(responses).await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("an unreachable transit mount must fail the listing, not empty it");
+        assert!(
+            matches!(error, KmsError::BackendError { .. }),
+            "a transient backend failure must not be reported as a damaged key: {error:?}"
+        );
+    }
+
+    /// A transit key whose persisted metadata record cannot be decoded is
+    /// reported per key, not as a backend outage.
+    ///
+    /// The metadata record lives in KV2 exactly like a KV2 key record, so it has
+    /// the same failure mode: without this classification one record written by
+    /// a newer build fails every listing on the node, and the deletion sweep —
+    /// which aborts on a listing error — stops destroying every other expired
+    /// key for as long as that record is there.
+    #[tokio::test]
+    async fn list_reports_an_undecodable_metadata_record_per_key() {
+        let (_vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] })),
+            ScriptedResponse::ok(transit_key_read_data("key-a")),
+            ScriptedResponse::ok(metadata_read_data(&TransitKeyMetadata::from_create_request(
+                &CreateKeyRequest::default(),
+            ))),
+            ScriptedResponse::ok(transit_key_read_data("key-b")),
+            // `key_usage` is an enum; a number cannot be decoded into it.
+            ScriptedResponse::ok(serde_json::json!({
+                "data": { "key_usage": 42 },
+                "metadata": { "created_time": "2026-01-01T00:00:00Z", "deletion_time": "", "custom_metadata": null, "destroyed": false, "version": 1 },
+            })),
+        ])
+        .await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("one undecodable metadata record must not fail the whole listing");
+        assert_eq!(response.keys.len(), 1, "the readable key must still be listed");
+        assert_eq!(response.unreadable_key_ids, vec!["key-b".to_string()]);
+    }
+
+    /// A key destroyed between the listing and the read is dropped, and the
+    /// listing still succeeds — the cursor comes from the identifier list, so
+    /// it advances past the gap on its own.
+    #[tokio::test]
+    async fn list_drops_a_key_that_vanished_between_the_scan_and_the_read() {
+        let (_vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a"] })),
+            ScriptedResponse::error(404, "no handler for route"),
+        ])
+        .await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("a key removed mid-listing must not fail the page");
+        assert!(response.keys.is_empty());
+        assert!(
+            response.unreadable_key_ids.is_empty(),
+            "a concurrent deletion is not damage: {:?}",
+            response.unreadable_key_ids
+        );
     }
 
     /// A caller asking for no keys gets an empty page, and the page arithmetic

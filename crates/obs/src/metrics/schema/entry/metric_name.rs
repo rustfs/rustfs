@@ -233,6 +233,7 @@ pub enum MetricName {
     UsageVersionsCount,
     UsageDeleteMarkersCount,
     UsageBucketsCount,
+    UsageSnapshotConverged,
     UsageSizeDistribution,
     UsageVersionCountDistribution,
 
@@ -642,6 +643,7 @@ impl MetricName {
             Self::UsageVersionsCount => "versions_count".to_string(),
             Self::UsageDeleteMarkersCount => "delete_markers_count".to_string(),
             Self::UsageBucketsCount => "buckets_count".to_string(),
+            Self::UsageSnapshotConverged => "snapshot_converged".to_string(),
             Self::UsageSizeDistribution => "size_distribution".to_string(),
             Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
 

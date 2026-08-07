@@ -19,8 +19,9 @@ use crate::backends::vault_credentials::{
     token_source_for,
 };
 use crate::backends::{
-    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, StateGatedOperation, empty_key_page, ensure_key_state_permits,
-    ensure_key_status_permits, ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
+    BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
+    classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_key_status_permits,
+    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
@@ -183,6 +184,42 @@ fn is_cas_conflict(error: &ClientError) -> bool {
         error,
         ClientError::APIError { code: 400, errors } if errors.iter().any(|message| message.contains("check-and-set"))
     )
+}
+
+/// Map a KV2 record read failure onto the typed error surface.
+///
+/// The three record-level outcomes are told apart from a backend outcome here,
+/// at the only place that knows a per-key record was being read: a 404 or a wrap
+/// failure is a key that is not there, an unparseable body is a record that is
+/// there and cannot be interpreted, and an empty `data` field is a record whose
+/// contents are gone. Folding the last two into a generic backend error made a
+/// damaged record indistinguishable from a Vault outage, which is exactly the
+/// distinction the fail-closed material rules and the listing contract turn on.
+///
+/// `record` names what was being read (`"key record"`, `"transit key
+/// metadata"`) and only reaches error text, never a metric label. Shared with
+/// the Transit backend, whose per-key metadata records live in KV2 too and
+/// otherwise had no way to be reported as damaged rather than as an outage.
+pub(super) fn map_key_record_read_error(key_id: &str, record: &str, error: ClientError) -> KmsError {
+    match error {
+        ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+        // Only the position and category of the parse failure are reported.
+        // serde's own message embeds the offending scalar ("invalid type:
+        // string \"…\", expected u32"), which for a key record is a value out
+        // of the stored material, and this message reaches both a log line and
+        // an admin HTTP body.
+        ClientError::JsonParseError { source } => KmsError::material_corrupt(
+            key_id,
+            format!(
+                "stored {record} does not deserialize ({:?} at line {}, column {})",
+                source.classify(),
+                source.line(),
+                source.column()
+            ),
+        ),
+        ClientError::ResponseDataEmptyError => KmsError::material_missing(key_id),
+        error => KmsError::backend_error(format!("Failed to read {record} from Vault: {error}")),
+    }
 }
 
 /// Decode and validate the stored master key material of a [`VaultKeyData`] record.
@@ -391,14 +428,7 @@ impl VaultKmsClient {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
                 kv2::read_version(&vault.client, &self.kv_mount, path, secret_version)
                     .await
-                    .map_err(|e| {
-                        AttemptError::from_vaultrs(e, |e| match e {
-                            ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
-                                KmsError::key_not_found(key_id)
-                            }
-                            e => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
-                        })
-                    })
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| map_key_record_read_error(key_id, "key record", e)))
             })
             .await?;
 
@@ -596,14 +626,9 @@ impl VaultKmsClient {
         let secret: VaultKeyData = self
             .run("vault_kv2_read_key", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
-                kv2::read(&vault.client, &self.kv_mount, path).await.map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| match e {
-                        ClientError::ResponseWrapError | ClientError::APIError { code: 404, .. } => {
-                            KmsError::key_not_found(key_id)
-                        }
-                        e => KmsError::backend_error(format!("Failed to read key from Vault: {e}")),
-                    })
-                })
+                kv2::read(&vault.client, &self.kv_mount, path)
+                    .await
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| map_key_record_read_error(key_id, "key record", e)))
             })
             .await?;
 
@@ -1200,6 +1225,8 @@ impl VaultKmsClient {
             created_at: key_data.created_at,
             rotated_at: key_data.rotated_at,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
         })
     }
 
@@ -1222,12 +1249,25 @@ impl VaultKmsClient {
         let page = paginate_keys(&all_keys, request, String::as_str);
 
         let mut key_infos = Vec::with_capacity(page.items.len());
+        let mut unreadable = UnreadableKeys::default();
         for key_id in page.items {
-            // A key that disappeared between the listing and the read is
-            // dropped from the page rather than failing it; the cursor comes
-            // from the identifier list, so the listing still advances past it.
-            let Ok(key_info) = self.describe_key(key_id, None).await else {
-                continue;
+            let key_info = match self.describe_key(key_id, None).await {
+                Ok(key_info) => {
+                    unreadable.saw_readable();
+                    key_info
+                }
+                Err(error) => match classify_listed_key_failure(&error) {
+                    Some(ListedKeyFailure::Vanished) => {
+                        debug!(key_id, "skipping key removed while listing");
+                        continue;
+                    }
+                    Some(ListedKeyFailure::Unreadable) => {
+                        warn!(key_id, %error, "listing a KV2 key record this build cannot describe");
+                        unreadable.record(key_id, error);
+                        continue;
+                    }
+                    None => return Err(error),
+                },
             };
             if request
                 .status_filter
@@ -1246,6 +1286,7 @@ impl VaultKmsClient {
             keys: key_infos,
             next_marker: page.next_marker,
             truncated: page.truncated,
+            unreadable_key_ids: unreadable.into_reported_ids(!page.truncated && started_at_the_first_key(request))?,
         })
     }
 
@@ -1983,6 +2024,125 @@ mod tests {
             vault.requests().is_empty(),
             "a request for no keys must not reach Vault: {:?}",
             vault.requests()
+        );
+    }
+
+    /// A KV2 record that does not deserialize is a property of that one key, so
+    /// the listing names it and keeps going. Dropping it silently — which is
+    /// what this backend used to do for every describe failure — answered "these
+    /// are your keys" with a set that omitted one, and the deletion sweep took
+    /// its census over that partial set.
+    #[tokio::test]
+    async fn wired_list_reports_an_undeserializable_record_and_keeps_the_rest() {
+        let (_vault, client) = scripted_client(vec![
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] })),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // `algorithm` is typed as a string; a number makes the record
+            // undecodable exactly as a newer or damaged writer would.
+            ScriptedResponse::ok(serde_json::json!({
+                "data": { "algorithm": 42 },
+                "metadata": { "created_time": "2026-01-01T00:00:00Z", "deletion_time": "", "custom_metadata": null, "destroyed": false, "version": 1 },
+            })),
+        ])
+        .await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("one undecodable record must not fail the whole listing");
+
+        assert_eq!(response.keys.len(), 1, "the readable key must still be listed");
+        assert_eq!(response.unreadable_key_ids, vec!["key-b".to_string()]);
+    }
+
+    /// The counterpart: an error that says nothing about a specific key must not
+    /// be reported as a damaged key. A Vault outage that listed itself as mass
+    /// key corruption would send an operator hunting for a data-loss event that
+    /// never happened, and would let the sweep proceed on a key set it could not
+    /// actually read.
+    #[tokio::test]
+    async fn wired_list_fails_when_the_backend_itself_is_unavailable() {
+        let mut responses = vec![
+            ScriptedResponse::ok(serde_json::json!({ "keys": ["key-a", "key-b"] })),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+        ];
+        for _ in 0..SCRIPTED_RETRY_ATTEMPTS {
+            responses.push(ScriptedResponse::error(503, "temporarily unavailable"));
+        }
+        let (_vault, client) = scripted_client(responses).await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("an unreachable backend must fail the listing, not shrink it");
+        assert!(
+            matches!(error, KmsError::BackendError { .. }),
+            "a transient backend failure must not be reported as a damaged record: {error:?}"
+        );
+    }
+
+    /// A record whose body is present but not a key record is corrupt material,
+    /// not a backend problem — and the reported message carries only where the
+    /// parse failed, never the values it tripped over.
+    #[tokio::test]
+    async fn wired_read_reports_an_uninterpretable_record_as_corrupt_material() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(serde_json::json!({
+            "data": null,
+            "metadata": { "created_time": "2026-01-01T00:00:00Z", "deletion_time": "", "custom_metadata": null, "destroyed": false, "version": 1 },
+        }))])
+        .await;
+
+        let error = client
+            .describe_key("wired-key", None)
+            .await
+            .expect_err("an uninterpretable key record must fail closed");
+        assert!(matches!(&error, KmsError::MaterialCorrupt { .. }), "got {error:?}");
+    }
+
+    /// A `200` whose envelope carries no `data` at all is material that is gone
+    /// — a distinct outcome from a record that cannot be parsed, and from Vault
+    /// being unreachable.
+    #[tokio::test]
+    async fn wired_read_reports_an_absent_record_body_as_missing_material() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 200,
+            body: serde_json::json!({
+                "request_id": "scripted",
+                "lease_id": "",
+                "lease_duration": 0,
+                "renewable": false,
+            })
+            .to_string(),
+        }])
+        .await;
+
+        let error = client
+            .describe_key("wired-key", None)
+            .await
+            .expect_err("a record with no body must fail closed");
+        assert!(matches!(&error, KmsError::MaterialMissing { .. }), "got {error:?}");
+    }
+
+    /// serde names the offending scalar in its own message ("invalid type:
+    /// string \"…\", expected u32"). For a key record that scalar comes out of
+    /// the stored material, and this message reaches both a log line and an
+    /// admin HTTP body, so only the position and category may survive.
+    #[tokio::test]
+    async fn wired_read_does_not_echo_record_values_into_the_error() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::ok(serde_json::json!({
+            "data": { "version": "sensitive-value-must-not-leak" },
+            "metadata": { "created_time": "2026-01-01T00:00:00Z", "deletion_time": "", "custom_metadata": null, "destroyed": false, "version": 1 },
+        }))])
+        .await;
+
+        let error = client
+            .describe_key("wired-key", None)
+            .await
+            .expect_err("a type-mismatched key record must fail closed");
+        assert!(matches!(&error, KmsError::MaterialCorrupt { .. }), "got {error:?}");
+        assert!(
+            !error.to_string().contains("sensitive-value-must-not-leak"),
+            "the error echoed a stored record value: {error}"
         );
     }
 

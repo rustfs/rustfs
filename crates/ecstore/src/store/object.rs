@@ -1253,7 +1253,7 @@ impl ECStore {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub(super) async fn handle_get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;
 
@@ -3012,6 +3012,7 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
             ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
         }
     }
 
@@ -3052,6 +3053,7 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
             ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
         }
     }
 

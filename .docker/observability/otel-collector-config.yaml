@@ -29,11 +29,27 @@ processors:
     limit_mib: 1024
     spike_limit_mib: 256
   transform/logs:
+    error_mode: ignore
     log_statements:
       - context: log
         statements:
-          - set(attributes["message"], body.string)
-          - set(attributes["log.body"], body.string)
+          - set(attributes["message"], body.string) where IsString(body)
+          - set(attributes["log.body"], body.string) where IsString(body)
+          - set(body, Concat([body, " event=", attributes["event"]], "")) where IsString(body) and attributes["event"] != nil
+          - set(body, Concat([body, " component=", attributes["component"]], "")) where IsString(body) and attributes["component"] != nil
+          - set(body, Concat([body, " subsystem=", attributes["subsystem"]], "")) where IsString(body) and attributes["subsystem"] != nil
+          - set(body, Concat([body, " state=", attributes["state"]], "")) where IsString(body) and attributes["state"] != nil
+          - set(body, Concat([body, " result=", attributes["result"]], "")) where IsString(body) and attributes["result"] != nil
+          - set(body, Concat([body, " reason=", attributes["reason"]], "")) where IsString(body) and attributes["reason"] != nil
+          - set(body, Concat([body, " failure_reason=", attributes["failure_reason"]], "")) where IsString(body) and attributes["failure_reason"] != nil
+          - set(body, Concat([body, " rpc_path=", attributes["rpc_path"]], "")) where IsString(body) and attributes["rpc_path"] != nil
+          - set(body, Concat([body, " rpc_service=", attributes["rpc_service"]], "")) where IsString(body) and attributes["rpc_service"] != nil
+          - set(body, Concat([body, " rpc_method=", attributes["rpc_method"]], "")) where IsString(body) and attributes["rpc_method"] != nil
+          - set(body, Concat([body, " expected_audience=", attributes["expected_audience"]], "")) where IsString(body) and attributes["expected_audience"] != nil
+          - set(body, Concat([body, " peer_addr=", attributes["peer_addr"]], "")) where IsString(body) and attributes["peer_addr"] != nil
+          - set(body, Concat([body, " replay_scope_bootstrap_allowed=", attributes["replay_scope_bootstrap_allowed"]], "")) where IsString(body) and attributes["replay_scope_bootstrap_allowed"] != nil
+          - set(body, Concat([body, " error=", attributes["error"]], "")) where IsString(body) and attributes["error"] != nil
+          - set(body, Concat([body, " exception_message=", attributes["exception.message"]], "")) where IsString(body) and attributes["exception.message"] != nil
 
 exporters:
   otlp/tempo:

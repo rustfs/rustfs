@@ -37,6 +37,10 @@ pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 *
 /// Keeping the existing object name preserves rolling-upgrade and rollback
 /// compatibility without allowing an ambiguous snapshot to become authoritative.
 pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
+/// Latest structurally complete scanner observation. Unlike
+/// [`DATA_USAGE_OBJECT_NAME`], this object is never authoritative for quota
+/// admission because namespace activity may have raced the scan.
+pub const DATA_USAGE_OBSERVED_OBJECT_NAME: &str = ".usage.observed.json";
 
 /// Usage snapshot written by scanner implementations predating distributed
 /// leadership fencing. It is read only when neither authoritative snapshot
@@ -218,11 +222,78 @@ pub struct DataUsageInfo {
     /// explicit entry for every bucket, including confirmed-empty buckets.
     #[serde(default)]
     pub usage_snapshot_complete: bool,
+    /// Whether no namespace activity or dirty-usage generation changed while
+    /// the coordinated snapshot was being produced.
+    ///
+    /// `false` still describes a structurally complete, useful point-in-time
+    /// usage view, but follow-up scanner work remains pending. `None` is kept
+    /// for snapshots written before this status became observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
+    /// Identity of the authoritative snapshot from which a nonconverged
+    /// observation started. Admin readers require an exact match before using
+    /// the observation, so bucket namespace mutations fence old observations
+    /// without relying on synchronized clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_authoritative_baseline: Option<DataUsageSnapshotIdentity>,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
     #[serde(default)]
     pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+/// Stable identity fields changed by both coordinated scanner publication and
+/// backward-compatible bucket namespace cleanup.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotIdentity {
+    pub last_update: Option<SystemTime>,
+    pub scanner_cycle: Option<u64>,
+    pub scanner_epoch: Option<u64>,
+}
+
+impl DataUsageInfo {
+    pub fn snapshot_identity(&self) -> DataUsageSnapshotIdentity {
+        DataUsageSnapshotIdentity {
+            last_update: self.last_update,
+            scanner_cycle: self.scanner_cycle,
+            scanner_epoch: self.scanner_epoch,
+        }
+    }
+}
+
+/// Return whether `candidate` was produced after `baseline`.
+///
+/// New coordinated snapshots are ordered by leadership epoch and scanner
+/// cycle. The timestamp fallback preserves ordering for legacy snapshots that
+/// predate those fields.
+pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUsageInfo) -> bool {
+    match (
+        candidate.scanner_epoch.zip(candidate.scanner_cycle),
+        baseline.scanner_epoch.zip(baseline.scanner_cycle),
+    ) {
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => match (candidate.last_update, baseline.last_update) {
+            (Some(candidate), Some(baseline)) => candidate > baseline,
+            (Some(_), None) => true,
+            (None, Some(_) | None) => false,
+        },
+    }
+}
+
+/// Return whether a nonconverged observation may safely supersede the admin
+/// view of `authoritative`.
+///
+/// The exact baseline identity is independent of clock ordering. Older binaries
+/// already advance the authoritative timestamp when deleting a bucket, so a
+/// rollback delete/recreate fences the previous bucket incarnation too.
+pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
+    observed.usage_snapshot_converged == Some(false)
+        && observed.is_complete_bucket_usage_snapshot()
+        && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
+        && data_usage_snapshot_is_newer(observed, authoritative)
 }
 
 /// Metadata describing the status of a disk-level data usage snapshot.
@@ -1783,6 +1854,8 @@ mod tests {
         let current = DataUsageInfo {
             last_update: Some(SystemTime::UNIX_EPOCH),
             usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(DataUsageSnapshotIdentity::default()),
             ..Default::default()
         };
         let encoded = rmp_serde::to_vec_named(&current).expect("encode current data usage snapshot");
@@ -1790,6 +1863,76 @@ mod tests {
 
         assert_eq!(legacy.buckets_count, 0);
         assert!(current.is_complete_bucket_usage_snapshot());
+        assert_eq!(current.usage_snapshot_converged, Some(false));
+    }
+
+    #[test]
+    fn convergence_marker_defaults_to_unknown_for_older_snapshots() {
+        let encoded = rmp_serde::to_vec_named(&DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        })
+        .expect("encode pre-convergence data usage snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode older data usage snapshot");
+
+        assert!(decoded.is_complete_bucket_usage_snapshot());
+        assert_eq!(decoded.usage_snapshot_converged, None);
+    }
+
+    #[test]
+    fn observation_selection_is_clock_independent_and_baseline_fenced() {
+        let mut authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(600)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let observed = DataUsageInfo {
+            // A newer leader may have a slower wall clock.
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(1),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+
+        assert!(observed_data_usage_is_newer(&observed, &authoritative));
+
+        authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(601));
+        assert!(
+            !observed_data_usage_is_newer(&observed, &authoritative),
+            "an old-binary namespace mutation must fence the prior bucket incarnation regardless of clock skew"
+        );
+    }
+
+    #[test]
+    fn observation_selection_requires_nonconverged_complete_newer_data() {
+        let authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(2),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let baseline = Some(authoritative.snapshot_identity());
+        let candidate = |epoch, cycle, converged, complete| DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(epoch),
+            scanner_cycle: Some(cycle),
+            usage_snapshot_complete: complete,
+            usage_snapshot_converged: converged,
+            usage_snapshot_authoritative_baseline: baseline,
+            ..Default::default()
+        };
+
+        assert!(observed_data_usage_is_newer(&candidate(2, 11, Some(false), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 9, Some(false), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(true), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(false), false), &authoritative));
     }
 
     #[test]

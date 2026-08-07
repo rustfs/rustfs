@@ -35,6 +35,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
+use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
 use rustfs_trusted_proxies::ClientInfo;
@@ -391,6 +392,7 @@ impl RequestLogContext {
 
         if status.is_server_error() {
             error!(
+                target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
@@ -407,6 +409,7 @@ impl RequestLogContext {
             );
         } else {
             info!(
+                target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
@@ -429,6 +432,7 @@ impl RequestLogContext {
         E: std::fmt::Display,
     {
         error!(
+            target: HTTP_SERVER_LOG_TARGET,
             event = HTTP_REQUEST_FAILED_EVENT,
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_HTTP,

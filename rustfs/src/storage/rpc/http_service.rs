@@ -26,6 +26,7 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     WALK_DIR_BODY_SHA256_QUERY,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::tonic_rpc_auth_failure_reason;
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -472,11 +473,17 @@ fn verify_internode_rpc_signature(uri: &Uri, method: &Method, headers: &HeaderMa
 
     verify_rpc_signature(&uri.to_string(), method, headers).map_err(|e| {
         let message = format!("rpc signature verification failed: {e}");
+        let operation = internode_http_operation(uri.path());
+        runtime_sources::current_internode_metrics().record_rpc_auth_failure_for_operation_and_backend(
+            operation.unwrap_or(RPC_OPERATION_UNKNOWN),
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            tonic_rpc_auth_failure_reason(&e),
+        );
         log_internode_rpc_response_failure!(
             StatusCode::FORBIDDEN,
             uri.path(),
             method,
-            internode_http_operation(uri.path()),
+            operation,
             "signature_verification_failed",
             "rejected",
             None,
@@ -1309,11 +1316,14 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use http_body_util::BodyExt;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
     use rustfs_io_metrics::internode_metrics::{
         INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-        INTERNODE_OPERATION_WALK_DIR, global_internode_metrics,
+        INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
     };
     use sha2::Digest as _;
+    use std::collections::HashMap;
     use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
@@ -1382,6 +1392,37 @@ mod tests {
         let headers = HeaderMap::new();
         let response = verify_internode_rpc_signature(&uri, &Method::GET, &headers).expect_err("response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn rpc_get_request_auth_failure_records_failure_reason_metric() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let uri: Uri = READ_FILE_STREAM_PATH.parse().expect("uri");
+        let headers = HeaderMap::new();
+
+        with_local_recorder(&recorder, || {
+            let response = verify_internode_rpc_signature(&uri, &Method::GET, &headers).expect_err("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        });
+
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_system_network_internode_rpc_auth_failures_total")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(labels.get("operation").map(String::as_str), Some(INTERNODE_OPERATION_READ_FILE_STREAM));
+        assert_eq!(labels.get("backend").map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_TCP_HTTP));
+        assert_eq!(labels.get("failure_reason").map(String::as_str), Some("missing_v1_signature"));
+        assert!(labels.get("server").is_some_and(|value| !value.is_empty()));
     }
 
     #[test]

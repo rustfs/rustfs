@@ -690,6 +690,17 @@ if [[ -n "$unmasked_revoke_fields" ]]; then
   exit 1
 fi
 
+# STS claims carry caller-supplied identity material (parent user, session policy, JWT
+# fields). Interpolating the claims map into any log or error repeats the
+# GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata
+# such as claims.len() may be logged (see trace_assume_role_claims in sts.rs).
+sts_claims_content_logs="$(rg -n '\{:\?\}.*claims|claims.*\{:\?\}|\{&?claims:\?\}|[?%]\s*&?claims\b' rustfs/src/admin/handlers/sts.rs || true)"
+if [[ -n "$sts_claims_content_logs" ]]; then
+  echo "❌ logging guardrail violation: STS handlers must not interpolate JWT claims into logs or errors (GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 class); log derived metadata such as claims.len() instead" >&2
+  echo "$sts_claims_content_logs" >&2
+  exit 1
+fi
+
 heal_hotpath_files=(
   "crates/ecstore/src/store/heal.rs"
   "crates/ecstore/src/store/mod.rs"
@@ -857,6 +868,11 @@ if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Hea
   exit 1
 fi
 
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
+  exit 1
+fi
+
 demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
 if [[ "$demoted_task_sites" -lt 4 ]]; then
   echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2
@@ -872,6 +888,43 @@ fi
 erasure_sampled_sites="$(rg -c -F 'take_failure_log_sample(' crates/heal/src/heal/erasure_healer.rs || echo 0)"
 if [[ "$erasure_sampled_sites" -lt 2 ]]; then
   echo "❌ logging guardrail violation: erasure-set per-object failure/skip warns must stay sample-capped via take_failure_log_sample (expected >= 2 sites in crates/heal/src/heal/erasure_healer.rs, found $erasure_sampled_sites)" >&2
+  exit 1
+fi
+
+# Object-read request fan-out crosses several thin wrappers. These spans are
+# useful for opt-in latency attribution, but default INFO turns one S3 request
+# into many redundant span-close records. Keep only the measured hot wrappers
+# TRACE-only; write, heal, rebalance, and admin operations are intentionally not
+# included here.
+trace_hot_spans=(
+  "crates/ecstore/src/set_disk/ops/locking.rs:new_ns_lock"
+  "crates/ecstore/src/store/rebalance.rs:handle_new_ns_lock"
+  "crates/ecstore/src/store/object.rs:handle_get_object_info"
+  "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
+  "crates/ecstore/src/store/mod.rs:list_objects_v2"
+  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  "crates/ecstore/src/core/sets.rs:list_objects_v2"
+  "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
+  "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+)
+
+for hot_span in "${trace_hot_spans[@]}"; do
+  file="${hot_span%%:*}"
+  function="${hot_span##*:}"
+  trace_span_pattern="#\\[(tracing::)?instrument\\([^]]*level = \\\"trace\\\"[^]]*\\)\\]([[:space:]]+#\\[[^]]+\\])*[[:space:]]+(pub(\\([^)]*\\))?[[:space:]]+)?(super[[:space:]]+)?async fn ${function}\\b"
+  if ! rg -U "$trace_span_pattern" "$file" >/dev/null; then
+    echo "❌ logging guardrail violation: $file::$function must remain TRACE-only" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U 'info!\([[:space:]]+target: HTTP_SERVER_LOG_TARGET,[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful HTTP completion events must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: HTTP request log target must use HTTP_SERVER_LOG_TARGET" >&2
   exit 1
 fi
 

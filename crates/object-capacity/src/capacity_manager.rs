@@ -40,6 +40,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_CAPACITY: &str = "capacity";
@@ -55,7 +57,7 @@ const EVENT_CAPACITY_REFRESH_CANCELLED: &str = "capacity_refresh_cancelled";
 const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
 const EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED: &str = "capacity_refresh_interval_clamped";
 const EVENT_CAPACITY_REFRESH_SCHEDULED: &str = "capacity_refresh_scheduled";
-const EVENT_CAPACITY_REFRESH_SKIPPED: &str = "capacity_refresh_skipped";
+const MAX_SCHEDULED_REFRESH_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 // ============================================================================
 // Configuration Functions
@@ -335,6 +337,8 @@ pub struct CapacityUpdate {
     /// `is_estimated` only reflects sampling; this flag is the only carrier of
     /// the "some disks failed to scan" fact (backlog#1014).
     pub degraded: bool,
+    /// Whether the scan reached its time budget and returned a fallback estimate.
+    pub timed_out: bool,
     /// Per-disk breakdown captured from a successful refresh.
     pub per_disk: Vec<DiskCapacityUpdate>,
     /// Expected disk count for a complete disk cache.
@@ -357,6 +361,7 @@ impl CapacityUpdate {
             file_count,
             is_estimated: false,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -372,6 +377,7 @@ impl CapacityUpdate {
             file_count,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -387,6 +393,7 @@ impl CapacityUpdate {
             file_count: 0,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -1321,7 +1328,96 @@ fn clamp_background_interval(value: Duration, env_var: &'static str) -> Duration
     clamped
 }
 
+#[derive(Debug)]
+struct ScheduledRefreshBackoff {
+    base: Duration,
+    current: Duration,
+    max: Duration,
+}
+
+impl ScheduledRefreshBackoff {
+    fn new(base: Duration) -> Self {
+        Self {
+            base,
+            current: base,
+            max: base.max(MAX_SCHEDULED_REFRESH_BACKOFF),
+        }
+    }
+
+    fn delay(&self) -> Duration {
+        self.current
+    }
+
+    fn record_result(&mut self, clean: bool) {
+        self.current = if clean {
+            self.base
+        } else {
+            self.current.saturating_mul(2).min(self.max)
+        };
+    }
+}
+
+fn scheduled_refresh_was_clean(result: &Result<CapacityUpdate, String>) -> bool {
+    matches!(result, Ok(update) if !update.timed_out && !update.degraded)
+}
+
+async fn run_scheduled_refresh_loop<F, Fut>(refresh_interval: Duration, shutdown: CancellationToken, mut refresh: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut backoff = ScheduledRefreshBackoff::new(refresh_interval);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(backoff.delay()) => {}
+        }
+        // Widen the cross-thread cancellation window deterministically in tests.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
+        if shutdown.is_cancelled() {
+            break;
+        }
+        backoff.record_result(refresh().await);
+    }
+}
+
+/// Owned capacity scheduler tasks for one server runtime.
+#[must_use = "capacity background tasks stop when their lifecycle handle is dropped"]
+pub struct CapacityBackgroundTasks {
+    shutdown: CancellationToken,
+    tasks: JoinSet<()>,
+}
+
+impl CapacityBackgroundTasks {
+    /// Leave the schedulers running without lifecycle ownership.
+    pub fn detach(mut self) {
+        self.tasks.detach_all();
+    }
+
+    /// Cancel the schedulers and wait for them and any active scheduled refresh.
+    pub async fn shutdown(mut self) -> Result<(), JoinError> {
+        self.shutdown.cancel();
+        let mut join_error = None;
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(err) = result
+                && join_error.is_none()
+            {
+                join_error = Some(err);
+            }
+        }
+        join_error.map_or(Ok(()), Err)
+    }
+}
+
+/// Start capacity refresh and metrics schedulers without lifecycle ownership.
 pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
+    start_background_tasks(disks).await.detach();
+}
+
+/// Start capacity refresh and metrics schedulers with lifecycle ownership.
+pub async fn start_background_tasks(disks: Vec<CapacityDiskRef>) -> CapacityBackgroundTasks {
     let manager = get_capacity_manager();
     let manager_for_refresh = manager.clone();
     let manager_for_metrics = manager.clone();
@@ -1331,25 +1427,18 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     refresh_interval = clamp_background_interval(refresh_interval, ENV_CAPACITY_SCHEDULED_INTERVAL);
     metrics_interval = clamp_background_interval(metrics_interval, ENV_CAPACITY_METRICS_INTERVAL);
 
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
+    let shutdown = CancellationToken::new();
+    let refresh_shutdown = shutdown.clone();
+    let metrics_shutdown = shutdown.clone();
+    let mut tasks = JoinSet::new();
 
-        loop {
-            timer.tick().await;
-
+    tasks.spawn(async move {
+        run_scheduled_refresh_loop(refresh_interval, refresh_shutdown, move || {
             let start = Instant::now();
             let manager = manager_for_refresh.clone();
             let disks = disks.clone();
             let disk_count = disks.len();
-            let started = manager
-                .clone()
-                .spawn_refresh_if_needed(
-                    DataSource::Scheduled,
-                    move || async move { refresh_capacity_with_scope(disks, false).await },
-                )
-                .await;
-
-            if started {
+            async move {
                 debug!(
                     event = EVENT_CAPACITY_REFRESH_SCHEDULED,
                     component = LOG_COMPONENT_CAPACITY,
@@ -1360,27 +1449,31 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
                     enqueue_latency_ms = start.elapsed().as_millis() as u64,
                     "capacity refresh scheduled"
                 );
-            } else {
-                debug!(
-                    event = EVENT_CAPACITY_REFRESH_SKIPPED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    state = "inflight",
-                    source = DataSource::Scheduled.as_metric_label(),
-                    disk_count,
-                    "capacity refresh skipped"
-                );
+                let result = manager
+                    .refresh_or_join(
+                        DataSource::Scheduled,
+                        move || async move { refresh_capacity_with_scope(disks, false).await },
+                    )
+                    .await;
+                scheduled_refresh_was_clean(&result)
             }
-        }
+        })
+        .await;
     });
 
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + metrics_interval, metrics_interval);
         loop {
-            timer.tick().await;
+            tokio::select! {
+                biased;
+                _ = metrics_shutdown.cancelled() => break,
+                _ = timer.tick() => {}
+            }
             manager_for_metrics.log_runtime_summary().await;
         }
     });
+
+    CapacityBackgroundTasks { shutdown, tasks }
 }
 
 // ============================================================================
@@ -1399,6 +1492,144 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_scheduled_refresh_backoff_grows_caps_and_resets() {
+        let mut backoff = ScheduledRefreshBackoff::new(Duration::from_secs(120));
+        let cases = [
+            (false, 240),
+            (false, 480),
+            (false, 960),
+            (false, 1_800),
+            (false, 1_800),
+            (true, 120),
+        ];
+
+        assert_eq!(backoff.delay(), Duration::from_secs(120));
+        for (clean, expected_secs) in cases {
+            backoff.record_result(clean);
+            assert_eq!(backoff.delay(), Duration::from_secs(expected_secs));
+        }
+
+        let mut configured_above_cap = ScheduledRefreshBackoff::new(Duration::from_secs(3_600));
+        configured_above_cap.record_result(false);
+        assert_eq!(configured_above_cap.delay(), Duration::from_secs(3_600));
+    }
+
+    #[test]
+    fn test_scheduled_refresh_cleanliness_distinguishes_sampling_from_timeout() {
+        let exact = Ok(CapacityUpdate::exact(10, 1));
+        let sampled = Ok(CapacityUpdate::estimated(10, 1));
+        let mut timed_out = CapacityUpdate::estimated(10, 1);
+        timed_out.timed_out = true;
+        let mut degraded = CapacityUpdate::exact(10, 1);
+        degraded.degraded = true;
+
+        assert!(scheduled_refresh_was_clean(&exact));
+        assert!(scheduled_refresh_was_clean(&sampled));
+        assert!(!scheduled_refresh_was_clean(&Ok(timed_out)));
+        assert!(!scheduled_refresh_was_clean(&Ok(degraded)));
+        assert!(!scheduled_refresh_was_clean(&Err("scan failed".to_string())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduled_refresh_loop_applies_backoff_and_reset() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let results = Arc::new(StdMutex::new(VecDeque::from([false, false, true, true])));
+        let task_calls = calls.clone();
+        let task_results = results.clone();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(10), shutdown.clone(), move || {
+            let task_calls = task_calls.clone();
+            let task_results = task_results.clone();
+            async move {
+                task_calls.fetch_add(1, Ordering::SeqCst);
+                task_results
+                    .lock()
+                    .expect("scheduled result queue lock should succeed")
+                    .pop_front()
+                    .unwrap_or(true)
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        shutdown.cancel();
+        task.await.expect("scheduled refresh loop should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_refresh_shutdown_waits_for_active_refresh() {
+        let shutdown = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let mut release_rx = Some(release_rx);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(1), task_shutdown, move || {
+            let started_tx = started_tx.take().expect("test runs one refresh");
+            let release_rx = release_rx.take().expect("test runs one refresh");
+            async move {
+                started_tx.send(()).expect("test should observe refresh start");
+                release_rx.await.expect("test should release active refresh");
+                true
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started_rx.await.expect("scheduled refresh should start");
+        shutdown.cancel();
+        assert!(!task.is_finished());
+
+        release_tx.send(()).expect("active refresh should still be running");
+        task.await.expect("scheduled refresh loop should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_refresh_shutdown_at_due_boundary_skips_refresh() {
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(1), task_shutdown, move || {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        task.await.expect("scheduled refresh loop should stop cleanly");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     type ConfigGetterCase = (&'static str, fn() -> u64, u64, &'static str, u64);
 
@@ -1539,6 +1770,62 @@ mod tests {
         );
         // The cap itself must be safely addable to a tokio Instant.
         let _ = tokio::time::Instant::now() + MAX_BACKGROUND_INTERVAL;
+    }
+
+    #[tokio::test]
+    async fn background_tasks_shutdown_cancels_and_joins_schedulers() {
+        let tasks = start_background_tasks(Vec::new()).await;
+
+        tokio::time::timeout(Duration::from_secs(1), tasks.shutdown())
+            .await
+            .expect("capacity background tasks should stop promptly")
+            .expect("capacity background tasks should join cleanly");
+    }
+
+    #[tokio::test]
+    async fn background_tasks_shutdown_joins_remaining_tasks_after_failure() {
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let failed_task = tasks.spawn(async { panic!("expected scheduler failure") });
+        while !failed_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let task_shutdown = shutdown.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            task_shutdown.cancelled().await;
+            ready_tx.send(()).expect("test should observe scheduler cancellation");
+            release_rx.await.expect("test should release scheduler shutdown");
+        });
+        let release_task = tokio::spawn(async move {
+            ready_rx.await.expect("scheduler should observe cancellation");
+            release_tx.send(()).expect("scheduler should still be joinable");
+        });
+
+        let background_tasks = CapacityBackgroundTasks { shutdown, tasks };
+        assert!(background_tasks.shutdown().await.is_err());
+        release_task.await.expect("scheduler release task should join");
+    }
+
+    #[tokio::test]
+    async fn background_tasks_detach_keeps_schedulers_running() {
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            ready_tx.send(()).expect("test should observe scheduler start");
+            release_rx.await.expect("test should release detached scheduler");
+            completed_tx.send(()).expect("test should observe scheduler completion");
+        });
+
+        CapacityBackgroundTasks { shutdown, tasks }.detach();
+        ready_rx.await.expect("detached scheduler should start");
+        release_tx.send(()).expect("detached scheduler should still be running");
+        completed_rx.await.expect("detached scheduler should complete");
     }
 
     #[test]
@@ -1926,6 +2213,7 @@ mod tests {
                     file_count: 3,
                     is_estimated: false,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -1962,6 +2250,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: true,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![DiskCapacityUpdate {
                         disk: CapacityScopeDisk {
                             endpoint: "node-a".to_string(),
@@ -2011,6 +2300,7 @@ mod tests {
             file_count: 2,
             is_estimated: false,
             degraded: false,
+            timed_out: false,
             per_disk: vec![
                 disk_entry("node-a", "/tmp/disk-a", 100, 1),
                 disk_entry("node-b", "/tmp/disk-b", 100, 1),
@@ -2039,6 +2329,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2082,6 +2373,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: Vec::new(),
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2111,6 +2403,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2315,6 +2608,7 @@ mod tests {
                     file_count: 3,
                     is_estimated: false,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -2350,6 +2644,7 @@ mod tests {
             file_count: 1,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: vec![DiskCapacityUpdate {
                 disk: CapacityScopeDisk {
                     endpoint: "node-a".to_string(),

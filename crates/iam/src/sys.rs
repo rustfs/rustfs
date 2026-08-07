@@ -79,6 +79,42 @@ enum PolicyPluginState {
     Failed,
 }
 
+impl PolicyPluginState {
+    fn prepared_iam_auth(&self) -> Option<PreparedIamAuth> {
+        match self {
+            Self::Ready(_) => Some(PreparedIamAuth {
+                needs_existing_object_tag: true,
+                mode: PreparedIamMode::Opa,
+            }),
+            Self::Initializing | Self::Failed => Some(PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            }),
+            Self::Disabled => None,
+        }
+    }
+}
+
+async fn resolve_policy_plugin_state() -> PolicyPluginState {
+    match opa::lookup_config().await {
+        Ok(conf) if conf.enable() => {
+            info!("OPA plugin enabled");
+            PolicyPluginState::Ready(opa::AuthZPlugin::new(conf))
+        }
+        Ok(_) => PolicyPluginState::Failed,
+        Err(e) => {
+            error!(
+                component = "iam",
+                subsystem = "policy_plugin",
+                result = "configuration_load_failed",
+                error_kind = e.kind(),
+                "OPA plugin configuration load failed"
+            );
+            PolicyPluginState::Failed
+        }
+    }
+}
+
 static POLICY_PLUGIN_STATE: OnceLock<Arc<RwLock<PolicyPluginState>>> = OnceLock::new();
 
 fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
@@ -93,23 +129,7 @@ fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
             if configured {
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let next_state = match opa::lookup_config().await {
-                        Ok(conf) if conf.enable() => {
-                            info!("OPA plugin enabled");
-                            PolicyPluginState::Ready(opa::AuthZPlugin::new(conf))
-                        }
-                        Ok(_) => PolicyPluginState::Failed,
-                        Err(e) => {
-                            error!(
-                                component = "iam",
-                                subsystem = "policy_plugin",
-                                result = "configuration_load_failed",
-                                error_kind = e.kind(),
-                                "OPA plugin configuration load failed"
-                            );
-                            PolicyPluginState::Failed
-                        }
-                    };
+                    let next_state = resolve_policy_plugin_state().await;
                     *state.write().await = next_state;
                 });
             }
@@ -1164,20 +1184,8 @@ impl<T: Store> IamSys<T> {
             };
         }
 
-        match Self::policy_plugin_state().await {
-            PolicyPluginState::Ready(_) => {
-                return PreparedIamAuth {
-                    needs_existing_object_tag: true,
-                    mode: PreparedIamMode::Opa,
-                };
-            }
-            PolicyPluginState::Initializing | PolicyPluginState::Failed => {
-                return PreparedIamAuth {
-                    needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Deny,
-                };
-            }
-            PolicyPluginState::Disabled => {}
+        if let Some(prepared) = Self::policy_plugin_state().await.prepared_iam_auth() {
+            return prepared;
         }
 
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
@@ -1840,6 +1848,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
     use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_combined_policy_for_view_returns_regular_policy() {
@@ -1900,6 +1910,74 @@ mod tests {
 
         assert!(needs_initial_tags, "OPA mode must request existing object tags before evaluation");
         assert!(needs_secondary_tags, "OPA mode must request existing object tags for secondary actions");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_denies_while_policy_plugin_is_unavailable() {
+        let store = StsTestMockStore::new(false);
+        let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
+        let claims = HashMap::new();
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "opa-unavailable-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListAllMyBucketsAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let mut outcomes = Vec::new();
+        for state in [PolicyPluginState::Initializing, PolicyPluginState::Failed] {
+            let prepared = state
+                .prepared_iam_auth()
+                .expect("unavailable policy plugin must prepare fail-closed IAM auth");
+            outcomes.push((
+                matches!(&prepared.mode, PreparedIamMode::Deny),
+                iam_sys.eval_prepared(&prepared, &args).await,
+            ));
+        }
+
+        assert_eq!(outcomes, [(true, false), (true, false)]);
+        assert!(PolicyPluginState::Disabled.prepared_iam_auth().is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_policy_plugin_state_fails_after_opa_validation_returns_503() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OPA validation test listener");
+        let url = format!(
+            "http://{}/v1/data/rustfs/authz/allow",
+            listener.local_addr().expect("read listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept OPA validation connection");
+            let mut request = [0_u8; 1024];
+            let bytes = stream.read(&mut request).await.expect("read OPA validation request");
+            assert!(bytes > 0, "OPA validation should send an HTTP request");
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write OPA unavailable response");
+        });
+
+        let state = temp_env::async_with_vars(
+            [
+                ("RUSTFS_POLICY_PLUGIN_URL", Some(url.as_str())),
+                ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", None),
+            ],
+            resolve_policy_plugin_state(),
+        )
+        .await;
+        server.await.expect("join OPA validation test server");
+
+        assert!(matches!(state, PolicyPluginState::Failed));
     }
 
     const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";

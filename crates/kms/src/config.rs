@@ -37,6 +37,10 @@ pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
 pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
 pub const ENV_KMS_AWS_REGION: &str = "RUSTFS_KMS_AWS_REGION";
 pub const ENV_KMS_AWS_ENDPOINT_URL: &str = "RUSTFS_KMS_AWS_ENDPOINT_URL";
+/// Age in whole seconds beyond which a key is reported as due for rotation;
+/// unset leaves rotation readiness unreported. Read once when the manager is
+/// built, by [`crate::manager::KmsManager`].
+pub const ENV_KMS_ROTATION_MAX_AGE_SECS: &str = "RUSTFS_KMS_ROTATION_MAX_AGE_SECS";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";

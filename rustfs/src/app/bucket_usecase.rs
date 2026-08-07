@@ -16,7 +16,12 @@
 
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
-use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, bucket_config_mutation_incarnation, req_info_ref};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::access::ReqInfo;
+use super::storage_api::bucket_usecase::access::{
+    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    prepare_list_buckets_iam_authorization, req_info_ref,
+};
 #[cfg(test)]
 use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
 use super::storage_api::bucket_usecase::bucket::{
@@ -34,7 +39,8 @@ use super::storage_api::bucket_usecase::bucket::{
     policy_sys::PolicySys,
     replication::{
         ReplicationTargetValidationError, invalid_replication_config_status_field, replication_target_arns,
-        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
+        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_structure,
+        validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -70,7 +76,6 @@ use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
-use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
@@ -580,6 +585,9 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
 }
 
 fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+    if let Err(err) = validate_replication_config_structure(config) {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, err.message()));
+    }
     if let Some(field) = invalid_replication_config_status_field(config) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -800,6 +808,8 @@ async fn is_list_objects_metadata_action_allowed<T>(
     req_info.bucket = Some(bucket.to_string());
     req_info.object = Some(object.to_string());
     req_info.version_id = None;
+    // Denial here is an expected filter outcome, not an error (issue #5740).
+    req_info.suppress_denial_log = true;
     auth_req.extensions.insert(req_info);
 
     match authorize_request(&mut auth_req, Action::S3Action(action)).await {
@@ -1386,49 +1396,31 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut req = req;
-
         if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
         }
 
-        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
-            if e.code() != &S3ErrorCode::AccessDenied {
-                return Err(e);
-            }
-
-            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-
-            list_bucket_infos = futures::stream::iter(list_bucket_infos)
-                .filter_map(|info| async {
-                    let mut req_clone = req.clone();
-                    let Some(req_info) = req_clone.extensions.get_mut::<ReqInfo>() else {
-                        debug!(bucket = %info.name, "ReqInfo missing in extensions, skipping bucket authorization");
-                        return None;
-                    };
-                    req_info.bucket = Some(info.name.clone());
-
-                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
-                        .await
-                        .is_ok()
-                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
-                            .await
-                            .is_ok()
-                    {
-                        Some(info)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-                .await;
-
-            if list_bucket_infos.is_empty() {
-                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
-            }
-            list_bucket_infos
-        } else {
+        let iam_authorization = prepare_list_buckets_iam_authorization(&req).await?;
+        let bucket_infos = if iam_authorization.is_allowed("", S3Action::ListAllMyBucketsAction).await {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        } else {
+            log_list_buckets_iam_implicit_deny(&req)?;
+            let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+            let mut visible_bucket_infos = Vec::new();
+            for info in bucket_infos {
+                if iam_authorization.is_allowed(&info.name, S3Action::ListBucketAction).await
+                    || iam_authorization
+                        .is_allowed(&info.name, S3Action::GetBucketLocationAction)
+                        .await
+                {
+                    visible_bucket_infos.push(info);
+                }
+            }
+
+            if visible_bucket_infos.is_empty() {
+                return Err(ApiError::access_denied().into());
+            }
+            visible_bucket_infos
         };
 
         Ok(S3Response::new(build_list_buckets_output(&bucket_infos)))
@@ -2562,7 +2554,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    #[instrument(level = "info", skip(self, req))]
+    #[instrument(level = "trace", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
@@ -3185,6 +3177,24 @@ mod tests {
                 .contains("Destination.EncryptionConfiguration is not supported")
         );
         assert!(!err.to_string().contains(destination_key_id));
+    }
+
+    #[test]
+    fn validate_replication_config_capabilities_rejects_structural_defects_before_write() {
+        let mut first = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        first.priority = Some(1);
+        let mut second = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        second.priority = Some(1);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![first, second],
+        };
+
+        let err = validate_replication_config_capabilities(&config)
+            .expect_err("duplicate rule priorities must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.to_string().contains("Priority must be unique"));
     }
 
     #[test]
@@ -4460,11 +4470,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        // The config must clear the structural/capability validators so the
+        // request actually reaches the store lookup this test pins.
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
             .replication_configuration(ReplicationConfiguration {
                 role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![],
+                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
             })
             .build()
             .unwrap();

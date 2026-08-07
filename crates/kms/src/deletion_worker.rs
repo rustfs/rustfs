@@ -63,7 +63,7 @@ const METRIC_TOMBSTONE_KEYS: &str = "rustfs_kms_deletion_tombstone_keys";
 /// (its creation time when it was never rotated); `0` when there are none.
 const METRIC_OLDEST_ROTATION_AGE_SECONDS: &str = "rustfs_kms_oldest_key_rotation_age_seconds";
 /// Counter: keys the sweep acted on, by `outcome` (`removed`, `blocked`,
-/// `skipped`, `failed`).
+/// `skipped`, `failed`, `unreadable`).
 const METRIC_SWEEP_KEYS_TOTAL: &str = "rustfs_kms_deletion_sweep_keys_total";
 
 /// Register metric descriptions once per process.
@@ -140,6 +140,7 @@ fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
         ("blocked", report.blocked.len()),
         ("skipped", report.skipped),
         ("failed", report.failed),
+        ("unreadable", report.unreadable),
     ] {
         // Emitted even at zero so every outcome series exists from the first
         // sweep on and a rate over it is defined.
@@ -193,6 +194,13 @@ pub struct SweepReport {
     pub skipped: usize,
     /// Keys whose removal attempt failed; retried on the next sweep.
     pub failed: usize,
+    /// Keys the backend listed but could not describe.
+    ///
+    /// The sweep keeps going past them — one damaged record must not stop every
+    /// other expired key from being destroyed — but their existence means the
+    /// key set was only partially observed, so the lifecycle gauges are
+    /// withheld for this round rather than published over an incomplete census.
+    pub unreadable: usize,
 }
 
 pub(crate) struct DeletionWorker {
@@ -243,12 +251,13 @@ impl DeletionWorker {
                 _ = ticker.tick() => {}
             }
             let report = self.sweep(&Zoned::now()).await;
-            if !report.removed.is_empty() || !report.blocked.is_empty() || report.failed > 0 {
+            if !report.removed.is_empty() || !report.blocked.is_empty() || report.failed > 0 || report.unreadable > 0 {
                 info!(
                     removed = ?report.removed,
                     blocked = ?report.blocked,
                     skipped = report.skipped,
                     failed = report.failed,
+                    unreadable = report.unreadable,
                     "KMS deletion sweep completed"
                 );
             }
@@ -280,6 +289,13 @@ impl DeletionWorker {
                     break false;
                 }
             };
+            if !response.unreadable_key_ids.is_empty() {
+                warn!(
+                    key_ids = ?response.unreadable_key_ids,
+                    "KMS deletion sweep listed key records it cannot describe; census withheld this round"
+                );
+                report.unreadable += response.unreadable_key_ids.len();
+            }
             for key in &response.keys {
                 // Keys this sweep destroys are left out of the census: the
                 // gauges describe the key set as it stands once the sweep is
@@ -310,7 +326,12 @@ impl DeletionWorker {
                 None => break false,
             }
         };
-        record_sweep(&report, listed_everything.then_some(census));
+        // A census taken over a key set with unreadable members would report an
+        // oldest-rotation age and a pending-deletion count computed from the
+        // keys that happened to be readable, which is exactly the kind of quiet
+        // undercount the gauges exist to catch.
+        let observed_every_key = listed_everything && report.unreadable == 0;
+        record_sweep(&report, observed_every_key.then_some(census));
         report
     }
 
@@ -749,6 +770,8 @@ mod tests {
             created_at,
             rotated_at,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
         }
     }
 
@@ -848,5 +871,53 @@ mod tests {
         });
 
         assert_eq!(gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS), Some(total as f64));
+    }
+
+    /// One key record this build cannot read must not stop the sweep.
+    ///
+    /// Before the listing reported unreadable identifiers, the damaged record
+    /// either vanished from the page — so the census counted a key set it had
+    /// not fully seen — or failed the listing outright, which aborted the sweep
+    /// and left every expired key on the node undeleted for as long as the
+    /// damage lasted. Now the expired key is still destroyed, and the gauges are
+    /// withheld for the round instead of being published over a partial census.
+    #[test]
+    fn sweep_destroys_expired_keys_past_a_record_it_cannot_read() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async move {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let backend = local_backend(&temp_dir).await;
+                let expired = create_key(&backend, "zz-expired").await;
+                schedule(&backend, &expired).await;
+                let damaged = create_key(&backend, "aa-damaged").await;
+
+                // Stamp a protection marker no build understands, exactly as a
+                // record written by a newer node would look here.
+                let key_path = temp_dir.path().join(format!("{damaged}.key"));
+                assert!(key_path.exists(), "the key record must exist before it is damaged");
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&tokio::fs::read(&key_path).await.expect("read record")).expect("decode record");
+                record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+                tokio::fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+                    .await
+                    .expect("write record");
+
+                let report = worker(backend.clone()).sweep(&after_window()).await;
+                assert_eq!(report.unreadable, 1, "the damaged record must be reported, not hidden");
+                assert_eq!(report.removed, vec![expired.clone()], "the expired key must still be destroyed");
+                assert_eq!(report.failed, 0, "an unreadable record is not a removal failure");
+                assert_key_gone(&backend, &expired).await;
+            })
+        });
+
+        assert_eq!(
+            gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS),
+            None,
+            "a census taken over a partially readable key set must not be published"
+        );
+        // The runbook points operators at this series as the signal that the
+        // gauges above have gone quiet on purpose, so it has to be emitted.
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "unreadable"), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "removed"), 1);
     }
 }
