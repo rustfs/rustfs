@@ -45,6 +45,7 @@ hotpath.workspace = true
 rustfs-s3select-api = { workspace = true }
 async-recursion = { workspace = true }
 async-trait.workspace = true
+bytes.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 derive_builder = { workspace = true }
 futures = { workspace = true }
