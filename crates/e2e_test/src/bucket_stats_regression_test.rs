@@ -88,12 +88,21 @@ mod tests {
 
         // Wait for scanner to process (up to 90 seconds)
         let mut found_nonzero = false;
+        let mut last_query_error = None;
         for attempt in 0..18 {
             sleep(Duration::from_secs(5)).await;
 
-            if let Ok(usage) = get_data_usage(&env).await
-                && let Some(bucket_usage) = usage.buckets_usage.get(bucket)
-            {
+            let usage = match get_data_usage(&env).await {
+                Ok(usage) => {
+                    last_query_error = None;
+                    usage
+                }
+                Err(err) => {
+                    last_query_error = Some(err.to_string());
+                    continue;
+                }
+            };
+            if let Some(bucket_usage) = usage.buckets_usage.get(bucket) {
                 info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
                 if bucket_usage.objects_count >= 10 {
                     found_nonzero = true;
@@ -104,7 +113,8 @@ mod tests {
 
         assert!(
             found_nonzero,
-            "RT-09 FAIL: bucket object count did not update after PUT 10 objects (regression: stats stuck at 0)"
+            "RT-09 FAIL: bucket object count did not update after PUT 10 objects (regression: stats stuck at 0); last query error: {}",
+            last_query_error.as_deref().unwrap_or("none")
         );
 
         info!("RT-09 PASS: bucket object count updates after PUT");
@@ -156,12 +166,21 @@ mod tests {
 
         // Wait for scanner to update stats (up to 90 seconds)
         let mut found_zero = false;
+        let mut last_query_error = None;
         for attempt in 0..18 {
             sleep(Duration::from_secs(5)).await;
 
-            if let Ok(usage) = get_data_usage(&env).await
-                && let Some(bucket_usage) = usage.buckets_usage.get(bucket)
-            {
+            let usage = match get_data_usage(&env).await {
+                Ok(usage) => {
+                    last_query_error = None;
+                    usage
+                }
+                Err(err) => {
+                    last_query_error = Some(err.to_string());
+                    continue;
+                }
+            };
+            if let Some(bucket_usage) = usage.buckets_usage.get(bucket) {
                 info!("  attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
                 if bucket_usage.objects_count == 0 {
                     found_zero = true;
@@ -172,7 +191,8 @@ mod tests {
 
         assert!(
             found_zero,
-            "RT-09b FAIL: bucket object count did not update to 0 after deleting all objects (regression rustfs#5615)"
+            "RT-09b FAIL: bucket object count did not update to 0 after deleting all objects (regression rustfs#5615); last query error: {}",
+            last_query_error.as_deref().unwrap_or("none")
         );
 
         info!("RT-09b PASS: bucket object count updates to 0 after DELETE");
