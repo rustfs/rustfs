@@ -199,7 +199,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
@@ -1407,7 +1407,7 @@ where
 }
 
 struct GetObjectStreamingReader<R> {
-    inner: R,
+    inner: Option<R>,
     bucket: String,
     key: String,
     // request_id + optional content_range are only used for diagnostic correlation and
@@ -1440,7 +1440,7 @@ impl<R> GetObjectStreamingReader<R> {
         resume: Option<GetObjectResumeControl<R>>,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             bucket: bucket.to_string(),
             key: key.to_string(),
             request_id: request_id.to_string(),
@@ -1511,6 +1511,14 @@ impl<R> GetObjectStreamingReader<R> {
         )
     }
 
+    fn begin_resume(&mut self, error: std::io::Error) {
+        let Some(resume) = self.resume.as_mut() else {
+            return;
+        };
+        self.inner.take();
+        resume.begin(error);
+    }
+
     // Drive the armed resume flow: backoff ticks gate each reopen attempt, and
     // a successful reopen swaps the failed stream out for the replacement.
     fn poll_resume(&mut self, cx: &mut Context<'_>) -> GetObjectResumePoll {
@@ -1555,24 +1563,7 @@ impl<R> GetObjectStreamingReader<R> {
                     };
                     match poll {
                         Poll::Ready(Ok(reader)) => {
-                            // The replacement stream is swapped in only fully opened
-                            // (metadata re-resolved, identity verified, disk admission
-                            // held); the failed stream is dropped here, after the
-                            // swap. The namespace read lock is write-preferring, so a
-                            // queued writer between the old read guard and the reopen's
-                            // read acquisition would deadlock the swap — the overlap is
-                            // only safe because it cannot hold two guards today: the
-                            // lock optimization drops the read guard at open, and with
-                            // it disabled the duplex pump self-releases at EOF before a
-                            // resume arms while typed errors only surface on the
-                            // guardless codec path. If typed errors ever propagate
-                            // through the duplex pump, the failed stream must be
-                            // dropped at `begin` instead of here. The old stream's
-                            // admission token likewise stays held while the reopen
-                            // acquires its own; admission and stall timeouts bound
-                            // that overlap, so a permit-saturated rebalance storm fails
-                            // the body closed instead of convoying indefinitely.
-                            self.inner = reader;
+                            self.inner = Some(reader);
                             break GetObjectResumePoll::Resumed {
                                 attempts: resume.attempts,
                             };
@@ -1651,7 +1642,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
             if self.resume_in_flight() {
                 match self.poll_resume(cx) {
                     GetObjectResumePoll::Resumed { attempts } => {
-                        info!(
+                        debug!(
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
@@ -1696,7 +1687,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                 }
             }
 
-            match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            let Some(inner) = self.inner.as_mut() else {
+                self.finish_err();
+                return Poll::Ready(Err(std::io::Error::other(
+                    "get object streaming reader lost its active read outside resume",
+                )));
+            };
+            match Pin::new(inner).poll_read(cx, buf) {
                 Poll::Ready(Ok(())) => {
                     self.timer = None;
                     let produced = buf.filled().len().saturating_sub(filled_before);
@@ -1751,8 +1748,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         // surfaces the object data vanishing mid-stream (typed
                         // errors do not survive that pump), so arm the resume
                         // flow before failing loudly when one is attached.
-                        if let Some(resume) = self.resume.as_mut() {
-                            resume.begin(error);
+                        if self.resume.is_some() {
+                            self.begin_resume(error);
                             continue;
                         }
                         warn!(
@@ -1783,11 +1780,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     // object data mid-stream: reopen and continue instead of
                     // failing the download. The error is only intercepted before
                     // the committed body length has been fully delivered.
-                    if self.emitted < self.expected
-                        && is_object_relocation_error(&err)
-                        && let Some(resume) = self.resume.as_mut()
-                    {
-                        resume.begin(err);
+                    if self.emitted < self.expected && is_object_relocation_error(&err) && self.resume.is_some() {
+                        self.begin_resume(err);
                         continue;
                     }
                     let failure_reason = Self::classify_read_error(&err);
@@ -4951,7 +4945,7 @@ impl DefaultObjectUsecase {
         Ok(ResponseChecksums::default())
     }
     #[allow(clippy::too_many_arguments)]
-    async fn build_get_object_body<R>(
+    async fn build_get_object_body<R, F>(
         final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
@@ -4967,10 +4961,11 @@ impl DefaultObjectUsecase {
         bucket: &str,
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
-        resume: Option<GetObjectResumeControl<R>>,
+        resume: F,
     ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
+        F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<R>>,
     {
         if encryption_applied {
             let should_buffer_encrypted_object =
@@ -5013,7 +5008,7 @@ impl DefaultObjectUsecase {
                 bucket,
                 key,
                 lifecycle,
-                resume,
+                resume(info),
             ));
         }
 
@@ -5091,12 +5086,12 @@ impl DefaultObjectUsecase {
             bucket,
             key,
             lifecycle,
-            resume,
+            resume(info),
         ))
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_get_object_body_with_cache<R>(
+    async fn build_get_object_body_with_cache<R, F>(
         cache_adapter: &ObjectDataCacheAdapter,
         final_stream: R,
         info: &ObjectInfo,
@@ -5116,10 +5111,11 @@ impl DefaultObjectUsecase {
         bucket: &str,
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
-        resume: Option<GetObjectResumeControl<R>>,
+        resume: F,
     ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
+        F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<R>>,
     {
         // ODC-16 (backlog#1121): when the ecstore hook or shared cold fill
         // already supplied this body, the request-level plan was built before
@@ -6097,7 +6093,7 @@ impl DefaultObjectUsecase {
         result
     }
     #[allow(clippy::too_many_arguments)]
-    async fn build_get_object_output_context(
+    async fn build_get_object_output_context<F>(
         &self,
         req: &S3Request<GetObjectInput>,
         manager: &ConcurrencyManager,
@@ -6128,8 +6124,11 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         versioned: bool,
         lifecycle: GetObjectBodyLifecycle,
-        resume: Option<GetObjectResumeControl<DynReader>>,
-    ) -> S3Result<GetObjectOutputContext> {
+        resume: F,
+    ) -> S3Result<GetObjectOutputContext>
+    where
+        F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<DynReader>>,
+    {
         let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
@@ -6395,21 +6394,6 @@ impl DefaultObjectUsecase {
             final_stream
         };
 
-        // Reopen parameters for a mid-stream resume: rebalance/decommission
-        // can delete the pinned object data while the body is streaming, and
-        // the resume flow transparently continues from the emitted offset when
-        // the reopened object still carries the committed version identity.
-        let resume = get_object_resume_control(GetObjectResumeContext::new(
-            store,
-            &bucket,
-            &key,
-            opts.clone(),
-            &req.headers,
-            &info,
-            resume_range_start,
-            resume_range_end,
-        ));
-
         // Clone ObjectInfo for event notification only when an event will
         // actually be built — the clone is expensive for multipart objects.
         let event_info = helper.wants_object_info().then(|| info.clone());
@@ -6446,7 +6430,18 @@ impl DefaultObjectUsecase {
                 part_number,
                 opts.versioned,
                 lifecycle,
-                Some(resume),
+                |info| {
+                    Some(get_object_resume_control(GetObjectResumeContext::new(
+                        store,
+                        &bucket,
+                        &key,
+                        opts,
+                        &req.headers,
+                        info,
+                        resume_range_start,
+                        resume_range_end,
+                    )))
+                },
             )
             .await;
         let output_context = match output_context {
@@ -10944,7 +10939,7 @@ mod tests {
             "bucket",
             "object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("reservation bypass must construct the normal streaming fallback");
@@ -12087,6 +12082,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_object_streaming_reader_fails_closed_without_active_reader() {
+        use tokio::io::AsyncReadExt;
+
+        let mut reader = GetObjectStreamingReader::new(
+            cursor_reader(b"x"),
+            "test-bucket",
+            "missing-reader-object",
+            "req-missing-reader",
+            None,
+            1,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        );
+        reader.inner.take();
+
+        let err = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("an impossible missing active reader must fail closed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "get object streaming reader lost its active read outside resume");
+    }
+
+    #[tokio::test]
     async fn put_object_body_read_timeout_guard_aborts_on_stall() {
         // Inner stream never yields and never reports EOF (a proxy that forwarded
         // a partial body then went silent while holding the connection open).
@@ -12337,6 +12358,80 @@ mod tests {
             assert_eq!(out, b"hello world");
             assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_object_streaming_reader_releases_failed_disk_permit_before_reopen() {
+        use tokio::io::AsyncReadExt;
+
+        let manager = Arc::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 0));
+        let initial_permit = match manager
+            .admit_disk_read(Duration::ZERO)
+            .await
+            .expect("test disk admission must remain open")
+        {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("initial read must hold the only primary permit, got {other:?}"),
+        };
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let reopen: GetObjectReopen<DiskReadPermitReader<FailAtEndReader>> = Box::new({
+            let manager = Arc::clone(&manager);
+            let reopen_count = Arc::clone(&reopen_count);
+            move |emitted| {
+                assert_eq!(emitted, 6, "resume must reopen at the emitted offset");
+                reopen_count.fetch_add(1, Ordering::Relaxed);
+                let manager = Arc::clone(&manager);
+                Box::pin(async move {
+                    match manager
+                        .admit_disk_read(Duration::from_millis(1))
+                        .await
+                        .map_err(|_| GetObjectResumeFailure::Fatal)?
+                    {
+                        DiskReadAdmission::Primary(permit) => {
+                            Ok(DiskReadPermitReader::new(FailAtEndReader::new(b"world", None), permit.into()))
+                        }
+                        _ => Err(GetObjectResumeFailure::Retryable),
+                    }
+                })
+            }
+        });
+        let control = GetObjectResumeControl::new(
+            reopen,
+            RetryTimer::new(
+                GET_OBJECT_RESUME_MAX_ATTEMPTS,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                rustfs_utils::retry::NO_JITTER,
+                0,
+            ),
+        );
+        let initial_reader =
+            DiskReadPermitReader::new(FailAtEndReader::new(b"hello ", Some(relocation_read_error())), initial_permit.into());
+        let mut reader = GetObjectStreamingReader::new(
+            initial_reader,
+            "test-bucket",
+            "relocated-object",
+            "req-resume-single-permit",
+            None,
+            11,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        );
+        let mut out = Vec::new();
+
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("resume must not wait on the failed reader's permit");
+
+        assert_eq!(out, b"hello world");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager.io_queue_status().permits_in_use,
+            0,
+            "the replacement reader must release its permit at EOF"
+        );
     }
 
     #[tokio::test]
@@ -12771,7 +12866,8 @@ mod tests {
         let mut parts = Vec::new();
         let mut body = Vec::with_capacity(part_size * part_count);
         for part_id in 1..=part_count {
-            let part_body = vec![fill; part_size];
+            let part_fill = fill.wrapping_add(u8::try_from(part_id - 1).expect("test part index must fit u8"));
+            let part_body = vec![part_fill; part_size];
             body.extend_from_slice(&part_body);
             let mut reader = PutObjReader::from_vec(part_body);
             let part = store
@@ -12898,6 +12994,112 @@ mod tests {
             attempts,
             usize::try_from(GET_OBJECT_RESUME_MAX_ATTEMPTS).expect("resume budget fits usize"),
             "resume must exhaust its reopen budget before failing"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_get_object_resumes_from_relocated_pool_without_splicing_body() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (_temp_dir, pool_disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("multi-pool resume test requires an ambient AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("resume-relocate-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create multi-pool resume bucket");
+        let part_size = 24 * 1024 * 1024;
+        let body = put_real_multipart_object(&store, &bucket, object, part_size, 3, 0xA5).await;
+        let upload_pool = pool_disk_paths
+            .iter()
+            .position(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.join(&bucket).join(object).join("xl.meta").is_file())
+            })
+            .expect("multipart object must be placed in one source pool");
+        if upload_pool != 0 {
+            for (source_disk, target_disk) in pool_disk_paths[upload_pool].iter().zip(&pool_disk_paths[0]) {
+                std::fs::rename(source_disk.join(&bucket).join(object), target_disk.join(&bucket).join(object))
+                    .expect("normalize the test object into the old pool");
+            }
+        }
+        let source_pool = 0;
+        let target_pool = 1;
+
+        // Stage the relocated data before the GET, but publish xl.meta only
+        // after the initial reader opens. This mirrors rebalance's data-first,
+        // metadata-last ordering and guarantees the first reader uses the
+        // source pool while its later parts are already unavailable.
+        for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
+            let source_dir = source_disk.join(&bucket).join(object);
+            let target_dir = target_disk.join(&bucket).join(object);
+            std::fs::create_dir_all(&target_dir).expect("create relocated target object directory");
+            for entry in std::fs::read_dir(&source_dir).expect("read source object directory") {
+                let entry = entry.expect("read source object entry");
+                if !entry.file_type().expect("read source object entry type").is_dir() {
+                    continue;
+                }
+                let target_entry = target_dir.join(entry.file_name());
+                std::fs::create_dir_all(&target_entry).expect("create relocated target data directory");
+                for child in std::fs::read_dir(entry.path()).expect("read source object data directory") {
+                    let child = child.expect("read source object data entry");
+                    std::fs::copy(child.path(), target_entry.join(child.file_name())).expect("copy relocated object data entry");
+                }
+            }
+        }
+        let deleted = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
+        assert_eq!(deleted, pool_disk_paths[source_pool].len() * 2);
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("multi-pool resume GET input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let mut response = usecase
+            .execute_get_object(build_request(input, Method::GET))
+            .await
+            .expect("multi-pool GET must commit its response");
+        let mut response_body = response
+            .output
+            .body
+            .take()
+            .expect("multi-pool GET response must include a body");
+        for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
+            let source_meta = source_disk.join(&bucket).join(object).join("xl.meta");
+            std::fs::copy(&source_meta, target_disk.join(&bucket).join(object).join("xl.meta"))
+                .expect("publish relocated object metadata");
+            std::fs::remove_file(source_meta).expect("remove relocated source object metadata");
+        }
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the relocated object must resolve from the target pool");
+
+        let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
+        let mut collected = Vec::new();
+        while let Some(chunk) = response_body.next().await {
+            match chunk {
+                Ok(chunk) => collected.extend_from_slice(&chunk),
+                Err(err) => panic!(
+                    "relocated GET from pool {source_pool} must resume from pool {target_pool} after {} attempts: {err:?}",
+                    GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed) - attempts_before
+                ),
+            }
+        }
+
+        assert_eq!(collected, body, "resumed production GET must preserve the complete body byte-for-byte");
+        assert_eq!(
+            GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed) - attempts_before,
+            1,
+            "the relocated body must reopen exactly once"
         );
     }
 
@@ -13249,7 +13451,7 @@ mod tests {
             "test-bucket",
             "large-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("build_get_object_body should succeed for streaming path");
@@ -13288,7 +13490,7 @@ mod tests {
             "test-bucket",
             "large-encrypted-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("build_get_object_body should succeed for encrypted streaming path");
@@ -13327,7 +13529,7 @@ mod tests {
             "test-bucket",
             "direct-memory-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| panic!("a buffered body must not initialize streaming resume state"),
         )
         .await
         .expect("build_get_object_body should consume buffered body");
@@ -13393,7 +13595,7 @@ mod tests {
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| panic!("a cache hit must not initialize streaming resume state"),
         )
         .await
         .expect("cache hit body handoff should succeed");
@@ -13457,7 +13659,7 @@ mod tests {
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("size-mismatched direct fill should not create a cache hit");
@@ -13520,7 +13722,7 @@ mod tests {
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("buffered-body handoff should succeed");
@@ -13549,7 +13751,7 @@ mod tests {
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("follow-up cache hit should succeed");
@@ -13617,7 +13819,7 @@ mod tests {
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("size-mismatched buffered-body handoff should still return a response body");
@@ -13702,7 +13904,7 @@ mod tests {
             "test-bucket",
             "hook-served",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("hook-served body handoff should succeed");
@@ -13763,7 +13965,7 @@ mod tests {
             "test-bucket",
             "hook-missed",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("hook-miss buffered-body handoff should succeed");
@@ -13826,7 +14028,7 @@ mod tests {
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("materialize-fill handoff should succeed");
@@ -13855,7 +14057,7 @@ mod tests {
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("follow-up cache hit should succeed");
@@ -13918,7 +14120,7 @@ mod tests {
             "test-bucket",
             "mismatch-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await;
 
@@ -13974,7 +14176,7 @@ mod tests {
             "test-bucket",
             "short-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await;
 
@@ -14028,7 +14230,7 @@ mod tests {
             "test-bucket",
             "partial-read-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await;
 
@@ -14069,7 +14271,7 @@ mod tests {
             "test-bucket",
             "short-buffered-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await;
 
@@ -14113,7 +14315,7 @@ mod tests {
             "test-bucket",
             "exact-buffered-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| panic!("an exact-length buffered body must not initialize streaming resume state"),
         )
         .await
         .expect("an exact-length buffered body must serve without error");
@@ -14168,7 +14370,7 @@ mod tests {
             "test-bucket",
             "too-large-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("too-large cache candidate should use streaming fallback");
@@ -14207,7 +14409,7 @@ mod tests {
             "test-bucket",
             "small-plain-object",
             GetObjectBodyLifecycle::disabled(),
-            None,
+            |_| None,
         )
         .await
         .expect("build_get_object_body should keep small plain object on streaming path");
@@ -14950,7 +15152,7 @@ mod tests {
                 info.clone(),
                 Some(info),
                 wrap_reader(tokio::io::empty()),
-                None,
+                Some(Bytes::new()),
                 false,
                 false,
                 true,
@@ -14972,7 +15174,7 @@ mod tests {
                 None,
                 false,
                 GetObjectBodyLifecycle::disabled(),
-                None,
+                |_| panic!("a buffered output must not initialize streaming resume state"),
             )
             .await
             .expect("get object output context");
