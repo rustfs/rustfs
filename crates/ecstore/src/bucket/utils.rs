@@ -269,6 +269,32 @@ pub fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
     check_bucket_and_object_names(bucket, object)
 }
 
+/// Filesystem `NAME_MAX`: every object-key path segment becomes one on-disk
+/// directory entry, so a longer segment can never be stored and previously
+/// escaped as an `ENAMETOOLONG` io error → `InternalError` 500 (rustfs#5785).
+const MAX_OBJECT_KEY_SEGMENT_BYTES: usize = 255;
+
+/// Reject object keys whose on-disk directory names would exceed `NAME_MAX`.
+///
+/// Middle segments map to their raw bytes; the final segment of a
+/// directory-object key (trailing `/`) is stored with the `__XLDIR__` suffix
+/// appended, shrinking its budget accordingly.
+fn object_key_segments_fit_on_disk(object: &str) -> bool {
+    let trailing_dir = object.ends_with('/');
+    let segments: Vec<&str> = object.split('/').collect();
+    let last_nonempty = segments.iter().rposition(|s| !s.is_empty());
+    for (index, segment) in segments.iter().enumerate() {
+        let mut budget = MAX_OBJECT_KEY_SEGMENT_BYTES;
+        if trailing_dir && Some(index) == last_nonempty {
+            budget = budget.saturating_sub(rustfs_utils::path::GLOBAL_DIR_SUFFIX.len());
+        }
+        if segment.len() > budget {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(StorageError::BucketNameInvalid(bucket.to_string()));
@@ -279,6 +305,10 @@ pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     }
 
     if !is_valid_object_prefix(object) {
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
+    }
+
+    if !object_key_segments_fit_on_disk(object) {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
@@ -386,6 +416,37 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// rustfs#5785: keys whose path segments exceed the on-disk NAME_MAX
+    /// budget must be rejected up front as ObjectNameInvalid (4xx), not leak
+    /// ENAMETOOLONG as InternalError 500 from the disk layer.
+    #[test]
+    fn object_key_segment_name_max_budget() {
+        // 255-byte single segment: exactly at the on-disk limit.
+        assert!(check_bucket_and_object_names("bucket", &"a".repeat(255)).is_ok());
+        // 256 bytes: one over.
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &"a".repeat(256)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        // Long keys are fine as long as every segment fits.
+        let segmented = ["b".repeat(200), "c".repeat(200), "d".repeat(200)].join("/");
+        assert!(check_bucket_and_object_names("bucket", &segmented).is_ok());
+        // The budget counts bytes, not characters (100 CJK chars = 300 bytes).
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &"中".repeat(100)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        assert!(check_bucket_and_object_names("bucket", &"中".repeat(85)).is_ok());
+        // Directory-object keys spend GLOBAL_DIR_SUFFIX bytes of the final
+        // segment's budget on the on-disk __XLDIR__ encoding.
+        let dir_budget = 255 - rustfs_utils::path::GLOBAL_DIR_SUFFIX.len();
+        assert!(check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget))).is_ok());
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+    }
 
     // Test validation functions
     #[test]
