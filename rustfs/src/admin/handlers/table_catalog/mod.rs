@@ -3864,8 +3864,12 @@ fn apply_remove_properties_update(metadata: &mut serde_json::Value, update: &ser
 }
 
 fn append_previous_metadata_log(metadata: &mut serde_json::Value, previous_metadata_location: &str) -> S3Result<()> {
+    let previous_metadata_timestamp = metadata
+        .get("last-updated-ms")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "current table metadata is missing last-updated-ms"))?;
     ensure_array_field(metadata, "metadata-log")?.push(serde_json::json!({
-        "timestamp-ms": current_time_millis(),
+        "timestamp-ms": previous_metadata_timestamp,
         "metadata-file": previous_metadata_location
     }));
     Ok(())

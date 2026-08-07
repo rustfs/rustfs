@@ -2102,6 +2102,7 @@ async fn standard_commit_applies_updates_and_writes_next_metadata() {
     assert_eq!(commit.metadata["last-sequence-number"], 1);
     assert_eq!(commit.metadata["refs"]["main"]["snapshot-id"], 10);
     assert_eq!(commit.metadata["metadata-log"][0]["metadata-file"], created.metadata_location);
+    assert_eq!(commit.metadata["metadata-log"][0]["timestamp-ms"], created.metadata["last-updated-ms"]);
     let committed = store
         .load_table("warehouse", "analytics", "events")
         .await
