@@ -3328,7 +3328,8 @@ mod tests {
         let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
         let (service, source) = super::make_heal_control_server_for_source();
         *source.write().await = Some(endpoints);
-        let probe_command = rustfs_protos::cross_pool_fence_capability_probe(&[7; 16]);
+        let mut probe_command = rustfs_protos::CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.to_vec();
+        probe_command.extend_from_slice(&[7; 16]);
 
         let unauthenticated = Request::new(HealControlRequest {
             version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
@@ -3381,9 +3382,9 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        let (supported_version, topology_member, process_epoch) =
-            rustfs_protos::decode_cross_pool_fence_capability(&response.result).expect("capability response should decode");
-        assert_eq!(supported_version, 0);
+        assert_eq!(&response.result[..4], &0_u32.to_be_bytes());
+        let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
+            .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");
         assert!(
             !Uuid::from_slice(process_epoch)
@@ -3401,7 +3402,8 @@ mod tests {
         crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
             .expect("outer proof should bind the response to the request");
 
-        let different_probe = rustfs_protos::cross_pool_fence_capability_probe(&[8; 16]);
+        let mut different_probe = rustfs_protos::CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.to_vec();
+        different_probe.extend_from_slice(&[8; 16]);
         let different_response = rustfs_protos::canonical_heal_control_response_body(
             rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
             &fingerprint,
