@@ -26,7 +26,9 @@
 //! Later batches tracked on backlog#1154: config get/set, info, pools status,
 //! group lifecycle, import/export IAM.
 
-use crate::common::{RustFSTestEnvironment, admin_ok, admin_request, init_logging};
+use crate::common::{
+    RustFSTestEnvironment, admin_ok, admin_request, admin_request_with_session_token, build_test_sts_client, init_logging,
+};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
@@ -85,6 +87,255 @@ fn bucket_rw_policy(bucket: &str) -> String {
         }]
     })
     .to_string()
+}
+
+async fn create_user_with_service_account_update_policy(
+    env: &RustFSTestEnvironment,
+    user: &str,
+    secret: &str,
+    policy: &str,
+) -> TestResult {
+    admin_ok(
+        env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={user}"),
+        Some(serde_json::json!({ "secretKey": secret, "status": "enabled" }).to_string()),
+    )
+    .await?;
+    admin_ok(
+        env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-canned-policy?name={policy}"),
+        Some(
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["admin:UpdateServiceAccount"]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sts:AssumeRole"],
+                        "Resource": ["arn:aws:s3:::*"]
+                    }
+                ]
+            })
+            .to_string(),
+        ),
+    )
+    .await?;
+    admin_ok(
+        env,
+        http::Method::POST,
+        "/rustfs/admin/v3/idp/builtin/policy/attach",
+        Some(serde_json::json!({ "policies": [policy], "user": user }).to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_service_account_for(
+    env: &RustFSTestEnvironment,
+    parent: &str,
+) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let response = admin_ok(
+        env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/add-service-accounts",
+        Some(serde_json::json!({ "targetUser": parent }).to_string()),
+    )
+    .await?;
+    let response: serde_json::Value = serde_json::from_str(&response)?;
+    let access_key = response["credentials"]["accessKey"]
+        .as_str()
+        .ok_or("service account response should contain credentials.accessKey")?
+        .to_owned();
+    let secret_key = response["credentials"]["secretKey"]
+        .as_str()
+        .ok_or("service account response should contain credentials.secretKey")?
+        .to_owned();
+    Ok((access_key, secret_key))
+}
+
+async fn assert_admin_status(
+    env: &RustFSTestEnvironment,
+    credentials: (&str, &str, Option<&str>),
+    path: &str,
+    body: String,
+    expected: StatusCode,
+    context: &str,
+) -> TestResult {
+    let (access_key, secret_key, session_token) = credentials;
+    let (status, response) =
+        admin_request_with_session_token(&env.url, http::Method::POST, path, Some(body), access_key, secret_key, session_token)
+            .await?;
+    assert_eq!(status, expected, "{context}: got {status}: {response}");
+    if expected == StatusCode::FORBIDDEN {
+        assert!(response.contains("AccessDenied"), "{context}: expected AccessDenied body, got {response}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestResult {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let parent = "updateparent";
+    let parent_secret = "updateparentsecret";
+    let outsider = "updateoutsider";
+    let outsider_secret = "updateoutsidersecret";
+    let ordinary = "updateordinary";
+    let ordinary_secret = "updateordinarysecret";
+    create_user_with_service_account_update_policy(&env, parent, parent_secret, "update-parent-policy").await?;
+    create_user_with_service_account_update_policy(&env, outsider, outsider_secret, "update-outsider-policy").await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={ordinary}"),
+        Some(serde_json::json!({ "secretKey": ordinary_secret, "status": "enabled" }).to_string()),
+    )
+    .await?;
+
+    let (target_access_key, _) = create_service_account_for(&env, parent).await?;
+    let target_path = format!("/rustfs/admin/v3/update-service-account?accessKey={target_access_key}");
+
+    assert_admin_status(
+        &env,
+        (&env.access_key, &env.secret_key, None),
+        &target_path,
+        serde_json::json!({}).to_string(),
+        StatusCode::NO_CONTENT,
+        "root no-op update across parents must succeed",
+    )
+    .await?;
+
+    let custom_policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": ["arn:aws:s3:::update-scope/*"]
+        }]
+    });
+    assert_admin_status(
+        &env,
+        (&env.access_key, &env.secret_key, None),
+        &target_path,
+        serde_json::json!({ "newPolicy": custom_policy }).to_string(),
+        StatusCode::NO_CONTENT,
+        "root implied-to-custom update across parents must succeed",
+    )
+    .await?;
+
+    assert_admin_status(
+        &env,
+        (parent, parent_secret, None),
+        &target_path,
+        serde_json::json!({ "newDescription": "updated by parent" }).to_string(),
+        StatusCode::NO_CONTENT,
+        "parent with UpdateServiceAccount may update its own service account",
+    )
+    .await?;
+
+    let takeover = serde_json::json!({
+        "newSecretKey": "cross-parent-takeover-secret",
+        "newDescription": "cross-parent takeover"
+    })
+    .to_string();
+    assert_admin_status(
+        &env,
+        (ordinary, ordinary_secret, None),
+        &target_path,
+        takeover.clone(),
+        StatusCode::FORBIDDEN,
+        "ordinary user must not update another parent's service account",
+    )
+    .await?;
+    assert_admin_status(
+        &env,
+        (outsider, outsider_secret, None),
+        &target_path,
+        takeover.clone(),
+        StatusCode::FORBIDDEN,
+        "non-owner with UpdateServiceAccount must not update across parents",
+    )
+    .await?;
+
+    let (derived_access_key, derived_secret_key) = create_service_account_for(&env, outsider).await?;
+    assert_admin_status(
+        &env,
+        (&derived_access_key, &derived_secret_key, None),
+        &target_path,
+        takeover.clone(),
+        StatusCode::FORBIDDEN,
+        "service-account credential must not update across parents",
+    )
+    .await?;
+
+    let assumed = build_test_sts_client(&env.url, outsider, outsider_secret, None, "e2e-admin-update-service-account")
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/update-service-account")
+        .role_session_name("update-service-account-scope")
+        .send()
+        .await?;
+    let temporary = assumed
+        .credentials()
+        .ok_or("AssumeRole response should contain credentials")?;
+    assert_admin_status(
+        &env,
+        (temporary.access_key_id(), temporary.secret_access_key(), Some(temporary.session_token())),
+        &target_path,
+        takeover,
+        StatusCode::FORBIDDEN,
+        "temporary credential must not update across parents",
+    )
+    .await?;
+
+    let info = admin_ok(
+        &env,
+        http::Method::GET,
+        &format!("/rustfs/admin/v3/info-service-account?accessKey={target_access_key}"),
+        None,
+    )
+    .await?;
+    let info: serde_json::Value = serde_json::from_str(&info)?;
+    assert_eq!(
+        info["impliedPolicy"].as_bool(),
+        Some(false),
+        "root update must replace the implied policy with a custom policy"
+    );
+    assert!(
+        info["policy"].as_str().is_some_and(|policy| policy.contains("s3:GetObject")),
+        "custom policy must round-trip through the handler: {info}"
+    );
+    assert_eq!(
+        info["description"].as_str(),
+        Some("updated by parent"),
+        "denied takeover attempts must not mutate target"
+    );
+
+    let (missing_status, missing_body) = admin_request(
+        &env.url,
+        http::Method::POST,
+        "/rustfs/admin/v3/update-service-account?accessKey=missing-service-account",
+        Some(serde_json::json!({}).to_string()),
+        &env.access_key,
+        &env.secret_key,
+    )
+    .await?;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "missing target must fail closed: {missing_body}");
+    assert!(
+        missing_body.contains("NoSuchResource"),
+        "missing target must preserve the lookup error: {missing_body}"
+    );
+
+    env.stop_server();
+    Ok(())
 }
 
 /// Full user -> policy -> service-account lifecycle, proving each management
