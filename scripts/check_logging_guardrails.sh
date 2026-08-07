@@ -857,6 +857,11 @@ if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Hea
   exit 1
 fi
 
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
+  exit 1
+fi
+
 demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
 if [[ "$demoted_task_sites" -lt 4 ]]; then
   echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2

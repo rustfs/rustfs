@@ -214,6 +214,19 @@ pub(crate) mod runtime {
     ) -> Result<(), crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::init_local_disks(endpoint_pools).await
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_instance_ctx() -> Arc<crate::storage::storage_api::InstanceContext> {
+        crate::storage::storage_api::new_instance_ctx()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn init_local_disks_with_instance_ctx(
+        instance_ctx: &Arc<crate::storage::storage_api::InstanceContext>,
+        endpoint_pools: crate::storage::storage_api::EndpointServerPools,
+    ) -> Result<(), crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools).await
+    }
 }
 
 pub(crate) mod runtime_sources {
