@@ -10111,6 +10111,7 @@ version = "1.0.0-beta.12"
 dependencies = [
  "async-recursion",
  "async-trait",
+ "bytes",
  "datafusion",
  "derive_builder",
  "futures",
