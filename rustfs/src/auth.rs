@@ -1390,6 +1390,19 @@ mod tests {
     }
 
     #[test]
+    fn version_id_condition_ignores_spoofed_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("versionid", "spoofed-version".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        assert_eq!(conditions.get("versionid"), None);
+
+        let conditions = get_condition_values(&headers, &cred, Some("server-version"), None, None);
+        assert_eq!(conditions.get("versionid"), Some(&vec!["server-version".to_string()]));
+    }
+
+    #[test]
     fn ghsa_6r96_claim_condition_keys_ignore_spoofed_headers() {
         // The credential carries no groups/roles claims, so these keys are absent --
         // precisely the case a spoofed header would otherwise fill in.
