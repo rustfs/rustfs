@@ -2442,7 +2442,7 @@ mod tests {
                 json_field: "batch_read_version_resps",
                 bin_field: "batch_read_version_resps_bin",
             },
-            json_encoder: "compat_response_json(batch_read_version_resp, false)",
+            json_encoder: "compat_response_json(batch_read_version_resp, request_decoded_from_msgpack)",
         },
         ResponseCompatSendSite {
             field: CompatPayloadField {
