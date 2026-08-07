@@ -183,6 +183,7 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, key_id: &str) {
         .await
         .expect("decrypt with a disabled key must keep working");
     assert_eq!(decrypted.plaintext, data_key.plaintext_key, "decrypt must recover the original data key");
+    assert_eq!(decrypted.key_id, key_id, "decrypt must report the master key that opened the envelope");
     // ...disable stays idempotent, cancel has nothing to cancel, and enable recovers.
     backend.disable_key(key_id).await.expect("disable must be idempotent");
     expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "not pending deletion");

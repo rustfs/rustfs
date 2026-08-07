@@ -33,7 +33,7 @@
 
 mod common;
 
-use common::{BackendCase, BackendKind, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload};
+use common::{BackendCase, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload};
 use rustfs_kms::{
     DecryptRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KmsError, ObjectEncryptionContext, is_data_key_envelope,
 };
@@ -259,55 +259,51 @@ async fn data_key_spec_controls_the_length_of_the_generated_key() {
         // A backend that accepts a `key_spec` must honour it. Silently
         // returning a different size means the caller builds a cipher from
         // material it did not ask for, and the envelope records a spec its
-        // payload does not match.
-        // ChaCha20 material is 32 random bytes, exactly like AES_256, so a
-        // backend that mints DEKs itself has no technical reason to refuse it.
-        // Static accepts it; Local and both Vault backends route through
-        // `generate_key_material`, which only knows the two AES specs. That
-        // split is pinned per backend rather than tolerated on both sides: a
-        // blanket "honoured or refused" contract would accept a backend
-        // regressing from working into refusing, which is exactly how a
-        // silently dropped spec would ship.
+        // payload does not match. Every backend in this matrix mints DEKs via
+        // the shared `generate_key_material`, so all three specs must be
+        // honoured; tolerating a refusal would accept a backend regressing
+        // out of that shared mapping.
         for spec in [KeySpec::Aes256, KeySpec::Aes128, KeySpec::ChaCha20] {
-            let must_be_honoured = spec != KeySpec::ChaCha20 || case.kind() == BackendKind::Static;
-            match manager
+            let generated = manager
                 .generate_data_key(GenerateDataKeyRequest {
                     key_id: case.key_id.clone(),
                     key_spec: spec.clone(),
                     encryption_context: context(),
                 })
                 .await
-            {
-                Ok(generated) => assert_eq!(
-                    generated.plaintext_key.len(),
-                    spec.key_size(),
-                    "[{label}] {spec:?} must yield a {}-byte data key",
-                    spec.key_size()
-                ),
-                Err(KmsError::UnsupportedAlgorithm { .. }) if !must_be_honoured => {}
-                Err(error) => panic!("[{label}] {spec:?} must yield a {}-byte data key: {error:?}", spec.key_size()),
-            }
+                .unwrap_or_else(|error| panic!("[{label}] {spec:?} must yield a data key: {error:?}"));
+            assert_eq!(
+                generated.plaintext_key.len(),
+                spec.key_size(),
+                "[{label}] {spec:?} must yield a {}-byte data key",
+                spec.key_size()
+            );
+            assert_eq!(
+                generated.key_id, case.key_id,
+                "[{label}] {spec:?} must name the master key that wrapped the DEK"
+            );
+
+            // The envelope must record the spec it was minted under, or a
+            // reader can no longer tell what the wrapped material is.
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&generated.ciphertext_blob).expect("ciphertext must be a KMS envelope");
+            assert_eq!(
+                envelope.get("key_spec").and_then(|value| value.as_str()),
+                Some(spec.as_str()),
+                "[{label}] the envelope must record the requested spec"
+            );
+
+            // Whatever the length, the blob still round-trips.
+            let decrypted = manager
+                .decrypt(DecryptRequest {
+                    ciphertext: generated.ciphertext_blob,
+                    encryption_context: context(),
+                    grant_tokens: Vec::new(),
+                })
+                .await
+                .unwrap_or_else(|error| panic!("[{label}] {spec:?} blob should decrypt: {error:?}"));
+            assert_eq!(decrypted.plaintext, generated.plaintext_key);
         }
-
-        let aes128 = manager
-            .generate_data_key(GenerateDataKeyRequest {
-                key_id: case.key_id.clone(),
-                key_spec: KeySpec::Aes128,
-                encryption_context: context(),
-            })
-            .await
-            .unwrap_or_else(|error| panic!("[{label}] AES-128 generate should succeed: {error:?}"));
-
-        // Whatever the length, the blob still round-trips.
-        let decrypted = manager
-            .decrypt(DecryptRequest {
-                ciphertext: aes128.ciphertext_blob,
-                encryption_context: context(),
-                grant_tokens: Vec::new(),
-            })
-            .await
-            .unwrap_or_else(|error| panic!("[{label}] AES-128 blob should decrypt: {error:?}"));
-        assert_eq!(decrypted.plaintext, aes128.plaintext_key);
     })
     .await;
 }
@@ -344,7 +340,8 @@ async fn corrupt_ciphertext_fails_cleanly() {
         let tampered = flip_middle_bit(&dek.ciphertext_blob);
         assert!(decrypt(tampered).await.is_err(), "[{label}] a bit-flipped envelope must not decrypt");
 
-        // Truncation, emptiness, and non-envelope bytes are all typed errors.
+        // Truncation, emptiness, and non-envelope bytes are unparseable
+        // ciphertext, and every backend reports that as the same error class.
         for (name, input) in [
             ("truncated", dek.ciphertext_blob[..dek.ciphertext_blob.len() / 2].to_vec()),
             ("empty", Vec::new()),
@@ -355,8 +352,8 @@ async fn corrupt_ciphertext_fails_cleanly() {
                 .await
                 .expect_err(&format!("[{label}] {name} input must be rejected"));
             assert!(
-                !matches!(error, KmsError::InternalError { .. }),
-                "[{label}] {name} input must map to a specific error, not InternalError: {error:?}"
+                matches!(error, KmsError::CryptographicError { .. }),
+                "[{label}] {name} input must be rejected as unparseable ciphertext, got: {error:?}"
             );
         }
 
