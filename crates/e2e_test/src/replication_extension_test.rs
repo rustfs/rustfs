@@ -2289,6 +2289,30 @@ async fn site_replication_state_edit(
     Ok(())
 }
 
+/// Start a bucket-level replication resync (`PUT ?replication-reset`) and
+/// return the target `(arn, reset_id)`, asserting the response carries the
+/// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
+/// that `mc replicate resync start` decodes.
+async fn start_bucket_replication_reset(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{bucket}?replication-reset", env.url);
+    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("replication reset start failed: {status} {body}").into());
+    }
+    let payload: serde_json::Value = response.json().await?;
+    let arn = payload["target"][0]["arn"].as_str().unwrap_or_default().to_string();
+    let reset_id = payload["target"][0]["resetid"].as_str().unwrap_or_default().to_string();
+    if arn.is_empty() || reset_id.is_empty() {
+        return Err(format!("replication reset response missing madmin target[0].arn/resetid: {payload}").into());
+    }
+    Ok((arn, reset_id))
+}
+
 async fn get_replication_reset_status(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -4464,14 +4488,74 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
 }
 
 /// backlog#1147 repl-17 / backlog#1291: SSE-S3 must fail closed until managed
-/// encryption is supported on the target. The current plaintext replication is
-/// a known security bug, so this pins the required contract without blessing it.
+/// encryption is supported on the target. The silent plaintext replication
+/// that originally kept this test ignored was fixed by the fail-closed gate in
+/// `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`
+/// (all replication modes route through it), so this now pins the current
+/// fail-closed contract: FAILED status, failure event, readable source, and a
+/// stable absence of all target versions.
 #[tokio::test]
 #[serial]
-#[ignore = "backlog#1291: SSE-S3 replication silently drops encryption"]
 async fn test_bucket_replication_sse_s3_contract() -> TestResult {
     init_logging();
     assert_managed_sse_replication_fails_explicitly("sse-s3", false).await
+}
+
+/// P1-22 stage 0: the existing-object resync path must fail closed for
+/// managed-SSE objects exactly like inline replication (which
+/// `test_bucket_replication_sse_s3_contract` pins, including the scanner heal
+/// re-drive). Resync re-drives every object version through the same
+/// fail-closed target boundary, so a resync over an encrypted bucket must
+/// terminate without ever materializing a plaintext (or unreadable) replica;
+/// the post-resync stays-absent window also spans further fast-scanner heal
+/// cycles.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-resync-contract.txt";
+    let body = b"repl-22 sse resync payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
+
+    // Resync: drive the existing-object resync path over the failed object.
+    let (target_arn, reset_id) = start_bucket_replication_reset(&source_env, &source_bucket).await?;
+    let terminal = wait_for_replication_reset_target(&source_env, &source_bucket, &target_arn, |target| {
+        target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+    assert_eq!(terminal.reset_id, reset_id);
+
+    // The resync pass must have failed closed: still no target version (the
+    // window also spans further scanner heal cycles), and the source object
+    // stays readable and encrypted.
+    assert_failed_replication_stays_absent_for(
+        &source_client,
+        &source_bucket,
+        &target_client,
+        &target_bucket,
+        key,
+        false,
+        Duration::from_secs(5),
+    )
+    .await?;
+    let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
+    assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    Ok(())
 }
 
 /// backlog#1147 repl-17: SSE-KMS currently fails closed rather than creating an
