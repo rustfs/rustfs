@@ -770,6 +770,19 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
