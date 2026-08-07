@@ -172,6 +172,8 @@ pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
+pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const CROSS_POOL_FENCE_PROTOCOL_VERSION: u32 = 1;
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
 pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
@@ -210,6 +212,18 @@ pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
         && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
 }
 
+pub fn cross_pool_fence_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
+    command.len() == CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX)
+}
+
 pub fn encode_remote_version_state_capability(
     topology_member: &str,
     process_epoch: &[u8; 16],
@@ -239,6 +253,28 @@ pub fn decode_remote_version_state_capability(result: &[u8]) -> Result<(&str, &[
         .and_then(|value| value.try_into().ok())
         .ok_or("remote version state process epoch has an invalid length")?;
     Ok((topology_member, process_epoch))
+}
+
+pub fn encode_cross_pool_fence_capability(
+    supported_version: u32,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(4 + identity.len());
+    result.extend_from_slice(&supported_version.to_be_bytes());
+    result.extend_from_slice(&identity);
+    Ok(result)
+}
+
+pub fn decode_cross_pool_fence_capability(result: &[u8]) -> Result<(u32, &str, &[u8; 16]), &'static str> {
+    let supported_version = result
+        .get(..4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or("cross-pool fence capability version is truncated")?;
+    let (topology_member, process_epoch) = decode_remote_version_state_capability(&result[4..])?;
+    Ok((supported_version, topology_member, process_epoch))
 }
 
 /// Builds the stable byte representation authenticated for a heal-control request.
@@ -1700,11 +1736,13 @@ mod scanner_activity_tests {
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
-        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
-        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
-        decode_remote_version_state_capability, encode_remote_version_state_capability, heal_control_capability_probe,
-        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        internode_rpc_timeout, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
+        CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, CROSS_POOL_FENCE_PROTOCOL_VERSION, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX,
+        HEAL_CONTROL_PROTOCOL_VERSION, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack,
+        canonical_heal_control_request_body, canonical_heal_control_response_body, cross_pool_fence_capability_probe,
+        decode_cross_pool_fence_capability, decode_remote_version_state_capability, encode_cross_pool_fence_capability,
+        encode_remote_version_state_capability, heal_control_capability_probe, heal_control_coordinator_epoch,
+        heal_control_execution_timeout, heal_control_execution_timeout_for, internode_rpc_timeout,
+        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
         normalize_internode_rpc_timeout, remote_version_state_capability_probe,
     };
     use crate::heal_control;
@@ -1783,6 +1821,40 @@ mod heal_control_tests {
             encode_remote_version_state_capability("node-a", &[7; 16]).expect("small capability response should encode");
         invalid_utf8[8] = 0xff;
         assert!(decode_remote_version_state_capability(&invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn cross_pool_fence_capability_binds_version_member_and_epoch() {
+        assert_eq!(CROSS_POOL_FENCE_PROTOCOL_VERSION, 1);
+        let probe = cross_pool_fence_capability_probe(&[7; 16]);
+        let mut expected_probe = b"rustfs-cross-pool-fence-capability-v1\0".to_vec();
+        expected_probe.extend_from_slice(&[7; 16]);
+        assert_eq!(probe, expected_probe);
+        assert!(is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_cross_pool_fence_capability_probe(&wrong_prefix));
+
+        let encoded = encode_cross_pool_fence_capability(0x0102_0304, "node-a:9000", &[7; 16])
+            .expect("small capability response should encode");
+        let mut expected_response = vec![1, 2, 3, 4];
+        expected_response.extend_from_slice(&11_u64.to_be_bytes());
+        expected_response.extend_from_slice(b"node-a:9000");
+        expected_response.extend_from_slice(&[7; 16]);
+        assert_eq!(encoded, expected_response);
+        assert_eq!(
+            decode_cross_pool_fence_capability(&encoded).expect("capability response should decode"),
+            (0x0102_0304, "node-a:9000", &[7; 16])
+        );
+        assert_eq!(
+            decode_cross_pool_fence_capability(&encoded[..3]),
+            Err("cross-pool fence capability version is truncated")
+        );
+        assert_eq!(
+            decode_cross_pool_fence_capability(&encoded[..encoded.len() - 1]),
+            Err("remote version state process epoch has an invalid length")
+        );
     }
 
     #[test]

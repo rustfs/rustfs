@@ -153,6 +153,10 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
+// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise an authenticated unsupported
+// state during predeployment. Remove after composite acquisition, activation fencing,
+// and fleet proof ship together.
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -840,7 +844,9 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
                 response_proof: Bytes::new(),
             }));
         }
-        if rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command) {
+        let remote_version_state_probe = rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command);
+        let cross_pool_fence_probe = rustfs_protos::is_cross_pool_fence_capability_probe(&request.get_ref().command);
+        if remote_version_state_probe || cross_pool_fence_probe {
             let topology_member = self
                 .endpoint_pools()
                 .await
@@ -850,9 +856,17 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             if topology_member.is_empty() {
                 return Err(Status::failed_precondition("local topology member identity is unavailable"));
             }
-            let result =
+            let result = if remote_version_state_probe {
                 rustfs_protos::encode_remote_version_state_capability(&topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
-                    .map_err(|_| Status::internal("remote version state capability length cannot be represented"))?;
+                    .map_err(|_| Status::internal("remote version state capability length cannot be represented"))?
+            } else {
+                rustfs_protos::encode_cross_pool_fence_capability(
+                    CROSS_POOL_FENCE_SUPPORTED_VERSION,
+                    &topology_member,
+                    NODE_CAPABILITY_SERVER_EPOCH.as_bytes(),
+                )
+                .map_err(|_| Status::internal("cross-pool fence capability length cannot be represented"))?
+            };
             let canonical_response = rustfs_protos::canonical_heal_control_response_body(
                 request.get_ref().version,
                 &request.get_ref().topology_fingerprint,
@@ -3291,6 +3305,103 @@ mod tests {
             .expect("outer proof should bind the response to the request");
 
         let different_probe = rustfs_protos::remote_version_state_capability_probe(&[8; 16]);
+        let different_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &different_probe,
+            &response.result,
+        )
+        .expect("different response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&different_response, &response.response_proof)
+            .expect_err("proof from one challenge must not be reusable");
+    }
+
+    #[tokio::test]
+    async fn cross_pool_fence_probe_authenticates_unsupported_rollout_state() {
+        let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
+        assert!(
+            !super::heal::heal_control_coordinator(&endpoints)
+                .expect("test topology should have a coordinator")
+                .is_local
+        );
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let probe_command = rustfs_protos::cross_pool_fence_capability_probe(&[7; 16]);
+
+        let unauthenticated = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let auth_error = service
+            .heal_control(unauthenticated)
+            .await
+            .expect_err("capability probe without authentication must fail closed");
+        assert_eq!(auth_error.code(), tonic::Code::PermissionDenied);
+
+        let mut divergent = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: "different-topology".to_string(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let divergent_body = rustfs_protos::canonical_heal_control_request_body(
+            divergent.get_ref().version,
+            &divergent.get_ref().topology_fingerprint,
+            &divergent.get_ref().command,
+        )
+        .expect("divergent probe should encode");
+        set_tonic_canonical_body_digest(&mut divergent, &divergent_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut divergent);
+        let topology_error = service
+            .heal_control(divergent)
+            .await
+            .expect_err("capability probe for a different topology must fail closed");
+        assert_eq!(topology_error.code(), tonic::Code::FailedPrecondition);
+
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .heal_control(request)
+            .await
+            .expect("non-coordinator peer should answer a capability probe")
+            .into_inner();
+
+        assert!(response.success);
+        assert_eq!(response.error_info, None);
+        let (supported_version, topology_member, process_epoch) =
+            rustfs_protos::decode_cross_pool_fence_capability(&response.result).expect("capability response should decode");
+        assert_eq!(supported_version, 0);
+        assert_eq!(topology_member, "node-a:9000");
+        assert!(
+            !Uuid::from_slice(process_epoch)
+                .expect("server epoch should be a UUID")
+                .is_nil()
+        );
+
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &probe_command,
+            &response.result,
+        )
+        .expect("response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .expect("outer proof should bind the response to the request");
+
+        let different_probe = rustfs_protos::cross_pool_fence_capability_probe(&[8; 16]);
         let different_response = rustfs_protos::canonical_heal_control_response_body(
             rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
             &fingerprint,
