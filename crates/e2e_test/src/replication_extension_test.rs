@@ -3951,7 +3951,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   <Role></Role>
   <Rule>
     <ID>matrix-prefix</ID>
-    <Priority>100</Priority>
+    <Priority>110</Priority>
     <Status>Enabled</Status>
     <Filter><Prefix>prefix/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
@@ -3962,7 +3962,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-both-prefix</ID>
-    <Priority>100</Priority>
+    <Priority>120</Priority>
     <Status>Enabled</Status>
     <Filter><Prefix>both/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
@@ -3972,7 +3972,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-tag</ID>
-    <Priority>100</Priority>
+    <Priority>130</Priority>
     <Status>Enabled</Status>
     <Filter><Tag><Key>route</Key><Value>tagged</Value></Tag></Filter>
     <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
@@ -3982,7 +3982,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-disabled</ID>
-    <Priority>100</Priority>
+    <Priority>140</Priority>
     <Status>Disabled</Status>
     <Filter><Prefix>disabled/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>

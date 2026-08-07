@@ -32,6 +32,12 @@ pub const REPLICATION_CAPABILITY_CONTRACT_VERSION: u32 = 1;
 // clients should keep omitting it, but the validator tolerates an explicit
 // `STANDARD` as a no-op (see `unsupported_replication_config_field`) because the
 // console's rule form always sends it.
+//
+// Contract note: rule-level `Destination.StorageClass` is never consumed by the
+// replication engine (MinIO's engine likewise reads only the target-level
+// storage class). To control the storage class of replicated objects, set the
+// remote target's `storage_class` field (set-remote-target API), which RustFS
+// does apply on replication PUTs.
 pub const REPLICATION_WRITABLE_FIELDS: &[&str] = &[
     "Role",
     "Rule.ID",
@@ -295,6 +301,117 @@ pub fn should_remove_replication_target(
     config_target_arns: &HashSet<String>,
 ) -> bool {
     is_replication_target && config_target_arns.contains(target_arn)
+}
+
+/// Maximum number of rules accepted in one replication configuration,
+/// matching MinIO's `replication.Config.Validate` limit.
+pub const REPLICATION_CONFIG_MAX_RULES: usize = 1000;
+
+/// Maximum length of a replication rule ID, matching the S3 schema.
+pub const REPLICATION_CONFIG_MAX_RULE_ID_LEN: usize = 255;
+
+/// A structural defect in a replication configuration, detected before the
+/// configuration is persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationConfigStructureError {
+    NoRules,
+    TooManyRules,
+    NegativeRulePriority,
+    DuplicateRulePriority,
+    RuleIdTooLong,
+    AmbiguousRuleFilter,
+    TagFilterWithDeleteMarkerReplication,
+}
+
+impl ReplicationConfigStructureError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NoRules => "replication configuration must contain at least one rule",
+            Self::TooManyRules => "replication configuration cannot contain more than 1000 rules",
+            Self::NegativeRulePriority => "replication rule Priority must be zero or a positive integer",
+            Self::DuplicateRulePriority => "replication rule Priority must be unique across rules",
+            Self::RuleIdTooLong => "replication rule ID cannot be longer than 255 characters",
+            Self::AmbiguousRuleFilter => "replication rule Filter must specify only one of Prefix, Tag or And",
+            Self::TagFilterWithDeleteMarkerReplication => {
+                "delete marker replication cannot be enabled on a rule with a Tag filter"
+            }
+        }
+    }
+}
+
+fn filter_and_operator_is_set(and: &s3s::dto::ReplicationRuleAndOperator) -> bool {
+    and.prefix.as_ref().is_some_and(|prefix| !prefix.is_empty()) || and.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+}
+
+fn rule_filter_has_tags(filter: &s3s::dto::ReplicationRuleFilter) -> bool {
+    filter.tag.is_some()
+        || filter
+            .and
+            .as_ref()
+            .is_some_and(|and| and.tags.as_ref().is_some_and(|tags| !tags.is_empty()))
+}
+
+/// Structural validation of a replication configuration, mirroring the checks
+/// MinIO's `replication.Config.Validate` performs before persisting: at least
+/// one rule, at most [`REPLICATION_CONFIG_MAX_RULES`], non-negative and unique
+/// per-rule priorities (a missing Priority counts as 0, like Go's zero value),
+/// rule IDs within [`REPLICATION_CONFIG_MAX_RULE_ID_LEN`], a Filter carrying
+/// only one of Prefix/Tag/And, and delete marker replication disabled on
+/// tag-filtered rules.
+///
+/// This is shape-only validation: capability gating lives in
+/// [`unsupported_replication_config_field`]/[`invalid_replication_config_status_field`],
+/// and the self-target ("same target") rejection is enforced when the remote
+/// target itself is created, so a config can never reference a self-pointing
+/// ARN.
+pub fn validate_replication_config_structure(
+    config: &ReplicationConfiguration,
+) -> std::result::Result<(), ReplicationConfigStructureError> {
+    if config.rules.is_empty() {
+        return Err(ReplicationConfigStructureError::NoRules);
+    }
+    if config.rules.len() > REPLICATION_CONFIG_MAX_RULES {
+        return Err(ReplicationConfigStructureError::TooManyRules);
+    }
+
+    let mut priorities = HashSet::new();
+    for rule in &config.rules {
+        let priority = rule.priority.unwrap_or(0);
+        if priority < 0 {
+            return Err(ReplicationConfigStructureError::NegativeRulePriority);
+        }
+        if !priorities.insert(priority) {
+            return Err(ReplicationConfigStructureError::DuplicateRulePriority);
+        }
+
+        if rule
+            .id
+            .as_ref()
+            .is_some_and(|id| id.chars().count() > REPLICATION_CONFIG_MAX_RULE_ID_LEN)
+        {
+            return Err(ReplicationConfigStructureError::RuleIdTooLong);
+        }
+
+        if let Some(filter) = &rule.filter {
+            let has_and = filter.and.as_ref().is_some_and(filter_and_operator_is_set);
+            let has_prefix = filter.prefix.as_ref().is_some_and(|prefix| !prefix.is_empty());
+            let has_tag = filter.tag.is_some();
+            if usize::from(has_and) + usize::from(has_prefix) + usize::from(has_tag) > 1 {
+                return Err(ReplicationConfigStructureError::AmbiguousRuleFilter);
+            }
+
+            let delete_marker_replication_enabled = rule
+                .delete_marker_replication
+                .as_ref()
+                .and_then(|delete_marker| delete_marker.status.as_ref())
+                .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
+            if delete_marker_replication_enabled && rule_filter_has_tags(filter) {
+                return Err(ReplicationConfigStructureError::TagFilterWithDeleteMarkerReplication);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl ReplicationConfigurationExt for ReplicationConfiguration {
@@ -563,6 +680,154 @@ mod tests {
             source_selection_criteria: None,
             status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
         }
+    }
+
+    fn structure_config(rules: Vec<ReplicationRule>) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            role: String::new(),
+            rules,
+        }
+    }
+
+    fn tag_filter() -> s3s::dto::ReplicationRuleFilter {
+        s3s::dto::ReplicationRuleFilter {
+            tag: Some(s3s::dto::Tag {
+                key: Some("k".to_string()),
+                value: Some("v".to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn structure_validation_accepts_multi_rule_config_with_unique_priorities() {
+        let mut second = replication_rule("rule-2", "arn:target:a");
+        second.priority = Some(2);
+        second.filter = Some(s3s::dto::ReplicationRuleFilter {
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: Some("photos/".to_string()),
+                tags: Some(vec![s3s::dto::Tag {
+                    key: Some("k".to_string()),
+                    value: Some("v".to_string()),
+                }]),
+            }),
+            ..Default::default()
+        });
+        let config = structure_config(vec![replication_rule("rule-1", "arn:target:a"), second]);
+
+        assert_eq!(validate_replication_config_structure(&config), Ok(()));
+    }
+
+    #[test]
+    fn structure_validation_rejects_empty_rule_list() {
+        let config = structure_config(Vec::new());
+
+        assert_eq!(
+            validate_replication_config_structure(&config),
+            Err(ReplicationConfigStructureError::NoRules)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_more_than_max_rules() {
+        let rules = (0..=REPLICATION_CONFIG_MAX_RULES as i32)
+            .map(|priority| {
+                let mut rule = replication_rule(&format!("rule-{priority}"), "arn:target:a");
+                rule.priority = Some(priority);
+                rule
+            })
+            .collect();
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(rules)),
+            Err(ReplicationConfigStructureError::TooManyRules)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_duplicate_priorities() {
+        let config = structure_config(vec![
+            replication_rule("rule-1", "arn:target:a"),
+            replication_rule("rule-2", "arn:target:a"),
+        ]);
+
+        assert_eq!(
+            validate_replication_config_structure(&config),
+            Err(ReplicationConfigStructureError::DuplicateRulePriority)
+        );
+    }
+
+    #[test]
+    fn structure_validation_treats_missing_priority_as_zero_for_uniqueness() {
+        let mut first = replication_rule("rule-1", "arn:target:a");
+        first.priority = None;
+        let mut second = replication_rule("rule-2", "arn:target:a");
+        second.priority = None;
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![first, second])),
+            Err(ReplicationConfigStructureError::DuplicateRulePriority)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_negative_priority() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.priority = Some(-1);
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![rule])),
+            Err(ReplicationConfigStructureError::NegativeRulePriority)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_rule_id_longer_than_255_chars() {
+        let mut rule = replication_rule(&"x".repeat(REPLICATION_CONFIG_MAX_RULE_ID_LEN + 1), "arn:target:a");
+        rule.priority = Some(1);
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![rule])),
+            Err(ReplicationConfigStructureError::RuleIdTooLong)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_filter_with_both_prefix_and_tag() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        let mut filter = tag_filter();
+        filter.prefix = Some("photos/".to_string());
+        rule.filter = Some(filter);
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![rule])),
+            Err(ReplicationConfigStructureError::AmbiguousRuleFilter)
+        );
+    }
+
+    #[test]
+    fn structure_validation_rejects_delete_marker_replication_on_tag_filtered_rule() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.filter = Some(tag_filter());
+
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![rule])),
+            Err(ReplicationConfigStructureError::TagFilterWithDeleteMarkerReplication)
+        );
+    }
+
+    #[test]
+    fn structure_validation_allows_tag_filter_when_delete_marker_replication_disabled() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+        });
+        rule.filter = Some(tag_filter());
+
+        assert_eq!(validate_replication_config_structure(&structure_config(vec![rule])), Ok(()));
     }
 
     #[test]
