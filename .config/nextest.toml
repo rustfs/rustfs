@@ -30,6 +30,7 @@
 [test-groups]
 ecstore-serial-flaky = { max-threads = 1 }
 embedded-test-ports = { max-threads = 1 }
+e2e-vault = { max-threads = 1 }
 
 # Reliability / fault-injection e2e tests each spawn a single-node 4-disk RustFS
 # server and manipulate its disk directories at runtime (crates/e2e_test:
@@ -95,6 +96,12 @@ test-group = 'e2e-reliability'
 [[profile.default.overrides]]
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
+
+# Vault KMS tests share the fixed dev-server port 8200. serial_test's #[serial]
+# does not cross nextest process boundaries, so keep these tests in one group.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+test-group = 'e2e-vault'
 
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
@@ -342,9 +349,9 @@ path = "junit.xml"
 #
 # Each e2e test spawns its own single-node rustfs server on a random port with
 # an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
-# parallel-safe — the same property e2e-smoke relies on. The exception is the
-# 4-disk reliability / degraded-read fault-injection tests, serialized below
-# (identical to the ci profile) so several 4-disk servers never run at once.
+# parallel-safe — the same property e2e-smoke relies on. The exceptions are the
+# 4-disk reliability / degraded-read fault-injection tests and the fixed-port
+# Vault tests, both serialized below.
 # KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
 # 341 ran / 32 failed on the suites' first automated run ever). Deterministic
 # product failures cannot be quarantined away with retries, so each family is
@@ -380,3 +387,7 @@ test-group = 'e2e-reliability'
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
+
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+test-group = 'e2e-vault'
