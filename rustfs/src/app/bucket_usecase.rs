@@ -4470,11 +4470,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        // The config must clear the structural/capability validators so the
+        // request actually reaches the store lookup this test pins.
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
             .replication_configuration(ReplicationConfiguration {
                 role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![],
+                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
             })
             .build()
             .unwrap();

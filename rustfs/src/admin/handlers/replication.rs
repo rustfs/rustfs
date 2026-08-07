@@ -1093,6 +1093,14 @@ impl Operation for ReplicationDiffHandler {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // The madmin stream has no envelope to carry truncation info; a
+        // truncated scan would otherwise be indistinguishable from a complete
+        // one (an empty diff on a >MAX_SCAN bucket reads as "healthy"). Signal
+        // it out-of-band so RustFS-aware clients can detect the partial scan;
+        // madmin/mc ignore unknown headers.
+        if is_truncated {
+            headers.insert("x-rustfs-replication-diff-truncated", HeaderValue::from_static("true"));
+        }
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }

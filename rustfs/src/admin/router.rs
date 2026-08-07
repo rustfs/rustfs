@@ -3248,6 +3248,7 @@ mod tests {
             "arn:a".to_string(),
             crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
+                start_time: Some(datetime!(2025-01-01 00:00 UTC)),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
                 resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
@@ -3267,6 +3268,7 @@ mod tests {
         assert_eq!(payload["target"][0]["resetid"], "rid-a");
         assert_eq!(payload["target"][0]["bucket"], "bucket-a");
         assert_eq!(payload["target"][0]["resyncStatus"], "Completed");
+        assert_eq!(payload["target"][0]["startTime"], "2025-01-01T00:00:00Z");
         assert_eq!(payload["target"][0]["endTime"], "2025-01-02T00:00:00Z");
         assert_eq!(payload["target"][0]["replicationCount"], 3);
         assert_eq!(payload["target"][0]["completedReplicationSize"], 9);

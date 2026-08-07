@@ -343,21 +343,17 @@ fn filter_and_operator_is_set(and: &s3s::dto::ReplicationRuleAndOperator) -> boo
     and.prefix.as_ref().is_some_and(|prefix| !prefix.is_empty()) || and.tags.as_ref().is_some_and(|tags| !tags.is_empty())
 }
 
-fn rule_filter_has_tags(filter: &s3s::dto::ReplicationRuleFilter) -> bool {
-    filter.tag.is_some()
-        || filter
-            .and
-            .as_ref()
-            .is_some_and(|and| and.tags.as_ref().is_some_and(|tags| !tags.is_empty()))
-}
-
 /// Structural validation of a replication configuration, mirroring the checks
 /// MinIO's `replication.Config.Validate` performs before persisting: at least
 /// one rule, at most [`REPLICATION_CONFIG_MAX_RULES`], non-negative and unique
 /// per-rule priorities (a missing Priority counts as 0, like Go's zero value),
-/// rule IDs within [`REPLICATION_CONFIG_MAX_RULE_ID_LEN`], a Filter carrying
-/// only one of Prefix/Tag/And, and delete marker replication disabled on
-/// tag-filtered rules.
+/// rule IDs within [`REPLICATION_CONFIG_MAX_RULE_ID_LEN`] bytes, a Filter
+/// carrying only one of Prefix/Tag/And, and delete marker replication
+/// disabled on rules with a direct `Filter.Tag`. Tags inside `Filter.And` do
+/// NOT trigger the delete-marker check — MinIO only inspects the direct tag,
+/// and `mc replicate add --tags "k1=v1&k2=v2"` (delete-marker replication on
+/// by default) puts multiple tags into `And.Tags`, so rejecting that shape
+/// would break mc-generated configs that MinIO accepts.
 ///
 /// This is shape-only validation: capability gating lives in
 /// [`unsupported_replication_config_field`]/[`invalid_replication_config_status_field`],
@@ -384,10 +380,11 @@ pub fn validate_replication_config_structure(
             return Err(ReplicationConfigStructureError::DuplicateRulePriority);
         }
 
+        // Byte length, matching Go's `len(r.ID) > 255` in MinIO.
         if rule
             .id
             .as_ref()
-            .is_some_and(|id| id.chars().count() > REPLICATION_CONFIG_MAX_RULE_ID_LEN)
+            .is_some_and(|id| id.len() > REPLICATION_CONFIG_MAX_RULE_ID_LEN)
         {
             return Err(ReplicationConfigStructureError::RuleIdTooLong);
         }
@@ -395,7 +392,12 @@ pub fn validate_replication_config_structure(
         if let Some(filter) = &rule.filter {
             let has_and = filter.and.as_ref().is_some_and(filter_and_operator_is_set);
             let has_prefix = filter.prefix.as_ref().is_some_and(|prefix| !prefix.is_empty());
-            let has_tag = filter.tag.is_some();
+            // An empty <Tag/> element (no key) counts as absent, matching
+            // MinIO's Tag.IsEmpty(); console form serializers emit empty tags.
+            let has_tag = filter
+                .tag
+                .as_ref()
+                .is_some_and(|tag| tag.key.as_ref().is_some_and(|key| !key.is_empty()));
             if usize::from(has_and) + usize::from(has_prefix) + usize::from(has_tag) > 1 {
                 return Err(ReplicationConfigStructureError::AmbiguousRuleFilter);
             }
@@ -405,7 +407,7 @@ pub fn validate_replication_config_structure(
                 .as_ref()
                 .and_then(|delete_marker| delete_marker.status.as_ref())
                 .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
-            if delete_marker_replication_enabled && rule_filter_has_tags(filter) {
+            if delete_marker_replication_enabled && has_tag {
                 return Err(ReplicationConfigStructureError::TagFilterWithDeleteMarkerReplication);
             }
         }
@@ -817,6 +819,54 @@ mod tests {
             validate_replication_config_structure(&structure_config(vec![rule])),
             Err(ReplicationConfigStructureError::TagFilterWithDeleteMarkerReplication)
         );
+    }
+
+    #[test]
+    fn structure_validation_treats_empty_tag_element_as_absent() {
+        // MinIO's Tag.IsEmpty() ignores an empty <Tag/> element; the console's
+        // form serializer emits them, so prefix + empty tag must stay valid
+        // and an empty tag must not trip the delete-marker check.
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            prefix: Some("photos/".to_string()),
+            tag: Some(s3s::dto::Tag { key: None, value: None }),
+            ..Default::default()
+        });
+
+        assert_eq!(validate_replication_config_structure(&structure_config(vec![rule])), Ok(()));
+    }
+
+    #[test]
+    fn structure_validation_allows_delete_marker_replication_with_and_tags() {
+        // mc `replicate add --tags "k1=v1&k2=v2"` puts multiple tags into
+        // Filter.And.Tags and enables delete-marker replication by default;
+        // MinIO's validator only inspects the direct Filter.Tag, so this
+        // shape must stay accepted for mc interop.
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: None,
+                tags: Some(vec![
+                    s3s::dto::Tag {
+                        key: Some("k1".to_string()),
+                        value: Some("v1".to_string()),
+                    },
+                    s3s::dto::Tag {
+                        key: Some("k2".to_string()),
+                        value: Some("v2".to_string()),
+                    },
+                ]),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(validate_replication_config_structure(&structure_config(vec![rule])), Ok(()));
     }
 
     #[test]
