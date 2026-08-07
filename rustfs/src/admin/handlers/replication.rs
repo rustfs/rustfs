@@ -886,30 +886,37 @@ const REPLICATION_DIFF_MAX_SCAN: usize = 10_000;
 const REPLICATION_DIFF_PAGE_SIZE: i32 = 1_000;
 
 /// A single object version whose replication is not yet complete, reported by
-/// `POST /v3/replication/diff`. Field names mirror MinIO's `madmin.DiffInfo`
-/// so MinIO-compatible admin clients can parse the response.
+/// `POST /v3/replication/diff`. Field names are the exact json tags of
+/// madmin-go `DiffInfo` (replication-api.go), which `mc replicate diff`
+/// decodes one JSON document at a time from the response body. `Size` is a
+/// RustFS extension key with no madmin counterpart; Go decoders ignore
+/// unknown keys.
 #[derive(Debug, Serialize)]
 struct ReplicationDiffEntry {
-    #[serde(rename = "Object")]
+    #[serde(rename = "object")]
     object: String,
-    #[serde(rename = "VersionID", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "versionId", skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
     #[serde(rename = "Size")]
     size: i64,
-    #[serde(rename = "IsDeleteMarker")]
+    #[serde(rename = "deletemarker")]
     is_delete_marker: bool,
-    #[serde(rename = "ReplicationStatus")]
+    #[serde(rename = "rStatus")]
     replication_status: String,
-    #[serde(rename = "LastModified", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
     last_modified: Option<String>,
 }
 
-/// Response body for `POST /v3/replication/diff`.
+/// Aggregate response body for `POST /v3/replication/diff?aggregate=true`.
 ///
-/// `entries` lists object versions with a `PENDING` or `FAILED` replication
-/// status. `is_truncated` indicates the on-demand scan hit
-/// [`REPLICATION_DIFF_MAX_SCAN`] before reaching the end of the bucket, so the
-/// diff is partial and should be re-run with a narrower prefix.
+/// This shell is a deliberate RustFS extension: madmin streams bare
+/// `DiffInfo` documents with no envelope (see [`render_replication_diff`]),
+/// so the scan-coverage metadata (`is_truncated`, `scanned_versions`) is only
+/// representable in this opt-in aggregate shape. `entries` lists object
+/// versions with a `PENDING` or `FAILED` replication status. `is_truncated`
+/// indicates the on-demand scan hit [`REPLICATION_DIFF_MAX_SCAN`] before
+/// reaching the end of the bucket, so the diff is partial and should be
+/// re-run with a narrower prefix.
 #[derive(Debug, Serialize)]
 struct ReplicationDiffResponse {
     #[serde(rename = "Entries")]
@@ -918,6 +925,39 @@ struct ReplicationDiffResponse {
     is_truncated: bool,
     #[serde(rename = "ScannedVersions")]
     scanned_versions: usize,
+}
+
+/// Render the diff scan result as a response body.
+///
+/// Default (madmin-compatible) mode emits one `DiffInfo` JSON document per
+/// line with no envelope — madmin's `BucketReplicationDiff` reads the body
+/// with a `json.Decoder` loop, so any envelope object would decode as a
+/// single entry with an empty `object` (a phantom row in `mc replicate
+/// diff`). Scan-truncation info is not representable in that stream and is
+/// reported via the tracing event in the handler instead.
+///
+/// `aggregate=true` (RustFS extension) keeps the enveloped shape including
+/// `IsTruncated`/`ScannedVersions`.
+fn render_replication_diff(
+    entries: Vec<ReplicationDiffEntry>,
+    is_truncated: bool,
+    scanned_versions: usize,
+    aggregate: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    if aggregate {
+        return serde_json::to_vec(&ReplicationDiffResponse {
+            entries,
+            is_truncated,
+            scanned_versions,
+        });
+    }
+
+    let mut data = Vec::new();
+    for entry in &entries {
+        serde_json::to_writer(&mut data, entry)?;
+        data.push(b'\n');
+    }
+    Ok(data)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1036,16 +1076,31 @@ impl Operation for ReplicationDiffHandler {
             truncated = is_truncated,
             "computed replication diff"
         );
+        let aggregate = queries.get("aggregate").map(String::as_str) == Some("true");
+        if is_truncated && !aggregate {
+            // The madmin stream has no envelope to carry truncation info, so
+            // surface the partial-scan condition here instead.
+            tracing::warn!(
+                bucket = %bucket,
+                prefix = %prefix,
+                scanned = scanned_versions,
+                max_scan = REPLICATION_DIFF_MAX_SCAN,
+                "replication diff scan truncated; stream response is partial — re-run with a narrower prefix or use aggregate=true"
+            );
+        }
 
-        let response = ReplicationDiffResponse {
-            entries,
-            is_truncated,
-            scanned_versions,
-        };
-        let data = serde_json::to_vec(&response)
+        let data = render_replication_diff(entries, is_truncated, scanned_versions, aggregate)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // The madmin stream has no envelope to carry truncation info; a
+        // truncated scan would otherwise be indistinguishable from a complete
+        // one (an empty diff on a >MAX_SCAN bucket reads as "healthy"). Signal
+        // it out-of-band so RustFS-aware clients can detect the partial scan;
+        // madmin/mc ignore unknown headers.
+        if is_truncated {
+            headers.insert("x-rustfs-replication-diff-truncated", HeaderValue::from_static("true"));
+        }
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
@@ -1247,8 +1302,8 @@ impl Operation for ReplicationMrfHandler {
 mod tests {
     use super::{
         REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
-        SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params, parse_remote_target_update_ops,
-        unique_replication_peers, validate_remote_target_tls_settings,
+        ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
+        parse_remote_target_update_ops, render_replication_diff, unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1949,5 +2004,72 @@ mod tests {
         assert_eq!(target.target_bucket, "target");
         assert!(target.secure);
         assert_eq!(target.credentials.expect("credentials should be present").access_key, "access");
+    }
+
+    fn sample_diff_entries() -> Vec<ReplicationDiffEntry> {
+        vec![
+            ReplicationDiffEntry {
+                object: "a.txt".to_string(),
+                version_id: Some("v1".to_string()),
+                size: 42,
+                is_delete_marker: false,
+                replication_status: "PENDING".to_string(),
+                last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            ReplicationDiffEntry {
+                object: "b.txt".to_string(),
+                version_id: None,
+                size: 0,
+                is_delete_marker: true,
+                replication_status: "FAILED".to_string(),
+                last_modified: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn replication_diff_stream_emits_bare_madmin_diff_info_documents() {
+        let data = render_replication_diff(sample_diff_entries(), true, 2, false).expect("stream must render");
+        let text = std::str::from_utf8(&data).expect("stream must be utf-8");
+
+        // madmin decodes the body with a json.Decoder loop over DiffInfo — one
+        // bare document per entry, no envelope keys anywhere in the stream.
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line must be a JSON document"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["object"], "a.txt");
+        assert_eq!(lines[0]["versionId"], "v1");
+        assert_eq!(lines[0]["rStatus"], "PENDING");
+        assert_eq!(lines[0]["deletemarker"], false);
+        assert_eq!(lines[0]["lastModified"], "2026-01-01T00:00:00Z");
+        assert_eq!(lines[1]["object"], "b.txt");
+        assert_eq!(lines[1]["deletemarker"], true);
+        assert_eq!(lines[1]["rStatus"], "FAILED");
+        for line in &lines {
+            assert!(line.get("Entries").is_none());
+            assert!(line.get("IsTruncated").is_none());
+            assert!(line.get("ScannedVersions").is_none());
+        }
+    }
+
+    #[test]
+    fn replication_diff_stream_renders_empty_body_for_no_entries() {
+        let data = render_replication_diff(Vec::new(), false, 0, false).expect("stream must render");
+        // An empty body makes madmin's json.Decoder loop end immediately with
+        // io.EOF — zero rows, not one phantom empty row.
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn replication_diff_aggregate_keeps_enveloped_extension_shape() {
+        let data = render_replication_diff(sample_diff_entries(), true, 7, true).expect("aggregate must render");
+        let payload: serde_json::Value = serde_json::from_slice(&data).expect("aggregate must be one JSON object");
+
+        assert_eq!(payload["Entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["Entries"][0]["object"], "a.txt");
+        assert_eq!(payload["IsTruncated"], true);
+        assert_eq!(payload["ScannedVersions"], 7);
     }
 }

@@ -39,7 +39,8 @@ use super::storage_api::bucket_usecase::bucket::{
     policy_sys::PolicySys,
     replication::{
         ReplicationTargetValidationError, invalid_replication_config_status_field, replication_target_arns,
-        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
+        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_structure,
+        validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -584,6 +585,9 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
 }
 
 fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+    if let Err(err) = validate_replication_config_structure(config) {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, err.message()));
+    }
     if let Some(field) = invalid_replication_config_status_field(config) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -3176,6 +3180,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_replication_config_capabilities_rejects_structural_defects_before_write() {
+        let mut first = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        first.priority = Some(1);
+        let mut second = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        second.priority = Some(1);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![first, second],
+        };
+
+        let err = validate_replication_config_capabilities(&config)
+            .expect_err("duplicate rule priorities must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.to_string().contains("Priority must be unique"));
+    }
+
+    #[test]
     fn validate_replication_config_capabilities_rejects_invalid_status_before_write() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         rule.status = ReplicationRuleStatus::from_static("Invalid");
@@ -4448,11 +4470,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        // The config must clear the structural/capability validators so the
+        // request actually reaches the store lookup this test pins.
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
             .replication_configuration(ReplicationConfiguration {
                 role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![],
+                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
             })
             .build()
             .unwrap();
