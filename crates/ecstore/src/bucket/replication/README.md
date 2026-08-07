@@ -100,11 +100,41 @@ paths.
     behind the ECStore replication facade; only `rustfs/src/app/storage_api.rs`
     may retain direct object/delete replication helper calls.
 
-## First Code-Bearing Step
+## Completion Criteria
 
-Start with `ReplicationRuntime` or `ReplicationEventSink`. Both can be added as
-narrow internal contracts while keeping current queue, MRF, resync, and target
-behavior unchanged. Do not start with a crate move.
+The split is complete when the "Current dependency to remove" column in the
+Required Contracts table above is empty: every row is either deleted because
+the dependency is gone, or reduced to "none". No other signal — file count,
+boundary count, line count — measures completion.
+
+Target end state:
+
+- `replication_pool.rs`, `replication_resyncer.rs`, and `replication_state.rs`
+  move into `crates/replication` behind the contracts above;
+- the `*_boundary.rs` and `*_bridge.rs` micro-files dissolve naturally as the
+  code they fence moves across the crate boundary. They are the mechanical
+  seams of the migration ratchet — the architecture guard scripts anchor on
+  their file names — so batch-merging them beforehand is explicitly rejected:
+  it forces synchronized guard-script/mod/import churn with zero functional
+  gain;
+- the only module that can retire early is `datatypes.rs`: delete it once its
+  facade consumers import the resync status enums through `rustfs-replication`
+  directly.
+
+## Milestones
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M0 | Record the completion criteria and end state (this section). | Done |
+| M1 | Contract extraction: resync/queue/stats/object-decision/filemeta/storage wire contracts owned by `crates/replication`; ECStore imports concentrated in `*_boundary.rs`; event sink and runtime access behind local contracts. | Done — see Required Contracts |
+| M2 | Move resyncer pure decision logic (no IO) into `crates/replication`. | Pending; sequence after splitting the oversized resyncer/pool functions (`resync_bucket`, `replicate_all`, `start_mrf_processor`) so moves stay mechanical |
+| M3 | Move the worker runtime (`replication_pool.rs`, the IO paths of `replication_resyncer.rs`, `replication_state.rs`) once the contract traits are stable. Highest-risk step of the whole plan; do it last. | Pending |
+| M4 | Retire the boundary modules together with their guard-script entries; delete `datatypes.rs`. | Pending |
+
+The original first code-bearing step (narrow `ReplicationEventSink` /
+`ReplicationRuntime` contracts) has landed — `replication_event_sink.rs`
+exists and runtime access goes through local boundary aliases — so new work
+starts from M2.
 
 Current compatibility guard: `crates/ecstore/tests/replication_facade_compat_test.rs`
 keeps the ECStore replication facade types covered while architecture rules
