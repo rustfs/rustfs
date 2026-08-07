@@ -14,6 +14,7 @@
 
 use crate::config::ObjectDataCacheConfig;
 use crate::metrics::record_memory_pressure;
+use crate::runtime_memory::resolve_effective_memory;
 use crate::stats::ObjectDataCacheStats;
 use bytes::Bytes;
 use std::hint::spin_loop;
@@ -22,7 +23,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use sysinfo::System;
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_TELEMETRY_STALENESS: Duration = Duration::from_secs(15);
@@ -30,73 +30,6 @@ const DEFAULT_TELEMETRY_STALENESS: Duration = Duration::from_secs(15);
 // attempts cover brief overlap without prolonged spinning on a Tokio worker;
 // exhaustion safely skips only the cache fill.
 const MAX_STATE_RETRIES: usize = 8;
-
-/// Source used to resolve the effective memory limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemoryBasis {
-    /// Limits come from host memory reported by sysinfo.
-    Host,
-    /// Limits come from a constraining cgroup (container) memory limit.
-    Cgroup,
-}
-
-impl MemoryBasis {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::Cgroup => "cgroup",
-        }
-    }
-}
-
-/// Effective memory totals after reconciling host memory with cgroup limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EffectiveMemory {
-    /// Effective total memory in bytes.
-    pub(crate) total_bytes: u64,
-    /// Effective available memory in bytes.
-    pub(crate) available_bytes: u64,
-    /// Whether the limits are host- or cgroup-derived.
-    pub(crate) basis: MemoryBasis,
-}
-
-/// Reconciles host memory with an optional cgroup limit.
-///
-/// `cgroup` carries `(total_memory, free_memory)` as reported for the cgroup
-/// hierarchy (sysinfo already caps `total_memory` at the host total). A cgroup
-/// only counts when it actually constrains below the host, so an unlimited
-/// cgroup transparently falls back to host values.
-pub(crate) fn select_effective_memory(host_total: u64, host_available: u64, cgroup: Option<(u64, u64)>) -> EffectiveMemory {
-    match cgroup {
-        Some((cgroup_total, cgroup_free)) if cgroup_total > 0 && cgroup_total < host_total => EffectiveMemory {
-            total_bytes: cgroup_total,
-            available_bytes: cgroup_free.min(cgroup_total),
-            basis: MemoryBasis::Cgroup,
-        },
-        _ => EffectiveMemory {
-            total_bytes: host_total,
-            available_bytes: host_available,
-            basis: MemoryBasis::Host,
-        },
-    }
-}
-
-/// Resolves the effective memory from an already-refreshed system handle.
-///
-/// `cgroup_limits()` is computed fresh on each call and is only implemented on
-/// Linux (it returns `None` elsewhere), so non-Linux hosts always use host
-/// values.
-pub(crate) fn effective_memory_from_system(system: &System) -> EffectiveMemory {
-    let cgroup = system.cgroup_limits().map(|limits| (limits.total_memory, limits.free_memory));
-    select_effective_memory(system.total_memory(), system.available_memory(), cgroup)
-}
-
-/// Resolves the effective memory using a fresh, memory-refreshed system handle.
-pub(crate) fn resolve_effective_memory() -> EffectiveMemory {
-    let mut system = System::new();
-    system.refresh_memory();
-    effective_memory_from_system(&system)
-}
 
 /// Immutable memory snapshot used by the cache fill gate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -797,10 +730,7 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_TELEMETRY_STALENESS, MemoryBasis, ObjectDataCacheMemoryGate, ObjectDataCacheMemorySnapshot,
-        select_effective_memory,
-    };
+    use super::{DEFAULT_TELEMETRY_STALENESS, ObjectDataCacheMemoryGate, ObjectDataCacheMemorySnapshot};
     use crate::config::ObjectDataCacheConfig;
     use crate::stats::ObjectDataCacheStats;
     use bytes::Bytes;
@@ -1238,42 +1168,6 @@ mod tests {
         assert_eq!(gate.claimed_bytes_for_test(), 100);
         drop(response);
         assert_eq!(gate.claimed_bytes_for_test(), 0);
-    }
-
-    #[test]
-    fn select_effective_memory_prefers_constraining_cgroup() {
-        let effective = select_effective_memory(64 * GIB, 40 * GIB, Some((2 * GIB, GIB)));
-
-        assert_eq!(effective.basis, MemoryBasis::Cgroup);
-        assert_eq!(effective.total_bytes, 2 * GIB);
-        assert_eq!(effective.available_bytes, GIB);
-    }
-
-    #[test]
-    fn select_effective_memory_ignores_non_constraining_cgroup() {
-        // A cgroup total equal to (or above) the host total means no real limit.
-        let effective = select_effective_memory(64 * GIB, 40 * GIB, Some((64 * GIB, 10 * GIB)));
-
-        assert_eq!(effective.basis, MemoryBasis::Host);
-        assert_eq!(effective.total_bytes, 64 * GIB);
-        assert_eq!(effective.available_bytes, 40 * GIB);
-    }
-
-    #[test]
-    fn select_effective_memory_falls_back_to_host_without_cgroup() {
-        let effective = select_effective_memory(8 * GIB, 4 * GIB, None);
-
-        assert_eq!(effective.basis, MemoryBasis::Host);
-        assert_eq!(effective.total_bytes, 8 * GIB);
-        assert_eq!(effective.available_bytes, 4 * GIB);
-    }
-
-    #[test]
-    fn select_effective_memory_caps_available_at_total() {
-        let effective = select_effective_memory(64 * GIB, 40 * GIB, Some((2 * GIB, 3 * GIB)));
-
-        assert_eq!(effective.total_bytes, 2 * GIB);
-        assert_eq!(effective.available_bytes, 2 * GIB);
     }
 
     #[test]

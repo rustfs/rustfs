@@ -41,27 +41,52 @@
 //! the cache disabled for those buckets. Adding timing noise is not a viable
 //! mitigation: it would cost exactly the latency the cache exists to save.
 
+#[cfg(feature = "cache")]
 pub mod backend;
+#[cfg(feature = "cache")]
 pub mod cache;
+#[cfg(feature = "cache")]
 pub mod config;
+#[cfg(feature = "cache")]
 pub mod entry;
+#[cfg(feature = "cache")]
 pub mod error;
+#[cfg(feature = "cache")]
 pub mod index;
+#[cfg(feature = "cache")]
 pub mod key;
+#[cfg(feature = "cache")]
 pub mod memory;
+#[cfg(feature = "cache")]
 pub mod metrics;
+#[cfg(feature = "cache")]
 pub mod moka_backend;
+#[cfg(feature = "cache")]
 pub mod noop;
+#[cfg(feature = "runtime-memory")]
+mod runtime_memory;
+#[cfg(feature = "cache")]
 pub mod singleflight;
+#[cfg(feature = "cache")]
 pub mod starshard_index;
+#[cfg(feature = "cache")]
 pub mod stats;
 
+#[cfg(feature = "cache")]
 pub use cache::{
     ObjectDataCache, ObjectDataCacheBodyReservation, ObjectDataCacheFillResult, ObjectDataCacheGetPlan,
     ObjectDataCacheGetRequest, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
     ObjectDataCacheReservedBody,
 };
+#[cfg(feature = "cache")]
 pub use config::{ObjectDataCacheConfig, ObjectDataCacheMode};
+#[cfg(feature = "cache")]
 pub use error::ObjectDataCacheConfigError;
+#[cfg(feature = "cache")]
 pub use key::{NULL_VERSION_ID, ObjectDataCacheBodyVariant, ObjectDataCacheIdentity, ObjectDataCacheKey};
+#[cfg(feature = "runtime-memory")]
+pub use runtime_memory::{
+    EffectiveMemory, MemoryBasis, effective_memory_from_system, resolve_effective_memory, select_effective_memory,
+};
+#[cfg(feature = "cache")]
 pub use stats::{ObjectDataCacheStats, ObjectDataCacheStatsSnapshot};
