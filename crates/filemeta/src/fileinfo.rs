@@ -1111,6 +1111,12 @@ impl FileInfo {
         insert_str(&mut self.metadata, SUFFIX_HEALING, "true".to_string());
     }
 
+    /// Reader for the marker [`Self::set_healing`] writes: true when this
+    /// FileInfo is being committed by the heal path.
+    pub fn is_healing(&self) -> bool {
+        contains_key_str(&self.metadata, SUFFIX_HEALING)
+    }
+
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {
         insert_str(&mut self.metadata, SUFFIX_TIER_FV_ID, version_id.to_string());
     }
