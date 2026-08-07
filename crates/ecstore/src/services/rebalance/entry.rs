@@ -519,9 +519,23 @@ impl ECStore {
             let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let list_result =
-                    run_rebalance_listing_with_retry(set, rx, bucket.clone(), rebalance_entry, set_idx, rebalance_max_attempts())
-                        .await;
+                let list_rx = rx.clone();
+                let list_bucket = bucket.clone();
+                let list_result = run_rebalance_listing_with_retry(
+                    rx,
+                    bucket,
+                    rebalance_entry,
+                    set_idx,
+                    rebalance_max_attempts(),
+                    entry_tasks.clone(),
+                    move |cb| {
+                        let set = set.clone();
+                        let rx = list_rx.clone();
+                        let bucket = list_bucket.clone();
+                        async move { set.list_objects_to_rebalance(rx, bucket, cb).await }
+                    },
+                )
+                .await;
                 let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
                 let result = list_result.and(entry_result);
                 if let Err(err) = &result {

@@ -399,19 +399,24 @@ pub(super) async fn load_rebalance_bucket_configs(api: &ECStore, bucket: &str) -
     })
 }
 
-pub(super) async fn run_rebalance_listing_with_retry(
-    set: Arc<SetDisks>,
+pub(super) async fn run_rebalance_listing_with_retry<List, ListFuture>(
     rx: CancellationToken,
     bucket: String,
     cb: ListCallback,
     set_idx: usize,
     max_attempts: usize,
-) -> Result<()> {
+    entry_tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>,
+    mut list: List,
+) -> Result<()>
+where
+    List: FnMut(ListCallback) -> ListFuture,
+    ListFuture: std::future::Future<Output = Result<()>>,
+{
     let max_attempts = max_attempts.max(1);
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
-        match set.list_objects_to_rebalance(rx.clone(), bucket.clone(), cb.clone()).await {
+        match list(cb.clone()).await {
             Ok(()) => return Ok(()),
             Err(err) if should_retry_rebalance_listing(&err, attempt, max_attempts) => {
                 let next_attempt = attempt + 2;
@@ -426,6 +431,8 @@ pub(super) async fn run_rebalance_listing_with_retry(
                     delay
                 );
                 last_error = Some(err);
+                // The full retry re-evaluates deferred entries; only task failures block the next attempt.
+                let _ = wait_rebalance_entry_tasks(set_idx, entry_tasks.clone()).await?;
                 wait_rebalance_listing_retry(&rx, delay).await?;
                 info!(
                     "rebalance listing retrying bucket {} set {} attempt {}/{}",
