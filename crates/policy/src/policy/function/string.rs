@@ -408,6 +408,8 @@ mod tests {
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["public"])] => true ; "19")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["private"])] => false ; "20")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["webapp"])] => false ; "21")]
+    #[test_case(new_fkv("s3:VersionId", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "aws_version_id")]
+    #[test_case(new_fkv("s3:versionid", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "minio_version_id")]
     fn test_string_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
         test_eval(s, for_all, false, false, values)
     }
