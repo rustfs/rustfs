@@ -141,6 +141,7 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
 const MAX_UPLOADS_LIST: usize = 10000;
 
 mod bucket;
+mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 mod heal;
 mod heal_walk;
@@ -193,6 +194,9 @@ pub struct ECStore {
     /// startup writes and post-construction reads share one cell — single
     /// instance behavior is unchanged.
     pub(crate) ctx: Arc<InstanceContext>,
+    /// Memoizes bucket-incarnation validation under continuous lifecycle
+    /// read-lock coverage (see [`bucket_fence`]).
+    pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -890,6 +894,7 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
             ctx,
+            bucket_fence_registry: Arc::default(),
         })
     }
 

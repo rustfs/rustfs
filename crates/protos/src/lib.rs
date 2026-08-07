@@ -2442,7 +2442,7 @@ mod tests {
                 json_field: "batch_read_version_resps",
                 bin_field: "batch_read_version_resps_bin",
             },
-            json_encoder: "compat_response_json(batch_read_version_resp)",
+            json_encoder: "compat_response_json(batch_read_version_resp, false)",
         },
         ResponseCompatSendSite {
             field: CompatPayloadField {
@@ -2450,7 +2450,7 @@ mod tests {
                 json_field: "read_multiple_resps",
                 bin_field: "read_multiple_resps_bin",
             },
-            json_encoder: "compat_response_json(read_multiple_resp)",
+            json_encoder: "compat_response_json(read_multiple_resp, false)",
         },
         ResponseCompatSendSite {
             field: CompatPayloadField {
@@ -2458,7 +2458,7 @@ mod tests {
                 json_field: "file_info",
                 bin_field: "file_info_bin",
             },
-            json_encoder: "let file_info_json = compat_response_json(&file_info);",
+            json_encoder: "let file_info_json = compat_response_json(&file_info, request_had_msgpack_payload);",
         },
         ResponseCompatSendSite {
             field: CompatPayloadField {
@@ -2466,7 +2466,7 @@ mod tests {
                 json_field: "raw_file_info",
                 bin_field: "raw_file_info_bin",
             },
-            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info);",
+            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info, false);",
         },
         ResponseCompatSendSite {
             field: CompatPayloadField {
@@ -2474,7 +2474,7 @@ mod tests {
                 json_field: "rename_data_resp",
                 bin_field: "rename_data_resp_bin",
             },
-            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp);",
+            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp, false);",
         },
     ];
 

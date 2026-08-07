@@ -896,6 +896,14 @@ pub(crate) mod bucket {
         ) -> Option<&'static str> {
             replication_contracts::invalid_replication_config_status_field(config)
         }
+
+        pub(crate) type ReplicationConfigStructureError = replication_contracts::ReplicationConfigStructureError;
+
+        pub(crate) fn validate_replication_config_structure(
+            config: &s3s::dto::ReplicationConfiguration,
+        ) -> Result<(), ReplicationConfigStructureError> {
+            replication_contracts::validate_replication_config_structure(config)
+        }
     }
 
     pub(crate) mod tagging {
