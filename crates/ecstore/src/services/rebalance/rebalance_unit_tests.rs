@@ -40,9 +40,9 @@ use super::worker::{
     resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
     resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result,
     resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-    send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
-    should_defer_rebalance_entry_failure, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
-    wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
+    run_rebalance_listing_with_retry, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_retry_rebalance_listing,
+    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
@@ -55,8 +55,8 @@ use crate::disk::RUSTFS_META_BUCKET;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
-use rustfs_filemeta::FileInfo;
 use rustfs_filemeta::TRANSITION_COMPLETE;
+use rustfs_filemeta::{FileInfo, MetaCacheEntry};
 use rustfs_rio::Index;
 use s3s::dto::ReplicationConfiguration;
 use serde::Serialize;
@@ -1807,6 +1807,110 @@ fn test_should_retry_rebalance_listing_respects_attempt_limit_and_error_type() {
     assert!(should_retry_rebalance_listing(&Error::SlowDown, 1, 3));
     assert!(!should_retry_rebalance_listing(&Error::SlowDown, 2, 3));
     assert!(!should_retry_rebalance_listing(&Error::FileAccessDenied, 0, 3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rebalance_listing_retry_waits_for_scheduled_entries() {
+    let entry_tasks = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let task_registered = Arc::new(tokio::sync::Notify::new());
+    let release_task = Arc::new(tokio::sync::Notify::new());
+    let task_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback: crate::core::pools::ListCallback = Arc::new({
+        let entry_tasks = entry_tasks.clone();
+        let task_registered = task_registered.clone();
+        let release_task = release_task.clone();
+        let task_finished = task_finished.clone();
+        move |_| {
+            let entry_tasks = entry_tasks.clone();
+            let task_registered = task_registered.clone();
+            let release_task = release_task.clone();
+            let task_finished = task_finished.clone();
+            Box::pin(async move {
+                let task = tokio::spawn(async move {
+                    release_task.notified().await;
+                    task_finished.store(true, Ordering::SeqCst);
+                    Ok(RebalanceEntryOutcome::Completed)
+                });
+                entry_tasks.lock().await.push(task);
+                task_registered.notify_one();
+            })
+        }
+    });
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let runner = tokio::spawn(run_rebalance_listing_with_retry(
+        CancellationToken::new(),
+        "bucket-a".to_string(),
+        callback,
+        0,
+        3,
+        entry_tasks,
+        {
+            let attempts = attempts.clone();
+            let task_finished = task_finished.clone();
+            move |cb| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let task_finished = task_finished.clone();
+                async move {
+                    if attempt == 0 {
+                        cb(MetaCacheEntry::default()).await;
+                        return Err(Error::SlowDown);
+                    }
+                    assert!(task_finished.load(Ordering::SeqCst), "retry must wait for scheduled entries");
+                    Ok(())
+                }
+            }
+        },
+    ));
+
+    task_registered.notified().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "retry must not overlap the scheduled entry task");
+    release_task.notify_one();
+
+    let result = runner
+        .await
+        .expect("listing retry task should join")
+        .expect("listing retry should complete after the scheduled entry");
+    assert_eq!(result, ());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_rebalance_listing_retry_propagates_scheduled_entry_failure() {
+    let entry_tasks = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let callback: crate::core::pools::ListCallback = Arc::new({
+        let entry_tasks = entry_tasks.clone();
+        move |_| {
+            let entry_tasks = entry_tasks.clone();
+            Box::pin(async move {
+                entry_tasks
+                    .lock()
+                    .await
+                    .push(tokio::spawn(async { Err(Error::other("scheduled entry failed")) }));
+            })
+        }
+    });
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let err = run_rebalance_listing_with_retry(CancellationToken::new(), "bucket-a".to_string(), callback, 0, 3, entry_tasks, {
+        let attempts = attempts.clone();
+        move |cb| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    cb(MetaCacheEntry::default()).await;
+                    return Err(Error::SlowDown);
+                }
+                panic!("entry failure must stop listing retries")
+            }
+        }
+    })
+    .await
+    .expect_err("scheduled entry failure must be returned before retrying the listing");
+
+    assert!(err.to_string().contains("scheduled entry failed"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[test]
