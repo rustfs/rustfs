@@ -1868,11 +1868,10 @@ async fn test_rebalance_listing_retry_waits_for_scheduled_entries() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "retry must not overlap the scheduled entry task");
     release_task.notify_one();
 
-    let result = runner
+    runner
         .await
         .expect("listing retry task should join")
         .expect("listing retry should complete after the scheduled entry");
-    assert_eq!(result, ());
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
