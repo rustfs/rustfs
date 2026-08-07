@@ -51,6 +51,13 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
+    pub(crate) async fn load_admin_data_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn load_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
@@ -206,6 +213,19 @@ pub(crate) mod runtime {
         endpoint_pools: crate::storage::storage_api::EndpointServerPools,
     ) -> Result<(), crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::init_local_disks(endpoint_pools).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_instance_ctx() -> Arc<crate::storage::storage_api::InstanceContext> {
+        crate::storage::storage_api::new_instance_ctx()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn init_local_disks_with_instance_ctx(
+        instance_ctx: &Arc<crate::storage::storage_api::InstanceContext>,
+        endpoint_pools: crate::storage::storage_api::EndpointServerPools,
+    ) -> Result<(), crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools).await
     }
 }
 

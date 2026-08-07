@@ -25,7 +25,7 @@ use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     multipart::{CompletePart, MultipartOperations as _},
     namespace::NamespaceLocking as _,
-    object::{ObjectIO as _, ObjectOperations as _},
+    object::{HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::store::ECStore;
 use bytes::Bytes;
@@ -228,6 +228,7 @@ fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx:
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        http_preconditions: data_movement_unversioned_target_precondition(object_info),
         data_movement: true,
         mod_time: object_info.mod_time,
         preserve_etag: object_info.etag.clone(),
@@ -242,11 +243,23 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         src_pool_idx,
         data_movement: true,
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        http_preconditions: data_movement_unversioned_target_precondition(object_info),
         mod_time: object_info.mod_time,
         user_defined: data_movement_user_defined(object_info),
         preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
+}
+
+fn is_unversioned_data_movement_object(object_info: &ObjectInfo) -> bool {
+    object_info.version_id.is_none_or(|version_id| version_id.is_nil())
+}
+
+fn data_movement_unversioned_target_precondition(object_info: &ObjectInfo) -> Option<HTTPPreconditions> {
+    is_unversioned_data_movement_object(object_info).then(|| HTTPPreconditions {
+        if_none_match: Some("*".to_string()),
+        ..Default::default()
+    })
 }
 
 fn data_movement_put_object_reader(
@@ -337,7 +350,7 @@ fn schedule_data_movement_multipart_abort_cleanup(
 }
 
 fn should_check_data_movement_overwrite_resume(err: &Error) -> bool {
-    is_err_data_movement_overwrite(err)
+    is_err_data_movement_overwrite(err) || matches!(err, Error::PreconditionFailed)
 }
 
 fn effective_actual_size(info: &ObjectInfo) -> Option<i64> {
@@ -401,6 +414,16 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.version_purge_status_internal == target.version_purge_status_internal
         && source.version_purge_status == target.version_purge_status
         && are_equivalent_data_movement_parts(&source.parts, &target.parts)
+}
+
+fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    is_unversioned_data_movement_object(source)
+        && is_unversioned_data_movement_object(target)
+        && !target.delete_marker
+        && source
+            .mod_time
+            .zip(target.mod_time)
+            .is_some_and(|(source_time, target_time)| target_time > source_time)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -546,6 +569,81 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     ))
 }
 
+#[cfg(test)]
+struct SourceCleanupDeleteBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct SourceCleanupDeleteBarrier {
+    state: Arc<SourceCleanupDeleteBarrierState>,
+}
+
+#[cfg(test)]
+static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SourceCleanupDeleteBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl SourceCleanupDeleteBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(SourceCleanupDeleteBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        assert!(slot.is_none(), "source cleanup delete barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("source cleanup should reach the pre-delete barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SourceCleanupDeleteBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
+    let barrier = SOURCE_CLEANUP_DELETE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("source cleanup delete barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 pub(crate) async fn cleanup_source_entry_if_unchanged(
     set: Arc<SetDisks>,
     bucket: &str,
@@ -560,19 +658,18 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    let result = set
-        .delete_object(
-            bucket,
-            cleanup_key.as_str(),
-            ObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                data_movement: true,
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await;
+    #[cfg(test)]
+    pause_source_cleanup_before_delete(bucket, object).await;
+
+    let mut opts = ObjectOptions {
+        delete_prefix: true,
+        delete_prefix_object: true,
+        data_movement: true,
+        no_lock: true,
+        ..Default::default()
+    };
+    opts.add_namespace_lock_guard(&_guard);
+    let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
@@ -627,7 +724,11 @@ fn resolve_data_movement_overwrite_resume_result(
         return Ok(false);
     };
 
-    Ok(is_equivalent_data_movement_object(source, &target))
+    if is_equivalent_data_movement_object(source, &target) {
+        return Ok(true);
+    }
+
+    Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
 }
 
 async fn should_treat_data_movement_overwrite_as_complete(
@@ -838,7 +939,6 @@ pub(crate) async fn migrate_object(
                         bucket.as_str(),
                         object_info.name.as_str()
                     );
-                    mark_multipart_upload_completed(&abort_multipart_flag);
                     return Ok(());
                 }
 
@@ -856,6 +956,32 @@ pub(crate) async fn migrate_object(
             Ok(())
         }
         .await;
+
+        if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
+            let abort_result = match store.pools.get(target_pool_idx) {
+                Some(pool) => {
+                    pool.abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
+                        .await
+                }
+                None => Err(Error::other(format!(
+                    "{op_label}: target pool {target_pool_idx} is out of range while aborting superseded multipart upload"
+                ))),
+            };
+            if let Err(abort_err) = abort_result
+                && !is_err_invalid_upload_id(&abort_err)
+            {
+                error!("{op_label}: abort superseded multipart upload err {:?}", &abort_err);
+                schedule_data_movement_multipart_abort_cleanup(
+                    store.clone(),
+                    target_pool_idx,
+                    bucket.clone(),
+                    object_info.name.clone(),
+                    res.upload_id.clone(),
+                    op_label,
+                );
+            }
+            return Ok(());
+        }
 
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
@@ -1171,12 +1297,13 @@ mod tests {
     }
 
     #[test]
-    fn test_should_check_data_movement_overwrite_resume_only_for_overwrite_error() {
+    fn test_should_check_data_movement_overwrite_resume_accepts_conflict_errors() {
         assert!(should_check_data_movement_overwrite_resume(&Error::DataMovementOverwriteErr(
             "bucket-a".to_string(),
             "object-a".to_string(),
             "version-a".to_string(),
         )));
+        assert!(should_check_data_movement_overwrite_resume(&Error::PreconditionFailed));
         assert!(!should_check_data_movement_overwrite_resume(&Error::SlowDown));
     }
 
@@ -1551,7 +1678,7 @@ mod tests {
     #[test]
     fn test_data_movement_complete_multipart_opts_preserves_mod_time_version_and_etag() {
         let mod_time = OffsetDateTime::now_utc();
-        let version_id = Uuid::nil();
+        let version_id = Uuid::from_u128(7);
         let object_info = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(mod_time),
@@ -1567,11 +1694,12 @@ mod tests {
         assert_eq!(opts.version_id.as_deref(), Some(version_id.to_string().as_str()));
         assert_eq!(opts.preserve_etag.as_deref(), Some("etag-value"));
         assert_eq!(opts.src_pool_idx, 7);
+        assert!(opts.http_preconditions.is_none());
     }
 
     #[test]
     fn test_data_movement_put_object_opts_preserves_version_and_etag() {
-        let version_id = Uuid::nil();
+        let version_id = Uuid::from_u128(9);
         let object_info = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
@@ -1589,6 +1717,35 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 9);
         assert!(opts.data_movement);
         assert_eq!(opts.mod_time, object_info.mod_time);
+        assert!(opts.http_preconditions.is_none());
+    }
+
+    #[test]
+    fn test_data_movement_unversioned_put_and_complete_require_absent_target() {
+        for version_id in [None, Some(Uuid::nil())] {
+            let object_info = ObjectInfo {
+                version_id,
+                ..Default::default()
+            };
+
+            let put_opts = data_movement_put_object_opts(&object_info, 9);
+            let complete_opts = data_movement_complete_multipart_opts(&object_info, 9);
+
+            assert_eq!(
+                put_opts
+                    .http_preconditions
+                    .as_ref()
+                    .and_then(HTTPPreconditions::if_none_match_value),
+                Some("*")
+            );
+            assert_eq!(
+                complete_opts
+                    .http_preconditions
+                    .as_ref()
+                    .and_then(HTTPPreconditions::if_none_match_value),
+                Some("*")
+            );
+        }
     }
 
     #[test]
@@ -1835,6 +1992,154 @@ mod tests {
             .expect("equivalent overwrite target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_accepts_newer_unversioned_target() {
+        for version_id in [None, Some(Uuid::nil())] {
+            let source = ObjectInfo {
+                version_id,
+                size: 128,
+                etag: Some("etag-source".to_string()),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            };
+            let target = ObjectInfo {
+                etag: Some("etag-client-write".to_string()),
+                mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+                ..source.clone()
+            };
+
+            let should_resume =
+                resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                    .expect("precondition conflict target should be evaluated");
+
+            assert!(should_resume);
+        }
+    }
+
+    #[test]
+    fn test_precondition_conflict_accepts_equivalent_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(source.clone())), &source, 0, 1)
+                .expect("equivalent precondition target should be evaluated");
+
+        assert!(should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_non_newer_unversioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-conflict".to_string()),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("precondition conflict target should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_newer_delete_marker() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            delete_marker: true,
+            etag: None,
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("delete marker conflict should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_overwrite_error_rejects_newer_unversioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-client-write".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source, 0, 1)
+            .expect("pool-selection overwrite must require target equivalence");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_newer_versioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(Uuid::from_u128(2)),
+            etag: Some("etag-conflict".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("versioned conflict target should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_versioned_source_with_unversioned_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: None,
+            etag: Some("etag-conflict".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("versioned source conflict should be evaluated");
+
+        assert!(!should_resume);
     }
 
     #[test]

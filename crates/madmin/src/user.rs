@@ -401,6 +401,11 @@ pub struct AccountInfo {
     pub server: BackendInfo,
     pub policy: serde_json::Value, // Use iam/policy::parse to parse the result, to be done by the caller.
     pub buckets: Vec<BucketAccessInfo>,
+    /// Whether the usage values came from a fully converged scanner cycle.
+    /// `false` means the values are a newer structurally complete observation
+    /// while another convergence pass remains pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -796,6 +801,20 @@ mod tests {
         assert_eq!(value["objects"], 0);
         assert_eq!(value["object_sizes_histogram"], serde_json::json!({}));
         assert_eq!(value["object_versions_histogram"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn account_info_exposes_observational_usage_state_additively() {
+        let info = AccountInfo {
+            usage_snapshot_converged: Some(false),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["usage_snapshot_converged"], false);
+
+        let legacy_shape = serde_json::to_value(AccountInfo::default()).unwrap();
+        assert!(!legacy_shape.as_object().unwrap().contains_key("usage_snapshot_converged"));
     }
 
     #[test]

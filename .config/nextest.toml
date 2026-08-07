@@ -29,6 +29,7 @@
 
 [test-groups]
 ecstore-serial-flaky = { max-threads = 1 }
+embedded-test-ports = { max-threads = 1 }
 
 # Reliability / fault-injection e2e tests each spawn a single-node 4-disk RustFS
 # server and manipulate its disk directories at runtime (crates/e2e_test:
@@ -53,6 +54,20 @@ test-group = 'ecstore-serial-flaky'
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
+
+# The production-handler relocation regression builds an isolated 8-disk,
+# 2-pool store and commits a 72 MiB multipart object. Keep that cross-disk IO
+# from overlapping the ecstore commit fixtures above.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+
+# Embedded integration-test binaries discover an ephemeral port and release
+# the probe listener before RustFS binds it. Serialize that cross-process
+# TOCTOU window; retries would only hide real startup failures.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
+test-group = 'embedded-test-ports'
 
 # Serialize the durable manual-transition checkpoint test across nextest's
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
@@ -142,6 +157,16 @@ test-group = 'e2e-reliability'
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+
+# Match the default-profile embedded test isolation without quarantining or
+# retrying failures in CI.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
+test-group = 'embedded-test-ports'
 
 # Serialize the durable manual-transition checkpoint test under the ci profile
 # too. No retries: failures stay visible.

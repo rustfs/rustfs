@@ -7,6 +7,7 @@ use crate::io_support::rio::HashReader;
 use crate::object_api::{BLOCK_SIZE_V2, ObjectLockConfigSnapshot, ObjectOptions, PutObjReader};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use crate::store::init_format::save_format_file;
@@ -206,8 +207,28 @@ async fn blackbox_get_restores_body_after_one_shard_file_is_removed() {
 #[tokio::test]
 // Serialized: forces the reader-setup strategy through a process-global env var.
 #[serial_test::serial]
-async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard() {
-    use rustfs_common::heal_channel::{HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealRequestSource};
+async fn blackbox_heal_requests_preserve_repair_scope() {
+    use rustfs_common::heal_channel::{
+        HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealRequestSource,
+    };
+
+    async fn receive_matching_heal(rx: &mut HealChannelReceiver, bucket: &str, object: &str) -> HealChannelRequest {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await.expect("heal channel should stay open") {
+                    HealChannelCommand::Start { request, response_tx }
+                        if request.bucket == bucket && request.object_prefix.as_deref() == Some(object) =>
+                    {
+                        let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                        break request;
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("matching heal request should be submitted")
+    }
 
     // Own the process-global heal channel so the read path's repair submission
     // becomes observable. init_heal_channel() succeeds exactly once per test
@@ -219,6 +240,126 @@ async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard(
     // deterministic channel state serialize under the same serial key.
     let mut heal_rx = rustfs_common::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
+
+    // Ordinary PUTs use the same admission channel as read repair. A single
+    // rename target failure still satisfies write quorum, so the committed
+    // version must be queued for convergence without delaying the PUT ACK.
+    let (_put_dirs, put_set) = make_local_set_disks(4, 2).await;
+    let put_bucket = "bb-put-partial-convergence";
+    let put_object = "object.bin";
+    put_set
+        .make_bucket(put_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("PUT bucket should be created");
+    let offline_disk = {
+        let mut disks = put_set.disks.write().await;
+        disks[0].take()
+    };
+    let mut put_reader = PutObjReader::from_vec(vec![0x42; BLOCK_SIZE_V2 + 1024]);
+    let committed = put_set
+        .put_object(
+            put_bucket,
+            put_object,
+            &mut put_reader,
+            &ObjectOptions {
+                no_lock: true,
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("partial ordinary PUT should succeed at write quorum");
+    let committed_version = committed
+        .version_id
+        .expect("versioned PUT should return a version id")
+        .to_string();
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == put_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break request;
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("partial ordinary PUT should enqueue convergence heal");
+    assert_eq!(request.object_version_id.as_deref(), Some(committed_version.as_str()));
+    assert_eq!(request.pool_index, Some(0));
+    assert_eq!(request.set_index, Some(0));
+
+    let duplicate_request = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == put_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break Some(request);
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(duplicate_request.is_none(), "partial ordinary PUT must enqueue exactly one heal request");
+
+    {
+        let mut disks = put_set.disks.write().await;
+        disks[0] = offline_disk;
+    }
+
+    let healthy_bucket = "bb-put-healthy-convergence";
+    put_set
+        .make_bucket(healthy_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("healthy PUT bucket should be created");
+    let mut healthy_reader = PutObjReader::from_vec(b"healthy".to_vec());
+    put_set
+        .put_object(
+            healthy_bucket,
+            put_object,
+            &mut healthy_reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("healthy ordinary PUT should succeed");
+    let healthy_request = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            match heal_rx.recv().await.expect("heal channel should stay open") {
+                HealChannelCommand::Start { request, response_tx }
+                    if request.bucket == healthy_bucket && request.object_prefix.as_deref() == Some(put_object) =>
+                {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    break Some(request);
+                }
+                HealChannelCommand::Start { response_tx, .. } => {
+                    let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(healthy_request.is_none(), "fully converged ordinary PUT must not enqueue heal");
 
     // Keep data-blocks-first reader setup explicit for this deterministic
     // repair assertion (see ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP in
@@ -276,19 +417,7 @@ async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard(
 
         assert_eq!(restored, payload);
 
-        let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                match heal_rx.recv().await.expect("heal channel should stay open") {
-                    HealChannelCommand::Start { request, response_tx } if request.bucket == bucket => {
-                        let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
-                        break request;
-                    }
-                    _ => continue,
-                }
-            }
-        })
-        .await
-        .expect("corrupt-shard GET should enqueue a read-repair heal request");
+        let request = receive_matching_heal(&mut heal_rx, bucket, object).await;
 
         assert_eq!(request.source, HealRequestSource::ReadRepair);
         assert_eq!(request.object_prefix.as_deref(), Some(object));
@@ -297,6 +426,142 @@ async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard(
         assert_eq!(request.set_index, Some(0));
         assert_eq!(request.priority, HealChannelPriority::Low);
         assert_eq!(request.recreate_missing, Some(true));
+
+        let mpu_bucket = "bb-mpu-convergence-heal";
+        let partial_object = "partial.bin";
+        let suspended_object = "suspended.bin";
+        let payload = vec![0x5a; 1 << 20];
+        let mpu_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(mpu_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("multipart bucket should be created");
+
+        let stage_upload = async |object: &str| {
+            let upload = set_disks
+                .new_multipart_upload(mpu_bucket, object, &mpu_opts)
+                .await
+                .expect("multipart upload should be created");
+            let mut reader = PutObjReader::new(
+                HashReader::from_stream(
+                    Cursor::new(payload.clone()),
+                    payload.len() as i64,
+                    payload.len() as i64,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("multipart reader should be constructed"),
+            );
+            let part = set_disks
+                .put_object_part(mpu_bucket, object, &upload.upload_id, 1, &mut reader, &mpu_opts)
+                .await
+                .expect("multipart part should be written");
+            (
+                upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+            )
+        };
+
+        let (partial_upload_id, partial_parts) = stage_upload(partial_object).await;
+        let offline_disk = {
+            let mut disks = set_disks.disks.write().await;
+            disks[3].take().expect("fourth disk should be online before completion")
+        };
+        crate::crash_inject::arm(crate::crash_inject::CrashPoint::MultipartAfterCommitBeforePartsCleanup, partial_object);
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(mpu_bucket, partial_object, &partial_upload_id, partial_parts, &mpu_opts)
+            .await;
+        assert!(
+            matches!(completed, Err(Error::Unexpected)),
+            "partial multipart completion should reach the post-commit crash point, got {completed:?}"
+        );
+        crate::crash_inject::disarm(crate::crash_inject::CrashPoint::MultipartAfterCommitBeforePartsCleanup, partial_object);
+
+        let request = receive_matching_heal(&mut heal_rx, mpu_bucket, partial_object).await;
+
+        let completed_version_id = request
+            .object_version_id
+            .clone()
+            .expect("versioned multipart convergence heal must bind a version id");
+        assert_eq!(request.pool_index, Some(0));
+        assert_eq!(request.set_index, Some(0));
+        assert_eq!(request.priority, HealChannelPriority::Normal);
+
+        let duplicate = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                match heal_rx.recv().await.expect("heal channel should stay open") {
+                    HealChannelCommand::Start { request, .. }
+                        if request.bucket == mpu_bucket && request.object_prefix.as_deref() == Some(partial_object) =>
+                    {
+                        break request;
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await;
+        assert!(duplicate.is_err(), "partial multipart completion must enqueue exactly one heal request");
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[3] = Some(offline_disk);
+        }
+        let committed = set_disks
+            .get_object_info(
+                mpu_bucket,
+                partial_object,
+                &ObjectOptions {
+                    no_lock: true,
+                    versioned: true,
+                    version_id: Some(completed_version_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal-bound multipart version should be committed and addressable");
+        assert_eq!(committed.version_id.map(|version_id| version_id.to_string()), Some(completed_version_id));
+
+        let (suspended_upload_id, suspended_parts) = stage_upload(suspended_object).await;
+        let offline_disk = {
+            let mut disks = set_disks.disks.write().await;
+            disks[3]
+                .take()
+                .expect("fourth disk should be online before suspended completion")
+        };
+        let suspended_opts = ObjectOptions {
+            no_lock: true,
+            version_suspended: true,
+            ..Default::default()
+        };
+        let suspended = set_disks
+            .clone()
+            .complete_multipart_upload(mpu_bucket, suspended_object, &suspended_upload_id, suspended_parts, &suspended_opts)
+            .await
+            .expect("suspended multipart completion should succeed at write quorum");
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[3] = Some(offline_disk);
+        }
+        assert!(
+            suspended.version_id.is_some_and(|version_id| version_id.is_nil()),
+            "suspended multipart completion should publish the null version"
+        );
+
+        let request = receive_matching_heal(&mut heal_rx, mpu_bucket, suspended_object).await;
+
+        let null_version_id = uuid::Uuid::nil().to_string();
+        assert_eq!(request.object_version_id.as_deref(), Some(null_version_id.as_str()));
     })
     .await;
 }

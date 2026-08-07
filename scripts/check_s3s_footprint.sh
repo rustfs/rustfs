@@ -6,7 +6,7 @@
 # The migration's goal is to shrink the direct s3s surface, so new code must
 # not grow it. Two counters are ratcheted, baselines verified on 2026-08-05:
 #
-#   - files importing s3s:          rg -l 's3s::' --type rust        (files)
+#   - files referencing s3s paths:  rg -l "$S3S_PATH_PATTERN" --type rust (files)
 #   - s3_error! invocation lines:   rg -c 's3_error!' --type rust    (summed)
 #
 # Either count exceeding its baseline fails the check with the offending
@@ -23,8 +23,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Baselines verified on 2026-08-06. Lower-only; see header.
-S3S_IMPORT_FILES_BASELINE=237
+S3S_IMPORT_FILES_BASELINE=236
 S3_ERROR_LINES_BASELINE=1679
+S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -41,7 +42,7 @@ run_rg_to() {
     fi
 }
 
-run_rg_to "$TMP_DIR/import_files" -l 's3s::' --type rust
+run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust
 run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
@@ -75,7 +76,7 @@ check_ratchet() {
 }
 
 check_ratchet "files importing s3s" "$s3s_import_files" "$S3S_IMPORT_FILES_BASELINE" \
-    "rg -l 's3s::' --type rust"
+    "rg -l '$S3S_PATH_PATTERN' --type rust"
 check_ratchet "s3_error! invocation lines" "$s3_error_lines" "$S3_ERROR_LINES_BASELINE" \
     "rg -c 's3_error!' --type rust"
 
