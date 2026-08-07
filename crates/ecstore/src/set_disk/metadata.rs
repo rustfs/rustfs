@@ -250,14 +250,26 @@ impl SetDisks {
                 continue;
             }
 
+            // A parity count outside [0, total_shards] cannot describe a real
+            // layout on this set: it comes from corrupt or foreign metadata
+            // (e.g. stray leftovers, rustfs#5801). Treat the entry as invalid
+            // instead of clamping to i32::MAX, which would poison
+            // `common_parity`'s occurrence counting.
+            let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(-1);
+            let erasure_parity = if (0..=total_shards_i32).contains(&erasure_parity) {
+                erasure_parity
+            } else {
+                -1
+            };
             if metadata.is_canonical_delete_marker() || metadata.size == 0 {
                 parities[index] = half;
+            } else if erasure_parity < 0 {
+                parities[index] = -1;
             } else if metadata.transition_status == TRANSITION_COMPLETE {
                 let majority_metadata_parity = total_shards_i32 - (half + 1);
-                let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
                 parities[index] = majority_metadata_parity.max(erasure_parity);
             } else {
-                parities[index] = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
+                parities[index] = erasure_parity;
             }
         }
         parities
@@ -294,6 +306,19 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
+            // No parity value reached read quorum. Distinguish two cases:
+            // enough disks answered with valid-looking metadata that simply
+            // cannot be reconciled (corrupt/foreign entries — retrying cannot
+            // help, and heal should see Corrupt, rustfs#5801) versus too few
+            // healthy answers (a genuine quorum condition where retry may
+            // succeed once disks recover).
+            let healthy_replies = errs.iter().filter(|err| err.is_none()).count();
+            if healthy_replies >= expected_rquorum {
+                error!(
+                    "object_quorum_from_meta: irreconcilable parity across {healthy_replies} healthy replies (corrupt metadata), errs={errs:?}"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
             error!("object_quorum_from_meta: parity_blocks < 0, errs={:?}", errs);
             return Err(DiskError::ErasureReadQuorum);
         }
@@ -1136,7 +1161,9 @@ mod tests {
         let invalid = vec![FileInfo::default(); 4];
         let err = SetDisks::object_quorum_from_meta(&invalid, &vec![None; 4], 2)
             .expect_err("invalid metadata without a common parity must fail closed");
-        assert_eq!(err, DiskError::ErasureReadQuorum);
+        // A full set of healthy replies whose metadata cannot be reconciled is
+        // corrupt (heal-actionable), not a retryable quorum outage (rustfs#5801).
+        assert_eq!(err, DiskError::FileCorrupt);
     }
 
     #[test]
@@ -1467,5 +1494,56 @@ mod tests {
             SetDisks::file_info_quorum_hash(&dual_prefixed),
             "compatible prefixes carrying the same mapping must share one identity"
         );
+    }
+
+    /// rustfs#5801: parity counts outside [0, total_shards] come from corrupt
+    /// or foreign metadata and must be treated as invalid entries instead of
+    /// clamped values that poison `common_parity`'s occurrence counting.
+    #[test]
+    fn out_of_range_parity_is_treated_as_invalid_entry() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let parities = SetDisks::list_object_parities(&metas, &errs);
+        assert_eq!(parities, vec![-1; 4], "garbage parity must not survive as a candidate");
+    }
+
+    /// rustfs#5801: when a read quorum of healthy disks answers but their
+    /// parity values are irreconcilable, the object metadata is corrupt —
+    /// return `FileCorrupt` (heal-actionable, non-retryable) instead of the
+    /// retryable-looking `ErasureReadQuorum`.
+    #[test]
+    fn irreconcilable_parity_with_healthy_quorum_is_file_corrupt() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("garbage parity cannot form a quorum");
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    /// Too few healthy replies remains a genuine quorum condition where a
+    /// retry may succeed once disks recover.
+    #[test]
+    fn insufficient_healthy_replies_stays_erasure_read_quorum() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        metas[0].erasure.parity_blocks = usize::MAX;
+        let errs: Vec<Option<DiskError>> = vec![
+            None,
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("one healthy reply is below quorum");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 }
