@@ -607,6 +607,7 @@ mod tests {
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(()),
             ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
         });
         let mut version = FileInfo::new("object.bin", 4, 2);
         version.name = "object.bin".to_string();
