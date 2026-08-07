@@ -211,7 +211,7 @@ test-group = 'ecstore-serial-flaky'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 28 nightly = 48 total
+# regexes byte-identical. Count invariant: 20 here + 36 nightly = 56 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
@@ -273,10 +273,10 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 # tests that are unfit for the per-PR e2e-smoke gate:
 #
 #   * 2 remote-target TLS validation tests.
-#   * 12 bucket-replication data-plane/helper tests — they PUT/delete objects
-#     and poll until source and target converge; two replicate over HTTPS, two
-#     pin active SSE failure contracts, and one guards event/history observers.
-#     The SSE-S3 contract remains ignored under backlog#1291.
+#   * 13 bucket-replication data-plane/helper tests — they PUT/delete objects
+#     and poll until source and target converge; two replicate over HTTPS,
+#     four pin active SSE fail-closed contracts (SSE-C, SSE-S3, SSE-KMS, and
+#     the SSE-S3 resync path), and one guards event/history observers.
 #   * 12 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
 #   * 1 `_real_three_node` site-replication test.
