@@ -7578,6 +7578,55 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_aborts_after_outer_lock_loss() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "data-movement-cleanup-lock-lost";
+        let object = "object.bin";
+        let payload = b"lost data movement cleanup lock must preserve the source".repeat(1024);
+        write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let expected = set_disks
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source versions should be readable")
+            .expect("source versions should exist");
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+
+        let cleanup_set = Arc::clone(&set_disks);
+        let cleanup = tokio::spawn(async move {
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                cleanup_set,
+                bucket,
+                object,
+                &expected,
+                &[],
+                "test_data_movement",
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) > 0,
+            "test must drive the real distributed-lock heartbeat before cleanup commit"
+        );
+        barrier.release();
+
+        let error = cleanup
+            .await
+            .expect("cleanup task should not panic")
+            .expect_err("cleanup must fail after its outer namespace lock loses refresh quorum");
+        assert!(matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }));
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
