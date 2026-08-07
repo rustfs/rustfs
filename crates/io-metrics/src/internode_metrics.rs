@@ -47,6 +47,8 @@ const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const HTTP_VERSION_LABEL: &str = "http_version";
 const FAILURE_REASON_LABEL: &str = "failure_reason";
+const RPC_PATH_LABEL: &str = "rpc_path";
+const REASON_LABEL: &str = "reason";
 const DIRECTION_LABEL: &str = "direction";
 const MESSAGE_LABEL: &str = "message";
 const CODEC_LABEL: &str = "codec";
@@ -73,6 +75,11 @@ const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
 const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_replay_scope_fallback_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
+const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
+    "rustfs_system_network_internode_replay_cache_overflow_by_operation_total";
+const INTERNODE_REPLAY_CACHE_ENTRIES: &str = "rustfs_system_network_internode_replay_cache_entries";
+const INTERNODE_REPLAY_CACHE_CAPACITY: &str = "rustfs_system_network_internode_replay_cache_capacity";
+const INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_evictions_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +94,9 @@ const SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] =
 const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
 const SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS: &[&str] =
     &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL];
+const SERVER_OPERATION_BACKEND_RPC_PATH_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL];
+const SERVER_LABELS: &[&str] = &[SERVER_LABEL];
+const SERVER_REASON_LABELS: &[&str] = &[SERVER_LABEL, REASON_LABEL];
 const SERVER_QUORUM_FAILURE_LABELS: &[&str] = &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL];
 
 pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
@@ -143,6 +153,22 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         labels: SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS,
     },
     InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_ENTRIES,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_CAPACITY,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL,
+        labels: SERVER_REASON_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
         labels: SERVER_QUORUM_FAILURE_LABELS,
     },
@@ -192,6 +218,9 @@ pub struct InternodeMetricsSnapshot {
     pub body_digest_fallback_total: u64,
     pub replay_scope_fallback_total: u64,
     pub replay_cache_overflow_total: u64,
+    pub replay_cache_entries: u64,
+    pub replay_cache_capacity: u64,
+    pub replay_cache_evictions_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -215,6 +244,13 @@ pub struct InternodeMetrics {
     body_digest_fallback_total: AtomicU64,
     replay_scope_fallback_total: AtomicU64,
     replay_cache_overflow_total: AtomicU64,
+    replay_cache_entries: AtomicU64,
+    replay_cache_capacity: AtomicU64,
+    replay_cache_evictions_total: AtomicU64,
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl InternodeMetrics {
@@ -565,6 +601,46 @@ impl InternodeMetrics {
         counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
     }
 
+    pub fn record_replay_cache_overflow_for_operation_and_backend_path(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        rpc_path: &str,
+    ) {
+        self.record_replay_cache_overflow();
+        counter!(
+            INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            RPC_PATH_LABEL => rpc_path.to_owned()
+        )
+        .increment(1);
+    }
+
+    pub fn record_replay_cache_state(&self, entries: usize, capacity: usize) {
+        let entries = usize_to_u64_saturating(entries);
+        let capacity = usize_to_u64_saturating(capacity);
+        self.replay_cache_entries.store(entries, Ordering::Relaxed);
+        self.replay_cache_capacity.store(capacity, Ordering::Relaxed);
+        gauge!(INTERNODE_REPLAY_CACHE_ENTRIES, SERVER_LABEL => current_server_label()).set(entries as f64);
+        gauge!(INTERNODE_REPLAY_CACHE_CAPACITY, SERVER_LABEL => current_server_label()).set(capacity as f64);
+    }
+
+    pub fn record_replay_cache_evictions(&self, reason: &'static str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = usize_to_u64_saturating(count);
+        self.replay_cache_evictions_total.fetch_add(count, Ordering::Relaxed);
+        counter!(
+            INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            REASON_LABEL => reason
+        )
+        .increment(count);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -618,6 +694,9 @@ impl InternodeMetrics {
             body_digest_fallback_total: self.body_digest_fallback_total.load(Ordering::Relaxed),
             replay_scope_fallback_total: self.replay_scope_fallback_total.load(Ordering::Relaxed),
             replay_cache_overflow_total: self.replay_cache_overflow_total.load(Ordering::Relaxed),
+            replay_cache_entries: self.replay_cache_entries.load(Ordering::Relaxed),
+            replay_cache_capacity: self.replay_cache_capacity.load(Ordering::Relaxed),
+            replay_cache_evictions_total: self.replay_cache_evictions_total.load(Ordering::Relaxed),
         }
     }
 
@@ -642,6 +721,9 @@ impl InternodeMetrics {
         self.body_digest_fallback_total.store(0, Ordering::Relaxed);
         self.replay_scope_fallback_total.store(0, Ordering::Relaxed);
         self.replay_cache_overflow_total.store(0, Ordering::Relaxed);
+        self.replay_cache_entries.store(0, Ordering::Relaxed);
+        self.replay_cache_capacity.store(0, Ordering::Relaxed);
+        self.replay_cache_evictions_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -864,6 +946,8 @@ mod tests {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             "missing_v2_signature",
         );
+        metrics.record_replay_cache_state(64, 1024);
+        metrics.record_replay_cache_evictions("expired", 3);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.sent_bytes_total, 128);
@@ -872,11 +956,14 @@ mod tests {
         assert_eq!(snapshot.incoming_requests_total, 1);
         assert_eq!(snapshot.errors_total, 1);
         assert_eq!(snapshot.rpc_auth_failures_total, 1);
+        assert_eq!(snapshot.replay_cache_entries, 64);
+        assert_eq!(snapshot.replay_cache_capacity, 1024);
+        assert_eq!(snapshot.replay_cache_evictions_total, 3);
     }
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 16);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 20);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -894,10 +981,18 @@ mod tests {
             INTERNODE_OPERATION_METRICS[12].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL]
         );
-        assert_eq!(INTERNODE_OPERATION_METRICS[13].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[13].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[14..16] {
+            assert_eq!(metric.labels, &[SERVER_LABEL]);
+        }
+        assert_eq!(INTERNODE_OPERATION_METRICS[16].labels, &[SERVER_LABEL, REASON_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[17].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
         // Payload histogram + large-payload counter carry operation+backend labels.
-        assert_eq!(INTERNODE_OPERATION_METRICS[14].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[15].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -947,14 +1042,30 @@ mod tests {
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[13].name,
-            "rustfs_system_storage_erasure_write_quorum_failures_total"
+            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[14].name,
-            "rustfs_system_network_internode_operation_payload_bytes"
+            "rustfs_system_network_internode_replay_cache_entries"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[15].name,
+            "rustfs_system_network_internode_replay_cache_capacity"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[16].name,
+            "rustfs_system_network_internode_replay_cache_evictions_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[17].name,
+            "rustfs_system_storage_erasure_write_quorum_failures_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[18].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[19].name,
             "rustfs_system_network_internode_operation_large_payloads_total"
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
@@ -979,6 +1090,8 @@ mod tests {
             "rustfs_system_network_internode_signature_v1_fallback_total"
         );
         assert_eq!(FAILURE_REASON_LABEL, "failure_reason");
+        assert_eq!(RPC_PATH_LABEL, "rpc_path");
+        assert_eq!(REASON_LABEL, "reason");
     }
 
     #[test]
@@ -1012,6 +1125,57 @@ mod tests {
         assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
         assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
         assert_eq!(labels.get(FAILURE_REASON_LABEL).map(String::as_str), Some("invalid_v2_signature"));
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn replay_cache_metrics_record_state_eviction_and_overflow_scope() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_replay_cache_state(7, 11);
+            metrics.record_replay_cache_evictions("expired", 5);
+            metrics.record_replay_cache_overflow_for_operation_and_backend_path(
+                INTERNODE_OPERATION_GRPC_READ_ALL,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "/node_service.NodeService/ReadAll",
+            );
+        });
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.replay_cache_entries, 7);
+        assert_eq!(snapshot.replay_cache_capacity, 11);
+        assert_eq!(snapshot.replay_cache_evictions_total, 5);
+        assert_eq!(snapshot.replay_cache_overflow_total, 1);
+
+        let entries: Vec<_> = snapshotter.snapshot().into_vec();
+        assert!(
+            entries
+                .iter()
+                .any(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_ENTRIES)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_CAPACITY)
+        );
+
+        let overflow: Vec<_> = entries
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL)
+            .collect();
+        assert_eq!(overflow.len(), 1);
+        let labels: HashMap<_, _> = overflow[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(labels.get(RPC_PATH_LABEL).map(String::as_str), Some("/node_service.NodeService/ReadAll"));
         assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
     }
 

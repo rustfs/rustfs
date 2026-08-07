@@ -690,6 +690,17 @@ if [[ -n "$unmasked_revoke_fields" ]]; then
   exit 1
 fi
 
+# STS claims carry caller-supplied identity material (parent user, session policy, JWT
+# fields). Interpolating the claims map into any log or error repeats the
+# GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata
+# such as claims.len() may be logged (see trace_assume_role_claims in sts.rs).
+sts_claims_content_logs="$(rg -n '\{:\?\}.*claims|claims.*\{:\?\}|\{&?claims:\?\}|[?%]\s*&?claims\b' rustfs/src/admin/handlers/sts.rs || true)"
+if [[ -n "$sts_claims_content_logs" ]]; then
+  echo "❌ logging guardrail violation: STS handlers must not interpolate JWT claims into logs or errors (GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 class); log derived metadata such as claims.len() instead" >&2
+  echo "$sts_claims_content_logs" >&2
+  exit 1
+fi
+
 heal_hotpath_files=(
   "crates/ecstore/src/store/heal.rs"
   "crates/ecstore/src/store/mod.rs"
@@ -854,6 +865,11 @@ fi
 # between the macro open and the message at every retry-admission site.
 if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Heal retry admission decided"' crates/heal/src/heal/manager.rs >/dev/null; then
   echo "❌ logging guardrail violation: heal retry admission decisions repeat per retrying task (per-object under MRF retry storms) and must stay at DEBUG" >&2
+  exit 1
+fi
+
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
   exit 1
 fi
 
