@@ -84,7 +84,23 @@ const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total
 const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SCANNER_SCHEDULE_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
-const SUPERSEDED_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(60);
+/// First-retry delay after a usage snapshot is superseded by concurrent writes.
+///
+/// A superseded cycle is the *expected* outcome of the dirty-usage fast path:
+/// a write burst marks buckets dirty, the scanner wakes within milliseconds,
+/// and the still-landing writes then supersede the snapshot it took. Charging
+/// that first race a full cycle interval means a burst of writes surfaces in
+/// usage/quota accounting roughly two cycles late (measured: ~120 s on an
+/// otherwise idle instance whose clean-idle backoff had doubled a 60 s
+/// interval), which defeats the fast path it is meant to protect.
+///
+/// The exponential growth in [`ScannerSupersededBackoff::retry_interval`] is
+/// what protects against a persistently hot bucket driving an unbroken
+/// full-scan loop, so it can start small: 5 s, 10 s, 20 s … capped by
+/// [`SUPERSEDED_RETRY_MAX_INTERVAL`]. A one-off race recovers in seconds; a
+/// genuinely hot bucket still reaches minute-scale backoff within a handful of
+/// cycles.
+const SUPERSEDED_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
 const SUPERSEDED_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
@@ -6925,7 +6941,7 @@ mod tests {
         let mut backoff = ScannerSupersededBackoff::default();
         assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
-        for expected in [60, 120, 240, 480, 960, 1_920, 3_840] {
+        for expected in [5, 10, 20, 40, 80, 160, 320] {
             backoff.record_cycle(ScannerCycleOutcome::Superseded);
             assert_eq!(
                 backoff.retry_interval(Duration::from_secs(24 * 60 * 60)),
@@ -6949,15 +6965,19 @@ mod tests {
         let mut backoff = ScannerSupersededBackoff::default();
         backoff.record_cycle(ScannerCycleOutcome::Superseded);
 
-        assert_eq!(backoff.retry_interval(Duration::from_secs(15)), Some(Duration::from_secs(15)));
+        // A configured cycle shorter than the base still wins: retrying sooner
+        // than the operator's own cadence buys nothing.
+        assert_eq!(backoff.retry_interval(Duration::from_secs(3)), Some(Duration::from_secs(3)));
         backoff.record_cycle(ScannerCycleOutcome::Superseded);
-        assert_eq!(backoff.retry_interval(Duration::from_secs(15)), Some(Duration::from_secs(30)));
+        assert_eq!(backoff.retry_interval(Duration::from_secs(3)), Some(Duration::from_secs(6)));
     }
 
     #[test]
     fn superseded_retry_backoff_grows_from_the_default_cycle() {
         let mut backoff = ScannerSupersededBackoff::default();
-        for expected in [60, 120, 240, 480] {
+        // The first race after a write burst retries in seconds, not a whole
+        // cycle, while repeated supersedes still climb toward the cap.
+        for expected in [5, 10, 20, 40] {
             backoff.record_cycle(ScannerCycleOutcome::Superseded);
             assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(expected)));
         }
