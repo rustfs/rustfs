@@ -982,10 +982,9 @@ impl SetDisks {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
                             .await?
-                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
-                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
                 }
                 object_lock_guard = Some(
                     self.acquire_write_lock_diag("put_object_precondition", bucket, object)
@@ -1321,10 +1320,9 @@ impl SetDisks {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
                             .await?
-                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
-                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
                 }
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
