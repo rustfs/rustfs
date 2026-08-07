@@ -66,8 +66,7 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV)
-        .await?;
+    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV).await?;
 
     let client = env.create_s3_client();
 
@@ -125,8 +124,7 @@ async fn data_usage_reports_versioned_objects_and_delete_markers() -> Result<(),
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV)
-        .await?;
+    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV).await?;
 
     let client = env.create_s3_client();
     let bucket = "data-usage-versioned";
