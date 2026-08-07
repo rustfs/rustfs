@@ -691,6 +691,10 @@ const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
+/// A healing commit could not trash the stale destination data dir it is about
+/// to replace. Best effort — the rename that follows fails closed — but a
+/// recurring signal means heal is stuck on that drive.
+const EVENT_DISK_LOCAL_HEAL_PURGE_FAILED: &str = "disk_local_heal_purge_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
 // io_uring read-backend gray-release observability (rustfs/backlog#1172).
@@ -7982,7 +7986,14 @@ impl DiskAPI for LocalDisk {
                 && let Some((_, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = self.move_to_trash(dst_data_path, true, false).await
             {
-                warn!("heal rename_data: purging stale destination data dir {:?} failed: {}", dst_data_path, err);
+                warn!(
+                    event = EVENT_DISK_LOCAL_HEAL_PURGE_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    dst_path = ?dst_data_path,
+                    error = ?err,
+                    "Healing commit could not purge the stale destination data dir"
+                );
             }
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
