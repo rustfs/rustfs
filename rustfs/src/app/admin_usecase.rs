@@ -703,8 +703,6 @@ mod tests {
         });
     }
 
-    #[test]
-
     /// rustfs#5806: a bucket the last scan never reached must not blank the
     /// usage the scan *did* measure — that turned every bucket creation into a
     /// deployment-wide usage blackout until the next cycle.
