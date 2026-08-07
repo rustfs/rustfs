@@ -144,6 +144,8 @@ async fn run(config: Config) -> Result<()> {
         shutdown_token: ctx,
     } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
 
+    let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
+
     let service_runtime = init_startup_runtime_services(
         &config,
         endpoint_pools,
@@ -160,6 +162,7 @@ async fn run(config: Config) -> Result<()> {
         state_manager,
         s3_shutdown_tx,
         console_shutdown_tx,
+        capacity_tasks,
         service_runtime,
         store,
         shutdown_token: ctx,
