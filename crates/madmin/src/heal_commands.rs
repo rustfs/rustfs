@@ -29,6 +29,11 @@ pub struct Infos {
     pub drives: Vec<HealDriveInfo>,
 }
 
+/// String form of `DriveState::Ok` as recorded in `HealDriveInfo::state`
+/// (this crate stores drive states as strings and does not depend on the
+/// enum's crate).
+const DRIVE_STATE_OK: &str = "ok";
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
     #[serde(rename = "resultId")]
@@ -57,4 +62,49 @@ pub struct HealResultItem {
     pub after: Infos,
     #[serde(rename = "objectSize")]
     pub object_size: usize,
+}
+
+impl HealResultItem {
+    /// Number of drives this heal actually repaired: entries whose state
+    /// changed from a non-ok `before` value to ok in `after`. The heal
+    /// populates `before.drives` and `after.drives` pairwise, one entry per
+    /// consulted drive, so `after.drives.len()` is the drive count of the
+    /// set — logging that as "drives healed" reported 12 for heals that
+    /// repaired nothing (issue #5863).
+    pub fn drives_healed(&self) -> usize {
+        self.before
+            .drives
+            .iter()
+            .zip(&self.after.drives)
+            .filter(|(before, after)| before.state != after.state && after.state == DRIVE_STATE_OK)
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive(state: &str) -> HealDriveInfo {
+        HealDriveInfo {
+            uuid: String::new(),
+            endpoint: String::new(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn drives_healed_counts_transitions_to_ok_not_consulted_drives() {
+        let mut item = HealResultItem::default();
+        item.before.drives = vec![drive("ok"), drive("missing"), drive("corrupt"), drive("offline")];
+        item.after.drives = vec![drive("ok"), drive("ok"), drive("ok"), drive("offline")];
+        // 4 drives consulted, 2 repaired (missing->ok, corrupt->ok); the
+        // already-ok drive and the still-offline drive are not repairs.
+        assert_eq!(item.drives_healed(), 2);
+
+        let mut noop = HealResultItem::default();
+        noop.before.drives = vec![drive("ok"); 12];
+        noop.after.drives = vec![drive("ok"); 12];
+        assert_eq!(noop.drives_healed(), 0);
+    }
 }
