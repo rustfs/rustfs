@@ -1482,6 +1482,17 @@ mod test {
     }
 
     #[test]
+    fn test_is_indexed_meta_reports_file_corrupt_on_crc_mismatch() {
+        let fm = FileMeta::default();
+        let mut buf = fm.marshal_msg().expect("serialize default FileMeta");
+        let idx = 8 + 5;
+        buf[idx] ^= 0xff;
+
+        let err = FileMeta::is_indexed_meta(&buf).expect_err("corrupted indexed metadata must fail");
+        assert_eq!(err, Error::FileCorrupt, "indexed CRC mismatch must classify as FileCorrupt, got: {err}");
+    }
+
+    #[test]
     fn test_unmarshal_rejects_absurd_version_count() {
         let mut meta = Vec::new();
         rmp::encode::write_uint(&mut meta, XL_HEADER_VERSION as u64).unwrap();
