@@ -1932,6 +1932,9 @@ impl ECStore {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
+            if self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
             futures.push(pool.delete_objects(bucket, objects.clone(), opts.clone()));
         }
 
