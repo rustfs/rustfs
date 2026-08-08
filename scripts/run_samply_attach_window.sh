@@ -12,7 +12,9 @@ usage() {
 Usage: scripts/run_samply_attach_window.sh --pid <pid> --duration-secs <n> --output <profile.json.gz> [options]
 
 Attach samply to an already-running process for a bounded window and force a
-Ctrl+C-style shutdown so samply writes the profile artifact.
+Ctrl+C-style shutdown so samply writes the profile artifact. This script uses
+direct `samply record -p`; `cargo samply` launches a cargo target and is not
+suitable for attaching to an existing RustFS service PID.
 
 Options:
   --pid <pid>              Existing process id to profile.
