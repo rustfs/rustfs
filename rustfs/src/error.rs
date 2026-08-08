@@ -288,7 +288,11 @@ impl From<StorageError> for ApiError {
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
-            StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::SlowDown
+            | StorageError::FaultyDisk
+            | StorageError::FaultyRemoteDisk
+            | StorageError::DiskNotFound
+            | StorageError::TooManyOpenFiles => S3ErrorCode::SlowDown,
             StorageError::ErasureReadQuorum
             | StorageError::InsufficientReadQuorum(_, _)
             | StorageError::ErasureWriteQuorum
@@ -598,6 +602,10 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (StorageError::FaultyDisk, S3ErrorCode::SlowDown),
+            (StorageError::FaultyRemoteDisk, S3ErrorCode::SlowDown),
+            (StorageError::DiskNotFound, S3ErrorCode::SlowDown),
+            (StorageError::TooManyOpenFiles, S3ErrorCode::SlowDown),
             (StorageError::ErasureReadQuorum, S3ErrorCode::SlowDown),
             (StorageError::InsufficientReadQuorum("test".into(), "test".into()), S3ErrorCode::SlowDown),
             (StorageError::ErasureWriteQuorum, S3ErrorCode::SlowDown),
