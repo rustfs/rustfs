@@ -5314,6 +5314,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "info", skip(self, _fs, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
@@ -5640,6 +5641,7 @@ impl DefaultObjectUsecase {
                 buffer_size,
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
+            let body = hotpath::io!(body, label = "s3.put.body.compressed");
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
@@ -5662,7 +5664,11 @@ impl DefaultObjectUsecase {
         } else {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
-                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
+                let eager_body = hotpath::future!(
+                    read_zero_copy_put_body_exact(body, actual_size as usize),
+                    label = "s3.put.body.zero_copy_eager"
+                )
+                .await?;
                 rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             } else if use_small_eager_put_path {
@@ -5671,7 +5677,10 @@ impl DefaultObjectUsecase {
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        hotpath::io!(
+                            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                            label = "s3.put.body.small_eager_direct"
+                        ),
                         actual_size as usize,
                     )
                     .await?;
@@ -5679,7 +5688,10 @@ impl DefaultObjectUsecase {
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        hotpath::io!(
+                            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                            label = "s3.put.body.small_eager_pooled"
+                        ),
                         actual_size as usize,
                         pool.as_ref(),
                     )
@@ -5692,6 +5704,7 @@ impl DefaultObjectUsecase {
                     buffer_size,
                     StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                 );
+                let body = hotpath::io!(body, label = "s3.put.body.streaming");
                 HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             }
         };
@@ -6253,6 +6266,7 @@ impl DefaultObjectUsecase {
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -8785,6 +8799,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
