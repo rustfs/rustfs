@@ -28,7 +28,7 @@ use rustfs_io_metrics::{
     record_write_lock_held_acquire, record_write_lock_held_release,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
@@ -40,11 +40,6 @@ const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const LOCK_ACQUIRE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
-const RELEASE_CLEANUP_QUEUE_CAPACITY: usize = 1024;
-const RELEASE_CLEANUP_CONCURRENCY: usize = 32;
-
-type ReleaseCleanupJob = (Vec<(LockId, Arc<dyn LockClient>)>, &'static str);
-static RELEASE_CLEANUP_SENDER: OnceLock<Option<tokio::sync::mpsc::Sender<ReleaseCleanupJob>>> = OnceLock::new();
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
 const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
 const UNRECOVERABLE_QUORUM_FAILURE_PREFIX: &str = "unrecoverable quorum failure";
@@ -497,77 +492,6 @@ struct LockAcquireQuorumResult {
     quorum_impossible: bool,
 }
 
-struct LockAcquireState<'a> {
-    individual_locks: Vec<HeldLockEntry>,
-    pending: Option<JoinSet<LockAcquireTaskResult>>,
-    clients: &'a [Arc<dyn LockClient>],
-    fallback_lock_id: &'a LockId,
-    cleanup_runtime: tokio::runtime::Handle,
-}
-
-impl<'a> LockAcquireState<'a> {
-    fn new(pending: JoinSet<LockAcquireTaskResult>, clients: &'a [Arc<dyn LockClient>], fallback_lock_id: &'a LockId) -> Self {
-        Self {
-            individual_locks: Vec::new(),
-            pending: Some(pending),
-            clients,
-            fallback_lock_id,
-            cleanup_runtime: tokio::runtime::Handle::current(),
-        }
-    }
-
-    fn rollback(mut self, release_context: &'static str, pending_context: &'static str) -> Vec<HeldLockEntry> {
-        let individual_locks = std::mem::take(&mut self.individual_locks);
-        DistributedLock::spawn_release_cleanup(
-            individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
-            release_context,
-        );
-        if let Some(pending) = self.pending.take().filter(|pending| !pending.is_empty()) {
-            DistributedLock::spawn_pending_cleanup(
-                pending,
-                self.clients.to_vec(),
-                (*self.fallback_lock_id).clone(),
-                self.cleanup_runtime.clone(),
-                pending_context,
-            );
-        }
-        individual_locks
-    }
-
-    fn complete(mut self, pending_context: &'static str) -> Vec<HeldLockEntry> {
-        let individual_locks = std::mem::take(&mut self.individual_locks);
-        if let Some(pending) = self.pending.take().filter(|pending| !pending.is_empty()) {
-            DistributedLock::spawn_pending_cleanup(
-                pending,
-                self.clients.to_vec(),
-                (*self.fallback_lock_id).clone(),
-                self.cleanup_runtime.clone(),
-                pending_context,
-            );
-        }
-        individual_locks
-    }
-}
-
-impl Drop for LockAcquireState<'_> {
-    fn drop(&mut self) {
-        DistributedLock::spawn_cancel_release_cleanup(
-            self.individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
-            self.cleanup_runtime.clone(),
-            "distributed_lock_cancel_cleanup",
-        );
-        if let Some(pending) = self.pending.take().filter(|pending| !pending.is_empty()) {
-            DistributedLock::spawn_pending_cleanup(
-                pending,
-                self.clients.to_vec(),
-                (*self.fallback_lock_id).clone(),
-                self.cleanup_runtime.clone(),
-                "distributed_lock_cancel_pending_cleanup",
-            );
-        }
-    }
-}
-
 impl DistributedLock {
     /// Create new distributed lock
     pub fn new(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
@@ -827,136 +751,22 @@ impl DistributedLock {
             return;
         }
 
-        Self::send_release_cleanup_blocking(entries, context);
-    }
-
-    fn release_cleanup_sender() -> Option<&'static tokio::sync::mpsc::Sender<ReleaseCleanupJob>> {
-        RELEASE_CLEANUP_SENDER
-            .get_or_init(|| {
-                let (sender, receiver) = tokio::sync::mpsc::channel(RELEASE_CLEANUP_QUEUE_CAPACITY);
-                let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-                let worker = std::thread::Builder::new()
-                    .name("rustfs-lock-cleanup".to_string())
-                    .spawn(move || {
-                        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                            Ok(runtime) => runtime,
-                            Err(err) => {
-                                let _ = ready_sender.send(Err(err.to_string()));
-                                return;
-                            }
-                        };
-                        if ready_sender.send(Ok(())).is_err() {
-                            return;
-                        }
-                        runtime.block_on(Self::run_release_cleanup_worker(receiver, RELEASE_CLEANUP_CONCURRENCY));
-                    });
-
-                let worker = match worker {
-                    Ok(worker) => worker,
-                    Err(err) => {
-                        warn!("failed to start distributed unlock cleanup worker: {}", err);
-                        return None;
-                    }
-                };
-                match ready_receiver.recv() {
-                    Ok(Ok(())) => {
-                        drop(worker);
-                        Some(sender)
-                    }
-                    Ok(Err(err)) => {
-                        warn!("failed to create distributed unlock cleanup runtime: {}", err);
-                        None
-                    }
-                    Err(err) => {
-                        warn!("distributed unlock cleanup worker exited during startup: {}", err);
-                        None
-                    }
-                }
-            })
-            .as_ref()
-    }
-
-    async fn run_release_cleanup_worker(mut receiver: tokio::sync::mpsc::Receiver<ReleaseCleanupJob>, concurrency: usize) {
-        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        while let Some((entries, context)) = receiver.recv().await {
-            let Ok(permit) = permits.clone().acquire_owned().await else {
-                break;
-            };
-            tokio::spawn(async move {
+        let join_handle = std::thread::spawn(move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(async move {
                 Self::release_entries(entries, context).await;
-                drop(permit);
-            });
-        }
-    }
-
-    fn send_release_cleanup_blocking(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
-        if entries.is_empty() {
-            return;
-        }
-        let Some(sender) = Self::release_cleanup_sender() else {
-            warn!(context, "distributed unlock cleanup worker is unavailable");
-            return;
-        };
-        if let Err(err) = sender.blocking_send((entries, context)) {
-            warn!(context, "distributed unlock cleanup worker rejected a job: {}", err);
-        }
-    }
-
-    fn spawn_cancel_release_cleanup(
-        entries: Vec<(LockId, Arc<dyn LockClient>)>,
-        cleanup_runtime: tokio::runtime::Handle,
-        context: &'static str,
-    ) {
-        if entries.is_empty() {
-            return;
-        }
-        let Some(sender) = Self::release_cleanup_sender() else {
-            let handle = cleanup_runtime.spawn(async move {
-                Self::release_entries(entries, context).await;
-            });
-            drop(handle);
-            return;
-        };
-        Self::dispatch_cancel_release_cleanup(sender, entries, cleanup_runtime, context);
-    }
-
-    fn dispatch_cancel_release_cleanup(
-        sender: &tokio::sync::mpsc::Sender<ReleaseCleanupJob>,
-        entries: Vec<(LockId, Arc<dyn LockClient>)>,
-        cleanup_runtime: tokio::runtime::Handle,
-        context: &'static str,
-    ) {
-        match sender.try_send((entries, context)) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
-                let sender = sender.clone();
-                let handle = cleanup_runtime.spawn(async move {
-                    if let Err(err) = sender.send(job).await {
-                        let (entries, context) = err.0;
-                        warn!(context, "distributed unlock cleanup worker closed while queueing a job");
-                        Self::release_entries(entries, context).await;
-                    }
-                });
-                drop(handle);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed((entries, context))) => {
-                warn!(context, "distributed unlock cleanup worker is closed; using acquisition runtime");
-                let handle = cleanup_runtime.spawn(async move {
-                    Self::release_entries(entries, context).await;
-                });
-                drop(handle);
-            }
-        }
+            }),
+            Err(err) => warn!(context, "failed to create fallback unlock runtime: {}", err),
+        });
+        drop(join_handle);
     }
 
     fn spawn_pending_cleanup(
         mut pending: JoinSet<LockAcquireTaskResult>,
         clients: Vec<Arc<dyn LockClient>>,
         fallback_lock_id: LockId,
-        cleanup_runtime: tokio::runtime::Handle,
         context: &'static str,
     ) {
-        let handle = cleanup_runtime.spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(join_result) = pending.join_next().await {
                 match join_result {
                     Ok((idx, Ok(resp))) if resp.success => {
@@ -1101,19 +911,28 @@ impl DistributedLock {
     async fn acquire_lock_quorum_once(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
         let required_quorum = self.required_quorum(request.lock_type);
         let attempt_started = Instant::now();
+        let mut pending = self.spawn_lock_requests(request);
+        let mut individual_locks: Vec<HeldLockEntry> = Vec::new();
         let fallback_lock_id = request.lock_id.clone();
-        let mut acquisition = LockAcquireState::new(self.spawn_lock_requests(request), &self.clients, &fallback_lock_id);
         let mut last_failure = None;
         let mut last_failure_kind = None;
         let mut last_hard_failure_kind = None;
         let mut hard_failures = 0usize;
         let start = Instant::now();
 
-        while acquisition.pending.as_ref().is_some_and(|pending| !pending.is_empty()) {
+        while !pending.is_empty() {
             let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                let individual_locks =
-                    acquisition.rollback("distributed_lock_attempt_timeout", "distributed_lock_attempt_timeout_cleanup");
+                Self::spawn_release_cleanup(
+                    individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
+                    "distributed_lock_attempt_timeout",
+                );
+                Self::spawn_pending_cleanup(
+                    pending,
+                    self.clients.clone(),
+                    fallback_lock_id.clone(),
+                    "distributed_lock_attempt_timeout_cleanup",
+                );
                 return Ok(Self::lock_acquire_attempt_timeout_result(
                     request.acquire_timeout,
                     individual_locks,
@@ -1122,15 +941,20 @@ impl DistributedLock {
                 ));
             }
 
-            let Some(pending) = acquisition.pending.as_mut() else {
-                break;
-            };
             let join_result = match tokio::time::timeout(remaining, pending.join_next()).await {
                 Ok(Some(join_result)) => join_result,
                 Ok(None) => break,
                 Err(_) => {
-                    let individual_locks =
-                        acquisition.rollback("distributed_lock_attempt_timeout", "distributed_lock_attempt_timeout_cleanup");
+                    Self::spawn_release_cleanup(
+                        individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
+                        "distributed_lock_attempt_timeout",
+                    );
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_attempt_timeout_cleanup",
+                    );
                     return Ok(Self::lock_acquire_attempt_timeout_result(
                         request.acquire_timeout,
                         individual_locks,
@@ -1150,7 +974,7 @@ impl DistributedLock {
                             .unwrap_or_else(|| fallback_lock_id.clone());
 
                         if let Some(client) = self.clients.get(idx) {
-                            acquisition.individual_locks.push(HeldLockEntry {
+                            individual_locks.push(HeldLockEntry {
                                 lock_id,
                                 client: client.clone(),
                                 valid_until: attempt_started.checked_add(request.ttl).unwrap_or(attempt_started),
@@ -1188,9 +1012,19 @@ impl DistributedLock {
             }
 
             if self.clients.len().saturating_sub(hard_failures) < required_quorum {
-                let rollback_count = acquisition.individual_locks.len();
-                let individual_locks =
-                    acquisition.rollback("distributed_lock_quorum_rollback", "distributed_lock_failure_cleanup");
+                let rollback_count = individual_locks.len();
+                Self::spawn_release_cleanup(
+                    individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
+                    "distributed_lock_quorum_rollback",
+                );
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
 
                 let mut error = format!(
                     "Unrecoverable quorum failure: {rollback_count}/{required_quorum} required; {hard_failures} clients failed"
@@ -1209,8 +1043,15 @@ impl DistributedLock {
                 });
             }
 
-            if acquisition.individual_locks.len() >= required_quorum {
-                let individual_locks = acquisition.complete("distributed_lock_success_cleanup");
+            if individual_locks.len() >= required_quorum {
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_success_cleanup",
+                    );
+                }
 
                 let aggregate_lock_id = generate_aggregate_lock_id(&request.resource);
                 tracing::debug!(
@@ -1244,10 +1085,20 @@ impl DistributedLock {
                 });
             }
 
-            if acquisition.individual_locks.len() + acquisition.pending.as_ref().map_or(0, JoinSet::len) < required_quorum {
-                let rollback_count = acquisition.individual_locks.len();
-                let individual_locks =
-                    acquisition.rollback("distributed_lock_quorum_rollback", "distributed_lock_failure_cleanup");
+            if individual_locks.len() + pending.len() < required_quorum {
+                let rollback_count = individual_locks.len();
+                Self::spawn_release_cleanup(
+                    individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
+                    "distributed_lock_quorum_rollback",
+                );
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
 
                 let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
                 let (failure_kind, quorum_impossible) = if hard_failures > 0 {
@@ -1272,8 +1123,11 @@ impl DistributedLock {
             }
         }
 
-        let rollback_count = acquisition.individual_locks.len();
-        let individual_locks = acquisition.rollback("distributed_lock_quorum_rollback", "distributed_lock_failure_cleanup");
+        let rollback_count = individual_locks.len();
+        Self::spawn_release_cleanup(
+            individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
+            "distributed_lock_quorum_rollback",
+        );
         let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
         if let Some(last_failure) = &last_failure {
             error.push_str("; last failure: ");
@@ -1321,7 +1175,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{HashMap, VecDeque},
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -1849,100 +1703,6 @@ mod tests {
 
         async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
             Ok(false)
-        }
-
-        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
-            Ok(None)
-        }
-
-        async fn get_stats(&self) -> crate::Result<LockStats> {
-            Ok(LockStats::default())
-        }
-
-        async fn close(&self) -> crate::Result<()> {
-            Ok(())
-        }
-
-        async fn is_online(&self) -> bool {
-            true
-        }
-
-        async fn is_local(&self) -> bool {
-            false
-        }
-    }
-
-    #[derive(Debug)]
-    struct GrantThenWaitClient {
-        active: tokio::sync::Mutex<HashSet<LockId>>,
-        granted: Arc<AtomicUsize>,
-        response_gate: Option<Arc<tokio::sync::Semaphore>>,
-        release_gate: Option<Arc<tokio::sync::Semaphore>>,
-        release_started: AtomicUsize,
-    }
-
-    impl GrantThenWaitClient {
-        fn new(
-            granted: Arc<AtomicUsize>,
-            response_gate: Option<Arc<tokio::sync::Semaphore>>,
-            release_gate: Option<Arc<tokio::sync::Semaphore>>,
-        ) -> Arc<Self> {
-            Arc::new(Self {
-                active: tokio::sync::Mutex::new(HashSet::new()),
-                granted,
-                response_gate,
-                release_gate,
-                release_started: AtomicUsize::new(0),
-            })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LockClient for GrantThenWaitClient {
-        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
-            self.active.lock().await.insert(request.lock_id.clone());
-            self.granted.fetch_add(1, Ordering::SeqCst);
-            if let Some(response_gate) = &self.response_gate {
-                response_gate
-                    .acquire()
-                    .await
-                    .expect("test response gate should remain open")
-                    .forget();
-            }
-            let info = LockInfo {
-                id: request.lock_id.clone(),
-                resource: request.resource.clone(),
-                lock_type: request.lock_type,
-                status: crate::types::LockStatus::Acquired,
-                owner: request.owner.clone(),
-                acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.ttl,
-                last_refreshed: std::time::SystemTime::now(),
-                metadata: request.metadata.clone(),
-                priority: request.priority,
-                wait_start_time: None,
-            };
-            Ok(LockResponse::success(info, Duration::ZERO))
-        }
-
-        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
-            self.release_started.fetch_add(1, Ordering::SeqCst);
-            if let Some(release_gate) = &self.release_gate {
-                release_gate
-                    .acquire()
-                    .await
-                    .expect("test release gate should remain open")
-                    .forget();
-            }
-            Ok(self.active.lock().await.remove(lock_id))
-        }
-
-        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
-            Ok(false)
-        }
-
-        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
-            self.release(lock_id).await
         }
 
         async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
@@ -2503,306 +2263,6 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(800), lock.acquire_guard(&request)).await;
 
         assert_matches!(result, Ok(Ok(None)));
-    }
-
-    #[tokio::test]
-    async fn cancelling_quorum_acquire_releases_recorded_and_response_pending_grants() {
-        let granted = Arc::new(AtomicUsize::new(0));
-        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let recorded = GrantThenWaitClient::new(granted.clone(), None, None);
-        let pending_a = GrantThenWaitClient::new(granted.clone(), Some(response_gate.clone()), None);
-        let pending_b = GrantThenWaitClient::new(granted.clone(), Some(response_gate.clone()), None);
-        let clients: Vec<Arc<dyn LockClient>> = vec![
-            recorded.clone(),
-            pending_a.clone(),
-            pending_b.clone(),
-            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
-        ];
-        let lock = DistributedLock::new("test".to_string(), clients, 3);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(5))
-            .with_ttl(Duration::from_secs(30));
-
-        let mut acquire = Box::pin(lock.acquire_guard(&request));
-        assert!(futures::poll!(acquire.as_mut()).is_pending());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while granted.load(Ordering::SeqCst) < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all successful backends should grant before cancellation");
-        assert!(futures::poll!(acquire.as_mut()).is_pending());
-
-        drop(acquire);
-        response_gate.add_permits(2);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let recorded_active = recorded.active.lock().await.len();
-                let pending_a_active = pending_a.active.lock().await.len();
-                let pending_b_active = pending_b.active.lock().await.len();
-                let active = recorded_active + pending_a_active + pending_b_active;
-                if active == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancellation cleanup should release every backend grant before its TTL");
-    }
-
-    #[test]
-    fn dropping_pending_acquire_after_runtime_shutdown_does_not_panic() {
-        let granted = Arc::new(AtomicUsize::new(0));
-        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let clients: Vec<Arc<dyn LockClient>> = vec![GrantThenWaitClient::new(granted.clone(), Some(response_gate), None)];
-        let lock = DistributedLock::new("test".to_string(), clients, 1);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(5));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime should build");
-        let mut acquire = Box::pin(lock.acquire_guard(&request));
-
-        runtime.block_on(async {
-            assert!(futures::poll!(acquire.as_mut()).is_pending());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while granted.load(Ordering::SeqCst) == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("backend should grant before runtime shutdown");
-        });
-        drop(runtime);
-
-        drop(acquire);
-    }
-
-    #[test]
-    fn dropping_pending_acquire_outside_live_runtime_releases_grant() {
-        let granted = Arc::new(AtomicUsize::new(0));
-        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let client = GrantThenWaitClient::new(granted.clone(), Some(response_gate.clone()), None);
-        let clients: Vec<Arc<dyn LockClient>> = vec![client.clone()];
-        let lock = DistributedLock::new("test".to_string(), clients, 1);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(5));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime should build");
-        let mut acquire = Box::pin(lock.acquire_guard(&request));
-
-        runtime.block_on(async {
-            assert!(futures::poll!(acquire.as_mut()).is_pending());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while granted.load(Ordering::SeqCst) == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("backend should grant before cancellation");
-        });
-        drop(acquire);
-        response_gate.add_permits(1);
-
-        runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !client.active.lock().await.is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("cleanup should use the acquisition runtime outside its context");
-        });
-    }
-
-    #[test]
-    fn cancelling_acquire_in_another_runtime_releases_recorded_grant() {
-        let granted = Arc::new(AtomicUsize::new(0));
-        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let release_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let recorded = GrantThenWaitClient::new(granted.clone(), None, Some(release_gate.clone()));
-        let pending = GrantThenWaitClient::new(granted.clone(), Some(response_gate.clone()), None);
-        let clients: Vec<Arc<dyn LockClient>> = vec![recorded.clone(), pending.clone()];
-        let lock = DistributedLock::new("test".to_string(), clients, 2);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(5));
-        let acquisition_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("acquisition runtime should build");
-        let mut acquire = Box::pin(lock.acquire_guard(&request));
-
-        acquisition_runtime.block_on(async {
-            assert!(futures::poll!(acquire.as_mut()).is_pending());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while granted.load(Ordering::SeqCst) < 2 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("both backends should grant before cancellation");
-            assert!(futures::poll!(acquire.as_mut()).is_pending());
-        });
-
-        let cancellation_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("cancellation runtime should build");
-        cancellation_runtime.block_on(async {
-            drop(acquire);
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while recorded.release_started.load(Ordering::SeqCst) == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("recorded grant cleanup should start before cancellation runtime exits");
-        });
-        drop(cancellation_runtime);
-        release_gate.add_permits(1);
-
-        acquisition_runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !recorded.active.lock().await.is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("recorded grant cleanup must survive the cancellation runtime shutdown");
-
-            response_gate.add_permits(1);
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !pending.active.lock().await.is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("pending grant cleanup should finish on the acquisition runtime");
-        });
-    }
-
-    #[test]
-    fn release_cleanup_worker_is_shared_and_bounded() {
-        let first = DistributedLock::release_cleanup_sender().expect("cleanup worker should initialize");
-        let second = DistributedLock::release_cleanup_sender().expect("cleanup worker should be reused");
-
-        assert!(std::ptr::eq(first, second));
-        assert_eq!(first.max_capacity(), super::RELEASE_CLEANUP_QUEUE_CAPACITY);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn release_cleanup_worker_caps_concurrent_releases() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(super::RELEASE_CLEANUP_CONCURRENCY + 1);
-        let release_gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let granted = Arc::new(AtomicUsize::new(0));
-        let mut clients = Vec::new();
-
-        for _ in 0..=super::RELEASE_CLEANUP_CONCURRENCY {
-            let client = GrantThenWaitClient::new(granted.clone(), None, Some(release_gate.clone()));
-            let lock_id = LockId::default();
-            client.active.lock().await.insert(lock_id.clone());
-            let cleanup_client: Arc<dyn LockClient> = client.clone();
-            sender
-                .send((vec![(lock_id, cleanup_client)], "bounded_release_cleanup_test"))
-                .await
-                .expect("test cleanup queue should remain open");
-            clients.push(client);
-        }
-
-        let worker = tokio::spawn(DistributedLock::run_release_cleanup_worker(receiver, super::RELEASE_CLEANUP_CONCURRENCY));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while clients
-                .iter()
-                .take(super::RELEASE_CLEANUP_CONCURRENCY)
-                .any(|client| client.release_started.load(Ordering::SeqCst) == 0)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the configured cleanup concurrency should start");
-        assert_eq!(
-            clients[super::RELEASE_CLEANUP_CONCURRENCY]
-                .release_started
-                .load(Ordering::SeqCst),
-            0,
-            "the next cleanup must wait for a worker permit"
-        );
-
-        release_gate.add_permits(super::RELEASE_CLEANUP_CONCURRENCY);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while clients[super::RELEASE_CLEANUP_CONCURRENCY]
-                .release_started
-                .load(Ordering::SeqCst)
-                == 0
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the queued cleanup should start after a permit is released");
-        release_gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let mut all_released = true;
-                for client in &clients {
-                    if !client.active.lock().await.is_empty() {
-                        all_released = false;
-                        break;
-                    }
-                }
-                if all_released {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all bounded cleanup jobs should finish");
-
-        drop(sender);
-        tokio::time::timeout(Duration::from_secs(1), worker)
-            .await
-            .expect("cleanup worker should stop after its local queue closes")
-            .expect("cleanup worker task should join");
-    }
-
-    #[tokio::test]
-    async fn full_release_cleanup_queue_does_not_bypass_worker() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let placeholder = ResponseClient::new(LockResponse::failure("unused", Duration::ZERO)).into_client();
-        sender
-            .try_send((vec![(LockId::default(), placeholder)], "full_release_cleanup_test"))
-            .expect("first test job should fill the queue");
-        let granted = Arc::new(AtomicUsize::new(0));
-        let queued = GrantThenWaitClient::new(granted, None, None);
-        let queued_client: Arc<dyn LockClient> = queued.clone();
-
-        DistributedLock::dispatch_cancel_release_cleanup(
-            &sender,
-            vec![(LockId::default(), queued_client)],
-            tokio::runtime::Handle::current(),
-            "full_release_cleanup_test",
-        );
-        tokio::task::yield_now().await;
-        assert_eq!(queued.release_started.load(Ordering::SeqCst), 0);
-
-        receiver.recv().await.expect("the placeholder job should be queued");
-        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .expect("the overflow job should wait and then enter the queue")
-            .expect("the overflow job should remain owned by the queue");
-        assert_eq!(
-            queued.release_started.load(Ordering::SeqCst),
-            0,
-            "a full queue must not execute release outside the bounded worker"
-        );
     }
 
     #[tokio::test]

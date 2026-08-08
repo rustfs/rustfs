@@ -1007,9 +1007,8 @@ pub(crate) mod sse {
         validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::sse_consumer::{
-        EncryptionKeyKind, SSEType, SelectObjectResponseHeaderError, build_ssec_read_headers, encryption_material_to_metadata,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, map_get_object_reader_error,
-        mark_encrypted_multipart_metadata, select_object_encryption_response_headers,
+        EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
+        extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
     };
 }
 
@@ -1158,8 +1157,8 @@ pub(crate) mod select_object {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::StorageError;
     pub(crate) use crate::storage::storage_api::{
-        StorageObjectInfo, StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store,
-        validate_sse_headers_for_read, validate_ssec_for_read,
+        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
+        validate_ssec_for_read,
     };
 }
 

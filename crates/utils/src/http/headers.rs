@@ -232,14 +232,16 @@ static SUPPORTED_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
     m.insert("x-amz-replication-status".to_string(), true);
     m
 });
-const SSE_HEADERS: [&str; 6] = [
-    "x-amz-server-side-encryption",
-    "x-amz-server-side-encryption-aws-kms-key-id",
-    "x-amz-server-side-encryption-context",
-    "x-amz-server-side-encryption-customer-algorithm",
-    "x-amz-server-side-encryption-customer-key",
-    "x-amz-server-side-encryption-customer-key-md5",
-];
+static SSE_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("x-amz-server-side-encryption".to_string(), true);
+    m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
+    m.insert("x-amz-server-side-encryption-context".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
+    m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
+    m
+});
 
 pub fn is_standard_query_value(qs_key: &str) -> bool {
     *SUPPORTED_QUERY_VALUES.get(qs_key).unwrap_or(&false)
@@ -254,7 +256,7 @@ pub fn is_standard_header(header_key: &str) -> bool {
 }
 
 pub fn is_sse_header(header_key: &str) -> bool {
-    SSE_HEADERS.iter().any(|known| header_key.eq_ignore_ascii_case(known))
+    *SSE_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
 }
 
 pub fn is_amz_header(header_key: &str) -> bool {
@@ -272,16 +274,4 @@ pub fn is_rustfs_header(header_key: &str) -> bool {
 
 pub fn is_minio_header(header_key: &str) -> bool {
     header_key.to_lowercase().starts_with("x-minio-")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_sse_header;
-
-    #[test]
-    fn sse_header_matching_is_ascii_case_insensitive() {
-        assert!(is_sse_header("x-amz-server-side-encryption"));
-        assert!(is_sse_header("X-Amz-Server-Side-Encryption-Customer-Key-Md5"));
-        assert!(!is_sse_header("x-amz-meta-server-side-encryption"));
-    }
 }

@@ -2,12 +2,10 @@
 use super::storage_api::select_object::StorageError;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
-use super::storage_api::select_object::sse::{
-    SelectObjectResponseHeaderError, SseKmsPrincipal, authorize_sse_kms_object_read, select_object_encryption_response_headers,
-};
+use super::storage_api::select_object::sse::{SseKmsPrincipal, authorize_sse_kms_object_read};
 use super::storage_api::select_object::{
-    StorageObjectInfo, StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store,
-    validate_sse_headers_for_read, validate_ssec_for_read,
+    StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
+    validate_ssec_for_read,
 };
 use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
@@ -20,7 +18,7 @@ use datafusion::arrow::{
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use http::{HeaderMap, StatusCode, header::RANGE};
+use http::{StatusCode, header::RANGE};
 use rustfs_s3select_api::{
     QueryError, S3SelectPolicyError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
@@ -99,8 +97,6 @@ pub async fn execute_select_object_content(
     .await
     .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))??;
     validate_scan_range_for_object_size(&input.request, snapshot.logical_size())?;
-    let response_headers = select_snapshot_response_headers(snapshot.object_info(), &req.headers)?;
-
     let snapshot = Arc::new(snapshot);
     let query =
         Query::new_with_snapshot(Context { input: input.clone() }, input.request.expression.clone(), Arc::clone(&snapshot));
@@ -130,18 +126,9 @@ pub async fn execute_select_object_content(
         .await;
     });
 
-    Ok(select_object_response(rx, response_headers))
-}
-
-fn select_object_response(
-    rx: mpsc::Receiver<S3Result<SelectObjectContentEvent>>,
-    response_headers: SelectSnapshotResponseHeaders,
-) -> S3Response<SelectObjectContentOutput> {
-    let mut response = S3Response::new(SelectObjectContentOutput {
+    Ok(S3Response::new(SelectObjectContentOutput {
         payload: Some(SelectObjectContentEventStream::new(ReceiverStream::new(rx))),
-    });
-    response.headers = response_headers.0;
-    response
+    }))
 }
 
 async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
@@ -457,32 +444,9 @@ async fn prepare_select_object_snapshot(
         .map_err(map_prepare_snapshot_error)?;
     let info = snapshot.object_info();
     validate_sse_headers_for_read(&info.user_defined, headers)?;
-    validate_ssec_for_read(
-        &input.bucket,
-        &input.key,
-        &info.user_defined,
-        input.sse_customer_key.as_ref(),
-        input.sse_customer_key_md5.as_ref(),
-    )?;
+    validate_ssec_for_read(&info.user_defined, input.sse_customer_key.as_ref(), input.sse_customer_key_md5.as_ref())?;
     authorize_sse_kms_object_read(read_principal, &info.user_defined).await?;
     Ok(snapshot)
-}
-
-struct SelectSnapshotResponseHeaders(HeaderMap);
-
-fn select_snapshot_response_headers(
-    info: &StorageObjectInfo,
-    request_headers: &HeaderMap,
-) -> S3Result<SelectSnapshotResponseHeaders> {
-    select_object_encryption_response_headers(info, request_headers)
-        .map(SelectSnapshotResponseHeaders)
-        .map_err(map_select_response_header_error)
-}
-
-fn map_select_response_header_error(err: SelectObjectResponseHeaderError) -> S3Error {
-    let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, err.to_string());
-    s3_error.set_source(Box::new(err));
-    s3_error
 }
 
 fn map_prepare_snapshot_error(err: StoragePrepareSelectObjectSnapshotError) -> S3Error {
@@ -1029,35 +993,6 @@ mod tests {
         assert!(
             err.source()
                 .is_some_and(|source| source.downcast_ref::<StoragePrepareSelectObjectSnapshotError>().is_some())
-        );
-    }
-
-    #[test]
-    fn select_response_header_error_maps_to_internal_error() {
-        let err = map_select_response_header_error(SelectObjectResponseHeaderError);
-
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.source().is_some());
-    }
-
-    #[test]
-    fn select_response_preserves_snapshot_encryption_headers() {
-        let (_tx, rx) = mpsc::channel(1);
-        let info = StorageObjectInfo {
-            user_defined: Arc::new(std::collections::HashMap::from([(
-                "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key".to_string(),
-                "sealed-object-key".to_string(),
-            )])),
-            ..Default::default()
-        };
-        let headers = select_snapshot_response_headers(&info, &HeaderMap::new())
-            .expect("MinIO SSE-S3 snapshot metadata should produce response headers");
-
-        let response = select_object_response(rx, headers);
-
-        assert_eq!(
-            response.headers.get(s3s::header::X_AMZ_SERVER_SIDE_ENCRYPTION),
-            Some(&http::HeaderValue::from_static("AES256"))
         );
     }
 
