@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::bucket::bandwidth::reader::BucketOptions;
-use ratelimit::{Error as RatelimitError, Ratelimiter};
+use ratelimit::{Clock, Error as RatelimitError, Ratelimiter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,33 @@ use tracing::warn;
 
 /// BETA_BUCKET is the weight used to calculate exponential moving average
 const BETA_BUCKET: f64 = 0.1;
+
+// ratelimit 2.0 stores tokens at six decimal places. Above this limit its
+// scaled capacity and token-cost calculations saturate instead of preserving
+// the configured bandwidth.
+const MAX_RATELIMIT_TOKENS: i64 = 18_446_744_073_709;
+
+fn consume_tokens<C: Clock>(limiter: &Ratelimiter<C>, n: u64) -> (u64, f64, u64) {
+    if n == 0 {
+        return (0, limiter.rate() as f64, 0);
+    }
+
+    let mut consumed = 0u64;
+    // Consuming one token also refills the bucket based on elapsed time, so
+    // the subsequent `available()` read reflects freshly accrued tokens.
+    if limiter.try_wait().is_ok() {
+        consumed = 1;
+    }
+    let available = limiter.available();
+    let to_consume = n - consumed;
+    let batch = to_consume.min(available);
+    if batch > 0 && limiter.try_wait_n(batch).is_ok() {
+        consumed += batch;
+    }
+    let deficit = n.saturating_sub(consumed);
+    let rate = limiter.rate() as f64;
+    (deficit, rate, consumed)
+}
 
 #[derive(Clone)]
 pub struct BucketThrottle {
@@ -61,24 +88,7 @@ impl BucketThrottle {
             warn!("bucket throttle mutex poisoned, recovering");
             e.into_inner()
         });
-        if n == 0 {
-            return (0, guard.rate() as f64, 0);
-        }
-        let mut consumed = 0u64;
-        // Consuming one token also refills the bucket based on elapsed time, so
-        // the subsequent `available()` read reflects freshly accrued tokens.
-        if guard.try_wait().is_ok() {
-            consumed = 1;
-        }
-        let available = guard.available();
-        let to_consume = n - consumed;
-        let batch = to_consume.min(available);
-        if batch > 0 && guard.try_wait_n(batch).is_ok() {
-            consumed += batch;
-        }
-        let deficit = n.saturating_sub(consumed);
-        let rate = guard.rate() as f64;
-        (deficit, rate, consumed)
+        consume_tokens(&guard, n)
     }
 }
 
@@ -335,6 +345,16 @@ impl Monitor {
                 "bandwidth limit too small for cluster size, per-node limit will clamp to 1 byte/s"
             );
         }
+        if limit_bytes > MAX_RATELIMIT_TOKENS {
+            warn!(
+                bucket = bucket,
+                arn = arn,
+                limit_bytes = limit_bytes,
+                max_limit_bytes = MAX_RATELIMIT_TOKENS,
+                "bandwidth limit exceeds ratelimiter capacity, throttling disabled for this target"
+            );
+            return;
+        }
         let opts = BucketOptions {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
@@ -380,6 +400,30 @@ impl Monitor {
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[derive(Clone)]
+    struct TestClock {
+        elapsed_ns: Arc<AtomicU64>,
+    }
+
+    impl TestClock {
+        fn new() -> Self {
+            Self {
+                elapsed_ns: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let elapsed_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+            self.elapsed_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn elapsed(&self) -> Duration {
+            Duration::from_nanos(self.elapsed_ns.load(Ordering::Relaxed))
+        }
+    }
 
     #[test]
     fn test_set_and_get_throttle_with_node_split() {
@@ -433,6 +477,15 @@ mod tests {
     }
 
     #[test]
+    fn test_set_bandwidth_limit_rejects_unrepresentable_rate() {
+        let monitor = Monitor::new(1);
+
+        monitor.set_bandwidth_limit("b1", "arn1", MAX_RATELIMIT_TOKENS + 1);
+
+        assert!(!monitor.is_throttled("b1", "arn1"));
+    }
+
+    #[test]
     fn test_consume_returns_deficit_when_tokens_exhausted() {
         let throttle = BucketThrottle::new(100).expect("test");
 
@@ -440,6 +493,23 @@ mod tests {
 
         assert!(deficit > 0);
         assert!(rate > 0.0);
+    }
+
+    #[test]
+    fn test_consume_refills_continuously() {
+        let clock = TestClock::new();
+        let limiter = Ratelimiter::with_clock(100, clock.clone());
+
+        assert_eq!(consume_tokens(&limiter, 100), (100, 100.0, 0));
+
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(consume_tokens(&limiter, 100), (75, 100.0, 25));
+
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(consume_tokens(&limiter, 100), (75, 100.0, 25));
+
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(consume_tokens(&limiter, 100), (50, 100.0, 50));
     }
 
     #[test]
