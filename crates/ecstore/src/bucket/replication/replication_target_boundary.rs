@@ -28,7 +28,7 @@ use rustfs_utils::http::{
     AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE,
     HeaderExt as _, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map,
-    is_internal_key,
+    is_internal_key, is_object_encryption_marker, is_replication_stripped_encryption_key, ssec_replication_transport_header,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -62,23 +62,6 @@ static STANDARD_HEADERS: &[&str] = &[
     AMZ_SERVER_SIDE_ENCRYPTION,
 ];
 
-static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key",
-        "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Seal-Algorithm",
-        "X-Rustfs-Replication-Server-Side-Encryption-Seal-Algorithm",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Iv",
-        "X-Rustfs-Replication-Server-Side-Encryption-Iv",
-    ),
-    ("X-Rustfs-Internal-Encrypted-Multipart", "X-Rustfs-Replication-Encrypted-Multipart"),
-    ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
-];
-
 const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 const ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED: &str = "replication source contains unsupported encryption metadata";
 
@@ -105,15 +88,29 @@ fn classify_replication_source_encryption(metadata: &HashMap<String, String>) ->
     let kms_context = metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT);
 
     if is_ssec {
-        return if sse.is_some() || kms_key_id.is_some() || kms_context.is_some() {
-            ReplicationSourceEncryption::Unsupported
-        } else {
+        // Stored SSE-C objects always carry x-amz-server-side-encryption=AES256
+        // alongside the customer-algorithm key; only KMS evidence marks a
+        // mixed, unsupported state.
+        let sse_compatible = sse.map(str::trim).is_none_or(|value| value.eq_ignore_ascii_case("AES256"));
+        return if sse_compatible && kms_key_id.is_none() && kms_context.is_none() {
             ReplicationSourceEncryption::SseC
+        } else {
+            ReplicationSourceEncryption::Unsupported
         };
     }
 
     match sse.map(str::trim) {
-        None if kms_key_id.is_none() && kms_context.is_none() => ReplicationSourceEncryption::Plaintext,
+        None if kms_key_id.is_none() && kms_context.is_none() => {
+            // Sealed material without any recognizable SSE marker (e.g. an
+            // object written by MinIO, which does not persist the x-amz SSE
+            // intent header) must fail closed: replicating it as plaintext
+            // ships ciphertext the target can never decrypt.
+            if metadata.keys().any(|key| is_object_encryption_marker(key)) {
+                ReplicationSourceEncryption::Unsupported
+            } else {
+                ReplicationSourceEncryption::Plaintext
+            }
+        }
         Some(value) if value.eq_ignore_ascii_case("AES256") && kms_key_id.is_none() && kms_context.is_none() => {
             ReplicationSourceEncryption::SseS3
         }
@@ -174,17 +171,23 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
     }
 
     for (key, value) in object_info.user_defined.iter() {
-        let has_valid_sse_header = valid_sse_replication_header(key).is_some();
-
-        if (!is_ssec || !has_valid_sse_header) && (is_internal_key(key) || is_standard_header(key)) {
+        if is_ssec && let Some(transport_header) = ssec_replication_transport_header(key) {
+            meta.insert(transport_header.to_string(), value.to_string());
             continue;
         }
 
-        if let Some(replication_header) = valid_sse_replication_header(key) {
-            meta.insert(replication_header.to_string(), value.to_string());
-        } else {
-            meta.insert(key.to_string(), value.to_string());
+        // Encryption metadata that is not remapped for SSE-C passthrough must
+        // never leave the source site: envelopes and intent headers are only
+        // meaningful to the source KMS.
+        if is_replication_stripped_encryption_key(key) {
+            continue;
         }
+
+        if is_internal_key(key) || is_standard_header(key) {
+            continue;
+        }
+
+        meta.insert(key.to_string(), value.to_string());
     }
 
     let mut is_multipart = object_info.is_multipart();
@@ -195,6 +198,11 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         if is_ssec {
             let encoded = BASE64_STANDARD.encode(checksum_data);
             insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
+        } else if object_info.is_encrypted() {
+            // Encrypted checksums cannot be exposed as plaintext headers, and
+            // decrypt_checksums reports is_multipart=false for them (a value
+            // the response path relies on). Keep the object's own multipart
+            // flag so encrypted objects stay on the multipart route.
         } else {
             let (checksum_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
             is_multipart = is_mp;
@@ -413,20 +421,14 @@ fn is_standard_header(key: &str) -> bool {
     STANDARD_HEADERS.iter().any(|header| header.eq_ignore_ascii_case(key))
 }
 
-fn valid_sse_replication_header(key: &str) -> Option<&str> {
-    VALID_SSE_REPLICATION_HEADERS
-        .iter()
-        .find(|(internal, _)| key.eq_ignore_ascii_case(internal))
-        .map(|(_, replication)| *replication)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aws_smithy_types::DateTime;
     use rustfs_replication::content_matches_by_etag;
     use rustfs_utils::http::{
-        SSEC_ALGORITHM_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_header_map,
+        SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+        get_header_map,
     };
     use std::sync::Arc;
     use time::Duration;
@@ -583,11 +585,29 @@ mod tests {
 
     #[test]
     fn replication_put_options_filter_and_map_metadata() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+            REPLICATION_ENCRYPTED_MULTIPART_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSE_IV_HEADER,
+            REPLICATION_SSE_SEAL_ALGORITHM_HEADER, REPLICATION_SSE_SEALED_KEY_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
+            REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, SSEC_ORIGINAL_SIZE_HEADER,
+        };
+
+        // The stored shape of a real SSE-C object: SSE marker plus customer
+        // material, per encryption_material_to_metadata. Every transport-table
+        // source key is present so each mapping is pinned individually.
         let mut metadata = HashMap::new();
         metadata.insert(CONTENT_TYPE.to_string(), "text/plain".to_string());
         metadata.insert("x-user-meta".to_string(), "value".to_string());
+        metadata.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string());
         metadata.insert(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string());
-        metadata.insert("X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key".to_string(), "sealed".to_string());
+        metadata.insert(SSEC_KEY_MD5_HEADER.to_string(), "md5-value".to_string());
+        metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), "1024".to_string());
+        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "iv-direct".to_string());
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "iv-minio".to_string());
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "DAREv2-HMAC-SHA256".to_string());
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(), "sealed".to_string());
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), "true".to_string());
 
         let object_info = ObjectInfo {
             user_defined: Arc::new(metadata),
@@ -605,12 +625,40 @@ mod tests {
         assert!(!is_multipart);
         assert_eq!(options.user_metadata.get("x-user-meta"), Some(&"value".to_string()));
         assert!(!options.user_metadata.contains_key(CONTENT_TYPE));
+
+        // Every stored SSE-C material key is remapped onto its transport name.
+        assert_eq!(options.user_metadata.get(REPLICATION_SSEC_ALGORITHM_HEADER), Some(&"AES256".to_string()));
+        assert_eq!(options.user_metadata.get(REPLICATION_SSEC_KEY_MD5_HEADER), Some(&"md5-value".to_string()));
         assert_eq!(
-            options
-                .user_metadata
-                .get("X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key"),
-            Some(&"sealed".to_string())
+            options.user_metadata.get(REPLICATION_SSEC_ORIGINAL_SIZE_HEADER),
+            Some(&"1024".to_string())
         );
+        assert_eq!(
+            options.user_metadata.get(REPLICATION_ENCRYPTION_IV_HEADER),
+            Some(&"iv-direct".to_string())
+        );
+        assert_eq!(options.user_metadata.get(REPLICATION_SSE_IV_HEADER), Some(&"iv-minio".to_string()));
+        assert_eq!(
+            options.user_metadata.get(REPLICATION_SSE_SEAL_ALGORITHM_HEADER),
+            Some(&"DAREv2-HMAC-SHA256".to_string())
+        );
+        assert_eq!(options.user_metadata.get(REPLICATION_SSE_SEALED_KEY_HEADER), Some(&"sealed".to_string()));
+        assert_eq!(
+            options.user_metadata.get(REPLICATION_ENCRYPTED_MULTIPART_HEADER),
+            Some(&"true".to_string())
+        );
+
+        // The stored keys themselves and the SSE intent header must not leave
+        // the source verbatim.
+        assert!(!options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION));
+        assert!(!options.user_metadata.contains_key(SSEC_ALGORITHM_HEADER));
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            !options
+                .user_metadata
+                .contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+        );
+
         assert_eq!(options.content_type, "text/plain");
         assert_eq!(options.content_encoding, "gzip");
         assert_eq!(options.user_tags.get("env"), Some(&"prod".to_string()));
@@ -618,6 +666,68 @@ mod tests {
         assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef");
         assert_eq!(options.internal.replication_status, ReplicationStatusType::Replica);
         assert!(options.internal.replication_request);
+    }
+
+    #[test]
+    fn replication_put_options_strip_encryption_metadata_from_plaintext_objects() {
+        use rustfs_utils::http::object_encryption_keys::{INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER, SSEC_ORIGINAL_SIZE_HEADER};
+
+        // Migration leftovers: original-size metadata is not an encryption
+        // marker (older plaintext objects can retain it), so the object still
+        // classifies as plaintext — but the keys must be stripped, never
+        // forwarded as plain user metadata (backlog#1783 D2). The SSE-C
+        // original-size key is also a transport-table source key, so this
+        // doubles as the guard for the is_ssec gate: without SSE-C
+        // classification it must be stripped, not remapped.
+        let metadata = HashMap::from([
+            ("x-user-meta".to_string(), "value".to_string()),
+            (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), "1024".to_string()),
+            (SSEC_ORIGINAL_SIZE_HEADER.to_string(), "1024".to_string()),
+        ]);
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
+
+        assert_eq!(options.user_metadata.get("x-user-meta"), Some(&"value".to_string()));
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER));
+        assert!(!options.user_metadata.contains_key(SSEC_ORIGINAL_SIZE_HEADER));
+        assert!(
+            !options
+                .user_metadata
+                .keys()
+                .any(|key| key.to_ascii_lowercase().starts_with("x-rustfs-replication-")),
+            "non-SSE-C objects must never emit SSE replication transport keys"
+        );
+    }
+
+    #[test]
+    fn replication_put_options_fail_closed_on_sealed_material_without_sse_marker() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        };
+
+        // Sealed material without a recognizable SSE marker (MinIO-written
+        // objects, or corrupted metadata) must fail closed instead of
+        // replicating ciphertext as a plaintext object.
+        for sealed_key in [
+            INTERNAL_ENCRYPTION_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        ] {
+            let object_info = ObjectInfo {
+                user_defined: Arc::new(HashMap::from([(sealed_key.to_string(), "sealed-envelope".to_string())])),
+                ..Default::default()
+            };
+
+            let err = match replication_put_object_options("", &object_info) {
+                Ok(_) => panic!("sealed material without an SSE marker must fail closed ({sealed_key})"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
+            assert!(!err.to_string().contains("sealed-envelope"));
+        }
     }
 
     #[test]
@@ -657,6 +767,30 @@ mod tests {
         assert_eq!(
             classify_replication_source_encryption(&HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())])),
             ReplicationSourceEncryption::SseC
+        );
+        // Real stored SSE-C objects carry the AES256 SSE marker alongside the
+        // customer algorithm (encryption_material_to_metadata writes both).
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+                ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+            ])),
+            ReplicationSourceEncryption::SseC
+        );
+        // SSE-C material mixed with KMS evidence stays unsupported.
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+            ])),
+            ReplicationSourceEncryption::Unsupported
+        );
+        assert_eq!(
+            classify_replication_source_encryption(&HashMap::from([
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+                ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ])),
+            ReplicationSourceEncryption::Unsupported
         );
         assert_eq!(
             classify_replication_source_encryption(&HashMap::from([(
