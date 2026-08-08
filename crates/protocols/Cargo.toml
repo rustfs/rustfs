@@ -97,7 +97,6 @@ swift = [
     "dep:serde",
     "dep:urlencoding",
     "dep:md-5",
-    "dep:quick-xml",
     "dep:hmac",
     "dep:sha1",
     "dep:hex",
@@ -162,7 +161,6 @@ tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compa
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
-quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
