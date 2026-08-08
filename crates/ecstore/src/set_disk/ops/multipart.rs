@@ -3177,6 +3177,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn put_object_part_recovers_transaction_with_one_faulty_disk_at_write_quorum() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(4, 0, 2).await;
+        assert_eq!(set_disks.default_read_quorum(), 2);
+        assert_eq!(set_disks.default_write_quorum(), 3);
+
+        let bucket = "multipart-degraded-upload-part-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created before the disk fault");
+        disk_stores[0]
+            .set_disk_id_state(Some(Uuid::new_v4()))
+            .await
+            .expect("test should mark one disk stale");
+
+        let payload = vec![0x5b; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("upload part should commit with exactly write quorum healthy disks");
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("completion should settle the write-quorum part");
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should be readable through read quorum");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("completed object should stream fully");
+        assert_eq!(restored, payload);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn put_object_part_rechecks_upload_after_commit_lock() {
