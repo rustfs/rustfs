@@ -2555,6 +2555,12 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission;
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission;
     async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission;
+    /// Persist one entry straight to the durable MRF journal, bypassing the
+    /// live worker queues. For failures whose source state is already gone —
+    /// e.g. exhausted delete-marker purges — where only a startup replay can
+    /// retry, and live re-dispatch would loop unboundedly against a down
+    /// target.
+    async fn persist_mrf_entry(&self, entry: MrfReplicateEntry) -> ReplicationQueueAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -2593,6 +2599,10 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn queue_replica_delete_batch(&self, deletes: &[DeletedObjectReplicationInfo]) -> ReplicationBatchAdmission {
         self.queue_replica_delete_batch(deletes).await
+    }
+
+    async fn persist_mrf_entry(&self, entry: MrfReplicateEntry) -> ReplicationQueueAdmission {
+        self.queue_mrf_save_admission(entry, "delete_marker_purge").await
     }
 
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize) {
