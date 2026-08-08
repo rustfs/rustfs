@@ -185,19 +185,19 @@ pub mod bucket {
             MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
             REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION,
             REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo,
-            ReplicationBatchAdmission, ReplicationConfig, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
-            ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
-            ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
-            ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
-            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
-            VersionPurgeStatusType, commit_force_delete_intent, complete_force_delete_intent,
+            ReplicationBatchAdmission, ReplicationConfig, ReplicationConfigStructureError, ReplicationConfigurationExt,
+            ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge,
+            ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission,
+            ReplicationScannerBridge, ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage,
+            ReplicationTargetValidationError, ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog,
+            TargetReplicationResyncStatus, VersionPurgeStatusType, commit_force_delete_intent, complete_force_delete_intent,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
             get_global_replication_stats, init_background_replication, invalid_replication_config_status_field,
             persist_force_delete_intent, read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta,
             replication_statuses_map, replication_target_arns, resync_start_conflict_id, should_remove_replication_target,
             should_schedule_delete_replication, should_use_existing_delete_replication_info,
             should_use_existing_delete_replication_source, unsupported_replication_config_field,
-            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            validate_replication_config_structure, validate_replication_config_target_arns, version_purge_status_to_filemeta,
         };
     }
 
@@ -310,7 +310,8 @@ pub mod config {
 pub mod data_usage {
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
-        init_compression_total_memory_from_backend, invalidate_data_usage_snapshot_cache, live_bucket_usage_computations,
+        init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
+        invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
         load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
         record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
@@ -439,7 +440,7 @@ pub mod rpc {
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
         node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
         set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
-        tonic_boot_epoch_response_headers, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_rpc_signature, verify_tonic_boot_epoch_response,
         verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
         verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };

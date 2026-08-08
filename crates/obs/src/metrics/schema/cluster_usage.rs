@@ -76,6 +76,15 @@ pub static USAGE_BUCKETS_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(||
     )
 });
 
+pub static USAGE_SNAPSHOT_CONVERGED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::UsageSnapshotConverged,
+        "Whether the selected admin usage snapshot is converged (1) or observational (0)",
+        &[],
+        subsystems::CLUSTER_USAGE_OBJECTS,
+    )
+});
+
 pub static USAGE_OBJECTS_DISTRIBUTION_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::UsageSizeDistribution,

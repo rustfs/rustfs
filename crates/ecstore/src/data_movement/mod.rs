@@ -25,7 +25,7 @@ use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     multipart::{CompletePart, MultipartOperations as _},
     namespace::NamespaceLocking as _,
-    object::{ObjectIO as _, ObjectOperations as _},
+    object::{HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::store::ECStore;
 use bytes::Bytes;
@@ -228,6 +228,7 @@ fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx:
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        http_preconditions: data_movement_unversioned_target_precondition(object_info),
         data_movement: true,
         mod_time: object_info.mod_time,
         preserve_etag: object_info.etag.clone(),
@@ -242,11 +243,23 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         src_pool_idx,
         data_movement: true,
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        http_preconditions: data_movement_unversioned_target_precondition(object_info),
         mod_time: object_info.mod_time,
         user_defined: data_movement_user_defined(object_info),
         preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
+}
+
+fn is_unversioned_data_movement_object(object_info: &ObjectInfo) -> bool {
+    object_info.version_id.is_none_or(|version_id| version_id.is_nil())
+}
+
+fn data_movement_unversioned_target_precondition(object_info: &ObjectInfo) -> Option<HTTPPreconditions> {
+    is_unversioned_data_movement_object(object_info).then(|| HTTPPreconditions {
+        if_none_match: Some("*".to_string()),
+        ..Default::default()
+    })
 }
 
 fn data_movement_put_object_reader(
@@ -337,7 +350,7 @@ fn schedule_data_movement_multipart_abort_cleanup(
 }
 
 fn should_check_data_movement_overwrite_resume(err: &Error) -> bool {
-    is_err_data_movement_overwrite(err)
+    is_err_data_movement_overwrite(err) || matches!(err, Error::PreconditionFailed)
 }
 
 fn effective_actual_size(info: &ObjectInfo) -> Option<i64> {
@@ -403,6 +416,16 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && are_equivalent_data_movement_parts(&source.parts, &target.parts)
 }
 
+fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    is_unversioned_data_movement_object(source)
+        && is_unversioned_data_movement_object(target)
+        && !target.delete_marker
+        && source
+            .mod_time
+            .zip(target.mod_time)
+            .is_some_and(|(source_time, target_time)| target_time > source_time)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceCleanupPartIdentity {
     number: usize,
@@ -415,6 +438,15 @@ struct SourceCleanupPartIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceCleanupErasureIdentity {
+    algorithm: String,
+    data_blocks: usize,
+    parity_blocks: usize,
+    block_size: usize,
+    distribution: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceCleanupVersionIdentity {
     name: String,
     version_id: Option<uuid::Uuid>,
@@ -424,8 +456,26 @@ pub(crate) struct SourceCleanupVersionIdentity {
     etag: Option<String>,
     checksum: Option<Vec<u8>>,
     data_dir: Option<uuid::Uuid>,
+    transition_status: String,
+    transitioned_objname: String,
+    transition_tier: String,
+    transition_version_id: Option<uuid::Uuid>,
+    transition_version: Option<String>,
+    transition_version_state: u8,
+    expire_restored: bool,
+    erasure: SourceCleanupErasureIdentity,
     metadata: BTreeMap<String, String>,
     parts: Vec<SourceCleanupPartIdentity>,
+}
+
+fn source_cleanup_erasure_identity(erasure: &rustfs_filemeta::ErasureInfo) -> SourceCleanupErasureIdentity {
+    SourceCleanupErasureIdentity {
+        algorithm: erasure.algorithm.clone(),
+        data_blocks: erasure.data_blocks,
+        parity_blocks: erasure.parity_blocks,
+        block_size: erasure.block_size,
+        distribution: erasure.distribution.clone(),
+    }
 }
 
 fn source_cleanup_part_identity(part: &ObjectPartInfo) -> SourceCleanupPartIdentity {
@@ -457,6 +507,19 @@ pub(crate) fn source_cleanup_version_identity(version: &FileInfo) -> SourceClean
         etag: version.get_etag(),
         checksum: version.checksum.as_ref().map(|checksum| checksum.to_vec()),
         data_dir: version.data_dir,
+        transition_status: version.transition_status.clone(),
+        transitioned_objname: version.transitioned_objname.clone(),
+        transition_tier: version.transition_tier.clone(),
+        transition_version_id: version.transition_version_id,
+        transition_version: version.transition_version.clone(),
+        transition_version_state: match version.transition_version_state {
+            rustfs_filemeta::TransitionVersionState::Unknown => 0,
+            rustfs_filemeta::TransitionVersionState::KnownDisabled => 1,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull => 2,
+            rustfs_filemeta::TransitionVersionState::Exact => 3,
+        },
+        expire_restored: version.expire_restored,
+        erasure: source_cleanup_erasure_identity(&version.erasure),
         metadata: version
             .metadata
             .iter()
@@ -470,10 +533,6 @@ fn source_cleanup_version_identities(fivs: &FileInfoVersions) -> Vec<SourceClean
     let mut identities: Vec<_> = fivs.versions.iter().map(source_cleanup_version_identity).collect();
     identities.sort();
     identities
-}
-
-fn source_cleanup_versions_match(expected: &FileInfoVersions, current: &FileInfoVersions) -> bool {
-    source_cleanup_versions_match_with_allowed_missing(expected, current, &[])
 }
 
 fn source_cleanup_versions_match_with_allowed_missing(
@@ -507,6 +566,26 @@ fn source_cleanup_versions_match_with_allowed_missing(
         .all(|(identity, count)| allowed_counts.get(&identity).copied().unwrap_or_default() >= count)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SourceCleanupError {
+    #[error("source versions changed after migration started")]
+    SourceChanged,
+    #[error(transparent)]
+    Storage(#[from] Error),
+}
+
+fn ensure_source_cleanup_versions_match(
+    expected: &FileInfoVersions,
+    current: &FileInfoVersions,
+    allowed_missing: &[SourceCleanupVersionIdentity],
+) -> std::result::Result<(), SourceCleanupError> {
+    if source_cleanup_versions_match_with_allowed_missing(expected, current, allowed_missing) {
+        Ok(())
+    } else {
+        Err(SourceCleanupError::SourceChanged)
+    }
+}
+
 fn source_cleanup_preflight_error(op_label: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
     Error::other(format!("{op_label}: source cleanup preflight failed for {bucket}/{object}: {err}"))
 }
@@ -529,21 +608,87 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
     op_label: &str,
-) -> Result<()> {
+) -> std::result::Result<(), SourceCleanupError> {
     let Some(current) = load_source_cleanup_versions(set, bucket, object, op_label).await? else {
         return Ok(());
     };
 
-    if source_cleanup_versions_match_with_allowed_missing(expected, &current, allowed_missing) {
-        return Ok(());
+    ensure_source_cleanup_versions_match(expected, &current, allowed_missing)
+}
+
+#[cfg(test)]
+struct SourceCleanupDeleteBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct SourceCleanupDeleteBarrier {
+    state: Arc<SourceCleanupDeleteBarrierState>,
+}
+
+#[cfg(test)]
+static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SourceCleanupDeleteBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl SourceCleanupDeleteBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(SourceCleanupDeleteBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        assert!(slot.is_none(), "source cleanup delete barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
     }
 
-    Err(source_cleanup_preflight_error(
-        op_label,
-        bucket,
-        object,
-        "source versions changed after migration started",
-    ))
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(StdDuration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("source cleanup should reach the pre-delete barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SourceCleanupDeleteBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("source cleanup delete barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
+    let barrier = SOURCE_CLEANUP_DELETE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("source cleanup delete barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
 }
 
 pub(crate) async fn cleanup_source_entry_if_unchanged(
@@ -553,30 +698,32 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
     op_label: &str,
-) -> Result<ObjectInfo> {
+) -> std::result::Result<ObjectInfo, SourceCleanupError> {
     let cleanup_key = encode_dir_object(object);
     let ns_lock = set.new_ns_lock(bucket, cleanup_key.as_str()).await?;
-    let _guard = ns_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+    let _guard = ns_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(Error::from)?;
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    let result = set
-        .delete_object(
-            bucket,
-            cleanup_key.as_str(),
-            ObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                data_movement: true,
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await;
+    #[cfg(test)]
+    pause_source_cleanup_before_delete(bucket, object).await;
+
+    let mut opts = ObjectOptions {
+        delete_prefix: true,
+        delete_prefix_object: true,
+        data_movement: true,
+        no_lock: true,
+        ..Default::default()
+    };
+    opts.add_namespace_lock_guard(&_guard);
+    let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
-    result
+    result.map_err(SourceCleanupError::from)
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -627,7 +774,11 @@ fn resolve_data_movement_overwrite_resume_result(
         return Ok(false);
     };
 
-    Ok(is_equivalent_data_movement_object(source, &target))
+    if is_equivalent_data_movement_object(source, &target) {
+        return Ok(true);
+    }
+
+    Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
 }
 
 async fn should_treat_data_movement_overwrite_as_complete(
@@ -838,7 +989,6 @@ pub(crate) async fn migrate_object(
                         bucket.as_str(),
                         object_info.name.as_str()
                     );
-                    mark_multipart_upload_completed(&abort_multipart_flag);
                     return Ok(());
                 }
 
@@ -856,6 +1006,32 @@ pub(crate) async fn migrate_object(
             Ok(())
         }
         .await;
+
+        if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
+            let abort_result = match store.pools.get(target_pool_idx) {
+                Some(pool) => {
+                    pool.abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
+                        .await
+                }
+                None => Err(Error::other(format!(
+                    "{op_label}: target pool {target_pool_idx} is out of range while aborting superseded multipart upload"
+                ))),
+            };
+            if let Err(abort_err) = abort_result
+                && !is_err_invalid_upload_id(&abort_err)
+            {
+                error!("{op_label}: abort superseded multipart upload err {:?}", &abort_err);
+                schedule_data_movement_multipart_abort_cleanup(
+                    store.clone(),
+                    target_pool_idx,
+                    bucket.clone(),
+                    object_info.name.clone(),
+                    res.upload_id.clone(),
+                    op_label,
+                );
+            }
+            return Ok(());
+        }
 
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
@@ -1056,7 +1232,7 @@ mod tests {
         let expected = cleanup_test_versions(vec![first.clone(), second.clone()]);
         let current = cleanup_test_versions(vec![second, first]);
 
-        assert!(source_cleanup_versions_match(&expected, &current));
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
     }
 
     #[test]
@@ -1064,7 +1240,40 @@ mod tests {
         let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
         let current = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "changed")]);
 
-        assert!(!source_cleanup_versions_match(&expected, &current));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("changed source metadata must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+    }
+
+    #[test]
+    fn test_source_cleanup_preflight_rejects_changed_transition_or_erasure() {
+        let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        let mut current = expected.clone();
+        current.versions[0].transition_tier = "COLD".to_string();
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("transition metadata changes must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+
+        let mut current = expected.clone();
+        current.versions[0].erasure.algorithm = "changed".to_string();
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("erasure metadata changes must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+    }
+
+    #[test]
+    fn test_source_cleanup_preflight_ignores_per_disk_erasure_fields() {
+        let mut expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        expected.versions[0].erasure.checksums = vec![rustfs_filemeta::ChecksumInfo {
+            part_number: 1,
+            hash: Bytes::from_static(b"disk-a-checksum"),
+            ..Default::default()
+        }];
+        let mut current = expected.clone();
+        current.versions[0].erasure.index = 7;
+        current.versions[0].erasure.checksums[0].hash = Bytes::from_static(b"disk-b-checksum");
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
     }
 
     #[test]
@@ -1075,7 +1284,9 @@ mod tests {
             cleanup_test_file_info("object.txt", Uuid::from_u128(2), "new-version"),
         ]);
 
-        assert!(!source_cleanup_versions_match(&expected, &current));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("an added source version must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]
@@ -1096,7 +1307,9 @@ mod tests {
         let expected = cleanup_test_versions(vec![migrated.clone(), protected]);
         let current = cleanup_test_versions(vec![migrated]);
 
-        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("an unexpected missing version must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]
@@ -1108,7 +1321,9 @@ mod tests {
         let current = cleanup_test_versions(vec![migrated, new_version]);
         let allowed_missing = vec![source_cleanup_version_identity(&expired)];
 
-        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &allowed_missing)
+            .expect_err("a new source version must defer cleanup even when an expired version may be missing");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]
@@ -1171,12 +1386,13 @@ mod tests {
     }
 
     #[test]
-    fn test_should_check_data_movement_overwrite_resume_only_for_overwrite_error() {
+    fn test_should_check_data_movement_overwrite_resume_accepts_conflict_errors() {
         assert!(should_check_data_movement_overwrite_resume(&Error::DataMovementOverwriteErr(
             "bucket-a".to_string(),
             "object-a".to_string(),
             "version-a".to_string(),
         )));
+        assert!(should_check_data_movement_overwrite_resume(&Error::PreconditionFailed));
         assert!(!should_check_data_movement_overwrite_resume(&Error::SlowDown));
     }
 
@@ -1551,7 +1767,7 @@ mod tests {
     #[test]
     fn test_data_movement_complete_multipart_opts_preserves_mod_time_version_and_etag() {
         let mod_time = OffsetDateTime::now_utc();
-        let version_id = Uuid::nil();
+        let version_id = Uuid::from_u128(7);
         let object_info = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(mod_time),
@@ -1567,11 +1783,12 @@ mod tests {
         assert_eq!(opts.version_id.as_deref(), Some(version_id.to_string().as_str()));
         assert_eq!(opts.preserve_etag.as_deref(), Some("etag-value"));
         assert_eq!(opts.src_pool_idx, 7);
+        assert!(opts.http_preconditions.is_none());
     }
 
     #[test]
     fn test_data_movement_put_object_opts_preserves_version_and_etag() {
-        let version_id = Uuid::nil();
+        let version_id = Uuid::from_u128(9);
         let object_info = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
@@ -1589,6 +1806,35 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 9);
         assert!(opts.data_movement);
         assert_eq!(opts.mod_time, object_info.mod_time);
+        assert!(opts.http_preconditions.is_none());
+    }
+
+    #[test]
+    fn test_data_movement_unversioned_put_and_complete_require_absent_target() {
+        for version_id in [None, Some(Uuid::nil())] {
+            let object_info = ObjectInfo {
+                version_id,
+                ..Default::default()
+            };
+
+            let put_opts = data_movement_put_object_opts(&object_info, 9);
+            let complete_opts = data_movement_complete_multipart_opts(&object_info, 9);
+
+            assert_eq!(
+                put_opts
+                    .http_preconditions
+                    .as_ref()
+                    .and_then(HTTPPreconditions::if_none_match_value),
+                Some("*")
+            );
+            assert_eq!(
+                complete_opts
+                    .http_preconditions
+                    .as_ref()
+                    .and_then(HTTPPreconditions::if_none_match_value),
+                Some("*")
+            );
+        }
     }
 
     #[test]
@@ -1835,6 +2081,154 @@ mod tests {
             .expect("equivalent overwrite target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_accepts_newer_unversioned_target() {
+        for version_id in [None, Some(Uuid::nil())] {
+            let source = ObjectInfo {
+                version_id,
+                size: 128,
+                etag: Some("etag-source".to_string()),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            };
+            let target = ObjectInfo {
+                etag: Some("etag-client-write".to_string()),
+                mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+                ..source.clone()
+            };
+
+            let should_resume =
+                resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                    .expect("precondition conflict target should be evaluated");
+
+            assert!(should_resume);
+        }
+    }
+
+    #[test]
+    fn test_precondition_conflict_accepts_equivalent_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(source.clone())), &source, 0, 1)
+                .expect("equivalent precondition target should be evaluated");
+
+        assert!(should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_non_newer_unversioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-conflict".to_string()),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("precondition conflict target should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_newer_delete_marker() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            delete_marker: true,
+            etag: None,
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("delete marker conflict should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_overwrite_error_rejects_newer_unversioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-client-write".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source, 0, 1)
+            .expect("pool-selection overwrite must require target equivalence");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_newer_versioned_target() {
+        let source = ObjectInfo {
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(Uuid::from_u128(2)),
+            etag: Some("etag-conflict".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("versioned conflict target should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_precondition_conflict_rejects_versioned_source_with_unversioned_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: None,
+            etag: Some("etag-conflict".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..source.clone()
+        };
+
+        let should_resume =
+            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
+                .expect("versioned source conflict should be evaluated");
+
+        assert!(!should_resume);
     }
 
     #[test]

@@ -51,6 +51,7 @@ mod rolling;
 
 use crate::TelemetryError;
 use crate::config::OtelConfig;
+pub use filter::HTTP_SERVER_LOG_TARGET;
 pub use guard::OtelGuard;
 pub use recorder::{Recorder, retire_metric_series};
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;

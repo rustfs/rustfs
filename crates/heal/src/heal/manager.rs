@@ -3768,6 +3768,23 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_request_for_incomplete_heal_rename() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);
+        let result = Err(Error::TaskExecutionFailed {
+            message: "Failed to heal object bucket/object: heal rename incomplete: 1 of 2 targets committed".to_string(),
+        });
+
+        let (retry_request, retry_delay, retry_error) =
+            retry_request_for_result(&task, &result).expect("incomplete target rename should be retryable");
+
+        assert_eq!(retry_request.id, task.id);
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert!(retry_delay > Duration::ZERO);
+        assert!(retry_error.contains("heal rename incomplete"));
+    }
+
+    #[test]
     fn test_retry_request_for_typed_read_quorum_error() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);

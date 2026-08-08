@@ -571,12 +571,23 @@ fn archive_content_encoding_strict_mode() -> bool {
 
 const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
 const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
+const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 
+/// Keys a client must not be able to materialize as bare stored metadata.
+///
+/// Must stay symmetric with [`should_skip_object_metadata_key`]: every prefix the
+/// read side strips as internal must be namespaced here on the write side, or a
+/// client PUT of `x-amz-meta-<internal-key>` lands on disk as the internal key
+/// itself (e.g. `x-rustfs-encryption-algorithm`, which the KMS
+/// `headers_to_metadata` path treats as the cipher selector).
 fn is_reserved_user_metadata_key(key: &str) -> bool {
     SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header))
         || starts_with_ignore_ascii_case(key, "x-amz-")
         || starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX)
         || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
+        || starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
+        || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
 }
 
 fn stored_user_metadata_key(key: &str) -> String {
@@ -661,8 +672,6 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
 }
 
 fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&str]) -> bool {
-    const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
-    const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
     const X_AMZ_PREFIX: &str = "x-amz-";
 
     // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
@@ -1934,6 +1943,93 @@ mod tests {
         ]);
         let filtered_legacy = filter_object_metadata(&legacy_metadata).expect("safe user metadata should remain");
         assert_eq!(filtered_legacy, HashMap::from([("project".to_string(), "rustfs".to_string())]));
+    }
+
+    #[test]
+    fn test_client_cannot_inject_internal_encryption_metadata_keys() {
+        // Attack form: a client PUT smuggles internal encryption keys through the
+        // x-amz-meta- user-metadata prefix. Stripping the prefix must NOT produce a
+        // bare internal key (`x-rustfs-encryption-*` / `x-minio-encryption-*`) in
+        // stored metadata, otherwise the KMS `headers_to_metadata` path would read
+        // attacker-chosen values (e.g. the cipher algorithm) as trusted state.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-x-rustfs-encryption-algorithm", HeaderValue::from_static("ChaCha20Poly1305"));
+        headers.insert("x-amz-meta-x-minio-encryption-key", HeaderValue::from_static("attacker-key"));
+        headers.insert("x-amz-meta-X-Rustfs-Encryption-Iv", HeaderValue::from_static("attacker-iv"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        for injected in [
+            "x-rustfs-encryption-algorithm",
+            "x-minio-encryption-key",
+            "X-Rustfs-Encryption-Iv",
+        ] {
+            assert!(
+                !metadata.keys().any(|k| k.eq_ignore_ascii_case(injected)),
+                "client-injected internal encryption key must not be stored bare: {injected}"
+            );
+        }
+        // The values survive only inside the user-metadata namespace.
+        assert_eq!(
+            metadata.get("x-amz-meta-x-rustfs-encryption-algorithm"),
+            Some(&"ChaCha20Poly1305".to_string())
+        );
+        assert_eq!(metadata.get("x-amz-meta-x-minio-encryption-key"), Some(&"attacker-key".to_string()));
+
+        // CopyObject REPLACE path: DTO metadata keys take the same namespacing.
+        let mut copied = HashMap::from([
+            ("x-rustfs-encryption-algorithm".to_string(), "ChaCha20Poly1305".to_string()),
+            ("X-Minio-Encryption-Key".to_string(), "attacker-key".to_string()),
+        ]);
+        namespace_reserved_user_metadata(&mut copied);
+        assert_eq!(
+            copied.get("x-amz-meta-x-rustfs-encryption-algorithm"),
+            Some(&"ChaCha20Poly1305".to_string())
+        );
+        assert_eq!(copied.get("x-amz-meta-X-Minio-Encryption-Key"), Some(&"attacker-key".to_string()));
+        assert!(!copied.contains_key("x-rustfs-encryption-algorithm"));
+        assert!(!copied.contains_key("X-Minio-Encryption-Key"));
+    }
+
+    #[test]
+    fn test_bare_encryption_headers_are_not_ingested_as_metadata() {
+        // A client sending the internal header directly (no x-amz-meta- prefix) must
+        // not have it ingested into stored metadata either: it matches neither the
+        // user-metadata prefixes nor SUPPORTED_HEADERS.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rustfs-encryption-algorithm", HeaderValue::from_static("ChaCha20Poly1305"));
+        headers.insert("x-minio-encryption-iv", HeaderValue::from_static("attacker-iv"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        assert!(!metadata.contains_key("x-rustfs-encryption-algorithm"));
+        assert!(!metadata.contains_key("x-minio-encryption-iv"));
+    }
+
+    #[test]
+    fn test_server_written_encryption_metadata_stays_internal() {
+        // Legitimate SSE flow: the server inserts bare internal encryption keys into
+        // stored metadata after user-metadata namespacing. They must remain hidden
+        // from the client-visible Metadata map, while namespaced user metadata that
+        // merely resembles them round-trips back to the client.
+        let metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "server-iv".to_string()),
+            ("x-rustfs-encryption-key".to_string(), "wrapped-key".to_string()),
+            ("x-minio-encryption-original-size".to_string(), "1024".to_string()),
+            ("x-amz-meta-x-rustfs-encryption-algorithm".to_string(), "user-value".to_string()),
+            ("x-amz-meta-project".to_string(), "rustfs".to_string()),
+        ]);
+
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+        assert_eq!(
+            filtered,
+            HashMap::from([
+                ("x-rustfs-encryption-algorithm".to_string(), "user-value".to_string()),
+                ("project".to_string(), "rustfs".to_string()),
+            ])
+        );
     }
 
     #[test]

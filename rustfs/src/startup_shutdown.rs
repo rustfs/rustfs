@@ -14,7 +14,10 @@
 
 use crate::storage_api::startup::shutdown::shutdown_background_services;
 use crate::{
-    server::{ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system},
+    server::{
+        SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier,
+        stop_audit_system,
+    },
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
     },
@@ -22,6 +25,7 @@ use crate::{
 };
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_notify::NotificationLifecycleTransition;
+use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
 use rustfs_utils::get_env_bool_with_aliases;
 use std::future::Future;
 use std::path::PathBuf;
@@ -42,6 +46,7 @@ const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 const EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED: &str = "embedded_shutdown_cleanup_failed";
 const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
 const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
+const BACKGROUND_SERVICE_CAPACITY: &str = "capacity";
 const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
@@ -200,6 +205,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
     s3_shutdown_handle: Option<ShutdownHandle>,
     console_shutdown_handle: Option<ShutdownHandle>,
     optional_runtimes: OptionalRuntimeServices,
+    capacity_tasks: Option<CapacityBackgroundTasks>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -219,6 +225,57 @@ pub(crate) async fn run_startup_shutdown_sequence(
         "Shutdown signal received"
     );
     state_manager.update(ServiceState::Stopping);
+
+    if let Some(handle) = &s3_shutdown_handle {
+        handle.signal();
+    }
+    if let Some(handle) = &console_shutdown_handle {
+        handle.signal();
+    }
+
+    if let Some(capacity_tasks) = capacity_tasks {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            service = BACKGROUND_SERVICE_CAPACITY,
+            state = "stopping",
+            "Background service shutdown started"
+        );
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, capacity_tasks.shutdown()).await {
+            Ok(Ok(())) => info!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                service = BACKGROUND_SERVICE_CAPACITY,
+                state = "stopped",
+                "Background service shutdown completed"
+            ),
+            Ok(Err(err)) => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                service = BACKGROUND_SERVICE_CAPACITY,
+                state = "stop_failed",
+                reason = join_failure_reason(&err),
+                "Background service shutdown failed"
+            ),
+            Err(_) => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                service = BACKGROUND_SERVICE_CAPACITY,
+                state = "stop_failed",
+                reason = "timeout",
+                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                "Background service shutdown timed out"
+            ),
+        }
+    }
 
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);

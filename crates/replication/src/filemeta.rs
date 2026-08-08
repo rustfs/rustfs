@@ -48,6 +48,14 @@ pub const REPLICATE_HEAL: &str = "replicate:heal";
 pub const REPLICATE_HEAL_DELETE: &str = "replicate:heal:delete";
 
 /// StatusType of Replication for x-amz-replication-status header
+///
+/// NOTE: `rustfs-filemeta` owns a sibling copy of this enum (plus
+/// `VersionPurgeStatusType` and `ReplicationState`) bound to the xl.meta disk
+/// format, while this copy is bound to the MRF/resync persistence format.
+/// When adding or renaming a variant here, reconcile the sibling and the
+/// conversion layer — the reconciliation tests in
+/// `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`
+/// fail to compile until both sides agree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
 pub enum ReplicationStatusType {
     /// Pending - replication is pending.

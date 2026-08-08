@@ -29,6 +29,8 @@
 
 [test-groups]
 ecstore-serial-flaky = { max-threads = 1 }
+embedded-test-ports = { max-threads = 1 }
+e2e-vault = { max-threads = 1 }
 
 # Reliability / fault-injection e2e tests each spawn a single-node 4-disk RustFS
 # server and manipulate its disk directories at runtime (crates/e2e_test:
@@ -53,6 +55,20 @@ test-group = 'ecstore-serial-flaky'
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
+
+# The production-handler relocation regression builds an isolated 8-disk,
+# 2-pool store and commits a 72 MiB multipart object. Keep that cross-disk IO
+# from overlapping the ecstore commit fixtures above.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+
+# Embedded integration-test binaries discover an ephemeral port and release
+# the probe listener before RustFS binds it. Serialize that cross-process
+# TOCTOU window; retries would only hide real startup failures.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
+test-group = 'embedded-test-ports'
 
 # Serialize the durable manual-transition checkpoint test across nextest's
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
@@ -80,6 +96,12 @@ test-group = 'e2e-reliability'
 [[profile.default.overrides]]
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
+
+# Vault KMS tests share the fixed dev-server port 8200. serial_test's #[serial]
+# does not cross nextest process boundaries, so keep these tests in one group.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+test-group = 'e2e-vault'
 
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
@@ -143,6 +165,16 @@ test-group = 'e2e-reliability'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
 
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+
+# Match the default-profile embedded test isolation without quarantining or
+# retrying failures in CI.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnostic_capability_e2e))'
+test-group = 'embedded-test-ports'
+
 # Serialize the durable manual-transition checkpoint test under the ci profile
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
@@ -186,7 +218,7 @@ test-group = 'ecstore-serial-flaky'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 28 nightly = 48 total
+# regexes byte-identical. Count invariant: 20 here + 36 nightly = 56 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
@@ -222,7 +254,7 @@ test-group = 'ecstore-serial-flaky'
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|multipart_storage_class|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat)_test::|^fake_s3_target::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|multipart_storage_class|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat)_test::|^fake_s3_target::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
@@ -248,10 +280,10 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 # tests that are unfit for the per-PR e2e-smoke gate:
 #
 #   * 2 remote-target TLS validation tests.
-#   * 12 bucket-replication data-plane/helper tests — they PUT/delete objects
-#     and poll until source and target converge; two replicate over HTTPS, two
-#     pin active SSE failure contracts, and one guards event/history observers.
-#     The SSE-S3 contract remains ignored under backlog#1291.
+#   * 13 bucket-replication data-plane/helper tests — they PUT/delete objects
+#     and poll until source and target converge; two replicate over HTTPS,
+#     four pin active SSE fail-closed contracts (SSE-C, SSE-S3, SSE-KMS, and
+#     the SSE-S3 resync path), and one guards event/history observers.
 #   * 12 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
 #   * 1 `_real_three_node` site-replication test.
@@ -317,9 +349,9 @@ path = "junit.xml"
 #
 # Each e2e test spawns its own single-node rustfs server on a random port with
 # an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
-# parallel-safe — the same property e2e-smoke relies on. The exception is the
-# 4-disk reliability / degraded-read fault-injection tests, serialized below
-# (identical to the ci profile) so several 4-disk servers never run at once.
+# parallel-safe — the same property e2e-smoke relies on. The exceptions are the
+# 4-disk reliability / degraded-read fault-injection tests and the fixed-port
+# Vault tests, both serialized below.
 # KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
 # 341 ran / 32 failed on the suites' first automated run ever). Deterministic
 # product failures cannot be quarantined away with retries, so each family is
@@ -355,3 +387,7 @@ test-group = 'e2e-reliability'
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
+
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+test-group = 'e2e-vault'

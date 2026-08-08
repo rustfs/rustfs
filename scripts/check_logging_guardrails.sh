@@ -690,6 +690,17 @@ if [[ -n "$unmasked_revoke_fields" ]]; then
   exit 1
 fi
 
+# STS claims carry caller-supplied identity material (parent user, session policy, JWT
+# fields). Interpolating the claims map into any log or error repeats the
+# GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata
+# such as claims.len() may be logged (see trace_assume_role_claims in sts.rs).
+sts_claims_content_logs="$(rg -n '\{:\?\}.*claims|claims.*\{:\?\}|\{&?claims:\?\}|[?%]\s*&?claims\b' rustfs/src/admin/handlers/sts.rs || true)"
+if [[ -n "$sts_claims_content_logs" ]]; then
+  echo "❌ logging guardrail violation: STS handlers must not interpolate JWT claims into logs or errors (GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 class); log derived metadata such as claims.len() instead" >&2
+  echo "$sts_claims_content_logs" >&2
+  exit 1
+fi
+
 heal_hotpath_files=(
   "crates/ecstore/src/store/heal.rs"
   "crates/ecstore/src/store/mod.rs"
@@ -831,6 +842,60 @@ for file in "${disk_logging_files[@]}"; do
   fi
 done
 
+# `forbidden_patterns` above only retires log lines that already shipped, so a
+# newly written sentence-style log passes every check in this script — which is
+# how one reaches review in the first place (PR #5822 added
+# `warn!("heal rename_data: purging ... {:?} failed: {}", ...)` to
+# disk/local.rs with CI green). Assert the RustFS event shape positively on the
+# file sets already governed here: error!/warn!/info! must open with fields
+# (`event = ...`) or a `target:`, never with a bare message string. debug! and
+# trace! stay out of scope — they are targeted diagnostics, not operator
+# events. Extend this list as more files are converted; it is deliberately
+# narrower than `checked_files`, which is only a blocklist surface.
+structured_event_files=(
+  "crates/ecstore/src/disk/mod.rs"
+  "crates/ecstore/src/disk/local.rs"
+  "crates/ecstore/src/cluster/rpc/remote_disk.rs"
+)
+
+# The leading class rejects `my_info!(` while still matching `tracing::warn!(`.
+sentence_style_log_pattern='(?:^|[^A-Za-z0-9_])(?:error|warn|info)!\(\s*"'
+
+for file in "${structured_event_files[@]}"; do
+  # Commented-out macros are dead code, not emitted events.
+  sentence_style_logs="$(rg -n -U "$sentence_style_log_pattern" "$file" | rg -v '^[0-9]+:\s*//' || true)"
+  if [[ -n "$sentence_style_logs" ]]; then
+    echo "❌ logging guardrail violation: error!/warn!/info! must lead with structured fields (event/component/subsystem) in $file" >&2
+    echo "$sentence_style_logs" >&2
+    exit 1
+  fi
+done
+
+# Keep the matcher honest in both directions.
+for fixture in \
+  'warn!("heal rename_data: purging stale destination data dir {:?} failed: {}", dst_data_path, err);' \
+  $'warn!(\n    "rename_data commit failed: {}",\n    err\n);' \
+  'tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");' \
+  'info!("disk scan finished");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: sentence-style log was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'info!(\n    event = EVENT_DISK_LOCAL_RENAME_REJECTED,\n    component = LOG_COMPONENT_ECSTORE,\n    reason = "rename_all_data_path_failed",\n    "Disk local rename flow failed"\n);' \
+  'warn!(target: "rustfs::heal::manager", event = EVENT_HEAL_RETRY, "Heal retry admission decided");' \
+  'my_info!("not a tracing macro");' \
+  'debug!("list_dir raw {:?}", entries);'; do
+  if printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: structured event was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 if rg -n -U 'debug!\([\s\S]{0,600}"Remote disk RPC started"' crates/ecstore/src/cluster/rpc/remote_disk.rs >/dev/null; then
   echo "❌ logging guardrail violation: successful remote disk RPC events must not be emitted at DEBUG" >&2
   exit 1
@@ -857,6 +922,11 @@ if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Hea
   exit 1
 fi
 
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
+  exit 1
+fi
+
 demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
 if [[ "$demoted_task_sites" -lt 4 ]]; then
   echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2
@@ -872,6 +942,43 @@ fi
 erasure_sampled_sites="$(rg -c -F 'take_failure_log_sample(' crates/heal/src/heal/erasure_healer.rs || echo 0)"
 if [[ "$erasure_sampled_sites" -lt 2 ]]; then
   echo "❌ logging guardrail violation: erasure-set per-object failure/skip warns must stay sample-capped via take_failure_log_sample (expected >= 2 sites in crates/heal/src/heal/erasure_healer.rs, found $erasure_sampled_sites)" >&2
+  exit 1
+fi
+
+# Object-read request fan-out crosses several thin wrappers. These spans are
+# useful for opt-in latency attribution, but default INFO turns one S3 request
+# into many redundant span-close records. Keep only the measured hot wrappers
+# TRACE-only; write, heal, rebalance, and admin operations are intentionally not
+# included here.
+trace_hot_spans=(
+  "crates/ecstore/src/set_disk/ops/locking.rs:new_ns_lock"
+  "crates/ecstore/src/store/rebalance.rs:handle_new_ns_lock"
+  "crates/ecstore/src/store/object.rs:handle_get_object_info"
+  "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
+  "crates/ecstore/src/store/mod.rs:list_objects_v2"
+  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  "crates/ecstore/src/core/sets.rs:list_objects_v2"
+  "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
+  "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+)
+
+for hot_span in "${trace_hot_spans[@]}"; do
+  file="${hot_span%%:*}"
+  function="${hot_span##*:}"
+  trace_span_pattern="#\\[(tracing::)?instrument\\([^]]*level = \\\"trace\\\"[^]]*\\)\\]([[:space:]]+#\\[[^]]+\\])*[[:space:]]+(pub(\\([^)]*\\))?[[:space:]]+)?(super[[:space:]]+)?async fn ${function}\\b"
+  if ! rg -U "$trace_span_pattern" "$file" >/dev/null; then
+    echo "❌ logging guardrail violation: $file::$function must remain TRACE-only" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U 'info!\([[:space:]]+target: HTTP_SERVER_LOG_TARGET,[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful HTTP completion events must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: HTTP request log target must use HTTP_SERVER_LOG_TARGET" >&2
   exit 1
 fi
 

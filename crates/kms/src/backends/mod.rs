@@ -162,6 +162,15 @@ pub(crate) fn ensure_rewrap_context_matches(
 /// Page size used when a [`ListKeysRequest`] does not ask for one.
 pub(crate) const DEFAULT_LIST_KEYS_PAGE_SIZE: u32 = 100;
 
+/// Largest page a single [`ListKeysRequest`] can be served.
+///
+/// A page is not a cheap slice: every listed identifier costs the backend one
+/// metadata lookup — a disk read on Local, an HTTP round trip on Vault Transit —
+/// so an unbounded `limit` turns one request into an unbounded fan-out against
+/// the key store. The ceiling is applied where the page is cut rather than at
+/// each caller, so no backend can opt out of it.
+pub(crate) const MAX_LIST_KEYS_PAGE_SIZE: u32 = 1_000;
+
 /// One page of a key set the backend has to slice itself.
 pub(crate) struct KeyPage<'a, T> {
     /// The identifiers this page covers, in listing order.
@@ -228,10 +237,14 @@ pub(crate) fn paginate_keys<'a, T>(sorted: &'a [T], request: &ListKeysRequest, k
 /// already gives `max-keys=0` on the S3 listing path — not a malformed one and
 /// not an omitted value. Rounding it up to a default would hand back a full
 /// page of keys to a caller that explicitly asked for none.
+///
+/// A larger request is clamped to [`MAX_LIST_KEYS_PAGE_SIZE`] rather than
+/// rejected: the caller still reaches every key by following `next_marker`, so
+/// clamping costs it an extra round trip where rejecting would break it.
 pub(crate) fn list_keys_page_size(limit: Option<u32>) -> Option<usize> {
     match limit.unwrap_or(DEFAULT_LIST_KEYS_PAGE_SIZE) {
         0 => None,
-        size => Some(size as usize),
+        size => Some(size.min(MAX_LIST_KEYS_PAGE_SIZE) as usize),
     }
 }
 
@@ -246,6 +259,106 @@ pub(crate) fn empty_key_page() -> ListKeysResponse {
         keys: Vec::new(),
         next_marker: None,
         truncated: false,
+        unreadable_key_ids: Vec::new(),
+    }
+}
+
+/// What a failed per-key describe means for the page being assembled.
+pub(crate) enum ListedKeyFailure {
+    /// The key disappeared between the identifier scan and the read. Concurrent
+    /// removal is normal and the cursor comes from the identifier list, so the
+    /// listing drops it and advances.
+    Vanished,
+    /// The record is still in the store and this build cannot interpret it.
+    /// Reported through [`ListKeysResponse::unreadable_key_ids`] rather than
+    /// omitted or turned into a whole-page failure.
+    Unreadable,
+}
+
+/// Decide whether a per-key describe failure may be attributed to that one key.
+///
+/// `None` means it may not: the error describes something outside the record,
+/// so the caller must fail the whole listing. Downgrading a timeout to "this key
+/// is unreadable" would report a Vault outage as mass key corruption.
+///
+/// The material-level variants are all per-record by construction: each names
+/// one key and stays true on re-read. That includes
+/// [`KmsError::MaterialAuthenticationFailed`], which on the local backend means
+/// one record's AEAD tag did not verify — bit rot or a torn write. The
+/// systemic reading of the same variant, a process holding the wrong master
+/// key, cannot reach a listing: it is rejected when the backend is constructed.
+/// The whole-key-set guard in [`UnreadableKeys`] covers whatever slips past
+/// that.
+pub(crate) fn classify_listed_key_failure(error: &KmsError) -> Option<ListedKeyFailure> {
+    match error {
+        KmsError::KeyNotFound { .. } => Some(ListedKeyFailure::Vanished),
+        KmsError::MaterialMissing { .. }
+        | KmsError::MaterialCorrupt { .. }
+        | KmsError::MaterialAuthenticationFailed { .. }
+        | KmsError::UnsupportedFormatVersion { .. }
+        | KmsError::BaselineVersionLost { .. } => Some(ListedKeyFailure::Unreadable),
+        _ => None,
+    }
+}
+
+/// Whether this request starts at the very beginning of the key set.
+///
+/// An empty `marker` is not the same as no marker to a caller, but it is to
+/// [`paginate_keys`]: no identifier sorts at or below the empty string, so the
+/// page starts at the first key either way. Testing `Option::is_none` alone
+/// would let `?marker=` — which a generated pager that always emits its cursor
+/// parameter sends on its first request — slip past the whole-key-set guard
+/// below and get the empty, healthy-looking page that guard exists to prevent.
+pub(crate) fn started_at_the_first_key(request: &ListKeysRequest) -> bool {
+    request.marker.as_deref().is_none_or(str::is_empty)
+}
+
+/// The unreadable identifiers of one page, and the guarantee that a *complete*
+/// listing never reports every key as damaged while looking empty.
+///
+/// The failure mode being guarded against is a shared cause — a mixed-version
+/// node reading records in a format it has no reader for — that makes every key
+/// unreadable at once. Answering that with `200 OK` and an empty `keys` list
+/// looks, to any client written before `unreadable_key_ids` existed, exactly
+/// like a deployment that has no keys.
+///
+/// The guard is deliberately scoped to a listing that reached the end of the key
+/// set on its first page. Firing it per page instead would be a trap: with
+/// `limit=1` a single damaged key would fail its own page, and since a failed
+/// page carries no `next_marker` the caller could never advance past it — every
+/// key behind the damaged one becomes permanently unreachable. A page that is
+/// truncated, or that resumed from a marker, always reports per-key so paging
+/// can advance; and an empty `keys` array on such a page is already a documented
+/// state, because filters are applied after the page is cut.
+#[derive(Default)]
+pub(crate) struct UnreadableKeys {
+    ids: Vec<String>,
+    first_error: Option<KmsError>,
+    readable: usize,
+}
+
+impl UnreadableKeys {
+    pub(crate) fn saw_readable(&mut self) {
+        self.readable += 1;
+    }
+
+    pub(crate) fn record(&mut self, key_id: &str, error: KmsError) {
+        self.ids.push(key_id.to_string());
+        self.first_error.get_or_insert(error);
+    }
+
+    /// The identifiers to report.
+    ///
+    /// `whole_key_set` says this page both started at the beginning and reached
+    /// the end, so there is no further page a caller could advance to — which is
+    /// what makes failing here safe. Every identifier has already been logged
+    /// individually by the backend, so the single returned error does not hide
+    /// the rest.
+    pub(crate) fn into_reported_ids(self, whole_key_set: bool) -> Result<Vec<String>> {
+        match self.first_error {
+            Some(error) if whole_key_set && self.readable == 0 => Err(error),
+            _ => Ok(self.ids),
+        }
     }
 }
 
@@ -858,6 +971,43 @@ mod tests {
         let keys = key_ids(3);
         assert_eq!(page_of(&keys, Some(u32::MAX), None), (keys.clone(), None, false));
         assert_eq!(page_of(&keys, Some(u32::MAX), Some("key-01")), (vec![keys[2].clone()], None, false));
+    }
+
+    /// A page is capped however large a limit the caller asks for, and the
+    /// capped page still carries a cursor, so the caller reaches every key
+    /// instead of being cut off at the ceiling.
+    #[test]
+    fn page_size_is_capped_and_the_capped_page_still_advances() {
+        // Pinned as a number, not only symbolically: the published contract in
+        // `docs/operations/kms-admin-contract.md` states this exact ceiling, so
+        // raising it is an API change and has to be a deliberate edit here.
+        assert_eq!(MAX_LIST_KEYS_PAGE_SIZE, 1_000);
+        assert_eq!(
+            list_keys_page_size(Some(u32::MAX)),
+            Some(MAX_LIST_KEYS_PAGE_SIZE as usize),
+            "an unbounded limit must not become an unbounded per-key fan-out"
+        );
+        assert_eq!(list_keys_page_size(Some(MAX_LIST_KEYS_PAGE_SIZE)), Some(MAX_LIST_KEYS_PAGE_SIZE as usize));
+        // Under the ceiling the caller's limit is still honoured exactly.
+        assert_eq!(
+            list_keys_page_size(Some(MAX_LIST_KEYS_PAGE_SIZE - 1)),
+            Some(MAX_LIST_KEYS_PAGE_SIZE as usize - 1)
+        );
+
+        // Padded to a fixed width so the vector is sorted by identifier, which
+        // is what `paginate_keys` requires of its input.
+        let keys: Vec<String> = (0..MAX_LIST_KEYS_PAGE_SIZE as usize + 5)
+            .map(|index| format!("key-{index:04}"))
+            .collect();
+        let (items, next_marker, truncated) = page_of(&keys, Some(u32::MAX), None);
+        assert_eq!(items.len(), MAX_LIST_KEYS_PAGE_SIZE as usize);
+        assert!(truncated);
+        let next_marker = next_marker.expect("a capped page must hand back a cursor");
+        assert_eq!(next_marker, items.last().cloned().expect("page is non-empty"));
+
+        let (rest, _, still_truncated) = page_of(&keys, Some(u32::MAX), Some(&next_marker));
+        assert_eq!(rest.len(), 5, "following the cursor must reach the keys the cap held back");
+        assert!(!still_truncated);
     }
 
     /// The cursor is an identifier, so a marker naming a key that no longer

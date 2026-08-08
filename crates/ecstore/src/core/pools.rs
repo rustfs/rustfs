@@ -3017,7 +3017,14 @@ impl ECStore {
                 &cleanup_preflight_allowed_missing,
                 "decommission",
             )
-            .await;
+            .await
+            .map_err(|err| match err {
+                data_movement::SourceCleanupError::SourceChanged => Error::other(format!(
+                    "decommission: source cleanup preflight failed for {}/{}: source versions changed after migration started",
+                    bucket, entry.name
+                )),
+                data_movement::SourceCleanupError::Storage(err) => err,
+            });
             resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
         } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(

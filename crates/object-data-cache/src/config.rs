@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::ObjectDataCacheConfigError;
-use crate::memory::{EffectiveMemory, MemoryBasis, resolve_effective_memory};
+use crate::{EffectiveMemory, MemoryBasis, resolve_effective_memory};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -296,7 +296,7 @@ mod tests {
         clamp_derived_max_bytes,
     };
     use crate::error::ObjectDataCacheConfigError;
-    use crate::memory::{EffectiveMemory, MemoryBasis};
+    use crate::{EffectiveMemory, MemoryBasis};
     use std::time::Duration;
 
     #[test]

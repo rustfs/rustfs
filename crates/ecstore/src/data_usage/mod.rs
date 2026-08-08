@@ -20,7 +20,7 @@ pub mod local_snapshot;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
     list::{ListOperations as _, StorageListObjectVersionsInfo},
-    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _},
+    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
@@ -33,8 +33,9 @@ use crate::{
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DATA_USAGE_OBJECT_NAME, DataUsageCache, DataUsageEntry,
-    DataUsageInfo, DiskUsageStatus, LEGACY_DATA_USAGE_OBJECT_NAME, SizeHistogram, SizeSummary, VersionsHistogram,
+    BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
+    DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, LEGACY_DATA_USAGE_OBJECT_NAME, SizeHistogram, SizeSummary,
+    VersionsHistogram, observed_data_usage_is_newer,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -162,8 +163,9 @@ fn cache_data_usage_snapshot_result(
     result: Result<(DataUsageInfo, HashMap<String, u64>), Error>,
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
+    current_generation: u64,
 ) -> Option<Result<DataUsageInfo, Error>> {
-    if data_usage_snapshot_generation() != refresh_generation {
+    if current_generation != refresh_generation {
         return None;
     }
 
@@ -196,6 +198,9 @@ type DataUsageSnapshotCache = Arc<RwLock<Option<CachedDataUsageSnapshot>>>;
 static DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
 static DATA_USAGE_SNAPSHOT_REFRESH: OnceLock<Arc<TokioMutex<()>>> = OnceLock::new();
 static DATA_USAGE_SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ADMIN_DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
+static ADMIN_DATA_USAGE_SNAPSHOT_REFRESH: OnceLock<Arc<TokioMutex<()>>> = OnceLock::new();
+static ADMIN_DATA_USAGE_SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Always-on revert detector for rustfs/backlog#1306: one relaxed increment per
 // full-bucket version listing is negligible and lets tests prove that admin
@@ -254,8 +259,21 @@ fn data_usage_snapshot_generation() -> u64 {
     DATA_USAGE_SNAPSHOT_GENERATION.load(Ordering::Acquire)
 }
 
+fn admin_data_usage_snapshot_cache() -> &'static DataUsageSnapshotCache {
+    ADMIN_DATA_USAGE_SNAPSHOT_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+fn admin_data_usage_snapshot_generation() -> u64 {
+    ADMIN_DATA_USAGE_SNAPSHOT_GENERATION.load(Ordering::Acquire)
+}
+
 fn clear_data_usage_snapshot_cache(cache: &mut Option<CachedDataUsageSnapshot>) {
     DATA_USAGE_SNAPSHOT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    *cache = None;
+}
+
+fn clear_admin_data_usage_snapshot_cache(cache: &mut Option<CachedDataUsageSnapshot>) {
+    ADMIN_DATA_USAGE_SNAPSHOT_GENERATION.fetch_add(1, Ordering::AcqRel);
     *cache = None;
 }
 
@@ -282,6 +300,11 @@ lazy_static::lazy_static! {
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
         DATA_USAGE_OBJECT_NAME
+    );
+    pub static ref DATA_USAGE_OBSERVED_OBJ_NAME_PATH: String = format!("{}{}{}",
+        crate::disk::BUCKET_META_PREFIX,
+        SLASH_SEPARATOR,
+        DATA_USAGE_OBSERVED_OBJECT_NAME
     );
     static ref DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     static ref LEGACY_DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
@@ -357,6 +380,11 @@ fn stale_data_usage_persist_reason_for_source(
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+    if data_usage_info.usage_snapshot_converged == Some(false) {
+        return Err(Error::other(
+            "nonconverged data usage observations cannot replace the quota-authoritative snapshot",
+        ));
+    }
     // Prevent older data from overwriting newer persisted stats
     if let Ok((existing, source)) = load_data_usage_snapshot(store.clone()).await
         && source.is_authoritative()
@@ -377,9 +405,11 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
     // Save to backend using the same mechanism as original code
-    crate::config::com::save_config(store, &DATA_USAGE_OBJ_NAME_PATH, data)
+    crate::config::com::save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data)
         .await
         .map_err(Error::other)?;
+
+    cleanup_observed_data_usage_after_authoritative_save(store.as_ref(), &data_usage_info).await;
 
     // Invalidate the cached snapshot so readers observe the new save on their
     // next request instead of waiting out the remaining TTL. The next cached
@@ -388,6 +418,64 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
     invalidate_data_usage_snapshot_cache().await;
 
     Ok(())
+}
+
+#[async_trait::async_trait]
+trait ObservedDataUsageSnapshotCleanup {
+    async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error>;
+}
+
+#[async_trait::async_trait]
+impl ObservedDataUsageSnapshotCleanup for ECStore {
+    async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error> {
+        self.delete_object(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+            ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some(revision.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+async fn cleanup_observed_data_usage_after_authoritative_save<S>(store: &S, authoritative: &DataUsageInfo)
+where
+    S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
+{
+    let (observed, revision) = match load_data_usage_for_bucket_removal(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(err) => {
+            record_usage_snapshot_failure(
+                "read_observed_before_authoritative_cleanup",
+                DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                &err,
+            );
+            return;
+        }
+    };
+    if observed_data_usage_is_newer(&observed, authoritative) {
+        return;
+    }
+
+    match store.delete_observed_data_usage_snapshot(&revision).await {
+        Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::ObjectNotFound(_, _) | Error::PreconditionFailed) => {}
+        Err(err) => {
+            record_usage_snapshot_failure(
+                "delete_observed_after_authoritative_save",
+                DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                &err,
+            );
+        }
+    }
 }
 
 fn set_buckets_count_from_usage(data_usage_info: &mut DataUsageInfo) {
@@ -443,6 +531,11 @@ pub(crate) async fn prepare_bucket_usage_for_namespace_change(
     let mut snapshot_cache = data_usage_snapshot_cache().write().await;
     ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache cleanup")?;
     clear_data_usage_snapshot_cache(&mut snapshot_cache);
+    drop(snapshot_cache);
+
+    let mut admin_snapshot_cache = admin_data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "admin data usage snapshot cache cleanup")?;
+    clear_admin_data_usage_snapshot_cache(&mut admin_snapshot_cache);
     Ok(())
 }
 
@@ -458,6 +551,10 @@ where
     let mut snapshot_cache = data_usage_snapshot_cache().write().await;
     ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache invalidation")?;
     clear_data_usage_snapshot_cache(&mut snapshot_cache);
+    drop(snapshot_cache);
+    let mut admin_snapshot_cache = admin_data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "admin data usage snapshot cache invalidation")?;
+    clear_admin_data_usage_snapshot_cache(&mut admin_snapshot_cache);
     result
 }
 
@@ -550,6 +647,23 @@ where
         guard,
     )
     .await?;
+
+    ensure_bucket_namespace_guard(guard, bucket, "observed data usage cleanup")?;
+    if let Err(err) = remove_bucket_usage_from_object_with_retries(
+        store,
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+        bucket,
+        DATA_USAGE_REMOVE_CAS_RETRIES,
+        None,
+        guard,
+    )
+    .await
+    {
+        // The authoritative timestamp was already advanced above, so admin
+        // selection rejects this observation even if optional cleanup fails.
+        // Never make an admin-only freshness artifact block DeleteBucket.
+        record_usage_snapshot_failure("remove_bucket_from_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
+    }
 
     for object in [
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -826,6 +940,61 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
     Ok(normalize_loaded_data_usage(data_usage_info, source.is_authoritative()).await)
 }
 
+async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUsageInfo> {
+    let data = match read_config_preserve_empty(store, &DATA_USAGE_OBSERVED_OBJ_NAME_PATH).await {
+        Ok(data) => data,
+        Err(Error::ConfigNotFound) => return None,
+        Err(err) => {
+            record_usage_snapshot_failure("read_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
+            return None;
+        }
+    };
+
+    match parse_usage_snapshot(&data) {
+        Ok(info) if info.usage_snapshot_converged == Some(false) && info.is_complete_bucket_usage_snapshot() => Some(info),
+        Ok(_) => {
+            error!(
+                event = "data_usage_snapshot_load_failed",
+                component = "ecstore",
+                subsystem = "data_usage",
+                state = "invalid_observed_snapshot",
+                object = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+                "observed data usage snapshot was not a structurally complete nonconverged view"
+            );
+            None
+        }
+        Err(err) => {
+            record_usage_snapshot_decode_failure("parse_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
+            None
+        }
+    }
+}
+
+fn select_admin_data_usage_snapshot(
+    mut authoritative: DataUsageInfo,
+    authoritative_format: bool,
+    observed: Option<DataUsageInfo>,
+) -> (DataUsageInfo, bool) {
+    if authoritative_format
+        && authoritative.is_complete_bucket_usage_snapshot()
+        && authoritative.usage_snapshot_converged.is_none()
+    {
+        authoritative.usage_snapshot_converged = Some(true);
+    }
+    match observed {
+        Some(observed) if observed_data_usage_is_newer(&observed, &authoritative) => (observed, true),
+        _ => (authoritative, authoritative_format),
+    }
+}
+
+async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let (authoritative, source) = load_data_usage_snapshot(store.clone()).await?;
+    let observed = load_observed_data_usage_snapshot(store).await;
+    let (selected, selected_is_current_format) =
+        select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
+    Ok(normalize_loaded_data_usage(selected, selected_is_current_format).await.0)
+}
+
 fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
     if !data_usage_info.is_complete_bucket_usage_snapshot() {
         data_usage_info.usage_snapshot_complete = false;
@@ -944,7 +1113,55 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
         let result = load_data_usage_from_backend_with_baseline(store.clone()).await;
         let loaded_at = tokio::time::Instant::now();
         let mut cache = data_usage_snapshot_cache().write().await;
-        if let Some(result) = cache_data_usage_snapshot_result(&mut cache, result, loaded_at, refresh_generation) {
+        if let Some(result) =
+            cache_data_usage_snapshot_result(&mut cache, result, loaded_at, refresh_generation, data_usage_snapshot_generation())
+        {
+            return result;
+        }
+        drop(cache);
+        drop(refresh_guard);
+    }
+}
+
+/// Load the freshest structurally complete snapshot for authenticated admin
+/// observability. A scan raced by namespace activity may be selected here, but
+/// never by [`load_data_usage_from_backend_cached`], which remains the
+/// converged source for quota admission.
+pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+
+    loop {
+        {
+            let cache = admin_data_usage_snapshot_cache().read().await;
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+                return result;
+            }
+        }
+
+        let refresh_guard = ADMIN_DATA_USAGE_SNAPSHOT_REFRESH
+            .get_or_init(|| Arc::new(TokioMutex::new(())))
+            .lock()
+            .await;
+        {
+            let cache = admin_data_usage_snapshot_cache().read().await;
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+                return result;
+            }
+        }
+
+        let refresh_generation = admin_data_usage_snapshot_generation();
+        let result = load_admin_data_usage_from_backend(store.clone())
+            .await
+            .map(|info| (info, HashMap::new()));
+        let loaded_at = tokio::time::Instant::now();
+        let mut cache = admin_data_usage_snapshot_cache().write().await;
+        if let Some(result) = cache_data_usage_snapshot_result(
+            &mut cache,
+            result,
+            loaded_at,
+            refresh_generation,
+            admin_data_usage_snapshot_generation(),
+        ) {
             return result;
         }
         drop(cache);
@@ -957,6 +1174,16 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
 pub async fn invalidate_data_usage_snapshot_cache() {
     let mut cache = data_usage_snapshot_cache().write().await;
     clear_data_usage_snapshot_cache(&mut cache);
+
+    let mut admin_cache = admin_data_usage_snapshot_cache().write().await;
+    clear_admin_data_usage_snapshot_cache(&mut admin_cache);
+}
+
+/// Invalidate only the admin/console view after an observational save. Quota
+/// admission continues to use the independently cached converged snapshot.
+pub async fn invalidate_admin_data_usage_snapshot_cache() {
+    let mut cache = admin_data_usage_snapshot_cache().write().await;
+    clear_admin_data_usage_snapshot_cache(&mut cache);
 }
 
 /// Aggregate usage information from local disk snapshots.
@@ -2080,6 +2307,7 @@ mod tests {
     struct UsageCasState {
         object: Option<(Vec<u8>, u64)>,
         backup_object: Option<(Vec<u8>, u64)>,
+        observed_object: Option<(Vec<u8>, u64)>,
         legacy_object: Option<(Vec<u8>, u64)>,
         legacy_backup_object: Option<(Vec<u8>, u64)>,
         interleaving_snapshot: Option<Vec<u8>>,
@@ -2099,10 +2327,24 @@ mod tests {
         state: Mutex<UsageCasState>,
     }
 
+    #[async_trait::async_trait]
+    impl ObservedDataUsageSnapshotCleanup for UsageCasStore {
+        async fn delete_observed_data_usage_snapshot(&self, revision: &str) -> Result<(), Error> {
+            let mut state = self.state.lock().await;
+            let current = state.observed_object.as_ref().ok_or(Error::FileNotFound)?.1;
+            if revision != format!("usage-{current}") {
+                return Err(Error::PreconditionFailed);
+            }
+            state.observed_object = None;
+            Ok(())
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum UsageObjectSlot {
         Primary,
         Backup,
+        Observed,
         LegacyPrimary,
         LegacyBackup,
     }
@@ -2131,6 +2373,7 @@ mod tests {
             let slot = match object {
                 object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
                 object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Observed,
                 object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
                 object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
                 _ => return Err(Error::FileNotFound),
@@ -2139,6 +2382,7 @@ mod tests {
             let stored = match slot {
                 UsageObjectSlot::Primary => &state.object,
                 UsageObjectSlot::Backup => &state.backup_object,
+                UsageObjectSlot::Observed => &state.observed_object,
                 UsageObjectSlot::LegacyPrimary => &state.legacy_object,
                 UsageObjectSlot::LegacyBackup => &state.legacy_backup_object,
             };
@@ -2178,6 +2422,7 @@ mod tests {
             let slot = match object {
                 object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
                 object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Observed,
                 object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
                 object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
                 _ => return Err(Error::FileNotFound),
@@ -2213,6 +2458,9 @@ mod tests {
                 let revision = state.backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
                 state.backup_object = Some((interleaving, revision));
             }
+            if slot == UsageObjectSlot::Observed {
+                return Err(Error::other("observed test fixture writes are injected directly"));
+            }
             if slot == UsageObjectSlot::LegacyPrimary
                 && let Some(interleaving) = state.interleaving_legacy_snapshot.take()
             {
@@ -2228,6 +2476,7 @@ mod tests {
             let current_revision = match slot {
                 UsageObjectSlot::Primary => state.object.as_ref(),
                 UsageObjectSlot::Backup => state.backup_object.as_ref(),
+                UsageObjectSlot::Observed => state.observed_object.as_ref(),
                 UsageObjectSlot::LegacyPrimary => state.legacy_object.as_ref(),
                 UsageObjectSlot::LegacyBackup => state.legacy_backup_object.as_ref(),
             }
@@ -2258,6 +2507,7 @@ mod tests {
             match slot {
                 UsageObjectSlot::Primary => state.object = Some((buf, revision)),
                 UsageObjectSlot::Backup => state.backup_object = Some((buf, revision)),
+                UsageObjectSlot::Observed => state.observed_object = Some((buf, revision)),
                 UsageObjectSlot::LegacyPrimary => state.legacy_object = Some((buf, revision)),
                 UsageObjectSlot::LegacyBackup => state.legacy_backup_object = Some((buf, revision)),
             }
@@ -2551,14 +2801,85 @@ mod tests {
     }
 
     #[test]
+    fn admin_snapshot_selection_requires_the_current_authoritative_baseline() {
+        let authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(11),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+
+        let (selected, _) = select_admin_data_usage_snapshot(authoritative.clone(), true, Some(observed.clone()));
+        assert_eq!(selected.usage_snapshot_converged, Some(false));
+
+        let mut namespace_changed = authoritative;
+        namespace_changed.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let (selected, _) = select_admin_data_usage_snapshot(namespace_changed, true, Some(observed));
+        assert_eq!(selected.usage_snapshot_converged, Some(true));
+    }
+
+    #[tokio::test]
+    async fn authoritative_save_cleanup_removes_observed_snapshot_best_effort() {
+        let store = UsageCasStore::default();
+        let authoritative = data_usage_info_for_test("bucket", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let stale_observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            ..Default::default()
+        };
+        store.state.lock().await.observed_object =
+            Some((serde_json::to_vec(&stale_observed).expect("observed snapshot should encode"), 1));
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_none());
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_none());
+
+        let newer_observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(3)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(11),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+        store.state.lock().await.observed_object =
+            Some((serde_json::to_vec(&newer_observed).expect("observed snapshot should encode"), 2));
+
+        cleanup_observed_data_usage_after_authoritative_save(&store, &authoritative).await;
+        assert!(store.state.lock().await.observed_object.is_some());
+    }
+
+    #[test]
     #[serial]
     fn cached_snapshot_failure_is_reused_until_ttl_expires() {
         let loaded_at = tokio::time::Instant::now();
         let mut cache = None;
         let refresh_generation = data_usage_snapshot_generation();
 
-        let first = cache_data_usage_snapshot_result(&mut cache, Err(Error::ErasureReadQuorum), loaded_at, refresh_generation)
-            .expect("an uninterrupted refresh should populate the cache");
+        let first = cache_data_usage_snapshot_result(
+            &mut cache,
+            Err(Error::ErasureReadQuorum),
+            loaded_at,
+            refresh_generation,
+            data_usage_snapshot_generation(),
+        )
+        .expect("an uninterrupted refresh should populate the cache");
         assert!(matches!(first, Err(Error::ErasureReadQuorum)));
 
         let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
@@ -2576,9 +2897,15 @@ mod tests {
         let mut cache = None;
         let refresh_generation = data_usage_snapshot_generation();
 
-        let first = cache_data_usage_snapshot_result(&mut cache, Ok((expected, HashMap::new())), loaded_at, refresh_generation)
-            .expect("an uninterrupted refresh should populate the cache")
-            .expect("successful load must be returned");
+        let first = cache_data_usage_snapshot_result(
+            &mut cache,
+            Ok((expected, HashMap::new())),
+            loaded_at,
+            refresh_generation,
+            data_usage_snapshot_generation(),
+        )
+        .expect("an uninterrupted refresh should populate the cache")
+        .expect("successful load must be returned");
         assert_snapshot_bucket(&first, "bucket");
 
         let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
@@ -2604,6 +2931,7 @@ mod tests {
             Ok((data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH), HashMap::new())),
             loaded_at,
             refresh_generation,
+            data_usage_snapshot_generation(),
         );
 
         assert!(stale_result.is_none());

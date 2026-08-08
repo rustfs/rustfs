@@ -28,21 +28,33 @@ categories = ["web-programming", "development-tools"]
 doctest = false
 
 [features]
-default = []
-hotpath = ["hotpath/hotpath", "hotpath/tokio"]
+default = ["cache"]
+runtime-memory = ["dep:sysinfo"]
+cache = [
+    "runtime-memory",
+    "dep:bytes",
+    "dep:metrics",
+    "dep:moka",
+    "dep:starshard",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:tracing",
+    "sysinfo/multithread",
+]
+hotpath = ["cache", "hotpath/hotpath", "hotpath/tokio"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
 hotpath.workspace = true
-bytes = { workspace = true, features = ["serde"] }
-metrics = { workspace = true }
-moka = { workspace = true, features = ["future"] }
-starshard = { workspace = true, features = ["rayon", "async", "serde"] }
-sysinfo = { workspace = true, features = ["multithread"] }
-thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "fs", "rt-multi-thread"] }
-tracing.workspace = true
+bytes = { workspace = true, optional = true, features = ["serde"] }
+metrics = { workspace = true, optional = true }
+moka = { workspace = true, optional = true, features = ["future"] }
+starshard = { workspace = true, optional = true, features = ["rayon", "async", "serde"] }
+sysinfo = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["sync", "time", "fs", "rt-multi-thread"] }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

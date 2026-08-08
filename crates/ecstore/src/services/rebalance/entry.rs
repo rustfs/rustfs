@@ -18,8 +18,8 @@ use super::meta::{
 };
 use super::migration::migrate_entry_version;
 use super::worker::{
-    RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts, resolve_rebalance_bucket_error,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+    RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
+    resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
     resolve_rebalance_migrate_result_error, resolve_rebalance_stats_update_result, resolve_rebalance_worker_result,
     run_rebalance_listing_with_retry, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
     should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks,
@@ -27,7 +27,7 @@ use super::worker::{
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_ENTRY, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
-    REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome,
+    ObjectInfo, REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome,
 };
 use crate::core::pools::ListCallback;
 use crate::data_movement;
@@ -37,13 +37,55 @@ use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::object::ObjectOperations as _;
 use crate::store::ECStore;
-use rustfs_filemeta::MetaCacheEntry;
+use rustfs_filemeta::{FileInfo, MetaCacheEntry};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 impl ECStore {
+    async fn finish_rebalance_entry_after_cleanup(
+        &self,
+        pool_index: usize,
+        bucket: &str,
+        object: &str,
+        stats_updates: &[&FileInfo],
+        cleanup: impl std::future::Future<Output = std::result::Result<ObjectInfo, data_movement::SourceCleanupError>>,
+    ) -> Result<RebalanceEntryCleanupResult> {
+        // Persisted stats can complete a pool on restart, so source cleanup must resolve first.
+        let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup.await, bucket, object);
+        let RebalanceEntryCleanupResult::Completed { warning } = cleanup_result else {
+            return Ok(cleanup_result);
+        };
+        if let Some(message) = warning.as_ref()
+            && let Err(err) = self
+                .record_rebalance_cleanup_warning(pool_index, bucket, object, message.clone())
+                .await
+        {
+            error!(
+                event = EVENT_REBALANCE_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                pool_index,
+                bucket,
+                object,
+                stage = "cleanup_source",
+                error = ?err,
+                "Failed to record rebalance source cleanup warning"
+            );
+        }
+
+        resolve_rebalance_stats_update_result(
+            self.update_pool_stats_batch(pool_index, bucket.to_string(), stats_updates)
+                .await,
+            pool_index,
+            bucket,
+            object,
+        )?;
+
+        Ok(RebalanceEntryCleanupResult::Completed { warning })
+    }
+
     #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, set))]
     async fn rebalance_entry(
@@ -216,7 +258,7 @@ impl ECStore {
                 );
                 if should_defer_rebalance_entry_failure(&err) {
                     let deferred_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} {err}");
-                    warn!(
+                    debug!(
                         event = EVENT_REBALANCE_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REBALANCE,
@@ -260,46 +302,40 @@ impl ECStore {
             }
         }
 
-        resolve_rebalance_stats_update_result(
-            self.update_pool_stats_batch(pool_index, bucket.clone(), stats_updates.as_slice())
-                .await,
-            pool_index,
-            bucket.as_str(),
-            entry.name.as_str(),
-        )?;
-
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len(), expired) {
-            let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
-                data_movement::cleanup_source_entry_if_unchanged(
-                    set.clone(),
+            let cleanup_result = self
+                .finish_rebalance_entry_after_cleanup(
+                    pool_index,
                     bucket.as_str(),
                     entry.name.as_str(),
-                    &fivs,
-                    &cleanup_preflight_allowed_missing,
-                    "rebalance",
+                    stats_updates.as_slice(),
+                    data_movement::cleanup_source_entry_if_unchanged(
+                        set.clone(),
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                        &fivs,
+                        &cleanup_preflight_allowed_missing,
+                        "rebalance",
+                    ),
                 )
-                .await,
-                bucket.as_str(),
-                entry.name.as_str(),
-            )?;
-            if let Some(message) = cleanup_warning {
-                warn!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    stage = "cleanup_source",
-                    cleanup_status = "failed_ignored",
-                    error = %message,
-                    "Ignored rebalance source cleanup failure"
-                );
-                if let Err(err) = self
-                    .record_rebalance_cleanup_warning(pool_index, bucket.as_str(), entry.name.as_str(), message)
-                    .await
-                {
-                    error!(
+                .await?;
+            match cleanup_result {
+                RebalanceEntryCleanupResult::Deferred { last_error } => {
+                    debug!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "deferred",
+                        error = %last_error,
+                        "Deferred rebalance entry after source cleanup conflict"
+                    );
+                    return Ok(RebalanceEntryOutcome::Deferred { last_error });
+                }
+                RebalanceEntryCleanupResult::Completed { warning: Some(message) } => {
+                    warn!(
                         event = EVENT_REBALANCE_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REBALANCE,
@@ -307,21 +343,23 @@ impl ECStore {
                         bucket = %bucket,
                         object = %entry.name,
                         stage = "cleanup_source",
-                        error = ?err,
-                        "Failed to record rebalance source cleanup warning"
+                        cleanup_status = "failed_ignored",
+                        error = %message,
+                        "Ignored rebalance source cleanup failure"
                     );
                 }
-            } else {
-                debug!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    state = "source_deleted",
-                    "Deleted rebalance source entry"
-                );
+                RebalanceEntryCleanupResult::Completed { warning: None } => {
+                    debug!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "source_deleted",
+                        "Deleted rebalance source entry"
+                    );
+                }
             }
         } else if rebalanced != fivs.versions.len() || expired > 0 {
             warn!(
@@ -337,6 +375,14 @@ impl ECStore {
                 state = "source_retained",
                 "Rebalance source object retained"
             );
+
+            resolve_rebalance_stats_update_result(
+                self.update_pool_stats_batch(pool_index, bucket.clone(), stats_updates.as_slice())
+                    .await,
+                pool_index,
+                bucket.as_str(),
+                entry.name.as_str(),
+            )?;
         }
 
         Ok(RebalanceEntryOutcome::Completed)
@@ -493,9 +539,23 @@ impl ECStore {
             let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let list_result =
-                    run_rebalance_listing_with_retry(set, rx, bucket.clone(), rebalance_entry, set_idx, rebalance_max_attempts())
-                        .await;
+                let list_rx = rx.clone();
+                let list_bucket = bucket.clone();
+                let list_result = run_rebalance_listing_with_retry(
+                    rx,
+                    bucket,
+                    rebalance_entry,
+                    set_idx,
+                    rebalance_max_attempts(),
+                    entry_tasks.clone(),
+                    move |cb| {
+                        let set = set.clone();
+                        let rx = list_rx.clone();
+                        let bucket = list_bucket.clone();
+                        async move { set.list_objects_to_rebalance(rx, bucket, cb).await }
+                    },
+                )
+                .await;
                 let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
                 let result = list_result.and(entry_result);
                 if let Err(err) = &result {
@@ -546,5 +606,126 @@ impl ECStore {
             "Finished rebalance bucket"
         );
         Ok(RebalanceBucketOutcome::Completed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
+    use rustfs_filemeta::FileInfo;
+    use time::OffsetDateTime;
+
+    #[tokio::test]
+    async fn rebalance_stats_wait_for_source_cleanup_result() {
+        let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
+        let store = Arc::new(ECStore {
+            id: uuid::Uuid::new_v4(),
+            disk_map: std::collections::HashMap::new(),
+            pools: Vec::new(),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
+            pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
+            rebalance_meta: tokio::sync::RwLock::new(Some(RebalanceMeta {
+                pool_stats: vec![RebalanceStats {
+                    participating: true,
+                    info: RebalanceInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
+            start_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
+        });
+        let mut version = FileInfo::new("object.bin", 4, 2);
+        version.name = "object.bin".to_string();
+        version.size = 128;
+        version.is_latest = true;
+        let warning_version = version.clone();
+        let (release_cleanup, cleanup_released) = tokio::sync::oneshot::channel();
+
+        let finish_store = Arc::clone(&store);
+        let finish = tokio::spawn(async move {
+            finish_store
+                .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&version], async move {
+                    cleanup_released.await.expect("cleanup release sender should remain alive");
+                    Ok(ObjectInfo::default())
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("rebalance metadata should exist")
+                .pool_stats[0]
+                .bytes,
+            0,
+            "stats must not become visible before source cleanup resolves"
+        );
+
+        release_cleanup.send(()).expect("cleanup waiter should remain alive");
+        assert_eq!(
+            finish
+                .await
+                .expect("finish task should not panic")
+                .expect("finish should succeed"),
+            RebalanceEntryCleanupResult::Completed { warning: None }
+        );
+        assert!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("rebalance metadata should exist")
+                .pool_stats[0]
+                .bytes
+                > 0,
+            "stats should become visible after source cleanup resolves"
+        );
+
+        {
+            let mut meta = store.rebalance_meta.write().await;
+            meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
+        }
+        let warning_result = store
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], async {
+                Err(Error::SlowDown.into())
+            })
+            .await
+            .expect("cleanup warnings should not fail the completed migration");
+        assert!(matches!(warning_result, RebalanceEntryCleanupResult::Completed { warning: Some(_) }));
+        let meta = store.rebalance_meta.read().await;
+        let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(pool_stats.cleanup_warnings.count, 1, "cleanup warning must block pool completion");
+        assert!(pool_stats.bytes > 0, "completed migration bytes should still be recorded");
+        drop(meta);
+
+        {
+            let mut meta = store.rebalance_meta.write().await;
+            meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
+        }
+        let deferred = store
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], async {
+                Err(data_movement::SourceCleanupError::SourceChanged)
+            })
+            .await
+            .expect("source changes should defer cleanup without failing the worker");
+        assert!(matches!(deferred, RebalanceEntryCleanupResult::Deferred { .. }));
+        let meta = store.rebalance_meta.read().await;
+        let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
+        assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
     }
 }

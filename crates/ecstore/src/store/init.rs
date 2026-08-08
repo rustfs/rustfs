@@ -419,6 +419,7 @@ impl ECStore {
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
             ctx: instance_ctx.clone(),
+            bucket_fence_registry: std::sync::Arc::default(),
         });
 
         // Only set it when this instance's deployment ID is not yet configured
@@ -611,6 +612,7 @@ mod tests {
     };
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
+    use rustfs_filemeta::ObjectPartInfo;
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use std::{
@@ -1151,6 +1153,145 @@ mod tests {
         .expect("store should build around the fresh context");
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn data_movement_conflicts_preserve_newer_target_and_abort_staging() {
+        let temp_dir = tempfile::tempdir().expect("create data movement store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "data-movement-conflict-convergence", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("data-movement-conflict-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create data movement bucket");
+        let source_mod_time = OffsetDateTime::UNIX_EPOCH;
+        let target_mod_time = source_mod_time + time::Duration::SECOND;
+
+        let object = "single-object";
+        let target_body = b"newer client body".to_vec();
+        let mut target_reader = PutObjReader::from_vec(target_body.clone());
+        store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut target_reader,
+                &ObjectOptions {
+                    mod_time: Some(target_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write newer single-part target");
+
+        let source_body = b"stale migration body".to_vec();
+        crate::data_movement::migrate_object(
+            store.clone(),
+            0,
+            bucket.clone(),
+            GetObjectReader {
+                stream: Box::new(Cursor::new(source_body.clone())),
+                object_info: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object.to_string(),
+                    size: i64::try_from(source_body.len()).expect("single source size should fit i64"),
+                    actual_size: i64::try_from(source_body.len()).expect("single source size should fit i64"),
+                    etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+                    mod_time: Some(source_mod_time),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            },
+            "test_data_movement",
+        )
+        .await
+        .expect("newer single-part target should converge migration");
+
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read converged single-part target");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain single-part target");
+        assert_eq!(body, target_body);
+
+        let multipart_object = "multipart-object";
+        let multipart_target_body = b"newer multipart client body".to_vec();
+        let mut multipart_target_reader = PutObjReader::from_vec(multipart_target_body.clone());
+        store.pools[1]
+            .put_object(
+                &bucket,
+                multipart_object,
+                &mut multipart_target_reader,
+                &ObjectOptions {
+                    mod_time: Some(target_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write newer multipart target");
+
+        let first_part_size = 5 * 1024 * 1024;
+        let mut multipart_source_body = vec![b'a'; first_part_size];
+        multipart_source_body.push(b'b');
+        let multipart_source_size = i64::try_from(multipart_source_body.len()).expect("multipart source size should fit i64");
+        crate::data_movement::migrate_object(
+            store.clone(),
+            0,
+            bucket.clone(),
+            GetObjectReader {
+                stream: Box::new(Cursor::new(multipart_source_body)),
+                object_info: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: multipart_object.to_string(),
+                    size: multipart_source_size,
+                    actual_size: multipart_source_size,
+                    etag: Some("source-multipart-etag-2".to_string()),
+                    mod_time: Some(source_mod_time),
+                    parts: Arc::new(vec![
+                        ObjectPartInfo {
+                            number: 1,
+                            size: first_part_size,
+                            actual_size: i64::try_from(first_part_size).expect("first part size should fit i64"),
+                            etag: "source-part-1".to_string(),
+                            ..Default::default()
+                        },
+                        ObjectPartInfo {
+                            number: 2,
+                            size: 1,
+                            actual_size: 1,
+                            etag: "source-part-2".to_string(),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            },
+            "test_data_movement",
+        )
+        .await
+        .expect("newer multipart target should converge migration");
+
+        let uploads = store.pools[1]
+            .list_multipart_uploads(&bucket, multipart_object, None, None, None, 100)
+            .await
+            .expect("list target pool multipart uploads");
+        assert!(uploads.uploads.is_empty(), "superseded migration staging must be aborted");
+
+        let mut reader = store
+            .get_object_reader(&bucket, multipart_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read converged multipart target");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain multipart target");
+        assert_eq!(body, multipart_target_body);
     }
 
     #[cfg(feature = "test-util")]

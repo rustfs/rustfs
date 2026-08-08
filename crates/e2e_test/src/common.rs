@@ -47,6 +47,8 @@ use walkdir::WalkDir;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
+pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
+    &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
 
@@ -65,8 +67,14 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
-    let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
+pub(crate) fn build_test_s3_config(
+    endpoint_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    provider_name: &'static str,
+) -> Config {
+    let credentials = Credentials::new(access_key, secret_key, session_token.map(str::to_owned), None, provider_name);
     let mut config = Config::builder()
         .credentials_provider(credentials)
         .region(Region::new("us-east-1"))
@@ -79,6 +87,33 @@ fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, 
     }
 
     config.build()
+}
+
+pub(crate) fn build_test_sts_client(
+    endpoint_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    provider_name: &'static str,
+) -> aws_sdk_sts::Client {
+    let mut config = aws_sdk_sts::Config::builder()
+        .credentials_provider(aws_sdk_sts::config::Credentials::new(
+            access_key,
+            secret_key,
+            session_token.map(str::to_owned),
+            None,
+            provider_name,
+        ))
+        .region(aws_sdk_sts::config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .retry_config(aws_sdk_sts::config::retry::RetryConfig::standard().with_max_attempts(1))
+        .behavior_version_latest();
+
+    if endpoint_url.starts_with("http://") {
+        config = config.http_client(SmithyHttpClientBuilder::new().build_http());
+    }
+
+    aws_sdk_sts::Client::from_conf(config.build())
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -95,6 +130,38 @@ pub fn local_http_client() -> HttpClient {
         .expect("failed to build local reqwest client")
 }
 
+pub(crate) async fn signed_s3_request(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
+    let mut request = http::Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header(HOST, authority)
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
+    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+
+    let mut request = local_http_client().request(method, url);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    Ok(request.send().await?)
+}
+
 /// Signs and sends an admin HTTP request with the given credentials.
 pub(crate) async fn admin_request(
     base_url: &str,
@@ -105,28 +172,8 @@ pub(crate) async fn admin_request(
     secret_key: &str,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut request = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        request = request.header(CONTENT_TYPE, "application/json");
-    }
-
-    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
-    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
-
-    let mut request = local_http_client().request(method, &url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    let response = request.send().await?;
+    let content_type = body.as_ref().map(|_| "application/json");
+    let response = signed_s3_request(method, &url, body, content_type, access_key, secret_key).await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))
@@ -569,7 +616,7 @@ impl RustFSTestEnvironment {
 
     /// Create an AWS S3 client with explicit credentials for this RustFS instance.
     pub fn create_s3_client_with_credentials(&self, access_key: &str, secret_key: &str) -> Client {
-        Client::from_conf(build_test_s3_config(&self.url, access_key, secret_key, "e2e-test"))
+        Client::from_conf(build_test_s3_config(&self.url, access_key, secret_key, None, "e2e-test"))
     }
 
     /// Create test bucket
@@ -1301,6 +1348,7 @@ impl RustFSTestClusterEnvironment {
             &self.nodes[node_idx].url,
             &self.access_key,
             &self.secret_key,
+            None,
             "cluster-test",
         )))
     }
