@@ -39,7 +39,7 @@ use rustfs_utils::{
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
 use s3s::{
-    Body, S3Request, S3Response, S3Result,
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -102,6 +102,10 @@ fn rebalance_start_rollback_error(start_err: &str, rollback_result: &Result<(), 
     }
 }
 
+fn rebalance_internal_error(message: impl Into<String>) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, message.into())
+}
+
 fn rebalance_rollback_stop_failure_message(rebalance_id: &str, failures: &[String]) -> String {
     format!("cluster stop_rebalance rollback for {rebalance_id} partial: {}", failures.join("; "))
 }
@@ -126,6 +130,28 @@ fn rebalance_rollback_failure_message(
         failures.push(rebalance_rollback_terminal_reload_failure_message(rebalance_id, terminal_reload_failures));
     }
     failures.join("; ")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebalanceStartStep {
+    PropagateFence,
+    StartLocal,
+    PropagateWorkers,
+}
+
+const DISTRIBUTED_REBALANCE_START_STEPS: [RebalanceStartStep; 3] = [
+    RebalanceStartStep::PropagateFence,
+    RebalanceStartStep::StartLocal,
+    RebalanceStartStep::PropagateWorkers,
+];
+const LOCAL_REBALANCE_START_STEPS: [RebalanceStartStep; 1] = [RebalanceStartStep::StartLocal];
+
+fn rebalance_start_steps(has_notification_sys: bool) -> &'static [RebalanceStartStep] {
+    if has_notification_sys {
+        &DISTRIBUTED_REBALANCE_START_STEPS
+    } else {
+        &LOCAL_REBALANCE_START_STEPS
+    }
 }
 
 async fn rollback_cluster_rebalance_start(
@@ -175,6 +201,50 @@ async fn rollback_cluster_rebalance_start(
         .await
         .map_err(|err| format!("local rollback stop metadata save for {rebalance_id} failed: {err}"))?;
     Ok(())
+}
+
+async fn rollback_rebalance_start_for_admin(
+    store: &Arc<ECStore>,
+    notification_sys: Option<&NotificationSys>,
+    rebalance_id: &str,
+    start_err: &str,
+    request_id: &str,
+    actor: &str,
+    remote_addr: &str,
+) -> S3Result<()> {
+    let rollback_result = rollback_cluster_rebalance_start(store, notification_sys, rebalance_id).await;
+    let rollback_label = rollback_result_label(&rollback_result);
+    match &rollback_result {
+        Ok(_) => info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            result = rollback_label,
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            rebalance_id = %rebalance_id,
+            propagation_error = %start_err,
+            "admin rebalance state"
+        ),
+        Err(rollback_err) => error!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            result = rollback_label,
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            rebalance_id = %rebalance_id,
+            propagation_error = %start_err,
+            rollback_error = %rollback_err,
+            "admin rebalance state"
+        ),
+    }
+
+    Err(rebalance_internal_error(rebalance_start_rollback_error(start_err, &rollback_result)))
 }
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -473,7 +543,7 @@ impl Operation for RebalanceStart {
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
-        let id = match store.init_and_start_rebalance(buckets).await {
+        let id = match store.init_rebalance_start(buckets).await {
             Ok(id) => id,
             Err(StorageError::DecommissionAlreadyRunning) => {
                 log_rebalance_request_rejected("start", "decommission_in_progress", &request_id, &actor, &remote_addr);
@@ -484,7 +554,7 @@ impl Operation for RebalanceStart {
                 return Err(s3_error!(OperationAborted, "rebalance is already in progress"));
             }
             Err(e) => {
-                return Err(s3_error!(InternalError, "failed to start rebalance: {}", e));
+                return Err(s3_error!(InternalError, "failed to initialize rebalance: {}", e));
             }
         };
 
@@ -493,80 +563,186 @@ impl Operation for RebalanceStart {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "start",
-            state = "started",
+            state = "metadata_initialized",
             request_id = %request_id,
             actor = %actor,
             remote_addr = %remote_addr,
             rebalance_id = %id,
             "admin rebalance state"
         );
-        if let Some(notification_sys) = current_notification_system() {
-            info!(
-                event = EVENT_ADMIN_REBALANCE_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                action = "start",
-                state = "propagation_started",
-                request_id = %request_id,
-                actor = %actor,
-                remote_addr = %remote_addr,
-                rebalance_id = %id,
-                "admin rebalance state"
-            );
-            if let Err(err) = notification_sys.load_rebalance_meta(true).await {
-                error!(
-                    event = EVENT_ADMIN_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    action = "start",
-                    result = "propagation_failed",
-                    request_id = %request_id,
-                    actor = %actor,
-                    remote_addr = %remote_addr,
-                    rebalance_id = %id,
-                    error = %err,
-                    "admin rebalance state"
-                );
+        let notification_sys = current_notification_system();
+        for step in rebalance_start_steps(notification_sys.is_some()) {
+            match step {
+                RebalanceStartStep::PropagateFence => {
+                    if let Some(notification_sys) = notification_sys.as_ref() {
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            state = "fence_propagation_started",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            "admin rebalance state"
+                        );
+                        if let Err(err) = notification_sys.load_rebalance_meta(false).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "fence_propagation_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                error = %err,
+                                "admin rebalance state"
+                            );
 
-                let start_err = err.to_string();
-                let rollback_result = rollback_cluster_rebalance_start(&store, Some(&notification_sys), &id).await;
-                let rollback_label = rollback_result_label(&rollback_result);
-                match &rollback_result {
-                    Ok(_) => info!(
-                        event = EVENT_ADMIN_REBALANCE_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        action = "start",
-                        result = rollback_label,
-                        request_id = %request_id,
-                        actor = %actor,
-                        remote_addr = %remote_addr,
-                        rebalance_id = %id,
-                        propagation_error = %start_err,
-                        "admin rebalance state"
-                    ),
-                    Err(rollback_err) => error!(
-                        event = EVENT_ADMIN_REBALANCE_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        action = "start",
-                        result = rollback_label,
-                        request_id = %request_id,
-                        actor = %actor,
-                        remote_addr = %remote_addr,
-                        rebalance_id = %id,
-                        propagation_error = %start_err,
-                        rollback_error = %rollback_err,
-                        "admin rebalance state"
-                    ),
+                            let start_err = err.to_string();
+                            rollback_rebalance_start_for_admin(
+                                &store,
+                                Some(notification_sys),
+                                &id,
+                                &start_err,
+                                &request_id,
+                                &actor,
+                                &remote_addr,
+                            )
+                            .await?;
+                        }
+                    }
                 }
+                RebalanceStartStep::StartLocal => {
+                    if let Err(err) = store.start_rebalance_for_id(&id).await {
+                        error!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            result = "local_start_failed",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            error = %err,
+                            "admin rebalance state"
+                        );
 
-                return Err(s3_error!(
-                    InternalError,
-                    "{}",
-                    rebalance_start_rollback_error(&start_err, &rollback_result)
-                ));
+                        let start_err = err.to_string();
+                        if let Err(rollback_err) = store.rollback_rebalance_start_for_id(Some(&id), start_err.clone()).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "local_start_rollback_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                start_error = %start_err,
+                                rollback_error = %rollback_err,
+                                "admin rebalance state"
+                            );
+                            return Err(rebalance_internal_error(format!(
+                                "failed to start rebalance after metadata initialized for {id}; rollback failed: {rollback_err}"
+                            )));
+                        }
+
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            result = "local_start_rollback_success",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            start_error = %start_err,
+                            "admin rebalance state"
+                        );
+                        if let Some(notification_sys) = notification_sys.as_ref() {
+                            let terminal_reload_attempt_at = OffsetDateTime::now_utc();
+                            let terminal_reload_failures = match notification_sys.load_rebalance_meta_failures(false).await {
+                                Ok(failures) => failures,
+                                Err(err) => vec![format!("terminal rebalance reload rollback for {id} failed: {err}")],
+                            };
+                            if !terminal_reload_failures.is_empty() {
+                                let record = RebalanceStopPropagationRecord {
+                                    stop_attempt_at: None,
+                                    stop_failures: Vec::new(),
+                                    terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
+                                    terminal_reload_failures: terminal_reload_failures.clone(),
+                                };
+                                store.record_rebalance_stop_propagation(record).await.map_err(|err| {
+                                    rebalance_internal_error(format!(
+                                        "failed to persist rebalance local-start rollback propagation metadata: {err}"
+                                    ))
+                                })?;
+                                return Err(rebalance_internal_error(format!(
+                                    "failed to start rebalance after metadata initialized for {}; local metadata was finalized as failed, but terminal peer reload was incomplete: {}",
+                                    id,
+                                    rebalance_rollback_terminal_reload_failure_message(&id, &terminal_reload_failures)
+                                )));
+                            }
+                        }
+                        return Err(rebalance_internal_error(format!(
+                            "failed to start rebalance after metadata initialized for {id}; local metadata was finalized as failed: {start_err}"
+                        )));
+                    }
+                }
+                RebalanceStartStep::PropagateWorkers => {
+                    if let Some(notification_sys) = notification_sys.as_ref() {
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            state = "worker_propagation_started",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            "admin rebalance state"
+                        );
+                        if let Err(err) = notification_sys.load_rebalance_meta(true).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "worker_propagation_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                error = %err,
+                                "admin rebalance state"
+                            );
+
+                            let start_err = err.to_string();
+                            rollback_rebalance_start_for_admin(
+                                &store,
+                                Some(notification_sys),
+                                &id,
+                                &start_err,
+                                &request_id,
+                                &actor,
+                                &remote_addr,
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
+        }
+
+        if notification_sys.is_some() {
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -902,10 +1078,11 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
+        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStartStep, RebalanceStopPropagationStatus,
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
-        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_used_pct,
+        rollback_result_label,
     };
     use crate::admin::storage_api::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
@@ -992,6 +1169,23 @@ mod rebalance_handler_tests {
         let rollback_result = Err("local stop_rebalance failed: disk error".to_string());
 
         assert_eq!(rollback_result_label(&rollback_result), "rollback_failed");
+    }
+
+    #[test]
+    fn test_distributed_rebalance_start_fences_peers_before_workers() {
+        assert_eq!(
+            rebalance_start_steps(true),
+            &[
+                RebalanceStartStep::PropagateFence,
+                RebalanceStartStep::StartLocal,
+                RebalanceStartStep::PropagateWorkers
+            ]
+        );
+    }
+
+    #[test]
+    fn test_local_rebalance_start_has_no_peer_propagation_steps() {
+        assert_eq!(rebalance_start_steps(false), &[RebalanceStartStep::StartLocal]);
     }
 
     #[test]
