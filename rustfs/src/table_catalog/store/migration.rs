@@ -390,6 +390,11 @@ where
                 "migration snapshot contains duplicate idempotency lookup keys".to_string(),
             ));
         }
+        let commit_logs = snapshot
+            .commits
+            .iter()
+            .map(|record| record.commit.clone())
+            .collect::<Vec<_>>();
         for record in &snapshot.commits {
             let table = tables_by_id.get(record.table_id.as_str()).ok_or_else(|| {
                 TableCatalogStoreError::Invalid(format!("commit {} has no table in migration snapshot", record.commit.commit_id))
@@ -408,7 +413,12 @@ where
                 .idempotency_key
                 .as_deref()
                 .and_then(|idempotency_key| idempotency_by_key.get(&(record.table_id.as_str(), idempotency_key)).copied());
-            let recovery = table_commit_recovery_entry(table, &record.commit, indexed);
+            let recovery = table_commit_recovery_entry(
+                table,
+                &record.commit,
+                indexed,
+                table_commit_history_proves_committed(table, &record.commit, &commit_logs),
+            );
             if recovery.recovery_state != TableCommitRecoveryState::Committed {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "commit {} requires catalog recovery before durable strong migration",

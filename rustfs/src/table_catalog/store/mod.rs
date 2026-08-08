@@ -319,6 +319,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool>;
 
+    async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
+        self.object_exists(bucket, object).await
+    }
+
     async fn put_object(
         &self,
         bucket: &str,
@@ -1207,6 +1211,25 @@ where
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
+            Ok(_) => Ok(true),
+            Err(err) if is_missing_storage_error(&err) => Ok(false),
+            Err(err) => Err(storage_error_to_catalog("check catalog object", err)),
+        }
+    }
+
+    async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
+        match self
+            .store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
             Ok(_) => Ok(true),
             Err(err) if is_missing_storage_error(&err) => Ok(false),
             Err(err) => Err(storage_error_to_catalog("check catalog object", err)),

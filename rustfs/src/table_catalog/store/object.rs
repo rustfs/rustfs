@@ -1056,6 +1056,20 @@ where
             .map(|entry| entry.map(|(commit, _)| commit))
     }
 
+    async fn read_table_commit_logs(&self, entry: &TableEntry) -> TableCatalogStoreResult<Vec<(String, CommitLogEntry)>> {
+        let commit_prefix = self.paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id);
+        let mut commits = Vec::new();
+        for object in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
+            if !object.ends_with(".json") {
+                continue;
+            }
+            if let Some(commit_log) = self.read_commit_by_path(&object).await? {
+                commits.push((object, commit_log));
+            }
+        }
+        Ok(commits)
+    }
+
     async fn finalize_commit_log(
         &self,
         commit_path: &str,
@@ -1076,15 +1090,13 @@ where
         entry: &TableEntry,
         finalized_count: usize,
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
-        let commit_prefix = self.paths.commit_log_entries_prefix(&entry.table_bucket, &entry.table_id);
-        let mut commits = Vec::new();
-        for object in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
-            if !object.ends_with(".json") {
-                continue;
-            }
-            let Some(commit_log) = self.read_commit_by_path(&object).await? else {
-                continue;
-            };
+        let commit_logs_with_paths = self.read_table_commit_logs(entry).await?;
+        let commit_logs = commit_logs_with_paths
+            .iter()
+            .map(|(_, commit_log)| commit_log.clone())
+            .collect::<Vec<_>>();
+        let mut commits = Vec::with_capacity(commit_logs.len());
+        for (_, commit_log) in commit_logs_with_paths {
             let idempotency_commit = match commit_log.idempotency_key.as_deref() {
                 Some(idempotency_key) => {
                     let idempotency_path =
@@ -1094,7 +1106,12 @@ where
                 }
                 None => None,
             };
-            commits.push(table_commit_recovery_entry(entry, &commit_log, idempotency_commit.as_ref()));
+            commits.push(table_commit_recovery_entry(
+                entry,
+                &commit_log,
+                idempotency_commit.as_ref(),
+                table_commit_history_proves_committed(entry, &commit_log, &commit_logs),
+            ));
         }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
 
@@ -1172,15 +1189,13 @@ where
             )));
         };
 
-        let commit_prefix = self.paths.commit_log_entries_prefix(table_bucket, &entry.table_id);
+        let commit_logs_with_paths = self.read_table_commit_logs(&entry).await?;
+        let commit_logs = commit_logs_with_paths
+            .iter()
+            .map(|(_, commit_log)| commit_log.clone())
+            .collect::<Vec<_>>();
         let mut finalized_count = 0;
-        for commit_path in self.backend.list_objects(self.catalog_bucket(), &commit_prefix).await? {
-            if !commit_path.ends_with(".json") {
-                continue;
-            }
-            let Some(commit_log) = self.read_commit_by_path(&commit_path).await? else {
-                continue;
-            };
+        for (commit_path, commit_log) in commit_logs_with_paths {
             let idempotency_path = commit_log.idempotency_key.as_deref().map(|idempotency_key| {
                 self.paths
                     .commit_idempotency_entry_path(table_bucket, &entry.table_id, idempotency_key)
@@ -1189,7 +1204,12 @@ where
                 Some(idempotency_path) => self.read_commit_by_path(idempotency_path).await?,
                 None => None,
             };
-            let recovery_entry = table_commit_recovery_entry(&entry, &commit_log, idempotency_commit.as_ref());
+            let recovery_entry = table_commit_recovery_entry(
+                &entry,
+                &commit_log,
+                idempotency_commit.as_ref(),
+                table_commit_history_proves_committed(&entry, &commit_log, &commit_logs),
+            );
             if matches!(
                 recovery_entry.recovery_state,
                 TableCommitRecoveryState::FinalizationRequired | TableCommitRecoveryState::IdempotencyIndexRepairRequired
@@ -3773,6 +3793,33 @@ where
             None => None,
         };
 
+        if let Some(existing) = existing_idempotency_commit.as_ref()
+            && !commit_log_matches_request(existing, &request, &current.table_id)
+        {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string())),
+            );
+        }
+        if existing_commit.is_none() && existing_idempotency_commit.is_some() {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict(
+                    "idempotency key exists without a recoverable commit record".to_string(),
+                )),
+            );
+        }
+
         if let Some(existing) = existing_commit.as_ref() {
             if !commit_log_matches_request(existing, &request, &current.table_id) {
                 return table_commit_result(
@@ -3788,7 +3835,48 @@ where
                     ))),
                 );
             }
-            if matches!(existing.status, CommitLogStatus::Committed) || table_matches_committed_log(&current, existing) {
+            if matches!(existing.status, CommitLogStatus::Failed) {
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(TableCatalogStoreError::Conflict("failed commit record cannot be replayed".to_string())),
+                );
+            }
+            if matches!(existing.status, CommitLogStatus::Committed) && table_matches_staged_base(&current, existing) {
+                return table_commit_result(
+                    &request.table_bucket,
+                    &request.namespace,
+                    &request.table,
+                    &request.commit_id,
+                    &request.operation,
+                    commit_started,
+                    Err(TableCatalogStoreError::Conflict(
+                        "committed record still matches the pre-commit table state".to_string(),
+                    )),
+                );
+            }
+            let historically_committed = if matches!(existing.status, CommitLogStatus::Staged)
+                && !table_matches_staged_base(&current, existing)
+                && !table_matches_committed_log(&current, existing)
+            {
+                let commit_logs = self
+                    .read_table_commit_logs(&current)
+                    .await?
+                    .into_iter()
+                    .map(|(_, commit_log)| commit_log)
+                    .collect::<Vec<_>>();
+                table_commit_history_proves_committed(&current, existing, &commit_logs)
+            } else {
+                false
+            };
+            if matches!(existing.status, CommitLogStatus::Committed)
+                || (matches!(existing.status, CommitLogStatus::Staged)
+                    && (table_matches_committed_log(&current, existing) || historically_committed))
+            {
                 let mut committed = existing.clone();
                 committed.status = CommitLogStatus::Committed;
                 let _ = self
@@ -3820,32 +3908,6 @@ where
                     )),
                 );
             }
-        }
-        if let Some(existing) = existing_idempotency_commit.as_ref()
-            && !commit_log_matches_request(existing, &request, &current.table_id)
-        {
-            return table_commit_result(
-                &request.table_bucket,
-                &request.namespace,
-                &request.table,
-                &request.commit_id,
-                &request.operation,
-                commit_started,
-                Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string())),
-            );
-        }
-        if existing_commit.is_none() && existing_idempotency_commit.is_some() {
-            return table_commit_result(
-                &request.table_bucket,
-                &request.namespace,
-                &request.table,
-                &request.commit_id,
-                &request.operation,
-                commit_started,
-                Err(TableCatalogStoreError::Conflict(
-                    "idempotency key exists without a recoverable commit record".to_string(),
-                )),
-            );
         }
 
         if current.version_token != request.expected_version_token {
@@ -3905,6 +3967,7 @@ where
                 ))),
             );
         };
+        validate_commit_metadata_digest(&request, &new_metadata_object)?;
         let table_bucket = request.table_bucket.clone();
         let metadata_location = request.new_metadata_location.clone();
         let next_warehouse_location = tokio::task::spawn_blocking(move || {

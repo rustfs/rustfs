@@ -95,6 +95,7 @@ pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
 pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
+pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
 pub(crate) const TABLE_MANIFEST_AVRO_MAX_SIZE: usize = 128 * 1024 * 1024;

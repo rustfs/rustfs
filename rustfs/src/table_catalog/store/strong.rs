@@ -709,6 +709,12 @@ where
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
+        let commit_logs = state
+            .commits
+            .iter()
+            .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
+            .map(|(_, commit_log)| commit_log.clone())
+            .collect::<Vec<_>>();
         let mut commits = state
             .commits
             .iter()
@@ -719,7 +725,12 @@ where
                         .idempotency
                         .get(&Self::idempotency_key(&entry.table_bucket, &entry.table_id, idempotency_key))
                 });
-                table_commit_recovery_entry(entry, commit_log, idempotency_commit)
+                table_commit_recovery_entry(
+                    entry,
+                    commit_log,
+                    idempotency_commit,
+                    table_commit_history_proves_committed(entry, commit_log, &commit_logs),
+                )
             })
             .collect::<Vec<_>>();
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
@@ -783,6 +794,17 @@ where
             .map(|idempotency_key| Self::idempotency_key(&request.table_bucket, &current.table_id, idempotency_key));
         let existing_idempotency_commit = idempotency_key.as_ref().and_then(|key| state.idempotency.get(key));
 
+        if let Some(existing) = existing_idempotency_commit
+            && !commit_log_matches_request(existing, request, &current.table_id)
+        {
+            return Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string()));
+        }
+        if existing_commit.is_none() && existing_idempotency_commit.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "idempotency key exists without a recoverable commit record".to_string(),
+            ));
+        }
+
         if let Some(existing) = existing_commit {
             if !commit_log_matches_request(existing, request, &current.table_id) {
                 return Err(TableCatalogStoreError::Conflict(format!(
@@ -790,21 +812,38 @@ where
                     request.commit_id
                 )));
             }
-            if matches!(existing.status, CommitLogStatus::Committed) || table_matches_committed_log(&current, existing) {
+            if matches!(existing.status, CommitLogStatus::Failed) {
+                return Err(TableCatalogStoreError::Conflict("failed commit record cannot be replayed".to_string()));
+            }
+            if matches!(existing.status, CommitLogStatus::Committed) && table_matches_staged_base(&current, existing) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "committed record still matches the pre-commit table state".to_string(),
+                ));
+            }
+            let historically_committed = if matches!(existing.status, CommitLogStatus::Staged)
+                && !table_matches_staged_base(&current, existing)
+                && !table_matches_committed_log(&current, existing)
+            {
+                let commit_logs = state
+                    .commits
+                    .iter()
+                    .filter(|((table_bucket, table_id, _), _)| {
+                        table_bucket == &request.table_bucket && table_id == &current.table_id
+                    })
+                    .map(|(_, commit_log)| commit_log.clone())
+                    .collect::<Vec<_>>();
+                table_commit_history_proves_committed(&current, existing, &commit_logs)
+            } else {
+                false
+            };
+            if matches!(existing.status, CommitLogStatus::Committed)
+                || (matches!(existing.status, CommitLogStatus::Staged)
+                    && (table_matches_committed_log(&current, existing) || historically_committed))
+            {
                 return Ok(current);
             }
             return Err(TableCatalogStoreError::Conflict(
                 "existing commit record does not match current table state".to_string(),
-            ));
-        }
-        if let Some(existing) = existing_idempotency_commit
-            && !commit_log_matches_request(existing, request, &current.table_id)
-        {
-            return Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string()));
-        }
-        if existing_idempotency_commit.is_some() {
-            return Err(TableCatalogStoreError::Conflict(
-                "idempotency key exists without a recoverable commit record".to_string(),
             ));
         }
         if current.version_token != request.expected_version_token {
@@ -831,15 +870,34 @@ where
         current: TableEntry,
     ) -> Option<TableCommitResult> {
         let commit_key = Self::commit_key(&request.table_bucket, &current.table_id, &request.commit_id);
-        let existing = state.commits.get(&commit_key)?;
-        if !commit_log_matches_request(existing, request, &current.table_id) {
+        let existing = state.commits.get(&commit_key)?.clone();
+        if !commit_log_matches_request(&existing, request, &current.table_id) {
             return None;
         }
-        if !matches!(existing.status, CommitLogStatus::Committed) && !table_matches_committed_log(&current, existing) {
+        let historically_committed = if matches!(existing.status, CommitLogStatus::Staged)
+            && !table_matches_staged_base(&current, &existing)
+            && !table_matches_committed_log(&current, &existing)
+        {
+            let commit_logs = state
+                .commits
+                .iter()
+                .filter(|((table_bucket, table_id, _), _)| table_bucket == &request.table_bucket && table_id == &current.table_id)
+                .map(|(_, commit_log)| commit_log.clone())
+                .collect::<Vec<_>>();
+            table_commit_history_proves_committed(&current, &existing, &commit_logs)
+        } else {
+            false
+        };
+        if matches!(existing.status, CommitLogStatus::Failed)
+            || (matches!(existing.status, CommitLogStatus::Committed) && table_matches_staged_base(&current, &existing))
+            || (!matches!(existing.status, CommitLogStatus::Committed)
+                && !table_matches_committed_log(&current, &existing)
+                && !historically_committed)
+        {
             return None;
         }
 
-        let mut committed = existing.clone();
+        let mut committed = existing;
         committed.status = CommitLogStatus::Committed;
         state.commits.insert(commit_key, committed.clone());
         if let Some(idempotency_key) = committed.idempotency_key.as_deref() {
@@ -1396,6 +1454,7 @@ where
                 ))),
             );
         };
+        validate_commit_metadata_digest(&request, &new_metadata_object)?;
         let table_bucket = request.table_bucket.clone();
         let metadata_location = request.new_metadata_location.clone();
         let next_warehouse_location = tokio::task::spawn_blocking(move || {
