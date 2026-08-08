@@ -286,6 +286,23 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
+    fn get_heal_object_disks(&self, object: &str, opts: &HealOpts) -> Result<Arc<SetDisks>> {
+        if let Some(set_idx) = opts.set {
+            return self.disk_set.get(set_idx).cloned().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "heal".to_string(),
+                    "scope".to_string(),
+                    format!(
+                        "invalid object heal set index {set_idx} for pool {} with {} sets",
+                        self.pool_idx, self.set_count
+                    ),
+                )
+            });
+        }
+
+        Ok(self.get_disks_by_key(object))
+    }
+
     pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
 
@@ -1101,7 +1118,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.get_disks_by_key(object)
+        self.get_heal_object_disks(object, opts)?
             .heal_object(bucket, object, version_id, opts)
             .await
     }
@@ -1429,6 +1446,44 @@ mod tests {
             ctx: bootstrap_ctx(),
         });
         (temp_dirs, sets)
+    }
+
+    #[tokio::test]
+    async fn heal_object_uses_requested_set_instead_of_object_hash() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let object = (0..100)
+            .map(|idx| format!("hashes-to-set-zero-{idx}"))
+            .find(|object| sets.get_hashed_set_index(object) == 0)
+            .expect("test object should hash to set zero");
+
+        let selected = sets
+            .get_heal_object_disks(
+                &object,
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("requested set should exist");
+
+        assert!(Arc::ptr_eq(&selected, &sets.disk_set[1]));
+    }
+
+    #[tokio::test]
+    async fn heal_object_rejects_requested_set_outside_pool() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+
+        let err = sets
+            .get_heal_object_disks(
+                "object",
+                &HealOpts {
+                    set: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect_err("missing requested set must fail closed");
+
+        assert!(matches!(err, Error::InvalidArgument(_, _, message) if message.contains("set index 2")));
     }
 
     #[tokio::test]

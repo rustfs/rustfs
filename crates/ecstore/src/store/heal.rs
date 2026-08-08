@@ -20,6 +20,31 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const HEAL_SCOPE_OPERATION: &str = "heal";
+const HEAL_SCOPE_ARGUMENT: &str = "scope";
+
+fn invalid_heal_scope_error(message: String) -> Error {
+    Error::InvalidArgument(HEAL_SCOPE_OPERATION.to_string(), HEAL_SCOPE_ARGUMENT.to_string(), message)
+}
+
+fn heal_object_scope_matches_pool(pool_idx: usize, set_count: usize, opts: &HealOpts) -> bool {
+    if let Some(target_pool) = opts.pool
+        && pool_idx != target_pool
+    {
+        return false;
+    }
+    if let Some(target_set) = opts.set {
+        return target_set < set_count;
+    }
+    true
+}
+
+fn invalid_heal_object_scope_error(opts: &HealOpts, pool_count: usize) -> Error {
+    invalid_heal_scope_error(format!(
+        "invalid object heal scope pool={:?} set={:?} for {pool_count} pools",
+        opts.pool, opts.set
+    ))
+}
 
 impl ECStore {
     #[instrument(skip(self))]
@@ -106,11 +131,19 @@ impl ECStore {
         let object = encode_dir_object(object);
 
         let mut futures = Vec::with_capacity(self.pools.len());
+        let mut selected_pool = false;
         for pool in self.pools.iter() {
+            if !heal_object_scope_matches_pool(pool.pool_idx, pool.set_count, opts) {
+                continue;
+            }
+            selected_pool = true;
             if self.is_suspended(pool.pool_idx).await {
                 continue;
             }
             futures.push(pool.heal_object(bucket, &object, version_id, opts));
+        }
+        if !selected_pool && (opts.pool.is_some() || opts.set.is_some()) {
+            return Ok((HealResultItem::default(), Some(invalid_heal_object_scope_error(opts, self.pools.len()))));
         }
         let results = join_all(futures).await;
 
@@ -177,6 +210,76 @@ mod tests {
     use crate::disk::{DiskOption, format::FormatV3, new_disk};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
     use crate::store::init_format::{load_format_erasure, save_format_file};
+
+    #[test]
+    fn heal_object_scope_matches_only_target_pool() {
+        let opts = HealOpts {
+            pool: Some(1),
+            ..Default::default()
+        };
+
+        assert!(!heal_object_scope_matches_pool(0, 2, &opts));
+        assert!(heal_object_scope_matches_pool(1, 2, &opts));
+    }
+
+    #[test]
+    fn heal_object_scope_rejects_missing_set() {
+        let opts = HealOpts {
+            set: Some(2),
+            ..Default::default()
+        };
+
+        assert!(!heal_object_scope_matches_pool(0, 2, &opts));
+        assert!(heal_object_scope_matches_pool(1, 3, &opts));
+    }
+
+    #[test]
+    fn invalid_heal_object_scope_reports_requested_coordinates() {
+        let opts = HealOpts {
+            pool: Some(4),
+            set: Some(2),
+            ..Default::default()
+        };
+
+        let err = invalid_heal_object_scope_error(&opts, 2);
+
+        assert!(
+            matches!(err, Error::InvalidArgument(_, _, message) if message.contains("pool=Some(4)") && message.contains("set=Some(2)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_heal_object_rejects_unmatched_scoped_pool() {
+        let endpoint_pools = EndpointServerPools::from(Vec::<PoolEndpoints>::new());
+        let store = ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools: Vec::new(),
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
+        };
+
+        let (_, err) = store
+            .handle_heal_object(
+                "bucket",
+                "object",
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("invalid scope should be reported as a heal result error");
+
+        assert!(matches!(err, Some(Error::InvalidArgument(_, _, message)) if message.contains("pool=Some(1)")));
+    }
 
     #[tokio::test]
     async fn handle_heal_format_continues_after_a_pool_error() {
