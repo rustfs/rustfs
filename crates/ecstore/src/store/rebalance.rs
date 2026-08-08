@@ -541,14 +541,22 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, usize)> {
         let mut futures = Vec::with_capacity(self.pools.len());
-        for pool in self.pools.iter() {
-            futures.push(pool.get_object_info(bucket, object, opts));
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if opts.skip_decommissioned && self.is_suspended(idx).await {
+                continue;
+            }
+
+            if opts.skip_rebalancing && self.is_pool_rebalancing(idx).await {
+                continue;
+            }
+
+            futures.push(async move { (idx, pool.get_object_info(bucket, object, opts).await) });
         }
 
         let results = join_all(futures).await;
         let mut candidates = Vec::with_capacity(self.pools.len());
 
-        for (idx, result) in results.into_iter().enumerate() {
+        for (idx, result) in results {
             match result {
                 Ok(res) => {
                     candidates.push(LatestObjectInfoCandidate {

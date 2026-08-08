@@ -602,7 +602,7 @@ mod tests {
         error::{Error, Result, StorageError},
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-        services::rebalance::RebalanceMeta,
+        services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats},
         storage_api_contracts::{
             bucket::{BucketOperations as _, MakeBucketOptions},
             multipart::MultipartOperations as _,
@@ -1153,6 +1153,183 @@ mod tests {
         .expect("store should build around the fresh context");
 
         (instance_ctx, store, shutdown)
+    }
+
+    fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
+        let now = OffsetDateTime::now_utc();
+        let mut pool_stats = vec![RebalanceStats::default(); pool_count];
+        pool_stats[active_pool_idx] = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(now),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        RebalanceMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            pool_stats,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tag_updates_skip_active_rebalance_source_pool() {
+        let temp_dir = tempfile::tempdir().expect("create writer-fencing store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "writer-fencing-tags", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("writer-fencing-tags-{}", uuid::Uuid::new_v4());
+        let object = "tagged-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create writer fencing bucket");
+
+        let old_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed timestamp should be valid");
+        let newer_time = old_time + time::Duration::seconds(10);
+        let mut source_reader = PutObjReader::from_vec(b"source-body".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut source_reader,
+                &ObjectOptions {
+                    mod_time: Some(newer_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write newer source object");
+        let mut target_reader = PutObjReader::from_vec(b"target-body".to_vec());
+        store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut target_reader,
+                &ObjectOptions {
+                    mod_time: Some(old_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write older target object");
+
+        *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+        assert!(store.is_pool_rebalancing(0).await, "pool 0 must be marked as an active rebalance source");
+
+        let tags = "rebalance=target";
+        assert_ne!(
+            store.pools[0]
+                .get_object_tags(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("source object tags should be readable before update"),
+            tags,
+            "source object must start without the target tag"
+        );
+        assert_ne!(
+            store.pools[1]
+                .get_object_tags(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("target object tags should be readable before update"),
+            tags,
+            "target object must start without the target tag"
+        );
+        let selected_pool = store
+            .get_pool_idx_existing_with_opts(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_chg: true,
+                    skip_decommissioned: true,
+                    skip_rebalancing: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("writer lookup should select an existing non-rebalancing pool");
+        assert_eq!(selected_pool, 1, "writer lookup must skip active rebalance pool 0");
+
+        let updated = store
+            .put_object_tags(&bucket, object, tags, &ObjectOptions::default())
+            .await
+            .expect("tag update should use the non-rebalancing target pool");
+        assert_eq!(
+            updated.mod_time,
+            Some(old_time),
+            "tag update must return the non-rebalancing pool object rather than the newer active source"
+        );
+
+        let target_tags = store.pools[1]
+            .get_object_tags(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("target object tags should be readable");
+        assert_eq!(target_tags, tags, "non-rebalancing pool must receive writer tag updates");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multipart_listing_skips_active_rebalance_source_pool() {
+        let temp_dir = tempfile::tempdir().expect("create multipart writer-fencing store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "writer-fencing-multipart", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("writer-fencing-multipart-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create multipart writer fencing bucket");
+
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_read_lock(&bucket)
+            .await
+            .expect("acquire multipart test lifecycle fence");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let source_upload = store.pools[0]
+            .new_multipart_upload(&bucket, "source-only.bin", &upload_opts)
+            .await
+            .expect("create source upload");
+        let target_upload = store.pools[1]
+            .new_multipart_upload(&bucket, "target-visible.bin", &upload_opts)
+            .await
+            .expect("create target upload");
+
+        *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+        assert!(store.is_pool_rebalancing(0).await, "pool 0 must be marked as an active rebalance source");
+
+        let listed = store
+            .list_multipart_uploads(&bucket, "", None, None, None, 100)
+            .await
+            .expect("list multipart uploads");
+        let listed_uploads: Vec<(&str, &str)> = listed
+            .uploads
+            .iter()
+            .map(|upload| (upload.object.as_str(), upload.upload_id.as_str()))
+            .collect();
+
+        assert!(
+            !listed_uploads.contains(&("source-only.bin", source_upload.upload_id.as_str())),
+            "active source pool upload must be hidden from multipart listing"
+        );
+        assert!(
+            listed_uploads.contains(&("target-visible.bin", target_upload.upload_id.as_str())),
+            "non-rebalancing pool upload must remain visible"
+        );
+
+        shutdown.cancel();
     }
 
     #[tokio::test]
