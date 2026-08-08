@@ -26,11 +26,8 @@ The policy governs the outbound clients used by:
 - S3 tiering (warm-backend) endpoints;
 - Keystone auth URLs.
 
-The webhook, audit, and OIDC outbound clients also **disable proxies and do not
-follow redirects**, so the destination must be reachable directly at the
-configured URL. OIDC intentionally ignores `HTTP_PROXY`, `HTTPS_PROXY`, and
-`ALL_PROXY`: a forward proxy resolves the provider hostname outside RustFS and
-would bypass the connection-boundary address check.
+The webhook and audit outbound clients also **disable proxies and do not follow
+redirects**, so the destination must be reachable directly at the configured URL.
 
 ## What changed in beta.11 (and for OIDC in beta.12)
 
@@ -52,9 +49,7 @@ is unchanged.
 OIDC joined the same policy in beta.12. An internal identity provider that
 worked in beta.11 can therefore fail discovery after upgrading to beta.12 unless
 its exact origin is allowlisted. The policy remains active for discovery, JWKS,
-and token requests to prevent SSRF and DNS-rebinding bypasses; these requests
-must have direct network reachability because proxy environment variables are
-not used.
+and token requests.
 
 ## Symptoms
 
@@ -150,8 +145,8 @@ The endpoint keeps its full path (`/events`); the allowlist entry is the origin
    providers, tiering endpoints, and Keystone auth URLs.
 2. Add each one to `RUSTFS_OUTBOUND_ALLOW_ORIGINS` as an exact
    `scheme://host:port` origin (no path).
-3. Ensure the endpoint is reachable directly — for webhook, audit, and OIDC
-   targets, proxies are disabled and redirects are not followed.
+3. Ensure the endpoint is reachable directly — for webhook and audit targets,
+   proxies are disabled and redirects are not followed.
 4. Restart RustFS; the policy is read at startup.
 5. Confirm delivery, and check the logs for `... is not allowed` messages if a
    target still fails to activate.

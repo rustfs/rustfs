@@ -159,7 +159,6 @@ export RUSTFS_OUTBOUND_ALLOW_ORIGINS="http://keycloak.keycloak.svc.cluster.local
 
 Discovery and issuer-relative JWKS requests use the internal `CONFIG_URL` base. ID token issuer validation still uses `ISSUER`.
 The outbound allowlist entry is the exact internal origin only; do not include the realm or discovery path. RustFS reads this process setting at startup, so restart every RustFS node after changing it.
-RustFS connects directly to OIDC endpoints and ignores proxy environment variables so DNS and address policy checks cannot be delegated to a forward proxy. Ensure every RustFS node can route directly to the configured Keycloak origin.
 Use HTTPS with a trusted CA for the internal URL whenever possible. Discovery and JWKS define the token-signing trust root; use HTTP only on a network where DNS and traffic cannot be tampered with, because a compromised response can authorize forged tokens.
 
 For short-lived connectivity testing only, you may temporarily add:

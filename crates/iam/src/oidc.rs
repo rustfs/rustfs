@@ -36,6 +36,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
@@ -341,17 +342,20 @@ fn build_oidc_http_client(
             OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(&url).is_ok());
         oidc_forbidden_outbound_error(&url, base, can_allow_origin)
     })?;
+    let bypass_proxy = should_bypass_proxy_for_oidc_uri(uri);
+    #[cfg(test)]
+    let bypass_proxy = bypass_proxy || dns_resolver_override.is_some();
     #[cfg(test)]
     let resolver: Arc<dyn reqwest::dns::Resolve> = dns_resolver_override.unwrap_or_else(|| Arc::new(resolver));
 
-    let builder = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .dns_resolver(resolver)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(OIDC_HTTP_REQUEST_TIMEOUT)
         .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
-    #[cfg(test)]
-    let builder = builder.proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("test proxy URL should parse"));
-    let builder = builder.no_proxy();
+    if bypass_proxy {
+        builder = builder.no_proxy();
+    }
     builder.build().map(|client| (client, url)).map_err(OidcHttpError::Reqwest)
 }
 
@@ -393,6 +397,15 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
+    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
 impl ReqwestHttpClient {
@@ -2951,6 +2964,17 @@ mod tests {
             build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None, None).is_ok(),
             "public https endpoint should build"
         );
+    }
+
+    #[test]
+    fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
+        assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
+        assert!(!should_bypass_proxy_for_oidc_uri(
+            "https://idp.example.com/.well-known/openid-configuration"
+        ));
+        assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
     }
 
     #[test]
