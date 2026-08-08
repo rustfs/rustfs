@@ -27,9 +27,9 @@ const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 const MINIO_INTERNAL_ENCRYPTION_PREFIX: &str = "x-minio-internal-server-side-encryption-";
 const MINIO_INTERNAL_ENCRYPTED_MULTIPART: &str = "x-minio-internal-encrypted-multipart";
-const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = "x-rustfs-encryption-original-size";
+const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = super::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER;
 const MINIO_ENCRYPTION_ORIGINAL_SIZE: &str = "x-minio-encryption-original-size";
-const SSEC_ORIGINAL_SIZE: &str = "x-amz-server-side-encryption-customer-original-size";
+const SSEC_ORIGINAL_SIZE: &str = super::object_encryption_keys::SSEC_ORIGINAL_SIZE_HEADER;
 
 // Suffix constants (part after x-rustfs- or x-minio-). Use with get_header/insert_header.
 pub const SUFFIX_FORCE_DELETE: &str = "force-delete";

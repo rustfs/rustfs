@@ -278,7 +278,11 @@ pub struct FileInfo {
 fn is_sensitive_metadata_key(key: &str) -> bool {
     // `is_encryption_metadata_key` covers the x-minio-internal- SSE prefix but not
     // its x-rustfs-internal- twin, which the dual-key invariant writes alongside it.
-    is_encryption_metadata_key(key) || starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+    is_encryption_metadata_key(key)
+        || starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+        || rustfs_utils::http::REPLICATION_SSE_TRANSPORT_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(key, prefix))
 }
 
 struct RedactedMetadata<'a>(&'a HashMap<String, String>);
@@ -2556,6 +2560,30 @@ mod tests {
         assert!(dump.contains("X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key"));
         assert!(dump.contains(&format!("<redacted {} bytes>", sealed_key.len())));
         // Non-sensitive metadata values keep their diagnostic value.
+        assert!(dump.contains("text/plain"));
+    }
+
+    #[test]
+    fn debug_redacts_replication_sse_transport_metadata_values() {
+        let sealed_key = "IAAfANqt7wIJfVSgFAG3f5S6HuC2eyM5DdJlx7RSJKw2ZakSb3d5";
+        let mut fi = FileInfo::default();
+        for key in [
+            "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
+            "X-Rustfs-Replication-Server-Side-Encryption-Iv",
+            "X-Rustfs-Replication-Encryption-Iv",
+            "X-Rustfs-Replication-Ssec-Key-Md5",
+        ] {
+            fi.metadata.insert(key.to_string(), sealed_key.to_string());
+        }
+        fi.metadata.insert("content-type".to_string(), "text/plain".to_string());
+
+        let dump = format!("{fi:?}");
+        assert!(
+            !dump.contains(sealed_key),
+            "replication SSE transport value leaked into Debug output: {dump}"
+        );
+        assert!(dump.contains("X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key"));
+        assert!(dump.contains(&format!("<redacted {} bytes>", sealed_key.len())));
         assert!(dump.contains("text/plain"));
     }
 
