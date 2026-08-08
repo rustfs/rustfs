@@ -18,20 +18,29 @@ use datafusion::arrow::{
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use http::{StatusCode, header::RANGE};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::RANGE};
 use rustfs_s3select_api::{
     QueryError, S3SelectPolicyError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
 use rustfs_s3select_query::instance::s3_select_query_timeout;
+use rustfs_utils::http::headers::{
+    AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
+    AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
+};
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
     JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
     SelectObjectContentEventStream, SelectObjectContentInput, SelectObjectContentOutput, SelectObjectContentRequest, Stats,
     StatsEvent,
 };
+use s3s::header::{
+    X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
+    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout_at};
@@ -42,6 +51,13 @@ const MAX_SELECT_EXPRESSION_BYTES: usize = 256 * 1024;
 const RECORDS_CHUNK_TARGET: usize = 128 * 1024;
 const PARSE_SELECT_FAILURE_CODE: &str = "ParseSelectFailure";
 const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
+const SELECT_MINIO_SSEC_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
+const SELECT_MINIO_S3_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key";
+const SELECT_MINIO_KMS_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key";
+const SELECT_MINIO_KMS_KEY_ID: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
+const SELECT_MINIO_KMS_CONTEXT: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
+const SELECT_RUSTFS_KMS_KEY_ID: &str = "x-rustfs-encryption-key-id";
+const SELECT_KMS_ARN_PREFIX: &str = "arn:aws:kms:";
 
 #[derive(Clone, Debug)]
 struct SelectValidation {
@@ -113,6 +129,7 @@ pub async fn execute_select_object_content(
         .clone()
         .try_reserve_owned()
         .map_err(|_| s3_error!(InternalError, "can't reserve Select terminal event capacity"))?;
+    let response = select_object_response(rx, &snapshot.object_info().user_defined, &req.headers)?;
     spawn_traced(async move {
         send_select_events_until_deadline(
             output,
@@ -126,9 +143,187 @@ pub async fn execute_select_object_content(
         .await;
     });
 
-    Ok(S3Response::new(SelectObjectContentOutput {
+    Ok(response)
+}
+
+fn select_object_response(
+    rx: mpsc::Receiver<S3Result<SelectObjectContentEvent>>,
+    metadata: &HashMap<String, String>,
+    request_headers: &HeaderMap,
+) -> S3Result<S3Response<SelectObjectContentOutput>> {
+    let response_headers = select_snapshot_sse_response_headers(metadata, request_headers)?;
+    let mut response = S3Response::new(SelectObjectContentOutput {
         payload: Some(SelectObjectContentEventStream::new(ReceiverStream::new(rx))),
-    }))
+    });
+    response.headers = response_headers;
+    Ok(response)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectSnapshotSseMode {
+    S3,
+    Kms,
+    Customer,
+}
+
+fn invalid_select_snapshot_sse_metadata() -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InternalError,
+        "Persisted SelectObjectContent encryption metadata is invalid.",
+    )
+}
+
+fn select_metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) -> S3Result<Option<&'a str>> {
+    let mut values = metadata
+        .iter()
+        .filter_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()));
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.any(|candidate| candidate != value) {
+        return Err(invalid_select_snapshot_sse_metadata());
+    }
+    Ok(Some(value))
+}
+
+fn select_snapshot_kms_key_id(metadata: &HashMap<String, String>) -> S3Result<Option<&str>> {
+    let values = [
+        select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?,
+        select_metadata_value(metadata, SELECT_RUSTFS_KMS_KEY_ID)?,
+        select_metadata_value(metadata, SELECT_MINIO_KMS_KEY_ID)?,
+    ];
+    let mut resolved = None;
+    for value in values.into_iter().flatten() {
+        if resolved.is_some_and(|current| current != value) {
+            return Err(invalid_select_snapshot_sse_metadata());
+        }
+        resolved = Some(value);
+    }
+    Ok(resolved)
+}
+
+fn select_snapshot_sse_mode(metadata: &HashMap<String, String>) -> S3Result<Option<SelectSnapshotSseMode>> {
+    let public_mode = select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION)?;
+    let customer_algorithm = select_metadata_value(metadata, SSEC_ALGORITHM_HEADER)?;
+    let has_ssec_marker = select_metadata_value(metadata, SELECT_MINIO_SSEC_SEALED_KEY)?.is_some();
+    let has_s3_marker = select_metadata_value(metadata, SELECT_MINIO_S3_SEALED_KEY)?.is_some();
+    let has_kms_marker = select_metadata_value(metadata, SELECT_MINIO_KMS_SEALED_KEY)?.is_some();
+
+    let public_mode = match public_mode {
+        Some(AMZ_ENCRYPTION_AES) => Some(SelectSnapshotSseMode::S3),
+        Some(AMZ_ENCRYPTION_KMS) => Some(SelectSnapshotSseMode::Kms),
+        Some(_) => return Err(invalid_select_snapshot_sse_metadata()),
+        None => None,
+    };
+    if customer_algorithm.is_some_and(|algorithm| algorithm != AMZ_ENCRYPTION_AES) {
+        return Err(invalid_select_snapshot_sse_metadata());
+    }
+
+    let resolved = if customer_algorithm.is_some() {
+        if public_mode == Some(SelectSnapshotSseMode::Kms) {
+            return Err(invalid_select_snapshot_sse_metadata());
+        }
+        Some(SelectSnapshotSseMode::Customer)
+    } else {
+        public_mode
+    };
+    let internal_modes = [
+        has_ssec_marker.then_some(SelectSnapshotSseMode::Customer),
+        has_s3_marker.then_some(SelectSnapshotSseMode::S3),
+        has_kms_marker.then_some(SelectSnapshotSseMode::Kms),
+    ];
+    for mode in internal_modes.into_iter().flatten() {
+        if resolved != Some(mode) {
+            return Err(invalid_select_snapshot_sse_metadata());
+        }
+    }
+    if resolved.is_none()
+        && metadata
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+    {
+        return Err(invalid_select_snapshot_sse_metadata());
+    }
+    Ok(resolved)
+}
+
+fn insert_select_snapshot_header(headers: &mut HeaderMap, name: HeaderName, value: &str) -> S3Result<()> {
+    let value = HeaderValue::from_str(value).map_err(|_| invalid_select_snapshot_sse_metadata())?;
+    headers.insert(name, value);
+    Ok(())
+}
+
+fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, request_headers: &HeaderMap) -> S3Result<HeaderMap> {
+    if select_metadata_value(metadata, SSEC_KEY_HEADER)?.is_some()
+        || select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT)?.is_some()
+    {
+        return Err(invalid_select_snapshot_sse_metadata());
+    }
+    let Some(mode) = select_snapshot_sse_mode(metadata)? else {
+        return Ok(HeaderMap::new());
+    };
+    let kms_key_id = select_snapshot_kms_key_id(metadata)?;
+
+    let mut response_headers = HeaderMap::with_capacity(3);
+    match mode {
+        SelectSnapshotSseMode::S3 => {
+            if select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?.is_some()
+                || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some()
+                || select_metadata_value(metadata, SSEC_KEY_MD5_HEADER)?.is_some()
+            {
+                return Err(invalid_select_snapshot_sse_metadata());
+            }
+            response_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static(AMZ_ENCRYPTION_AES));
+        }
+        SelectSnapshotSseMode::Kms => {
+            if select_metadata_value(metadata, SSEC_KEY_MD5_HEADER)?.is_some() {
+                return Err(invalid_select_snapshot_sse_metadata());
+            }
+            let key_id = kms_key_id
+                .filter(|key_id| !key_id.is_empty())
+                .ok_or_else(invalid_select_snapshot_sse_metadata)?;
+            response_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static(AMZ_ENCRYPTION_KMS));
+            if key_id.starts_with(SELECT_KMS_ARN_PREFIX) {
+                insert_select_snapshot_header(&mut response_headers, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, key_id)?;
+            } else {
+                insert_select_snapshot_header(
+                    &mut response_headers,
+                    X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID,
+                    &format!("{SELECT_KMS_ARN_PREFIX}{key_id}"),
+                )?;
+            }
+            if let Some(context) = select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)? {
+                let context = HeaderValue::from_str(context).map_err(|_| invalid_select_snapshot_sse_metadata())?;
+                let mut validation_headers = HeaderMap::with_capacity(1);
+                validation_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT, context.clone());
+                super::storage_api::select_object::sse::extract_ssekms_context_from_headers(&validation_headers)
+                    .map_err(|_| invalid_select_snapshot_sse_metadata())?;
+                response_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT, context);
+            }
+        }
+        SelectSnapshotSseMode::Customer => {
+            if kms_key_id.is_some() || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some() {
+                return Err(invalid_select_snapshot_sse_metadata());
+            }
+            let algorithm = request_headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM)
+                .and_then(|value| value.to_str().ok())
+                .filter(|algorithm| *algorithm == AMZ_ENCRYPTION_AES)
+                .ok_or_else(invalid_select_snapshot_sse_metadata)?;
+            let key_md5 = request_headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(invalid_select_snapshot_sse_metadata)?;
+            let stored_md5 =
+                select_metadata_value(metadata, SSEC_KEY_MD5_HEADER)?.ok_or_else(invalid_select_snapshot_sse_metadata)?;
+            if stored_md5 != key_md5 {
+                return Err(invalid_select_snapshot_sse_metadata());
+            }
+            insert_select_snapshot_header(&mut response_headers, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, algorithm)?;
+            insert_select_snapshot_header(&mut response_headers, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, key_md5)?;
+        }
+    }
+    Ok(response_headers)
 }
 
 async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
@@ -753,7 +948,6 @@ mod tests {
         physical_plan::stream::RecordBatchStreamAdapter,
         sql::sqlparser::parser::ParserError,
     };
-    use http::HeaderMap;
     use rustfs_test_utils::TestECStoreEnv;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
 
@@ -866,6 +1060,155 @@ mod tests {
             output_format: SelectOutputFormat::Csv(CSVOutput::default()),
             progress_enabled: false,
         }
+    }
+
+    #[test]
+    fn select_snapshot_sse_s3_headers_are_whitelisted() {
+        let metadata = HashMap::from([
+            (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_AES.to_string()),
+            (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "default".to_string()),
+            (SELECT_MINIO_KMS_KEY_ID.to_string(), "default".to_string()),
+            ("x-amz-meta-private".to_string(), "private-value".to_string()),
+        ]);
+
+        let headers = select_snapshot_sse_response_headers(&metadata, &HeaderMap::new())
+            .expect("valid SSE-S3 snapshot metadata should project response headers");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION).expect("SSE-S3 mode"), "AES256");
+        assert!(headers.get("x-amz-meta-private").is_none());
+    }
+
+    #[test]
+    fn select_snapshot_sse_kms_headers_use_snapshot_metadata() {
+        let context = "eyJ0ZW5hbnQiOiJvbmUifQ==";
+        for key_id in ["key-1", "arn:aws:kms:key-2"] {
+            let metadata = HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), key_id.to_string()),
+                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), key_id.to_string()),
+                (SELECT_MINIO_KMS_KEY_ID.to_string(), key_id.to_string()),
+                (SELECT_MINIO_KMS_CONTEXT.to_string(), context.to_string()),
+            ]);
+
+            let headers = select_snapshot_sse_response_headers(&metadata, &HeaderMap::new())
+                .expect("valid SSE-KMS snapshot metadata should project response headers");
+            let expected_key_id = if key_id.starts_with(SELECT_KMS_ARN_PREFIX) {
+                key_id.to_string()
+            } else {
+                format!("{SELECT_KMS_ARN_PREFIX}{key_id}")
+            };
+
+            assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION).expect("SSE-KMS mode"), "aws:kms");
+            assert_eq!(
+                headers
+                    .get(X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID)
+                    .expect("SSE-KMS key ID")
+                    .to_str()
+                    .expect("SSE-KMS key ID should be valid text"),
+                expected_key_id
+            );
+            assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT).expect("SSE-KMS context"), context);
+        }
+    }
+
+    #[test]
+    fn select_snapshot_sse_c_headers_never_echo_the_customer_key() {
+        let key_md5 = "customer-key-md5";
+        let metadata = HashMap::from([
+            (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_AES.to_string()),
+            (SSEC_ALGORITHM_HEADER.to_string(), AMZ_ENCRYPTION_AES.to_string()),
+            (SSEC_KEY_MD5_HEADER.to_string(), key_md5.to_string()),
+            ("x-amz-meta-private".to_string(), "private-value".to_string()),
+        ]);
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, HeaderValue::from_static("AES256"));
+        request_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, HeaderValue::from_static(key_md5));
+        request_headers.insert(
+            http::HeaderName::from_static(SSEC_KEY_HEADER),
+            HeaderValue::from_static("must-not-be-returned"),
+        );
+
+        let headers = select_snapshot_sse_response_headers(&metadata, &request_headers)
+            .expect("validated SSE-C request values should project response headers");
+
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM)
+                .expect("SSE-C algorithm"),
+            "AES256"
+        );
+        assert_eq!(
+            headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5)
+                .expect("SSE-C key MD5"),
+            key_md5
+        );
+        assert!(headers.get(SSEC_KEY_HEADER).is_none());
+        assert!(headers.get("x-amz-meta-private").is_none());
+    }
+
+    #[test]
+    fn select_snapshot_sse_headers_fail_closed_on_corrupt_metadata() {
+        let invalid_context = "not-base64";
+        let persisted_key = "must-not-leak";
+        let corrupt_metadata = [
+            HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_ascii_lowercase(), "AES256".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_ascii_uppercase(), "aws:kms".to_string()),
+            ]),
+            HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+            ]),
+            HashMap::from([(SELECT_MINIO_KMS_SEALED_KEY.to_string(), "sealed".to_string())]),
+            HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "key-2".to_string()),
+            ]),
+            HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+                (SELECT_MINIO_KMS_CONTEXT.to_string(), invalid_context.to_string()),
+            ]),
+            HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_KMS.to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT.to_string(), "persisted-context".to_string()),
+            ]),
+            HashMap::from([
+                (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+                (SSEC_KEY_MD5_HEADER.to_string(), "customer-key-md5".to_string()),
+                (SSEC_KEY_HEADER.to_string(), persisted_key.to_string()),
+            ]),
+        ];
+
+        for metadata in corrupt_metadata {
+            let error = select_snapshot_sse_response_headers(&metadata, &HeaderMap::new())
+                .expect_err("corrupt snapshot encryption metadata must fail closed");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            assert!(!error.to_string().contains(invalid_context));
+            assert!(!error.to_string().contains(persisted_key));
+        }
+    }
+
+    #[test]
+    fn select_response_projects_snapshot_sse_headers() {
+        let (_tx, rx) = mpsc::channel(1);
+        let metadata = HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_AES.to_string())]);
+
+        let response = select_object_response(rx, &metadata, &HeaderMap::new())
+            .expect("valid snapshot metadata should produce a Select response");
+
+        assert_eq!(
+            response
+                .headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION)
+                .expect("snapshot SSE response header"),
+            AMZ_ENCRYPTION_AES
+        );
     }
 
     fn spawn_test_producer(

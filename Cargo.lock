@@ -3798,7 +3798,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
