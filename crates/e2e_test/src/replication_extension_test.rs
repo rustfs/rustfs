@@ -7547,6 +7547,11 @@ async fn start_delayed_purge_fixture(
 /// stores the marker replica. Returns the source marker version id — the fake
 /// target mirrors it because delete replication forwards
 /// `x-*-source-version-id`.
+///
+/// Timing budget for callers: the delayed purge watcher only observes the
+/// source for ~4s after the marker replication completes, so the source-side
+/// marker-version DELETE must be issued promptly after this returns (the
+/// 100ms journal poll below keeps the detection latency small).
 async fn replicate_delete_marker(
     target: &FakeS3Target,
     target_bucket: &str,
@@ -7591,7 +7596,7 @@ async fn replicate_delete_marker(
     }
 }
 
-/// Journal records of purge attempts: target DELETEs addressing the marker
+/// Journal records of purge attempts: target DELETE calls addressing the marker
 /// version explicitly. The marker-creation replica DELETE carries no
 /// `versionId` query, so the version id is an exact discriminator.
 fn delayed_purge_attempts(target: &FakeS3Target, marker_version: &str) -> Vec<RequestRecord> {
@@ -7646,12 +7651,15 @@ async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure
 
     let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
 
-    // Four scripted failures. Deleting the marker version fans out over the
-    // version-purge replication (whose failure earns a couple of fast
-    // in-memory MRF retries) plus the delayed purge watcher's single attempt —
-    // three target DELETEs in total today, empirically (see the exhaustion
-    // test's journal). Four faults outlast all of them, so only a
-    // delayed-purge retry in a later watch round can converge.
+    // Four scripted failures. Fault budget accounting (each journal record
+    // consumes one fault, including the SDK's own per-request retries):
+    // deleting the marker version fans out over the version-purge replication
+    // channel (initial attempt + its fast in-memory MRF retries) plus the
+    // delayed purge watcher's single pre-fix attempt — three target DELETE calls
+    // in total today, empirically (see the exhaustion test's journal). Four
+    // faults outlast all of them, so only a delayed-purge retry in a later
+    // watch round can converge. If the SDK retry configuration ever changes,
+    // re-derive this budget from a fresh journal capture.
     target.inject(
         FakeTargetOperation::DeleteObject,
         FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
@@ -7717,17 +7725,30 @@ async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays
         .send()
         .await?;
 
-    // Wait for the first purge attempt, then let the watch window drain (5
-    // rounds spaced 1s apart) plus the fast MRF flush interval (100ms) so the
-    // purge intent reaches the durable journal before the restart.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while delayed_purge_attempts(&target, &marker_version).is_empty() {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("delayed purge never attempted the target DELETE; journal: {:?}", target.requests()).into());
+    // Let the watch window drain before restarting. The wall-clock length is
+    // not 5x1s: every faulted attempt embeds the SDK's own per-request 503
+    // retries (a few seconds each), so instead of a fixed sleep, wait until
+    // the faulted attempts stop arriving (the watcher exhausted its rounds and
+    // persisted the purge intent), then give the MRF persister its 100ms
+    // flush interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_seen = delayed_purge_attempts(&target, &marker_version).len();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let seen = delayed_purge_attempts(&target, &marker_version).len();
+        if seen != last_seen {
+            last_seen = seen;
+            quiet_since = tokio::time::Instant::now();
         }
-        sleep(Duration::from_millis(100)).await;
+        if last_seen > 0 && quiet_since.elapsed() >= Duration::from_secs(5) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("purge attempts never quiesced (saw {last_seen}); journal: {:?}", target.requests()).into());
+        }
     }
-    sleep(Duration::from_secs(7)).await;
+    sleep(Duration::from_secs(1)).await;
 
     let marker_survives_faults = target
         .stored_versions(target_bucket, DELAYED_PURGE_KEY)

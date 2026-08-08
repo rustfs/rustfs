@@ -18,9 +18,10 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
-    ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
-    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    MrfReplicateEntry, NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
+    ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType,
+    ReplicationWorkerOperation, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
+    replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
@@ -33,7 +34,7 @@ use super::replication_object_decision_boundary::{
     is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
     replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
 };
-use super::replication_queue_boundary::DeletedObjectReplicationInfo;
+use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
@@ -63,6 +64,7 @@ use futures::stream::StreamExt;
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
+use metrics::counter;
 #[cfg(test)]
 use rmp_serde;
 use rustfs_s3_types::EventName;
@@ -100,6 +102,9 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
+const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_failed";
+const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
+const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
     "dispatch failure",
     "timeouterror",
@@ -1271,7 +1276,12 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                     reason = "source_version_missing",
                     "Skipping stale delete-marker replication"
                 );
-                return true;
+                // The marker is gone at the source, but a replica of it may
+                // already exist on the targets (a live race, or an MRF
+                // purge-intent replay landing here on purpose). Purge instead
+                // of just skipping; the result decides whether an MRF replay
+                // may acknowledge the entry.
+                return purge_stale_delete_marker_targets(&bucket, &dobj).await;
             }
             Err(err) => {
                 source_state_verified = false;
@@ -1491,21 +1501,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         let dsc_clone = dsc.clone();
         let storage_clone = storage.clone();
         tokio::spawn(async move {
-            for _ in 0..5 {
-                if let Some(delete_marker_version_id) = dobj_clone.delete_object.delete_marker_version_id
-                    && source_delete_marker_missing(
-                        &*storage_clone,
-                        &bucket_clone,
-                        &dobj_clone.delete_object.object_name,
-                        delete_marker_version_id,
-                    )
-                    .await
-                {
-                    replicate_delete_marker_purge_to_targets(&bucket_clone, &dobj_clone, &dsc_clone).await;
-                    break;
-                }
-                tokio::time::sleep(TokioDuration::from_secs(1)).await;
-            }
+            watch_and_purge_source_delete_marker(bucket_clone, dobj_clone, dsc_clone, storage_clone).await;
         });
     }
 
@@ -1608,12 +1604,36 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         }
     };
 
+    replicate_delete_outcome(
+        expected_targets,
+        rinfos.targets.len(),
+        state_persisted,
+        source_state_verified,
+        &replication_status,
+    )
+}
+
+/// Whether a delete replication fully succeeded — the MRF replay acknowledges
+/// (drops) an entry exactly when this returns true.
+///
+/// The delayed purge is deliberately NOT an input: holding the outcome hostage
+/// to it (`&& !requires_delayed_purge`) forced `false` for every delete-marker
+/// entry and retained them all in the durable MRF journal forever. Purge
+/// failures persist their own purge-intent entry instead
+/// (`watch_and_purge_source_delete_marker`), and replays of those entries
+/// report purge success through `purge_stale_delete_marker_targets`.
+fn replicate_delete_outcome(
+    expected_targets: usize,
+    replicated_targets: usize,
+    state_persisted: bool,
+    source_state_verified: bool,
+    replication_status: &ReplicationStatusType,
+) -> bool {
     expected_targets > 0
-        && rinfos.targets.len() == expected_targets
+        && replicated_targets == expected_targets
         && state_persisted
         && source_state_verified
-        && !requires_delayed_purge
-        && replication_status == ReplicationStatusType::Completed
+        && *replication_status == ReplicationStatusType::Completed
 }
 
 async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
@@ -1663,20 +1683,48 @@ fn delete_marker_purge_version_id(
     })
 }
 
-async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
+/// One purge pass over the eligible targets. Returns the ARNs that must be
+/// retried: the remote DELETE failed, or the target client was unavailable
+/// (e.g. a runtime cache miss). Inconsistent recorded version mappings are a
+/// deliberate refusal — retrying cannot make guessing a version id safe — so
+/// they are logged and excluded from the retry set.
+async fn replicate_delete_marker_purge_to_targets(
+    bucket: &str,
+    dobj: &DeletedObjectReplicationInfo,
+    dsc: &ReplicateDecision,
+    retry_arns: Option<&[String]>,
+) -> Vec<String> {
     let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
-        return;
+        return Vec::new();
     };
 
+    let target_arns = dobj.admitted_target_arns();
+    let mut failed_arns = Vec::new();
     for tgt_entry in dsc.targets_map.values() {
         if !tgt_entry.replicate {
             continue;
         }
-        let target_arns = dobj.admitted_target_arns();
         if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
             continue;
         }
+        if let Some(retry_arns) = retry_arns
+            && !retry_arns.iter().any(|arn| arn == &tgt_entry.arn)
+        {
+            continue;
+        }
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
+            warn!(
+                event = EVENT_DELETE_MARKER_PURGE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket,
+                object = dobj.delete_object.object_name,
+                arn = tgt_entry.arn,
+                reason = "target_client_missing",
+                "Delete-marker purge attempt failed"
+            );
+            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "failed").increment(1);
+            failed_arns.push(tgt_entry.arn.clone());
             continue;
         };
 
@@ -1686,25 +1734,217 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
             delete_marker_version_id,
         ) else {
             warn!(
+                event = EVENT_DELETE_MARKER_PURGE_FAILED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                 bucket,
                 object = dobj.delete_object.object_name,
                 arn = tgt_entry.arn,
+                reason = "recorded_target_version_inconsistent",
                 "Skipping delete-marker purge: recorded target version metadata is inconsistent"
             );
             continue;
         };
 
-        let _ = tgt_client
+        match tgt_client
             .remove_object(
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
                 purge_version_id,
                 replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
-            .await;
+            .await
+        {
+            Ok(_) => {
+                counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "purged").increment(1);
+            }
+            // The marker version is already gone on the target: the purge goal
+            // is met. Strict S3 targets 404 here (RustFS/MinIO answer 204);
+            // treating it as a failure would retain the intent entry forever.
+            Err(error) if matches!(error.code.as_deref(), Some("NoSuchKey" | "NoSuchVersion")) => {
+                counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "purged").increment(1);
+            }
+            Err(error) => {
+                warn!(
+                    event = EVENT_DELETE_MARKER_PURGE_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    arn = tgt_entry.arn,
+                    error = %error,
+                    reason = "target_delete_failed",
+                    "Delete-marker purge attempt failed"
+                );
+                counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "failed").increment(1);
+                mark_replication_target_offline_if_needed(&tgt_client, &error).await;
+                failed_arns.push(tgt_entry.arn.clone());
+            }
+        }
     }
+    failed_arns
+}
+
+const DELETE_MARKER_PURGE_WATCH_ROUNDS: usize = 5;
+const DELETE_MARKER_PURGE_WATCH_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
+
+/// Watch the source delete marker for a short window after its replication.
+/// If the marker disappears (deleted before or while the replica landed),
+/// purge the replicated marker from the targets, retrying failed targets on
+/// later rounds. When the window drains with targets still dirty, persist the
+/// purge intent as a durable MRF entry so the next startup replays it through
+/// `purge_stale_delete_marker_targets`.
+async fn watch_and_purge_source_delete_marker<S: ReplicationStorage>(
+    bucket: String,
+    dobj: DeletedObjectReplicationInfo,
+    dsc: ReplicateDecision,
+    storage: Arc<S>,
+) {
+    let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
+        return;
+    };
+
+    // `pending` is None until the source marker is observed missing; after the
+    // first purge pass it holds the targets that still need a successful purge.
+    let mut pending: Option<Vec<String>> = None;
+    for round in 0..DELETE_MARKER_PURGE_WATCH_ROUNDS {
+        pending = match pending.take() {
+            None => {
+                if source_delete_marker_missing(&*storage, &bucket, &dobj.delete_object.object_name, delete_marker_version_id)
+                    .await
+                {
+                    Some(replicate_delete_marker_purge_to_targets(&bucket, &dobj, &dsc, None).await)
+                } else {
+                    None
+                }
+            }
+            Some(failed_arns) => Some(replicate_delete_marker_purge_to_targets(&bucket, &dobj, &dsc, Some(&failed_arns)).await),
+        };
+        if matches!(pending.as_deref(), Some([])) {
+            return;
+        }
+        if round + 1 < DELETE_MARKER_PURGE_WATCH_ROUNDS {
+            tokio::time::sleep(DELETE_MARKER_PURGE_WATCH_INTERVAL).await;
+        }
+    }
+    if let Some(failed_arns) = pending.filter(|failed_arns| !failed_arns.is_empty()) {
+        enqueue_delete_marker_purge_mrf(&dobj, failed_arns).await;
+    }
+}
+
+/// Shape an exhausted purge intent as a marker-creation delete entry. Replay
+/// reconstructs it with `delete_marker: true`, finds the source marker gone,
+/// and funnels into the stale-marker branch of `replicate_delete_with_outcome`
+/// — which re-runs the purge without touching source state and reports purge
+/// success as the replay outcome.
+fn delete_marker_purge_mrf_entry(dobj: &DeletedObjectReplicationInfo, failed_arns: Vec<String>) -> MrfReplicateEntry {
+    let mut entry = dobj.to_mrf_entry();
+    entry.delete_marker = true;
+    entry.version_id = None;
+    entry.retry_count = 0;
+    entry.target_arns = failed_arns;
+    entry
+}
+
+async fn enqueue_delete_marker_purge_mrf(dobj: &DeletedObjectReplicationInfo, failed_arns: Vec<String>) {
+    let arns = failed_arns.join(",");
+    let miss_reason = match runtime_sources::replication_pool() {
+        None => Some("replication_pool_unavailable"),
+        Some(pool) => match pool.persist_mrf_entry(delete_marker_purge_mrf_entry(dobj, failed_arns)).await {
+            ReplicationQueueAdmission::Queued => None,
+            _ => Some("mrf_save_unavailable"),
+        },
+    };
+    match miss_reason {
+        None => {
+            warn!(
+                event = EVENT_DELETE_MARKER_PURGE_MRF,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = dobj.bucket,
+                object = dobj.delete_object.object_name,
+                arns,
+                state = "queued",
+                "Delete-marker purge exhausted its watch window; intent persisted to the MRF journal"
+            );
+            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "mrf_queued").increment(1);
+        }
+        Some(reason) => {
+            warn!(
+                event = EVENT_DELETE_MARKER_PURGE_MRF,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = dobj.bucket,
+                object = dobj.delete_object.object_name,
+                arns,
+                state = "missed",
+                reason,
+                "Delete-marker purge intent could not be persisted for retry"
+            );
+            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "mrf_missed").increment(1);
+        }
+    }
+}
+
+/// The marker vanished at the source while its replication was still pending
+/// (a live race), or this is an MRF purge-intent replay. Any marker already
+/// replicated to a target must still be purged; run bounded retry passes and
+/// report the result so an MRF replay only acknowledges the entry once every
+/// target is clean. Live callers persist a fresh purge intent on failure;
+/// replay callers (`ReplicationType::Heal`) rely on Missed retention instead,
+/// so the journal does not accumulate duplicate entries.
+///
+/// Heal callers retry for the full watch window because the startup MRF
+/// processor runs before bucket metadata (and thus target clients) finishes
+/// initializing — the first pass can see `target_client_missing` and a later
+/// round resolves the client; the replay loop is serial and startup-only, so
+/// blocking it for up to the window per dirty entry is acceptable. Live
+/// callers run on replication workers where a down target would pin a worker
+/// for the whole window, so they attempt once and lean on the durable intent
+/// entry instead.
+async fn purge_stale_delete_marker_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo) -> bool {
+    let decision_str = dobj
+        .delete_object
+        .replication_state
+        .as_ref()
+        .map(|state| state.replicate_decision_str.clone())
+        .unwrap_or_default();
+    let dsc = match parse_replicate_decision(bucket, &decision_str) {
+        Ok(dsc) => dsc,
+        Err(error) => {
+            warn!(
+                event = EVENT_DELETE_MARKER_PURGE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket,
+                object = dobj.delete_object.object_name,
+                error = %error,
+                reason = "replicate_decision_parse_failed",
+                "Delete-marker purge attempt failed"
+            );
+            return false;
+        }
+    };
+    let rounds = if dobj.op_type == ReplicationType::Heal {
+        DELETE_MARKER_PURGE_WATCH_ROUNDS
+    } else {
+        1
+    };
+    let mut failed_arns = replicate_delete_marker_purge_to_targets(bucket, dobj, &dsc, None).await;
+    for _ in 1..rounds {
+        if failed_arns.is_empty() {
+            break;
+        }
+        tokio::time::sleep(DELETE_MARKER_PURGE_WATCH_INTERVAL).await;
+        failed_arns = replicate_delete_marker_purge_to_targets(bucket, dobj, &dsc, Some(&failed_arns)).await;
+    }
+    if failed_arns.is_empty() {
+        return true;
+    }
+    if dobj.op_type != ReplicationType::Heal {
+        enqueue_delete_marker_purge_mrf(dobj, failed_arns).await;
+    }
+    false
 }
 
 async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) -> bool {
@@ -3579,6 +3819,62 @@ mod tests {
             should_retry_delete_marker_purge(&dobj),
             "delete-marker creation should keep the late-arrival cleanup path so downstream purges can catch up"
         );
+    }
+
+    /// P1-21 regression guard for the outcome formula. A fully successful
+    /// delete-marker replication must acknowledge its MRF entry: the formula
+    /// once carried `&& !requires_delayed_purge`, which pinned every
+    /// delete-marker entry to Missed and retained the whole backlog forever.
+    /// (Deterministically staging a marker-creation entry in the durable
+    /// journal from e2e would require saturating the worker queues, so the
+    /// formula is pinned here instead; the purge-intent replay half is pinned
+    /// by the delayed-purge e2e pair.)
+    #[test]
+    fn test_replicate_delete_outcome_is_not_held_hostage_by_the_delayed_purge() {
+        assert!(
+            replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Completed),
+            "a completed delete-marker replication must be acknowledgeable even though a delayed purge watch is pending"
+        );
+        assert!(!replicate_delete_outcome(0, 0, true, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(2, 1, true, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, false, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, true, false, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Failed));
+    }
+
+    #[test]
+    fn test_delete_marker_purge_mrf_entry_replays_through_the_stale_marker_branch() {
+        let delete_marker_version_id = Uuid::new_v4();
+        let dobj = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                object_name: "doc.txt".to_string(),
+                // A version-purge flavored source event: the entry must still
+                // be reshaped as a marker-creation delete so replay funnels
+                // into the stale-marker branch instead of re-running the full
+                // delete replication (whose source-state stamping would fail
+                // against the already-purged version).
+                delete_marker: false,
+                version_id: Some(Uuid::new_v4()),
+                delete_marker_version_id: Some(delete_marker_version_id),
+                ..Default::default()
+            },
+            bucket: "bucket-a".to_string(),
+            ..Default::default()
+        };
+
+        let entry = delete_marker_purge_mrf_entry(&dobj, vec!["arn:a".to_string()]);
+
+        assert!(entry.delete_marker, "purge intents must replay as marker-creation deletes");
+        assert_eq!(entry.version_id, None, "the purged data version must not leak into the replay");
+        assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
+        assert_eq!(
+            entry.target_arns,
+            vec!["arn:a".to_string()],
+            "only the targets whose purge failed may be retried"
+        );
+        assert_eq!(entry.retry_count, 0);
+        assert_eq!(entry.bucket, "bucket-a");
+        assert_eq!(entry.object, "doc.txt");
     }
 
     #[test]
