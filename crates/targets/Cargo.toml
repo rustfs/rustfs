@@ -59,6 +59,12 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "tls12", "logging", "aws-lc-rs"] }
 lapin = { workspace = true, default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 libc = { workspace = true }
+# pulsar regenerates its protobuf bindings from `PulsarApi.proto` in build.rs on every
+# build, which needs `protoc`. Mainstream targets (Linux/macOS/Windows) get `protoc` from
+# CI or the system, so the base dependency stays lean. Non-mainstream Unix targets
+# (illumos/Solaris/*BSD) have no packaged `protoc`; they enable the `protobuf-src` feature
+# below, which builds a vendored `protoc` from C++ sources using the platform C/C++ toolchain.
+# See https://github.com/rustfs/rustfs/issues/3195.
 pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 regex = { workspace = true }
 rayon = { workspace = true }
@@ -89,6 +95,14 @@ parking_lot = { workspace = true }
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
 arc-swap = { workspace = true }
 metrics = { workspace = true }
+
+# Non-mainstream Unix targets have no packaged `protoc`, so pulsar's build-time protobuf
+# codegen would fail. Enable `protobuf-src` there to compile a vendored `protoc` from C++
+# sources. Cargo unions features across dependency tables, so this only augments the base
+# pulsar dependency on these targets and leaves Linux/macOS/Windows builds untouched.
+# See https://github.com/rustfs/rustfs/issues/3195.
+[target.'cfg(any(target_os = "illumos", target_os = "solaris", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry", "protobuf-src"] }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
