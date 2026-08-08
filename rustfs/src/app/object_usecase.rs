@@ -1974,6 +1974,13 @@ impl GetObjectResumeContext {
         range_start: i64,
         range_end: i64,
     ) -> Self {
+        let mut opts = opts;
+        if opts.version_id.is_none()
+            && let Some(version_id) = info.version_id
+        {
+            opts.version_id = Some(version_id.to_string());
+        }
+
         let mut ssec_headers = HeaderMap::new();
         for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
             if let Some(value) = request_headers.get(name) {
@@ -13101,6 +13108,70 @@ mod tests {
             1,
             "the relocated body must reopen exactly once"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_resume_context_pins_latest_version_for_reopen() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use tokio::io::AsyncReadExt as _;
+
+        let (_disk_paths, store, _context) = real_get_resume_test_context().await;
+        let bucket = format!("resume-latest-version-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned resume bucket");
+        let write_opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let body = vec![0xAA; 1024 * 1024];
+        let mut reader = PutObjReader::from_vec(body.clone());
+        let info = store
+            .put_object(&bucket, object, &mut reader, &write_opts)
+            .await
+            .expect("write initial version");
+        let initial_version = info.version_id.expect("versioned write must return a version ID");
+        let initial_version_string = initial_version.to_string();
+        let opts = get_opts(&bucket, object, None, None, &HeaderMap::new())
+            .await
+            .expect("latest GET opts must resolve");
+        assert!(opts.versioned, "the GET options must preserve bucket versioning state");
+        assert_eq!(opts.version_id, None, "a latest GET starts without an explicit version ID");
+
+        let ctx = GetObjectResumeContext::new(Arc::clone(&store), &bucket, object, opts, &HeaderMap::new(), &info, 0, -1);
+        assert_eq!(
+            ctx.opts.version_id.as_deref(),
+            Some(initial_version_string.as_str()),
+            "resume must pin the initial latest version before any reopen"
+        );
+
+        let replacement_body = vec![0xBB; 2 * 1024 * 1024];
+        let mut reader = PutObjReader::from_vec(replacement_body);
+        let replacement = store
+            .put_object(&bucket, object, &mut reader, &write_opts)
+            .await
+            .expect("write replacement latest version");
+        assert_ne!(replacement.version_id, Some(initial_version));
+
+        let mut reopened = ctx
+            .reopen(0)
+            .await
+            .expect("resume must reopen the version that the response committed to");
+        let mut reopened_body = Vec::new();
+        reopened
+            .read_to_end(&mut reopened_body)
+            .await
+            .expect("the pinned version must remain readable after a newer latest write");
+        assert_eq!(reopened_body, body);
     }
 
     #[tokio::test]
