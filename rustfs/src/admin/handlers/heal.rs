@@ -391,6 +391,7 @@ fn merge_peer_heal_statuses(
     mut snapshots: Vec<NodeHealStatusSnapshot>,
     peer_statuses: Vec<Result<Option<NodeHealStatusSnapshot>, String>>,
     expected_nodes: usize,
+    topology_complete: bool,
 ) -> S3Result<ClusterHealStatusSnapshot> {
     for peer_status in peer_statuses {
         match peer_status {
@@ -423,7 +424,13 @@ fn merge_peer_heal_statuses(
     if snapshots.is_empty() {
         return Err(cluster_heal_status_unavailable("no_node_status_available"));
     }
-    let complete = snapshots.len() == expected_nodes;
+    // Completeness requires every condition, not just the snapshot count: the
+    // peer queries iterate `peer_clients` while the topology check also
+    // examines `all_peer_clients`, and the two are populated independently —
+    // so during a reconfiguration the count can equal `expected_nodes` while
+    // the topology is known-incomplete. Counting alone would report a
+    // definitive answer precisely when the membership itself is in doubt.
+    let complete = topology_complete && snapshots.len() == expected_nodes;
     let mut status = aggregate_cluster_heal_status(snapshots);
     status.complete = complete;
     // A partial answer must never be mistakable for a definitive verdict: an
@@ -475,7 +482,7 @@ async fn read_cluster_heal_status(
     // queried. Proceed instead: the per-peer query below reports unavailable
     // slots as errors, and merge_peer_heal_statuses folds them into an
     // explicit partial answer (issue #5850).
-    if !peer_topology_complete(
+    let topology_complete = peer_topology_complete(
         expected_nodes,
         notification_system.peer_clients.len(),
         notification_system
@@ -489,7 +496,8 @@ async fn read_cluster_heal_status(
             .iter()
             .filter(|client| client.is_some())
             .count(),
-    ) {
+    );
+    if !topology_complete {
         warn!(
             event = EVENT_ADMIN_REQUEST_FAILED,
             component = LOG_COMPONENT_ADMIN_API,
@@ -510,7 +518,7 @@ async fn read_cluster_heal_status(
     }))
     .await;
 
-    merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes)
+    merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes, topology_complete)
 }
 
 fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
@@ -1978,12 +1986,12 @@ mod tests {
         // but the safety property of the previous fail-closed behaviour is
         // preserved: the partial answer is labelled Degraded, never Idle, so
         // unknown peer work cannot be mistaken for "nothing is running".
-        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2)
+        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2, true)
             .expect("an unreachable peer degrades the answer instead of destroying it");
         assert!(!partial.complete);
         assert_eq!(partial.state, HealRuntimeState::Degraded);
 
-        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2)
+        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2, true)
             .expect("an older peer degrades the answer instead of destroying it");
         assert!(!older_peer.complete);
         assert_eq!(older_peer.state, HealRuntimeState::Degraded);
@@ -1998,13 +2006,41 @@ mod tests {
             },
             None,
         );
-        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2)
+        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2, true)
             .expect("known active work may be reported as an explicit partial status");
         assert!(!partial_active.complete);
         assert_eq!(partial_active.state, HealRuntimeState::Active);
 
-        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2)
+        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2, true)
             .expect_err("no snapshot at all still fails closed");
+    }
+
+    #[test]
+    fn test_incomplete_topology_forces_partial_even_with_full_snapshot_count() {
+        // peer_clients and all_peer_clients are populated independently, so
+        // during a reconfiguration every queried peer can answer — snapshot
+        // count == expected_nodes — while the topology check knows the
+        // membership itself is in doubt. Completeness must AND in the
+        // topology verdict or the answer looks definitive exactly when it
+        // is not.
+        let snapshot = || {
+            NodeHealStatusSnapshot::for_test(
+                true,
+                true,
+                BackgroundHealInfo::default(),
+                rustfs_heal::HealOperationsSnapshot::default(),
+                None,
+            )
+        };
+        let full_count_incomplete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, false)
+            .expect("incomplete topology degrades the answer instead of destroying it");
+        assert!(!full_count_incomplete_topology.complete);
+        assert_eq!(full_count_incomplete_topology.state, HealRuntimeState::Degraded);
+
+        let full_count_complete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, true)
+            .expect("complete topology and full count is a definitive answer");
+        assert!(full_count_complete_topology.complete);
+        assert_eq!(full_count_complete_topology.state, HealRuntimeState::Idle);
     }
 
     #[test]
