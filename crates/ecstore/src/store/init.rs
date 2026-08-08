@@ -602,7 +602,7 @@ mod tests {
         error::{Error, Result, StorageError},
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-        services::rebalance::RebalanceMeta,
+        services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats},
         storage_api_contracts::{
             bucket::{BucketOperations as _, MakeBucketOptions},
             multipart::MultipartOperations as _,
@@ -1153,6 +1153,81 @@ mod tests {
         .expect("store should build around the fresh context");
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_skips_active_rebalance_source_pool() {
+        let temp_dir = tempfile::tempdir().expect("create batch-delete writer-fencing store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-delete-rebalance", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("batch-delete-rebalance-{}", uuid::Uuid::new_v4());
+        let object = "delete-me.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create batch delete rebalance bucket");
+
+        let mut source_reader = PutObjReader::from_vec(b"source-body".to_vec());
+        store.pools[0]
+            .put_object(&bucket, object, &mut source_reader, &ObjectOptions::default())
+            .await
+            .expect("write object on active source pool");
+        let mut target_reader = PutObjReader::from_vec(b"target-body".to_vec());
+        store.pools[1]
+            .put_object(&bucket, object, &mut target_reader, &ObjectOptions::default())
+            .await
+            .expect("write object on non-rebalancing target pool");
+
+        let mut pool_stats = vec![RebalanceStats::default(); store.pools.len()];
+        pool_stats[0] = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            pool_stats,
+            ..Default::default()
+        });
+        assert!(store.is_pool_rebalancing(0).await, "pool 0 must be marked as an active rebalance source");
+
+        let (deleted, errs) = store
+            .delete_objects(
+                &bucket,
+                vec![crate::storage_api_contracts::object::ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(matches!(errs.as_slice(), [None]), "batch delete must not fail: {errs:?}");
+        assert!(
+            matches!(deleted.as_slice(), [deleted] if deleted.found && deleted.object_name == object),
+            "batch delete must report the non-rebalancing pool deletion"
+        );
+
+        store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("active source pool object must not be deleted by DeleteObjects");
+        let target_err = store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("non-rebalancing target pool object must be deleted");
+        assert!(
+            matches!(target_err, StorageError::ObjectNotFound(_, _)),
+            "target pool should report object not found after DeleteObjects, got {target_err:?}"
+        );
+
+        shutdown.cancel();
     }
 
     #[tokio::test]
