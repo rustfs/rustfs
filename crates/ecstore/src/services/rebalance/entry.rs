@@ -18,8 +18,8 @@ use super::meta::{
 };
 use super::migration::migrate_entry_version;
 use super::worker::{
-    RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts, resolve_rebalance_bucket_error,
-    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+    RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
+    resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
     resolve_rebalance_migrate_result_error, resolve_rebalance_stats_update_result, resolve_rebalance_worker_result,
     run_rebalance_listing_with_retry, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
     should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks,
@@ -50,11 +50,14 @@ impl ECStore {
         bucket: &str,
         object: &str,
         stats_updates: &[&FileInfo],
-        cleanup: impl std::future::Future<Output = Result<ObjectInfo>>,
-    ) -> Result<Option<String>> {
+        cleanup: impl std::future::Future<Output = std::result::Result<ObjectInfo, data_movement::SourceCleanupError>>,
+    ) -> Result<RebalanceEntryCleanupResult> {
         // Persisted stats can complete a pool on restart, so source cleanup must resolve first.
-        let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(cleanup.await, bucket, object)?;
-        if let Some(message) = cleanup_warning.as_ref()
+        let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup.await, bucket, object);
+        let RebalanceEntryCleanupResult::Completed { warning } = cleanup_result else {
+            return Ok(cleanup_result);
+        };
+        if let Some(message) = warning.as_ref()
             && let Err(err) = self
                 .record_rebalance_cleanup_warning(pool_index, bucket, object, message.clone())
                 .await
@@ -80,7 +83,7 @@ impl ECStore {
             object,
         )?;
 
-        Ok(cleanup_warning)
+        Ok(RebalanceEntryCleanupResult::Completed { warning })
     }
 
     #[allow(unused_assignments)]
@@ -255,7 +258,7 @@ impl ECStore {
                 );
                 if should_defer_rebalance_entry_failure(&err) {
                     let deferred_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} {err}");
-                    warn!(
+                    debug!(
                         event = EVENT_REBALANCE_ENTRY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REBALANCE,
@@ -300,7 +303,7 @@ impl ECStore {
         }
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len(), expired) {
-            let cleanup_warning = self
+            let cleanup_result = self
                 .finish_rebalance_entry_after_cleanup(
                     pool_index,
                     bucket.as_str(),
@@ -316,30 +319,47 @@ impl ECStore {
                     ),
                 )
                 .await?;
-            if let Some(message) = cleanup_warning {
-                warn!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    stage = "cleanup_source",
-                    cleanup_status = "failed_ignored",
-                    error = %message,
-                    "Ignored rebalance source cleanup failure"
-                );
-            } else {
-                debug!(
-                    event = EVENT_REBALANCE_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket = %bucket,
-                    object = %entry.name,
-                    state = "source_deleted",
-                    "Deleted rebalance source entry"
-                );
+            match cleanup_result {
+                RebalanceEntryCleanupResult::Deferred { last_error } => {
+                    debug!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "deferred",
+                        error = %last_error,
+                        "Deferred rebalance entry after source cleanup conflict"
+                    );
+                    return Ok(RebalanceEntryOutcome::Deferred { last_error });
+                }
+                RebalanceEntryCleanupResult::Completed { warning: Some(message) } => {
+                    warn!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        stage = "cleanup_source",
+                        cleanup_status = "failed_ignored",
+                        error = %message,
+                        "Ignored rebalance source cleanup failure"
+                    );
+                }
+                RebalanceEntryCleanupResult::Completed { warning: None } => {
+                    debug!(
+                        event = EVENT_REBALANCE_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        pool_index,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        state = "source_deleted",
+                        "Deleted rebalance source entry"
+                    );
+                }
             }
         } else if rebalanced != fivs.versions.len() || expired > 0 {
             warn!(
@@ -655,13 +675,12 @@ mod tests {
         );
 
         release_cleanup.send(()).expect("cleanup waiter should remain alive");
-        assert!(
+        assert_eq!(
             finish
                 .await
                 .expect("finish task should not panic")
-                .expect("finish should succeed")
-                .is_none(),
-            "successful cleanup should not produce a warning"
+                .expect("finish should succeed"),
+            RebalanceEntryCleanupResult::Completed { warning: None }
         );
         assert!(
             store
@@ -680,14 +699,33 @@ mod tests {
             let mut meta = store.rebalance_meta.write().await;
             meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
         }
-        let warning = store
-            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], async { Err(Error::SlowDown) })
+        let warning_result = store
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], async {
+                Err(Error::SlowDown.into())
+            })
             .await
             .expect("cleanup warnings should not fail the completed migration");
-        assert!(warning.is_some(), "cleanup failure should return a warning");
+        assert!(matches!(warning_result, RebalanceEntryCleanupResult::Completed { warning: Some(_) }));
         let meta = store.rebalance_meta.read().await;
         let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
         assert_eq!(pool_stats.cleanup_warnings.count, 1, "cleanup warning must block pool completion");
         assert!(pool_stats.bytes > 0, "completed migration bytes should still be recorded");
+        drop(meta);
+
+        {
+            let mut meta = store.rebalance_meta.write().await;
+            meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
+        }
+        let deferred = store
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], async {
+                Err(data_movement::SourceCleanupError::SourceChanged)
+            })
+            .await
+            .expect("source changes should defer cleanup without failing the worker");
+        assert!(matches!(deferred, RebalanceEntryCleanupResult::Deferred { .. }));
+        let meta = store.rebalance_meta.read().await;
+        let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
+        assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
+        assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
     }
 }

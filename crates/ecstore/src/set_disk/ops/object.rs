@@ -7626,7 +7626,10 @@ mod transition_upload_integrity_tests {
             .await
             .expect("cleanup task should not panic")
             .expect_err("cleanup must fail after its outer namespace lock loses refresh quorum");
-        assert!(matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }));
+        assert!(matches!(
+            error,
+            crate::data_movement::SourceCleanupError::Storage(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 

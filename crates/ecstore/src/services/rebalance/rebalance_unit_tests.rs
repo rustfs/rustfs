@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX;
 use super::control::validate_rebalance_disk_stats_coverage;
 use super::meta::{
     RebalanceMetaMergeOutcome, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
@@ -33,23 +32,27 @@ use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
     rebalance_delete_marker_opts,
 };
+use super::runtime::{should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt};
 use super::worker::{
-    ensure_rebalance_listing_disks_available, is_transient_rebalance_error, parse_rebalance_max_attempts,
-    rebalance_listing_retry_delay, rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result,
-    resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
-    resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
-    resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result,
-    resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-    run_rebalance_listing_with_retry, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
-    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_retry_rebalance_listing,
-    should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
+    RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
+    parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
+    resolve_load_rebalance_stats_update_result, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
+    resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+    resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result, resolve_rebalance_migrate_result_error,
+    resolve_rebalance_optional_bucket_config_result, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
+    resolve_rebalance_terminal_error, resolve_rebalance_worker_result, run_rebalance_listing_with_retry,
+    send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
+    should_defer_rebalance_entry_failure, should_retry_rebalance_listing, should_skip_rebalance_delete_marker,
+    wait_rebalance_entry_tasks, wait_rebalance_listing_retry, with_rebalance_entry_context,
 };
 use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
     RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
 };
+use super::{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX};
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
+use crate::data_movement::SourceCleanupError;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::disk::error::DiskError;
@@ -1665,26 +1668,63 @@ fn test_resolve_rebalance_meta_load_result_wraps_error_context() {
 #[test]
 fn test_resolve_rebalance_entry_cleanup_delete_result_passthrough() {
     let result = resolve_rebalance_entry_cleanup_delete_result(Ok(ObjectInfo::default()), "bucket-a", "obj.txt");
-    assert_eq!(result.expect("successful cleanup should pass through"), None);
+    assert_eq!(result, RebalanceEntryCleanupResult::Completed { warning: None });
 }
 
 #[test]
 fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_not_found() {
     let result = resolve_rebalance_entry_cleanup_delete_result(
-        Err(Error::ObjectNotFound("bucket-a".to_string(), "obj.txt".to_string())),
+        Err(Error::ObjectNotFound("bucket-a".to_string(), "obj.txt".to_string()).into()),
         "bucket-a",
         "obj.txt",
     );
-    assert_eq!(result.expect("missing cleanup source should be ignored"), None);
+    assert_eq!(result, RebalanceEntryCleanupResult::Completed { warning: None });
 }
 
 #[test]
 fn test_resolve_rebalance_entry_cleanup_delete_result_returns_warning_for_failures() {
-    let warning = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
-        .expect("cleanup delete failures should be downgraded to warnings")
-        .expect("cleanup delete failure should return warning");
-    let message = warning.as_str();
-    assert!(message.contains("rebalance cleanup delete failed for bucket-a/obj.txt"));
+    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown.into()), "bucket-a", "obj.txt");
+    assert!(matches!(
+        result,
+        RebalanceEntryCleanupResult::Completed { warning: Some(ref message) }
+            if message.contains("rebalance cleanup delete failed for bucket-a/obj.txt")
+    ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_defers_source_change() {
+    let result = resolve_rebalance_entry_cleanup_delete_result(Err(SourceCleanupError::SourceChanged), "bucket-a", "obj.txt");
+    assert!(matches!(
+        result,
+        RebalanceEntryCleanupResult::Deferred { ref last_error }
+            if last_error.starts_with(REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX)
+                && last_error.contains("source changed during cleanup preflight for bucket-a/obj.txt")
+    ));
+}
+
+#[test]
+fn test_resolve_rebalance_entry_cleanup_delete_result_does_not_defer_other_precondition_failure() {
+    let result = resolve_rebalance_entry_cleanup_delete_result(Err(Error::PreconditionFailed.into()), "bucket-a", "obj.txt");
+    assert!(matches!(
+        result,
+        RebalanceEntryCleanupResult::Completed { warning: Some(ref message) }
+            if message.contains("rebalance cleanup delete failed for bucket-a/obj.txt")
+    ));
+}
+
+#[test]
+fn test_source_cleanup_defer_does_not_fail_repeated_bucket_retry() {
+    let mut deferred_buckets = std::collections::HashSet::new();
+
+    assert!(!should_fail_repeated_rebalance_bucket_defer(&mut deferred_buckets, "bucket-a", true));
+    assert!(!should_fail_repeated_rebalance_bucket_defer(&mut deferred_buckets, "bucket-a", true));
+    assert!(!should_fail_repeated_rebalance_bucket_defer(&mut deferred_buckets, "bucket-b", false));
+    assert!(should_fail_repeated_rebalance_bucket_defer(&mut deferred_buckets, "bucket-b", false));
+
+    let mut source_attempts = std::collections::HashMap::new();
+    assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 1);
+    assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 2);
+    assert_eq!(source_cleanup_defer_attempt(&mut source_attempts, "bucket-c"), 3);
 }
 
 #[test]
