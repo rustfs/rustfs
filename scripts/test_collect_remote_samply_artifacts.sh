@@ -11,6 +11,10 @@ mkdir -p "$mock_bin"
 cat >"$mock_bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if read -r consumed; then
+  printf 'ssh-consumed-stdin:%s\n' "$consumed" >>"$CALL_LOG"
+  exit 24
+fi
 printf 'ssh:%s\n' "$*" >>"$CALL_LOG"
 echo "profile.json.gz 128 bytes"
 echo "profile.syms.json 64 bytes"
@@ -47,7 +51,12 @@ output=$("$repo_root/scripts/collect_remote_samply_artifacts.sh" \
 [[ "$output" == "collected_nodes=2" ]]
 [[ -f "$tmp_dir/out/vm004/copied-profile.json.gz" ]]
 [[ -f "$tmp_dir/out/vm005/copied-profile.json.gz" ]]
+[[ "$(grep -c '^ssh:' "$CALL_LOG")" -eq 2 ]]
 [[ "$(grep -c '^scp:' "$CALL_LOG")" -eq 2 ]]
+if grep -q '^ssh-consumed-stdin:' "$CALL_LOG"; then
+  echo "ssh consumed the mapping loop stdin" >&2
+  exit 1
+fi
 if grep -q '^scp-consumed-stdin:' "$CALL_LOG"; then
   echo "scp consumed the mapping loop stdin" >&2
   exit 1

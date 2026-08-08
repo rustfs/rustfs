@@ -89,7 +89,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
   quoted_remote_dir=$(shell_quote "$remote_dir")
   remote_cmd="chmod -R a+rX $quoted_remote_dir; find $quoted_remote_dir -maxdepth 1 -type f -printf '%f %s bytes\n'"
-  "$SSH_BIN" "$node" "sudo su - root -c $(shell_quote "$remote_cmd")" >"$OUT_DIR/${node}-files.txt" 2>&1
+  "$SSH_BIN" "$node" "sudo su - root -c $(shell_quote "$remote_cmd")" >"$OUT_DIR/${node}-files.txt" 2>&1 </dev/null
   "$SCP_BIN" -q -r "$node:${remote_dir%/}/"* "$node_out_dir/" </dev/null 2>"$OUT_DIR/${node}-scp.err"
   processed=$((processed + 1))
 done <"$MAPPING"
