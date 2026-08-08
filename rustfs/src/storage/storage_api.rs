@@ -89,6 +89,8 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
+pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
@@ -513,9 +515,10 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
-        ObjectEncryptionResolver, ObjectMutationHook, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
+        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 

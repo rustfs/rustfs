@@ -4651,7 +4651,7 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
 /// unobserved object records nothing, keeping the registry bounded, and each
 /// [`CallCounterScope`] clears only its own object's counts on drop.
 #[cfg(test)]
-pub(in crate::set_disk) mod disk_call_counters {
+pub(crate) mod disk_call_counters {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex, OnceLock};
 

@@ -22,6 +22,7 @@ use super::{
     Query,
     execution::{Output, QueryStateMachine},
     logical_planner::Plan,
+    session::QueryAdmission,
 };
 
 #[async_trait]
@@ -31,6 +32,14 @@ pub trait QueryDispatcher: Send + Sync {
     // fn query_info(&self, id: &QueryId);
 
     async fn execute_query(&self, query: &Query) -> QueryResult<Output>;
+
+    fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
+        Ok(QueryAdmission::unmanaged())
+    }
+
+    async fn execute_query_admitted(&self, query: &Query, _admission: QueryAdmission) -> QueryResult<Output> {
+        self.execute_query(query).await
+    }
 
     async fn build_logical_plan(&self, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>>;
 

@@ -20,6 +20,7 @@ use crate::{
         Query,
         execution::{Output, QueryStateMachineRef},
         logical_planner::Plan,
+        session::QueryAdmission,
     },
 };
 
@@ -44,7 +45,16 @@ impl QueryHandle {
 
 #[async_trait]
 pub trait DatabaseManagerSystem {
+    fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
+        Ok(QueryAdmission::unmanaged())
+    }
+
     async fn execute(&self, query: &Query) -> QueryResult<QueryHandle>;
+
+    async fn execute_admitted(&self, query: &Query, _admission: QueryAdmission) -> QueryResult<QueryHandle> {
+        self.execute(query).await
+    }
+
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<QueryStateMachineRef>;
     async fn build_logical_plan(&self, query_state_machine: QueryStateMachineRef) -> QueryResult<Option<Plan>>;
     async fn execute_logical_plan(

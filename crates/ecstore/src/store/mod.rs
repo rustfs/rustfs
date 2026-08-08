@@ -152,7 +152,10 @@ mod list;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
-pub use object::PreparedGetObjectReader;
+pub use object::{
+    PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
+    SnapshotConsistencyError,
+};
 mod peer;
 mod rebalance;
 pub(crate) mod utils;
