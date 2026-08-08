@@ -1033,7 +1033,8 @@ impl HealTask {
                     bucket,
                     object,
                     object_size = object_size,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                     result = "ok",
                     "Heal object repaired"
                 );
@@ -1329,7 +1330,8 @@ impl HealTask {
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
                     bucket,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                     recursive = self.options.recursive,
                     result = "ok",
                     "Heal bucket completed"
@@ -1773,7 +1775,8 @@ impl HealTask {
                     task_id = %self.id,
                     bucket,
                     object,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                     result = "ok",
                     "Heal metadata repaired"
                 );
@@ -1904,7 +1907,8 @@ impl HealTask {
                     meta_path,
                     bucket,
                     object = %object,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                     result = "ok",
                     "Heal MRF repaired"
                 );
@@ -2068,7 +2072,8 @@ impl HealTask {
                     bucket,
                     object,
                     object_size,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                     result = "ok",
                     "Heal EC decode repaired"
                 );
@@ -2198,7 +2203,8 @@ impl HealTask {
                         subsystem = LOG_SUBSYSTEM_TASK,
                         task_id = %self.id,
                         set_disk_id,
-                        drives_healed = result.after.drives.len(),
+                        drives_healed = result.drives_healed(),
+                    drives_total = result.after.drives.len(),
                         result = "format_ok",
                         "Heal erasure set format repaired"
                     );
