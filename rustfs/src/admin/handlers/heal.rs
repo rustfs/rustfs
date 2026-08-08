@@ -231,6 +231,11 @@ enum HealRuntimeState {
     Uninitialized,
     Idle,
     Active,
+    /// One or more nodes were unreachable and the reachable ones report no
+    /// active work, so no definitive cluster verdict exists. Distinct from
+    /// `Idle` on purpose: an unreachable peer might be healing, and a partial
+    /// answer must not read as "nothing is running".
+    Degraded,
 }
 
 #[cfg(test)]
@@ -407,20 +412,30 @@ fn merge_peer_heal_statuses(
                     component = LOG_COMPONENT_ADMIN_API,
                     subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
                     operation = "background_heal_status",
-                    result = "failed",
+                    result = "degraded",
                     reason = "peer_status_unavailable",
                     error = %err,
                     "cluster heal peer status unavailable"
                 );
-                return Err(cluster_heal_status_unavailable("peer_status_unavailable"));
             }
         }
+    }
+    if snapshots.is_empty() {
+        return Err(cluster_heal_status_unavailable("no_node_status_available"));
     }
     let complete = snapshots.len() == expected_nodes;
     let mut status = aggregate_cluster_heal_status(snapshots);
     status.complete = complete;
+    // A partial answer must never be mistakable for a definitive verdict: an
+    // unreachable peer might be mid-heal, so reporting the reachable nodes'
+    // "idle" (or disabled/uninitialized) as the cluster state would falsely
+    // reassure. Known-active work is safe to report as-is — it cannot
+    // reassure. Everything else degrades to an explicit Degraded state so the
+    // caller still gets the reachable nodes' data (queue depths, progress,
+    // bitrot cycle) with an honest label, instead of the previous cluster-wide
+    // 500 that carried no information at all (issue #5850).
     if !complete && status.state != HealRuntimeState::Active {
-        return Err(cluster_heal_status_unavailable("peer_status_unsupported_without_known_active_work"));
+        status.state = HealRuntimeState::Degraded;
     }
     Ok(status)
 }
@@ -455,6 +470,11 @@ async fn read_cluster_heal_status(
     let Some(notification_system) = notification_system else {
         return Err(cluster_heal_status_unavailable("notification_system_unavailable"));
     };
+    // An incomplete peer topology (a down member's client slot, a rolling
+    // upgrade) previously failed the whole endpoint here, before any peer was
+    // queried. Proceed instead: the per-peer query below reports unavailable
+    // slots as errors, and merge_peer_heal_statuses folds them into an
+    // explicit partial answer (issue #5850).
     if !peer_topology_complete(
         expected_nodes,
         notification_system.peer_clients.len(),
@@ -470,7 +490,15 @@ async fn read_cluster_heal_status(
             .filter(|client| client.is_some())
             .count(),
     ) {
-        return Err(cluster_heal_status_unavailable("peer_topology_incomplete"));
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "background_heal_status",
+            result = "degraded",
+            reason = "peer_topology_incomplete",
+            "cluster heal status will be partial"
+        );
     }
 
     let peer_statuses = join_all(notification_system.peer_clients.iter().map(|client| async move {
@@ -1936,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_status_merge_fails_closed_but_degrades_for_older_peers() {
+    fn test_peer_status_merge_degrades_explicitly_and_never_claims_idle() {
         let local = || {
             NodeHealStatusSnapshot::for_test(
                 true,
@@ -1946,11 +1974,19 @@ mod tests {
                 None,
             )
         };
-        let error = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2)
-            .expect_err("peer failure must fail closed");
-        assert_eq!(error.message(), Some("cluster heal status unavailable"));
+        // An unreachable peer must not fail the whole endpoint (issue #5850) —
+        // but the safety property of the previous fail-closed behaviour is
+        // preserved: the partial answer is labelled Degraded, never Idle, so
+        // unknown peer work cannot be mistaken for "nothing is running".
+        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2)
+            .expect("an unreachable peer degrades the answer instead of destroying it");
+        assert!(!partial.complete);
+        assert_eq!(partial.state, HealRuntimeState::Degraded);
 
-        merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2).expect_err("unknown peer work must not be reported as idle");
+        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2)
+            .expect("an older peer degrades the answer instead of destroying it");
+        assert!(!older_peer.complete);
+        assert_eq!(older_peer.state, HealRuntimeState::Degraded);
 
         let known_active = NodeHealStatusSnapshot::for_test(
             true,
@@ -1962,9 +1998,28 @@ mod tests {
             },
             None,
         );
-        let partial = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2)
+        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2)
             .expect("known active work may be reported as an explicit partial status");
-        assert!(!partial.complete);
+        assert!(!partial_active.complete);
+        assert_eq!(partial_active.state, HealRuntimeState::Active);
+
+        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2)
+            .expect_err("no snapshot at all still fails closed");
+    }
+
+    #[test]
+    fn test_degraded_state_serializes_distinctly_from_idle() {
+        let encoded = encode_background_heal_status(
+            &BackgroundHealInfo::default(),
+            HealRuntimeState::Degraded,
+            rustfs_heal::HealOperationsSnapshot::default(),
+            None,
+            false,
+        )
+        .expect("degraded status must serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("valid json");
+        assert_eq!(json["state"], "degraded");
+        assert_eq!(json["clusterStatusComplete"], false);
     }
 
     #[tokio::test]
