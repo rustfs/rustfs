@@ -77,9 +77,9 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const REPLAY_CACHE_RETENTION_SECS: usize = 601;
 const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
-const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 4;
-const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 1024;
-const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 8_388_608;
+const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 8;
+const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 2048;
+const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 16_777_216;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
@@ -2301,9 +2301,21 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 5_368_709);
-        assert_eq!(decision.cpu_based_capacity, 4_923_392);
-        assert_eq!(decision.capacity, 4_923_392);
+        assert_eq!(decision.memory_based_capacity, 10_737_418);
+        assert_eq!(decision.cpu_based_capacity, 9_846_784);
+        assert_eq!(decision.capacity, 9_846_784);
+    }
+
+    #[test]
+    fn replay_cache_capacity_auto_reaches_hotpath_verified_capacity_on_larger_nodes() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let decision =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
+
+        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
+        assert_eq!(decision.memory_based_capacity, 21_474_836);
+        assert_eq!(decision.cpu_based_capacity, 19_693_568);
+        assert_eq!(decision.capacity, 16_777_216);
     }
 
     #[test]
@@ -2325,7 +2337,7 @@ mod tests {
         let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
-        assert_eq!(decision.capacity, 4_923_392);
+        assert_eq!(decision.capacity, 9_846_784);
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
