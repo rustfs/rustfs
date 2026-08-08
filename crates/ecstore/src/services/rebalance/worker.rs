@@ -2,10 +2,12 @@ use super::migration::MigrationVersionResult;
 use super::{
     DEFAULT_REBALANCE_MAX_ATTEMPTS, EVENT_REBALANCE_LISTING, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
     REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_MAX_ATTEMPTS_ENV, REBALANCE_MIGRATION_LOCK_RETRY_CAP,
-    REBALANCE_MIGRATION_RETRY_BASE_DELAY, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
+    REBALANCE_MIGRATION_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalanceBucketConfigs,
+    RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::core::pools::ListCallback;
+use crate::data_movement::SourceCleanupError;
 use crate::disk::error::DiskError;
 use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
@@ -35,6 +37,12 @@ pub(super) fn resolve_rebalance_worker_result<T>(
 }
 
 pub(super) type RebalanceEntryTask = tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RebalanceEntryCleanupResult {
+    Completed { warning: Option<String> },
+    Deferred { last_error: String },
+}
 
 pub(super) async fn wait_rebalance_entry_tasks(
     set_idx: usize,
@@ -145,14 +153,23 @@ where
 }
 
 pub(super) fn resolve_rebalance_entry_cleanup_delete_result(
-    result: Result<crate::object_api::ObjectInfo>,
+    result: std::result::Result<crate::object_api::ObjectInfo, SourceCleanupError>,
     bucket: &str,
     object_name: &str,
-) -> Result<Option<String>> {
+) -> RebalanceEntryCleanupResult {
     match result {
-        Ok(_) => Ok(None),
-        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
-        Err(err) => Ok(Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
+        Ok(_) => RebalanceEntryCleanupResult::Completed { warning: None },
+        Err(SourceCleanupError::Storage(err)) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+            RebalanceEntryCleanupResult::Completed { warning: None }
+        }
+        Err(SourceCleanupError::SourceChanged) => RebalanceEntryCleanupResult::Deferred {
+            last_error: format!(
+                "{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} source changed during cleanup preflight for {bucket}/{object_name}"
+            ),
+        },
+        Err(SourceCleanupError::Storage(err)) => RebalanceEntryCleanupResult::Completed {
+            warning: Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}")),
+        },
     }
 }
 
