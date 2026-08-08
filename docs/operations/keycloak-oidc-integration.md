@@ -154,9 +154,11 @@ If RustFS reaches Keycloak through an internal URL while tokens use a public iss
 ```bash
 export RUSTFS_IDENTITY_OPENID_CONFIG_URL="http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs/.well-known/openid-configuration"
 export RUSTFS_IDENTITY_OPENID_ISSUER="https://keycloak.example.com/realms/rustfs"
+export RUSTFS_OUTBOUND_ALLOW_ORIGINS="http://keycloak.keycloak.svc.cluster.local:8080"
 ```
 
 Discovery and issuer-relative JWKS requests use the internal `CONFIG_URL` base. ID token issuer validation still uses `ISSUER`.
+The outbound allowlist entry is the exact internal origin only; do not include the realm or discovery path. RustFS reads this process setting at startup, so restart every RustFS node after changing it.
 Use HTTPS with a trusted CA for the internal URL whenever possible. Discovery and JWKS define the token-signing trust root; use HTTP only on a network where DNS and traffic cannot be tampered with, because a compromised response can authorize forged tokens.
 
 For short-lived connectivity testing only, you may temporarily add:
@@ -287,6 +289,7 @@ Expected flow:
 | Groups appear as `/consoleAdmin` | Keycloak `Full group path` is enabled | Disable `Full group path`. |
 | Console redirects to an internal host | Missing `RUSTFS_BROWSER_REDIRECT_URL` or incorrect proxy headers | Set `RUSTFS_BROWSER_REDIRECT_URL` to the public browser origin. |
 | Invalid or expired OIDC state | Callback reached a different RustFS node | Configure load-balancer session affinity for authorize and callback requests. |
+| OIDC provider or login button is missing after upgrading to beta.12+ | The internal Keycloak origin is blocked by the outbound policy | Add the exact `scheme://host:port` origin to `RUSTFS_OUTBOUND_ALLOW_ORIGINS` and restart every RustFS node. |
 
 ## 7. Production Checklist
 
@@ -299,3 +302,4 @@ Expected flow:
 - [ ] `role_policy=consoleAdmin` is not used as a permanent production shortcut.
 - [ ] The load balancer preserves query strings.
 - [ ] OIDC authorize and callback requests have session affinity to the same RustFS node.
+- [ ] Internal Keycloak origins are listed exactly in `RUSTFS_OUTBOUND_ALLOW_ORIGINS` on every RustFS node.

@@ -18,6 +18,17 @@ use super::{
 };
 use crate::oidc::{OidcProviderConfig, OidcProviderSummary};
 
+const DEFAULT_OIDC_PROVIDER_ID: &str = "default";
+
+fn sorted_provider_summaries(mut providers: Vec<OidcProviderSummary>) -> Vec<OidcProviderSummary> {
+    providers.sort_by(|left, right| {
+        (left.provider_id != DEFAULT_OIDC_PROVIDER_ID)
+            .cmp(&(right.provider_id != DEFAULT_OIDC_PROVIDER_ID))
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
+    });
+    providers
+}
+
 pub struct FederatedIdentityService {
     registry: FederatedIdentityRegistry,
 }
@@ -32,11 +43,11 @@ impl FederatedIdentityService {
     }
 
     pub fn list_providers(&self) -> Vec<OidcProviderSummary> {
-        self.registry.standard_oidc().list_providers()
+        sorted_provider_summaries(self.registry.standard_oidc().list_providers())
     }
 
     pub fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
-        self.registry.standard_oidc().list_visible_providers()
+        sorted_provider_summaries(self.registry.standard_oidc().list_visible_providers())
     }
 
     pub fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
@@ -158,6 +169,8 @@ mod tests {
         failure: ProviderFailure,
         events: Arc<Mutex<Vec<&'static str>>>,
         expected_logout: (&'static str, &'static str),
+        listed_provider_ids: Vec<&'static str>,
+        visible_provider_ids: Vec<&'static str>,
     }
 
     impl TestProvider {
@@ -165,11 +178,13 @@ mod tests {
             Self {
                 with_policy: true,
                 with_group: false,
-                browser_provider_id: "default",
-                web_provider_id: "default",
+                browser_provider_id: DEFAULT_OIDC_PROVIDER_ID,
+                web_provider_id: DEFAULT_OIDC_PROVIDER_ID,
                 failure: ProviderFailure::None,
                 events,
-                expected_logout: ("default", "id-token"),
+                expected_logout: (DEFAULT_OIDC_PROVIDER_ID, "id-token"),
+                listed_provider_ids: Vec::new(),
+                visible_provider_ids: Vec::new(),
             }
         }
 
@@ -203,6 +218,16 @@ mod tests {
         }
     }
 
+    fn provider_summaries(provider_ids: &[&str]) -> Vec<OidcProviderSummary> {
+        provider_ids
+            .iter()
+            .map(|provider_id| OidcProviderSummary {
+                provider_id: (*provider_id).to_string(),
+                display_name: (*provider_id).to_string(),
+            })
+            .collect()
+    }
+
     #[async_trait::async_trait]
     impl FederatedIdentityProvider for TestProvider {
         fn has_providers(&self) -> bool {
@@ -210,11 +235,11 @@ mod tests {
         }
 
         fn list_providers(&self) -> Vec<OidcProviderSummary> {
-            Vec::new()
+            provider_summaries(&self.listed_provider_ids)
         }
 
         fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
-            Vec::new()
+            provider_summaries(&self.visible_provider_ids)
         }
 
         fn provider_config(&self, _id: &str) -> Option<&OidcProviderConfig> {
@@ -300,6 +325,39 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    #[test]
+    fn provider_listing_puts_default_first_and_sorts_named_providers() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TestProvider::new(events);
+        provider.listed_provider_ids = vec!["zeta", "hidden", DEFAULT_OIDC_PROVIDER_ID, "alpha"];
+        provider.visible_provider_ids = vec!["zeta", DEFAULT_OIDC_PROVIDER_ID, "alpha"];
+        let service = FederatedIdentityService::new(FederatedIdentityRegistry::new(Arc::new(provider)));
+
+        assert_eq!(
+            service
+                .list_providers()
+                .into_iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            [DEFAULT_OIDC_PROVIDER_ID, "alpha", "hidden", "zeta"]
+        );
+        assert_eq!(
+            service
+                .list_visible_providers()
+                .into_iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            [DEFAULT_OIDC_PROVIDER_ID, "alpha", "zeta"]
+        );
+        assert_eq!(
+            sorted_provider_summaries(provider_summaries(&["zeta", "alpha"]))
+                .into_iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
     }
 
     #[tokio::test]
