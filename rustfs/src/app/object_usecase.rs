@@ -1943,6 +1943,15 @@ impl GetObjectResumeIdentity {
     }
 }
 
+fn pin_get_object_resume_opts_to_resolved_version(mut opts: ObjectOptions, info: &ObjectInfo) -> ObjectOptions {
+    if opts.version_id.is_none()
+        && let Some(version_id) = info.version_id
+    {
+        opts.version_id = Some(version_id.to_string());
+    }
+    opts
+}
+
 /// Reopen parameters for a mid-stream resume. Only the SSE-C headers the store
 /// read path consumes are retained: the store-level `get_object_reader` spans
 /// record their header argument at debug level, so retaining the full request
@@ -1974,6 +1983,7 @@ impl GetObjectResumeContext {
         range_start: i64,
         range_end: i64,
     ) -> Self {
+        let opts = pin_get_object_resume_opts_to_resolved_version(opts, info);
         let mut ssec_headers = HeaderMap::new();
         for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
             if let Some(value) = request_headers.get(name) {
@@ -11079,9 +11089,19 @@ mod tests {
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
+        put_real_cold_fill_object_with_opts(store, bucket, object, body, &ObjectOptions::default()).await
+    }
+
+    async fn put_real_cold_fill_object_with_opts(
+        store: &Arc<ECStore>,
+        bucket: &str,
+        object: &str,
+        body: &[u8],
+        opts: &ObjectOptions,
+    ) -> ObjectInfo {
         let mut reader = PutObjReader::from_vec(body.to_vec());
         store
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .put_object(bucket, object, &mut reader, opts)
             .await
             .expect("real cold-fill test object must be written")
     }
@@ -12816,6 +12836,42 @@ mod tests {
     }
 
     #[test]
+    fn get_object_resume_opts_pin_latest_request_to_resolved_version() {
+        let resolved_version = Uuid::from_u128(0x1234);
+        let pinned = pin_get_object_resume_opts_to_resolved_version(
+            ObjectOptions::default(),
+            &ObjectInfo {
+                version_id: Some(resolved_version),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pinned.version_id.as_deref(), Some(resolved_version.to_string().as_str()));
+
+        let explicit_version = Uuid::from_u128(0x5678).to_string();
+        let explicit = pin_get_object_resume_opts_to_resolved_version(
+            ObjectOptions {
+                version_id: Some(explicit_version.clone()),
+                ..Default::default()
+            },
+            &ObjectInfo {
+                version_id: Some(resolved_version),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            explicit.version_id.as_deref(),
+            Some(explicit_version.as_str()),
+            "an explicit versionId request must remain pinned to the requested version"
+        );
+
+        let unversioned = pin_get_object_resume_opts_to_resolved_version(ObjectOptions::default(), &ObjectInfo::default());
+        assert!(
+            unversioned.version_id.is_none(),
+            "unversioned/null-less objects have no resolved version identity to pin"
+        );
+    }
+
+    #[test]
     fn get_object_resume_range_offsets() {
         // A full-object read that emitted nothing reopens range-free so the
         // replacement stream keeps the codec fast path.
@@ -13180,6 +13236,78 @@ mod tests {
         assert!(
             matches!(result, Err(GetObjectResumeFailure::Fatal)),
             "reopening a replaced version must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_resume_reopen_uses_initial_version_after_newer_put() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use tokio::io::AsyncReadExt as _;
+
+        let (_disk_paths, store, _context) = real_get_resume_test_context().await;
+        let bucket = format!("resume-version-pin-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned resume bucket");
+        let initial_body = vec![0xA1; 1024 * 1024];
+        let versioned_put_opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let initial_info = put_real_cold_fill_object_with_opts(&store, &bucket, object, &initial_body, &versioned_put_opts).await;
+        let initial_version = initial_info.version_id.expect("versioned PUT must return a version id");
+        let latest_opts = get_opts(&bucket, object, None, None, &HeaderMap::new())
+            .await
+            .expect("latest GET opts should load versioning state");
+        assert!(
+            latest_opts.version_id.is_none(),
+            "the original latest request reaches resume setup without an explicit versionId"
+        );
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            &bucket,
+            object,
+            latest_opts,
+            &HeaderMap::new(),
+            &initial_info,
+            0,
+            -1,
+        );
+        assert_eq!(
+            ctx.opts.version_id.as_deref(),
+            Some(initial_version.to_string().as_str()),
+            "resume must pin the resolved latest version before another writer advances the key"
+        );
+
+        let replacement_body = vec![0xB2; 2 * 1024 * 1024];
+        let replacement_info =
+            put_real_cold_fill_object_with_opts(&store, &bucket, object, &replacement_body, &versioned_put_opts).await;
+        assert_ne!(
+            replacement_info.version_id, initial_info.version_id,
+            "the replacement write must create a newer version"
+        );
+
+        let mut reader = ctx
+            .reopen(0)
+            .await
+            .expect("resume should reopen the initially committed version even after a newer PUT");
+        let mut reopened_body = Vec::new();
+        reader
+            .read_to_end(&mut reopened_body)
+            .await
+            .expect("the pinned version reader must stream");
+        assert_eq!(
+            reopened_body, initial_body,
+            "resume must continue the initial response version, not the newer latest version"
         );
     }
 
