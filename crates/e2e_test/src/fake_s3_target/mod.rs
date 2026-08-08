@@ -393,6 +393,25 @@ impl FakeS3Target {
         lock(&self.control).requests.drain(..).collect()
     }
 
+    /// Stored versions for one key as `(version_id, is_delete_marker)`, oldest
+    /// first. Empty when the bucket or key does not exist. Lets purge tests
+    /// assert on the target's actual state instead of inferring it from the
+    /// request journal (a versioned DELETE is a silent no-op for missing ids).
+    pub fn stored_versions(&self, bucket: &str, key: &str) -> Vec<(String, bool)> {
+        let state = lock(&self.backend.store);
+        state
+            .buckets
+            .get(bucket)
+            .and_then(|bucket_state| bucket_state.objects.get(key))
+            .map(|versions| {
+                versions
+                    .iter()
+                    .map(|version| (version.version_id.clone(), version.delete_marker))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
         if let Some(task) = self.task.take() {
