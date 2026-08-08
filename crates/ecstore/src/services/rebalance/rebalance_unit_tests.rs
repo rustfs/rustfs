@@ -2584,21 +2584,7 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         }],
         ..Default::default()
     };
-
-    let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
-    let store = Arc::new(crate::store::ECStore {
-        id: uuid::Uuid::new_v4(),
-        disk_map: std::collections::HashMap::new(),
-        pools: Vec::new(),
-        peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
-        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
-        rebalance_meta: tokio::sync::RwLock::new(Some(active_meta)),
-        decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
-        start_gate: tokio::sync::Mutex::new(()),
-        pool_meta_save_gate: tokio::sync::Mutex::new(()),
-        ctx: crate::runtime::instance::bootstrap_ctx(),
-        bucket_fence_registry: std::sync::Arc::default(),
-    });
+    let store = test_store_with_rebalance_meta(active_meta);
 
     let err = store
         .init_and_start_rebalance(vec!["bucket".to_string()])
@@ -2606,6 +2592,72 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         .expect_err("second rebalance start should be rejected before metadata init");
 
     assert!(matches!(err, Error::RebalanceAlreadyRunning));
+}
+
+#[tokio::test]
+async fn test_start_rebalance_for_id_rejects_changed_metadata() {
+    let meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+
+    let err = store
+        .start_rebalance_for_id("rebalance-b")
+        .await
+        .expect_err("staged start must not start changed metadata");
+
+    assert!(err.to_string().contains("rebalance metadata changed before start"));
+}
+
+#[tokio::test]
+async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
+    let meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        stopped_at: Some(OffsetDateTime::now_utc()),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+
+    let err = store
+        .start_rebalance_for_id("rebalance-a")
+        .await
+        .expect_err("staged start must not restart stopped metadata");
+
+    assert!(err.to_string().contains("was stopped before start"));
+}
+
+fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {
+    let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
+    Arc::new(crate::store::ECStore {
+        id: uuid::Uuid::new_v4(),
+        disk_map: std::collections::HashMap::new(),
+        pools: Vec::new(),
+        peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
+        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
+        rebalance_meta: tokio::sync::RwLock::new(Some(meta)),
+        decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
+        start_gate: tokio::sync::Mutex::new(()),
+        pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        ctx: crate::runtime::instance::bootstrap_ctx(),
+        bucket_fence_registry: std::sync::Arc::default(),
+    })
 }
 
 #[test]
