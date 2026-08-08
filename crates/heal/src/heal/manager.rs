@@ -2475,7 +2475,7 @@ impl HealManager {
             return;
         }
 
-        let mut running_per_set = running_erasure_set_counts(&active_heals_guard);
+        let mut running_per_set = running_heal_set_counts(&active_heals_guard);
         let mut tasks_started = 0usize;
         let mut delayed_by_mainline_throttle = false;
 
@@ -2856,6 +2856,14 @@ impl std::fmt::Debug for HealManager {
 fn heal_request_set_key(request: &HealRequest) -> Option<String> {
     match &request.heal_type {
         HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
+        HealType::Object { .. } => heal_options_set_key(&request.options),
+        _ => None,
+    }
+}
+
+fn heal_options_set_key(options: &HealOptions) -> Option<String> {
+    match (options.pool_index, options.set_index) {
+        (Some(pool), Some(set)) => Some(format!("pool_{pool}_set_{set}")),
         _ => None,
     }
 }
@@ -2905,14 +2913,22 @@ fn update_task_running_metric_for_task(active_heals: &HashMap<String, Arc<HealTa
     .set(count as f64);
 }
 
-fn running_erasure_set_counts(active_heals: &HashMap<String, Arc<HealTask>>) -> HashMap<String, usize> {
+fn running_heal_set_counts(active_heals: &HashMap<String, Arc<HealTask>>) -> HashMap<String, usize> {
     let mut running = HashMap::new();
     for task in active_heals.values() {
-        if let HealType::ErasureSet { set_disk_id, .. } = &task.heal_type {
-            *running.entry(set_disk_id.clone()).or_insert(0) += 1;
+        if let Some(set_key) = heal_request_set_key_for_task(task) {
+            *running.entry(set_key).or_insert(0) += 1;
         }
     }
     running
+}
+
+fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
+    match &task.heal_type {
+        HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
+        HealType::Object { .. } => heal_options_set_key(&task.options),
+        _ => None,
+    }
 }
 
 fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, CompletedHealStatus>) {
@@ -3513,6 +3529,30 @@ mod tests {
                 set_disk_id: "pool_0_set_1".to_string(),
             },
             HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let mut running = HashMap::new();
+        running.insert("pool_0_set_1".to_string(), 1);
+
+        assert!(!can_schedule_request(&request, &running, 1));
+        assert!(can_schedule_request(&request, &running, 2));
+    }
+
+    #[test]
+    fn test_can_schedule_scoped_object_request_respects_per_set_limit() {
+        let options = HealOptions {
+            pool_index: Some(0),
+            set_index: Some(1),
+            ..Default::default()
+        };
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id: None,
+            },
+            options,
             HealPriority::Normal,
         );
 
@@ -5136,7 +5176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_running_erasure_set_counts_groups_only_erasure_tasks() {
+    fn test_running_heal_set_counts_groups_set_scoped_tasks() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let erasure_task = Arc::new(HealTask::from_request(
             HealRequest::new(
@@ -5145,6 +5185,23 @@ mod tests {
                     set_disk_id: "pool_0_set_1".to_string(),
                 },
                 HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        ));
+        let scoped_options = HealOptions {
+            pool_index: Some(0),
+            set_index: Some(1),
+            ..Default::default()
+        };
+        let scoped_object_task = Arc::new(HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "scoped-object".to_string(),
+                    version_id: None,
+                },
+                scoped_options,
                 HealPriority::Normal,
             ),
             storage.clone(),
@@ -5164,10 +5221,11 @@ mod tests {
 
         let mut active = HashMap::new();
         active.insert(erasure_task.id.clone(), erasure_task);
+        active.insert(scoped_object_task.id.clone(), scoped_object_task);
         active.insert(object_task.id.clone(), object_task);
 
-        let counts = running_erasure_set_counts(&active);
-        assert_eq!(counts.get("pool_0_set_1"), Some(&1));
+        let counts = running_heal_set_counts(&active);
+        assert_eq!(counts.get("pool_0_set_1"), Some(&2));
         assert_eq!(counts.len(), 1);
     }
 

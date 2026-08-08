@@ -286,6 +286,23 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
+    fn get_disks_for_heal_object(&self, key: &str, opts: &HealOpts) -> Result<Arc<SetDisks>> {
+        match opts.set {
+            Some(set_idx) => self.disk_set.get(set_idx).cloned().ok_or_else(|| {
+                StorageError::InvalidArgument(
+                    "heal".to_string(),
+                    "set".to_string(),
+                    format!(
+                        "invalid heal set index {set_idx} for pool {} with {} sets",
+                        self.pool_idx,
+                        self.disk_set.len()
+                    ),
+                )
+            }),
+            None => Ok(self.get_disks_by_key(key)),
+        }
+    }
+
     pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
 
@@ -1101,7 +1118,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.get_disks_by_key(object)
+        self.get_disks_for_heal_object(object, opts)?
             .heal_object(bucket, object, version_id, opts)
             .await
     }
@@ -1429,6 +1446,53 @@ mod tests {
             ctx: bootstrap_ctx(),
         });
         (temp_dirs, sets)
+    }
+
+    #[tokio::test]
+    async fn heal_object_uses_explicit_set_scope() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let selected = sets
+            .get_disks_for_heal_object(
+                "object",
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("requested set should be selected");
+
+        assert!(Arc::ptr_eq(&selected, &sets.disk_set[1]));
+    }
+
+    #[tokio::test]
+    async fn heal_object_without_set_scope_keeps_hash_routing() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let object = "object";
+        let selected = sets
+            .get_disks_for_heal_object(object, &HealOpts::default())
+            .expect("hash-routed set should be selected");
+
+        assert!(Arc::ptr_eq(&selected, &sets.get_disks_by_key(object)));
+    }
+
+    #[tokio::test]
+    async fn heal_object_rejects_invalid_set_scope() {
+        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let err = sets
+            .get_disks_for_heal_object(
+                "object",
+                &HealOpts {
+                    set: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect_err("out-of-range set scope must fail closed");
+
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "set" && reason.contains("invalid heal set index 2 for pool 0 with 2 sets")),
+            "unexpected invalid set error: {err:?}"
+        );
     }
 
     #[tokio::test]
