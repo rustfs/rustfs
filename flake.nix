@@ -59,7 +59,7 @@
         {
           default = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "1.0.0-beta.12";
+            version = "1.0.0-rc.1";
 
             src = ./.;
 
