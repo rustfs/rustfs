@@ -97,7 +97,20 @@ impl FileMeta {
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
         if crc != meta_crc {
-            return Err(Error::other("xl file crc check failed"));
+            error!(
+                event = "filemeta_xl_crc_mismatch",
+                component = "filemeta",
+                expected_crc = meta_crc,
+                actual_crc = crc,
+                "xl.meta payload failed its CRC check"
+            );
+            // Error::FileCorrupt, not a generic error, for the same reason
+            // check_xl2_v1 classifies a bad magic as FileCorrupt: heal
+            // classification (should_heal_object_on_disk) recognises
+            // corruption only by the DiskError::FileCorrupt variant this
+            // converts to. As a generic error the drive is skipped,
+            // heal_object reports ok, and on-disk bitrot is never repaired.
+            return Err(Error::FileCorrupt);
         }
 
         Ok((meta, inline_data))
@@ -163,8 +176,16 @@ impl FileMeta {
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
         if crc != meta_crc {
-            error!("xl file crc check failed: expected CRC {:#x}, got {:#x}", meta_crc, crc);
-            return Err(Error::other("xl file crc check failed"));
+            error!(
+                event = "filemeta_xl_crc_mismatch",
+                component = "filemeta",
+                expected_crc = meta_crc,
+                actual_crc = crc,
+                "xl.meta payload failed its CRC check"
+            );
+            // See is_indexed_meta: the FileCorrupt variant is what makes heal
+            // classify this drive as needing metadata repair.
+            return Err(Error::FileCorrupt);
         }
 
         if !buf.is_empty() {
