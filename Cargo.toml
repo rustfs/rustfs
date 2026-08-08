@@ -139,7 +139,7 @@ async_zip = { default-features = false, version = "0.0.18" }
 mysql_async = { default-features = false, version = "0.37" }
 async-compression = { version = "0.4.43" }
 async-recursion = "1.1.1"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 async-nats = { version = "0.50.0", default-features = false }
 axum = "0.8.9"
 futures = "0.3.33"
@@ -302,7 +302,7 @@ sysinfo = "0.39.6"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
 tracing-core = "0.1.36"
@@ -354,7 +354,7 @@ hotpath = { version = "0.23.1", default-features = false }
 insta = { version = "1.48" }
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs"]
+ignored = ["hotpath", "rustfs"]
 
 [profile.dev]
 # Full debuginfo roughly doubles compile+link time and produces multi-GB
