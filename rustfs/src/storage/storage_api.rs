@@ -546,6 +546,12 @@ pub(crate) mod ecstore_set_disk {
     pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout, is_valid_storage_class};
 }
 
+/// Offline erasure primitives for `rustfs inspect bucket-meta` (backlog#1733):
+/// shard bitrot verification and reconstruction without a running store.
+pub(crate) mod ecstore_erasure {
+    pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
+}
+
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
