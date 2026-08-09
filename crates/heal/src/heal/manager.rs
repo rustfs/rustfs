@@ -1363,7 +1363,20 @@ impl HealManager {
                     set_disk_ids.insert(set_disk_id);
                 }
 
-                for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await.unwrap_or_default() {
+                let mut replacement_task_ids = ResumeUtils::get_replacement_intent_tasks(disk)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                // This migration scan runs only during manager startup. The
+                // periodic scanner below uses the isolated intent namespace
+                // and never deserializes ordinary resume states.
+                for task_id in ResumeUtils::get_resumable_tasks(disk).await.unwrap_or_default() {
+                    if ResumeManager::has_replacement_intent(disk, &task_id).await {
+                        replacement_task_ids.insert(task_id);
+                    }
+                }
+                for task_id in replacement_task_ids {
                     let Ok(manager) = ResumeManager::load_replacement_intent(disk.clone(), &task_id).await else {
                         continue;
                     };
