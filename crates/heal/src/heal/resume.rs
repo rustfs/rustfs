@@ -1020,7 +1020,7 @@ impl ResumeManager {
                 RUSTFS_META_BUCKET,
                 path_str,
                 None,
-                Some(EcstoreDiskBytes::from(legacy_bytes.clone())),
+                Some(legacy_bytes.clone()),
             )
             .await
             {
