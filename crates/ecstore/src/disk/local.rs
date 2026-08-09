@@ -4640,12 +4640,16 @@ fn mount_id_for_path(path: &Path) -> Option<u64> {
         .ok()
         .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
         .map(|statx| statx.stx_mnt_id)
-        .or_else(|| fs::canonicalize(path).ok().and_then(|path| mount_id_from_mountinfo(&path)))
+        .or_else(|| {
+            std::fs::canonicalize(path)
+                .ok()
+                .and_then(|path| mount_id_from_mountinfo(&path))
+        })
 }
 
 #[cfg(target_os = "linux")]
 fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
-    fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
@@ -4653,7 +4657,7 @@ fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn mount_id_from_mountinfo(path: &Path) -> Option<u64> {
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     mount_id_from_mountinfo_contents(&mountinfo, path)
 }
 
@@ -20209,7 +20213,7 @@ mod test {
         );
         assert_eq!(
             disk.format_path,
-            root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE),
+            root.join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE),
             "the public format path must keep configured-root semantics after replacement"
         );
         disk.write_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Bytes::from_static(b"owner"))
