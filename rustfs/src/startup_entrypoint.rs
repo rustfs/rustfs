@@ -87,6 +87,9 @@ async fn async_main() -> Result<()> {
         // Diagnose short-circuits before observability init on purpose:
         // the report goes to stdout and must not be wrapped by the JSON logger.
         CommandResult::Diagnose(opts) => return crate::diagnose::execute_diagnose(&opts),
+        // Inspect is offline like diagnose: read-only against drive paths, output
+        // to stdout/--out, and must run before any observability/storage init.
+        CommandResult::Inspect(opts) => return crate::inspect::execute_inspect(&opts).await,
         CommandResult::Server(config) => config,
     };
 

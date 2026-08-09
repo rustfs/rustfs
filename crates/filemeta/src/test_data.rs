@@ -189,7 +189,14 @@ fn encode_legacy_v1_header(version_id: Uuid, mod_time: OffsetDateTime) -> Vec<u8
     wr
 }
 
-fn encode_legacy_v1_body(version_id: Uuid, data_dir: Uuid, mod_time: OffsetDateTime) -> Vec<u8> {
+fn encode_legacy_v1_body(
+    version_id: Uuid,
+    data_dir: Uuid,
+    mod_time: OffsetDateTime,
+    erasure_index: usize,
+    checksum: Option<(&str, &[u8])>,
+    object_size: usize,
+) -> Vec<u8> {
     let mut wr = Vec::new();
 
     rmp::encode::write_map_len(&mut wr, 3).unwrap();
@@ -208,7 +215,7 @@ fn encode_legacy_v1_body(version_id: Uuid, data_dir: Uuid, mod_time: OffsetDateT
     rmp::encode::write_str(&mut wr, "Stat").unwrap();
     rmp::encode::write_map_len(&mut wr, 5).unwrap();
     rmp::encode::write_str(&mut wr, "Size").unwrap();
-    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_sint(&mut wr, object_size as i64).unwrap();
     rmp::encode::write_str(&mut wr, "ModTime").unwrap();
     write_legacy_time(&mut wr, mod_time);
     rmp::encode::write_str(&mut wr, "Name").unwrap();
@@ -229,14 +236,23 @@ fn encode_legacy_v1_body(version_id: Uuid, data_dir: Uuid, mod_time: OffsetDateT
     rmp::encode::write_str(&mut wr, "BlockSize").unwrap();
     rmp::encode::write_sint(&mut wr, 1_048_576).unwrap();
     rmp::encode::write_str(&mut wr, "Index").unwrap();
-    rmp::encode::write_sint(&mut wr, 1).unwrap();
+    rmp::encode::write_sint(&mut wr, erasure_index as i64).unwrap();
     rmp::encode::write_str(&mut wr, "Distribution").unwrap();
     rmp::encode::write_array_len(&mut wr, 6).unwrap();
     for value in 1..=6 {
         rmp::encode::write_sint(&mut wr, value).unwrap();
     }
     rmp::encode::write_str(&mut wr, "Checksums").unwrap();
-    rmp::encode::write_array_len(&mut wr, 0).unwrap();
+    rmp::encode::write_array_len(&mut wr, u32::from(checksum.is_some())).unwrap();
+    if let Some((algorithm, hash)) = checksum {
+        rmp::encode::write_map_len(&mut wr, 3).unwrap();
+        rmp::encode::write_str(&mut wr, "PartNumber").unwrap();
+        rmp::encode::write_sint(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "Algorithm").unwrap();
+        rmp::encode::write_str(&mut wr, algorithm).unwrap();
+        rmp::encode::write_str(&mut wr, "Hash").unwrap();
+        rmp::encode::write_bin(&mut wr, hash).unwrap();
+    }
 
     rmp::encode::write_str(&mut wr, "Meta").unwrap();
     rmp::encode::write_map_len(&mut wr, 1).unwrap();
@@ -251,9 +267,9 @@ fn encode_legacy_v1_body(version_id: Uuid, data_dir: Uuid, mod_time: OffsetDateT
     rmp::encode::write_str(&mut wr, "n").unwrap();
     rmp::encode::write_sint(&mut wr, 1).unwrap();
     rmp::encode::write_str(&mut wr, "s").unwrap();
-    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_sint(&mut wr, object_size as i64).unwrap();
     rmp::encode::write_str(&mut wr, "as").unwrap();
-    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_sint(&mut wr, object_size as i64).unwrap();
     rmp::encode::write_str(&mut wr, "mt").unwrap();
     write_legacy_time(&mut wr, mod_time);
 
@@ -275,8 +291,29 @@ pub fn create_legacy_v1_object_xlmeta() -> Result<Vec<u8>> {
     let mod_time = OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789)?;
 
     let header = encode_legacy_v1_header(version_id, mod_time);
-    let body = encode_legacy_v1_body(version_id, data_dir, mod_time);
+    let body = encode_legacy_v1_body(version_id, data_dir, mod_time, 1, None, 11);
 
+    encode_legacy_v1_xlmeta(header, body)
+}
+
+/// Legacy V1 xl.meta fixture with a per-drive whole-file bitrot checksum.
+pub fn create_legacy_v1_object_xlmeta_with_checksum(
+    erasure_index: usize,
+    algorithm: &str,
+    hash: &[u8],
+    object_size: usize,
+) -> Result<Vec<u8>> {
+    let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef")?;
+    let data_dir = Uuid::parse_str("fedcba98-7654-3210-fedc-ba9876543210")?;
+    let mod_time = OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789)?;
+
+    let header = encode_legacy_v1_header(version_id, mod_time);
+    let body = encode_legacy_v1_body(version_id, data_dir, mod_time, erasure_index, Some((algorithm, hash)), object_size);
+
+    encode_legacy_v1_xlmeta(header, body)
+}
+
+fn encode_legacy_v1_xlmeta(header: Vec<u8>, body: Vec<u8>) -> Result<Vec<u8>> {
     let mut wr = Vec::new();
     wr.extend_from_slice(b"XL2 ");
     wr.extend_from_slice(&1u16.to_le_bytes());

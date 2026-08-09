@@ -1016,6 +1016,83 @@ mod test {
     use proptest::collection::vec;
     use proptest::prelude::*;
 
+    /// A restore header meaning "restored copy is on disk until far in the future".
+    /// Format produced by `RestoreStatusOps::to_string` and consumed by
+    /// `parse_restore_obj_status` (fileinfo.rs).
+    const RESTORED_ON_DISK: &str = "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"";
+
+    /// backlog#1733 (P9-01 §4.3/§7.6, g-key-001): pin the five `s3s::header`
+    /// constants that double as **persisted metadata map keys**. They are not
+    /// just HTTP header names — they are stored inside xl.meta (`meta_user`)
+    /// and read back by fail-open code, so a silent drift produces zero
+    /// HTTP-visible errors while:
+    ///
+    /// 1. **WORM silently dissolves** — `get_object_retention_meta`
+    ///    (ecstore objectlock.rs) returns an empty retention when the lock keys
+    ///    are unreadable, making every compliance-locked object deletable.
+    /// 2. **Live data dirs can be reclaimed** — `MetaObject::uses_data_dir`
+    ///    falls back to `is_restored_object_on_disk`, which returns `false`
+    ///    when `x-amz-restore` is unreadable, so a restored object's data dir
+    ///    is judged unused.
+    ///
+    /// Any migration replacing these constants must keep the literals byte-stable.
+    #[test]
+    fn persisted_metadata_keys_are_byte_stable() {
+        use s3s::header::{
+            X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+            X_AMZ_SERVER_SIDE_ENCRYPTION,
+        };
+        assert_eq!(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(), "x-amz-object-lock-legal-hold");
+        assert_eq!(X_AMZ_OBJECT_LOCK_MODE.as_str(), "x-amz-object-lock-mode");
+        assert_eq!(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(), "x-amz-object-lock-retain-until-date");
+        assert_eq!(X_AMZ_RESTORE.as_str(), "x-amz-restore");
+        assert_eq!(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str(), "x-amz-server-side-encryption");
+    }
+
+    /// backlog#1733 g-key-003: a restored-to-local object must keep its data
+    /// dir. The restore marker lives under the pinned `x-amz-restore` key; if
+    /// the key ever drifts this flips to `false` and the data dir becomes
+    /// eligible for reclamation while the restored copy is still being served.
+    #[test]
+    fn restored_object_keeps_using_data_dir() {
+        let mut obj = MetaObject::default();
+        obj.meta_user
+            .insert("x-amz-restore".to_string(), RESTORED_ON_DISK.to_string());
+        assert!(obj.uses_data_dir(), "restored object's data dir must be considered in use");
+
+        // The same fail-open shape the pin protects against: without the marker
+        // the data dir is judged unused — exactly what a key drift would cause.
+        let bare = MetaObject::default();
+        assert!(!bare.uses_data_dir(), "object without restore marker reports data dir unused");
+    }
+
+    /// backlog#1733 g-key-004: a transition-complete object short-circuits to
+    /// `false` even when the restore marker is present — the existing
+    /// precedence must not change.
+    #[test]
+    fn transition_complete_object_does_not_use_data_dir() {
+        use rustfs_utils::http::{SUFFIX_TRANSITION_STATUS, insert_bytes};
+        let mut obj = MetaObject::default();
+        obj.meta_user
+            .insert("x-amz-restore".to_string(), RESTORED_ON_DISK.to_string());
+        insert_bytes(&mut obj.meta_sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        assert!(!obj.uses_data_dir(), "transition-complete short-circuit must win over the restore marker");
+    }
+
+    /// The restore-header parser and the pinned key literal must agree: the
+    /// marker written under `x-amz-restore` is only meaningful if the parser
+    /// accepts it.
+    #[test]
+    fn restore_marker_roundtrips_through_parser() {
+        let mut meta = HashMap::new();
+        meta.insert(X_AMZ_RESTORE.as_str().to_string(), RESTORED_ON_DISK.to_string());
+        assert!(crate::is_restored_object_on_disk(&meta));
+
+        // An in-progress restore is not "on disk".
+        meta.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        assert!(!crate::is_restored_object_on_disk(&meta));
+    }
+
     /// backlog#580: RustFS parses real MinIO-written object xl.meta (inline,
     /// versioned, and multipart) into equivalent `FileInfo`. Object metadata is
     /// the strong part of MinIO interop; this pins it against real fixtures.
