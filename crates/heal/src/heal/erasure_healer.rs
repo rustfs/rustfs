@@ -1107,6 +1107,8 @@ mod resume_loop_tests {
         pages: Mutex<HashMap<Option<String>, Page>>,
         /// per-`compose_key` heal outcome; default is `Ok`
         outcomes: Mutex<HashMap<String, HealOutcome>>,
+        /// successful low-level result per `compose_key`; default has no drive outcomes.
+        results: Mutex<HashMap<String, HealResultItem>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         fail_listing: AtomicBool,
@@ -1118,6 +1120,9 @@ mod resume_loop_tests {
         }
         fn set_outcome(&self, name: &str, version: Option<&str>, outcome: HealOutcome) {
             self.outcomes.lock().unwrap().insert(compose_key(name, version), outcome);
+        }
+        fn set_result(&self, name: &str, version: Option<&str>, result: HealResultItem) {
+            self.results.lock().unwrap().insert(compose_key(name, version), result);
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
@@ -1189,7 +1194,7 @@ mod resume_loop_tests {
             let key = compose_key(object, version_id);
             let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
             match outcome {
-                HealOutcome::Ok => Ok((HealResultItem::default(), None)),
+                HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -1254,6 +1259,10 @@ mod resume_loop_tests {
     }
 
     async fn make_env() -> Env {
+        make_env_with_targets(Vec::new()).await
+    }
+
+    async fn make_env_with_targets(target_endpoints: Vec<String>) -> Env {
         let temp = TempDir::new().unwrap();
         let disk = make_disk(&temp).await;
         let storage = Arc::new(FakeStorage::default());
@@ -1264,7 +1273,7 @@ mod resume_loop_tests {
             disk.clone(),
             HealOpts::default(),
             HealRequestSource::Internal,
-            Vec::new(),
+            target_endpoints,
         );
         let resume = ResumeManager::new(
             disk.clone(),
@@ -1699,5 +1708,44 @@ mod resume_loop_tests {
             checkpoint.skipped_objects.is_empty(),
             "the skipped set must be cleared so the retry re-heals the version"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_target_missing_from_success_result_retries_the_full_pass() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = env
+            .healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        result.expect_err("a missing replacement target must not report completion");
+        let state = env.resume.get_state().await;
+        assert!(!state.completed);
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
     }
 }
