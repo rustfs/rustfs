@@ -1207,9 +1207,9 @@ impl ResumeManager {
                 )
             })?;
         if !is_replacement_intent(&legacy.get_state().await) {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Resume state is not a replacement intent for task {task_id}"),
-            });
+            return Err(replacement_recovery_corruption(format!(
+                "Resume state is not a replacement intent for task {task_id}"
+            )));
         }
 
         let migrated = Self {
@@ -2135,14 +2135,7 @@ impl ResumeUtils {
                     continue;
                 }
             }
-            ResumeManager::load_replacement_intent(disk.clone(), &task_id)
-                .await
-                .map_err(|error| {
-                    replacement_recovery_corruption_for_state_load(
-                        format!("Failed to migrate legacy replacement state {task_id}"),
-                        error,
-                    )
-                })?;
+            ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
         }
 
         for task_id in proof_task_ids {
