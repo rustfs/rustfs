@@ -215,8 +215,8 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::{
-            ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
-            try_migrate_iam_config,
+            ECStore, get_global_replication_pool, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents,
+            try_migrate_bucket_metadata, try_migrate_iam_config,
         };
     }
 
@@ -263,7 +263,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::storage_api::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
+        pub(crate) use crate::storage::storage_api::{InstanceContext, set_global_rustfs_port};
     }
 
     pub(crate) mod services {

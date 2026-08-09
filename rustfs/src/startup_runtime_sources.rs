@@ -13,10 +13,8 @@
 // limitations under the License.
 
 use crate::config::RustFSBufferConfig;
-use crate::runtime_sources::{
-    current_outbound_tls_generation as runtime_current_outbound_tls_generation, current_replication_pool_handle,
-};
-use crate::storage_api::startup::runtime_sources::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
+use crate::runtime_sources::current_outbound_tls_generation as runtime_current_outbound_tls_generation;
+use crate::storage_api::startup::runtime_sources::{InstanceContext, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};
@@ -90,10 +88,6 @@ pub(crate) fn observability_metric_enabled() -> bool {
 
 pub(crate) fn init_metrics_runtime(ctx: CancellationToken) {
     rustfs_obs::init_metrics_runtime(ctx);
-}
-
-pub(crate) fn replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
-    current_replication_pool_handle()
 }
 
 pub(crate) fn set_put_stage_metrics_enabled(enabled: bool) {

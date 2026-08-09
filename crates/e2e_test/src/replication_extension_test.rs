@@ -16,7 +16,9 @@ use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
     replication_fast_env, rustfs_binary_path,
 };
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
+use crate::fake_s3_target::{
+    FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
+};
 use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -379,6 +381,10 @@ struct ReplicationResetStatusTarget {
     reset_id: String,
     #[serde(rename = "resyncStatus", default)]
     status: String,
+    #[serde(rename = "replicationCount", default)]
+    replicated_count: i64,
+    #[serde(rename = "object", default)]
+    object: String,
 }
 
 async fn signed_request(
@@ -5203,6 +5209,7 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     init_logging();
     let resync_process_env = [
         ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
         // Verbose server logging can block startup when this focused test is run
         // through a captured test process rather than nextest.
         ("RUST_LOG", "error"),
@@ -5219,6 +5226,7 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
         .await?;
 
     let source_bucket = "site-repl-resync-src";
+    const RESYNC_OBJECT_COUNT: usize = 128;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -5263,12 +5271,13 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
-    for idx in 0..96 {
+    for idx in 0..RESYNC_OBJECT_COUNT {
+        let size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
         source_client
             .put_object()
             .bucket(source_bucket)
             .key(format!("resync-object-{idx:02}"))
-            .body(ByteStream::from(vec![b'x'; 512 * 1024]))
+            .body(ByteStream::from(vec![b'x'; size]))
             .send()
             .await?;
     }
@@ -5327,6 +5336,22 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     );
     let restarted_reset_id = restarted.resync_id.clone();
 
+    let partial_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        let replicated = status.replicated_objects;
+        if status.resync_id == restarted_reset_id
+            && replicated > 0
+            && replicated < u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+        {
+            break;
+        }
+        if status.state == "completed" || tokio::time::Instant::now() >= partial_deadline {
+            return Err(format!("resync did not expose a partial durable checkpoint before restart: {status:?}").into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
     source_env.restart_server_preserving_data(vec![], &resync_process_env).await?;
     wait_for_site_replication_enabled(&source_env, 2).await?;
 
@@ -5359,6 +5384,41 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
         )
     })?;
     assert_eq!(restarted_target.reset_id, restarted_reset_id);
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let completed = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" => break status,
+            "failed" => return Err(format!("recovered resync failed: {status:?}").into()),
+            _ if tokio::time::Instant::now() < completion_deadline => sleep(Duration::from_millis(500)).await,
+            _ => return Err(format!("recovered resync did not complete in time: {status:?}").into()),
+        }
+    };
+    assert_eq!(
+        completed.replicated_objects,
+        u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+    );
+
+    let replicated = futures::stream::iter(0..RESYNC_OBJECT_COUNT)
+        .map(|idx| {
+            let target_client = target_client.clone();
+            async move {
+                let key = format!("resync-object-{idx:02}");
+                let body = wait_for_object_on_target(&target_client, source_bucket, &key).await?;
+                let expected_size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
+                if body != vec![b'x'; expected_size] {
+                    return Err(format!("recovered resync object body mismatch for {key}").into());
+                }
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    for result in replicated {
+        result?;
+    }
 
     Ok(())
 }
@@ -6860,6 +6920,119 @@ async fn wait_for_target_request_version_id(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_resync_restart_revisits_objects_before_out_of_order_checkpoint() -> TestResult {
+    init_logging();
+
+    const OBJECT_COUNT: usize = 128;
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "resync-checkpoint-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut process_env = replication_fast_env();
+    process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUST_LOG", "error"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "resync-checkpoint-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for idx in 0..OBJECT_COUNT {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(format!("checkpoint-{idx:03}"))
+            .body(ByteStream::from(format!("checkpoint payload {idx}").into_bytes()))
+            .send()
+            .await?;
+    }
+    wait_for_source_replication_status(&source_client, source_bucket, "checkpoint-127", "COMPLETED", false).await?;
+    let initial_replication_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let replicated = target
+            .requests()
+            .into_iter()
+            .filter(|request| request.operation == FakeTargetOperation::PutObject)
+            .count();
+        if replicated >= OBJECT_COUNT {
+            break;
+        }
+        if tokio::time::Instant::now() >= initial_replication_deadline {
+            return Err(format!("initial replication only sent {replicated}/{OBJECT_COUNT} objects").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    target.clear_bucket_objects(target_bucket);
+    target.take_requests();
+    target.inject_for_key(
+        FakeTargetOperation::PutObject,
+        "checkpoint-000",
+        FakeTargetFault::Delay(Duration::from_secs(30)),
+        100,
+    );
+
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let partial = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id
+            && status.replicated_count > 0
+            && status.replicated_count < i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+            && status.object.as_str() > "checkpoint-000"
+    })
+    .await
+    .map_err(|err| format!("{err}; target journal: {:?}", target.requests()))?;
+    assert!(target.requests().iter().any(|request| {
+        request.operation == FakeTargetOperation::PutObject
+            && request.key.as_deref() == Some("checkpoint-000")
+            && request.fault == Some(FakeTargetFault::Delay(Duration::from_secs(30)))
+    }));
+    assert!(!target.has_object(target_bucket, "checkpoint-000"));
+    source_env.stop_server();
+    target.clear_faults();
+
+    source_env.start_rustfs_server_without_cleanup_with_env(&process_env).await?;
+    let completed = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id && status.status == "Completed"
+    })
+    .await?;
+    assert_eq!(
+        completed.replicated_count,
+        i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+    );
+    assert!(
+        target.has_object(target_bucket, "checkpoint-000"),
+        "restart skipped failed object checkpoint-000 before persisted checkpoint {}",
+        partial.object
+    );
+
+    target.shutdown().await;
+    Ok(())
 }
 
 /// P0-5: MinIO derives the replicated version exclusively from the `versionId`
