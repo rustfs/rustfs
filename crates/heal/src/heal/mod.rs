@@ -140,26 +140,6 @@ async fn apply_healing_markers(endpoints: &[String], marker: Option<&str>, expec
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{all_marker_targets_matched, marker_matches};
-
-    #[test]
-    fn marker_clear_requires_the_current_owner_token() {
-        assert!(marker_matches(b"set:task-a", Some("set:task-a")));
-        assert!(!marker_matches(b"set:task-b", Some("set:task-a")));
-        assert!(!marker_matches(b"set:task-a", None));
-    }
-
-    #[test]
-    fn marker_update_requires_every_requested_target() {
-        let endpoints = vec!["disk-a".to_string(), "disk-b".to_string()];
-        let matched = std::collections::HashSet::from(["disk-a".to_string()]);
-
-        assert!(!all_marker_targets_matched(&endpoints, &matched));
-    }
-}
-
 pub(crate) type DiskError = EcstoreDiskError;
 pub(crate) type DiskResult<T> = EcstoreDiskResult<T>;
 pub(crate) type DiskStore = EcstoreDiskStore;
@@ -235,3 +215,23 @@ where
 pub type HealObjectInfo = <ECStore as ObjectOperations>::ObjectInfo;
 pub type HealObjectOptions = <ECStore as ObjectOperations>::ObjectOptions;
 pub type HealPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
+
+#[cfg(test)]
+mod tests {
+    use super::{all_marker_targets_matched, marker_matches};
+
+    #[test]
+    fn marker_clear_requires_the_current_owner_token() {
+        assert!(marker_matches(b"set:task-a", Some("set:task-a")));
+        assert!(!marker_matches(b"set:task-b", Some("set:task-a")));
+        assert!(!marker_matches(b"set:task-a", None));
+    }
+
+    #[test]
+    fn marker_update_requires_every_requested_target() {
+        let endpoints = vec!["disk-a".to_string(), "disk-b".to_string()];
+        let matched = std::collections::HashSet::from(["disk-a".to_string()]);
+
+        assert!(!all_marker_targets_matched(&endpoints, &matched));
+    }
+}
