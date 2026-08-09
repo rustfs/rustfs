@@ -1374,6 +1374,17 @@ impl HealManager {
                         && state.replacement_generation.as_deref() == Some(task_id.as_str())
                         && !state.replacement_targets.is_empty()
                     {
+                        if let Err(error) = manager.ensure_replacement_recovery_marker().await {
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                error = %error,
+                                "Replacement recovery marker backfill failed"
+                            );
+                        }
                         if matches!(state.replacement_phase, ReplacementPhase::CleanupPending) {
                             replacement_intents.entry(task_id).or_insert((
                                 state.set_disk_id,
@@ -2487,7 +2498,7 @@ impl HealManager {
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
                         for disk in &local_disks {
-                            for task_id in ResumeUtils::get_resumable_tasks(disk).await.unwrap_or_default() {
+                            for task_id in ResumeUtils::get_replacement_resumable_tasks(disk).await.unwrap_or_default() {
                                 let Ok(resume_manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
                                     continue;
                                 };
