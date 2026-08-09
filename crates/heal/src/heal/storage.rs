@@ -354,6 +354,20 @@ pub trait HealStorageAPI: Send + Sync {
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
 
+    /// Heal only the explicitly admitted replacement targets in one erasure set.
+    ///
+    /// The default is deliberately fail-closed so alternate storage
+    /// implementations cannot accidentally fall back to the global format path.
+    async fn heal_replacement_format(
+        &self,
+        _dry_run: bool,
+        _pool_index: usize,
+        _set_index: usize,
+        _targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        Err(Error::other("target-scoped replacement format is unsupported"))
+    }
+
     /// List object versions for healing (returns all versions, may use significant memory for large buckets)
     ///
     /// WARNING: This method loads all object versions into memory at once. For buckets with many
@@ -1304,6 +1318,20 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::Storage(e))
             }
         }
+    }
+
+    async fn heal_replacement_format(
+        &self,
+        dry_run: bool,
+        pool_index: usize,
+        set_index: usize,
+        targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.ecstore
+            .heal_replacement_format(dry_run, pool_index, set_index, targets)
+            .await
+            .map(|(result, error)| (result, error.map(Error::Storage)))
+            .map_err(Error::Storage)
     }
 
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {

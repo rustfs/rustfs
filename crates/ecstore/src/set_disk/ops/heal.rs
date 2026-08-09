@@ -1711,19 +1711,35 @@ impl SetDisks {
     }
 }
 
-// Heal operation family: the storage-api `HealOperations` contract stays
-// implemented `for SetDisks` (contract bounds unchanged) but now lives beside
-// its inherent helpers in the `set_disk::ops::heal` module. Bodies are moved
-// unchanged; `get_pool_and_set` reads the core through `SetDisksCtx` to keep
-// the Heal family aligned with the borrow pattern from #816.
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
-    type Error = Error;
-    type HealResultItem = HealResultItem;
-    type HealOptions = HealOpts;
+impl SetDisks {
+    pub(crate) async fn heal_replacement_format(
+        &self,
+        dry_run: bool,
+        targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        if targets.is_empty() {
+            return Err(Error::other("replacement format requires at least one target"));
+        }
 
-    #[tracing::instrument(skip(self))]
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        let mut target_slots = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(slot) = self.set_endpoints.iter().position(|endpoint| endpoint.to_string() == *target) else {
+                return Err(Error::other("replacement format target does not belong to the set"));
+            };
+            if target_slots.contains(&slot) {
+                return Err(Error::other("replacement format target is duplicated"));
+            }
+            target_slots.push(slot);
+        }
+
+        self.heal_format_for_slots(dry_run, Some(&target_slots)).await
+    }
+
+    async fn heal_format_for_slots(
+        &self,
+        dry_run: bool,
+        target_slots: Option<&[usize]>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
         let disks = self.disks.read().await.clone();
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if errs.iter().any(|err| {
@@ -1785,7 +1801,9 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
         if !dry_run {
             for (disk_idx, err) in errs.iter().enumerate() {
-                if !matches!(err, Some(DiskError::UnformattedDisk)) {
+                if !matches!(err, Some(DiskError::UnformattedDisk))
+                    || target_slots.is_some_and(|slots| !slots.contains(&disk_idx))
+                {
                     continue;
                 }
 
@@ -1802,6 +1820,23 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         }
 
         Ok((result, None))
+    }
+}
+
+// Heal operation family: the storage-api `HealOperations` contract stays
+// implemented `for SetDisks` (contract bounds unchanged) but now lives beside
+// its inherent helpers in the `set_disk::ops::heal` module. Bodies are moved
+// unchanged; `get_pool_and_set` reads the core through `SetDisksCtx` to keep
+// the Heal family aligned with the borrow pattern from #816.
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
+    #[tracing::instrument(skip(self))]
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_format_for_slots(dry_run, None).await
     }
 
     #[tracing::instrument(skip(self))]

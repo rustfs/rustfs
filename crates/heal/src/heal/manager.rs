@@ -2367,6 +2367,12 @@ impl HealManager {
                                     set_disk_id: set_disk_id.clone(),
                                 },
                                 HealOptions {
+                                    pool_index: endpoints
+                                        .first()
+                                        .and_then(|endpoint| usize::try_from(endpoint.pool_idx).ok()),
+                                    set_index: endpoints
+                                        .first()
+                                        .and_then(|endpoint| usize::try_from(endpoint.set_idx).ok()),
                                     timeout: None,
                                     ..HealOptions::default()
                                 },

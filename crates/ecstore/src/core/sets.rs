@@ -2212,6 +2212,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn replacement_format_only_writes_the_requested_slot() {
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(1, false).await;
+        let target = sets.endpoints.endpoints.as_ref()[1].to_string();
+        let untouched = sets.endpoints.endpoints.as_ref()[2].to_string();
+        let set = set_level_heal_view(&sets).await;
+
+        let (result, error) = set
+            .heal_replacement_format(false, &[target.clone()])
+            .await
+            .expect("target-scoped replacement format should run");
+
+        assert!(error.is_none(), "target format must not report an error: {error:?}");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == target && drive.state == DriveState::Ok.to_string()),
+            "requested replacement slot must be formatted"
+        );
+        let untouched_format = std::path::Path::new(&sets.endpoints.endpoints.as_ref()[2].get_file_path())
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(crate::disk::FORMAT_CONFIG_FILE);
+        assert!(
+            !tokio::fs::try_exists(untouched_format)
+                .await
+                .expect("untouched replacement format path should be inspectable"),
+            "unrequested slot {untouched} must remain unformatted"
+        );
+    }
+
     fn instance_ctx_test_pool_endpoints() -> (FormatV3, PoolEndpoints) {
         let format = FormatV3::new(1, 2);
         let endpoints = vec![

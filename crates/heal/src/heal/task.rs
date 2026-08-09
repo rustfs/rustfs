@@ -2160,7 +2160,23 @@ impl HealTask {
             stage = "heal_format",
             "Heal erasure set stage entered"
         );
-        let format_result = self.await_with_control(self.storage.heal_format(self.options.dry_run)).await;
+        let format_result = if matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty() {
+            let pool_index = self.options.pool_index.ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing pool scope for automatic replacement heal {set_disk_id}"),
+            })?;
+            let set_index = self.options.set_index.ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing set scope for automatic replacement heal {set_disk_id}"),
+            })?;
+            self.await_with_control(self.storage.heal_replacement_format(
+                self.options.dry_run,
+                pool_index,
+                set_index,
+                &self.heal_endpoints,
+            ))
+            .await
+        } else {
+            self.await_with_control(self.storage.heal_format(self.options.dry_run)).await
+        };
 
         match format_result {
             Ok((result, error)) => {
@@ -2460,6 +2476,42 @@ mod tests {
         assert!(!target_outcomes_complete(&result, &["disk-a".to_string(), "disk-b".to_string()]));
         assert!(!target_outcomes_complete(&result, &["disk-c".to_string()]));
     }
+
+    #[tokio::test]
+    async fn automatic_replacement_uses_target_scoped_format() {
+        let storage = Arc::new(MockStorage::default());
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: Vec::new(),
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..Default::default()
+            },
+            HealPriority::Low,
+        );
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect_err("the mock has no local replacement marker target");
+
+        assert_eq!(
+            *storage.global_format_calls.lock().unwrap(),
+            0,
+            "automatic replacement must not call global format"
+        );
+        assert_eq!(
+            storage.replacement_format_calls.lock().unwrap().as_slice(),
+            &[(0, 0, vec!["replacement-a".to_string()])],
+            "automatic replacement must pass the exact pool, set, and target"
+        );
+    }
+
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
@@ -2474,6 +2526,8 @@ mod tests {
         heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
         deleted_objects: Mutex<Vec<String>>,
         format_no_heal_required: Mutex<bool>,
+        global_format_calls: Mutex<u32>,
+        replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
         include_object_dir_candidate: Mutex<bool>,
@@ -2755,12 +2809,42 @@ mod tests {
         }
 
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+            *self.global_format_calls.lock().unwrap() += 1;
             let no_heal_required = *self.format_no_heal_required.lock().unwrap();
             if no_heal_required {
                 Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::NoHealRequired))))
             } else {
                 Ok((HealResultItem::default(), None))
             }
+        }
+
+        async fn heal_replacement_format(
+            &self,
+            _dry_run: bool,
+            pool_index: usize,
+            set_index: usize,
+            targets: &[String],
+        ) -> Result<(HealResultItem, Option<Error>)> {
+            self.replacement_format_calls
+                .lock()
+                .unwrap()
+                .push((pool_index, set_index, targets.to_vec()));
+            Ok((
+                HealResultItem {
+                    after: Infos {
+                        drives: targets
+                            .iter()
+                            .map(|endpoint| HealDriveInfo {
+                                endpoint: endpoint.clone(),
+                                state: "ok".to_string(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    },
+                    ..Default::default()
+                },
+                None,
+            ))
         }
 
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>> {
