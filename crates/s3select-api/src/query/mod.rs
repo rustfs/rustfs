@@ -15,6 +15,8 @@
 use s3s::dto::SelectObjectContentInput;
 use std::sync::Arc;
 
+use crate::SelectObjectSnapshot;
+
 pub mod analyzer;
 pub mod ast;
 pub mod dispatcher;
@@ -37,12 +39,26 @@ pub struct Context {
 pub struct Query {
     context: Context,
     content: String,
+    snapshot: Option<Arc<SelectObjectSnapshot>>,
 }
 
 impl Query {
     #[inline(always)]
     pub fn new(context: Context, content: String) -> Self {
-        Self { context, content }
+        Self {
+            context,
+            content,
+            snapshot: None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn new_with_snapshot(context: Context, content: String, snapshot: Arc<SelectObjectSnapshot>) -> Self {
+        Self {
+            context,
+            content,
+            snapshot: Some(snapshot),
+        }
     }
 
     pub fn context(&self) -> &Context {
@@ -51,5 +67,9 @@ impl Query {
 
     pub fn content(&self) -> &str {
         self.content.as_str()
+    }
+
+    pub fn snapshot(&self) -> Option<&Arc<SelectObjectSnapshot>> {
+        self.snapshot.as_ref()
     }
 }
