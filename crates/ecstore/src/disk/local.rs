@@ -4623,21 +4623,56 @@ fn replacement_mount_identity(metadata: &std::fs::Metadata, mount_id: u64) -> Re
 #[cfg(target_os = "linux")]
 fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
     use rustix::fs::{AtFlags, StatxFlags};
+    use std::os::fd::AsRawFd as _;
 
-    let statx = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).ok()?;
-    StatxFlags::from_bits_retain(statx.stx_mask)
-        .contains(StatxFlags::MNT_ID)
-        .then_some(statx.stx_mnt_id)
+    rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .ok()
+        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
+        .map(|statx| statx.stx_mnt_id)
+        .or_else(|| mount_id_from_fdinfo(fd.as_raw_fd()))
 }
 
 #[cfg(target_os = "linux")]
 fn mount_id_for_path(path: &Path) -> Option<u64> {
     use rustix::fs::{AtFlags, CWD, StatxFlags};
 
-    let statx = rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID).ok()?;
-    StatxFlags::from_bits_retain(statx.stx_mask)
-        .contains(StatxFlags::MNT_ID)
-        .then_some(statx.stx_mnt_id)
+    rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)
+        .ok()
+        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
+        .map(|statx| statx.stx_mnt_id)
+        .or_else(|| fs::canonicalize(path).ok().and_then(|path| mount_id_from_mountinfo(&path)))
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
+    fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_from_mountinfo(path: &Path) -> Option<u64> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mount_id_from_mountinfo_contents(&mountinfo, path)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64> {
+    let mountpoint = path
+        .to_string_lossy()
+        .replace('\\', "\\134")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012")
+        .replace(' ', "\\040");
+    mountinfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let mount_id = fields.next()?.parse().ok()?;
+        fields.next()?;
+        fields.next()?;
+        fields.next()?;
+        (fields.next()? == mountpoint).then_some(mount_id)
+    })
 }
 
 impl LocalDisk {
@@ -20240,5 +20275,13 @@ mod test {
             held, rebound,
             "a bind remount can retain device and inode while changing the mount incarnation"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_fallback_uses_the_exact_escaped_mountpoint() {
+        let mountinfo = "101 1 0:30 / / rw - rootfs rootfs rw\n202 101 0:42 / /mnt/replacement\\040disk rw - tmpfs tmpfs rw\n";
+        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement disk")), Some(202));
+        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement")), None);
     }
 }
