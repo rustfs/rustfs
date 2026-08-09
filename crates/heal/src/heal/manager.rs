@@ -65,6 +65,11 @@ fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bo
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
 
+fn replacement_recovery_error_requires_block(error: &Error) -> bool {
+    let error = error.to_string();
+    error.contains("conflict") || error.contains("conflicting")
+}
+
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
 // recovery loops submit those per object, so a full queue or a retry storm
@@ -1385,7 +1390,9 @@ impl HealManager {
                 // Legacy flat records are inspected only while starting. The
                 // periodic scanner lists the dedicated replacement directory.
                 if let Err(error) = ResumeUtils::migrate_legacy_replacement_records(disk).await {
-                    if let Some(set_disk_id) = &disk_set_disk_id {
+                    if replacement_recovery_error_requires_block(&error)
+                        && let Some(set_disk_id) = &disk_set_disk_id
+                    {
                         self.block_replacement_recovery_set(set_disk_id);
                     }
                     warn!(
@@ -1401,7 +1408,9 @@ impl HealManager {
                 let replacement_task_ids = match ResumeUtils::get_replacement_intent_tasks(disk).await {
                     Ok(task_ids) => task_ids,
                     Err(error) => {
-                        if let Some(set_disk_id) = &disk_set_disk_id {
+                        if replacement_recovery_error_requires_block(&error)
+                            && let Some(set_disk_id) = &disk_set_disk_id
+                        {
                             self.block_replacement_recovery_set(set_disk_id);
                         }
                         warn!(
@@ -1420,7 +1429,9 @@ impl HealManager {
                     let manager = match ResumeManager::load_replacement_intent(disk.clone(), &task_id).await {
                         Ok(manager) => manager,
                         Err(error) => {
-                            if let Some(set_disk_id) = &disk_set_disk_id {
+                            if replacement_recovery_error_requires_block(&error)
+                                && let Some(set_disk_id) = &disk_set_disk_id
+                            {
                                 self.block_replacement_recovery_set(set_disk_id);
                             }
                             warn!(
@@ -4437,6 +4448,16 @@ mod tests {
 
         assert!(manager.replacement_recovery_set_is_blocked("pool_0_set_0"));
         assert!(!manager.replacement_recovery_set_is_blocked("pool_0_set_1"));
+    }
+
+    #[test]
+    fn replacement_recovery_blocks_only_confirmed_conflicts() {
+        assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
+            message: "Replacement completion proof conflicts with legacy proof".to_string(),
+        }));
+        assert!(!replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
+            message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
+        }));
     }
 
     #[test]
