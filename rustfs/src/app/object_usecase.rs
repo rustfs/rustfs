@@ -200,7 +200,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 #[cfg(test)]
 use tokio_util::io::ReaderStream;
-use tokio_util::io::{StreamReader, poll_read_buf};
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -1344,13 +1344,21 @@ where
             None => return Poll::Ready(None),
         };
         let read_capacity = (*this.capacity).min(*this.remaining);
-        if this.buf.capacity() < read_capacity {
-            this.buf.reserve(read_capacity - this.buf.capacity());
-        }
+        this.buf.resize(read_capacity, 0);
 
-        let result: Poll<Option<Self::Item>> = match poll_read_buf(reader, cx, &mut *this.buf) {
+        let poll_read = {
+            let mut read_buf = ReadBuf::new(&mut this.buf[..read_capacity]);
+            match reader.poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        };
+
+        let result: Poll<Option<Self::Item>> = match poll_read {
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
-                let bytes = this.buf.split().freeze();
+                let bytes = this.buf.split_to(bytes_read).freeze();
+                this.buf.clear();
                 *this.remaining -= bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
@@ -1369,6 +1377,7 @@ where
                 }
             }
             Poll::Ready(Ok(_)) => {
+                this.buf.clear();
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
@@ -1382,6 +1391,7 @@ where
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
             Poll::Ready(Err(err)) => {
+                this.buf.clear();
                 this.reader.set(None);
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
@@ -1392,7 +1402,10 @@ where
                 );
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                this.buf.clear();
+                Poll::Pending
+            }
         };
 
         let emitted_bytes = match &result {
@@ -14864,6 +14877,32 @@ mod tests {
             vec![5],
             "stream should not ask the reader for more bytes than the response has left"
         );
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_bounds_multi_chunk_final_read() {
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(vec![b'a'; 66]),
+            64,
+            65,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
+
+        let chunks = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reader stream should ignore bytes past declared length");
+        let chunk_lengths = chunks.iter().map(Bytes::len).collect::<Vec<_>>();
+        let body = chunks.into_iter().fold(Vec::new(), |mut acc, chunk| {
+            acc.extend_from_slice(&chunk);
+            acc
+        });
+
+        assert_eq!(chunk_lengths, vec![64, 1]);
+        assert_eq!(body, vec![b'a'; 65]);
     }
 
     #[tokio::test]
