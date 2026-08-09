@@ -516,6 +516,8 @@ async fn read_drive_shard(drive: &str, object: &str, object_dir: &Path, xl_path:
     let fi = fm
         .into_fileinfo(META_BUCKET, object, "", true, false, true)
         .map_err(|e| Error::other(format!("resolve version in {}: {e}", xl_path.display())))?;
+    fi.validate_for_metadata_read()
+        .map_err(|error| Error::other(format!("{} on drive {drive}: invalid persisted metadata: {error}", xl_path.display())))?;
 
     let checksum_info = fi.erasure.get_checksum_info(1);
     let algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -694,6 +696,18 @@ mod tests {
         payload: &[u8],
         inline: bool,
     ) {
+        write_modern_object_fixture_with_distribution(drives, indices, bucket, object, payload, inline, &[1, 2, 3, 4]).await;
+    }
+
+    async fn write_modern_object_fixture_with_distribution(
+        drives: &[tempfile::TempDir],
+        indices: &[usize],
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+        inline: bool,
+        distribution: &[usize],
+    ) {
         let erasure = Erasure::try_new(2, 2, 64).expect("test erasure geometry");
         let encoded = encode_object_shards(&erasure, payload);
         let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("test data dir");
@@ -715,7 +729,7 @@ mod tests {
             }];
             file_info.erasure.block_size = 64;
             file_info.erasure.index = index;
-            file_info.erasure.distribution = vec![1, 2, 3, 4];
+            file_info.erasure.distribution = distribution.to_vec();
             file_info.erasure.checksums = vec![ChecksumInfo {
                 part_number: 1,
                 algorithm: algorithm.clone(),
@@ -1000,6 +1014,30 @@ mod tests {
             .await
             .expect("reconstruct non-inline metadata");
         assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn rejects_write_quorum_with_an_invalid_erasure_distribution() {
+        let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        write_modern_object_fixture_with_distribution(
+            &drives,
+            &[1, 2, 3],
+            "interop",
+            BUCKET_METADATA_FILE,
+            &payload,
+            true,
+            &[1, 1, 3, 4],
+        )
+        .await;
+
+        let error = reconstruct_system_object(&inspect_opts(&drives), BUCKET_METADATA_FILE)
+            .await
+            .expect_err("invalid metadata on a full write quorum must fail at the drive boundary");
+        assert!(error.to_string().contains("invalid persisted metadata"), "unexpected error: {error}");
+        assert!(error.to_string().contains("xl.meta"), "error must identify a drive path: {error}");
     }
 
     fn bucket_metadata_blob(incarnation: Uuid) -> Vec<u8> {
