@@ -46,6 +46,8 @@ const REPLACEMENT_COMPLETION_PROOF_FILE: &str = "ahm_replacement_completion_proo
 const REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 const REPLACEMENT_INTENT_SEAL_FILE: &str = "ahm_replacement_intent_seal";
 const LEGACY_REPLACEMENT_RECOVERY_MARKER_FILE: &str = "ahm_replacement_recovery.json";
+const REPLACEMENT_RECOVERY_CONFLICT_PREFIX: &str = "replacement recovery conflict:";
+const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corruption:";
 const CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA: u32 = 1;
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
@@ -322,6 +324,27 @@ impl PersistThrottle {
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {path:?}")))
+}
+
+fn replacement_recovery_conflict(message: impl std::fmt::Display) -> Error {
+    Error::TaskExecutionFailed {
+        message: format!("{REPLACEMENT_RECOVERY_CONFLICT_PREFIX} {message}"),
+    }
+}
+
+fn replacement_recovery_corruption(message: impl std::fmt::Display) -> Error {
+    Error::TaskExecutionFailed {
+        message: format!("{REPLACEMENT_RECOVERY_CORRUPTION_PREFIX} {message}"),
+    }
+}
+
+pub(crate) fn replacement_recovery_error_requires_block(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::TaskExecutionFailed { message }
+            if message.starts_with(REPLACEMENT_RECOVERY_CONFLICT_PREFIX)
+                || message.starts_with(REPLACEMENT_RECOVERY_CORRUPTION_PREFIX)
+    )
 }
 
 /// Resume task IDs become part of metadata file names. Persisted filenames are
@@ -982,9 +1005,9 @@ impl ResumeManager {
             [] => Ok(None),
             [proof] => Ok(Some(proof.clone())),
             [proof, legacy_proof] if proof == legacy_proof => Ok(Some(proof.clone())),
-            _ => Err(Error::TaskExecutionFailed {
-                message: format!("Replacement completion proof conflicts with legacy proof for task {task_id}"),
-            }),
+            _ => Err(replacement_recovery_conflict(format!(
+                "Replacement completion proof conflicts with legacy proof for task {task_id}"
+            ))),
         }
     }
 
@@ -1007,9 +1030,10 @@ impl ResumeManager {
             return Ok(());
         }
         if state.completed || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Replacement completion proof conflicts with state for task {}", state.task_id),
-            });
+            return Err(replacement_recovery_conflict(format!(
+                "Replacement completion proof conflicts with state for task {}",
+                state.task_id
+            )));
         }
 
         state.mark_completed();
@@ -1032,10 +1056,9 @@ impl ResumeManager {
                 });
             }
         };
-        let legacy_proof: ReplacementCompletionProof =
-            serde_json::from_slice(&legacy_bytes).map_err(|error| Error::TaskExecutionFailed {
-                message: format!("Failed to deserialize legacy replacement completion proof: {error}"),
-            })?;
+        let legacy_proof: ReplacementCompletionProof = serde_json::from_slice(&legacy_bytes).map_err(|error| {
+            replacement_recovery_corruption(format!("Failed to deserialize legacy replacement completion proof: {error}"))
+        })?;
         legacy_proof.validate(task_id)?;
 
         ensure_replacement_recovery_dir(disk)
@@ -1054,9 +1077,9 @@ impl ResumeManager {
                         })?;
                     proof.validate(task_id)?;
                     if proof != legacy_proof {
-                        return Err(Error::TaskExecutionFailed {
-                            message: format!("Replacement completion proof conflicts with legacy proof for task {task_id}"),
-                        });
+                        return Err(replacement_recovery_conflict(format!(
+                            "Replacement completion proof conflicts with legacy proof for task {task_id}"
+                        )));
                     }
                     delete_resume_file(disk, &legacy_path).await?;
                     return Ok(true);
@@ -1135,9 +1158,9 @@ impl ResumeManager {
                 let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file).await?;
                 let legacy_state = legacy.get_state().await;
                 if !is_replacement_intent(&legacy_state) || legacy_state != isolated.get_state().await {
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Replacement intent has conflicting legacy state for task {task_id}"),
-                    });
+                    return Err(replacement_recovery_conflict(format!(
+                        "Replacement intent has conflicting legacy state for task {task_id}"
+                    )));
                 }
                 legacy.cleanup().await?;
             }
@@ -2073,9 +2096,11 @@ impl ResumeUtils {
         for task_id in state_task_ids {
             let has_flat_intent = ResumeManager::has_state_file(disk, &task_id, ResumeStateFile::LegacyReplacementIntent).await;
             if !has_flat_intent {
-                let Ok(manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
-                    continue;
-                };
+                let manager = ResumeManager::load_from_disk(disk.clone(), &task_id).await.map_err(|error| {
+                    replacement_recovery_corruption(format!(
+                        "Failed to load legacy replacement recovery candidate {task_id}: {error}"
+                    ))
+                })?;
                 if !is_replacement_intent(&manager.get_state().await) {
                     continue;
                 }
@@ -2868,6 +2893,30 @@ mod tests {
                 .await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_migration_reports_corrupt_ordinary_replacement_candidate() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let legacy_resume = ResumeStateFile::Ordinary.path(&task_id);
+        let legacy_resume = legacy_resume.to_str().expect("legacy resume path must be UTF-8");
+        disk.write_all(RUSTFS_META_BUCKET, legacy_resume, b"{corrupt replacement resume".as_slice().into())
+            .await
+            .expect("corrupt legacy replacement candidate should persist");
+
+        let error = ResumeUtils::migrate_legacy_replacement_records(&disk)
+            .await
+            .expect_err("a corrupt UUID-named legacy candidate must fail closed");
+
+        assert!(replacement_recovery_error_requires_block(&error));
+        assert!(error.to_string().contains("replacement recovery corruption"));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_resume)
+                .await
+                .expect("corrupt legacy state must remain for operator recovery"),
+            b"{corrupt replacement resume".as_slice()
+        );
     }
 
     #[tokio::test]

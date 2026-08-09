@@ -14,7 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils},
+    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils, replacement_recovery_error_requires_block},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -63,11 +63,6 @@ fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bo
             && state.retry_count >= state.max_retries)
             || (state.completed
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
-}
-
-fn replacement_recovery_error_requires_block(error: &Error) -> bool {
-    let error = error.to_string();
-    error.contains("conflict") || error.contains("conflicting")
 }
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
@@ -4453,7 +4448,7 @@ mod tests {
     #[test]
     fn replacement_recovery_blocks_only_confirmed_conflicts() {
         assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
-            message: "Replacement completion proof conflicts with legacy proof".to_string(),
+            message: "replacement recovery conflict: proof mismatch".to_string(),
         }));
         assert!(!replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
             message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
