@@ -4484,7 +4484,10 @@ pub struct LocalDisk {
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
     mount_lease: std::fs::File,
+    /// Public path for callers that need the configured disk layout. Internal
+    /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
+    io_format_path: PathBuf,
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
@@ -4623,8 +4626,8 @@ impl LocalDisk {
         &self.io_root
     }
 
-    /// Auto-replacement is destructive, so it is admitted only when local
-    /// I/O is bound to the mounted directory rather than the endpoint path.
+    /// Auto-replacement is destructive, so it is admitted only when the
+    /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -4633,7 +4636,7 @@ impl LocalDisk {
             let Ok(configured) = std::fs::metadata(&self.root) else {
                 return false;
             };
-            let Ok(pinned) = std::fs::metadata(self.io_root()) else {
+            let Ok(pinned) = self.mount_lease.metadata() else {
                 return false;
             };
             return configured.dev() == pinned.dev() && configured.ino() == pinned.ino();
@@ -4716,7 +4719,8 @@ impl LocalDisk {
         }
 
         // Use optimized path resolution instead of absolutize_virtually
-        let format_path = io_root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
+        let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
+        let io_format_path = io_root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -4726,8 +4730,8 @@ impl LocalDisk {
             state = "format_path_resolved",
             "Local disk format path resolved"
         );
-        let (format_data, format_meta) = read_file_exists(&format_path).await.inspect_err(|err| {
-            log_startup_disk_error("read_format_json", &format_path, err);
+        let (format_data, format_meta) = read_file_exists(&io_format_path).await.inspect_err(|err| {
+            log_startup_disk_error("read_format_json", &io_format_path, err);
         })?;
 
         let mut id = None;
@@ -4822,6 +4826,7 @@ impl LocalDisk {
             mount_lease,
             endpoint: ep.clone(),
             format_path,
+            io_format_path,
             format_info: RwLock::new(format_info),
             disk_info_cache: Arc::new(cache),
             scanning: Arc::new(AtomicU32::new(0)),
@@ -5117,7 +5122,7 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = fs::metadata(&self.format_path).await.map_err(to_unformatted_disk_error)?;
+        let md = fs::metadata(&self.io_format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {
@@ -7274,7 +7279,7 @@ impl DiskAPI for LocalDisk {
 
         debug!("get_disk_id: read format.json");
 
-        let b = fs::read(&self.format_path).await.map_err(to_unformatted_disk_error)?;
+        let b = fs::read(&self.io_format_path).await.map_err(to_unformatted_disk_error)?;
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
             warn!(
@@ -20035,6 +20040,11 @@ mod test {
         assert!(
             !disk.has_replacement_mount_lease(),
             "replacement admission must reject a path that no longer names the lease"
+        );
+        assert_eq!(
+            disk.format_path,
+            root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE),
+            "the public format path must keep configured-root semantics after replacement"
         );
         disk.write_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Bytes::from_static(b"owner"))
             .await
