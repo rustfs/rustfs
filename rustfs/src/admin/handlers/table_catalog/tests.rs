@@ -2448,6 +2448,68 @@ async fn commit_publication_authorizes_referenced_objects() {
 }
 
 #[tokio::test]
+async fn commit_publication_denies_referenced_data_read_before_pointer_advance() {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let before = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let table_location = created.metadata["location"]
+        .as_str()
+        .expect("created metadata should have table location");
+    let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+    let data_file = format!("{table_location}/data/part-10.parquet");
+    seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
+    let request = serde_json::from_value(serde_json::json!({
+        "commit-id": "33333333-3333-4333-8333-333333333333",
+        "requirements": [],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 10,
+                    "sequence-number": 1,
+                    "timestamp-ms": 1234,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                }
+            },
+            {
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "snapshot-id": 10,
+                "type": "branch"
+            }
+        ]
+    }))
+    .expect("standard commit request should parse");
+    let denied_object = test_snapshot_object_key("warehouse", &data_file);
+    let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let commit_backend = TableCommitObjectBackend::test(metadata_backend, Arc::clone(&authorized), Some(denied_object.clone()));
+
+    let result = commit_table_response(&store, &commit_backend, "warehouse", &namespace, "events", request).await;
+    let error = commit_backend
+        .finish(result)
+        .await
+        .expect_err("denied referenced data read should fail the commit");
+
+    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    assert!(authorized.lock().await.contains(&(denied_object, S3Action::GetObjectAction)));
+    let after = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should remain");
+    assert_eq!(after.metadata_location, before.metadata_location);
+    assert_eq!(after.version_token, before.version_token);
+    assert_eq!(after.generation, before.generation);
+}
+
+#[tokio::test]
 async fn commit_publication_holds_referenced_object_locks_until_pointer_publish() {
     let pause = TestCatalogPublishPause::default();
     let store = Arc::new(TestTableCatalogStore {
