@@ -107,7 +107,8 @@ fn filesystem_identity(metadata: &fs::Metadata, canonical_path: &Path) -> Option
     use std::os::unix::fs::MetadataExt as _;
 
     let escaped_path = canonical_path.to_string_lossy().replace(' ', "\\040");
-    let mount_id = fs::read_to_string("/proc/self/mountinfo")?.lines().find_map(|line| {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mount_id = mountinfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let mount_id = fields.next()?;
         fields.next()?;
