@@ -260,7 +260,7 @@ impl ErasureSetHealer {
         if self.replacement_task_id.is_some() {
             // A replacement marker must outlive the successful data scan. The
             // task clears that owner marker before deleting these artifacts.
-            resume_manager.mark_replacement_verified().await?;
+            resume_manager.mark_replacement_completed_and_verified().await?;
             return Ok(());
         }
 
@@ -602,8 +602,11 @@ impl ErasureSetHealer {
             )));
         }
 
-        // no failures — mark task completed
-        resume_manager.mark_completed().await?;
+        // No failures — ordinary heals are complete now. Replacement heals
+        // atomically transition to Verified after the terminal identity fence.
+        if self.replacement_task_id.is_none() {
+            resume_manager.mark_completed().await?;
+        }
 
         debug!(
             target: "rustfs::heal::erasure_healer",

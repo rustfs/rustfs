@@ -44,7 +44,7 @@ const CURRENT_RESUME_SCHEMA: u32 = 5;
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
-const CURRENT_CHECKPOINT_SCHEMA: u32 = 4;
+const CURRENT_CHECKPOINT_SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -512,16 +512,17 @@ impl ResumeManager {
         self.save_state_strict().await
     }
 
-    /// Record that the replacement data scan completed before its healing
-    /// marker is removed. The marker-clear caller must advance this to
-    /// `CleanupPending` before it deletes the resume artifacts.
-    pub async fn mark_replacement_verified(&self) -> Result<()> {
+    /// Atomically persist replacement completion before its healing marker is
+    /// removed. The marker-clear caller must advance this to `CleanupPending`
+    /// before it deletes the resume artifacts.
+    pub async fn mark_replacement_completed_and_verified(&self) -> Result<()> {
         let mut state = self.state.write().await;
-        if !state.completed || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
+        if !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
             return Err(Error::TaskExecutionFailed {
                 message: format!("Replacement verification is not active for task {}", state.task_id),
             });
         }
+        state.mark_completed();
         state.replacement_phase = ReplacementPhase::Verified;
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         drop(state);
@@ -1295,13 +1296,9 @@ mod tests {
         .await
         .expect("replacement intent should persist");
         manager
-            .mark_completed()
+            .mark_replacement_completed_and_verified()
             .await
-            .expect("completion must persist before verification");
-        manager
-            .mark_replacement_verified()
-            .await
-            .expect("verified phase must persist");
+            .expect("completion and verified phase must persist together");
 
         let verified = ResumeManager::load_from_disk(disk.clone(), &task_id)
             .await
@@ -1648,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_checkpoint_schema_v2_discarded_on_load() {
+    async fn test_checkpoint_schema_v4_discarded_on_load() {
         use super::super::{DiskOption, Endpoint, new_disk};
         use tempfile::TempDir;
 
@@ -1671,7 +1668,7 @@ mod tests {
         // The previous checkpoint schema is unsafe once its paired resume
         // state is discarded: retaining either position would skip work.
         let legacy = r#"{
-            "schema_version": 2,
+            "schema_version": 4,
             "task_id": "old-task",
             "checkpoint_time": 1700000000,
             "current_bucket_index": 2,
