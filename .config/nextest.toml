@@ -280,10 +280,12 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 # tests that are unfit for the per-PR e2e-smoke gate:
 #
 #   * 2 remote-target TLS validation tests.
-#   * 13 bucket-replication data-plane/helper tests — they PUT/delete objects
+#   * 15 bucket-replication data-plane/helper tests — they PUT/delete objects
 #     and poll until source and target converge; two replicate over HTTPS,
-#     four pin active SSE fail-closed contracts (SSE-C, SSE-S3, SSE-KMS, and
-#     the SSE-S3 resync path), and one guards event/history observers.
+#     six pin SSE replication contracts (managed SSE-S3/SSE-KMS re-encrypt on
+#     the target incl. multipart and the resync path, SSE-C and
+#     target-without-KMS stay fail-closed), and one guards event/history
+#     observers.
 #   * 12 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
 #   * 1 `_real_three_node` site-replication test.

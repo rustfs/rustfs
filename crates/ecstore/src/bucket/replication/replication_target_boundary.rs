@@ -62,7 +62,6 @@ static STANDARD_HEADERS: &[&str] = &[
     AMZ_SERVER_SIDE_ENCRYPTION,
 ];
 
-const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 const ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED: &str = "replication source contains unsupported encryption metadata";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,14 +159,8 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
     let source_encryption = classify_replication_source_encryption(&object_info.user_defined);
     let is_ssec = matches!(source_encryption, ReplicationSourceEncryption::SseC);
 
-    match source_encryption {
-        ReplicationSourceEncryption::Plaintext | ReplicationSourceEncryption::SseC => {}
-        ReplicationSourceEncryption::SseS3 | ReplicationSourceEncryption::SseKms => {
-            return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
-        }
-        ReplicationSourceEncryption::Unsupported => {
-            return Err(Error::other(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
-        }
+    if matches!(source_encryption, ReplicationSourceEncryption::Unsupported) {
+        return Err(Error::other(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
     }
 
     for (key, value) in object_info.user_defined.iter() {
@@ -188,6 +181,16 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         }
 
         meta.insert(key.to_string(), value.to_string());
+    }
+
+    // Managed SSE replicates as plaintext (the replication reader decrypts via
+    // the object-encryption resolver) and re-encrypts on the target with the
+    // target's own KMS. Send only the encryption intent — never the source
+    // key id, whose meaning is local to the source site's KMS.
+    if matches!(source_encryption, ReplicationSourceEncryption::SseS3) {
+        meta.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string());
+    } else if matches!(source_encryption, ReplicationSourceEncryption::SseKms) {
+        meta.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string());
     }
 
     let mut is_multipart = object_info.is_multipart();
@@ -402,13 +405,22 @@ pub(crate) fn replication_force_delete_remove_options() -> RemoveObjectOptions {
     }
 }
 
-pub(crate) fn replication_complete_multipart_options(actual_size: String) -> PutObjectOptions {
+pub(crate) fn replication_complete_multipart_options(
+    actual_size: String,
+    source_etag: String,
+    source_mtime: Option<OffsetDateTime>,
+) -> PutObjectOptions {
     let mut user_metadata = HashMap::new();
     insert_header_map(&mut user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, actual_size);
 
     PutObjectOptions {
         user_metadata,
         internal: AdvancedPutOptions {
+            source_etag,
+            // AdvancedPutOptions::default() stamps now_utc(); an absent source
+            // mtime must degrade to epoch so header() suppresses the header
+            // instead of asserting the replication time as the object's mtime.
+            source_mtime: source_mtime.unwrap_or(OffsetDateTime::UNIX_EPOCH),
             replication_status: ReplicationStatusType::Replica,
             replication_request: true,
             ..Default::default()
@@ -573,7 +585,21 @@ mod tests {
 
     #[test]
     fn replication_complete_multipart_options_sets_actual_size() {
-        let options = replication_complete_multipart_options("1024".to_string());
+        let source_mtime = OffsetDateTime::from_unix_timestamp(1_716_170_000).expect("valid test timestamp");
+        let options = replication_complete_multipart_options(
+            "1024".to_string(),
+            "0123456789abcdef0123456789abcdef-3".to_string(),
+            Some(source_mtime),
+        );
+        assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef-3");
+        assert_eq!(options.internal.source_mtime, source_mtime);
+
+        // Absent source mtime must degrade to epoch (header suppressed), not
+        // the AdvancedPutOptions default of now_utc() — that default would
+        // stamp the replication time as the replica's mtime and break the
+        // multipart HEAD convergence.
+        let options_no_mtime = replication_complete_multipart_options("1024".to_string(), String::new(), None);
+        assert_eq!(options_no_mtime.internal.source_mtime.unix_timestamp(), 0);
 
         assert_eq!(
             get_header_map(&options.user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).as_deref(),
@@ -809,36 +835,75 @@ mod tests {
     }
 
     #[test]
-    fn replication_put_options_rejects_sse_s3_until_target_encryption_is_supported() {
-        let object_info = ObjectInfo {
-            user_defined: Arc::new(HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())])),
-            ..Default::default()
+    fn replication_put_options_sends_sse_s3_intent_without_source_material() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
+            INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
         };
 
-        let err = match replication_put_object_options("", &object_info) {
-            Ok(_) => panic!("SSE-S3 replication should fail closed until target encryption headers are supported"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
-    }
-
-    #[test]
-    fn replication_put_options_rejects_sse_kms_until_target_encryption_is_supported() {
+        // The stored shape of a managed SSE-S3 object per
+        // encryption_material_to_metadata: SSE marker plus envelope material.
         let object_info = ObjectInfo {
             user_defined: Arc::new(HashMap::from([
-                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
-                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "default".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "sealed-envelope".to_string()),
+                (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "iv".to_string()),
+                (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256-GCM".to_string()),
+                (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), "1024".to_string()),
+                ("x-user-meta".to_string(), "value".to_string()),
             ])),
             ..Default::default()
         };
 
-        let err = match replication_put_object_options("", &object_info) {
-            Ok(_) => panic!("SSE-KMS replication should fail closed until target encryption headers are supported"),
-            Err(err) => err,
+        let (options, _) = replication_put_object_options("", &object_info).expect("managed SSE-S3 must build put options");
+
+        assert_eq!(options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION), Some(&"AES256".to_string()));
+        assert_eq!(options.user_metadata.get("x-user-meta"), Some(&"value".to_string()));
+        // No envelope material and no key id may leave the source.
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_KEY_ID_HEADER));
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            !options.user_metadata.values().any(|value| value.contains("sealed-envelope")),
+            "source envelope material must never leave the source site"
+        );
+    }
+
+    #[test]
+    fn replication_put_options_sends_sse_kms_intent_without_source_key_id() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
         };
 
-        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "source-key-1".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "sealed-envelope".to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), "ctx".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("managed SSE-KMS must build put options");
+
+        // Intent only: the target encrypts with its own default KMS key.
+        assert_eq!(options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION), Some(&"aws:kms".to_string()));
+        assert!(!options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID));
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
+        assert!(
+            !options
+                .user_metadata
+                .contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+        );
+        assert!(
+            !options
+                .user_metadata
+                .values()
+                .any(|value| value.contains("sealed-envelope") || value.contains("source-key-1")),
+            "source KMS identifiers and envelopes must never leave the source site"
+        );
     }
 
     #[test]

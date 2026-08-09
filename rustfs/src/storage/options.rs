@@ -18,8 +18,8 @@ use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
-    insert_header_map,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
@@ -352,9 +352,11 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
 
     let mut replication_request = false;
     let mut mod_time = None;
+    let mut preserve_etag = None;
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
         mod_time = replication_source_mtime(headers);
+        preserve_etag = replication_source_etag(headers);
         if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
@@ -375,6 +377,7 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
         user_defined,
         replication_request,
         mod_time,
+        preserve_etag,
         ..Default::default()
     };
     apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
@@ -423,8 +426,18 @@ pub fn put_opts_from_headers_with_replication_authorization(
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
         opts.mod_time = replication_source_mtime(headers);
+        opts.preserve_etag = replication_source_etag(headers);
     }
     Ok(opts)
+}
+
+/// Replicas must keep the source object's ETag: managed-SSE replication
+/// re-encrypts on the target, so a recomputed ETag would differ from the
+/// source and every HEAD comparison would re-schedule the object forever.
+fn replication_source_etag(headers: &HeaderMap<HeaderValue>) -> Option<String> {
+    let value = get_header(headers, SUFFIX_SOURCE_ETAG)?;
+    let value = value.trim().trim_matches('"');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::OffsetDateTime> {
@@ -1014,8 +1027,8 @@ mod tests {
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME,
-        SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
+        SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -1431,6 +1444,7 @@ mod tests {
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "0123456789abcdef0123456789abcdef");
 
         let metadata = HashMap::new();
 
@@ -1441,6 +1455,7 @@ mod tests {
 
         assert!(!opts.replication_request);
         assert!(opts.mod_time.is_none());
+        assert!(opts.preserve_etag.is_none());
     }
 
     #[test]
@@ -1449,11 +1464,15 @@ mod tests {
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "\"0123456789abcdef0123456789abcdef-3\"");
 
         let opts = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replication request should parse");
 
         assert!(opts.replication_request);
+        // The replica keeps the source ETag verbatim (quotes trimmed) so the
+        // replication HEAD comparison converges after target-side re-encryption.
+        assert_eq!(opts.preserve_etag.as_deref(), Some("0123456789abcdef0123456789abcdef-3"));
 
         let expected_mtime = time::OffsetDateTime::parse(valid_mtime, &time::format_description::well_known::Rfc3339).unwrap();
         assert_eq!(opts.mod_time, Some(expected_mtime));
@@ -1534,11 +1553,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, source_mtime);
+        insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "\"0123456789abcdef0123456789abcdef-3\"");
 
         let untrusted = get_complete_multipart_upload_opts(&headers)
             .expect("ordinary multipart completion options should ignore replication headers");
         assert!(!untrusted.replication_request);
         assert!(untrusted.mod_time.is_none());
+        assert!(untrusted.preserve_etag.is_none());
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized multipart replication options should parse");
@@ -1546,6 +1567,7 @@ mod tests {
             .expect("test source mtime should be valid");
         assert!(authorized.replication_request);
         assert_eq!(authorized.mod_time, Some(expected));
+        assert_eq!(authorized.preserve_etag.as_deref(), Some("0123456789abcdef0123456789abcdef-3"));
 
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "invalid-time");
         let invalid = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)

@@ -2756,8 +2756,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        // TODO: SSE
-
         if tgt_client.bucket.is_empty() {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -3204,7 +3202,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
         object,
         &upload_id,
         uploaded_parts,
-        &replication_complete_multipart_options(actual_size),
+        &replication_complete_multipart_options(actual_size, object_info.etag.clone().unwrap_or_default(), object_info.mod_time),
     )
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?;
