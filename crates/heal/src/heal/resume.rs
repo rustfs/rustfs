@@ -40,11 +40,32 @@ pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 /// older schema (which tracked latest-only object names and a positional
 /// cursor) are incompatible with the per-version resume cursor, so they are
 /// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 3;
+const CURRENT_RESUME_SCHEMA: u32 = 4;
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
-const CURRENT_CHECKPOINT_SCHEMA: u32 = 3;
+const CURRENT_CHECKPOINT_SCHEMA: u32 = 4;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementPhase {
+    #[default]
+    None,
+    Intent,
+    Rebuilding,
+    Abandoned,
+}
+
+/// Stable evidence for the mounted replacement instance that owns a repair
+/// generation. Endpoint text alone is not sufficient because a later disk can
+/// be mounted at the same configured path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementTargetIdentity {
+    pub endpoint: String,
+    pub canonical_path: String,
+    pub physical_device_ids: Vec<String>,
+    pub filesystem_identity: String,
+}
 
 /// Build the canonical, provably-injective dedup identity for an object
 /// version. Length-prefixing the object key makes the encoding injective: no
@@ -171,6 +192,20 @@ pub struct ResumeState {
     pub set_disk_id: String,
     #[serde(default)]
     pub replacement_targets: Vec<String>,
+    #[serde(default)]
+    pub replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    /// Immutable bucket plan for a replacement generation. `pending_buckets`
+    /// shrinks during a pass and must never be reused as a positional resume
+    /// input after restart.
+    #[serde(default)]
+    pub replacement_buckets: Vec<String>,
+    /// A task-scoped generation assigned before formatting an automatic
+    /// replacement. A new unformatted replacement receives a new generation
+    /// and therefore cannot reuse an older disk's cursor or checkpoint.
+    #[serde(default)]
+    pub replacement_generation: Option<String>,
+    #[serde(default)]
+    pub replacement_phase: ReplacementPhase,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -212,6 +247,10 @@ impl ResumeState {
             task_type,
             set_disk_id,
             replacement_targets: Vec::new(),
+            replacement_target_identities: Vec::new(),
+            replacement_buckets: Vec::new(),
+            replacement_generation: None,
+            replacement_phase: ReplacementPhase::None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -228,6 +267,23 @@ impl ResumeState {
             retry_count: 0,
             max_retries: 3,
         }
+    }
+
+    fn replacement_intent(
+        task_id: String,
+        task_type: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+        replacement_targets: Vec<String>,
+        replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    ) -> Self {
+        let mut state = Self::new(task_id.clone(), task_type, set_disk_id, buckets);
+        state.replacement_targets = replacement_targets;
+        state.replacement_target_identities = replacement_target_identities;
+        state.replacement_buckets = state.pending_buckets.clone();
+        state.replacement_generation = Some(task_id);
+        state.replacement_phase = ReplacementPhase::Intent;
+        state
     }
 
     pub fn update_progress(&mut self, processed: u64, successful: u64, failed: u64, skipped: u64) {
@@ -345,6 +401,105 @@ impl ResumeManager {
         Ok(manager)
     }
 
+    /// Persist the automatic replacement intent before the target is formatted.
+    /// Reusing the same task id is idempotent for scheduler retries, while a new
+    /// admission obtains a new task id and cannot inherit stale progress.
+    pub async fn new_replacement_intent(
+        disk: DiskStore,
+        task_id: String,
+        set_disk_id: String,
+        buckets: Vec<String>,
+        mut replacement_targets: Vec<String>,
+        mut replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    ) -> Result<Self> {
+        replacement_targets.sort_unstable();
+        replacement_targets.dedup();
+        replacement_target_identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        replacement_target_identities.dedup_by(|left, right| left.endpoint == right.endpoint);
+        if replacement_target_identities
+            .iter()
+            .map(|identity| &identity.endpoint)
+            .collect::<Vec<_>>()
+            != replacement_targets.iter().collect::<Vec<_>>()
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement identities do not match targets for task {task_id}"),
+            });
+        }
+
+        if Self::has_resume_state(&disk, &task_id).await {
+            let manager = Self::load_from_disk(disk, &task_id).await?;
+            let state = manager.get_state().await;
+            if state.set_disk_id != set_disk_id
+                || state.replacement_targets != replacement_targets
+                || state.replacement_target_identities != replacement_target_identities
+                || state.replacement_generation.as_deref() != Some(task_id.as_str())
+                || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+            {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Replacement intent does not match task {task_id}"),
+                });
+            }
+            return Ok(manager);
+        }
+
+        let state = ResumeState::replacement_intent(
+            task_id,
+            "erasure_set".to_string(),
+            set_disk_id,
+            buckets,
+            replacement_targets,
+            replacement_target_identities,
+        );
+        let manager = Self {
+            disk,
+            state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
+        };
+        manager.save_state_strict().await?;
+        Ok(manager)
+    }
+
+    pub async fn mark_replacement_rebuilding(
+        &self,
+        mut replacement_target_identities: Vec<ReplacementTargetIdentity>,
+    ) -> Result<()> {
+        replacement_target_identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        replacement_target_identities.dedup_by(|left, right| left.endpoint == right.endpoint);
+        let mut state = self.state.write().await;
+        if !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement intent is not active for task {}", state.task_id),
+            });
+        }
+        if replacement_target_identities
+            .iter()
+            .map(|identity| &identity.endpoint)
+            .collect::<Vec<_>>()
+            != state.replacement_targets.iter().collect::<Vec<_>>()
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement identities do not match targets for task {}", state.task_id),
+            });
+        }
+        state.replacement_target_identities = replacement_target_identities;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    pub async fn abandon_replacement_intent(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if matches!(state.replacement_phase, ReplacementPhase::Abandoned) {
+            return Ok(());
+        }
+        state.replacement_phase = ReplacementPhase::Abandoned;
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
     pub async fn set_replacement_targets(&self, replacement_targets: Vec<String>) -> Result<()> {
         {
             let mut state = self.state.write().await;
@@ -363,6 +518,14 @@ impl ResumeManager {
         // A snapshot written by an older schema tracked a latest-only positional
         // cursor that is meaningless under per-version resume. Discard the stale
         // progress so the scan restarts cleanly, then stamp the current schema.
+        if state.schema_version > CURRENT_RESUME_SCHEMA {
+            return Err(Error::TaskExecutionFailed {
+                message: format!(
+                    "Resume state schema {} is newer than supported schema {CURRENT_RESUME_SCHEMA}",
+                    state.schema_version
+                ),
+            });
+        }
         if state.schema_version < CURRENT_RESUME_SCHEMA {
             warn!(
                 target: "rustfs::heal::resume",
@@ -529,6 +692,14 @@ impl ResumeManager {
 
     /// save state to disk
     async fn save_state(&self) -> Result<()> {
+        self.save_state_with_unformatted_policy(true).await
+    }
+
+    async fn save_state_strict(&self) -> Result<()> {
+        self.save_state_with_unformatted_policy(false).await
+    }
+
+    async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
         let state = self.state.read().await;
         let state_data = serde_json::to_vec(&*state).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to serialize resume state: {e}"),
@@ -538,7 +709,7 @@ impl ResumeManager {
 
         let path_str = path_to_str(&file_path)?;
         if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
-            if matches!(e, DiskError::UnformattedDisk) {
+            if allow_unformatted && matches!(e, DiskError::UnformattedDisk) {
                 warn!(
                     target: "rustfs::heal::resume",
                     event = EVENT_HEAL_RESUME_STATE,
@@ -702,6 +873,14 @@ impl CheckpointManager {
         // that are not comparable to the new per-version `compose_key`
         // identities. Discard the stale sets and position, then stamp the
         // current schema so the scan restarts cleanly.
+        if checkpoint.schema_version > CURRENT_CHECKPOINT_SCHEMA {
+            return Err(Error::TaskExecutionFailed {
+                message: format!(
+                    "Checkpoint schema {} is newer than supported schema {CURRENT_CHECKPOINT_SCHEMA}",
+                    checkpoint.schema_version
+                ),
+            });
+        }
         if checkpoint.schema_version < CURRENT_CHECKPOINT_SCHEMA {
             warn!(
                 target: "rustfs::heal::resume",
@@ -994,6 +1173,36 @@ mod tests {
         assert_eq!(state.pending_buckets.len(), 2);
     }
 
+    #[test]
+    fn replacement_intent_binds_a_generation_before_format() {
+        let state = ResumeState::replacement_intent(
+            "generation-a".to_string(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        );
+
+        assert_eq!(state.replacement_generation.as_deref(), Some("generation-a"));
+        assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+        assert_eq!(state.replacement_targets, ["replacement-a"]);
+        assert!(state.resume_cursor.is_none(), "a new replacement must start from the beginning");
+
+        let mut state = state;
+        state.complete_bucket("bucket-a");
+        assert_eq!(
+            state.replacement_buckets,
+            ["bucket-a"],
+            "recovery must retain the original positional bucket plan"
+        );
+    }
+
     #[tokio::test]
     async fn test_resume_state_progress() {
         let task_id = ResumeUtils::generate_task_id();
@@ -1012,6 +1221,98 @@ mod tests {
         state.total_objects = 100;
         let progress = state.get_progress_percentage();
         assert_eq!(progress, 10.0);
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_rejects_a_new_mount_at_the_same_endpoint() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let disk_path = temp_dir.path().join("resume_disk");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
+        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+
+        let task_id = "replacement-generation".to_string();
+        let targets = vec!["replacement-a".to_string()];
+        let first = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        };
+        ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            targets.clone(),
+            vec![first.clone()],
+        )
+        .await
+        .unwrap();
+
+        let reused = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-b".to_string()],
+            targets.clone(),
+            vec![first.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reused.get_state().await.replacement_buckets,
+            ["bucket-a"],
+            "retries must keep the first generation's bucket plan"
+        );
+
+        let mut second = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: first.physical_device_ids.clone(),
+            filesystem_identity: first.filesystem_identity.clone(),
+        };
+        for changed_identity in [
+            {
+                second.physical_device_ids = vec!["device-b".to_string()];
+                second.clone()
+            },
+            {
+                second.physical_device_ids = first.physical_device_ids.clone();
+                second.filesystem_identity = "4:5:6".to_string();
+                second.clone()
+            },
+            {
+                second.filesystem_identity = first.filesystem_identity.clone();
+                second.canonical_path = "/mnt/replacement-b".to_string();
+                second.clone()
+            },
+        ] {
+            let result = ResumeManager::new_replacement_intent(
+                disk.clone(),
+                task_id.clone(),
+                "pool_0_set_0".to_string(),
+                vec!["bucket-a".to_string()],
+                targets.clone(),
+                vec![changed_identity],
+            )
+            .await;
+            assert!(result.is_err(), "a new mounted instance must not reuse the old replacement cursor");
+        }
+        temp_dir.close().unwrap();
     }
 
     #[test]

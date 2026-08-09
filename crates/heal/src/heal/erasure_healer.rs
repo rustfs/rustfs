@@ -87,6 +87,7 @@ pub struct ErasureSetHealer {
     heal_opts: HealOpts,
     source: HealRequestSource,
     target_endpoints: Arc<[String]>,
+    replacement_task_id: Option<String>,
 }
 
 pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
@@ -184,6 +185,7 @@ impl ErasureSetHealer {
         heal_opts: HealOpts,
         source: HealRequestSource,
         mut target_endpoints: Vec<String>,
+        replacement_task_id: Option<String>,
     ) -> Self {
         target_endpoints.sort_unstable();
         target_endpoints.dedup();
@@ -195,6 +197,7 @@ impl ErasureSetHealer {
             heal_opts,
             source,
             target_endpoints: target_endpoints.into(),
+            replacement_task_id,
         }
     }
 
@@ -235,6 +238,21 @@ impl ErasureSetHealer {
 
     /// get or create task id
     async fn get_or_create_task_id(&self, set_disk_id: &str) -> Result<String> {
+        if let Some(task_id) = &self.replacement_task_id {
+            let manager = ResumeManager::load_from_disk(self.disk.clone(), task_id).await?;
+            let state = manager.get_state().await;
+            if !state.completed
+                && state.set_disk_id == set_disk_id
+                && state.replacement_targets.as_slice() == self.target_endpoints.as_ref()
+                && state.replacement_generation.as_deref() == Some(task_id.as_str())
+            {
+                return Ok(task_id.clone());
+            }
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement resume intent does not match task {task_id}"),
+            });
+        }
+
         // check if there are resumable tasks
         let resumable_tasks = ResumeUtils::get_resumable_tasks(&self.disk).await?;
 
@@ -1297,6 +1315,7 @@ mod resume_loop_tests {
             HealOpts::default(),
             HealRequestSource::Internal,
             target_endpoints,
+            None,
         );
         let resume = ResumeManager::new(
             disk.clone(),
@@ -1366,6 +1385,46 @@ mod resume_loop_tests {
         .await;
 
         assert_eq!(env.healer.target_endpoints.as_ref(), ["replacement-a", "replacement-b"]);
+    }
+
+    #[tokio::test]
+    async fn replacement_generation_never_reuses_another_disk_cursor() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            "generation-a".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("first replacement intent should persist");
+
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+            vec!["replacement-a".to_string()],
+            Some("generation-b".to_string()),
+        );
+
+        let error = healer
+            .get_or_create_task_id("pool_0_set_0")
+            .await
+            .expect_err("a second replacement must not reuse the first replacement cursor");
+        assert!(
+            !error.to_string().contains("generation-a"),
+            "the previous replacement generation must not be selected"
+        );
     }
 
     #[tokio::test]

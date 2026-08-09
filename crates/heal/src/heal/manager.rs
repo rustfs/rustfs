@@ -14,6 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
+    resume::{ReplacementPhase, ResumeManager, ResumeUtils},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -1257,6 +1258,10 @@ impl HealManager {
         // start scheduler
         self.start_scheduler().await?;
 
+        // Recover durable replacement intents before the scanner can admit a
+        // competing task for the same set.
+        self.process_unclean_shutdown().await;
+
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
             self.start_auto_disk_scanner().await?;
@@ -1270,10 +1275,6 @@ impl HealManager {
                 "Heal auto disk scanner disabled"
             );
         }
-
-        // Detect a previous unclean shutdown (crash/power loss) and proactively
-        // verify all local erasure sets instead of waiting for the periodic scanner.
-        self.process_unclean_shutdown().await;
 
         info!(
             target: "rustfs::heal::manager",
@@ -1293,10 +1294,15 @@ impl HealManager {
     async fn process_unclean_shutdown(&self) {
         let mut unclean = false;
         let mut set_disk_ids = HashSet::new();
+        let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>)>::new();
+        let mut replacement_restarts = HashMap::<String, (String, Vec<String>)>::new();
 
         {
-            let local_disk_map = local_disk_map_read().await;
-            for disk in local_disk_map.values().flatten() {
+            let local_disks = {
+                let local_disk_map = local_disk_map_read().await;
+                local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
+            };
+            for disk in &local_disks {
                 let endpoint = disk.endpoint();
                 match disk
                     .read_all(super::RUSTFS_META_BUCKET, super::UNCLEAN_SHUTDOWN_MARKER_PATH)
@@ -1339,6 +1345,103 @@ impl HealManager {
                 if let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx) {
                     set_disk_ids.insert(set_disk_id);
                 }
+
+                for task_id in ResumeUtils::get_resumable_tasks(disk).await.unwrap_or_default() {
+                    let Ok(manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
+                        continue;
+                    };
+                    let state = manager.get_state().await;
+                    if !state.completed
+                        && state.replacement_generation.as_deref() == Some(task_id.as_str())
+                        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                        && !state.replacement_targets.is_empty()
+                    {
+                        match self.storage.replacement_target_identities(&state.replacement_targets).await {
+                            Ok(identities) if identities == state.replacement_target_identities => {
+                                replacement_intents.entry(task_id).or_insert((
+                                    state.set_disk_id,
+                                    state.replacement_targets,
+                                    state.replacement_buckets,
+                                ));
+                            }
+                            Ok(_) => {
+                                if manager.abandon_replacement_intent().await.is_ok() {
+                                    replacement_restarts
+                                        .entry(task_id)
+                                        .or_insert((state.set_disk_id, state.replacement_targets));
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if !unclean && replacement_intents.is_empty() && replacement_restarts.is_empty() {
+            return;
+        }
+
+        let mut recovery_by_set = HashMap::<String, Vec<(Option<String>, Vec<String>, Vec<String>)>>::new();
+        for (task_id, (set_disk_id, heal_endpoints, buckets)) in replacement_intents {
+            recovery_by_set
+                .entry(set_disk_id)
+                .or_default()
+                .push((Some(task_id), heal_endpoints, buckets));
+        }
+        for (_abandoned_task_id, (set_disk_id, heal_endpoints)) in replacement_restarts {
+            recovery_by_set
+                .entry(set_disk_id)
+                .or_default()
+                .push((None, heal_endpoints, Vec::new()));
+        }
+
+        for (set_disk_id, mut recoveries) in recovery_by_set {
+            let Ok((pool_index, set_index)) = crate::heal::utils::parse_set_disk_id(&set_disk_id) else {
+                continue;
+            };
+            let reuse_single_generation = recoveries.len() == 1 && recoveries[0].0.is_some();
+            let mut heal_endpoints = recoveries
+                .iter_mut()
+                .flat_map(|(_, targets, _)| std::mem::take(targets))
+                .collect::<Vec<_>>();
+            heal_endpoints.sort_unstable();
+            heal_endpoints.dedup();
+            let buckets = if reuse_single_generation {
+                std::mem::take(&mut recoveries[0].2)
+            } else {
+                Vec::new()
+            };
+            let mut req = HealRequest::new(
+                HealType::ErasureSet {
+                    buckets,
+                    set_disk_id: set_disk_id.clone(),
+                },
+                HealOptions {
+                    pool_index: Some(pool_index),
+                    set_index: Some(set_index),
+                    timeout: None,
+                    ..HealOptions::default()
+                },
+                HealPriority::Low,
+            );
+            if reuse_single_generation {
+                if let Some(task_id) = recoveries[0].0.take() {
+                    req.id = task_id;
+                }
+            }
+            req.source = HealRequestSource::AutoHeal;
+            req.heal_endpoints = heal_endpoints;
+            if let Err(err) = self.submit_heal_request(req).await {
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    set_disk_id,
+                    error = %err,
+                    "Replacement recovery enqueue failed"
+                );
             }
         }
 

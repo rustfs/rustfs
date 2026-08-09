@@ -26,7 +26,7 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, Endpoint, StorageError};
+use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -409,8 +409,18 @@ pub trait HealStorageAPI: Send + Sync {
         self.list_objects_for_heal_page(bucket, prefix, continuation_token).await
     }
 
-    /// Get disk for resume functionality
+    /// Get disk for resume functionality.
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
+
+    /// Get a healthy non-target disk for durable replacement state.
+    async fn get_disk_for_resume_excluding(&self, _set_disk_id: &str, _excluded_targets: &[String]) -> Result<DiskStore> {
+        Err(Error::other("target-excluding resume disk selection is unsupported"))
+    }
+
+    /// Capture the mounted replacement instance before it is formatted.
+    async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+        Err(Error::other("replacement target identity collection is unsupported"))
+    }
 }
 
 /// ECStore Heal storage layer implementation
@@ -1580,6 +1590,10 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
+        self.get_disk_for_resume_excluding(set_disk_id, &[]).await
+    }
+
+    async fn get_disk_for_resume_excluding(&self, set_disk_id: &str, excluded_targets: &[String]) -> Result<DiskStore> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1601,8 +1615,18 @@ impl HealStorageAPI for ECStoreHealStorage {
                 message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
             })?;
 
-        // Find the first available disk
-        if let Some(disk_store) = disks.into_iter().flatten().next() {
+        // The replacement target is unformatted before repair and must never
+        // host the intent that authorizes its own formatting.
+        for disk_store in disks.into_iter().flatten() {
+            if !disk_store.endpoint().is_local {
+                continue;
+            }
+            if excluded_targets.contains(&disk_store.endpoint().to_string()) {
+                continue;
+            }
+            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                continue;
+            }
             debug!(
                 target: "rustfs::heal::storage",
                 event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1620,6 +1644,12 @@ impl HealStorageAPI for ECStoreHealStorage {
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+
+    async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+        super::replacement_readiness::auto_replacement_target_identities(targets)
+            .await
+            .ok_or_else(|| Error::other("replacement target is not a stable mounted disk"))
     }
 }
 
