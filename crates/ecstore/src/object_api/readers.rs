@@ -427,7 +427,7 @@ impl GetObjectReader {
     pub fn from_cache_body(mut object_info: ObjectInfo, body: Bytes) -> Result<Self> {
         object_info.size = i64::try_from(body.len()).map_err(|_| Error::other("cached GET body length exceeds i64::MAX"))?;
         Ok(Self {
-            stream: Box::new(hotpath::io!(std::io::Cursor::new(body.clone()), label = "ecstore.get.cache_body")),
+            stream: Box::new(std::io::Cursor::new(body.clone())),
             object_info,
             buffered_body: Some(body),
             body_source: GetObjectBodySource::HookServed,
@@ -700,7 +700,7 @@ impl ReadPlan {
         match self.transform {
             ReadTransform::Plain { .. } => Ok((
                 GetObjectReader {
-                    stream: Box::new(hotpath::io!(reader, label = "ecstore.get.plain")),
+                    stream: reader,
                     object_info: oi.clone(),
                     buffered_body: None,
                     body_source: GetObjectBodySource::Unprobed,
@@ -755,7 +755,7 @@ impl ReadPlan {
 
                 Ok((
                     GetObjectReader {
-                        stream: Box::new(hotpath::io!(final_reader, label = "ecstore.get.compressed")),
+                        stream: final_reader,
                         object_info,
                         buffered_body: None,
                         body_source: GetObjectBodySource::Unprobed,
@@ -857,7 +857,7 @@ impl ReadPlan {
 
                 Ok((
                     GetObjectReader {
-                        stream: Box::new(hotpath::io!(final_reader, label = "ecstore.get.encrypted")),
+                        stream: final_reader,
                         object_info,
                         buffered_body: None,
                         body_source: GetObjectBodySource::Unprobed,

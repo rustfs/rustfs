@@ -913,7 +913,6 @@ impl DefaultMultipartUsecase {
             buffer_size,
             StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
-        let body = hotpath::io!(body, label = "s3.multipart_upload.body");
 
         let is_disk_compressed = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
@@ -1390,7 +1389,6 @@ impl DefaultMultipartUsecase {
         let actual_size = length;
 
         let mut write_plan = WritePlan::new();
-        let src_stream = hotpath::io!(src_stream, label = "s3.multipart_copy.source_body");
         let mut reader = if is_disk_compressed {
             let algorithm = CompressionAlgorithm::default();
             let hrd = HashReader::from_stream(src_stream, length, actual_size, None, None, false).map_err(ApiError::from)?;

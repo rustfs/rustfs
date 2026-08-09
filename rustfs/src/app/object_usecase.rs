@@ -5646,7 +5646,6 @@ impl DefaultObjectUsecase {
                 buffer_size,
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
-            let body = hotpath::io!(body, label = "s3.put.body.compressed");
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
@@ -5682,10 +5681,7 @@ impl DefaultObjectUsecase {
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
-                        hotpath::io!(
-                            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-                            label = "s3.put.body.small_eager_direct"
-                        ),
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                         actual_size as usize,
                     )
                     .await?;
@@ -5693,10 +5689,7 @@ impl DefaultObjectUsecase {
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
-                        hotpath::io!(
-                            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-                            label = "s3.put.body.small_eager_pooled"
-                        ),
+                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                         actual_size as usize,
                         pool.as_ref(),
                     )
@@ -5709,7 +5702,6 @@ impl DefaultObjectUsecase {
                     buffer_size,
                     StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
                 );
-                let body = hotpath::io!(body, label = "s3.put.body.streaming");
                 HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             }
         };
