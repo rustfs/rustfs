@@ -115,6 +115,15 @@ pub enum PartTransactionAction {
     Rollback,
 }
 
+/// Result of an owner-aware file mutation. The disk applies the mutation only
+/// while the current contents match the supplied expected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalFileUpdate {
+    Updated,
+    Missing,
+    Mismatch,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MmapCopyStageMetrics {
     pub(crate) path: &'static str,
@@ -557,6 +566,26 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        match self {
+            Disk::Local(local_disk) => local_disk.compare_and_update_file(volume, path, expected, replacement).await,
+            Disk::Remote(remote_disk) => remote_disk.compare_and_update_file(volume, path, expected, replacement).await,
+        }
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.has_replacement_mount_lease(),
+            Disk::Remote(remote_disk) => remote_disk.has_replacement_mount_lease(),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
@@ -860,6 +889,24 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
+    /// Atomically replace or remove a small control file only when its current
+    /// contents match `expected`. Implementations that cannot provide this
+    /// cross-process guarantee must fail closed instead of emulating it with a
+    /// read-then-write sequence.
+    async fn compare_and_update_file(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    /// Whether local I/O is rooted at a held mount descriptor. Auto-replacement
+    /// refuses destructive work when this is false.
+    fn has_replacement_mount_lease(&self) -> bool {
+        false
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
 }

@@ -26,8 +26,8 @@ pub mod utils;
 
 use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
-    EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
+    EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult,
+    EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
     ecstore_local_disk_map_read,
 };
 #[cfg(test)]
@@ -88,12 +88,9 @@ pub(crate) async fn clear_healing_markers_after_verified(endpoints: &[String], m
     apply_healing_markers(endpoints, None, Some(marker), true).await
 }
 
+#[cfg(test)]
 fn marker_matches(current: &[u8], expected_marker: Option<&str>) -> bool {
     expected_marker.is_some_and(|expected| current == expected.as_bytes())
-}
-
-fn all_marker_targets_matched(endpoints: &[String], matched_endpoints: &std::collections::HashSet<String>) -> bool {
-    endpoints.iter().all(|endpoint| matched_endpoints.contains(endpoint))
 }
 
 async fn apply_healing_markers(
@@ -105,46 +102,92 @@ async fn apply_healing_markers(
     if endpoints.is_empty() {
         return Ok(());
     }
-    let local_disk_map = local_disk_map_read().await;
-    let mut matched_endpoints = std::collections::HashSet::new();
-    for disk in local_disk_map.values().flatten() {
-        let endpoint = EcstoreDiskAPI::endpoint(disk.as_ref()).to_string();
-        if !endpoints.iter().any(|candidate| candidate == &endpoint) {
-            continue;
+    let mut local_disks = std::collections::HashMap::new();
+    {
+        let local_disk_map = local_disk_map_read().await;
+        for disk in local_disk_map.values().flatten() {
+            local_disks.insert(EcstoreDiskAPI::endpoint(disk.as_ref()).to_string(), disk.clone());
         }
-        matched_endpoints.insert(endpoint.clone());
-        let result = match marker {
+    }
+
+    let mut matched_endpoints = std::collections::HashSet::new();
+    let mut targets = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        if !matched_endpoints.insert(endpoint.clone()) {
+            return Err(DiskError::other("healing marker endpoint is duplicated").into());
+        }
+        let Some(disk) = local_disks.remove(endpoint) else {
+            return Err(DiskError::other("healing marker target is unavailable").into());
+        };
+        targets.push(disk);
+    }
+
+    let marker_bytes = marker.map(|marker| EcstoreDiskBytes::copy_from_slice(marker.as_bytes()));
+    let expected_bytes = expected_marker.map(|marker| EcstoreDiskBytes::copy_from_slice(marker.as_bytes()));
+    let mut newly_acquired = Vec::new();
+    for disk in targets {
+        let result = match marker_bytes.as_ref() {
             Some(marker) => {
-                EcstoreDiskAPI::write_all(
+                match EcstoreDiskAPI::compare_and_update_file(
                     disk.as_ref(),
                     RUSTFS_META_BUCKET,
                     HEALING_MARKER_PATH,
-                    EcstoreDiskBytes::copy_from_slice(marker.as_bytes()),
+                    None,
+                    Some(marker.clone()),
                 )
-                .await
-            }
-            None => match EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await {
-                Ok(current) if marker_matches(current.as_ref(), expected_marker) => {
-                    EcstoreDiskAPI::delete(
+                .await?
+                {
+                    EcstoreConditionalFileUpdate::Updated => {
+                        newly_acquired.push(disk.clone());
+                        Ok(())
+                    }
+                    EcstoreConditionalFileUpdate::Mismatch => match EcstoreDiskAPI::compare_and_update_file(
                         disk.as_ref(),
                         RUSTFS_META_BUCKET,
                         HEALING_MARKER_PATH,
-                        EcstoreDeleteOptions::default(),
+                        Some(marker.clone()),
+                        Some(marker.clone()),
                     )
-                    .await
+                    .await?
+                    {
+                        EcstoreConditionalFileUpdate::Updated => Ok(()),
+                        _ => Err(DiskError::other("healing marker ownership changed")),
+                    },
+                    EcstoreConditionalFileUpdate::Missing => Err(DiskError::other("healing marker disappeared")),
                 }
-                Ok(_) => Err(DiskError::other("healing marker ownership changed")),
-                Err(DiskError::FileNotFound) if allow_missing => Ok(()),
-                Err(DiskError::FileNotFound) => Err(DiskError::other("healing marker is missing")),
-                Err(err) => Err(err),
-            },
+            }
+            None => {
+                match EcstoreDiskAPI::compare_and_update_file(
+                    disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    HEALING_MARKER_PATH,
+                    expected_bytes.clone(),
+                    None,
+                )
+                .await?
+                {
+                    EcstoreConditionalFileUpdate::Updated => Ok(()),
+                    EcstoreConditionalFileUpdate::Missing if allow_missing => Ok(()),
+                    EcstoreConditionalFileUpdate::Missing => Err(DiskError::other("healing marker is missing")),
+                    EcstoreConditionalFileUpdate::Mismatch => Err(DiskError::other("healing marker ownership changed")),
+                }
+            }
         };
         if let Err(err) = result {
+            if let Some(marker) = marker_bytes.as_ref() {
+                for acquired in newly_acquired.iter().rev() {
+                    let _ = EcstoreDiskAPI::compare_and_update_file(
+                        acquired.as_ref(),
+                        RUSTFS_META_BUCKET,
+                        HEALING_MARKER_PATH,
+                        Some(marker.clone()),
+                        None,
+                    )
+                    .await;
+                }
+            }
             return Err(err.into());
         }
-    }
-    if !all_marker_targets_matched(endpoints, &matched_endpoints) {
-        return Err(DiskError::other("healing marker target is unavailable").into());
     }
     Ok(())
 }
@@ -178,6 +221,7 @@ pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<Disk
 
 pub(crate) trait HealDiskExt {
     fn endpoint(&self) -> Endpoint;
+    fn has_replacement_mount_lease(&self) -> bool;
     async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>>;
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<EcstoreDiskBytes>;
     async fn write_all(&self, volume: &str, path: &str, data: EcstoreDiskBytes) -> DiskResult<()>;
@@ -193,6 +237,10 @@ where
 {
     fn endpoint(&self) -> Endpoint {
         EcstoreDiskAPI::endpoint(self)
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        EcstoreDiskAPI::has_replacement_mount_lease(self)
     }
 
     async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>> {
@@ -227,20 +275,12 @@ pub type HealPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
 
 #[cfg(test)]
 mod tests {
-    use super::{all_marker_targets_matched, marker_matches};
+    use super::marker_matches;
 
     #[test]
     fn marker_clear_requires_the_current_owner_token() {
         assert!(marker_matches(b"set:task-a", Some("set:task-a")));
         assert!(!marker_matches(b"set:task-b", Some("set:task-a")));
         assert!(!marker_matches(b"set:task-a", None));
-    }
-
-    #[test]
-    fn marker_update_requires_every_requested_target() {
-        let endpoints = vec!["disk-a".to_string(), "disk-b".to_string()];
-        let matched = std::collections::HashSet::from(["disk-a".to_string()]);
-
-        assert!(!all_marker_targets_matched(&endpoints, &matched));
     }
 }

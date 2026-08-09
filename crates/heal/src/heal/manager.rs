@@ -2279,6 +2279,7 @@ impl HealManager {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
+        let storage = self.storage.clone();
         let cancel_token = self.cancel_token.clone();
         let notify = self.notify.clone();
         let mut duration = {
@@ -2324,6 +2325,8 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
+                        let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>)>::new();
+                        let mut conflicted_recovery_sets = HashSet::<String>::new();
                         let (local_disks, local_endpoints) = {
                             let local_disk_map = local_disk_map_read().await;
                             let local_disks = local_disk_map.values().flatten().cloned().collect::<Vec<_>>();
@@ -2343,6 +2346,10 @@ impl HealManager {
                             // detect unformatted disk via get_disk_id()
                             match disk.get_disk_id().await {
                                 Err(DiskError::UnformattedDisk) => {
+                                    if !disk.has_replacement_mount_lease() {
+                                        skipped_invalid_count += 1;
+                                        continue;
+                                    }
                                     if !super::replacement_readiness::auto_replacement_target_ready(&endpoint, &local_endpoints)
                                         .await
                                     {
@@ -2405,6 +2412,103 @@ impl HealManager {
                             }
                         }
 
+                        // Once formatting succeeds a replacement is no longer
+                        // discoverable as UnformattedDisk. Re-admit exactly one
+                        // durable generation per set after bounded scheduler
+                        // retries are exhausted. Multiple generations are a
+                        // durable conflict: leave every marker/state intact and
+                        // require reconciliation rather than choosing one.
+                        for disk in &local_disks {
+                            for task_id in ResumeUtils::get_resumable_tasks(disk).await.unwrap_or_default() {
+                                let Ok(resume_manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
+                                    continue;
+                                };
+                                let state = resume_manager.get_state().await;
+                                if state.completed
+                                    || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                                    || state.replacement_generation.as_deref() != Some(task_id.as_str())
+                                    || state.replacement_targets.is_empty()
+                                {
+                                    continue;
+                                }
+                                let Ok(identities) = storage.replacement_target_identities(&state.replacement_targets).await else {
+                                    continue;
+                                };
+                                if identities != state.replacement_target_identities {
+                                    continue;
+                                }
+                                let targets = state
+                                    .replacement_targets
+                                    .iter()
+                                    .filter_map(|target| {
+                                        local_endpoints
+                                            .iter()
+                                            .find(|endpoint| endpoint.to_string() == *target)
+                                            .cloned()
+                                    })
+                                    .collect::<Vec<_>>();
+                                if targets.len() != state.replacement_targets.len() {
+                                    continue;
+                                }
+                                let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(
+                                    targets[0].pool_idx,
+                                    targets[0].set_idx,
+                                ) else {
+                                    continue;
+                                };
+                                if targets.iter().any(|target| {
+                                    crate::heal::utils::format_set_disk_id_from_i32(target.pool_idx, target.set_idx)
+                                        .as_deref()
+                                        != Some(set_disk_id.as_str())
+                                }) {
+                                    continue;
+                                }
+                                match durable_recoveries.get(&set_disk_id) {
+                                    Some((existing_task_id, _, _)) if existing_task_id != &task_id => {
+                                        conflicted_recovery_sets.insert(set_disk_id);
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        durable_recoveries.insert(
+                                            set_disk_id,
+                                            (task_id, targets, state.replacement_buckets),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        for set_disk_id in &conflicted_recovery_sets {
+                            durable_recoveries.remove(set_disk_id);
+                            endpoints.remove(set_disk_id);
+                            warn!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                set_disk_id,
+                                result = "durable_generation_conflict",
+                                "Replacement recovery deferred because multiple durable generations exist"
+                            );
+                        }
+
+                        for (set_disk_id, (_, targets, _)) in &durable_recoveries {
+                            let expected = targets.iter().map(ToString::to_string).collect::<HashSet<_>>();
+                            let observed = endpoints
+                                .get(set_disk_id)
+                                .map(|endpoints| endpoints.iter().map(ToString::to_string).collect::<HashSet<_>>())
+                                .unwrap_or_default();
+                            if !observed.is_subset(&expected) {
+                                conflicted_recovery_sets.insert(set_disk_id.clone());
+                                continue;
+                            }
+                            endpoints.entry(set_disk_id.clone()).or_default().extend(targets.clone());
+                        }
+                        for set_disk_id in &conflicted_recovery_sets {
+                            durable_recoveries.remove(set_disk_id);
+                            endpoints.remove(set_disk_id);
+                        }
+
                         for target_endpoints in endpoints.values_mut() {
                             target_endpoints.sort_by_key(ToString::to_string);
                             target_endpoints.dedup_by(|left, right| left.to_string() == right.to_string());
@@ -2463,9 +2567,13 @@ impl HealManager {
                             }
 
                             // enqueue erasure set heal request for all ready replacements in this set
+                            let recovery = durable_recoveries.remove(&set_disk_id);
                             let mut req = HealRequest::new(
                                 HealType::ErasureSet {
-                                    buckets: Vec::new(),
+                                    buckets: recovery
+                                        .as_ref()
+                                        .map(|(_, _, buckets)| buckets.clone())
+                                        .unwrap_or_default(),
                                     set_disk_id: set_disk_id.clone(),
                                 },
                                 HealOptions {
@@ -2480,6 +2588,9 @@ impl HealManager {
                                 },
                                 HealPriority::Low,
                             );
+                            if let Some((task_id, _, _)) = recovery {
+                                req.id = task_id;
+                            }
                             req.source = HealRequestSource::AutoHeal;
                             req.heal_endpoints = endpoints.iter().map(ToString::to_string).collect();
                             let endpoint_count = req.heal_endpoints.len();
@@ -3972,6 +4083,31 @@ mod tests {
         assert_eq!(retry_request.retry_attempts, 1);
         assert!(retry_delay > Duration::ZERO);
         assert!(retry_error.contains("Storage resources are insufficient"));
+    }
+
+    #[test]
+    fn test_retry_request_for_durable_replacement_retry_signal() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec!["bucket".to_string()],
+                    set_disk_id: "pool_0_set_0".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Low,
+            ),
+            storage,
+        );
+        let result = Err(Error::transient_skip("Replacement erasure set heal incomplete; retry scheduled"));
+
+        let (retry_request, retry_delay, retry_error) =
+            retry_request_for_result(&task, &result).expect("typed replacement retry signal must be scheduled");
+
+        assert_eq!(retry_request.id, task.id);
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert!(retry_delay > Duration::ZERO);
+        assert!(retry_error.contains("Replacement erasure set heal incomplete"));
     }
 
     #[test]

@@ -82,20 +82,25 @@ pub(crate) async fn auto_replacement_targets_ready(targets: &[String]) -> bool {
 
 pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Option<Vec<ReplacementTargetIdentity>> {
     let local_disk_map = local_disk_map_read().await;
-    let local_endpoints = local_disk_map
+    let local_disks = local_disk_map
         .values()
         .flatten()
-        .map(|disk| disk.endpoint())
-        .filter(|endpoint| endpoint.is_local)
+        .filter(|disk| disk.endpoint().is_local)
+        .cloned()
         .collect::<Vec<_>>();
+    let local_endpoints = local_disks.iter().map(|disk| disk.endpoint()).collect::<Vec<_>>();
     drop(local_disk_map);
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        let Some(endpoint) = local_endpoints.iter().find(|endpoint| endpoint.to_string() == *target) else {
+        let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
             return None;
         };
-        identities.push(auto_replacement_target_identity(endpoint, &local_endpoints).await?);
+        if !disk.has_replacement_mount_lease() {
+            return None;
+        }
+        let endpoint = disk.endpoint();
+        identities.push(auto_replacement_target_identity(&endpoint, &local_endpoints).await?);
     }
     identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     identities.dedup_by(|left, right| left.endpoint == right.endpoint);

@@ -1177,7 +1177,17 @@ impl ResumeUtils {
         for task_id in task_ids {
             if let Ok(resume_manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await {
                 let state = resume_manager.get_state().await;
-                let age_hours = (current_time - state.last_update) / 3600;
+                let age_hours = current_time.saturating_sub(state.last_update) / 3600;
+
+                if !state.completed && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                {
+                    continue;
+                }
+                if state.completed
+                    && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)
+                {
+                    continue;
+                }
 
                 if age_hours > max_age_hours {
                     debug!(
@@ -1340,6 +1350,58 @@ mod tests {
             .await;
         assert!(cleanup_pending.completed);
         assert_eq!(cleanup_pending.replacement_phase, ReplacementPhase::CleanupPending);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_states_keeps_durable_replacement_recovery() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create replacement expiry test directory");
+        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create test disk endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("create metadata volume for replacement expiry test: {err}"),
+        }
+
+        let task_id = "replacement-expiry-test".to_string();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        manager.state.write().await.last_update = 0;
+        manager.save_state_strict().await.expect("persist expired replacement intent");
+
+        ResumeUtils::cleanup_expired_states(&disk, 0)
+            .await
+            .expect("replacement expiry cleanup should complete");
+
+        let state = ResumeManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("active replacement intent must survive expiry cleanup")
+            .get_state()
+            .await;
+        assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
     }
 
     #[tokio::test]

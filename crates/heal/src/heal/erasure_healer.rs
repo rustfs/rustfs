@@ -553,6 +553,14 @@ impl ErasureSetHealer {
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
+            if self.replacement_task_id.is_some() {
+                if resume_manager.schedule_retry().await? {
+                    checkpoint_manager.reset_for_retry().await?;
+                    return Err(Error::transient_skip(format!(
+                        "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
+                    )));
+                }
+            }
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
                 // rewinds the resume state (cursor + counters), and the
@@ -576,7 +584,7 @@ impl ErasureSetHealer {
                     state = "retry_scheduled",
                     "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
-                return Err(Error::other(format!(
+                return Err(Error::transient_skip(format!(
                     "Erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
                 )));
             }

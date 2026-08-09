@@ -15,11 +15,13 @@
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
+#[cfg(test)]
+use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions,
-    DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
     PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
     RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
     STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
@@ -2897,10 +2899,14 @@ impl StdBackend {
         }
     }
 
+    fn io_root(&self) -> &Path {
+        &self.root
+    }
+
     async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
         let mut skip_parent = skip_parent.as_ref();
         if skip_parent.as_os_str().is_empty() {
-            skip_parent = self.root.as_path();
+            skip_parent = self.io_root();
         }
 
         if let Some(parent) = path.as_ref().parent()
@@ -3307,7 +3313,7 @@ impl LocalIoBackend for StdBackend {
             debug!(reason = "non_unix_platform", "zero_copy_fallback");
 
             let access_check_start = metrics_enabled.then(std::time::Instant::now);
-            let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+            let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
             if !skip_access_checks(volume) {
                 access(&volume_dir)
                     .await
@@ -3318,7 +3324,7 @@ impl LocalIoBackend for StdBackend {
             }
 
             let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
-            let file_path = local_disk_object_path(&self.root, volume, path)?;
+            let file_path = local_disk_object_path(self.io_root(), volume, path)?;
             check_path_length(file_path.to_string_lossy().as_ref())?;
             if let Some(metrics) = metrics {
                 record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
@@ -3372,14 +3378,14 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let mut f = self.open_file_read_only(file_path).await?;
@@ -3412,14 +3418,14 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
-        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let f = self.open_file_read_only(file_path).await?;
@@ -3430,8 +3436,8 @@ impl LocalIoBackend for StdBackend {
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
         match mode {
             WriteMode::Truncate { size_hint } => {
-                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
-                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
+                let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
 
                 if let Some(parent) = file_path.parent() {
@@ -3466,14 +3472,14 @@ impl LocalIoBackend for StdBackend {
                 Ok(Box::new(FileCacheReclaimWriter::new(f, size_hint.max(0) as usize, reclaim_on_shutdown)))
             }
             WriteMode::Append => {
-                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+                let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 if !skip_access_checks(volume) {
                     access(&volume_dir)
                         .await
                         .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
                 }
 
-                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
 
                 let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
@@ -4471,6 +4477,13 @@ fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
+    /// I/O root pinned to the mount instance that was opened while the disk
+    /// was initialized. On Linux this is `/proc/self/fd/<dirfd>`; resolving
+    /// paths beneath it keeps repair I/O on that mount even if the configured
+    /// pathname is later covered by another mount.
+    io_root: PathBuf,
+    #[cfg(target_os = "linux")]
+    mount_lease: std::fs::File,
     pub format_path: PathBuf,
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
@@ -4584,6 +4597,38 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
 }
 
 impl LocalDisk {
+    #[cfg(target_os = "linux")]
+    fn open_mount_lease(root: &Path) -> Result<(std::fs::File, PathBuf)> {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::os::fd::AsRawFd as _;
+
+        let fd = open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .map_err(DiskError::from)?;
+        let lease = std::fs::File::from(fd);
+        let io_root = PathBuf::from(format!("/proc/self/fd/{}", lease.as_raw_fd()));
+        Ok((lease, io_root))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_mount_lease(root: &Path) -> Result<PathBuf> {
+        Ok(root.to_path_buf())
+    }
+
+    fn io_root(&self) -> &Path {
+        &self.io_root
+    }
+
+    /// Auto-replacement is destructive, so it is admitted only when local
+    /// I/O is bound to the mounted directory rather than the endpoint path.
+    pub fn has_replacement_mount_lease(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
@@ -4619,7 +4664,12 @@ impl LocalDisk {
         // cannot split ordinary IO from handle-relative publication.
         let root = publication_root.path().to_path_buf();
 
-        ensure_data_usage_layout(&root)
+        #[cfg(target_os = "linux")]
+        let (mount_lease, io_root) = Self::open_mount_lease(&root)?;
+        #[cfg(not(target_os = "linux"))]
+        let io_root = Self::open_mount_lease(&root)?;
+
+        ensure_data_usage_layout(&io_root)
             .await
             .map_err(DiskError::from)
             .inspect_err(|err| {
@@ -4631,7 +4681,7 @@ impl LocalDisk {
 
         if cleanup
             && let Err(err) = Self::cleanup_tmp_on_startup(
-                &root,
+                &io_root,
                 &publication_root,
                 startup_cleanup_ready.clone(),
                 startup_cleanup_notify.clone(),
@@ -4652,7 +4702,7 @@ impl LocalDisk {
         }
 
         // Use optimized path resolution instead of absolutize_virtually
-        let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
+        let format_path = io_root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -4753,6 +4803,9 @@ impl LocalDisk {
         let mut disk = Self {
             root: root.clone(),
             publication_root,
+            io_root: io_root.clone(),
+            #[cfg(target_os = "linux")]
+            mount_lease,
             endpoint: ep.clone(),
             format_path,
             format_info: RwLock::new(format_info),
@@ -4772,8 +4825,8 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
-            io_backend: build_local_io_backend(root.clone()),
-            file_sync_permits: os::disk_file_sync_limiter(&root),
+            io_backend: build_local_io_backend(io_root.clone()),
+            file_sync_permits: os::disk_file_sync_limiter(&io_root),
             snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
@@ -5089,11 +5142,11 @@ impl LocalDisk {
         } else {
             #[cfg(windows)]
             {
-                self.root.join(path_str.replace('/', "\\"))
+                self.io_root().join(path_str.replace('/', "\\"))
             }
             #[cfg(not(windows))]
             {
-                self.root.join(path_ref)
+                self.io_root().join(path_ref)
             }
         };
 
@@ -5121,21 +5174,21 @@ impl LocalDisk {
 
     // Get the absolute path of an object
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        local_disk_object_path(&self.root, bucket, key)
+        local_disk_object_path(self.io_root(), bucket, key)
     }
 
     // Get the absolute path of a bucket
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        local_disk_bucket_path(&self.root, bucket)
+        local_disk_bucket_path(self.io_root(), bucket)
     }
 
     // Check if a path is valid
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        check_local_disk_valid_path(&self.root, path)
+        check_local_disk_valid_path(self.io_root(), path)
     }
 
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
-        reject_local_disk_symlink_components(&self.root, path)
+        reject_local_disk_symlink_components(self.io_root(), path)
     }
 
     // Batch path generation with single lock acquisition
@@ -5161,9 +5214,9 @@ impl LocalDisk {
             let mut new_entries = Vec::new();
             for (i, _bucket, _key, cache_key) in cache_misses {
                 #[cfg(windows)]
-                let path = self.root.join(cache_key.replace('/', "\\"));
+                let path = self.io_root().join(cache_key.replace('/', "\\"));
                 #[cfg(not(windows))]
-                let path = self.root.join(&cache_key);
+                let path = self.io_root().join(&cache_key);
 
                 results.push((i, path.clone()));
                 new_entries.push((cache_key, path));
@@ -5977,7 +6030,7 @@ impl LocalDisk {
         skip_parent: &Path,
     ) -> Result<()> {
         let skip_parent = if skip_parent.as_os_str().is_empty() {
-            self.root.as_path()
+            self.io_root()
         } else {
             skip_parent
         };
@@ -6040,7 +6093,7 @@ impl LocalDisk {
     async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
         let mut skip_parent = skip_parent.as_ref();
         if skip_parent.as_os_str().is_empty() {
-            skip_parent = self.root.as_path();
+            skip_parent = self.io_root();
         }
 
         if let Some(parent) = path.as_ref().parent()
@@ -7264,6 +7317,92 @@ impl DiskAPI for LocalDisk {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_all");
         self.write_all_public(volume, path, data).await
+    }
+
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{FlockOperation, flock};
+            use std::io::Write as _;
+
+            let file_path = self.get_object_path(volume, path)?;
+            let lock_path = file_path.with_extension("rustfs-cas.lock");
+            let path = path.to_string();
+            return Ok(tokio::task::spawn_blocking(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)?;
+                flock(&lock, FlockOperation::LockExclusive).map_err(std::io::Error::from)?;
+                let result = (|| {
+                    let current = match std::fs::read(&file_path) {
+                        Ok(current) => Some(current),
+                        Err(err) if err.kind() == ErrorKind::NotFound => None,
+                        Err(err) => return Err(err),
+                    };
+                    let matches = match (&current, &expected) {
+                        (None, None) => true,
+                        (Some(current), Some(expected)) => current.as_slice() == expected.as_ref(),
+                        _ => false,
+                    };
+                    if !matches {
+                        return Ok(match current {
+                            None => ConditionalFileUpdate::Missing,
+                            Some(_) => ConditionalFileUpdate::Mismatch,
+                        });
+                    }
+
+                    match replacement {
+                        Some(replacement) => {
+                            let parent = file_path
+                                .parent()
+                                .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?;
+                            let temporary = parent.join(format!(".{}.{}.tmp", path.replace('/', "_"), Uuid::new_v4()));
+                            let write_result = (|| -> std::io::Result<()> {
+                                let mut staged = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+                                staged.write_all(&replacement)?;
+                                staged.sync_all()?;
+                                std::fs::rename(&temporary, &file_path)?;
+                                Ok(())
+                            })();
+                            if let Err(err) = write_result {
+                                let _ = std::fs::remove_file(&temporary);
+                                return Err(err);
+                            }
+                            os::fsync_dir_std(parent)?;
+                        }
+                        None => {
+                            std::fs::remove_file(&file_path)?;
+                            if let Some(parent) = file_path.parent() {
+                                os::fsync_dir_std(parent)?;
+                            }
+                        }
+                    }
+                    Ok(ConditionalFileUpdate::Updated)
+                })();
+                let _ = flock(&lock, FlockOperation::Unlock);
+                result
+            })
+            .await
+            .map_err(DiskError::from)??);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (volume, path, expected, replacement);
+            Err(DiskError::MethodNotAllowed)
+        }
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        LocalDisk::has_replacement_mount_lease(self)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -9010,7 +9149,7 @@ impl DiskAPI for LocalDisk {
 
         if let Err(e) = access(&volume_dir).await {
             if e.kind() == ErrorKind::NotFound {
-                os::make_dir_all(&volume_dir, self.root.as_path()).await?;
+                os::make_dir_all(&volume_dir, self.io_root()).await?;
                 return Ok(());
             }
             error!(
@@ -9032,7 +9171,7 @@ impl DiskAPI for LocalDisk {
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         let mut volumes = Vec::new();
 
-        let entries = os::read_dir(&self.root, -1).await.map_err(to_volume_error)?;
+        let entries = os::read_dir(self.io_root(), -1).await.map_err(to_volume_error)?;
 
         for entry in entries {
             if !has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(clean(&entry).as_str()) {
@@ -19809,5 +19948,59 @@ mod test {
         assert_eq!(results[0].as_ref().unwrap().as_ref(), b"good data");
         assert!(results[1].is_err());
         assert!(matches!(results[1].as_ref().unwrap_err(), DiskError::Io(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_file_update_never_deletes_a_new_owner() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let owner_a = Bytes::from_static(b"owner-a");
+        let owner_b = Bytes::from_static(b"owner-b");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(owner_a.clone()))
+                .await
+                .expect("owner a should acquire marker"),
+            ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(owner_a.clone()), Some(owner_b.clone()),)
+                .await
+                .expect("owner b should replace marker"),
+            ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(owner_a), None)
+                .await
+                .expect("stale owner check should complete"),
+            ConditionalFileUpdate::Mismatch
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+                .await
+                .expect("new owner marker should remain"),
+            owner_b
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn replacement_io_paths_stay_under_the_mount_lease() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(disk.has_replacement_mount_lease());
+        let object_path = disk.get_object_path("bucket", "object").expect("object path should resolve");
+        assert!(
+            object_path.starts_with("/proc/self/fd/"),
+            "replacement I/O must resolve beneath the held directory descriptor"
+        );
     }
 }
