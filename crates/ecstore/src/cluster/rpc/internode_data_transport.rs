@@ -36,10 +36,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeDataTransport>, String>> = OnceLock::new();
@@ -47,6 +48,7 @@ static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeD
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
+const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
@@ -70,19 +72,61 @@ enum PutFileCapabilityState {
     V1 { server_epoch: Uuid, revalidate_after: Instant },
 }
 
-type PutFileCapabilityCacheEntry = Arc<tokio::sync::RwLock<Option<PutFileCapabilityState>>>;
+#[derive(Debug)]
+struct PutFileCapabilityProbeFailure(Error);
 
-static PUT_FILE_CAPABILITY_CACHE: LazyLock<Mutex<HashMap<String, PutFileCapabilityCacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+impl PutFileCapabilityProbeFailure {
+    fn into_error(&self) -> Error {
+        match &self.0 {
+            Error::Io(error) => rustfs_rio::clone_internode_http_io_error(error)
+                .map(Error::Io)
+                .unwrap_or_else(|| self.0.clone()),
+            _ => self.0.clone(),
+        }
+    }
+}
 
-fn put_file_capability_cache_entry(endpoint: &str) -> Result<PutFileCapabilityCacheEntry> {
-    let mut cache = PUT_FILE_CAPABILITY_CACHE
-        .lock()
-        .map_err(|_| Error::other("put_file capability cache lock poisoned"))?;
-    Ok(cache
-        .entry(endpoint.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
-        .clone())
+type PutFileCapabilityProbeOutcome = std::result::Result<Option<Uuid>, PutFileCapabilityProbeFailure>;
+
+#[derive(Debug, Clone)]
+struct PutFileCapabilityFlight {
+    generation: u64,
+    v1_was_pinned: bool,
+    outcome: Arc<OnceCell<PutFileCapabilityProbeOutcome>>,
+}
+
+#[derive(Debug, Default)]
+struct PutFileCapabilityCacheState {
+    cached: Option<PutFileCapabilityState>,
+    generation: u64,
+    in_flight: Option<PutFileCapabilityFlight>,
+}
+
+type PutFileCapabilityCacheEntry = Arc<tokio::sync::RwLock<PutFileCapabilityCacheState>>;
+
+static PUT_FILE_CAPABILITY_CACHE: LazyLock<parking_lot::RwLock<HashMap<String, PutFileCapabilityCacheEntry>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
+    if let Some(entry) = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned() {
+        return entry;
+    }
+    PUT_FILE_CAPABILITY_CACHE
+        .write()
+        .entry(endpoint.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(PutFileCapabilityCacheState::default())))
+        .clone()
+}
+
+fn fresh_put_file_capability(state: Option<PutFileCapabilityState>, now: Instant) -> Option<Option<Uuid>> {
+    match state {
+        Some(PutFileCapabilityState::V1 {
+            server_epoch,
+            revalidate_after,
+        }) if now < revalidate_after => Some(Some(server_epoch)),
+        Some(PutFileCapabilityState::LegacyUntil(expires_at)) if now < expires_at => Some(None),
+        Some(PutFileCapabilityState::V1 { .. }) | Some(PutFileCapabilityState::LegacyUntil(_)) | None => None,
+    }
 }
 
 fn put_file_capability_status_is_legacy(status: u16) -> bool {
@@ -310,45 +354,69 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Option<Uuid>>>,
 {
-    let entry = put_file_capability_cache_entry(endpoint)?;
-    match *entry.read().await {
-        Some(PutFileCapabilityState::V1 {
-            server_epoch,
-            revalidate_after,
-        }) if Instant::now() < revalidate_after => {
-            return Ok(Some(server_epoch));
+    let entry = put_file_capability_cache_entry(endpoint);
+    {
+        let state = entry.read().await;
+        if let Some(cached) = fresh_put_file_capability(state.cached, Instant::now()) {
+            return Ok(cached);
         }
-        Some(PutFileCapabilityState::V1 { .. }) => {}
-        Some(PutFileCapabilityState::LegacyUntil(expires_at)) if Instant::now() < expires_at => return Ok(None),
-        Some(PutFileCapabilityState::LegacyUntil(_)) | None => {}
-    }
-    let mut state = entry.write().await;
-    match *state {
-        Some(PutFileCapabilityState::V1 {
-            server_epoch,
-            revalidate_after,
-        }) if Instant::now() < revalidate_after => {
-            return Ok(Some(server_epoch));
-        }
-        Some(PutFileCapabilityState::V1 { .. }) => {}
-        Some(PutFileCapabilityState::LegacyUntil(expires_at)) if Instant::now() < expires_at => return Ok(None),
-        Some(PutFileCapabilityState::LegacyUntil(_)) | None => {}
     }
 
-    let v1_was_pinned = matches!(*state, Some(PutFileCapabilityState::V1 { .. }));
-    match probe().await? {
-        Some(server_epoch) => {
-            *state = Some(PutFileCapabilityState::V1 {
-                server_epoch,
-                revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
-            });
-            Ok(Some(server_epoch))
+    let flight = {
+        let mut state = entry.write().await;
+        if let Some(cached) = fresh_put_file_capability(state.cached, Instant::now()) {
+            return Ok(cached);
         }
-        None if v1_was_pinned => Err(Error::other("remote put_file capability downgrade rejected")),
-        None => {
-            *state = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
-            Ok(None)
+        if let Some(flight) = state.in_flight.clone() {
+            flight
+        } else {
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::other("put_file capability probe generation exhausted"))?;
+            let flight = PutFileCapabilityFlight {
+                generation: state.generation,
+                v1_was_pinned: matches!(state.cached, Some(PutFileCapabilityState::V1 { .. })),
+                outcome: Arc::new(OnceCell::new()),
+            };
+            state.in_flight = Some(flight.clone());
+            flight
         }
+    };
+
+    let outcome = flight
+        .outcome
+        .get_or_init(|| async { probe().await.map_err(PutFileCapabilityProbeFailure) })
+        .await;
+
+    {
+        let mut state = entry.write().await;
+        let is_current_flight = state
+            .in_flight
+            .as_ref()
+            .is_some_and(|current| current.generation == flight.generation && Arc::ptr_eq(&current.outcome, &flight.outcome));
+        if is_current_flight {
+            match outcome {
+                Ok(Some(server_epoch)) => {
+                    state.cached = Some(PutFileCapabilityState::V1 {
+                        server_epoch: *server_epoch,
+                        revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+                    });
+                }
+                Ok(None) if !flight.v1_was_pinned => {
+                    state.cached = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
+                }
+                Ok(None) | Err(_) => {}
+            }
+            state.in_flight = None;
+        }
+    }
+
+    match outcome {
+        Ok(Some(server_epoch)) => Ok(Some(*server_epoch)),
+        Ok(None) if flight.v1_was_pinned => Err(Error::other("remote put_file capability downgrade rejected")),
+        Ok(None) => Ok(None),
+        Err(failure) => Err(failure.into_error()),
     }
 }
 
@@ -408,7 +476,7 @@ fn build_put_file_capability_url(endpoint: &str, challenge: Uuid) -> String {
     format!(
         "{}{}?{}={}&{}={}",
         endpoint,
-        PUT_FILE_STREAM_PATH,
+        PUT_FILE_CAPABILITY_PATH,
         PUT_FILE_CAPABILITY_QUERY,
         PUT_FILE_CAPABILITY_VERSION,
         PUT_FILE_CAPABILITY_CHALLENGE_QUERY,
@@ -605,6 +673,28 @@ pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeData
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Notify};
+
+    async fn wait_for_capability_flight_waiters(entry: &PutFileCapabilityCacheEntry, waiters: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let strong_count = entry
+                    .read()
+                    .await
+                    .in_flight
+                    .as_ref()
+                    .map(|flight| Arc::strong_count(&flight.outcome))
+                    .unwrap_or_default();
+                if strong_count >= waiters + 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capability callers should join the in-flight probe");
+    }
 
     #[derive(Debug)]
     struct LegacyTestTransport;
@@ -764,7 +854,7 @@ mod tests {
         assert_eq!(
             build_put_file_capability_url("http://node1:9000", challenge),
             concat!(
-                "http://node1:9000/rustfs/rpc/put_file_stream?put_file_capability=1",
+                "http://node1:9000/rustfs/rpc/put_file_capability?put_file_capability=1",
                 "&put_file_challenge=11111111-2222-4333-8444-555555555555"
             )
         );
@@ -782,9 +872,9 @@ mod tests {
     async fn put_file_capability_cache_pins_v1_and_honors_live_legacy_ttl() {
         let transport = TcpHttpInternodeDataTransport;
         let v1_endpoint = format!("http://v1-{}.invalid", Uuid::new_v4());
-        let v1_entry = put_file_capability_cache_entry(&v1_endpoint).expect("cache entry");
+        let v1_entry = put_file_capability_cache_entry(&v1_endpoint);
         let server_epoch = Uuid::new_v4();
-        *v1_entry.write().await = Some(PutFileCapabilityState::V1 {
+        v1_entry.write().await.cached = Some(PutFileCapabilityState::V1 {
             server_epoch,
             revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
         });
@@ -792,7 +882,18 @@ mod tests {
             transport.put_file_auth_capability(&v1_endpoint).await.expect("v1 cache"),
             Some(server_epoch)
         );
-        *v1_entry.write().await = Some(PutFileCapabilityState::V1 {
+        let cache_probe_called = AtomicBool::new(false);
+        assert_eq!(
+            resolve_put_file_auth_capability(&v1_endpoint, || async {
+                cache_probe_called.store(true, Ordering::SeqCst);
+                Ok(None)
+            })
+            .await
+            .expect("live v1 cache"),
+            Some(server_epoch)
+        );
+        assert!(!cache_probe_called.load(Ordering::SeqCst));
+        v1_entry.write().await.cached = Some(PutFileCapabilityState::V1 {
             server_epoch,
             revalidate_after: Instant::now(),
         });
@@ -810,8 +911,9 @@ mod tests {
         );
 
         let legacy_endpoint = format!("http://legacy-{}.invalid", Uuid::new_v4());
-        let legacy_entry = put_file_capability_cache_entry(&legacy_endpoint).expect("cache entry");
-        *legacy_entry.write().await = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
+        let legacy_entry = put_file_capability_cache_entry(&legacy_endpoint);
+        legacy_entry.write().await.cached =
+            Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
         assert!(
             transport
                 .put_file_auth_capability(&legacy_endpoint)
@@ -821,8 +923,8 @@ mod tests {
         );
 
         let expired_endpoint = format!("http://expired-legacy-{}.invalid", Uuid::new_v4());
-        let expired_entry = put_file_capability_cache_entry(&expired_endpoint).expect("cache entry");
-        *expired_entry.write().await = Some(PutFileCapabilityState::LegacyUntil(Instant::now()));
+        let expired_entry = put_file_capability_cache_entry(&expired_endpoint);
+        expired_entry.write().await.cached = Some(PutFileCapabilityState::LegacyUntil(Instant::now()));
         let reprobed = std::sync::atomic::AtomicBool::new(false);
         assert_eq!(
             resolve_put_file_auth_capability(&expired_endpoint, || async {
@@ -863,26 +965,233 @@ mod tests {
     #[tokio::test]
     async fn put_file_capability_probe_is_singleflight_per_endpoint() {
         let endpoint = format!("http://singleflight-{}.invalid", Uuid::new_v4());
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let first_calls = Arc::clone(&calls);
-        let second_calls = Arc::clone(&calls);
-        let server_epoch = Uuid::new_v4();
+        let entry = put_file_capability_cache_entry(&endpoint);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let start = Arc::new(Barrier::new(65));
+        let mut tasks = Vec::with_capacity(64);
 
-        let (first, second) = tokio::join!(
-            resolve_put_file_auth_capability(&endpoint, || async move {
-                first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tokio::task::yield_now().await;
-                Ok(Some(server_epoch))
-            }),
-            resolve_put_file_auth_capability(&endpoint, || async move {
-                second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..64 {
+            let endpoint = endpoint.clone();
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            let start = Arc::clone(&start);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    Err(Error::from(rustfs_rio::new_test_internode_http_io_error(
+                        rustfs_rio::InternodeHttpErrorKind::ConnectionRefused,
+                    )))
+                })
+                .await
+            }));
+        }
+
+        start.wait().await;
+        wait_for_capability_flight_waiters(&entry, 64).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+
+        let results = tokio::time::timeout(Duration::from_secs(1), futures::future::join_all(tasks))
+            .await
+            .expect("all callers should finish within one probe window");
+        for result in results {
+            let error = result.expect("capability task should finish").expect_err("probe should fail");
+            assert_eq!(
+                error.internode_http_error_kind(),
+                Some(rustfs_rio::InternodeHttpErrorKind::ConnectionRefused)
+            );
+            assert!(error.is_retryable_internode_write_failure());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_probe_recovers_when_initializer_is_cancelled() {
+        let endpoint = format!("http://cancelled-singleflight-{}.invalid", Uuid::new_v4());
+        let entry = put_file_capability_cache_entry(&endpoint);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let initializer_started = Arc::new(Notify::new());
+        let never_release = Arc::new(Notify::new());
+
+        let first = {
+            let endpoint = endpoint.clone();
+            let calls = Arc::clone(&calls);
+            let initializer_started = Arc::clone(&initializer_started);
+            let never_release = Arc::clone(&never_release);
+            tokio::spawn(async move {
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    initializer_started.notify_one();
+                    never_release.notified().await;
+                    Ok(Some(Uuid::new_v4()))
+                })
+                .await
+            })
+        };
+        initializer_started.notified().await;
+
+        let replacement_epoch = Uuid::new_v4();
+        let second = {
+            let endpoint = endpoint.clone();
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(replacement_epoch))
+                })
+                .await
+            })
+        };
+        wait_for_capability_flight_waiters(&entry, 2).await;
+        first.abort();
+        assert!(first.await.expect_err("initializer should be cancelled").is_cancelled());
+
+        assert_eq!(
+            second.await.expect("waiter should finish").expect("waiter should take over"),
+            Some(replacement_epoch)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_probe_recovers_after_all_callers_cancel() {
+        let endpoint = format!("http://all-cancelled-{}.invalid", Uuid::new_v4());
+        let entry = put_file_capability_cache_entry(&endpoint);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let initializer_started = Arc::new(Notify::new());
+        let never_release = Arc::new(Notify::new());
+
+        let first = {
+            let endpoint = endpoint.clone();
+            let calls = Arc::clone(&calls);
+            let initializer_started = Arc::clone(&initializer_started);
+            let never_release = Arc::clone(&never_release);
+            tokio::spawn(async move {
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    initializer_started.notify_one();
+                    never_release.notified().await;
+                    Ok(None)
+                })
+                .await
+            })
+        };
+        initializer_started.notified().await;
+        let second = {
+            let endpoint = endpoint.clone();
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                })
+                .await
+            })
+        };
+        wait_for_capability_flight_waiters(&entry, 2).await;
+        first.abort();
+        second.abort();
+        assert!(first.await.expect_err("initializer should be cancelled").is_cancelled());
+        assert!(second.await.expect_err("waiter should be cancelled").is_cancelled());
+
+        let server_epoch = Uuid::new_v4();
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(server_epoch))
             })
+            .await
+            .expect("later caller should initialize the abandoned flight"),
+            Some(server_epoch)
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
-        assert_eq!(first.expect("first capability result"), Some(server_epoch));
-        assert_eq!(second.expect("second capability result"), Some(server_epoch));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    #[tokio::test]
+    async fn put_file_capability_failed_wave_can_retry_immediately() {
+        let endpoint = format!("http://retry-after-failure-{}.invalid", Uuid::new_v4());
+        let first = resolve_put_file_auth_capability(&endpoint, || async { Err(Error::Timeout) }).await;
+        assert!(matches!(first, Err(Error::Timeout)));
+
+        let server_epoch = Uuid::new_v4();
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(server_epoch)) })
+                .await
+                .expect("new request should reprobe"),
+            Some(server_epoch)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_probes_different_endpoints_in_parallel() {
+        let first_endpoint = format!("http://parallel-a-{}.invalid", Uuid::new_v4());
+        let second_endpoint = format!("http://parallel-b-{}.invalid", Uuid::new_v4());
+        let probes_started = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&probes_started);
+        let second_barrier = Arc::clone(&probes_started);
+
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                resolve_put_file_auth_capability(&first_endpoint, || async move {
+                    first_barrier.wait().await;
+                    Ok(None)
+                }),
+                resolve_put_file_auth_capability(&second_endpoint, || async move {
+                    second_barrier.wait().await;
+                    Ok(None)
+                })
+            )
+        })
+        .await
+        .expect("different endpoints should not serialize");
+        assert!(results.0.expect("first result").is_none());
+        assert!(results.1.expect("second result").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_put_file_capability_flight_cannot_overwrite_newer_state() {
+        let endpoint = format!("http://stale-flight-{}.invalid", Uuid::new_v4());
+        let entry = put_file_capability_cache_entry(&endpoint);
+        let probe_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let stale_epoch = Uuid::new_v4();
+        let newer_epoch = Uuid::new_v4();
+
+        let task = {
+            let endpoint = endpoint.clone();
+            let probe_started = Arc::clone(&probe_started);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                resolve_put_file_auth_capability(&endpoint, || async move {
+                    probe_started.notify_one();
+                    release.notified().await;
+                    Ok(Some(stale_epoch))
+                })
+                .await
+            })
+        };
+        probe_started.notified().await;
+        {
+            let mut state = entry.write().await;
+            state.generation = state.generation.checked_add(1).expect("test generation should advance");
+            state.cached = Some(PutFileCapabilityState::V1 {
+                server_epoch: newer_epoch,
+                revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+            });
+            state.in_flight = None;
+        }
+        release.notify_one();
+        assert_eq!(
+            task.await.expect("stale task should finish").expect("stale probe result"),
+            Some(stale_epoch)
+        );
+        assert_eq!(
+            fresh_put_file_capability(entry.read().await.cached, Instant::now()),
+            Some(Some(newer_epoch))
+        );
     }
 
     #[test]

@@ -36,8 +36,8 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-    INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+    INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
@@ -71,6 +71,7 @@ const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
+const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -417,7 +418,7 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
             Err(response) => *response,
         },
         (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
-        (Method::GET, PUT_FILE_STREAM_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
+        (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
             Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
                 match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
                     Some(challenge) => put_file_capability_response(challenge),
@@ -451,6 +452,7 @@ fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
         PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
         NS_SCANNER_PATH => Some(INTERNODE_OPERATION_NS_SCANNER),
         _ => None,
@@ -1637,7 +1639,9 @@ fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
     match operation {
         Some(INTERNODE_OPERATION_WALK_DIR) => LOG_SUBSYSTEM_DIRECTORY_WALK,
         Some(INTERNODE_OPERATION_NS_SCANNER) => LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-        Some(INTERNODE_OPERATION_READ_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_STREAM) => LOG_SUBSYSTEM_FILE_TRANSFER,
+        Some(
+            INTERNODE_OPERATION_READ_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_CAPABILITY,
+        ) => LOG_SUBSYSTEM_FILE_TRANSFER,
         _ => LOG_SUBSYSTEM_ROUTING,
     }
 }
@@ -1664,12 +1668,12 @@ mod tests {
         LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY,
         NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH,
         NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
-        NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_STREAM_PATH, PutFileQuery,
-        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
-        internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
-        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_capability_response,
-        put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock, read_file_body_stream,
-        remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
+        NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH,
+        PUT_FILE_STREAM_PATH, PutFileQuery, READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery,
+        append_walk_dir_completion, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
+        ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
+        put_file_capability_response, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
+        read_file_body_stream, remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
         validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
         verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
         write_put_file_body_chunks_to_writer,
@@ -1684,8 +1688,9 @@ mod tests {
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
     use rustfs_io_metrics::internode_metrics::{
-        INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-        INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+        INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        global_internode_metrics,
     };
     use sha2::Digest as _;
     use std::collections::HashMap;
@@ -1821,6 +1826,10 @@ mod tests {
             internode_http_operation(PUT_FILE_AUTH_STREAM_PATH),
             Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
         );
+        assert_eq!(
+            internode_http_operation(PUT_FILE_CAPABILITY_PATH),
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)
+        );
         assert_eq!(internode_http_operation(WALK_DIR_PATH), Some(INTERNODE_OPERATION_WALK_DIR));
         assert_eq!(internode_http_operation(NS_SCANNER_PATH), Some(INTERNODE_OPERATION_NS_SCANNER));
         assert_eq!(internode_http_operation("/rustfs/rpc/unknown"), None);
@@ -1851,7 +1860,7 @@ mod tests {
     fn put_file_capability_get_requires_signature() {
         let challenge = uuid::Uuid::new_v4();
         let uri: Uri = format!(
-            "{PUT_FILE_STREAM_PATH}?{}={}&{}={challenge}",
+            "{PUT_FILE_CAPABILITY_PATH}?{}={}&{}={challenge}",
             super::PUT_FILE_CAPABILITY_QUERY,
             super::PUT_FILE_CAPABILITY_VERSION,
             super::PUT_FILE_CAPABILITY_CHALLENGE_QUERY
@@ -1982,6 +1991,10 @@ mod tests {
         );
         assert_eq!(
             internode_rpc_subsystem(Some(INTERNODE_OPERATION_PUT_FILE_STREAM)),
+            LOG_SUBSYSTEM_FILE_TRANSFER
+        );
+        assert_eq!(
+            internode_rpc_subsystem(Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)),
             LOG_SUBSYSTEM_FILE_TRANSFER
         );
         assert_eq!(internode_rpc_subsystem(Some(INTERNODE_OPERATION_WALK_DIR)), LOG_SUBSYSTEM_DIRECTORY_WALK);
