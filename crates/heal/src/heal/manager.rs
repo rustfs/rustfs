@@ -3316,21 +3316,19 @@ mod tests {
             !super::super::replacement_readiness::auto_replacement_target_ready(&ready_disk, std::slice::from_ref(&ready_disk),)
                 .await
         );
-        let missing_disk = new_disk(
-            &missing,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .expect("missing temporary disk root should initialize");
         assert!(
-            !super::super::replacement_readiness::auto_replacement_target_ready(
-                &missing_disk,
-                std::slice::from_ref(&missing_disk),
-            )
-            .await
+            matches!(
+                new_disk(
+                    &missing,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await,
+                Err(DiskError::VolumeNotFound)
+            ),
+            "a missing replacement path must be rejected before admission"
         );
     }
 
