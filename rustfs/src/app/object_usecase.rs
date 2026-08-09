@@ -200,7 +200,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 #[cfg(test)]
 use tokio_util::io::ReaderStream;
-use tokio_util::io::StreamReader;
+use tokio_util::io::{StreamReader, poll_read_buf};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -871,7 +871,6 @@ pin_project! {
     struct GetObjectReaderStream<R> {
         #[pin]
         reader: Option<R>,
-        buf: BytesMut,
         capacity: usize,
         strategy: &'static str,
         buffer_source: &'static str,
@@ -923,7 +922,6 @@ where
         }
         Self {
             reader: Some(reader),
-            buf: BytesMut::with_capacity(capacity.min(remaining)),
             capacity,
             strategy,
             buffer_source,
@@ -1344,21 +1342,12 @@ where
             None => return Poll::Ready(None),
         };
         let read_capacity = (*this.capacity).min(*this.remaining);
-        this.buf.resize(read_capacity, 0);
-
-        let poll_read = {
-            let mut read_buf = ReadBuf::new(&mut this.buf[..read_capacity]);
-            match reader.poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            }
-        };
+        let mut buf = BytesMut::with_capacity(read_capacity);
+        let poll_read = poll_read_buf(reader, cx, &mut buf);
 
         let result: Poll<Option<Self::Item>> = match poll_read {
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
-                let bytes = this.buf.split_to(bytes_read).freeze();
-                this.buf.clear();
+                let bytes = buf.freeze();
                 *this.remaining -= bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
@@ -1377,7 +1366,6 @@ where
                 }
             }
             Poll::Ready(Ok(_)) => {
-                this.buf.clear();
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
@@ -1391,7 +1379,6 @@ where
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
             Poll::Ready(Err(err)) => {
-                this.buf.clear();
                 this.reader.set(None);
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
@@ -1402,10 +1389,7 @@ where
                 );
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
-            Poll::Pending => {
-                this.buf.clear();
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         };
 
         let emitted_bytes = match &result {
