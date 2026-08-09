@@ -1467,7 +1467,7 @@ mod tests {
 
     #[tokio::test]
     async fn heal_object_uses_explicit_set_scope() {
-        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
         let selected = sets
             .get_disks_for_heal_object(
                 "object",
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[tokio::test]
     async fn heal_object_without_set_scope_keeps_hash_routing() {
-        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
         let object = "object";
         let selected = sets
             .get_disks_for_heal_object(object, &HealOpts::default())
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn heal_object_rejects_invalid_set_scope() {
-        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
         let err = sets
             .get_disks_for_heal_object(
                 "object",
