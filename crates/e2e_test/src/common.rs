@@ -138,6 +138,18 @@ pub(crate) async fn signed_s3_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    signed_s3_request_with_session_token(method, url, body, content_type, access_key, secret_key, None).await
+}
+
+async fn signed_s3_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let uri = url.parse::<http::Uri>()?;
     let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
     let mut request = http::Request::builder()
@@ -150,7 +162,14 @@ pub(crate) async fn signed_s3_request(
     }
 
     let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
-    let signed = sign_v4(request.body(Body::empty())?, content_length, access_key, secret_key, "", "us-east-1");
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_length,
+        access_key,
+        secret_key,
+        session_token.unwrap_or_default(),
+        "us-east-1",
+    );
 
     let mut request = local_http_client().request(method, url);
     for (name, value) in signed.headers() {
@@ -171,9 +190,22 @@ pub(crate) async fn admin_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    admin_request_with_session_token(base_url, method, path_and_query, body, access_key, secret_key, None).await
+}
+
+pub(crate) async fn admin_request_with_session_token(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<String>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
     let content_type = body.as_ref().map(|_| "application/json");
-    let response = signed_s3_request(method, &url, body, content_type, access_key, secret_key).await?;
+    let response =
+        signed_s3_request_with_session_token(method, &url, body, content_type, access_key, secret_key, session_token).await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))

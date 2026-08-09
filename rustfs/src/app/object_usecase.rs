@@ -5109,7 +5109,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
-        buffered_body: Option<Bytes>,
+        mut buffered_body: Option<Bytes>,
         cache_hook_served: bool,
         cache_hook_probed: bool,
         cache_fill_allowed: bool,
@@ -5125,7 +5125,7 @@ impl DefaultObjectUsecase {
         // ODC-16 (backlog#1121): when the ecstore hook or shared cold fill
         // already supplied this body, the request-level plan was built before
         // the authoritative lookup. Serve it without planning a second time.
-        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+        if cache_hook_served && let Some(bytes) = buffered_body.take() {
             return Ok(Self::build_memory_bytes_blob(
                 bytes,
                 response_content_length,
@@ -5319,6 +5319,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "info", skip(self, _fs, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
@@ -6258,6 +6259,7 @@ impl DefaultObjectUsecase {
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -8790,6 +8792,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
