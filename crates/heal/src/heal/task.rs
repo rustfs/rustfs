@@ -2256,7 +2256,8 @@ impl HealTask {
 
         // The rebuilt disks are formatted now: mark them as healing so
         // DiskInfo.healing reflects the rebuild until it completes.
-        super::set_healing_markers(&self.heal_endpoints, &set_disk_id).await;
+        let healing_marker = format!("{set_disk_id}:{}", self.id);
+        super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
 
         // Step 2: Get disk for resume functionality
         debug!(
@@ -2374,9 +2375,10 @@ impl HealTask {
 
         // Keep the markers on failure: the resume state also persists, and the
         // next run of this set heal re-marks and eventually clears them.
-        if result.is_ok() {
-            super::clear_healing_markers(&self.heal_endpoints).await;
-        }
+        let result = match result {
+            Ok(()) => super::clear_healing_markers(&self.heal_endpoints, &healing_marker).await,
+            Err(err) => Err(err),
+        };
 
         {
             let mut progress = self.progress.write().await;
