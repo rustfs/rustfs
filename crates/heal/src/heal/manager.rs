@@ -2210,14 +2210,17 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
-                        let local_disk_map = local_disk_map_read().await;
-                        let local_endpoints = local_disk_map
-                            .values()
-                            .flatten()
-                            .map(|disk| disk.endpoint())
-                            .filter(|endpoint| endpoint.is_local)
-                            .collect::<Vec<_>>();
-                        for disk in local_disk_map.values().flatten() {
+                        let (local_disks, local_endpoints) = {
+                            let local_disk_map = local_disk_map_read().await;
+                            let local_disks = local_disk_map.values().flatten().cloned().collect::<Vec<_>>();
+                            let local_endpoints = local_disks
+                                .iter()
+                                .map(|disk| disk.endpoint())
+                                .filter(|endpoint| endpoint.is_local)
+                                .collect::<Vec<_>>();
+                            (local_disks, local_endpoints)
+                        };
+                        for disk in &local_disks {
                             let endpoint = disk.endpoint();
                             let runtime_state = disk.runtime_state();
                             let set_disk_id =
