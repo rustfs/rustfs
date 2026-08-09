@@ -7485,6 +7485,87 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     // With B's outbound proven, the inbound replica must stay put across
     // multiple fast-scanner cycles.
     assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+/// P1-19 (backlog#1675): the supported replication contract is targets that
+/// adopt the source version id (RustFS/MinIO semantics). A target that mints
+/// its own version ids silently breaks every version-addressed operation that
+/// follows — version deletes and heal re-drives never match, diverging the
+/// two sides. replication-check must surface this explicitly: a
+/// VersionFidelity phase that compares the probe PUT's response version id
+/// against the sent source version id and fails with
+/// BucketRemoteTargetVersionMismatch — while still cleaning up the probe
+/// object via the version id the target actually assigned.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "version-fidelity-dst";
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "version-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "FAILED",
+        "a version-minting target must fail the replication check: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "target must be FAILED: {payload}");
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "VersionFidelity phase must fail: {payload}");
+    assert_eq!(
+        fidelity["Code"], "BucketRemoteTargetVersionMismatch",
+        "the failure must carry a machine-readable code: {payload}"
+    );
+    // The probe PUT itself succeeded (fidelity is judged from its response);
+    // the later mutation phases are pointless against a drifting target and
+    // must be skipped, but cleanup still runs.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // No probe residue: cleanup must address the version id the target
+    // actually assigned, not the source id (which never matched anything).
+    let probe_key = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .and_then(|record| record.key)
+        .ok_or("the probe PUT never reached the fake target")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "the probe object must be cleaned up on the mismatching target"
+    );
 
     Ok(())
 }

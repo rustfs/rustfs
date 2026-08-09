@@ -30,10 +30,10 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteObjectInput, DeleteObjectOutput, ETag,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, ETag,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat,
-    UploadPartInput, UploadPartOutput,
+    HeadObjectInput, HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ObjectVersionId, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::validation::{AwsNameValidation, NameValidation};
@@ -91,6 +91,7 @@ pub enum Operation {
     GetObject,
     HeadObject,
     DeleteObject,
+    ListObjectVersions,
     CreateMultipartUpload,
     UploadPart,
     CompleteMultipartUpload,
@@ -659,6 +660,7 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
     let operation = match (method, key.is_some()) {
         (&Method::HEAD, false) => Operation::HeadBucket,
         (&Method::GET, false) if query.contains_key("versioning") => Operation::GetBucketVersioning,
+        (&Method::GET, false) if query.contains_key("versions") => Operation::ListObjectVersions,
         (&Method::PUT, true) if upload_id.is_some() && part_number.is_some() => Operation::UploadPart,
         (&Method::PUT, true) if upload_id.is_some() || query.contains_key("partNumber") => Operation::Unknown,
         (&Method::POST, true) if query.contains_key("uploads") => Operation::CreateMultipartUpload,
@@ -1101,6 +1103,63 @@ impl S3 for FakeBackend {
         ))
     }
 
+    /// Prefix + max-keys subset only — enough for the replication-check probe
+    /// key allocation. No pagination markers or delimiter folding.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let state = lock(&self.store);
+        let Some(bucket_state) = state.buckets.get(&req.input.bucket) else {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
+        };
+        let prefix = req.input.prefix.as_deref().unwrap_or_default();
+        let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
+
+        let mut keys: Vec<&String> = bucket_state.objects.keys().filter(|key| key.starts_with(prefix)).collect();
+        keys.sort();
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        'keys: for key in keys {
+            for version in bucket_state.objects[key].iter().rev() {
+                if versions.len() + delete_markers.len() >= max_keys {
+                    break 'keys;
+                }
+                if version.delete_marker {
+                    delete_markers.push(DeleteMarkerEntry {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        ..Default::default()
+                    });
+                } else {
+                    versions.push(s3s::dto::ObjectVersion {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        e_tag: Some(ETag::Strong(version.e_tag.clone())),
+                        size: Some(version.body.len() as i64),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        drop(state);
+
+        Ok(apply_response_fault(
+            S3Response::new(ListObjectVersionsOutput {
+                name: Some(req.input.bucket),
+                versions: Some(versions),
+                delete_markers: Some(delete_markers),
+                ..Default::default()
+            }),
+            fault.as_ref(),
+        ))
+    }
+
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let fault = request_fault(&req);
         let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
@@ -1155,7 +1214,7 @@ impl S3 for FakeBackend {
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
                 ..Default::default()
             }),
@@ -1177,7 +1236,7 @@ impl S3 for FakeBackend {
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
                 ..Default::default()
             }),
