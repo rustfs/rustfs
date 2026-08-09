@@ -14,7 +14,10 @@
 
 use crate::heal::{
     progress::HealProgress,
-    resume::{CheckpointManager, ResumeManager, ResumeUtils, compose_key},
+    resume::{
+        CheckpointManager, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
+        replacement_target_identities_match,
+    },
     storage::{HealStorageAPI, next_heal_listing_token},
     task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
 };
@@ -88,6 +91,7 @@ pub struct ErasureSetHealer {
     source: HealRequestSource,
     target_endpoints: Arc<[String]>,
     replacement_task_id: Option<String>,
+    replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
 }
 
 pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
@@ -198,7 +202,30 @@ impl ErasureSetHealer {
             source,
             target_endpoints: target_endpoints.into(),
             replacement_task_id,
+            replacement_target_identities: None,
         }
+    }
+
+    pub(crate) fn with_replacement_identity_fence(
+        mut self,
+        replacement_target_identities: Option<Vec<ReplacementTargetIdentity>>,
+    ) -> Self {
+        self.replacement_target_identities = replacement_target_identities.map(Into::into);
+        self
+    }
+
+    async fn verify_replacement_identity_fence(&self, stage: &str) -> Result<()> {
+        let Some(expected_identities) = self.replacement_target_identities.as_ref() else {
+            return Ok(());
+        };
+        let actual_identities = self.storage.replacement_target_identities(&self.target_endpoints).await?;
+        if replacement_target_identities_match(expected_identities, &actual_identities) {
+            return Ok(());
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("Replacement target changed during {stage}"),
+        })
     }
 
     /// execute erasure set heal with resume
@@ -228,6 +255,7 @@ impl ErasureSetHealer {
             .await;
 
         result?;
+        self.verify_replacement_identity_fence("completion").await?;
 
         // The healing marker is cleared by the caller only after both cleanup
         // operations succeed. Cleanup is idempotent, so a retry is safe.
@@ -663,6 +691,7 @@ impl ErasureSetHealer {
             matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
 
         loop {
+            self.verify_replacement_identity_fence("page scan").await?;
             // Get one page of object versions
             let (objects, next_token, is_truncated) = if use_disk_walk {
                 self.storage
@@ -1053,7 +1082,9 @@ mod resume_loop_tests {
     //! handling) — not merely a mock's own output.
     use super::{ErasureSetHealer, target_outcomes_complete};
     use crate::heal::progress::HealProgress;
-    use crate::heal::resume::{CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, compose_key};
+    use crate::heal::resume::{
+        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, compose_key,
+    };
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
@@ -1062,7 +1093,7 @@ mod resume_loop_tests {
     use crate::{Error, Result};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1152,6 +1183,7 @@ mod resume_loop_tests {
         results: Mutex<HashMap<String, HealResultItem>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
+        replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         fail_listing: AtomicBool,
     }
 
@@ -1271,6 +1303,13 @@ mod resume_loop_tests {
         async fn get_disk_for_resume(&self, _id: &str) -> Result<DiskStore> {
             Err(Error::other("not implemented in tests"))
         }
+        async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+            self.replacement_target_identity_sequences
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| Error::other("replacement identity sequence exhausted"))
+        }
     }
 
     async fn make_disk(temp: &TempDir) -> DiskStore {
@@ -1385,6 +1424,62 @@ mod resume_loop_tests {
         .await;
 
         assert_eq!(env.healer.target_endpoints.as_ref(), ["replacement-a", "replacement-b"]);
+    }
+
+    #[tokio::test]
+    async fn replacement_identity_fence_rejects_a_remount_before_page_scan() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let expected_identity = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "filesystem-a".to_string(),
+        };
+        let remounted_identity = ReplacementTargetIdentity {
+            physical_device_ids: vec!["device-b".to_string()],
+            filesystem_identity: "filesystem-b".to_string(),
+            ..expected_identity.clone()
+        };
+        env.storage
+            .replacement_target_identity_sequences
+            .lock()
+            .unwrap()
+            .push_back(vec![remounted_identity]);
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+            vec!["replacement-a".to_string()],
+            Some("generation-a".to_string()),
+        )
+        .with_replacement_identity_fence(Some(vec![expected_identity]));
+        let mut current_object_index = 0;
+        let mut processed = 0;
+        let mut successful = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+
+        let error = healer
+            .heal_bucket_with_resume(
+                "b",
+                "pool_0_set_0",
+                0,
+                &mut current_object_index,
+                &mut processed,
+                &mut successful,
+                &mut failed,
+                &mut skipped,
+                &env.resume,
+                &env.checkpoint,
+            )
+            .await
+            .expect_err("a remounted target must not begin a new page scan");
+
+        assert!(error.to_string().contains("page scan"));
+        assert!(env.storage.calls().is_empty());
     }
 
     #[tokio::test]

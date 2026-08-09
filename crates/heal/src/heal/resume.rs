@@ -67,6 +67,17 @@ pub struct ReplacementTargetIdentity {
     pub filesystem_identity: String,
 }
 
+pub(crate) fn replacement_target_identities_match(
+    expected: &[ReplacementTargetIdentity],
+    actual: &[ReplacementTargetIdentity],
+) -> bool {
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    expected.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    actual.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    expected == actual
+}
+
 /// Build the canonical, provably-injective dedup identity for an object
 /// version. Length-prefixing the object key makes the encoding injective: no
 /// two distinct `(object, version_id)` pairs can collide, even for adversarial
@@ -482,7 +493,11 @@ impl ResumeManager {
                 message: format!("Replacement identities do not match targets for task {}", state.task_id),
             });
         }
-        state.replacement_target_identities = replacement_target_identities;
+        if !replacement_target_identities_match(&state.replacement_target_identities, &replacement_target_identities) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement target changed after format for task {}", state.task_id),
+            });
+        }
         state.replacement_phase = ReplacementPhase::Rebuilding;
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         drop(state);

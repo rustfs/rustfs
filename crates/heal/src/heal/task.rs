@@ -16,7 +16,7 @@ use crate::heal::{
     DiskError, EcstoreError, ErasureSetHealer,
     erasure_healer::target_outcomes_complete,
     progress::HealProgress,
-    resume::ResumeManager,
+    resume::{ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match},
     storage::{HealStorageAPI, next_heal_listing_token},
 };
 use crate::{Error, Result};
@@ -378,6 +378,24 @@ pub struct HealTask {
 }
 
 impl HealTask {
+    async fn verify_replacement_identity_fence(
+        &self,
+        expected_identities: &[ReplacementTargetIdentity],
+        set_disk_id: &str,
+        stage: &str,
+    ) -> Result<()> {
+        let actual_identities = self
+            .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
+            .await?;
+        if replacement_target_identities_match(expected_identities, &actual_identities) {
+            return Ok(());
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("Replacement target changed during {stage} for automatic heal {set_disk_id}"),
+        })
+    }
+
     pub fn from_request(request: HealRequest, storage: Arc<dyn HealStorageAPI>) -> Self {
         Self {
             id: request.id,
@@ -2199,19 +2217,13 @@ impl HealTask {
             "Heal erasure set stage entered"
         );
         if is_auto_replacement {
-            let identities = self
-                .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
-                .await?;
             let Some((_, _, expected_identities)) = replacement_resume.as_ref() else {
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Replacement intent is missing for automatic heal {set_disk_id}"),
                 });
             };
-            if identities != *expected_identities {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Replacement target changed before automatic format heal {set_disk_id}"),
-                });
-            }
+            self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "format")
+                .await?;
         }
         let format_result = if is_auto_replacement {
             let pool_index = self.options.pool_index.ok_or_else(|| Error::TaskExecutionFailed {
@@ -2284,10 +2296,15 @@ impl HealTask {
                         message: format!("Failed to verify formatted replacement targets for {set_disk_id}"),
                     });
                 }
-                if let Some((_, replacement_resume, _)) = &replacement_resume {
+                if let Some((_, replacement_resume, expected_identities)) = &replacement_resume {
                     let identities = self
                         .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
                         .await?;
+                    if !replacement_target_identities_match(expected_identities, &identities) {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement target changed after format for automatic heal {set_disk_id}"),
+                        });
+                    }
                     replacement_resume.mark_replacement_rebuilding(identities).await?;
                 }
             }
@@ -2336,6 +2353,7 @@ impl HealTask {
             stage = "resolve_resume_disk",
             "Heal erasure set stage entered"
         );
+        let replacement_target_identities = replacement_resume.as_ref().map(|(_, _, identities)| identities.clone());
         let disk = match replacement_resume {
             Some((disk, _, _)) => disk,
             None => {
@@ -2366,6 +2384,10 @@ impl HealTask {
         for bucket in buckets.iter() {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;
+            if let Some(expected_identities) = replacement_target_identities.as_ref() {
+                self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "bucket prepass")
+                    .await?;
+            }
             let heal_result = self
                 .await_with_control(self.storage.heal_bucket(bucket, &bucket_heal_opts))
                 .await;
@@ -2422,7 +2444,8 @@ impl HealTask {
             self.source,
             self.heal_endpoints.clone(),
             is_auto_replacement.then(|| self.id.clone()),
-        );
+        )
+        .with_replacement_identity_fence(replacement_target_identities.clone());
 
         {
             let mut progress = self.progress.write().await;
@@ -2447,7 +2470,13 @@ impl HealTask {
         // Keep the markers on failure: the resume state also persists, and the
         // next run of this set heal re-marks and eventually clears them.
         let result = match result {
-            Ok(()) => super::clear_healing_markers(&self.heal_endpoints, &healing_marker).await,
+            Ok(()) => {
+                if let Some(expected_identities) = replacement_target_identities.as_ref() {
+                    self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "marker completion")
+                        .await?;
+                }
+                super::clear_healing_markers(&self.heal_endpoints, &healing_marker).await
+            }
             Err(err) => Err(err),
         };
 
@@ -2615,6 +2644,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_replacement_rejects_a_new_identity_after_format() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let first_identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
+        let second_identity = replacement_identity("replacement-a", "device-b", "filesystem-b");
+        let storage = Arc::new(MockStorage {
+            replacement_targets_ready: Mutex::new(true),
+            replacement_target_identity_sequences: Mutex::new(VecDeque::from([
+                vec![first_identity.clone()],
+                vec![first_identity.clone()],
+                vec![second_identity],
+            ])),
+            resume_disk: Mutex::new(Some(disk.clone())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+        let task = HealTask::from_request(request, storage.clone());
+
+        let error = task
+            .execute()
+            .await
+            .expect_err("a remounted target after format must fail closed");
+
+        assert!(error.to_string().contains("changed after format"));
+        assert_eq!(storage.replacement_format_calls.lock().unwrap().len(), 1);
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+
+        let state = ResumeManager::load_from_disk(disk, &task.id)
+            .await
+            .expect("durable replacement intent should remain available")
+            .get_state()
+            .await;
+        assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
+        assert_eq!(state.replacement_target_identities, vec![first_identity]);
+    }
+
+    #[tokio::test]
     async fn automatic_replacement_defers_before_bucket_listing_when_target_is_unready() {
         let storage = Arc::new(MockStorage::default());
         let mut request = HealRequest::new(
@@ -2661,6 +2741,7 @@ mod tests {
         global_format_calls: Mutex<u32>,
         replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
         replacement_targets_ready: Mutex<bool>,
+        replacement_target_identity_sequences: Mutex<VecDeque<Vec<crate::heal::resume::ReplacementTargetIdentity>>>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
         include_object_dir_candidate: Mutex<bool>,
@@ -2737,6 +2818,19 @@ mod tests {
             name: name.to_string(),
             version_id: None,
             is_delete_marker: false,
+        }
+    }
+
+    fn replacement_identity(
+        endpoint: &str,
+        physical_device_id: &str,
+        filesystem_identity: &str,
+    ) -> crate::heal::resume::ReplacementTargetIdentity {
+        crate::heal::resume::ReplacementTargetIdentity {
+            endpoint: endpoint.to_string(),
+            canonical_path: format!("/replacement/{endpoint}"),
+            physical_device_ids: vec![physical_device_id.to_string()],
+            filesystem_identity: filesystem_identity.to_string(),
         }
     }
 
@@ -3038,6 +3132,9 @@ mod tests {
         ) -> Result<Vec<crate::heal::resume::ReplacementTargetIdentity>> {
             if !*self.replacement_targets_ready.lock().unwrap() {
                 return Err(Error::other("replacement target is not ready"));
+            }
+            if let Some(identities) = self.replacement_target_identity_sequences.lock().unwrap().pop_front() {
+                return Ok(identities);
             }
             Ok(targets
                 .iter()
