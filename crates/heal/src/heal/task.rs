@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
-    DiskError, EcstoreError, ErasureSetHealer,
+    DiskError, EcstoreError, ErasureSetHealer, HealDiskExt as _,
     erasure_healer::target_outcomes_complete,
     progress::HealProgress,
     resume::{
@@ -354,6 +354,9 @@ pub struct HealTask {
     pub retry_attempts: u32,
     /// Endpoints of the disks being rebuilt (see `HealRequest::heal_endpoints`).
     pub heal_endpoints: Vec<String>,
+    /// Durable resume anchor injected by the manager for an existing automatic
+    /// replacement generation.
+    replacement_resume_endpoint: Option<String>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -407,6 +410,7 @@ impl HealTask {
             source: request.source,
             retry_attempts: request.retry_attempts,
             heal_endpoints: request.heal_endpoints,
+            replacement_resume_endpoint: None,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
@@ -436,6 +440,16 @@ impl HealTask {
             created_at: self.created_at,
             enqueued_at: SystemTime::now(),
         }
+    }
+
+    pub(crate) fn from_replacement_recovery_request(
+        request: HealRequest,
+        storage: Arc<dyn HealStorageAPI>,
+        replacement_resume_endpoint: Option<String>,
+    ) -> Self {
+        let mut task = Self::from_request(request, storage);
+        task.replacement_resume_endpoint = replacement_resume_endpoint;
+        task
     }
 
     pub fn metric_type_label(&self) -> &'static str {
@@ -2175,8 +2189,22 @@ impl HealTask {
                 )
                 .await?;
             let disk = match selection {
-                crate::heal::storage::ReplacementResumeDisk::Existing(disk) => disk,
+                crate::heal::storage::ReplacementResumeDisk::Existing(disk) => {
+                    if let Some(anchor) = &self.replacement_resume_endpoint
+                        && disk.endpoint().to_string() != *anchor
+                    {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement resume anchor changed for automatic heal {set_disk_id}"),
+                        });
+                    }
+                    disk
+                }
                 crate::heal::storage::ReplacementResumeDisk::Fresh => {
+                    if self.replacement_resume_endpoint.is_some() {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement resume anchor is unavailable for automatic heal {set_disk_id}"),
+                        });
+                    }
                     self.await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
                         .await?
                 }
@@ -2710,6 +2738,40 @@ mod tests {
             storage.replacement_format_calls.lock().unwrap().is_empty(),
             "format must not start before the durable replacement intent exists"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_replacement_never_uses_a_fresh_resume_disk() {
+        let storage = Arc::new(MockStorage {
+            replacement_targets_ready: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        let error = HealTask::from_replacement_recovery_request(request, storage.clone(), Some("survivor-a".to_string()))
+            .execute()
+            .await
+            .expect_err("a durable recovery must not fall back to another resume disk");
+
+        assert!(error.to_string().contains("resume anchor is unavailable"));
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "an unavailable durable anchor must block formatting before any write"
+        );
+        assert!(!*storage.listed.lock().unwrap(), "an unavailable durable anchor must not list buckets");
     }
 
     #[tokio::test]

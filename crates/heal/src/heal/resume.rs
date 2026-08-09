@@ -960,6 +960,11 @@ impl CheckpointManager {
             serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to deserialize checkpoint: {e}"),
             })?;
+        if checkpoint.task_id != task_id {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Resume checkpoint task ID does not match its file name: {task_id}"),
+            });
+        }
 
         if checkpoint.task_id != task_id {
             return Err(Error::TaskExecutionFailed {
@@ -2047,6 +2052,50 @@ mod tests {
             .cleanup()
             .await
             .expect("missing checkpoint must be idempotent success");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_a_task_id_mismatched_to_its_file_name() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create checkpoint binding test directory");
+        let endpoint =
+            Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create checkpoint binding test endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create checkpoint binding test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("create checkpoint binding metadata volume: {err}"),
+        }
+
+        let requested_task_id = "checkpoint-file-task";
+        let checkpoint = ResumeCheckpoint::new("other-task".to_string());
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{requested_task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &checkpoint_path,
+            serde_json::to_vec(&checkpoint)
+                .expect("serialize mismatched checkpoint")
+                .into(),
+        )
+        .await
+        .expect("persist mismatched checkpoint");
+
+        let error = match CheckpointManager::load_from_disk(disk, requested_task_id).await {
+            Ok(_) => panic!("checkpoint task id must be bound to its file name"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("does not match its file name"));
+        temp_dir.close().expect("remove checkpoint binding test directory");
     }
 
     #[tokio::test]

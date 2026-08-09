@@ -804,6 +804,10 @@ pub struct HealManager {
     task_aliases: Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     /// Heal tasks waiting for a retry backoff to expire.
     retrying_heals: Arc<Mutex<HashMap<String, RetryingHeal>>>,
+    /// Surviving disks that hold durable replacement intents, keyed by task ID.
+    /// This is rebuilt from durable state after restart and never crosses the
+    /// public request boundary.
+    replacement_recovery_anchors: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
     /// Cancel token
@@ -821,6 +825,7 @@ struct HealQueueContext<'a> {
     active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     completed_heals: &'a Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
+    replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     config: &'a Arc<RwLock<HealConfig>>,
     statistics: &'a Arc<RwLock<HealStatistics>>,
     storage: &'a Arc<dyn HealStorageAPI>,
@@ -1229,6 +1234,7 @@ impl HealManager {
             completed_heals: Arc::new(Mutex::new(HashMap::new())),
             task_aliases: Arc::new(Mutex::new(HashMap::new())),
             retrying_heals: Arc::new(Mutex::new(HashMap::new())),
+            replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
@@ -1304,6 +1310,7 @@ impl HealManager {
         let mut set_disk_ids = HashSet::new();
         let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>, String)>::new();
         let mut replacement_restarts = HashMap::<String, (String, Vec<String>)>::new();
+        let mut conflicted_replacement_sets = HashSet::new();
 
         {
             let local_disks = {
@@ -1378,12 +1385,28 @@ impl HealManager {
                         }
                         match self.storage.replacement_target_identities(&state.replacement_targets).await {
                             Ok(identities) if identities == state.replacement_target_identities => {
-                                replacement_intents.entry(task_id).or_insert((
-                                    state.set_disk_id,
-                                    state.replacement_targets,
-                                    state.replacement_buckets,
-                                    endpoint.to_string(),
-                                ));
+                                let resume_endpoint = endpoint.to_string();
+                                match replacement_intents.entry(task_id) {
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        entry.insert((
+                                            state.set_disk_id,
+                                            state.replacement_targets,
+                                            state.replacement_buckets,
+                                            resume_endpoint,
+                                        ));
+                                    }
+                                    std::collections::hash_map::Entry::Occupied(entry) => {
+                                        let (existing_set_disk_id, existing_targets, existing_buckets, existing_anchor) =
+                                            entry.get();
+                                        if existing_set_disk_id != &state.set_disk_id
+                                            || existing_targets != &state.replacement_targets
+                                            || existing_buckets != &state.replacement_buckets
+                                            || existing_anchor != &resume_endpoint
+                                        {
+                                            conflicted_replacement_sets.insert(state.set_disk_id);
+                                        }
+                                    }
+                                }
                             }
                             Ok(_) => {
                                 if manager.abandon_replacement_intent().await.is_ok() {
@@ -1421,7 +1444,7 @@ impl HealManager {
             let Ok((pool_index, set_index)) = crate::heal::utils::parse_set_disk_id(&set_disk_id) else {
                 continue;
             };
-            if recoveries.len() != 1 {
+            if conflicted_replacement_sets.contains(&set_disk_id) || recoveries.len() != 1 {
                 debug!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -1461,18 +1484,39 @@ impl HealManager {
             if reuse_single_generation && let Some(task_id) = recoveries[0].0.take() {
                 req.id = task_id;
             }
+            let recovery_anchor = reuse_single_generation.then(|| recoveries[0].3.take()).flatten();
             req.source = HealRequestSource::AutoHeal;
             req.heal_endpoints = heal_endpoints;
-            if let Err(err) = self.submit_heal_request(req).await {
-                warn!(
-                    target: "rustfs::heal::manager",
-                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_MANAGER,
-                    set_disk_id,
-                    error = %err,
-                    "Replacement recovery enqueue failed"
-                );
+            let request_id = req.id.clone();
+            if let Some(anchor) = &recovery_anchor {
+                self.replacement_recovery_anchors
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(request_id.clone(), anchor.clone());
+            }
+            match self.submit_heal_request(req).await {
+                Ok(HealAdmissionResult::Accepted) => {}
+                Ok(_) => {
+                    self.replacement_recovery_anchors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&request_id);
+                }
+                Err(err) => {
+                    self.replacement_recovery_anchors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&request_id);
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        set_disk_id,
+                        error = %err,
+                        "Replacement recovery enqueue failed"
+                    );
+                }
             }
         }
 
@@ -2234,6 +2278,7 @@ impl HealManager {
         let active_heals = self.active_heals.clone();
         let completed_heals = self.completed_heals.clone();
         let retrying_heals = self.retrying_heals.clone();
+        let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
@@ -2263,6 +2308,7 @@ impl HealManager {
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
                             retrying_heals: &retrying_heals,
+                            replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -2278,6 +2324,7 @@ impl HealManager {
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
                             retrying_heals: &retrying_heals,
+                            replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -2300,6 +2347,7 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let storage = self.storage.clone();
+        let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let cancel_token = self.cancel_token.clone();
         let notify = self.notify.clone();
         let mut duration = {
@@ -2606,17 +2654,27 @@ impl HealManager {
                                 },
                                 HealPriority::Low,
                             );
+                            let recovery_anchor = recovery.as_ref().map(|(_, _, _, anchor)| anchor.clone());
                             if let Some((task_id, _, _, _)) = recovery {
                                 req.id = task_id;
                             }
                             req.source = HealRequestSource::AutoHeal;
                             req.heal_endpoints = endpoints.iter().map(ToString::to_string).collect();
+                            let request_id = req.id.clone();
                             let endpoint_count = req.heal_endpoints.len();
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
                             let admission = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
                             let should_notify =
                                 matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
+                            if matches!(admission, HealAdmissionResult::Accepted)
+                                && let Some(anchor) = recovery_anchor
+                            {
+                                replacement_recovery_anchors
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(request_id, anchor);
+                            }
                             drop(queue);
                             drop(config);
                             if matches!(admission, HealAdmissionResult::Accepted) {
@@ -2692,6 +2750,7 @@ impl HealManager {
             active_heals,
             completed_heals,
             retrying_heals,
+            replacement_recovery_anchors,
             config,
             statistics,
             storage,
@@ -2756,7 +2815,16 @@ impl HealManager {
                 {
                     *running_per_set.entry(set_key).or_insert(0) += 1;
                 }
-                let task = Arc::new(HealTask::from_request(request, storage.clone()));
+                let replacement_resume_endpoint = replacement_recovery_anchors
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&request.id)
+                    .cloned();
+                let task = Arc::new(HealTask::from_replacement_recovery_request(
+                    request,
+                    storage.clone(),
+                    replacement_resume_endpoint,
+                ));
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
                 publish_active_heal_count(&active_heals_guard);
@@ -2765,6 +2833,7 @@ impl HealManager {
                 let heal_queue_clone = heal_queue.clone();
                 let completed_heals_clone = completed_heals.clone();
                 let retrying_heals_clone = retrying_heals.clone();
+                let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
                 let manager_cancel_token = cancel_token.clone();
@@ -2839,6 +2908,12 @@ impl HealManager {
                     });
                     let retry_request_for_queue = retry_request;
                     let retry_cancel_token = retry_request_for_queue.as_ref().map(|_| CancellationToken::new());
+                    if retry_request_for_queue.is_none() {
+                        replacement_recovery_anchors_clone
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&task_id);
+                    }
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
@@ -3249,6 +3324,7 @@ mod tests {
             active_heals: &manager.active_heals,
             completed_heals: &manager.completed_heals,
             retrying_heals: &manager.retrying_heals,
+            replacement_recovery_anchors: &manager.replacement_recovery_anchors,
             config: &manager.config,
             statistics: &manager.statistics,
             storage: &manager.storage,
