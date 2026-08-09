@@ -26,7 +26,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::LazyLock;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -55,8 +55,41 @@ const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-fn auto_replacement_path_ready(endpoint: &Endpoint) -> bool {
-    endpoint.is_local && Path::new(&endpoint.get_file_path()).is_dir()
+async fn auto_replacement_path_ready(endpoint: &Endpoint, local_endpoints: &[Endpoint]) -> bool {
+    if !endpoint.is_local {
+        return false;
+    }
+
+    let path = PathBuf::from(endpoint.get_file_path());
+    let sibling_paths = local_endpoints
+        .iter()
+        .filter(|sibling| sibling.is_local && *sibling != endpoint)
+        .map(|sibling| sibling.get_file_path())
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let path = path.to_string_lossy();
+        let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(path.as_ref()) else {
+            return false;
+        };
+        let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
+            return false;
+        };
+        if target_device_ids.is_empty()
+            || root_device_ids.is_empty()
+            || target_device_ids.iter().any(|target| root_device_ids.contains(target))
+            || !rustfs_utils::os::is_mount_point(Path::new(path.as_ref())).unwrap_or(false)
+        {
+            return false;
+        }
+
+        !sibling_paths.iter().any(|sibling| {
+            rustfs_utils::os::get_physical_device_ids(sibling)
+                .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
+                .unwrap_or(true)
+        })
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
@@ -2217,6 +2250,12 @@ impl HealManager {
                         // Build list of endpoints that need healing
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
                         let local_disk_map = local_disk_map_read().await;
+                        let local_endpoints = local_disk_map
+                            .values()
+                            .flatten()
+                            .map(|disk| disk.endpoint())
+                            .filter(|endpoint| endpoint.is_local)
+                            .collect::<Vec<_>>();
                         for disk in local_disk_map.values().flatten() {
                             let endpoint = disk.endpoint();
                             let runtime_state = disk.runtime_state();
@@ -2226,7 +2265,7 @@ impl HealManager {
                             // detect unformatted disk via get_disk_id()
                             match disk.get_disk_id().await {
                                 Err(DiskError::UnformattedDisk) => {
-                                    if !auto_replacement_path_ready(&endpoint) {
+                                    if !auto_replacement_path_ready(&endpoint, &local_endpoints).await {
                                         skipped_invalid_count += 1;
                                         debug!(
                                             target: "rustfs::heal::manager",
@@ -2981,15 +3020,15 @@ mod tests {
 
     use super::super::{DiskStore, Endpoint, storage_api::status::BucketInfo};
 
-    #[test]
-    fn auto_replacement_path_requires_an_existing_directory() {
+    #[tokio::test]
+    async fn auto_replacement_path_requires_a_non_root_mount() {
         let temp = TempDir::new().expect("temporary replacement root should be created");
         let ready = Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("replacement endpoint should parse");
         let missing = Endpoint::try_from(temp.path().join("missing").to_string_lossy().as_ref())
             .expect("missing replacement endpoint should parse");
 
-        assert!(auto_replacement_path_ready(&ready));
-        assert!(!auto_replacement_path_ready(&missing));
+        assert!(!auto_replacement_path_ready(&ready, std::slice::from_ref(&ready)).await);
+        assert!(!auto_replacement_path_ready(&missing, std::slice::from_ref(&missing)).await);
     }
 
     #[derive(Debug)]

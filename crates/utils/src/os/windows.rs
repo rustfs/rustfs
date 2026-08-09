@@ -158,6 +158,12 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(volume1 == volume2)
 }
 
+/// Automatic replacement formatting is disabled until Windows has an
+/// equivalent mount identity probe.
+pub fn is_mount_point(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
     let path_wide = to_wide_path(Path::new(disk));
     let volume = get_volume_name(&path_wide)?;
