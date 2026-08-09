@@ -27,6 +27,7 @@ documentation = "https://docs.rs/rustfs-test-utils/latest/rustfs_test_utils/"
 
 [features]
 default = []
+put-object-commit-barrier = ["rustfs-ecstore/test-util"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -51,7 +52,7 @@ hotpath-cpu = [
 
 [dependencies]
 hotpath.workspace = true
-rustfs-ecstore = { workspace = true }
+rustfs-ecstore.workspace = true
 rustfs-storage-api = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }

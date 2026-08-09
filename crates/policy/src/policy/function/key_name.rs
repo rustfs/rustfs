@@ -198,6 +198,9 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:object-lock-retain-until-date")]
     S3ObjectLockRetainUntilDate,
 
+    #[strum(serialize = "s3:object-lock-mode")]
+    S3ObjectLockMode,
+
     #[strum(serialize = "s3:max-keys")]
     S3MaxKeys,
 
@@ -385,6 +388,7 @@ mod tests {
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -407,6 +411,7 @@ mod tests {
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -425,6 +430,7 @@ mod tests {
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId))]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
