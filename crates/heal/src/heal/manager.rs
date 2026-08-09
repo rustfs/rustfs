@@ -1458,10 +1458,8 @@ impl HealManager {
                 },
                 HealPriority::Low,
             );
-            if reuse_single_generation {
-                if let Some(task_id) = recoveries[0].0.take() {
-                    req.id = task_id;
-                }
+            if reuse_single_generation && let Some(task_id) = recoveries[0].0.take() {
+                req.id = task_id;
             }
             req.source = HealRequestSource::AutoHeal;
             req.heal_endpoints = heal_endpoints;

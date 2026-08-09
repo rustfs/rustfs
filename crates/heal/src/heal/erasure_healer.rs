@@ -188,11 +188,7 @@ impl ErasureSetHealer {
         disk: DiskStore,
         heal_opts: HealOpts,
         source: HealRequestSource,
-        mut target_endpoints: Vec<String>,
-        replacement_task_id: Option<String>,
     ) -> Self {
-        target_endpoints.sort_unstable();
-        target_endpoints.dedup();
         Self {
             storage,
             progress,
@@ -200,10 +196,22 @@ impl ErasureSetHealer {
             disk,
             heal_opts,
             source,
-            target_endpoints: target_endpoints.into(),
-            replacement_task_id,
+            target_endpoints: Vec::new().into(),
+            replacement_task_id: None,
             replacement_target_identities: None,
         }
+    }
+
+    pub(crate) fn with_replacement_targets(
+        mut self,
+        mut target_endpoints: Vec<String>,
+        replacement_task_id: Option<String>,
+    ) -> Self {
+        target_endpoints.sort_unstable();
+        target_endpoints.dedup();
+        self.target_endpoints = target_endpoints.into();
+        self.replacement_task_id = replacement_task_id;
+        self
     }
 
     pub(crate) fn with_replacement_identity_fence(
@@ -553,13 +561,11 @@ impl ErasureSetHealer {
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
-            if self.replacement_task_id.is_some() {
-                if resume_manager.schedule_retry().await? {
-                    checkpoint_manager.reset_for_retry().await?;
-                    return Err(Error::transient_skip(format!(
-                        "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
-                    )));
-                }
+            if self.replacement_task_id.is_some() && resume_manager.schedule_retry().await? {
+                checkpoint_manager.reset_for_retry().await?;
+                return Err(Error::transient_skip(format!(
+                    "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
+                )));
             }
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
@@ -1367,9 +1373,8 @@ mod resume_loop_tests {
             disk.clone(),
             HealOpts::default(),
             HealRequestSource::Internal,
-            target_endpoints,
-            None,
-        );
+        )
+        .with_replacement_targets(target_endpoints, None);
         let resume = ResumeManager::new(
             disk.clone(),
             "task".to_string(),
@@ -1466,9 +1471,8 @@ mod resume_loop_tests {
             env.healer.disk.clone(),
             HealOpts::default(),
             HealRequestSource::AutoHeal,
-            vec!["replacement-a".to_string()],
-            Some("generation-a".to_string()),
         )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()))
         .with_replacement_identity_fence(Some(vec![expected_identity]));
         let mut current_object_index = 0;
         let mut processed = 0;
@@ -1522,9 +1526,8 @@ mod resume_loop_tests {
             env.healer.disk.clone(),
             HealOpts::default(),
             HealRequestSource::AutoHeal,
-            vec!["replacement-a".to_string()],
-            Some("generation-b".to_string()),
-        );
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-b".to_string()));
 
         let error = healer
             .get_or_create_task_id("pool_0_set_0")
@@ -1642,9 +1645,8 @@ mod resume_loop_tests {
             env.healer.disk.clone(),
             HealOpts::default(),
             HealRequestSource::AutoHeal,
-            vec!["replacement-a".to_string()],
-            Some(replacement_task_id.clone()),
-        );
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
 
         healer
             .heal_erasure_set(&["b".to_string()], "pool_0_set_0")

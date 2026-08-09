@@ -93,9 +93,7 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
-            return None;
-        };
+        let disk = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target)?;
         if !disk.has_replacement_mount_lease() {
             return None;
         }

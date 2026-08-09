@@ -1683,12 +1683,12 @@ impl HealStorageAPI for ECStoreHealStorage {
             if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
                 continue;
             }
-            if super::resume::ResumeManager::has_resume_state(&disk_store, task_id).await {
-                if existing.replace(disk_store).is_some() {
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
-                    });
-                }
+            if super::resume::ResumeManager::has_resume_state(&disk_store, task_id).await
+                && existing.replace(disk_store).is_some()
+            {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
+                });
             }
         }
         Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))

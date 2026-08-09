@@ -2501,9 +2501,8 @@ impl HealTask {
             disk,
             heal_opts,
             self.source,
-            self.heal_endpoints.clone(),
-            is_auto_replacement.then(|| self.id.clone()),
         )
+        .with_replacement_targets(self.heal_endpoints.clone(), is_auto_replacement.then(|| self.id.clone()))
         .with_replacement_identity_fence(replacement_target_identities.clone());
 
         {
