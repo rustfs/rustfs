@@ -14752,4 +14752,58 @@ mod tests {
         newer.generation += 1;
         assert!(parse_site_resync_page(&query, &newer).is_err());
     }
+
+    /// P1-15 red light (rustfs/backlog#1675 B2): the retry-event writers do a
+    /// load -> mutate -> persist without taking SITE_REPLICATION_STATE_LOCK,
+    /// racing every lock-holding RMW in this file — losing one side's update
+    /// in a single process. The interleaving below replays the exact three
+    /// steps of `enqueue_site_replication_retry_event` (its body has no
+    /// injection seam; these are the same crate-private calls it makes)
+    /// around a complete locked-writer commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-1".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        let peer = PeerInfo {
+            endpoint: "https://peer-b.example:9000".to_string(),
+            deployment_id: "peer-b-deployment".to_string(),
+            ..Default::default()
+        };
+
+        // enqueue step 1: load a snapshot (retry_queue empty, no ack yet).
+        let mut stale_snapshot = load_site_replication_state().await.expect("load snapshot");
+
+        // A locked writer commits in between.
+        mark_pending_rotation_peer_acked("rot-1", "peer-b-deployment")
+            .await
+            .expect("locked writer must succeed");
+
+        // enqueue steps 2+3: mutate the stale snapshot and persist it.
+        upsert_site_replication_retry_event(&mut stale_snapshot.retry_queue, &peer, "bucket-meta", "peer offline");
+        persist_site_replication_state(&stale_snapshot)
+            .await
+            .expect("persist retry event");
+
+        let final_state = load_site_replication_state().await.expect("reload final state");
+        assert_eq!(final_state.retry_queue.len(), 1, "the retry event must survive");
+        assert!(
+            final_state
+                .pending_rotation
+                .as_ref()
+                .is_some_and(|pending| pending.acked_deployment_ids.contains("peer-b-deployment")),
+            "the locked writer's rotation ack must survive a concurrent retry-event persist \
+             (lost update: the retry writer overwrote state from a stale snapshot)"
+        );
+    }
 }
