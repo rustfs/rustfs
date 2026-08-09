@@ -724,6 +724,17 @@ impl Disk {
             Disk::Remote(_) => None,
         }
     }
+
+    pub(crate) fn get_object_path_for_io_if_local(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_for_io(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
@@ -1659,6 +1670,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let expected_object_path = local_disk.root.join("test-bucket/test-object");
         let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
@@ -1673,6 +1685,19 @@ mod tests {
         // Test path method
         let path = disk.path();
         assert!(path.exists());
+        let object_path = disk
+            .get_object_path_if_local("test-bucket", "test-object")
+            .expect("local disk should expose an object path")
+            .expect("object path should resolve");
+        assert_eq!(object_path, expected_object_path);
+        assert!(!object_path.starts_with("/proc/self/fd/"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            disk.get_object_path_for_io_if_local("test-bucket", "test-object")
+                .expect("local disk should expose an I/O object path")
+                .expect("I/O object path should resolve")
+                .starts_with("/proc/self/fd/")
+        );
 
         // Test disk location
         let location = disk.get_disk_location();

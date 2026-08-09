@@ -5142,8 +5142,12 @@ impl LocalDisk {
         self.make_volumes(defaults).await
     }
 
-    // Optimized path resolution with caching
+    /// Resolve a caller-visible path beneath the configured disk root.
     pub fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        Ok(Self::resolve_abs_path_from(&self.root, path.as_ref()))
+    }
+
+    fn io_resolve_abs_path(&self, path: impl AsRef<Path>) -> PathBuf {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy();
 
@@ -5151,26 +5155,11 @@ impl LocalDisk {
         {
             let cache = self.path_cache.read();
             if let Some(cached_path) = cache.get(path_str.as_ref()) {
-                return Ok(cached_path.clone());
+                return cached_path.clone();
             }
         }
 
-        // Calculate absolute path without using path_absolutize for better performance
-        let abs_path = if path_ref.is_absolute() {
-            path_ref.to_path_buf()
-        } else {
-            #[cfg(windows)]
-            {
-                self.io_root().join(path_str.replace('/', "\\"))
-            }
-            #[cfg(not(windows))]
-            {
-                self.io_root().join(path_ref)
-            }
-        };
-
-        // Normalize path components to avoid filesystem calls
-        let normalized = normalize_path_components(abs_path.as_path());
+        let normalized = Self::resolve_abs_path_from(self.io_root(), path_ref);
 
         // Cache the result
         {
@@ -5188,16 +5177,45 @@ impl LocalDisk {
             cache.insert(path_str.into_owned(), normalized.clone());
         }
 
-        Ok(normalized)
+        normalized
+    }
+
+    fn resolve_abs_path_from(root: &Path, path: &Path) -> PathBuf {
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            #[cfg(windows)]
+            {
+                root.join(path.to_string_lossy().replace('/', "\\"))
+            }
+            #[cfg(not(windows))]
+            {
+                root.join(path)
+            }
+        };
+
+        normalize_path_components(abs_path)
     }
 
     // Get the absolute path of an object
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        local_disk_object_path(self.io_root(), bucket, key)
+        local_disk_object_path(&self.root, bucket, key)
     }
 
     // Get the absolute path of a bucket
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
+        local_disk_bucket_path(&self.root, bucket)
+    }
+
+    pub(crate) fn get_object_path_for_io(&self, bucket: &str, key: &str) -> Result<PathBuf> {
+        self.io_get_object_path(bucket, key)
+    }
+
+    fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
+        local_disk_object_path(self.io_root(), bucket, key)
+    }
+
+    fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
         local_disk_bucket_path(self.io_root(), bucket)
     }
 
@@ -5232,10 +5250,7 @@ impl LocalDisk {
         if !cache_misses.is_empty() {
             let mut new_entries = Vec::new();
             for (i, _bucket, _key, cache_key) in cache_misses {
-                #[cfg(windows)]
-                let path = self.io_root().join(cache_key.replace('/', "\\"));
-                #[cfg(not(windows))]
-                let path = self.io_root().join(&cache_key);
+                let path = self.io_resolve_abs_path(&cache_key);
 
                 results.push((i, path.clone()));
                 new_entries.push((cache_key, path));
@@ -5258,7 +5273,7 @@ impl LocalDisk {
     // /// Write to the filesystem atomically.
     // /// This is done by first writing to a temporary location and then moving the file.
     // pub(crate) async fn prepare_file_write<'a>(&self, path: &'a PathBuf) -> Result<FileWriter<'a>> {
-    //     let tmp_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+    //     let tmp_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
     //     debug!("prepare_file_write tmp_path:{:?}, path:{:?}", &tmp_path, &path);
 
@@ -5283,7 +5298,7 @@ impl LocalDisk {
 
         // TODO: async notifications for disk space checks and trash cleanup
 
-        let trash_path = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        let trash_path = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         // if let Some(parent) = trash_path.parent() {
         //     if !parent.exists() {
         //         fs::create_dir_all(parent).await?;
@@ -5294,7 +5309,7 @@ impl LocalDisk {
             rename_all_ignore_missing_source(
                 delete_path,
                 trash_path,
-                self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
+                self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
                 &self.publication_root,
             )
             .await
@@ -5312,11 +5327,11 @@ impl LocalDisk {
         };
 
         if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
-            let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+            let trash_path2 = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
             let _ = rename_all_ignore_missing_source(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
                 trash_path2,
-                self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
+                self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
                 &self.publication_root,
             )
             .await;
@@ -5344,14 +5359,14 @@ impl LocalDisk {
     }
 
     async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = access(&volume_dir).await
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        let file_path = self.get_object_path(volume, path)?;
+        let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
         self.delete_file(&volume_dir, &file_path, opt.recursive, opt.immediate)
             .await?;
@@ -5533,9 +5548,9 @@ impl LocalDisk {
     }
 
     async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
-        let object_dir = self.get_object_path(volume, object_name)?;
+        let object_dir = self.io_get_object_path(volume, object_name)?;
         let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         let result = tokio::task::spawn_blocking(move || {
             let (bytes, _) = read_all_data_std(&metadata_path)?;
             let file_meta = FileMeta::load(&bytes).ok();
@@ -5637,8 +5652,8 @@ impl LocalDisk {
     }
 
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo], opts: &DeleteOptions) -> Result<()> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        let xlpath = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let xlpath = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
         let object_dir = xlpath
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
@@ -5709,7 +5724,7 @@ impl LocalDisk {
                 let vid = fi.version_id.unwrap_or_default();
                 let _ = fm.data.remove(vec![vid, dir]);
 
-                let dir_path = match self.get_object_path(volume, format!("{path}/{dir}").as_str()) {
+                let dir_path = match self.io_get_object_path(volume, format!("{path}/{dir}").as_str()) {
                     Ok(dir_path) => dir_path,
                     Err(err) => {
                         if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
@@ -5960,12 +5975,12 @@ impl LocalDisk {
     }
 
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = self.get_object_path(volume, path)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let tmp_volume_dir = self.get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
-        let tmp_file_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        let tmp_volume_dir = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
+        let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
         let durability = effective_durability(volume);
 
@@ -6011,7 +6026,7 @@ impl LocalDisk {
             format_info.data.clone_from(&data);
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
 
         // Files written here (format.json, ...) stay where they land — no
         // rename follows — so the new directory entry must be fsynced too.
@@ -6030,7 +6045,7 @@ impl LocalDisk {
     // write_all_private with check_path_length
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
-        let file_path = self.get_object_path(volume, path)?;
+        let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
@@ -6213,10 +6228,10 @@ impl LocalDisk {
         // `read_dir_entries_with_walk_stall` so wide prefixes can still be handled
         // as a single logical read in API semantics.
         let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let dir_path_abs = self.get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
+        let dir_path_abs = self.io_get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
         let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
             Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
-                let volume_dir = self.get_bucket_path(&opts.bucket)?;
+                let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
                 if let Err(access_err) = access(&volume_dir).await {
                     Err(to_access_error(access_err, DiskError::VolumeAccessDenied).into())
                 } else {
@@ -6529,7 +6544,7 @@ impl LocalDisk {
                         // NOT an object, append to stack (with slash)
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj
-                            && !with_walk_stall_deadline(stall, is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?))
+                            && !with_walk_stall_deadline(stall, is_empty_dir(self.io_get_object_path(&opts.bucket, &meta.name)?))
                                 .await?
                         {
                             meta.name.push_str(SLASH_SEPARATOR);
@@ -6978,7 +6993,7 @@ fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
 impl LocalDisk {
     async fn reserve_version_delete(&self, volume: &str, object: &str, data_dir: Uuid, rollback_dir: Uuid) -> Result<bool> {
         let path = format!("{object}/{data_dir}");
-        let data_path = self.get_object_path(volume, &path)?;
+        let data_path = self.io_get_object_path(volume, &path)?;
         match fs::metadata(&data_path).await {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Ok(false),
@@ -6995,7 +7010,7 @@ impl LocalDisk {
     }
 
     async fn commit_reserved_version_delete(&self, volume: &str, object: &str, rollback_dir: Uuid) -> Result<()> {
-        let object_path = self.get_object_path(volume, object)?;
+        let object_path = self.io_get_object_path(volume, object)?;
         let mut entries = match fs::read_dir(object_path).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -7024,7 +7039,7 @@ impl LocalDisk {
     }
 
     async fn finish_version_delete(&self, volume: &str, object: &str, rollback_dir: Uuid) -> Result<bool> {
-        let object_path = self.get_object_path(volume, object)?;
+        let object_path = self.io_get_object_path(volume, object)?;
         let mut entries = match fs::read_dir(object_path).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
@@ -7325,7 +7340,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let p = self.get_object_path(volume, path)?;
+        let p = self.io_get_object_path(volume, path)?;
 
         let (data, _) = read_file_all(&p).await?;
 
@@ -7350,7 +7365,7 @@ impl DiskAPI for LocalDisk {
             use rustix::fs::{FlockOperation, flock};
             use std::io::Write as _;
 
-            let file_path = self.get_object_path(volume, path)?;
+            let file_path = self.io_get_object_path(volume, path)?;
             let lock_path = file_path.with_extension("rustfs-cas.lock");
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
@@ -7449,7 +7464,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = access(&volume_dir).await
         {
@@ -7476,7 +7491,7 @@ impl DiskAPI for LocalDisk {
             } else {
                 checksum_info.algorithm
             };
-            let part_path = self.get_object_path(
+            let part_path = self.io_get_object_path(
                 volume,
                 path_join_buf(&[
                     path,
@@ -7529,7 +7544,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        let volume_dir = self.get_bucket_path(bucket)?;
+        let volume_dir = self.io_get_bucket_path(bucket)?;
 
         let mut ret = vec![ObjectPartInfo::default(); paths.len()];
 
@@ -7543,7 +7558,7 @@ impl DiskAPI for LocalDisk {
                 .unwrap_or_default();
 
             if let Err(err) = access(
-                self.get_object_path(
+                self.io_get_object_path(
                     bucket,
                     path_join_buf(&[
                         path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
@@ -7563,7 +7578,11 @@ impl DiskAPI for LocalDisk {
             }
 
             let data = match self
-                .read_all_data(bucket, volume_dir.clone(), self.get_object_path(bucket, path.to_string_lossy().as_ref())?)
+                .read_all_data(
+                    bucket,
+                    volume_dir.clone(),
+                    self.io_get_object_path(bucket, path.to_string_lossy().as_ref())?,
+                )
                 .await
             {
                 Ok(data) => data,
@@ -7596,15 +7615,15 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let layout = fi.validate(ValidationMode::RequireErasure)?.ok_or(DiskError::FileCorrupt)?;
-        let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = self.get_object_path(volume, path)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
         let mut resp = CheckPartsResp {
             results: vec![0; fi.parts.len()],
         };
 
         for (i, part) in fi.parts.iter().enumerate() {
-            let part_path = self.get_object_path(
+            let part_path = self.io_get_object_path(
                 volume,
                 path_join_buf(&[
                     path,
@@ -7691,8 +7710,8 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
         meta: Bytes,
     ) -> Result<()> {
-        let src_volume_dir = self.get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
             super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
         }
@@ -7700,10 +7719,10 @@ impl DiskAPI for LocalDisk {
             super::fs::access_std(&dst_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
         }
 
-        let src_file_path = self.get_object_path(src_volume, src_path)?;
-        let dst_file_path = self.get_object_path(dst_volume, dst_path)?;
-        let dst_meta_path = self.get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
-        let transaction_path = self.get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
+        let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+        let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
         for path in [&src_file_path, &dst_file_path, &dst_meta_path, &transaction_path] {
             check_path_length(path.to_string_lossy().as_ref())?;
         }
@@ -7766,10 +7785,10 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
-        self.get_bucket_path(volume)?;
-        let current_data_path = self.get_object_path(volume, path)?;
-        let current_meta_path = self.get_object_path(volume, &format!("{path}.meta"))?;
-        let transaction_path = self.get_object_path(volume, &crate::disk::part_transaction_path(path))?;
+        self.io_get_bucket_path(volume)?;
+        let current_data_path = self.io_get_object_path(volume, path)?;
+        let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
+        let transaction_path = self.io_get_object_path(volume, &crate::disk::part_transaction_path(path))?;
         for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
             check_path_length(candidate.to_string_lossy().as_ref())?;
         }
@@ -7829,8 +7848,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
-        let src_volume_dir = self.get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
             super::fs::access_std(&src_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
         }
@@ -7854,8 +7873,8 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
 
-        let src_file_path = self.get_object_path(src_volume, src_path)?;
-        let dst_file_path = self.get_object_path(dst_volume, dst_path)?;
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
 
         // warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
 
@@ -7911,7 +7930,7 @@ impl DiskAPI for LocalDisk {
         let transaction_publish_meta = if src_is_dir {
             None
         } else {
-            let transaction_path = self.get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+            let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
             let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
             match fs::read(&transaction_meta_path).await {
                 Ok(expected_meta) => {
@@ -7978,7 +7997,7 @@ impl DiskAPI for LocalDisk {
         }
 
         if let Some(transaction_publish_meta) = transaction_publish_meta {
-            let dst_meta_path = self.get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+            let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
             rename_all(&transaction_publish_meta, &dst_meta_path, &dst_volume_dir, &self.publication_root).await?;
             if durability.syncs_commit_metadata()
                 && let Some(parent) = dst_meta_path.parent()
@@ -7999,8 +8018,8 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         crate::hp_guard!("LocalDisk::rename_file");
-        let src_volume_dir = self.get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
             access(&src_volume_dir)
                 .await
@@ -8018,10 +8037,10 @@ impl DiskAPI for LocalDisk {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
 
-        let src_file_path = self.get_object_path(src_volume, src_path)?;
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
         check_path_length(src_file_path.to_string_lossy().as_ref())?;
 
-        let dst_file_path = self.get_object_path(dst_volume, dst_path)?;
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
         check_path_length(dst_file_path.to_string_lossy().as_ref())?;
 
         if src_is_dir {
@@ -8072,7 +8091,7 @@ impl DiskAPI for LocalDisk {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
-            let origvolume_dir = self.get_bucket_path(origvolume)?;
+            let origvolume_dir = self.io_get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
                 access(origvolume_dir)
                     .await
@@ -8157,7 +8176,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
-            let origvolume_dir = self.get_bucket_path(origvolume)?;
+            let origvolume_dir = self.io_get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume)
                 && let Err(e) = access(origvolume_dir).await
             {
@@ -8165,8 +8184,8 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let dir_path_abs = self.io_get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
         // Whole-directory enumeration in one syscall path (see the wide-directory
         // stall hazard on this fn): with `count < 0` this reads every entry, and
@@ -8202,7 +8221,7 @@ impl DiskAPI for LocalDisk {
         }
         let stall = opts.stall_timeout_duration();
 
-        let volume_dir = self.get_bucket_path(&opts.bucket)?;
+        let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
             && let Err(e) = with_walk_stall_deadline(stall, access(&volume_dir)).await?
@@ -8240,8 +8259,8 @@ impl DiskAPI for LocalDisk {
                 write_metacache_obj(&mut out, &meta).await?;
                 objs_returned += 1;
             } else {
-                let fpath =
-                    self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
+                let fpath = self
+                    .io_get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
                 if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
                     && meta.is_file()
@@ -8298,7 +8317,7 @@ impl DiskAPI for LocalDisk {
         // object commit is publishing into it. The peer's empty scan remains
         // optimistic; this lease establishes the local commit/delete order and
         // remains owned by any blocking syscall that outlives async cancellation.
-        let destination_object_path = self.get_object_path(dst_volume, dst_path)?;
+        let destination_object_path = self.io_get_object_path(dst_volume, dst_path)?;
         let mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, dst_volume, &destination_object_path).await;
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
@@ -8315,7 +8334,7 @@ impl DiskAPI for LocalDisk {
                 .map(|part| format!("{dst_path}/{data_dir}/part.{}", part.number))
                 .collect()
         };
-        let src_volume_dir = self.get_bucket_path(src_volume)?;
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
         {
@@ -8331,7 +8350,7 @@ impl DiskAPI for LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(dst_volume)
             && let Err(e) = super::fs::access_std(&dst_volume_dir)
         {
@@ -8348,8 +8367,8 @@ impl DiskAPI for LocalDisk {
         }
 
         // xl.meta path
-        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path = self.io_get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.io_get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
         // data_dir path
         let has_data_dir_path = {
@@ -8363,11 +8382,11 @@ impl DiskAPI for LocalDisk {
             };
 
             if let Some(data_dir) = has_data_dir {
-                let src_data_path = self.get_object_path(
+                let src_data_path = self.io_get_object_path(
                     src_volume,
                     rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str()).as_str(),
                 )?;
-                let dst_data_path = self.get_object_path(
+                let dst_data_path = self.io_get_object_path(
                     dst_volume,
                     rustfs_utils::path::retain_slash(format!("{}/{}", dst_path, data_dir).as_str()).as_str(),
                 )?;
@@ -9169,7 +9188,7 @@ impl DiskAPI for LocalDisk {
             return Err(Error::other("Invalid arguments specified"));
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
 
         if let Err(e) = access(&volume_dir).await {
             if e.kind() == ErrorKind::NotFound {
@@ -9213,7 +9232,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         let meta = lstat(&volume_dir).await.map_err(to_volume_error)?;
 
         let modtime = match meta.modified() {
@@ -9229,7 +9248,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
                 .await
@@ -9237,7 +9256,7 @@ impl DiskAPI for LocalDisk {
         }
 
         for path in paths.iter() {
-            let file_path = self.get_object_path(volume, path)?;
+            let file_path = self.io_get_object_path(volume, path)?;
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -9252,7 +9271,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
-        let file_path = self.get_object_path(volume, path)?;
+        let file_path = self.io_get_object_path(volume, path)?;
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
             path: path.to_string(),
@@ -9383,7 +9402,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if !fi.metadata.is_empty() {
-            let file_path = self.get_object_path(volume, path)?;
+            let file_path = self.io_get_object_path(volume, path)?;
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -9420,7 +9439,7 @@ impl DiskAPI for LocalDisk {
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
         fi.validate_for_metadata_read()?;
-        let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
+        let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
         if !fi.fresh {
@@ -9455,7 +9474,7 @@ impl DiskAPI for LocalDisk {
     ) -> Result<FileInfo> {
         crate::hp_guard!("LocalDisk::read_version");
         if !org_volume.is_empty() {
-            let org_volume_path = self.get_bucket_path(org_volume)?;
+            let org_volume_path = self.io_get_bucket_path(org_volume)?;
             if !skip_access_checks(org_volume) {
                 access(&org_volume_path)
                     .await
@@ -9463,8 +9482,8 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let file_path = self.get_object_path(volume, path)?;
-        let volume_dir = self.get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
 
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -9514,7 +9533,7 @@ impl DiskAPI for LocalDisk {
                         fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                         part_path.as_str(),
                     ]);
-                    let part_path = self.get_object_path(volume, part_path.as_str())?;
+                    let part_path = self.io_get_object_path(volume, part_path.as_str())?;
                     if lstat(&part_path).await.is_err() {
                         fi.set_inline_data();
                         return Ok(fi);
@@ -9531,7 +9550,7 @@ impl DiskAPI for LocalDisk {
                     fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                     format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
-                let part_path = self.get_object_path(volume, part_path.as_str())?;
+                let part_path = self.io_get_object_path(volume, part_path.as_str())?;
 
                 let data = self.read_all_data(volume, volume_dir, part_path.clone()).await.map_err(|e| {
                     warn!(
@@ -9555,8 +9574,8 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         crate::hp_guard!("LocalDisk::read_xl");
-        let file_path = self.get_object_path(volume, path)?;
-        let file_dir = self.get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
+        let file_dir = self.io_get_bucket_path(volume)?;
 
         let (buf, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
@@ -9586,9 +9605,9 @@ impl DiskAPI for LocalDisk {
                 .await;
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
 
-        let file_path = self.get_object_path(volume, path)?;
+        let file_path = self.io_get_object_path(volume, path)?;
 
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -9909,7 +9928,7 @@ impl DiskAPI for LocalDisk {
         let mut found = 0;
 
         for v in req.files.iter() {
-            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
+            let fpath = self.io_get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
             let mut res = ReadMultipleResp {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -9971,7 +9990,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
-        let p = self.get_bucket_path(volume)?;
+        let p = self.io_get_bucket_path(volume)?;
         let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
 
         // A streaming reader's snapshot lease defers the physical cleanup of
@@ -10032,8 +10051,8 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         crate::hp_guard!("LocalDisk::read_metadata");
-        let file_path = self.get_object_path(volume, path)?;
-        let volume_dir = self.get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
+        let volume_dir = self.io_get_bucket_path(volume)?;
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data.into())
     }
@@ -20053,7 +20072,24 @@ mod test {
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
 
         assert!(disk.has_replacement_mount_lease());
-        let object_path = disk.get_object_path("bucket", "object").expect("object path should resolve");
+        let root_path = disk
+            .get_object_path("bucket", "object")
+            .expect("public object path should resolve");
+        assert_eq!(root_path, disk.root.join("bucket/object"));
+        assert!(!root_path.starts_with("/proc/self/fd/"));
+        assert_eq!(
+            disk.get_bucket_path("bucket").expect("public bucket path should resolve"),
+            disk.root.join("bucket")
+        );
+        assert_eq!(
+            disk.resolve_abs_path("bucket/object")
+                .expect("public absolute path should resolve"),
+            disk.root.join("bucket/object")
+        );
+
+        let object_path = disk
+            .io_get_object_path("bucket", "object")
+            .expect("lease I/O object path should resolve");
         assert!(
             object_path.starts_with("/proc/self/fd/"),
             "replacement I/O must resolve beneath the held directory descriptor"
