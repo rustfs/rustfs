@@ -45,13 +45,14 @@ use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
-use tracing::{debug, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 use url::form_urlencoded;
 
 const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
@@ -330,9 +331,10 @@ struct RequestLogContext {
     request_id: String,
     trace_id: Option<String>,
     span_id: Option<String>,
-    peer_addr: String,
-    method: String,
-    uri: String,
+    client_ip: Option<IpAddr>,
+    peer_addr: Option<SocketAddr>,
+    method: Method,
+    uri: Uri,
     request_started_at: Option<RequestContext>,
     fallback_start: Instant,
 }
@@ -344,20 +346,14 @@ impl RequestLogContext {
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| extract_request_id_from_headers(req.headers()));
-        let peer_addr = req
-            .extensions()
-            .get::<ClientInfo>()
-            .map(|info| info.real_ip.to_string())
-            .or_else(|| req.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-
         Self {
             request_id,
             trace_id: request_context.as_ref().and_then(|ctx| ctx.trace_id.clone()),
             span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
-            peer_addr,
-            method: req.method().to_string(),
-            uri: redact_sensitive_uri_query(req.uri()),
+            client_ip: req.extensions().get::<ClientInfo>().map(|info| info.real_ip),
+            peer_addr: req.extensions().get::<RemoteAddr>().map(|addr| addr.0),
+            method: req.method().clone(),
+            uri: req.uri().clone(),
             request_started_at: request_context,
             fallback_start: Instant::now(),
         }
@@ -382,6 +378,40 @@ impl RequestLogContext {
         }
     }
 
+    fn peer_addr(&self) -> String {
+        self.client_ip
+            .map(|addr| addr.to_string())
+            .or_else(|| self.peer_addr.map(|addr| addr.to_string()))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn redacted_uri(&self) -> String {
+        redact_sensitive_uri_query(&self.uri)
+    }
+
+    fn log_slow_inflight(&self) {
+        if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN) {
+            return;
+        }
+        warn!(
+            target: HTTP_SERVER_LOG_TARGET,
+            event = HTTP_REQUEST_INFLIGHT_SLOW_EVENT,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            request_id = %self.request_id,
+            trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
+            span_id = %self.span_id.as_deref().unwrap_or("unknown"),
+            peer_addr = %self.peer_addr(),
+            method = %self.method.as_str(),
+            uri = %self.redacted_uri(),
+            duration_ms = self.duration_ms(),
+            active_requests = active_http_requests(),
+            threshold_ms = HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD.as_millis() as u64,
+            state = "response_pending",
+            "HTTP request remains in flight"
+        );
+    }
+
     fn log_response<ResBody>(&self, response: &Response<ResBody>) {
         let duration_ms = self.duration_ms();
         let status = response.status();
@@ -391,6 +421,9 @@ impl RequestLogContext {
         let span_id = self.span_id.as_deref().unwrap_or("unknown");
 
         if status.is_server_error() {
+            if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::ERROR) {
+                return;
+            }
             error!(
                 target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
@@ -399,15 +432,18 @@ impl RequestLogContext {
                 request_id = %self.request_id,
                 trace_id = %trace_id,
                 span_id = %span_id,
-                peer_addr = %self.peer_addr,
-                method = %self.method,
-                uri = %self.uri,
+                peer_addr = %self.peer_addr(),
+                method = %self.method.as_str(),
+                uri = %self.redacted_uri(),
                 status_code,
                 duration_ms,
                 result,
                 "HTTP request completed"
             );
         } else {
+            if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::INFO) {
+                return;
+            }
             info!(
                 target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
@@ -416,9 +452,9 @@ impl RequestLogContext {
                 request_id = %self.request_id,
                 trace_id = %trace_id,
                 span_id = %span_id,
-                peer_addr = %self.peer_addr,
-                method = %self.method,
-                uri = %self.uri,
+                peer_addr = %self.peer_addr(),
+                method = %self.method.as_str(),
+                uri = %self.redacted_uri(),
                 status_code,
                 duration_ms,
                 result,
@@ -439,9 +475,9 @@ impl RequestLogContext {
             request_id = %self.request_id,
             trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
             span_id = %self.span_id.as_deref().unwrap_or("unknown"),
-            peer_addr = %self.peer_addr,
-            method = %self.method,
-            uri = %self.uri,
+            peer_addr = %self.peer_addr(),
+            method = %self.method.as_str(),
+            uri = %self.redacted_uri(),
             duration_ms = self.duration_ms(),
             result = "service_error",
             error = %error,
@@ -468,39 +504,27 @@ where
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
         let context = RequestLogContext::from_request(&req);
         let mut inner = self.inner.clone();
-        let watchdog = CancellationToken::new();
-        let watchdog_context = context.clone();
-
-        spawn_traced({
-            let watchdog = watchdog.clone();
-            async move {
-                tokio::select! {
-                    _ = watchdog.cancelled() => {}
-                    _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
-                        warn!(
-                            event = HTTP_REQUEST_INFLIGHT_SLOW_EVENT,
-                            component = LOG_COMPONENT_SERVER,
-                            subsystem = LOG_SUBSYSTEM_HTTP,
-                            request_id = %watchdog_context.request_id,
-                            trace_id = %watchdog_context.trace_id.as_deref().unwrap_or("unknown"),
-                            span_id = %watchdog_context.span_id.as_deref().unwrap_or("unknown"),
-                            peer_addr = %watchdog_context.peer_addr,
-                            method = %watchdog_context.method,
-                            uri = %watchdog_context.uri,
-                            duration_ms = watchdog_context.duration_ms(),
-                            active_requests = active_http_requests(),
-                            threshold_ms = HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD.as_millis() as u64,
-                            state = "response_pending",
-                            "HTTP request remains in flight"
-                        );
+        let watchdog = tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN).then(CancellationToken::new);
+        if let Some(watchdog) = watchdog.as_ref() {
+            spawn_traced({
+                let watchdog = watchdog.clone();
+                let watchdog_context = context.clone();
+                async move {
+                    tokio::select! {
+                        _ = watchdog.cancelled() => {}
+                        _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
+                            watchdog_context.log_slow_inflight();
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Box::pin(async move {
             let result = inner.call(req).await;
-            watchdog.cancel();
+            if let Some(watchdog) = watchdog {
+                watchdog.cancel();
+            }
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),
@@ -4583,9 +4607,9 @@ mod tests {
         assert_eq!(context.request_id, "req-ctx");
         assert_eq!(context.trace_id.as_deref(), Some("trace-123"));
         assert_eq!(context.span_id.as_deref(), Some("span-456"));
-        assert_eq!(context.peer_addr, "127.0.0.1:9000");
-        assert_eq!(context.method, "PUT");
-        assert_eq!(context.uri, "/bucket/object.txt");
+        assert_eq!(context.peer_addr(), "127.0.0.1:9000");
+        assert_eq!(context.method.as_str(), "PUT");
+        assert_eq!(context.redacted_uri(), "/bucket/object.txt");
     }
 
     #[test]
@@ -4598,8 +4622,9 @@ mod tests {
 
         let context = RequestLogContext::from_request(&request);
 
-        assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
-        assert!(!context.uri.contains("secret-token"));
+        let uri = context.redacted_uri();
+        assert_eq!(uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!uri.contains("secret-token"));
     }
 
     #[test]
@@ -4612,8 +4637,9 @@ mod tests {
 
         let context = RequestLogContext::from_request(&request);
 
-        assert_eq!(context.uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
-        assert!(!context.uri.contains("secret-token"));
+        let uri = context.redacted_uri();
+        assert_eq!(uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!uri.contains("secret-token"));
     }
 
     #[test]
