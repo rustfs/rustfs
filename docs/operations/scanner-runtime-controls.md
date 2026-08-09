@@ -213,6 +213,14 @@ missed work. Scanner-originated object checks should appear under
 under `admin/high`. If scanner work grows but admin work remains blocked, treat
 that as heal queue pressure rather than scanner pacing pressure.
 
+## Replacement Recovery Completion
+
+`POST /v3/background-heal/status` is an execution-queue view. `state=idle`, zero queue and active counts, an online disk, a readable object, or acceptance of an Admin deep-heal request do not independently prove that a replacement disk contains every erasure shard.
+
+Treat replacement recovery as verified only after the repair task has completed for the exact replacement instance and an operator has confirmed the target disk contains the expected `xl.meta` and data parts for every relevant object version. A replacement that is not mounted, is unsafe to format, loses its marker, or returns a partial target outcome must be treated as deferred or incomplete rather than complete.
+
+The v3 route and its peer status protocol preserve their existing fields for mixed-version clusters. A new node must not infer replacement completion from an old or unavailable peer; regard that information as unknown or degraded until every required peer can report the same replacement instance and verified completion. Do not automate destructive replacement actions from an `idle` observation alone.
+
 ## Reading Replication Repair
 
 `metrics.replication_repair`, `metrics.current_cycle_replication_repair`, and
