@@ -2349,6 +2349,7 @@ impl HealTask {
             disk,
             heal_opts,
             self.source,
+            self.heal_endpoints.clone(),
         );
 
         {

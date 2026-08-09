@@ -22,6 +22,7 @@ use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
 use metrics::gauge;
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -85,6 +86,7 @@ pub struct ErasureSetHealer {
     disk: DiskStore,
     heal_opts: HealOpts,
     source: HealRequestSource,
+    target_endpoints: Vec<String>,
 }
 
 impl ErasureSetHealer {
@@ -167,6 +169,13 @@ impl ErasureSetHealer {
         HealObjectOutcome::Failed
     }
 
+    fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
+        target_endpoints.iter().all(|endpoint| {
+            let mut drives = result.after.drives.iter().filter(|drive| drive.endpoint == *endpoint);
+            matches!(drives.next(), Some(drive) if drive.state == "ok") && drives.next().is_none()
+        })
+    }
+
     pub fn new(
         storage: Arc<dyn HealStorageAPI>,
         progress: Arc<RwLock<HealProgress>>,
@@ -174,6 +183,7 @@ impl ErasureSetHealer {
         disk: DiskStore,
         heal_opts: HealOpts,
         source: HealRequestSource,
+        target_endpoints: Vec<String>,
     ) -> Self {
         Self {
             storage,
@@ -182,6 +192,7 @@ impl ErasureSetHealer {
             disk,
             heal_opts,
             source,
+            target_endpoints,
         }
     }
 
@@ -672,6 +683,7 @@ impl ErasureSetHealer {
                 let set_label = set_disk_id.to_string();
                 let heal_opts = self.heal_opts;
                 let semaphore = semaphore.clone();
+                let target_endpoints = self.target_endpoints.clone();
 
                 page_tasks.push(async move {
                     let permit = semaphore
@@ -699,6 +711,10 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
+                            Ok((result, None)) if Self::target_outcomes_complete(&result, &target_endpoints) => Ok(true),
+                            Ok((_result, None)) if !target_endpoints.is_empty() => Err(Error::transient_skip(format!(
+                                "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
+                            ))),
                             Ok((_result, None)) => Ok(true),
                             Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
                             Ok((_, Some(err))) | Err(err) => match Self::classify_heal_object_error(&err) {
@@ -1021,7 +1037,7 @@ mod resume_loop_tests {
     };
     use crate::{Error, Result};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
-    use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1035,6 +1051,34 @@ mod resume_loop_tests {
             version_id: version.map(str::to_string),
             is_delete_marker: delete_marker,
         }
+    }
+
+    #[test]
+    fn target_outcomes_require_each_requested_endpoint_once_and_ok() {
+        let result = HealResultItem {
+            after: Infos {
+                drives: vec![
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    },
+                    HealDriveInfo {
+                        endpoint: "replacement-b".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+
+        assert!(ErasureSetHealer::target_outcomes_complete(&result, &["replacement-a".to_string()]));
+        assert!(!ErasureSetHealer::target_outcomes_complete(
+            &result,
+            &["replacement-a".to_string(), "replacement-b".to_string()]
+        ));
+        assert!(!ErasureSetHealer::target_outcomes_complete(&result, &["replacement-c".to_string()]));
     }
 
     #[derive(Clone)]
@@ -1218,6 +1262,7 @@ mod resume_loop_tests {
             disk.clone(),
             HealOpts::default(),
             HealRequestSource::Internal,
+            Vec::new(),
         );
         let resume = ResumeManager::new(
             disk.clone(),
