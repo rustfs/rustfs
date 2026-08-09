@@ -1968,12 +1968,17 @@ impl GetObjectResumeContext {
         store: Arc<ECStore>,
         bucket: &str,
         key: &str,
-        opts: ObjectOptions,
+        mut opts: ObjectOptions,
         request_headers: &HeaderMap,
         info: &ObjectInfo,
         range_start: i64,
         range_end: i64,
     ) -> Self {
+        if opts.version_id.is_none()
+            && let Some(version_id) = info.version_id
+        {
+            opts.version_id = Some(version_id.to_string());
+        }
         let mut ssec_headers = HeaderMap::new();
         for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
             if let Some(value) = request_headers.get(name) {
@@ -13196,6 +13201,67 @@ mod tests {
             matches!(result, Err(GetObjectResumeFailure::Fatal)),
             "reopening a replaced version must fail closed"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_resume_context_pins_latest_read_to_resolved_version() {
+        let (_disk_paths, store, _context) = real_get_resume_test_context().await;
+        let resolved_version = Uuid::new_v4();
+        let info = ObjectInfo {
+            version_id: Some(resolved_version),
+            ..Default::default()
+        };
+
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            ObjectOptions::default(),
+            &HeaderMap::new(),
+            &info,
+            0,
+            -1,
+        );
+        assert_eq!(
+            ctx.opts.version_id,
+            Some(resolved_version.to_string()),
+            "latest GET resume must reopen the initially resolved version, not the moving latest"
+        );
+
+        let explicit_version = Uuid::new_v4().to_string();
+        let explicit_opts = ObjectOptions {
+            version_id: Some(explicit_version.clone()),
+            ..Default::default()
+        };
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            explicit_opts,
+            &HeaderMap::new(),
+            &info,
+            0,
+            -1,
+        );
+        assert_eq!(
+            ctx.opts.version_id.as_deref(),
+            Some(explicit_version.as_str()),
+            "an explicit request version must stay authoritative"
+        );
+
+        let unversioned_info = ObjectInfo::default();
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            ObjectOptions::default(),
+            &HeaderMap::new(),
+            &unversioned_info,
+            0,
+            -1,
+        );
+        assert_eq!(ctx.opts.version_id, None, "unversioned reads have no version to pin");
     }
 
     #[tokio::test]

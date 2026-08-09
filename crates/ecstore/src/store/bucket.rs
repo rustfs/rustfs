@@ -197,8 +197,8 @@ impl ECStore {
             registry: self.bucket_fence_registry.clone(),
             inner,
         };
-        let memoized = pieces.enter(bucket);
-        let current = match memoized {
+        let registration = pieces.enter(bucket);
+        let current = match registration.memoized {
             Some(current) => current,
             None => match metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await {
                 Ok(current) => {
@@ -210,16 +210,16 @@ impl ECStore {
                     current
                 }
                 Err(err) => {
-                    pieces.abandon(bucket);
+                    pieces.abandon(bucket, registration.token);
                     return Err(err);
                 }
             },
         };
         if current != expected {
-            pieces.abandon(bucket);
+            pieces.abandon(bucket, registration.token);
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        Ok(pieces.into_guard(bucket))
+        Ok(pieces.into_guard(bucket, registration.token))
     }
 
     pub(crate) async fn acquire_bucket_lifecycle_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
