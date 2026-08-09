@@ -1908,14 +1908,7 @@ impl ResumeUtils {
     /// directory. Periodic recovery must never enumerate the ordinary resume
     /// directory, whose cardinality is unrelated to replacement work.
     pub async fn get_replacement_intent_tasks(disk: &DiskStore) -> Result<Vec<String>> {
-        let recovery_dir = replacement_recovery_dir();
-        let recovery_dir = path_to_str(&recovery_dir)?;
-        let entries = disk
-            .list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1)
-            .await
-            .map_err(|error| Error::TaskExecutionFailed {
-                message: format!("Failed to list replacement intents: {error}"),
-            })?;
+        let entries = Self::replacement_recovery_entries(disk).await?;
         let suffix = format!("_{REPLACEMENT_INTENT_FILE}");
         let mut task_ids = HashSet::new();
 
@@ -1931,6 +1924,18 @@ impl ResumeUtils {
         let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
         task_ids.sort_unstable();
         Ok(task_ids)
+    }
+
+    async fn replacement_recovery_entries(disk: &DiskStore) -> Result<Vec<String>> {
+        let recovery_dir = replacement_recovery_dir();
+        let recovery_dir = path_to_str(&recovery_dir)?;
+        match disk.list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1).await {
+            Ok(entries) => Ok(entries),
+            Err(DiskError::FileNotFound) => Ok(Vec::new()),
+            Err(error) => Err(Error::TaskExecutionFailed {
+                message: format!("Failed to list replacement recovery records: {error}"),
+            }),
+        }
     }
 
     /// Migrate flat replacement artifacts from earlier builds exactly once at
@@ -1998,14 +2003,7 @@ impl ResumeUtils {
     /// failures are returned to the caller so an observability surface cannot
     /// silently turn an unreadable durable record into a green result.
     pub async fn get_replacement_recovery_records(disk: &DiskStore) -> Result<Vec<ReplacementRecoveryRecord>> {
-        let recovery_dir = replacement_recovery_dir();
-        let recovery_dir = path_to_str(&recovery_dir)?;
-        let entries = disk
-            .list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1)
-            .await
-            .map_err(|error| Error::TaskExecutionFailed {
-                message: format!("Failed to list replacement recovery records: {error}"),
-            })?;
+        let entries = Self::replacement_recovery_entries(disk).await?;
         let proof_suffix = format!("_{REPLACEMENT_COMPLETION_PROOF_FILE}");
         let mut records = Vec::new();
         let mut intent_task_ids = HashSet::new();
@@ -2621,6 +2619,26 @@ mod tests {
                 .expect("dedicated replacement listing should not parse ordinary JSON"),
             vec![replacement_task_id]
         );
+    }
+
+    #[tokio::test]
+    async fn empty_replacement_recovery_directory_is_not_an_error() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        assert!(
+            ResumeUtils::get_replacement_intent_tasks(&disk)
+                .await
+                .expect("missing recovery directory should be empty")
+                .is_empty()
+        );
+        assert!(
+            ResumeUtils::get_replacement_recovery_records(&disk)
+                .await
+                .expect("missing recovery directory should have no records")
+                .is_empty()
+        );
+        ResumeUtils::cleanup_expired_states(&disk, 0)
+            .await
+            .expect("missing recovery directory should not block expiry cleanup");
     }
 
     #[tokio::test]
