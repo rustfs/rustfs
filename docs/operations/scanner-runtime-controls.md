@@ -221,6 +221,8 @@ Treat replacement recovery as verified only after the repair task has completed 
 
 The v3 route and its peer status protocol preserve their existing fields for mixed-version clusters. A new node must not infer replacement completion from an old or unavailable peer; regard that information as unknown or degraded until every required peer can report the same replacement instance and verified completion. Do not automate destructive replacement actions from an `idle` observation alone.
 
+Replacement resume and checkpoint files use an independent on-disk schema. A newer reader rejects a future schema rather than continuing with data it cannot interpret, while an older binary cannot safely enforce the new generation fence because it may ignore fields it does not know. Do not roll a cluster back after a replacement generation has started. Complete that recovery with the current-or-newer release; if it cannot complete, keep that version for diagnosis rather than deleting its durable records or continuing with an older binary.
+
 ## Reading Replication Repair
 
 `metrics.replication_repair`, `metrics.current_cycle_replication_repair`, and

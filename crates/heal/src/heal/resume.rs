@@ -1274,6 +1274,32 @@ impl ResumeUtils {
 mod tests {
     use super::*;
 
+    async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
+        use super::super::{DiskOption, Endpoint, new_disk};
+
+        let temp_dir = tempfile::TempDir::new().expect("create schema test directory");
+        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create schema test disk endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create schema test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("create metadata volume: {error}"),
+        }
+        match disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("create resume metadata volume: {error}"),
+        }
+
+        (temp_dir, disk)
+    }
+
     #[tokio::test]
     async fn test_resume_state_creation() {
         let task_id = ResumeUtils::generate_task_id();
@@ -1785,24 +1811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resumestate_schema_v0_discarded_on_load() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let disk_path = temp_dir.path().join("test_disk");
-        std::fs::create_dir_all(&disk_path).unwrap();
-        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .unwrap();
-        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
-        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+        let (temp_dir, disk) = schema_test_disk().await;
 
         // Legacy snapshot: no schema_version, a stale positional cursor and progress.
         let legacy = r#"{
@@ -1831,7 +1840,7 @@ mod tests {
         let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
         disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
             .await
-            .unwrap();
+            .expect("write legacy resume state");
 
         let manager = ResumeManager::load_from_disk(disk.clone(), task_id).await.unwrap();
         let state = manager.get_state().await;
@@ -1841,29 +1850,12 @@ mod tests {
         assert_eq!(state.successful_objects, 0);
         assert_eq!(state.failed_objects, 0);
         assert!(!state.completed);
-        temp_dir.close().unwrap();
+        temp_dir.close().expect("remove schema test directory");
     }
 
     #[tokio::test]
     async fn test_checkpoint_schema_v4_discarded_on_load() {
-        use super::super::{DiskOption, Endpoint, new_disk};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let disk_path = temp_dir.path().join("test_disk");
-        std::fs::create_dir_all(&disk_path).unwrap();
-        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
-        let disk = new_disk(
-            &endpoint,
-            &DiskOption {
-                cleanup: false,
-                health_check: false,
-            },
-        )
-        .await
-        .unwrap();
-        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
-        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+        let (temp_dir, disk) = schema_test_disk().await;
 
         // The previous checkpoint schema is unsafe once its paired resume
         // state is discarded: retaining either position would skip work.
@@ -1881,7 +1873,7 @@ mod tests {
         let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
         disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
             .await
-            .unwrap();
+            .expect("write legacy checkpoint");
 
         let manager = CheckpointManager::load_from_disk(disk.clone(), task_id).await.unwrap();
         let checkpoint = manager.get_checkpoint().await;
@@ -1891,7 +1883,82 @@ mod tests {
         assert!(checkpoint.processed_objects.is_empty());
         assert!(checkpoint.failed_objects.is_empty());
         assert!(checkpoint.skipped_objects.is_empty());
-        temp_dir.close().unwrap();
+        temp_dir.close().expect("remove schema test directory");
+    }
+
+    #[tokio::test]
+    async fn current_normal_resume_schema_preserves_progress() {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "normal-current-schema";
+        let mut state = ResumeState::new(
+            task_id.to_string(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-b".to_string()],
+        );
+        state.resume_cursor = Some("opaque-marker".to_string());
+        state.processed_objects = 7;
+        state.successful_objects = 6;
+        state.failed_objects = 1;
+        state.completed_buckets = vec!["bucket-a".to_string()];
+        let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+        let state_data = serde_json::to_vec(&state).expect("serialize current normal resume state");
+        disk.write_all(RUSTFS_META_BUCKET, &file_path, state_data.into())
+            .await
+            .expect("write current normal resume state");
+
+        let restored = ResumeManager::load_from_disk(disk.clone(), task_id)
+            .await
+            .expect("load current normal resume state")
+            .get_state()
+            .await;
+
+        assert_eq!(restored.schema_version, CURRENT_RESUME_SCHEMA);
+        assert_eq!(restored.resume_cursor.as_deref(), Some("opaque-marker"));
+        assert_eq!(restored.processed_objects, 7);
+        assert_eq!(restored.successful_objects, 6);
+        assert_eq!(restored.failed_objects, 1);
+        assert_eq!(restored.completed_buckets, ["bucket-a"]);
+        assert!(restored.replacement_targets.is_empty());
+        assert_eq!(restored.replacement_generation, None);
+        assert_eq!(restored.replacement_phase, ReplacementPhase::None);
+        temp_dir.close().expect("remove schema test directory");
+    }
+
+    #[tokio::test]
+    async fn future_resume_and_checkpoint_schemas_are_rejected() {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "future-schema";
+        let mut state = ResumeState::new(task_id.to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), Vec::new());
+        state.schema_version = CURRENT_RESUME_SCHEMA + 1;
+        let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+        let state_data = serde_json::to_vec(&state).expect("serialize future resume state");
+        disk.write_all(RUSTFS_META_BUCKET, &state_path, state_data.into())
+            .await
+            .expect("write future resume state");
+
+        let resume_error = match ResumeManager::load_from_disk(disk.clone(), task_id).await {
+            Ok(_) => panic!("future resume schema must not load"),
+            Err(error) => error,
+        };
+        assert!(matches!(resume_error, Error::TaskExecutionFailed { .. }));
+        assert!(resume_error.to_string().contains("newer than supported schema"));
+
+        let mut checkpoint = ResumeCheckpoint::new(task_id.to_string());
+        checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA + 1;
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let checkpoint_data = serde_json::to_vec(&checkpoint).expect("serialize future checkpoint");
+        disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, checkpoint_data.into())
+            .await
+            .expect("write future checkpoint");
+
+        let checkpoint_error = match CheckpointManager::load_from_disk(disk.clone(), task_id).await {
+            Ok(_) => panic!("future checkpoint schema must not load"),
+            Err(error) => error,
+        };
+        assert!(matches!(checkpoint_error, Error::TaskExecutionFailed { .. }));
+        assert!(checkpoint_error.to_string().contains("newer than supported schema"));
+        temp_dir.close().expect("remove schema test directory");
     }
 
     #[test]
