@@ -2218,6 +2218,7 @@ impl HealTask {
                     && state.replacement_targets == requested_targets
                     && state.replacement_generation.as_deref() == Some(self.id.as_str())
                 {
+                    resume_manager.ensure_replacement_completion_proof().await?;
                     if CheckpointManager::has_checkpoint(&disk, &self.id).await {
                         CheckpointManager::load_from_disk(disk.clone(), &self.id)
                             .await?
@@ -2280,6 +2281,7 @@ impl HealTask {
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
             let state = resume_manager.get_state().await;
             if state.completed && matches!(state.replacement_phase, ReplacementPhase::Verified) {
+                resume_manager.ensure_replacement_completion_proof().await?;
                 super::clear_healing_markers_after_verified(&self.heal_endpoints, &healing_marker).await?;
                 resume_manager.mark_replacement_cleanup_pending().await?;
                 if CheckpointManager::has_checkpoint(disk, &self.id).await {
