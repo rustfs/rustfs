@@ -20212,7 +20212,7 @@ mod test {
         );
         assert_eq!(
             disk.format_path,
-            root.join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE),
+            root.join(RUSTFS_META_BUCKET).join(crate::disk::FORMAT_CONFIG_FILE),
             "the public format path must keep configured-root semantics after replacement"
         );
         disk.write_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Bytes::from_static(b"owner"))
