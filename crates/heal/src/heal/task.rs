@@ -552,6 +552,16 @@ impl HealTask {
         }
     }
 
+    fn format_result_contains_targets(result: &HealResultItem, endpoints: &[String]) -> bool {
+        endpoints.iter().all(|endpoint| {
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == *endpoint && drive.state == "ok")
+        })
+    }
+
     fn is_object_not_found_heal_error(err: &Error) -> bool {
         match err {
             Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
@@ -2209,6 +2219,11 @@ impl HealTask {
                         "Heal erasure set format repaired"
                     );
                 }
+                if !self.options.dry_run && !Self::format_result_contains_targets(&result, &self.heal_endpoints) {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to verify formatted replacement targets for {set_disk_id}"),
+                    });
+                }
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
@@ -2420,12 +2435,40 @@ mod tests {
     use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
     use super::*;
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
-    use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     use super::super::storage_api::status::BucketInfo;
+
+    #[test]
+    fn format_result_requires_every_requested_target_to_be_ok() {
+        let result = HealResultItem {
+            after: Infos {
+                drives: vec![
+                    HealDriveInfo {
+                        endpoint: "disk-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    },
+                    HealDriveInfo {
+                        endpoint: "disk-b".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+
+        assert!(HealTask::format_result_contains_targets(&result, &["disk-a".to_string()]));
+        assert!(!HealTask::format_result_contains_targets(
+            &result,
+            &["disk-a".to_string(), "disk-b".to_string()]
+        ));
+        assert!(!HealTask::format_result_contains_targets(&result, &["disk-c".to_string()]));
+    }
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,

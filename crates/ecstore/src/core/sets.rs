@@ -1058,17 +1058,23 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             for (i, set) in new_format_sets.iter().enumerate() {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
-                        res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after.drives[i * self.set_drive_count + j].state = DriveState::Ok.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
             // Save new formats `format.json` on unformatted disks.
-            for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() && save_format_file(disk, fm).await.is_err() {
-                    let _ = disk.as_ref().unwrap().close().await;
-                    *fm = None;
+            for (index, (fm, disk)) in tmp_new_formats.iter_mut().zip(disks.iter()).enumerate() {
+                if fm.is_some() && disk.is_some() {
+                    if let Err(err) = save_format_file(disk, fm).await {
+                        if let Some(disk) = disk.as_ref() {
+                            let _ = disk.close().await;
+                        }
+                        return Ok((res, Some(err.into())));
+                    }
+                    if let Some(saved_format) = fm.as_ref() {
+                        res.after.drives[index].uuid = saved_format.erasure.this.to_string();
+                        res.after.drives[index].state = DriveState::Ok.to_string();
+                    }
                 }
             }
 

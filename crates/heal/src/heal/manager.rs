@@ -26,6 +26,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::LazyLock;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
+    path::Path,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -36,7 +37,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{DiskError, HealDiskExt as _, local_disk_map_read};
+use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -53,6 +54,10 @@ const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+fn auto_replacement_path_ready(endpoint: &Endpoint) -> bool {
+    endpoint.is_local && Path::new(&endpoint.get_file_path()).is_dir()
+}
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -2210,8 +2215,7 @@ impl HealManager {
                     }
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
-                        let mut endpoints = Vec::new();
-                        let mut seen_returning_sets = HashSet::new();
+                        let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
                         let local_disk_map = local_disk_map_read().await;
                         for disk in local_disk_map.values().flatten() {
                             let endpoint = disk.endpoint();
@@ -2222,6 +2226,23 @@ impl HealManager {
                             // detect unformatted disk via get_disk_id()
                             match disk.get_disk_id().await {
                                 Err(DiskError::UnformattedDisk) => {
+                                    if !auto_replacement_path_ready(&endpoint) {
+                                        skipped_invalid_count += 1;
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %endpoint,
+                                            disk_state = "replacement_path_unavailable",
+                                            "Heal auto-scan replacement deferred"
+                                        );
+                                        continue;
+                                    }
+                                    let Some(set_disk_id) = set_disk_id else {
+                                        skipped_invalid_count += 1;
+                                        continue;
+                                    };
                                     candidate_count += 1;
                                     debug!(
                                         target: "rustfs::heal::manager",
@@ -2232,7 +2253,7 @@ impl HealManager {
                                         disk_state = "unformatted",
                                         "Heal auto-scan candidate detected"
                                     );
-                                    endpoints.push(endpoint);
+                                    endpoints.entry(set_disk_id).or_default().push(endpoint);
                                 }
                                 Err(e) => {
                                     warn!(
@@ -2247,10 +2268,7 @@ impl HealManager {
                                     );
                                 }
                                 Ok(_) => {
-                                    if runtime_state.as_str() == "returning"
-                                        && let Some(set_disk_id) = set_disk_id
-                                        && seen_returning_sets.insert(set_disk_id.clone())
-                                    {
+                                    if runtime_state.as_str() == "returning" && let Some(set_disk_id) = set_disk_id {
                                         candidate_count += 1;
                                         debug!(
                                             target: "rustfs::heal::manager",
@@ -2262,7 +2280,7 @@ impl HealManager {
                                             disk_state = "returning",
                                             "Heal auto-scan returning disk candidate detected"
                                         );
-                                        endpoints.push(endpoint);
+                                        endpoints.entry(set_disk_id).or_default().push(endpoint);
                                     }
                                 }
                             }
@@ -2297,23 +2315,9 @@ impl HealManager {
                             }
                         };
 
-                        // Create erasure set heal requests for each endpoint
-                        for ep in endpoints {
-                            let Some(set_disk_id) =
-                                crate::heal::utils::format_set_disk_id_from_i32(ep.pool_idx, ep.set_idx)
-                            else {
-                                warn!(
-                                    target: "rustfs::heal::manager",
-                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                    endpoint = %ep,
-                                    result = "skipped_invalid_set_disk_id",
-                                    "Heal auto-scan enqueue skipped"
-                                );
-                                skipped_invalid_count += 1;
-                                continue;
-                            };
+                        // Admit one set task with every ready replacement target. Queue deduplication is
+                        // set-scoped, so admitting endpoints independently would silently drop later targets.
+                        for (set_disk_id, endpoints) in endpoints {
                             // skip if already queued or healing
                             // Use consistent lock order: queue first, then active_heals to avoid deadlock
                             let mut skip = false;
@@ -2343,7 +2347,7 @@ impl HealManager {
                                     event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                    endpoint = %ep,
+                                    endpoint_count = endpoints.len(),
                                     set_disk_id,
                                     result = "skipped_duplicate",
                                     "Heal auto-scan duplicate skipped"
@@ -2351,7 +2355,7 @@ impl HealManager {
                                 continue;
                             }
 
-                            // enqueue erasure set heal request for this disk
+                            // enqueue erasure set heal request for all ready replacements in this set
                             let mut req = HealRequest::new(
                                 HealType::ErasureSet {
                                     buckets: buckets.clone(),
@@ -2364,7 +2368,8 @@ impl HealManager {
                                 HealPriority::Low,
                             );
                             req.source = HealRequestSource::AutoHeal;
-                            req.heal_endpoints = vec![ep.to_string()];
+                            req.heal_endpoints = endpoints.iter().map(ToString::to_string).collect();
+                            let endpoint_count = req.heal_endpoints.len();
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
                             let admission = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
@@ -2382,7 +2387,7 @@ impl HealManager {
                                     event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                    endpoint = %ep,
+                                    endpoint_count,
                                     set_disk_id,
                                     bucket_count = buckets.len(),
                                     result = "enqueued",
@@ -2405,7 +2410,7 @@ impl HealManager {
                                     event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                    endpoint = %ep,
+                                    endpoint_count,
                                     set_disk_id,
                                     bucket_count = buckets.len(),
                                     admission = admission.result_label(),
@@ -2961,8 +2966,20 @@ mod tests {
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_concurrency::{WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot};
     use rustfs_madmin::heal_commands::HealResultItem;
+    use tempfile::TempDir;
 
     use super::super::{DiskStore, Endpoint, storage_api::status::BucketInfo};
+
+    #[test]
+    fn auto_replacement_path_requires_an_existing_directory() {
+        let temp = TempDir::new().expect("temporary replacement root should be created");
+        let ready = Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("replacement endpoint should parse");
+        let missing = Endpoint::try_from(temp.path().join("missing").to_string_lossy().as_ref())
+            .expect("missing replacement endpoint should parse");
+
+        assert!(auto_replacement_path_ready(&ready));
+        assert!(!auto_replacement_path_ready(&missing));
+    }
 
     #[derive(Debug)]
     struct FixedWorkloadProvider {

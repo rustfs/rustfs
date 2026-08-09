@@ -1791,9 +1791,12 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
                 let mut new_format = ref_format.clone();
                 new_format.erasure.this = ref_format.erasure.sets[self.set_index][disk_idx];
-                if save_format_file(&disks[disk_idx], &Some(new_format.clone())).await.is_ok() {
-                    result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
-                    result.after.drives[disk_idx].state = DriveState::Ok.to_string();
+                match save_format_file(&disks[disk_idx], &Some(new_format.clone())).await {
+                    Ok(()) => {
+                        result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
+                        result.after.drives[disk_idx].state = DriveState::Ok.to_string();
+                    }
+                    Err(err) => return Ok((result, Some(err.into()))),
                 }
             }
         }
