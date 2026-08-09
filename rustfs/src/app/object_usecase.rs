@@ -5109,7 +5109,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
-        buffered_body: Option<Bytes>,
+        mut buffered_body: Option<Bytes>,
         cache_hook_served: bool,
         cache_hook_probed: bool,
         cache_fill_allowed: bool,
@@ -5125,7 +5125,7 @@ impl DefaultObjectUsecase {
         // ODC-16 (backlog#1121): when the ecstore hook or shared cold fill
         // already supplied this body, the request-level plan was built before
         // the authoritative lookup. Serve it without planning a second time.
-        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+        if cache_hook_served && let Some(bytes) = buffered_body.take() {
             return Ok(Self::build_memory_bytes_blob(
                 bytes,
                 response_content_length,
