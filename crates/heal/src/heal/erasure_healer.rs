@@ -1138,12 +1138,8 @@ mod resume_loop_tests {
     use super::{ErasureSetHealer, target_outcomes_complete};
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
-<<<<<<< HEAD
         CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
         compose_key,
-=======
-        CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, ResumeUtils, compose_key,
->>>>>>> 5e2705bf9 (fix(heal): validate persisted resume task identifiers)
     };
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;

@@ -4484,6 +4484,8 @@ pub struct LocalDisk {
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
     mount_lease: std::fs::File,
+    #[cfg(target_os = "linux")]
+    mount_lease_mount_id: Option<u64>,
     /// Public path for callers that need the configured disk layout. Internal
     /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
@@ -4599,9 +4601,48 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplacementMountIdentity {
+    device: u64,
+    inode: u64,
+    mount_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_mount_identity(metadata: &std::fs::Metadata, mount_id: u64) -> ReplacementMountIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    ReplacementMountIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mount_id,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
+    use rustix::fs::{AtFlags, StatxFlags};
+
+    let statx = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID).ok()?;
+    StatxFlags::from_bits_retain(statx.stx_mask)
+        .contains(StatxFlags::MNT_ID)
+        .then_some(statx.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_for_path(path: &Path) -> Option<u64> {
+    use rustix::fs::{AtFlags, CWD, StatxFlags};
+
+    let statx = rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID).ok()?;
+    StatxFlags::from_bits_retain(statx.stx_mask)
+        .contains(StatxFlags::MNT_ID)
+        .then_some(statx.stx_mnt_id)
+}
+
 impl LocalDisk {
     #[cfg(target_os = "linux")]
-    fn open_mount_lease(root: &Path) -> Result<(std::fs::File, PathBuf)> {
+    fn open_mount_lease(root: &Path) -> Result<(std::fs::File, PathBuf, Option<u64>)> {
         use rustix::fs::{Mode, OFlags, open};
         use std::os::fd::AsRawFd as _;
 
@@ -4614,7 +4655,8 @@ impl LocalDisk {
         .map_err(DiskError::from)?;
         let lease = std::fs::File::from(fd);
         let io_root = PathBuf::from(format!("/proc/self/fd/{}", lease.as_raw_fd()));
-        Ok((lease, io_root))
+        let mount_id = mount_id_for_fd(&lease);
+        Ok((lease, io_root, mount_id))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -4631,15 +4673,20 @@ impl LocalDisk {
     pub fn has_replacement_mount_lease(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::fs::MetadataExt as _;
-
             let Ok(configured) = std::fs::metadata(self.endpoint.get_file_path()) else {
                 return false;
             };
             let Ok(pinned) = self.mount_lease.metadata() else {
                 return false;
             };
-            return configured.dev() == pinned.dev() && configured.ino() == pinned.ino();
+            let Some(configured_mount_id) = mount_id_for_path(Path::new(&self.endpoint.get_file_path())) else {
+                return false;
+            };
+            let Some(pinned_mount_id) = self.mount_lease_mount_id else {
+                return false;
+            };
+            return replacement_mount_identity(&configured, configured_mount_id)
+                == replacement_mount_identity(&pinned, pinned_mount_id);
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -4689,7 +4736,7 @@ impl LocalDisk {
         let root = publication_root.path().to_path_buf();
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root) = Self::open_mount_lease(&root)?;
+        let (mount_lease, io_root, mount_lease_mount_id) = Self::open_mount_lease(&root)?;
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
@@ -4831,6 +4878,8 @@ impl LocalDisk {
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
             mount_lease,
+            #[cfg(target_os = "linux")]
+            mount_lease_mount_id,
             endpoint: ep.clone(),
             format_path,
             io_format_path,
@@ -20175,5 +20224,21 @@ mod test {
             .expect("lease-root marker write should succeed");
         assert!(first_root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
         assert!(!second_root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacement_mount_identity_rejects_a_bind_remount_with_the_same_inode() {
+        let held = ReplacementMountIdentity {
+            device: 8,
+            inode: 42,
+            mount_id: 101,
+        };
+        let rebound = ReplacementMountIdentity { mount_id: 102, ..held };
+
+        assert_ne!(
+            held, rebound,
+            "a bind remount can retain device and inode while changing the mount incarnation"
+        );
     }
 }
