@@ -42,8 +42,10 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const REPLACEMENT_INTENT_FILE: &str = "ahm_replacement_intent.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
-const REPLACEMENT_RECOVERY_MARKER_FILE: &str = "ahm_replacement_recovery.json";
 const REPLACEMENT_COMPLETION_PROOF_FILE: &str = "ahm_replacement_completion_proof.json";
+const REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
+const REPLACEMENT_INTENT_SEAL_FILE: &str = "ahm_replacement_intent_seal";
+const LEGACY_REPLACEMENT_RECOVERY_MARKER_FILE: &str = "ahm_replacement_recovery.json";
 const CURRENT_REPLACEMENT_COMPLETION_PROOF_SCHEMA: u32 = 1;
 
 /// Current on-disk schema version for `ResumeState`. Snapshots written by an
@@ -449,11 +451,31 @@ async fn delete_resume_file(disk: &DiskStore, path: &Path) -> Result<()> {
 }
 
 fn replacement_completion_proof_path(task_id: &str) -> std::path::PathBuf {
+    replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_COMPLETION_PROOF_FILE}"))
+}
+
+fn legacy_replacement_completion_proof_path(task_id: &str) -> std::path::PathBuf {
     Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{REPLACEMENT_COMPLETION_PROOF_FILE}"))
 }
 
-fn replacement_recovery_marker_path(task_id: &str) -> std::path::PathBuf {
-    Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{REPLACEMENT_RECOVERY_MARKER_FILE}"))
+fn replacement_recovery_dir() -> std::path::PathBuf {
+    Path::new(BUCKET_META_PREFIX).join(REPLACEMENT_RECOVERY_DIR)
+}
+
+async fn ensure_replacement_recovery_dir(disk: &DiskStore) -> std::result::Result<(), DiskError> {
+    let volume = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}/{REPLACEMENT_RECOVERY_DIR}");
+    match super::storage_api::owner::EcstoreDiskAPI::make_volume(disk.as_ref(), &volume).await {
+        Ok(()) | Err(DiskError::VolumeExists) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn replacement_intent_seal_path(task_id: &str) -> std::path::PathBuf {
+    replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_INTENT_SEAL_FILE}"))
+}
+
+fn legacy_replacement_recovery_marker_path(task_id: &str) -> std::path::PathBuf {
+    Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{LEGACY_REPLACEMENT_RECOVERY_MARKER_FILE}"))
 }
 
 /// resume state
@@ -668,15 +690,16 @@ pub struct ResumeManager {
 enum ResumeStateFile {
     Ordinary,
     ReplacementIntent,
+    LegacyReplacementIntent,
 }
 
 impl ResumeStateFile {
     fn path(self, task_id: &str) -> std::path::PathBuf {
-        let file = match self {
-            Self::Ordinary => RESUME_STATE_FILE,
-            Self::ReplacementIntent => REPLACEMENT_INTENT_FILE,
-        };
-        Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{file}"))
+        match self {
+            Self::Ordinary => Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}")),
+            Self::ReplacementIntent => replacement_recovery_dir().join(format!("{task_id}_{REPLACEMENT_INTENT_FILE}")),
+            Self::LegacyReplacementIntent => Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{REPLACEMENT_INTENT_FILE}")),
+        }
     }
 }
 
@@ -764,7 +787,7 @@ impl ResumeManager {
                             message: format!("Replacement intent does not match task {task_id}"),
                         });
                     }
-                    manager.ensure_replacement_recovery_marker().await?;
+                    manager.ensure_replacement_intent_seal().await?;
                     return Ok(manager);
                 }
                 Err(error) if Self::can_recover_torn_replacement_intent(&disk, &task_id).await? => {
@@ -798,32 +821,32 @@ impl ResumeManager {
             state_file: ResumeStateFile::ReplacementIntent,
         };
         manager.save_state_strict().await?;
-        manager.ensure_replacement_recovery_marker().await?;
+        manager.ensure_replacement_intent_seal().await?;
         Ok(manager)
     }
 
-    /// Ensure the replacement-only discovery marker exists after the durable
-    /// state it names. The scanner lists markers instead of deserializing every
-    /// ordinary resume state on each polling cycle.
-    pub(crate) async fn ensure_replacement_recovery_marker(&self) -> Result<()> {
+    /// Seal a durably published intent before the caller may format a target.
+    /// A torn intent without this seal is known to have failed before its
+    /// creator returned and can be atomically recreated on retry.
+    async fn ensure_replacement_intent_seal(&self) -> Result<()> {
         let task_id = self.state.read().await.task_id.clone();
         validate_resume_task_id(&task_id)?;
-        let marker_path = replacement_recovery_marker_path(&task_id);
-        let marker_path = path_to_str(&marker_path)?;
-        match self.disk.read_all(RUSTFS_META_BUCKET, marker_path).await {
+        let path = replacement_intent_seal_path(&task_id);
+        let path = path_to_str(&path)?;
+        match self.disk.read_all(RUSTFS_META_BUCKET, path).await {
             Ok(_) => return Ok(()),
             Err(DiskError::FileNotFound) => {}
             Err(error) => {
                 return Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to read replacement recovery marker: {error}"),
+                    message: format!("Failed to read replacement intent seal: {error}"),
                 });
             }
         }
         self.disk
-            .write_all(RUSTFS_META_BUCKET, marker_path, b"replacement".to_vec().into())
+            .write_all(RUSTFS_META_BUCKET, path, b"sealed".as_slice().into())
             .await
             .map_err(|error| Error::TaskExecutionFailed {
-                message: format!("Failed to save replacement recovery marker: {error}"),
+                message: format!("Failed to save replacement intent seal: {error}"),
             })
     }
 
@@ -918,17 +941,105 @@ impl ResumeManager {
         validate_resume_task_id(task_id)?;
         let path = replacement_completion_proof_path(task_id);
         let path_str = path_to_str(&path)?;
-        let bytes = disk
-            .read_all(RUSTFS_META_BUCKET, path_str)
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to read replacement completion proof: {e}"),
-            })?;
+        let bytes = match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
+            Ok(bytes) => bytes,
+            Err(DiskError::FileNotFound) => {
+                let legacy_path = legacy_replacement_completion_proof_path(task_id);
+                let legacy_path = path_to_str(&legacy_path)?;
+                disk.read_all(RUSTFS_META_BUCKET, legacy_path)
+                    .await
+                    .map_err(|error| Error::TaskExecutionFailed {
+                        message: format!("Failed to read replacement completion proof: {error}"),
+                    })?
+            }
+            Err(error) => {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to read replacement completion proof: {error}"),
+                });
+            }
+        };
         let proof: ReplacementCompletionProof = serde_json::from_slice(&bytes).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize replacement completion proof: {e}"),
         })?;
         proof.validate(task_id)?;
         Ok(proof)
+    }
+
+    async fn migrate_legacy_replacement_completion_proof(disk: &DiskStore, task_id: &str) -> Result<bool> {
+        validate_resume_task_id(task_id)?;
+        let legacy_path = legacy_replacement_completion_proof_path(task_id);
+        let legacy_path_str = path_to_str(&legacy_path)?;
+        let legacy_bytes = match disk.read_all(RUSTFS_META_BUCKET, legacy_path_str).await {
+            Ok(bytes) => bytes,
+            Err(DiskError::FileNotFound) => return Ok(false),
+            Err(error) => {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to read legacy replacement completion proof: {error}"),
+                });
+            }
+        };
+        let legacy_proof: ReplacementCompletionProof =
+            serde_json::from_slice(&legacy_bytes).map_err(|error| Error::TaskExecutionFailed {
+                message: format!("Failed to deserialize legacy replacement completion proof: {error}"),
+            })?;
+        legacy_proof.validate(task_id)?;
+
+        ensure_replacement_recovery_dir(disk)
+            .await
+            .map_err(|error| Error::TaskExecutionFailed {
+                message: format!("Failed to create replacement recovery directory: {error}"),
+            })?;
+        let path = replacement_completion_proof_path(task_id);
+        let path_str = path_to_str(&path)?;
+        for _ in 0..2 {
+            match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
+                Ok(bytes) => {
+                    let proof: ReplacementCompletionProof =
+                        serde_json::from_slice(&bytes).map_err(|error| Error::TaskExecutionFailed {
+                            message: format!("Failed to deserialize replacement completion proof: {error}"),
+                        })?;
+                    proof.validate(task_id)?;
+                    if proof != legacy_proof {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement completion proof conflicts with legacy proof for task {task_id}"),
+                        });
+                    }
+                    delete_resume_file(disk, &legacy_path).await?;
+                    return Ok(true);
+                }
+                Err(DiskError::FileNotFound) => {}
+                Err(error) => {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to read replacement completion proof: {error}"),
+                    });
+                }
+            }
+
+            match super::storage_api::owner::EcstoreDiskAPI::compare_and_update_file(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                path_str,
+                None,
+                Some(EcstoreDiskBytes::from(legacy_bytes.clone())),
+            )
+            .await
+            {
+                Ok(EcstoreConditionalFileUpdate::Updated) => {
+                    delete_resume_file(disk, &legacy_path).await?;
+                    return Ok(true);
+                }
+                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
+                Err(error) => {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to migrate replacement completion proof: {error}"),
+                    });
+                }
+            }
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("Replacement completion proof changed while migrating task {task_id}"),
+        })
     }
 
     pub async fn abandon_replacement_intent(&self) -> Result<()> {
@@ -957,24 +1068,35 @@ impl ResumeManager {
         Self::load_from_disk_at(disk, task_id, ResumeStateFile::Ordinary).await
     }
 
-    /// Load a replacement intent, migrating the temporary legacy location
-    /// only after the isolated replacement record has been written.
+    /// Load a replacement intent, migrating a legacy flat record only after
+    /// the dedicated replacement record has been written.
     pub async fn load_replacement_intent(disk: DiskStore, task_id: &str) -> Result<Self> {
         if Self::has_state_file(&disk, task_id, ResumeStateFile::ReplacementIntent).await {
             let isolated = Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::ReplacementIntent).await?;
-            if Self::has_state_file(&disk, task_id, ResumeStateFile::Ordinary).await {
-                let legacy = Self::load_from_disk_at(disk, task_id, ResumeStateFile::Ordinary).await?;
-                if !is_replacement_intent(&legacy.get_state().await) || legacy.get_state().await != isolated.get_state().await {
+            isolated.ensure_replacement_intent_seal().await?;
+            for legacy_file in [ResumeStateFile::LegacyReplacementIntent, ResumeStateFile::Ordinary] {
+                if !Self::has_state_file(&disk, task_id, legacy_file).await {
+                    continue;
+                }
+                let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file).await?;
+                let legacy_state = legacy.get_state().await;
+                if !is_replacement_intent(&legacy_state) || legacy_state != isolated.get_state().await {
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Replacement intent has conflicting legacy state for task {task_id}"),
                     });
                 }
                 legacy.cleanup().await?;
             }
+            delete_resume_file(&disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
             return Ok(isolated);
         }
 
-        let legacy = Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::Ordinary).await?;
+        let legacy_file = if Self::has_state_file(&disk, task_id, ResumeStateFile::LegacyReplacementIntent).await {
+            ResumeStateFile::LegacyReplacementIntent
+        } else {
+            ResumeStateFile::Ordinary
+        };
+        let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file).await?;
         if !is_replacement_intent(&legacy.get_state().await) {
             return Err(Error::TaskExecutionFailed {
                 message: format!("Resume state is not a replacement intent for task {task_id}"),
@@ -988,7 +1110,9 @@ impl ResumeManager {
             state_file: ResumeStateFile::ReplacementIntent,
         };
         migrated.save_state_strict().await?;
+        migrated.ensure_replacement_intent_seal().await?;
         legacy.cleanup().await?;
+        delete_resume_file(&migrated.disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
         Ok(migrated)
     }
 
@@ -1050,11 +1174,13 @@ impl ResumeManager {
         Self::has_state_file(disk, task_id, ResumeStateFile::Ordinary).await
     }
 
-    /// Check for a replacement intent in its isolated namespace. A legacy
-    /// replacement record is recognized so the next new-binary resume can
-    /// migrate it, but ordinary states never match.
+    /// Check for a replacement intent in its dedicated namespace. Flat and
+    /// ordinary legacy records are recognized only for migration compatibility.
     pub async fn has_replacement_intent(disk: &DiskStore, task_id: &str) -> bool {
         if Self::has_state_file(disk, task_id, ResumeStateFile::ReplacementIntent).await {
+            return true;
+        }
+        if Self::has_state_file(disk, task_id, ResumeStateFile::LegacyReplacementIntent).await {
             return true;
         }
         match Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::Ordinary).await {
@@ -1083,13 +1209,13 @@ impl ResumeManager {
         let path = path_to_str(&path)?;
         match disk.read_all(RUSTFS_META_BUCKET, path).await {
             Ok(bytes) if serde_json::from_slice::<ResumeState>(&bytes).is_err() => {
-                let marker = replacement_recovery_marker_path(task_id);
-                let marker = path_to_str(&marker)?;
-                match disk.read_all(RUSTFS_META_BUCKET, marker).await {
+                let seal = replacement_intent_seal_path(task_id);
+                let seal = path_to_str(&seal)?;
+                match disk.read_all(RUSTFS_META_BUCKET, seal).await {
                     Err(DiskError::FileNotFound) => Ok(true),
                     Ok(_) => Ok(false),
                     Err(error) => Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to read replacement recovery marker: {error}"),
+                        message: format!("Failed to read replacement intent seal: {error}"),
                     }),
                 }
             }
@@ -1205,9 +1331,6 @@ impl ResumeManager {
     pub async fn cleanup(&self) -> Result<()> {
         let state = self.state.read().await;
         let task_id = state.task_id.clone();
-        let is_replacement = state.replacement_generation.is_some()
-            || !state.replacement_targets.is_empty()
-            || !matches!(state.replacement_phase, ReplacementPhase::None);
         drop(state);
         validate_resume_task_id(&task_id)?;
 
@@ -1215,12 +1338,9 @@ impl ResumeManager {
         let progress_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_PROGRESS_FILE}"));
 
         delete_resume_file(&self.disk, &progress_file).await?;
-        // Keep the marker until the state is gone so a partial cleanup remains
-        // discoverable to replacement recovery.
         delete_resume_file(&self.disk, &state_file).await?;
-        if is_replacement {
-            let marker_file = replacement_recovery_marker_path(&task_id);
-            delete_resume_file(&self.disk, &marker_file).await?;
+        if matches!(self.state_file, ResumeStateFile::ReplacementIntent) {
+            delete_resume_file(&self.disk, &replacement_intent_seal_path(&task_id)).await?;
         }
 
         debug!(
@@ -1249,6 +1369,11 @@ impl ResumeManager {
         state: &ResumeState,
         verified_at: Option<u64>,
     ) -> Result<ReplacementCompletionProof> {
+        ensure_replacement_recovery_dir(&self.disk)
+            .await
+            .map_err(|error| Error::TaskExecutionFailed {
+                message: format!("Failed to create replacement recovery directory: {error}"),
+            })?;
         let path = replacement_completion_proof_path(&state.task_id);
         let path_str = path_to_str(&path)?;
         let proof = ReplacementCompletionProof::from_state(
@@ -1325,7 +1450,9 @@ impl ResumeManager {
 
         let path_str = path_to_str(&file_path)?;
         let write_result = match self.state_file {
-            ResumeStateFile::Ordinary => self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data).await,
+            ResumeStateFile::Ordinary | ResumeStateFile::LegacyReplacementIntent => {
+                self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data).await
+            }
             ResumeStateFile::ReplacementIntent => self.write_replacement_intent_state(path_str, state_data).await,
         };
         if let Err(e) = write_result {
@@ -1363,6 +1490,7 @@ impl ResumeManager {
         path: &str,
         state_data: EcstoreDiskBytes,
     ) -> std::result::Result<(), DiskError> {
+        ensure_replacement_recovery_dir(&self.disk).await?;
         for _ in 0..2 {
             let expected = match self.disk.read_all(RUSTFS_META_BUCKET, path).await {
                 Ok(existing) => Some(existing),
@@ -1776,12 +1904,14 @@ impl ResumeUtils {
         Ok(task_ids)
     }
 
-    /// Return replacement intent task IDs without exposing them through the
-    /// ordinary resume enumeration that older binaries consume. Legacy
-    /// replacement records are included once so the caller can migrate them.
+    /// Return replacement intent task IDs from the dedicated recovery
+    /// directory. Periodic recovery must never enumerate the ordinary resume
+    /// directory, whose cardinality is unrelated to replacement work.
     pub async fn get_replacement_intent_tasks(disk: &DiskStore) -> Result<Vec<String>> {
+        let recovery_dir = replacement_recovery_dir();
+        let recovery_dir = path_to_str(&recovery_dir)?;
         let entries = disk
-            .list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1)
+            .list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1)
             .await
             .map_err(|error| Error::TaskExecutionFailed {
                 message: format!("Failed to list replacement intents: {error}"),
@@ -1803,13 +1933,75 @@ impl ResumeUtils {
         Ok(task_ids)
     }
 
+    /// Migrate flat replacement artifacts from earlier builds exactly once at
+    /// manager startup. The normal scanner only uses the dedicated directory;
+    /// ordinary resume JSON is never read on its periodic path.
+    pub async fn migrate_legacy_replacement_records(disk: &DiskStore) -> Result<()> {
+        let entries = disk
+            .list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1)
+            .await
+            .map_err(|error| Error::TaskExecutionFailed {
+                message: format!("Failed to list legacy replacement records: {error}"),
+            })?;
+        let ordinary_suffix = format!("_{RESUME_STATE_FILE}");
+        let intent_suffix = format!("_{REPLACEMENT_INTENT_FILE}");
+        let proof_suffix = format!("_{REPLACEMENT_COMPLETION_PROOF_FILE}");
+        let mut ordinary_task_ids = HashSet::new();
+        let mut intent_task_ids = HashSet::new();
+        let mut proof_task_ids = HashSet::new();
+
+        for entry in entries {
+            if let Some(task_id) = entry.strip_suffix(&intent_suffix)
+                && validate_resume_task_id(task_id).is_ok()
+            {
+                intent_task_ids.insert(task_id.to_string());
+                continue;
+            }
+            if let Some(task_id) = entry.strip_suffix(&ordinary_suffix)
+                && validate_resume_task_id(task_id).is_ok()
+            {
+                ordinary_task_ids.insert(task_id.to_string());
+                continue;
+            }
+            if let Some(task_id) = entry.strip_suffix(&proof_suffix)
+                && validate_resume_task_id(task_id).is_ok()
+            {
+                proof_task_ids.insert(task_id.to_string());
+            }
+        }
+
+        let mut state_task_ids = intent_task_ids.into_iter().collect::<Vec<_>>();
+        state_task_ids.extend(ordinary_task_ids);
+        state_task_ids.sort_unstable();
+        state_task_ids.dedup();
+        for task_id in state_task_ids {
+            let has_flat_intent = ResumeManager::has_state_file(disk, &task_id, ResumeStateFile::LegacyReplacementIntent).await;
+            if !has_flat_intent {
+                let Ok(manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
+                    continue;
+                };
+                if !is_replacement_intent(&manager.get_state().await) {
+                    continue;
+                }
+            }
+            ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
+        }
+
+        for task_id in proof_task_ids {
+            ResumeManager::migrate_legacy_replacement_completion_proof(disk, &task_id).await?;
+        }
+        Ok(())
+    }
+
     /// Return all durable replacement states and completion proofs stored on
     /// one survivor disk. Unlike the legacy resumable-task helper, listing
     /// failures are returned to the caller so an observability surface cannot
     /// silently turn an unreadable durable record into a green result.
     pub async fn get_replacement_recovery_records(disk: &DiskStore) -> Result<Vec<ReplacementRecoveryRecord>> {
+        let recovery_dir = replacement_recovery_dir();
+        let recovery_dir = path_to_str(&recovery_dir)?;
         let entries = disk
-            .list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1)
+            .list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1)
             .await
             .map_err(|error| Error::TaskExecutionFailed {
                 message: format!("Failed to list replacement recovery records: {error}"),
@@ -2179,7 +2371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_intent_does_not_recreate_torn_state_after_marker_publication() {
+    async fn replacement_intent_does_not_recreate_torn_state_after_seal_publication() {
         let (_temp_dir, disk) = schema_test_disk().await;
         let task_id = ResumeUtils::generate_task_id();
         let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
@@ -2188,14 +2380,14 @@ mod tests {
         disk.write_all(RUSTFS_META_BUCKET, intent_path, torn.as_slice().into())
             .await
             .expect("torn replacement intent fixture should persist");
-        let marker_path = replacement_recovery_marker_path(&task_id);
+        let marker_path = replacement_intent_seal_path(&task_id);
         disk.write_all(
             RUSTFS_META_BUCKET,
-            marker_path.to_str().expect("replacement marker path must be UTF-8"),
-            b"replacement".as_slice().into(),
+            marker_path.to_str().expect("replacement seal path must be UTF-8"),
+            b"sealed".as_slice().into(),
         )
         .await
-        .expect("recovery marker fixture should persist");
+        .expect("replacement seal fixture should persist");
 
         let error = match ResumeManager::new_replacement_intent(
             disk.clone(),
@@ -2212,7 +2404,7 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("a marker means a torn state may have crossed the format boundary"),
+            Ok(_) => panic!("a seal means a torn state may have crossed the format boundary"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("Failed to deserialize resume state"));
@@ -2284,12 +2476,6 @@ mod tests {
         assert!(!ResumeManager::has_replacement_intent(&disk, &task_id).await);
         assert!(ResumeManager::load_replacement_intent(disk.clone(), &task_id).await.is_err());
         assert!(ResumeManager::has_resume_state(&disk, &task_id).await);
-        assert!(
-            ResumeUtils::get_resumable_tasks(&disk)
-                .await
-                .expect("ordinary resume listing should succeed")
-                .contains(&task_id)
-        );
     }
 
     #[tokio::test]
@@ -2319,6 +2505,122 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].task_id, task_id);
         assert_eq!(records[0].state, ReplacementRecoveryState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn startup_migration_moves_flat_replacement_artifacts_to_dedicated_directory() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let mut state = ResumeState::replacement_intent(
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        );
+        state.mark_completed();
+        state.replacement_phase = ReplacementPhase::Verified;
+        let legacy_intent = ResumeStateFile::LegacyReplacementIntent.path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_intent.to_str().expect("legacy intent path must be UTF-8"),
+            serde_json::to_vec(&state)
+                .expect("serialize legacy replacement intent")
+                .into(),
+        )
+        .await
+        .expect("write legacy replacement intent");
+        let proof = ReplacementCompletionProof::from_state(&state, state.last_update).expect("build legacy completion proof");
+        let legacy_proof = legacy_replacement_completion_proof_path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_proof.to_str().expect("legacy proof path must be UTF-8"),
+            serde_json::to_vec(&proof).expect("serialize legacy completion proof").into(),
+        )
+        .await
+        .expect("write legacy completion proof");
+
+        ResumeUtils::migrate_legacy_replacement_records(&disk)
+            .await
+            .expect("startup migration should move flat replacement artifacts");
+
+        assert_eq!(
+            ResumeUtils::get_replacement_intent_tasks(&disk)
+                .await
+                .expect("dedicated intent listing should succeed"),
+            vec![task_id.clone()]
+        );
+        assert_eq!(
+            ResumeManager::load_replacement_completion_proof(disk.clone(), &task_id)
+                .await
+                .expect("dedicated completion proof should be readable"),
+            proof
+        );
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_intent.to_str().expect("legacy intent path must be UTF-8"))
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_proof.to_str().expect("legacy proof path must be UTF-8"))
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_discovery_does_not_read_ordinary_resume_directory() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        for _ in 0..3 {
+            ResumeManager::new(
+                disk.clone(),
+                ResumeUtils::generate_task_id(),
+                "erasure_set".to_string(),
+                "pool_0_set_0".to_string(),
+                vec!["bucket".to_string()],
+            )
+            .await
+            .expect("ordinary resume state should persist");
+        }
+        let corrupt_task_id = ResumeUtils::generate_task_id();
+        let corrupt_path = ResumeStateFile::Ordinary.path(&corrupt_task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            corrupt_path.to_str().expect("ordinary resume path must be UTF-8"),
+            b"not-json".to_vec().into(),
+        )
+        .await
+        .expect("corrupt ordinary resume state should persist");
+
+        let replacement_task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist in the dedicated directory");
+
+        assert_eq!(
+            ResumeUtils::get_replacement_intent_tasks(&disk)
+                .await
+                .expect("dedicated replacement listing should not parse ordinary JSON"),
+            vec![replacement_task_id]
+        );
     }
 
     #[tokio::test]
