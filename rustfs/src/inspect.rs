@@ -688,6 +688,12 @@ mod tests {
         shards
     }
 
+    struct ModernFixtureLayout<'a> {
+        inline: bool,
+        distribution: &'a [usize],
+        declared_size: usize,
+    }
+
     async fn write_modern_object_fixture(
         drives: &[tempfile::TempDir],
         indices: &[usize],
@@ -708,6 +714,29 @@ mod tests {
         inline: bool,
         distribution: &[usize],
     ) {
+        write_modern_object_fixture_with_layout(
+            drives,
+            indices,
+            bucket,
+            object,
+            payload,
+            ModernFixtureLayout {
+                inline,
+                distribution,
+                declared_size: payload.len(),
+            },
+        )
+        .await;
+    }
+
+    async fn write_modern_object_fixture_with_layout(
+        drives: &[tempfile::TempDir],
+        indices: &[usize],
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+        layout: ModernFixtureLayout<'_>,
+    ) {
         let erasure = Erasure::try_new(2, 2, 64).expect("test erasure geometry");
         let encoded = encode_object_shards(&erasure, payload);
         let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("test data dir");
@@ -720,22 +749,22 @@ mod tests {
             file_info.name = object.to_string();
             file_info.data_dir = Some(data_dir);
             file_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp"));
-            file_info.size = payload.len() as i64;
+            file_info.size = layout.declared_size as i64;
             file_info.parts = vec![ObjectPartInfo {
                 number: 1,
-                size: payload.len(),
-                actual_size: payload.len() as i64,
+                size: layout.declared_size,
+                actual_size: layout.declared_size as i64,
                 ..Default::default()
             }];
             file_info.erasure.block_size = 64;
             file_info.erasure.index = index;
-            file_info.erasure.distribution = distribution.to_vec();
+            file_info.erasure.distribution = layout.distribution.to_vec();
             file_info.erasure.checksums = vec![ChecksumInfo {
                 part_number: 1,
                 algorithm: algorithm.clone(),
                 ..Default::default()
             }];
-            if inline {
+            if layout.inline {
                 file_info.data = Some(framed.clone().into());
                 file_info.set_inline_data();
             }
@@ -746,7 +775,7 @@ mod tests {
             std::fs::create_dir_all(&object_dir).expect("create test object directory");
             std::fs::write(object_dir.join("xl.meta"), file_meta.marshal_msg().expect("marshal test xl.meta"))
                 .expect("write test xl.meta");
-            if !inline {
+            if !layout.inline {
                 let part_dir = object_dir.join(data_dir.to_string());
                 std::fs::create_dir_all(&part_dir).expect("create test part directory");
                 std::fs::write(part_dir.join("part.1"), framed).expect("write test part");
@@ -822,10 +851,15 @@ mod tests {
     #[tokio::test]
     async fn corrupted_inline_shard_fails_bitrot_verification() {
         let mut xlmeta = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata_full.xlmeta.hex"));
-        // Flip a byte near the end, inside the inline data region (the xl.meta
-        // header/versions live at the front).
-        let target = xlmeta.len() - 64;
-        xlmeta[target] ^= 0xff;
+        // Corrupt an XML value without damaging MessagePack framing. With
+        // verification bypassed this still unmarshals, so only the bitrot
+        // boundary can make the test fail.
+        let needle = b"primary:webhook";
+        let target = xlmeta
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("fixture contains notification destination");
+        xlmeta[target] = b'q';
 
         let dir = tempfile::tempdir().expect("tempdir");
         let obj_dir = dir
@@ -843,8 +877,10 @@ mod tests {
             raw: false,
             out: None,
         };
-        let result = reconstruct_metadata_blob(&opts).await;
-        assert!(result.is_err(), "corrupted shard must not reconstruct");
+        let error = reconstruct_metadata_blob(&opts)
+            .await
+            .expect_err("corrupted shard must not reconstruct");
+        assert!(error.to_string().contains("bitrot verification failed"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1038,6 +1074,72 @@ mod tests {
             .expect_err("invalid metadata on a full write quorum must fail at the drive boundary");
         assert!(error.to_string().contains("invalid persisted metadata"), "unexpected error: {error}");
         assert!(error.to_string().contains("xl.meta"), "error must identify a drive path: {error}");
+    }
+
+    #[tokio::test]
+    async fn rejects_xlmeta_above_the_inspection_limit() {
+        let drive = tempfile::tempdir().expect("drive tempdir");
+        let object_dir = system_object_dir(drive.path().to_string_lossy().as_ref(), "interop", BUCKET_METADATA_FILE);
+        std::fs::create_dir_all(&object_dir).expect("create test object directory");
+        let xl_path = object_dir.join("xl.meta");
+        let file = std::fs::File::create(&xl_path).expect("create oversized xl.meta");
+        file.set_len(MAX_XL_META_BYTES + 1).expect("size oversized xl.meta");
+
+        let drive_path = drive.path().to_string_lossy().into_owned();
+        let error = read_drive_shard(&drive_path, BUCKET_METADATA_FILE, &object_dir, &xl_path)
+            .await
+            .expect_err("oversized xl.meta must fail before parsing");
+        assert!(error.to_string().contains("xl.meta is"), "unexpected error: {error}");
+        assert!(error.to_string().contains("inspection limit"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_inline_part_above_the_inspection_limit() {
+        let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let drives = vec![tempfile::tempdir().expect("drive tempdir")];
+        write_modern_object_fixture(&drives, &[1], "interop", BUCKET_METADATA_FILE, &payload, false).await;
+
+        let object_dir = system_object_dir(drives[0].path().to_string_lossy().as_ref(), "interop", BUCKET_METADATA_FILE);
+        let part_path = object_dir.join("11111111-1111-1111-1111-111111111111/part.1");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part_path)
+            .expect("open test part");
+        file.set_len(MAX_SHARD_SOURCE_BYTES + 1).expect("size oversized part");
+
+        let drive_path = drives[0].path().to_string_lossy().into_owned();
+        let error = read_drive_shard(&drive_path, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+            .await
+            .expect_err("oversized non-inline part must fail before reading");
+        assert!(error.to_string().contains("shard source is"), "unexpected error: {error}");
+        assert!(error.to_string().contains("inspection limit"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_object_size_above_the_reconstruction_limit() {
+        let payload = b"small fixture data";
+        let drives = vec![tempfile::tempdir().expect("drive tempdir")];
+        write_modern_object_fixture_with_layout(
+            &drives,
+            &[1],
+            "interop",
+            BUCKET_METADATA_FILE,
+            payload,
+            ModernFixtureLayout {
+                inline: true,
+                distribution: &[1, 2, 3, 4],
+                declared_size: MAX_BUCKET_METADATA_BYTES + 1,
+            },
+        )
+        .await;
+
+        let object_dir = system_object_dir(drives[0].path().to_string_lossy().as_ref(), "interop", BUCKET_METADATA_FILE);
+        let drive_path = drives[0].path().to_string_lossy().into_owned();
+        let error = read_drive_shard(&drive_path, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+            .await
+            .expect_err("oversized reconstructed object must fail before shard allocation");
+        assert!(error.to_string().contains("system object body is"), "unexpected error: {error}");
+        assert!(error.to_string().contains("inspection limit"), "unexpected error: {error}");
     }
 
     fn bucket_metadata_blob(incarnation: Uuid) -> Vec<u8> {
