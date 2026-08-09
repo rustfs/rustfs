@@ -17,7 +17,7 @@ use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
-    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
+    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient, append_version_id_query,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -206,6 +206,9 @@ struct ReplicationResetStatusTarget {
 
 const REPLICATION_CHECK_PROBE_PREFIX: &str = ".rustfs.sys/replication-check/";
 const REPLICATION_CHECK_ERROR_MAX_BYTES: usize = 512;
+/// RustFS extension code (no madmin analogue): the target does not adopt the
+/// source version id, breaking the version-identity replication contract.
+const REPLICATION_CHECK_CODE_VERSION_MISMATCH: &str = "BucketRemoteTargetVersionMismatch";
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct ReplicationCheckResponse {
@@ -245,6 +248,8 @@ struct ReplicationCheckPhases {
     object_lock: ReplicationCheckPhaseStatus,
     #[serde(rename = "Put")]
     put: ReplicationCheckPhaseStatus,
+    #[serde(rename = "VersionFidelity")]
+    version_fidelity: ReplicationCheckPhaseStatus,
     #[serde(rename = "DeleteMarker")]
     delete_marker: ReplicationCheckPhaseStatus,
     #[serde(rename = "VersionDelete")]
@@ -259,6 +264,11 @@ struct ReplicationCheckPhaseStatus {
     status: &'static str,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Machine-readable failure code (RustFS extension key; Go decoders
+    /// ignore unknown keys). Only set for failures that a caller is expected
+    /// to branch on, e.g. `BucketRemoteTargetVersionMismatch`.
+    #[serde(rename = "Code", skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl Default for ReplicationCheckPhaseStatus {
@@ -266,6 +276,7 @@ impl Default for ReplicationCheckPhaseStatus {
         Self {
             status: "SKIPPED",
             error: None,
+            code: None,
         }
     }
 }
@@ -275,6 +286,7 @@ impl ReplicationCheckPhaseStatus {
         Self {
             status: "OK",
             error: None,
+            code: None,
         }
     }
 
@@ -282,6 +294,14 @@ impl ReplicationCheckPhaseStatus {
         Self {
             status: "FAILED",
             error: Some(bound_replication_check_error(error.into())),
+            code: None,
+        }
+    }
+
+    fn failed_with_code(error: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            code: Some(code),
+            ..Self::failed(error)
         }
     }
 }
@@ -2046,9 +2066,17 @@ fn fail_replication_check_target(result: &mut ReplicationCheckTargetStatus, erro
     }
 }
 
+/// The probe PUT reports both sides of the version-identity contract: the
+/// source version id it sent (header + `?versionId=` query, the exact shape
+/// live replication uses) and the version id the target answered with.
+struct ReplicationProbePutOutcome {
+    sent_version_id: String,
+    response_version_id: Option<String>,
+}
+
 #[async_trait::async_trait]
 trait ReplicationProbeOperations {
-    async fn put(&mut self) -> Result<Option<String>, S3ClientError>;
+    async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
     async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
     async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String>;
@@ -2063,7 +2091,7 @@ struct RemoteReplicationProbeOperations<'a> {
 
 #[async_trait::async_trait]
 impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
-    async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+    async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
         put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
@@ -2101,9 +2129,28 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
     let mut cleanup_required = true;
 
     match operations.put().await {
-        Ok(version_id) => {
-            probe_version_id = version_id;
+        Ok(outcome) => {
             result.phases.put = ReplicationCheckPhaseStatus::passed();
+            // P1-19 version-identity contract: replication only converges on
+            // targets that adopt the source version id — version-addressed
+            // deletes and heal re-drives never match a minted id. Judge it
+            // from the probe PUT's own response; on mismatch the later
+            // mutation phases are pointless (they address by version id), but
+            // cleanup still runs against whatever id the target assigned.
+            if outcome.response_version_id.as_deref() == Some(outcome.sent_version_id.as_str()) {
+                result.phases.version_fidelity = ReplicationCheckPhaseStatus::passed();
+            } else {
+                let error = format!(
+                    "target assigned version id {} instead of adopting the source version id {}; \
+                     version-addressed replication (version deletes, heal) cannot converge on this target",
+                    outcome.response_version_id.as_deref().unwrap_or("<none>"),
+                    outcome.sent_version_id,
+                );
+                result.phases.version_fidelity =
+                    ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
+                fail_replication_check_target(result, error);
+            }
+            probe_version_id = outcome.response_version_id;
         }
         Err(err) => {
             let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
@@ -2115,7 +2162,7 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
-    if result.phases.put.status == "OK" {
+    if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
         match operations.create_delete_marker(probe_version_id.as_deref()).await {
             Ok(version_id) => {
                 delete_marker_version_id = version_id;
@@ -2230,8 +2277,9 @@ async fn put_replication_probe_object(
     target_bucket: &str,
     probe_key: &str,
     now: OffsetDateTime,
-) -> Result<Option<String>, S3ClientError> {
+) -> Result<ReplicationProbePutOutcome, S3ClientError> {
     let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
     insert_header(
@@ -2246,7 +2294,13 @@ async fn put_replication_probe_object(
         HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
     );
 
-    target_client
+    // Carry the source version as `?versionId=` exactly like a live
+    // replication PUT (P0-5 shape): the probe must exercise the query the
+    // real data path relies on, and the response tells us whether the target
+    // adopts the id. The probe id is always a fresh non-nil UUID, so the
+    // null-version mapping in the live path does not apply here.
+    let query_version_id = sent_version_id.clone();
+    let response = target_client
         .client
         .put_object()
         .bucket(target_bucket)
@@ -2259,12 +2313,18 @@ async fn put_replication_probe_object(
             for (key, value) in headers.clone() {
                 req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
+            let uri = append_version_id_query(req.uri(), &query_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
             Result::<_, std::io::Error>::Ok(req)
         })
         .send()
         .await
-        .map(|output| output.version_id().map(ToOwned::to_owned))
-        .map_err(S3ClientError::from)
+        .map_err(S3ClientError::from)?;
+
+    Ok(ReplicationProbePutOutcome {
+        sent_version_id,
+        response_version_id: response.version_id().map(ToOwned::to_owned),
+    })
 }
 
 async fn delete_replication_probe_object(
@@ -3431,6 +3491,9 @@ mod tests {
     #[derive(Default)]
     struct ScriptedReplicationProbe {
         put_error: Option<&'static str>,
+        /// Version id the scripted target answers with on PUT; None models a
+        /// mirroring target that echoes the sent source version id.
+        minted_version_id: Option<&'static str>,
         delete_marker_error: Option<&'static str>,
         version_delete_error: Option<&'static str>,
         cleanup_error: Option<&'static str>,
@@ -3449,11 +3512,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ReplicationProbeOperations for ScriptedReplicationProbe {
-        async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+        async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
             self.calls.push("put");
             match self.put_error {
                 Some(code) => Err(scripted_probe_error(code)),
-                None => Ok(Some("object-version".to_string())),
+                None => Ok(ReplicationProbePutOutcome {
+                    sent_version_id: "object-version".to_string(),
+                    response_version_id: Some(self.minted_version_id.unwrap_or("object-version").to_string()),
+                }),
             }
         }
 
@@ -3484,6 +3550,44 @@ mod tests {
                 None => Ok(()),
             }
         }
+    }
+
+    /// P1-19: a target that mints its own version ids must fail the
+    /// VersionFidelity phase with the machine-readable mismatch code, skip
+    /// the version-addressed mutation phases (they cannot mean anything on a
+    /// drifting target), and still clean up using the id the target actually
+    /// assigned — the source-derived id would never match.
+    #[tokio::test]
+    async fn replication_probe_flags_version_minting_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            minted_version_id: Some("target-minted-version"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "cleanup"]);
+        assert_eq!(result.status, "FAILED");
+        assert_eq!(result.phases.put.status, "OK");
+        assert_eq!(result.phases.version_fidelity.status, "FAILED");
+        assert_eq!(result.phases.version_fidelity.code, Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH));
+        assert_eq!(result.phases.delete_marker.status, "SKIPPED");
+        assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None]);
+    }
+
+    #[tokio::test]
+    async fn replication_probe_passes_version_fidelity_for_mirroring_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe::default();
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.phases.version_fidelity.status, "OK");
+        assert_eq!(result.phases.version_fidelity.code, None);
     }
 
     #[tokio::test]

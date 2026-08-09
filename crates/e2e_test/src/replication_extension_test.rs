@@ -2595,6 +2595,9 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
     assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["Targets"][0]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
+    // A RustFS target adopts the source version id, so the P1-19
+    // version-identity probe passes.
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
@@ -7554,14 +7557,26 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
     assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
-    // No probe residue: cleanup must address the version id the target
-    // actually assigned, not the source id (which never matched anything).
-    let probe_key = target
+    // The probe PUT must carry the source version as `?versionId=` — the
+    // exact shape live replication uses (P0-5), and the only shape MinIO
+    // consumes. The journal records the query value.
+    let probe_put = target
         .requests()
         .into_iter()
         .find(|record| record.operation == FakeTargetOperation::PutObject)
-        .and_then(|record| record.key)
         .ok_or("the probe PUT never reached the fake target")?;
+    let probe_query_version = probe_put
+        .version_id
+        .as_deref()
+        .ok_or("the probe PUT must carry a versionId query")?;
+    assert!(
+        uuid::Uuid::parse_str(probe_query_version).is_ok(),
+        "the probe versionId query must be the source uuid, got {probe_query_version}"
+    );
+
+    // No probe residue: cleanup must address the version id the target
+    // actually assigned, not the source id (which never matched anything).
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
     assert!(
         target.stored_versions(target_bucket, &probe_key).is_empty(),
         "the probe object must be cleaned up on the mismatching target"

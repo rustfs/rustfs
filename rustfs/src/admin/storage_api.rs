@@ -183,6 +183,7 @@ pub(crate) mod bandwidth {
 }
 
 pub(crate) mod bucket_target_sys {
+    pub(crate) use super::ecstore_bucket::bucket_target_sys::append_version_id_query;
     pub(crate) type AdvancedPutOptions = super::ecstore_bucket::bucket_target_sys::AdvancedPutOptions;
     pub(crate) type BucketTargetError = super::ecstore_bucket::bucket_target_sys::BucketTargetError;
     pub(crate) type BucketTargetSys = super::ecstore_bucket::bucket_target_sys::BucketTargetSys;
