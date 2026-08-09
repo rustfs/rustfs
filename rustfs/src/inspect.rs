@@ -1096,6 +1096,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_incarnation_rejects_nil_and_malformed_sidecars() {
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        let legacy_blob = bucket_metadata_blob(Uuid::nil());
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_METADATA_FILE, &legacy_blob, true).await;
+
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_INCARNATION_FILE, Uuid::nil().as_bytes(), true).await;
+        let nil_error = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect_err("a persisted nil bucket incarnation must fail");
+        assert!(nil_error.to_string().contains("incarnation is nil"), "unexpected error: {nil_error}");
+
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_INCARNATION_FILE, &[0x5a; 15], true).await;
+        let malformed_error = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect_err("a malformed bucket incarnation must fail");
+        assert!(
+            malformed_error
+                .to_string()
+                .contains("persisted bucket incarnation is invalid"),
+            "unexpected error: {malformed_error}"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_v1_whole_file_bitrot_fixtures_support_all_persisted_algorithms() {
         let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
         let erasure = Erasure::try_new(4, 2, 1_048_576).expect("legacy erasure geometry");
@@ -1175,6 +1201,8 @@ mod tests {
         let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
         let stale_first = vec![
             quorum_test_shard("stale-1", stale_time, 1),
+            quorum_test_shard("stale-2", stale_time, 2),
+            quorum_test_shard("stale-3", stale_time, 3),
             quorum_test_shard("current-3", current_time, 3),
             quorum_test_shard("current-2", current_time, 2),
             quorum_test_shard("current-1", current_time, 1),
@@ -1184,6 +1212,8 @@ mod tests {
             quorum_test_shard("current-2", current_time, 2),
             quorum_test_shard("current-3", current_time, 3),
             quorum_test_shard("stale-1", stale_time, 1),
+            quorum_test_shard("stale-2", stale_time, 2),
+            quorum_test_shard("stale-3", stale_time, 3),
         ];
 
         for shards in [stale_first, current_first] {
@@ -1192,6 +1222,27 @@ mod tests {
             assert_eq!(selected_shards.len(), 3);
             assert!(selected_shards.iter().all(|shard| shard.drive.starts_with("current-")));
         }
+    }
+
+    #[test]
+    fn metadata_selection_rejects_two_write_quorums_at_the_same_modification_time() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(2).expect("test timestamp");
+        let mut shards = Vec::new();
+        for index in 1..=3 {
+            shards.push(quorum_test_shard(&format!("identity-a-{index}"), mod_time, index));
+            let mut other = quorum_test_shard(&format!("identity-b-{index}"), mod_time, index);
+            other.file_info.size = 64;
+            shards.push(other);
+        }
+
+        let Err(error) = select_quorum_shards(shards) else {
+            panic!("two different write-quorum identities at one timestamp must fail closed");
+        };
+        assert!(
+            error.to_string().contains("2 different object-metadata identities"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("latest modification time"), "unexpected error: {error}");
     }
 
     #[test]
