@@ -263,52 +263,97 @@ impl DiskFaultHarness {
         key: &str,
         version_id: Option<&str>,
     ) -> ChaosResult<VersionShardCensus> {
-        let version_id = version_id.map(str::to_owned);
-        let object_dir = self.disks[disk_index].join(bucket).join(key);
-        let meta_path = object_dir.join("xl.meta");
-        if !meta_path.is_file() {
-            return Ok(VersionShardCensus {
-                version_id,
-                has_xl_meta: false,
-                data_dir: None,
-                expected_part_numbers: BTreeSet::new(),
-                present_part_numbers: BTreeSet::new(),
-            });
-        }
-
-        let metadata = rustfs_filemeta::FileMeta::load(&std::fs::read(&meta_path)?)?;
-        let file_info = metadata.into_fileinfo(bucket, key, version_id.as_deref().unwrap_or_default(), true, false, true)?;
-        let expected_part_numbers = if file_info.inline_data() {
-            BTreeSet::new()
-        } else {
-            file_info.parts.iter().map(|part| part.number).collect()
-        };
-        let data_dir = file_info.data_dir.map(|id| id.to_string());
-        let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
-        let present_part_numbers = match std::fs::read_dir(&part_dir) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| {
-                    entry
-                        .file_type()
-                        .ok()
-                        .filter(|kind| kind.is_file())
-                        .and_then(|_| entry.file_name().to_str().map(str::to_owned))
-                })
-                .filter_map(|name| name.strip_prefix("part.").and_then(|number| number.parse::<usize>().ok()))
-                .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
-            Err(error) => return Err(error.into()),
-        };
-
-        Ok(VersionShardCensus {
-            version_id,
-            has_xl_meta: true,
-            data_dir,
-            expected_part_numbers,
-            present_part_numbers,
-        })
+        census_object_version_on_disk(&self.disks[disk_index], bucket, key, version_id)
     }
+}
+
+/// Census one physical object version without requiring a single-node harness.
+/// Cluster replacement tests use the same evidence as the disk-fault tests.
+pub(crate) fn census_object_version_on_disk(
+    disk: &Path,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> ChaosResult<VersionShardCensus> {
+    let version_id = version_id.map(str::to_owned);
+    let object_dir = disk.join(bucket).join(key);
+    let meta_path = object_dir.join("xl.meta");
+    if !meta_path.is_file() {
+        return Ok(VersionShardCensus {
+            version_id,
+            has_xl_meta: false,
+            data_dir: None,
+            expected_part_numbers: BTreeSet::new(),
+            present_part_numbers: BTreeSet::new(),
+        });
+    }
+
+    let metadata = rustfs_filemeta::FileMeta::load(&std::fs::read(&meta_path)?)?;
+    let file_info = metadata.into_fileinfo(bucket, key, version_id.as_deref().unwrap_or_default(), true, false, true)?;
+    let expected_part_numbers = if file_info.inline_data() {
+        BTreeSet::new()
+    } else {
+        file_info.parts.iter().map(|part| part.number).collect()
+    };
+    let data_dir = file_info.data_dir.map(|id| id.to_string());
+    let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
+    let present_part_numbers = match std::fs::read_dir(&part_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_file())
+                    .and_then(|_| entry.file_name().to_str().map(str::to_owned))
+            })
+            .filter_map(|name| name.strip_prefix("part.").and_then(|number| number.parse::<usize>().ok()))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    Ok(VersionShardCensus {
+        version_id,
+        has_xl_meta: true,
+        data_dir,
+        expected_part_numbers,
+        present_part_numbers,
+    })
+}
+
+/// Read the durable automatic-replacement intent for `target` from any
+/// surviving disk. This is deliberately on-disk evidence rather than an admin
+/// status response, which may be stale or unsupported by a mixed-version peer.
+pub(crate) fn replacement_resume_state_for_target(
+    survivor_disks: &[PathBuf],
+    target: &Path,
+) -> ChaosResult<Option<serde_json::Value>> {
+    let target = target.to_string_lossy();
+    for disk in survivor_disks {
+        let resume_dir = disk.join(".rustfs.sys").join("buckets");
+        let Ok(entries) = std::fs::read_dir(resume_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with("_ahm_resume_state.json") {
+                continue;
+            }
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+            let owns_target = state["replacement_targets"].as_array().is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|endpoint| endpoint.ends_with(target.as_ref()))
+            });
+            if owns_target {
+                return Ok(Some(state));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `POST` a signed (SigV4, service `s3`) admin request without relying on the

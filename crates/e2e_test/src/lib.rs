@@ -39,6 +39,12 @@ pub mod fault_proxy;
 #[cfg(test)]
 mod reliability_disk_fault_test;
 
+// The single-host 3x4 replacement scenario needs the Linux mount lease and
+// debug-only local-drive readiness seam; production builds always keep the
+// physical-mount admission.
+#[cfg(all(test, debug_assertions, target_os = "linux"))]
+mod replacement_auto_heal_e2e_test;
+
 // dist-13 (backlog#1150/#1155): e2e regression net proving a large-object
 // degraded EC read never returns a silently truncated body (rustfs#4594/#4560/#4585).
 #[cfg(test)]
