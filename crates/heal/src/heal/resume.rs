@@ -745,26 +745,42 @@ impl ResumeManager {
         }
 
         if Self::has_replacement_intent(&disk, &task_id).await {
-            let manager = Self::load_replacement_intent(disk, &task_id).await?;
-            let state = manager.get_state().await;
-            if state.set_disk_id != set_disk_id
-                || state.replacement_targets != replacement_targets
-                || state.replacement_target_identities != replacement_target_identities
-                || state.replacement_generation.as_deref() != Some(task_id.as_str())
-                || !matches!(
-                    state.replacement_phase,
-                    ReplacementPhase::Intent
-                        | ReplacementPhase::Rebuilding
-                        | ReplacementPhase::Verified
-                        | ReplacementPhase::CleanupPending
-                )
-            {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Replacement intent does not match task {task_id}"),
-                });
+            match Self::load_replacement_intent(disk.clone(), &task_id).await {
+                Ok(manager) => {
+                    let state = manager.get_state().await;
+                    if state.set_disk_id != set_disk_id
+                        || state.replacement_targets != replacement_targets
+                        || state.replacement_target_identities != replacement_target_identities
+                        || state.replacement_generation.as_deref() != Some(task_id.as_str())
+                        || !matches!(
+                            state.replacement_phase,
+                            ReplacementPhase::Intent
+                                | ReplacementPhase::Rebuilding
+                                | ReplacementPhase::Verified
+                                | ReplacementPhase::CleanupPending
+                        )
+                    {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Replacement intent does not match task {task_id}"),
+                        });
+                    }
+                    manager.ensure_replacement_recovery_marker().await?;
+                    return Ok(manager);
+                }
+                Err(error) if Self::can_recover_torn_replacement_intent(&disk, &task_id).await? => {
+                    warn!(
+                        target: "rustfs::heal::resume",
+                        event = EVENT_HEAL_RESUME_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_RESUME,
+                        task_id,
+                        error = %error,
+                        state = "torn_replacement_intent_recovered",
+                        "Replacing a torn replacement intent before formatting"
+                    );
+                }
+                Err(error) => return Err(error),
             }
-            manager.ensure_replacement_recovery_marker().await?;
-            return Ok(manager);
         }
 
         let state = ResumeState::replacement_intent(
@@ -1061,6 +1077,30 @@ impl ResumeManager {
         }
     }
 
+    async fn can_recover_torn_replacement_intent(disk: &DiskStore, task_id: &str) -> Result<bool> {
+        validate_resume_task_id(task_id)?;
+        let path = ResumeStateFile::ReplacementIntent.path(task_id);
+        let path = path_to_str(&path)?;
+        match disk.read_all(RUSTFS_META_BUCKET, path).await {
+            Ok(bytes) if serde_json::from_slice::<ResumeState>(&bytes).is_err() => {
+                let marker = replacement_recovery_marker_path(task_id);
+                let marker = path_to_str(&marker)?;
+                match disk.read_all(RUSTFS_META_BUCKET, marker).await {
+                    Err(DiskError::FileNotFound) => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to read replacement recovery marker: {error}"),
+                    }),
+                }
+            }
+            Ok(_) => Ok(false),
+            Err(DiskError::FileNotFound) => Ok(false),
+            Err(error) => Err(Error::TaskExecutionFailed {
+                message: format!("Failed to read replacement intent: {error}"),
+            }),
+        }
+    }
+
     /// get current state
     pub async fn get_state(&self) -> ResumeState {
         self.state.read().await.clone()
@@ -1275,16 +1315,20 @@ impl ResumeManager {
     }
 
     async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
-        let state = self.state.read().await;
+        let state = self.state.read().await.clone();
         validate_resume_task_id(&state.task_id)?;
-        let state_data = serde_json::to_vec(&*state).map_err(|e| Error::TaskExecutionFailed {
+        let state_data = EcstoreDiskBytes::from(serde_json::to_vec(&state).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to serialize resume state: {e}"),
-        })?;
+        })?);
 
         let file_path = self.state_file.path(&state.task_id);
 
         let path_str = path_to_str(&file_path)?;
-        if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
+        let write_result = match self.state_file {
+            ResumeStateFile::Ordinary => self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data).await,
+            ResumeStateFile::ReplacementIntent => self.write_replacement_intent_state(path_str, state_data).await,
+        };
+        if let Err(e) = write_result {
             if allow_unformatted && matches!(e, DiskError::UnformattedDisk) {
                 warn!(
                     target: "rustfs::heal::resume",
@@ -1312,6 +1356,34 @@ impl ResumeManager {
             "Heal resume state persisted"
         );
         Ok(())
+    }
+
+    async fn write_replacement_intent_state(
+        &self,
+        path: &str,
+        state_data: EcstoreDiskBytes,
+    ) -> std::result::Result<(), DiskError> {
+        for _ in 0..2 {
+            let expected = match self.disk.read_all(RUSTFS_META_BUCKET, path).await {
+                Ok(existing) => Some(existing),
+                Err(DiskError::FileNotFound) => None,
+                Err(error) => return Err(error),
+            };
+            match super::storage_api::owner::EcstoreDiskAPI::compare_and_update_file(
+                self.disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                path,
+                expected,
+                Some(state_data.clone()),
+            )
+            .await
+            {
+                Ok(EcstoreConditionalFileUpdate::Updated) => return Ok(()),
+                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(DiskError::other("replacement intent changed while publishing"))
     }
 
     /// read state file from disk
@@ -2065,6 +2137,90 @@ mod tests {
                 .get_state()
                 .await,
             manager.get_state().await
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_recovers_from_torn_publication_before_formatting() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            intent_path.to_str().expect("replacement intent path must be UTF-8"),
+            b"{torn replacement intent".as_slice().into(),
+        )
+        .await
+        .expect("torn replacement intent fixture should persist");
+
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("a retry must atomically replace only a torn pre-format intent");
+
+        let recovered = ResumeManager::load_replacement_intent(disk, &task_id)
+            .await
+            .expect("recovered intent should be readable after restart")
+            .get_state()
+            .await;
+        assert_eq!(recovered, manager.get_state().await);
+        assert_eq!(recovered.replacement_phase, ReplacementPhase::Intent);
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_does_not_recreate_torn_state_after_marker_publication() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+        let intent_path = intent_path.to_str().expect("replacement intent path must be UTF-8");
+        let torn = b"{torn replacement intent";
+        disk.write_all(RUSTFS_META_BUCKET, intent_path, torn.as_slice().into())
+            .await
+            .expect("torn replacement intent fixture should persist");
+        let marker_path = replacement_recovery_marker_path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            marker_path.to_str().expect("replacement marker path must be UTF-8"),
+            b"replacement".as_slice().into(),
+        )
+        .await
+        .expect("recovery marker fixture should persist");
+
+        let error = match ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        {
+            Ok(_) => panic!("a marker means a torn state may have crossed the format boundary"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Failed to deserialize resume state"));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, intent_path)
+                .await
+                .expect("torn intent must remain for operator recovery"),
+            torn.as_slice()
         );
     }
 
