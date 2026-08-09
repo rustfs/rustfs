@@ -7148,3 +7148,87 @@ async fn test_replication_put_and_create_multipart_carry_source_version_id_query
     target.shutdown().await;
     Ok(())
 }
+
+/// P1-20: inbound replicas never cascade. An object replicated A->B carries
+/// x-amz-replication-status=REPLICA on B; `must_replicate` returns an empty
+/// decision for replicas, so even an ExistingObjectReplication=Enabled rule
+/// configured on B AFTER the replica landed (making it an "existing object"
+/// for that rule) must never push it onward — while B's own native objects
+/// flow to the onward bucket, proving B's outbound replication and scanner
+/// are live.
+#[tokio::test]
+#[serial]
+async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
+    init_logging();
+
+    let mut env_a = RustFSTestEnvironment::new().await?;
+    let mut env_a_vars = replication_fast_env();
+    env_a_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_a.start_rustfs_server_with_env(vec![], &env_a_vars).await?;
+
+    // B becomes a replication source itself, driven by its scanner.
+    let mut env_b = RustFSTestEnvironment::new().await?;
+    let mut env_b_vars = replication_fast_env();
+    env_b_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_b_vars.extend_from_slice(FAST_SCANNER_ENV);
+    env_b.start_rustfs_server_with_env(vec![], &env_b_vars).await?;
+
+    let bucket_a = "cascade-a-src";
+    let bucket_b = "cascade-b-mid";
+    let bucket_c = "cascade-a-third";
+    let client_a = env_a.create_s3_client();
+    let client_b = env_b.create_s3_client();
+    client_a.create_bucket().bucket(bucket_a).send().await?;
+    client_b.create_bucket().bucket(bucket_b).send().await?;
+    client_a.create_bucket().bucket(bucket_c).send().await?;
+    enable_bucket_versioning(&env_a, bucket_a).await?;
+    enable_bucket_versioning(&env_b, bucket_b).await?;
+    enable_bucket_versioning(&env_a, bucket_c).await?;
+
+    // A -> B first: the replica lands on B before B has any outbound rule.
+    let arn_ab = set_replication_target(&env_a, bucket_a, &env_b, bucket_b).await?;
+    put_bucket_replication(&env_a, bucket_a, &arn_ab).await?;
+
+    let replica_key = "replica-object.txt";
+    let replica_payload = "replica payload";
+    client_a
+        .put_object()
+        .bucket(bucket_a)
+        .key(replica_key)
+        .body(ByteStream::from_static(replica_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_b, bucket_b, replica_key, replica_payload).await?;
+
+    // Precondition for the anti-cascade contract: the inbound copy must carry
+    // REPLICA status on B. If this fails, the break is in inbound status
+    // stamping, not in the scanner guard.
+    let inbound = client_b.head_object().bucket(bucket_b).key(replica_key).send().await?;
+    assert_eq!(
+        inbound.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "inbound replica must be stamped REPLICA on the target"
+    );
+
+    // Now wire B's outbound rule; the replica is an "existing object" for it.
+    let arn_bc = set_replication_target(&env_b, bucket_b, &env_a, bucket_c).await?;
+    put_bucket_replication(&env_b, bucket_b, &arn_bc).await?;
+
+    // B's own native object flows onward through the live path.
+    let native_key = "native-control.txt";
+    let native_payload = "native control payload";
+    client_b
+        .put_object()
+        .bucket(bucket_b)
+        .key(native_key)
+        .body(ByteStream::from_static(native_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_a, bucket_c, native_key, native_payload).await?;
+
+    // With B's outbound proven, the inbound replica must stay put across
+    // multiple fast-scanner cycles.
+    assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}

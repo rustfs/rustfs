@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore,
+    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectOptions,
+    SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore, SnapshotConsistencyError,
     query::{
         parser::RustFsDialect,
         session::{QueryExecutionGuard, QueryExecutionTracker},
@@ -24,7 +24,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use datafusion::{
     common::{DataFusionError, runtime::SpawnedTask},
     execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool},
@@ -43,31 +43,24 @@ use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
 use parking_lot::Mutex;
 use rustfs_common::DEFAULT_DELIMITER;
-use s3s::S3Result;
-use s3s::dto::SelectObjectContentInput;
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
 };
-use s3s::s3_error;
+use s3s::{S3Error, S3ErrorCode, S3Result, dto::SelectObjectContentInput};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
-use crate::storage_api::object_store::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use crate::storage_api::object_store::HTTPRangeSpec;
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
-}
-
-fn validated_object_size(size: i64) -> Result<u64> {
-    u64::try_from(size).map_err(|err| o_Error::Generic {
-        store: "EcObjectStore",
-        source: Box::new(err),
-    })
 }
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
@@ -94,7 +87,6 @@ pub const INVALID_SCAN_RANGE_MESSAGE: &str =
 const NORMALIZED_RECORD_DELIMITER: &[u8] = b"\r\n";
 const NORMALIZED_FIELD_DELIMITER: &[u8] = &[DEFAULT_DELIMITER];
 
-#[derive(Debug)]
 pub struct EcObjectStore {
     input: Arc<SelectObjectContentInput>,
     need_convert: bool,
@@ -109,38 +101,18 @@ pub struct EcObjectStore {
     json_sub_path: Option<String>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
-
-    store: Arc<SelectStore>,
+    store: Option<Arc<SelectStore>>,
+    snapshot: OnceCell<Arc<SelectObjectSnapshot>>,
+    #[cfg(test)]
+    reader_open_count: Arc<AtomicUsize>,
 }
 
-#[cfg(test)]
-struct ScanRangeBeforeMainHook {
-    bucket: String,
-    object: String,
-    reached: tokio::sync::oneshot::Sender<()>,
-    resume: tokio::sync::oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-static SCAN_RANGE_BEFORE_MAIN_HOOK: tokio::sync::Mutex<Option<ScanRangeBeforeMainHook>> = tokio::sync::Mutex::const_new(None);
-
-#[cfg(test)]
-async fn run_scan_range_before_main_hook(bucket: &str, object: &str) {
-    let hook = {
-        let mut hook = SCAN_RANGE_BEFORE_MAIN_HOOK.lock().await;
-        if hook
-            .as_ref()
-            .is_some_and(|hook| hook.bucket == bucket && hook.object == object)
-        {
-            hook.take()
-        } else {
-            None
-        }
-    };
-    if let Some(hook) = hook {
-        let _ = hook.reached.send(());
-        let _ = hook.resume.await;
-    }
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EcObjectStoreBuildError {
+    #[error("ec store not inited")]
+    StoreUnavailable,
+    #[error("SelectObjectContent snapshot consistency failure: {0}")]
+    Snapshot(#[source] SnapshotConsistencyError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -168,20 +140,55 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        Self::build(input, Arc::new(UnboundedMemoryPool::default()), None, None)
+        Self::build_lazy(input, Arc::new(UnboundedMemoryPool::default()), None).map_err(map_build_error_to_s3)
     }
 
-    pub(crate) fn new_with_memory_pool(input: Arc<SelectObjectContentInput>, memory_pool: Arc<dyn MemoryPool>) -> S3Result<Self> {
-        Self::build(input, memory_pool, None, None)
+    pub fn new_with_snapshot(input: Arc<SelectObjectContentInput>, snapshot: Arc<SelectObjectSnapshot>) -> S3Result<Self> {
+        Self::build_with_snapshot(input, Arc::new(UnboundedMemoryPool::default()), None, snapshot).map_err(map_build_error_to_s3)
+    }
+
+    pub(crate) fn new_with_memory_pool(
+        input: Arc<SelectObjectContentInput>,
+        memory_pool: Arc<dyn MemoryPool>,
+        snapshot: Option<Arc<SelectObjectSnapshot>>,
+    ) -> std::result::Result<Self, EcObjectStoreBuildError> {
+        match snapshot {
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, None, snapshot),
+            None => Self::build_lazy(input, memory_pool, None),
+        }
     }
 
     pub(crate) fn new_with_query_tracker(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: QueryExecutionTracker,
-        store: Option<Arc<SelectStore>>,
-    ) -> S3Result<Self> {
-        Self::build(input, memory_pool, Some(query_tracker), store)
+        snapshot: Option<Arc<SelectObjectSnapshot>>,
+    ) -> std::result::Result<Self, EcObjectStoreBuildError> {
+        match snapshot {
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, Some(query_tracker), snapshot),
+            None => Self::build_lazy(input, memory_pool, Some(query_tracker)),
+        }
+    }
+
+    fn build_lazy(
+        input: Arc<SelectObjectContentInput>,
+        memory_pool: Arc<dyn MemoryPool>,
+        query_tracker: Option<QueryExecutionTracker>,
+    ) -> std::result::Result<Self, EcObjectStoreBuildError> {
+        let store = resolve_select_object_store_handle().ok_or(EcObjectStoreBuildError::StoreUnavailable)?;
+        Ok(Self::build(input, memory_pool, query_tracker, Some(store), None))
+    }
+
+    fn build_with_snapshot(
+        input: Arc<SelectObjectContentInput>,
+        memory_pool: Arc<dyn MemoryPool>,
+        query_tracker: Option<QueryExecutionTracker>,
+        snapshot: Arc<SelectObjectSnapshot>,
+    ) -> std::result::Result<Self, EcObjectStoreBuildError> {
+        if !snapshot.is_for(&input.bucket, &input.key) {
+            return Err(EcObjectStoreBuildError::Snapshot(SnapshotConsistencyError::ObjectChanged));
+        }
+        Ok(Self::build(input, memory_pool, query_tracker, None, Some(snapshot)))
     }
 
     fn build(
@@ -189,11 +196,8 @@ impl EcObjectStore {
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
         store: Option<Arc<SelectStore>>,
-    ) -> S3Result<Self> {
-        let Some(store) = store.or_else(resolve_select_object_store_handle) else {
-            return Err(s3_error!(InternalError, "ec store not inited"));
-        };
-
+        snapshot: Option<Arc<SelectObjectSnapshot>>,
+    ) -> Self {
         let (need_convert, delimiter) = if let Some(csv) = input.request.input_serialization.csv.as_ref() {
             if let Some(delimiter) = csv.field_delimiter.as_ref() {
                 if delimiter.len() > 1 {
@@ -227,7 +231,7 @@ impl EcObjectStore {
             None
         };
 
-        Ok(Self {
+        Self {
             input,
             need_convert,
             delimiter,
@@ -236,18 +240,13 @@ impl EcObjectStore {
             memory_pool,
             query_tracker,
             store,
-        })
-    }
-
-    fn object_options(&self, options: &GetOptions) -> SelectObjectOptions {
-        SelectObjectOptions {
-            version_id: options.version.clone(),
-            ..Default::default()
+            snapshot: match snapshot {
+                Some(snapshot) => OnceCell::new_with(Some(snapshot)),
+                None => OnceCell::new(),
+            },
+            #[cfg(test)]
+            reader_open_count: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    fn read_headers(&self) -> HeaderMap {
-        select_read_headers(&self.input)
     }
 
     fn scan_range(&self, object_size: u64) -> Result<Option<SelectScanRange>> {
@@ -283,37 +282,60 @@ impl EcObjectStore {
             .is_some_and(|info| matches!(info.as_str(), "USE" | "IGNORE"))
     }
 
-    async fn object_info(&self, opts: &SelectObjectOptions) -> Result<SelectObjectInfo> {
-        self.store
-            .get_object_info(&self.input.bucket, &self.input.key, opts)
-            .await
-            .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
+    async fn snapshot(&self, version: Option<&str>) -> Result<&Arc<SelectObjectSnapshot>> {
+        let snapshot = self
+            .snapshot
+            .get_or_try_init(|| async {
+                let store = self.store.as_ref().ok_or_else(|| o_Error::Generic {
+                    store: "EcObjectStore",
+                    source: "prepared snapshot is unavailable".into(),
+                })?;
+                let opts = SelectObjectOptions {
+                    version_id: version.map(|version| {
+                        let version = version.trim();
+                        if version.eq_ignore_ascii_case("null") {
+                            uuid::Uuid::nil().to_string()
+                        } else {
+                            version.to_owned()
+                        }
+                    }),
+                    ..Default::default()
+                };
+                let snapshot = store
+                    .prepare_select_object_snapshot(&self.input.bucket, &self.input.key, &select_read_headers(&self.input), &opts)
+                    .await
+                    .map_err(|err| map_prepare_snapshot_error(&self.input.bucket, &self.input.key, err))?;
+                Ok::<_, o_Error>(Arc::new(snapshot))
+            })
+            .await?;
+        if let Some(requested) = version
+            && !snapshot.matches_version(requested)
+        {
+            return Err(o_Error::Generic {
+                store: "EcObjectStore",
+                source: "prepared snapshot is pinned to a different object version".into(),
+            });
+        }
+        Ok(snapshot)
     }
 
-    async fn object_reader(&self, range: Option<HTTPRangeSpec>, opts: &SelectObjectOptions) -> Result<SelectGetObjectReader> {
-        let h = self.read_headers();
-        self.store
-            .get_object_reader(&self.input.bucket, &self.input.key, range, h, opts)
+    async fn object_reader(&self, range: Option<HTTPRangeSpec>) -> Result<SelectGetObjectReader> {
+        #[cfg(test)]
+        self.reader_open_count.fetch_add(1, Ordering::Relaxed);
+        self.snapshot(None)
+            .await?
+            .open_reader(range)
             .await
-            .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
+            .map_err(|err| snapshot_read_error(&self.input.bucket, &self.input.key, err))
     }
 
-    async fn read_raw_range_with_opts(
-        &self,
-        range: Range<u64>,
-        opts: &SelectObjectOptions,
-        expected_snapshot: Option<&SelectObjectInfo>,
-    ) -> Result<Bytes> {
+    async fn read_raw_range(&self, range: Range<u64>) -> Result<Bytes> {
         if range.is_empty() {
             return Ok(Bytes::new());
         }
-        let reader = self
-            .object_reader(Some(http_range_spec_from_range(range.clone())), opts)
-            .await?;
-        if let Some(expected_snapshot) = expected_snapshot {
-            validate_object_snapshot(expected_snapshot, &reader.object_info)?;
-        }
-        let object_size = validated_object_size(reader.object_info.size)?;
+        let snapshot = self.snapshot(None).await?;
+        let reader = self.object_reader(Some(http_range_spec_from_range(range.clone()))).await?;
+        let object_size = snapshot.logical_size();
         let resolved_range = GetRange::Bounded(range)
             .as_range(object_size)
             .map_err(|err| o_Error::Generic {
@@ -337,25 +359,14 @@ impl EcObjectStore {
         Ok(Bytes::from(bytes))
     }
 
-    async fn read_raw_range(&self, range: Range<u64>) -> Result<Bytes> {
-        self.read_raw_range_with_opts(range, &self.object_options(&GetOptions::new()), None)
-            .await
-    }
-
-    async fn read_header_record(
-        &self,
-        object_size: u64,
-        delimiter: &[u8],
-        opts: &SelectObjectOptions,
-        expected_snapshot: &SelectObjectInfo,
-    ) -> Result<Bytes> {
+    async fn read_header_record(&self, object_size: u64, delimiter: &[u8]) -> Result<Bytes> {
         if object_size == 0 {
             return Ok(Bytes::new());
         }
 
         let mut end = select_default_read_buffer_size_u64().min(object_size);
         loop {
-            let bytes = self.read_raw_range_with_opts(0..end, opts, Some(expected_snapshot)).await?;
+            let bytes = self.read_raw_range(0..end).await?;
             if let Some(pos) = find_delimiter(&bytes, delimiter) {
                 return Ok(bytes.slice(0..pos + delimiter.len()));
             }
@@ -366,13 +377,7 @@ impl EcObjectStore {
         }
     }
 
-    async fn scan_range_read_start(
-        &self,
-        scan_range: SelectScanRange,
-        delimiter: &[u8],
-        opts: &SelectObjectOptions,
-        expected_snapshot: &SelectObjectInfo,
-    ) -> Result<u64> {
+    async fn scan_range_read_start(&self, scan_range: SelectScanRange, delimiter: &[u8]) -> Result<u64> {
         let delimiter_len = u64::try_from(delimiter.len()).unwrap_or(u64::MAX);
         let fallback_start = scan_range.start().saturating_sub(delimiter_len);
         if delimiter.len() != 2 || delimiter[0] != delimiter[1] || scan_range.start() == 0 {
@@ -380,9 +385,7 @@ impl EcObjectStore {
         }
 
         let context_start = scan_range.start().saturating_sub(select_default_read_buffer_size_u64());
-        let context = self
-            .read_raw_range_with_opts(context_start..scan_range.start(), opts, Some(expected_snapshot))
-            .await?;
+        let context = self.read_raw_range(context_start..scan_range.start()).await?;
         let suffix_len = context.iter().rev().take_while(|byte| **byte == delimiter[0]).count();
         if suffix_len == context.len() && context_start > 0 {
             return Err(o_Error::Generic {
@@ -394,6 +397,18 @@ impl EcObjectStore {
             return Ok(fallback_start);
         }
         Ok(scan_range.start().saturating_sub(u64::from(suffix_len % 2 != 0)))
+    }
+}
+
+impl std::fmt::Debug for EcObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcObjectStore")
+            .field("bucket", &self.input.bucket)
+            .field("object", &self.input.key)
+            .field("need_convert", &self.need_convert)
+            .field("is_json_document", &self.is_json_document)
+            .field("json_sub_path", &self.json_sub_path)
+            .finish_non_exhaustive()
     }
 }
 
@@ -469,21 +484,6 @@ fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
     }
 }
 
-fn validate_object_snapshot(expected: &SelectObjectInfo, actual: &SelectObjectInfo) -> Result<()> {
-    if expected.size != actual.size
-        || expected.version_id != actual.version_id
-        || expected.data_dir != actual.data_dir
-        || expected.etag != actual.etag
-        || expected.mod_time != actual.mod_time
-    {
-        return Err(o_Error::Generic {
-            store: "EcObjectStore",
-            source: "object changed while preparing SelectObjectContent ScanRange".into(),
-        });
-    }
-    Ok(())
-}
-
 fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
     if delimiter.is_empty() {
         return None;
@@ -491,17 +491,55 @@ fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
     bytes.windows(delimiter.len()).position(|window| window == delimiter)
 }
 
+fn map_prepare_snapshot_error(bucket: &str, object: &str, err: PrepareSelectObjectSnapshotError) -> o_Error {
+    match err {
+        PrepareSelectObjectSnapshotError::Storage(err) => map_storage_error(bucket, object, err),
+        err => o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        },
+    }
+}
+
+fn map_build_error_to_s3(error: EcObjectStoreBuildError) -> S3Error {
+    let message = error.to_string();
+    let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, message);
+    s3_error.set_source(Box::new(error));
+    s3_error
+}
+
+fn snapshot_read_error(bucket: &str, object: &str, err: SelectObjectSnapshotReadError) -> o_Error {
+    match err {
+        SelectObjectSnapshotReadError::Storage(err) => map_storage_error(bucket, object, err),
+        err => o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        },
+    }
+}
+
 fn map_storage_error(bucket: &str, object: &str, err: SelectStorageError) -> o_Error {
     if select_is_err_bucket_not_found(&err) || select_is_err_object_not_found(&err) || select_is_err_version_not_found(&err) {
         return o_Error::NotFound {
             path: format!("{bucket}/{object}"),
-            source: err.to_string().into(),
+            source: Box::new(err),
         };
     }
     o_Error::Generic {
         store: "EcObjectStore",
         source: Box::new(err),
     }
+}
+
+fn snapshot_last_modified(snapshot: &SelectObjectSnapshot) -> Result<DateTime<Utc>> {
+    let mod_time = snapshot.object_info().mod_time.ok_or_else(|| o_Error::Generic {
+        store: "EcObjectStore",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot metadata has no modification time").into(),
+    })?;
+    DateTime::<Utc>::from_timestamp(mod_time.unix_timestamp(), mod_time.nanosecond()).ok_or_else(|| o_Error::Generic {
+        store: "EcObjectStore",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot modification time is out of range").into(),
+    })
 }
 
 pub fn scan_range_from_bounds(start: Option<i64>, end: Option<i64>, object_size: u64) -> Result<Option<SelectScanRange>> {
@@ -579,51 +617,19 @@ impl ObjectStore for EcObjectStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let opts = self.object_options(&options);
-        let record_delimiter = if options.head {
-            None
-        } else {
-            self.record_delimiter_for_conversion()
+        // SelectObjectContent has no version-id input. For direct ObjectStore
+        // compatibility, a version supplied on the first operation defines
+        // this instance's immutable snapshot; later operations reuse it.
+        let snapshot = self.snapshot(options.version.as_deref()).await?;
+        let original_size = snapshot.logical_size();
+        let object_info = snapshot.object_info();
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: snapshot_last_modified(snapshot)?,
+            size: original_size,
+            e_tag: object_info.etag.clone(),
+            version: object_info.version_id.map(|version| version.to_string()),
         };
-        let needs_scan_context = options.range.is_none() && !options.head && self.input.request.scan_range.is_some();
-        let scan_context = if needs_scan_context {
-            let source_snapshot = self.object_info(&opts).await?;
-            let original_size = validated_object_size(source_snapshot.size)?;
-            if let Some(scan_range) = self.scan_range(original_size)? {
-                let delimiter = self.record_delimiter();
-                let read_start = self
-                    .scan_range_read_start(scan_range, &delimiter, &opts, &source_snapshot)
-                    .await?;
-                Some((source_snapshot, scan_range, read_start))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        #[cfg(test)]
-        if scan_context.is_some() {
-            run_scan_range_before_main_hook(&self.input.bucket, &self.input.key).await;
-        }
-        let range = options.range.as_ref().map(http_range_spec_from_get_range);
-        let reader = if let Some((source_snapshot, _, read_start)) = scan_context.as_ref() {
-            let range = (source_snapshot.size > 0).then(|| http_range_spec_from_start(*read_start));
-            self.object_reader(range, &opts).await?
-        } else {
-            self.object_reader(range, &opts).await?
-        };
-        if let Some((source_snapshot, _, _)) = scan_context.as_ref() {
-            validate_object_snapshot(source_snapshot, &reader.object_info)?;
-        }
-
-        let original_size = match scan_context.as_ref() {
-            Some((source_snapshot, _, _)) => validated_object_size(source_snapshot.size)?,
-            None => validated_object_size(reader.object_info.size)?,
-        };
-        let etag = reader.object_info.etag;
-        let version = reader.object_info.version_id.map(|version| version.to_string());
-        let attributes = Attributes::default();
         let result_range = match options.range.as_ref() {
             Some(range) => range.as_range(original_size).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
@@ -631,9 +637,38 @@ impl ObjectStore for EcObjectStore {
             })?,
             None => 0..original_size,
         };
-        let payload = if options.head {
-            GetResultPayload::Stream(stream::empty().boxed())
-        } else if options.range.is_some() {
+        if options.head {
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream::empty().boxed()),
+                meta,
+                range: result_range,
+                attributes: Attributes::default(),
+            });
+        }
+
+        let record_delimiter = self.record_delimiter_for_conversion();
+        let needs_scan_context = options.range.is_none() && self.input.request.scan_range.is_some();
+        let scan_context = if needs_scan_context {
+            if let Some(scan_range) = self.scan_range(original_size)? {
+                let delimiter = self.record_delimiter();
+                let read_start = self.scan_range_read_start(scan_range, &delimiter).await?;
+                Some((scan_range, read_start))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let range = options.range.as_ref().map(http_range_spec_from_get_range);
+        let reader = if let Some((_, read_start)) = scan_context.as_ref() {
+            let range = (original_size > 0).then(|| http_range_spec_from_start(*read_start));
+            self.object_reader(range).await?
+        } else {
+            self.object_reader(range).await?
+        };
+
+        let payload = if options.range.is_some() {
             let size = usize::try_from(result_range.end - result_range.start).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
@@ -663,14 +698,11 @@ impl ObjectStore for EcObjectStore {
                 self.query_tracker.clone(),
             );
             GetResultPayload::Stream(stream)
-        } else if let Some((source_snapshot, scan_range, read_start)) = scan_context {
+        } else if let Some((scan_range, read_start)) = scan_context {
             let delimiter = self.record_delimiter();
             let include_header = self.csv_has_header();
             let header = if include_header && read_start > 0 {
-                Some(
-                    self.read_header_record(original_size, &delimiter, &opts, &source_snapshot)
-                        .await?,
-                )
+                Some(self.read_header_record(original_size, &delimiter).await?)
             } else {
                 None
             };
@@ -694,10 +726,11 @@ impl ObjectStore for EcObjectStore {
                 self.need_convert.then(|| self.delimiter.clone()),
             ))
         } else {
-            let stream = bytes_stream(
-                ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
-                original_size as usize,
-            );
+            let stream_size = usize::try_from(original_size).map_err(|err| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(err),
+            })?;
+            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), stream_size);
             GetResultPayload::Stream(convert_csv_delimiter_stream(
                 stream,
                 record_delimiter,
@@ -705,19 +738,11 @@ impl ObjectStore for EcObjectStore {
             ))
         };
 
-        let meta = ObjectMeta {
-            location: location.clone(),
-            last_modified: Utc::now(),
-            size: original_size,
-            e_tag: etag,
-            version,
-        };
-
         Ok(GetResult {
             payload,
             meta,
             range: result_range,
-            attributes,
+            attributes: Attributes::default(),
         })
     }
 
@@ -1312,12 +1337,12 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        EcObjectStore, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SCAN_RANGE_BEFORE_MAIN_HOOK, SELECT_DEFAULT_READ_BUFFER_SIZE,
-        ScanRangeBeforeMainHook, SelectScanRange, bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream,
-        convert_record_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson,
-        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser,
-        scan_range_from_bounds, scan_range_stream, select_read_headers, validate_json_document_size, validate_object_snapshot,
-        validated_object_size,
+        EcObjectStore, EcObjectStoreBuildError, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, OnceCell,
+        SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
+        bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
+        extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
+        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, scan_range_from_bounds, scan_range_stream,
+        select_read_headers, snapshot_last_modified, validate_json_document_size,
     };
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
@@ -1332,6 +1357,9 @@ mod test {
         prelude::CsvReadOptions,
     };
     use futures::{StreamExt, TryStreamExt, stream};
+    use http::HeaderMap;
+    use rustfs_test_utils::PutObjectCommitBarrier;
+    use s3s::S3ErrorCode;
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization, ScanRange,
         SelectObjectContentInput, SelectObjectContentRequest,
@@ -1345,38 +1373,596 @@ mod test {
         atomic::{AtomicUsize, Ordering},
     };
 
-    #[test]
-    fn ec_object_store_constructor_remains_source_compatible() {
-        let _constructor: fn(Arc<SelectObjectContentInput>) -> s3s::S3Result<EcObjectStore> = EcObjectStore::new;
+    use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    fn csv_input(bucket: &str, object: &str) -> Arc<SelectObjectContentInput> {
+        Arc::new(SelectObjectContentInput {
+            bucket: bucket.to_string(),
+            expected_bucket_owner: None,
+            key: object.to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM s3object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        })
     }
-    use tokio::sync::Semaphore;
 
     #[test]
-    fn test_validated_object_size_rejects_negative_metadata() {
-        assert_eq!(validated_object_size(0).expect("zero object size should be valid"), 0);
-        assert!(validated_object_size(-1).is_err());
+    fn lazy_snapshot_headers_preserve_ssec_context() {
+        let mut input = (*csv_input("bucket", "object.csv")).clone();
+        input.sse_customer_algorithm = Some("AES256".to_string());
+        input.sse_customer_key = Some("customer-key".to_string());
+        input.sse_customer_key_md5 = Some("customer-key-md5".to_string());
+
+        let headers = select_read_headers(&input);
+
+        assert_eq!(
+            headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM)
+                .and_then(|value| value.to_str().ok()),
+            Some("AES256")
+        );
+        assert_eq!(
+            headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("customer-key")
+        );
+        assert_eq!(
+            headers
+                .get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5)
+                .and_then(|value| value.to_str().ok()),
+            Some("customer-key-md5")
+        );
     }
 
-    #[test]
-    fn test_scan_range_snapshot_validation_rejects_changed_object() {
-        let expected = crate::SelectObjectInfo::default();
-        let mut actual = expected.clone();
-        assert!(validate_object_snapshot(&expected, &actual).is_ok());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_constructor_retries_snapshot_after_not_found() {
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let bucket = "s3select-lazy-snapshot-retry";
+        let object = "input.csv";
+        env.make_bucket(bucket, false).await;
+        let store = EcObjectStore::new(csv_input(bucket, object)).expect("legacy constructor should resolve the global store");
 
-        actual.size = 1;
-        assert!(validate_object_snapshot(&expected, &actual).is_err());
-        actual = expected.clone();
-        actual.version_id = Some("00000000-0000-0000-0000-000000000001".parse().expect("valid version UUID"));
-        assert!(validate_object_snapshot(&expected, &actual).is_err());
-        actual = expected.clone();
-        actual.data_dir = Some("00000000-0000-0000-0000-000000000002".parse().expect("valid data-dir UUID"));
-        assert!(validate_object_snapshot(&expected, &actual).is_err());
-        actual = expected.clone();
-        actual.etag = Some("changed".to_string());
-        assert!(validate_object_snapshot(&expected, &actual).is_err());
-        actual = expected.clone();
-        actual.mod_time = Some(std::time::SystemTime::UNIX_EPOCH.into());
-        assert!(validate_object_snapshot(&expected, &actual).is_err());
+        let error = store
+            .get_opts(
+                &Path::from(object),
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("missing object should remain a typed not-found error");
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+
+        env.put_object_bytes(bucket, object, b"id,name\n1,Alice\n".to_vec()).await;
+        let result = store
+            .get_opts(
+                &Path::from(object),
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed snapshot initialization must not be cached");
+        assert_eq!(result.meta.size, 16);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_constructor_maps_missing_bucket_to_not_found() {
+        let _env = crate::storage_api::select_test_ecstore_env().await;
+        let bucket = "s3select-lazy-snapshot-missing-bucket";
+        let object = "input.csv";
+        let store = EcObjectStore::new(csv_input(bucket, object)).expect("legacy constructor should resolve the global store");
+
+        let error = store
+            .get_opts(
+                &Path::from(object),
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("missing bucket should remain a typed not-found error");
+
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_constructor_reuses_head_snapshot_for_body() {
+        const BUCKET: &str = "s3select-lazy-snapshot-head-body";
+        const OBJECT: &str = "input.csv";
+        const OLD_DATA: &[u8] = b"id,name\n1,old\n";
+        const NEW_DATA: &[u8] = b"id,name\n1,new\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, OBJECT, OLD_DATA.to_vec()).await;
+        let store = EcObjectStore::new(csv_input(BUCKET, OBJECT)).expect("legacy constructor should resolve the global store");
+        let head = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("HEAD should lazily prepare the snapshot");
+        assert_eq!(head.meta.size, u64::try_from(OLD_DATA.len()).expect("fixture length should fit in u64"));
+
+        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
+        let writer = tokio::spawn(async move {
+            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
+        });
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(!writer.is_finished(), "overwrite must wait for the lazy snapshot");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("body should reuse the HEAD snapshot");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming snapshot body");
+        };
+        let bytes = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect lazy snapshot body")
+            .concat();
+        assert_eq!(bytes, OLD_DATA);
+        assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 1);
+
+        drop(store);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("overwrite should finish after the lazy snapshot is released")
+            .expect("overwrite task should join");
+        assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_constructor_first_version_pins_later_reads() {
+        const BUCKET: &str = "s3select-lazy-snapshot-version";
+        const OBJECT: &str = "input.csv";
+        const OLD_DATA: &[u8] = b"old-marker\n";
+        const NEW_DATA: &[u8] = b"new-poison-value\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, true).await;
+        let versioned_opts = SelectObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let mut old_reader = SelectPutObjReader::from_vec(OLD_DATA.to_vec());
+        let old_info = env
+            .ecstore
+            .put_object(BUCKET, OBJECT, &mut old_reader, &versioned_opts)
+            .await
+            .expect("put old version fixture");
+        let old_version = old_info
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let mut new_reader = SelectPutObjReader::from_vec(NEW_DATA.to_vec());
+        let new_info = env
+            .ecstore
+            .put_object(BUCKET, OBJECT, &mut new_reader, &versioned_opts)
+            .await
+            .expect("put latest version poison fixture");
+        let new_version = new_info
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+
+        let store = EcObjectStore::new(csv_input(BUCKET, OBJECT)).expect("legacy constructor should resolve the global store");
+        let head = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    head: true,
+                    version: Some(old_version.to_uppercase()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first HEAD should bind the requested old version");
+        assert_eq!(head.meta.version.as_deref(), Some(old_version.as_str()));
+
+        let mismatch = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    head: true,
+                    version: Some(new_version),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an explicit different version must not reuse the pinned snapshot");
+        assert!(mismatch.to_string().contains("different object version"));
+
+        let range = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..3)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("later range should reuse the old-version snapshot");
+        let GetResultPayload::Stream(range_stream) = range.payload else {
+            panic!("expected ranged snapshot stream");
+        };
+        assert_eq!(
+            range_stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect old-version range")
+                .concat(),
+            b"old"
+        );
+
+        let body = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("later body should reuse the old-version snapshot");
+        let GetResultPayload::Stream(body_stream) = body.payload else {
+            panic!("expected full snapshot stream");
+        };
+        assert_eq!(
+            body_stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect old-version body")
+                .concat(),
+            OLD_DATA
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_constructor_normalizes_null_version_before_snapshot_prepare() {
+        const BUCKET: &str = "s3select-lazy-snapshot-null-version";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"null-version-marker\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, OBJECT, DATA.to_vec()).await;
+        let store = EcObjectStore::new(csv_input(BUCKET, OBJECT)).expect("legacy constructor should resolve the global store");
+
+        let head = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    head: true,
+                    version: Some("NULL".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("null version should prepare an unversioned snapshot");
+        assert!(head.meta.version.is_none());
+
+        let body = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    version: Some(uuid::Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("nil UUID should match the pinned null-version snapshot");
+        let GetResultPayload::Stream(body_stream) = body.payload else {
+            panic!("expected null-version snapshot stream");
+        };
+        assert_eq!(
+            body_stream
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect null-version body")
+                .concat(),
+            DATA
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn prepared_snapshot_rejects_a_different_query_object() {
+        const BUCKET: &str = "s3select-snapshot-identity";
+        const OBJECT: &str = "source.csv";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, OBJECT, b"source-marker\n".to_vec()).await;
+        let snapshot = Arc::new(
+            env.ecstore
+                .prepare_select_object_snapshot(BUCKET, OBJECT, &HeaderMap::new(), &Default::default())
+                .await
+                .expect("prepare source snapshot"),
+        );
+
+        let error = EcObjectStore::new_with_snapshot(csv_input(BUCKET, "different.csv"), snapshot)
+            .expect_err("a snapshot must remain bound to its source object");
+
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert!(error.source().is_some_and(|source| {
+            source
+                .downcast_ref::<EcObjectStoreBuildError>()
+                .is_some_and(|error| matches!(error, EcObjectStoreBuildError::Snapshot(SnapshotConsistencyError::ObjectChanged)))
+        }));
+    }
+
+    async fn prepare_test_snapshot(bucket: &str, object: &str) -> Arc<SelectObjectSnapshot> {
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        Arc::new(
+            env.ecstore
+                .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &Default::default())
+                .await
+                .expect("prepare SelectObjectContent snapshot"),
+        )
+    }
+
+    fn scan_range_csv_store(
+        bucket: &str,
+        object: &str,
+        snapshot: Arc<SelectObjectSnapshot>,
+        record_delimiter: &str,
+        file_header_info: Option<FileHeaderInfo>,
+        start: i64,
+        end: i64,
+    ) -> EcObjectStore {
+        EcObjectStore::new_with_snapshot(
+            Arc::new(SelectObjectContentInput {
+                bucket: bucket.to_string(),
+                expected_bucket_owner: None,
+                key: object.to_string(),
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                request: SelectObjectContentRequest {
+                    expression: "SELECT * FROM s3object".to_string(),
+                    expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                    input_serialization: InputSerialization {
+                        csv: Some(CSVInput {
+                            record_delimiter: Some(record_delimiter.to_string()),
+                            file_header_info,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    output_serialization: OutputSerialization {
+                        csv: Some(CSVOutput::default()),
+                        ..Default::default()
+                    },
+                    request_progress: None,
+                    scan_range: Some(ScanRange {
+                        start: Some(start),
+                        end: Some(end),
+                    }),
+                },
+            }),
+            snapshot,
+        )
+        .expect("snapshot should match SelectObjectContent input")
+    }
+
+    async fn read_current_object(bucket: &str, object: &str) -> Vec<u8> {
+        let snapshot = prepare_test_snapshot(bucket, object).await;
+        let mut reader = snapshot.open_reader(None).await.expect("current object reader should open");
+        let mut bytes = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("current object should be readable");
+        bytes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn head_uses_snapshot_metadata_without_opening_body() {
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let bucket = "s3select-snapshot-head";
+        let object = "input.csv";
+        env.make_bucket(bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(b"id,name\n1,Alice\n".to_vec());
+        env.ecstore
+            .put_object(bucket, object, &mut reader, &Default::default())
+            .await
+            .expect("put HEAD fixture");
+
+        let snapshot = prepare_test_snapshot(bucket, object).await;
+        let expected_modified = snapshot_last_modified(&snapshot).expect("snapshot modification time");
+        let expected_size = snapshot.logical_size();
+        let expected_etag = snapshot.object_info().etag.clone();
+        let expected_version = snapshot.object_info().version_id.map(|version| version.to_string());
+        let input = Arc::new(SelectObjectContentInput {
+            bucket: bucket.to_string(),
+            expected_bucket_owner: None,
+            key: object.to_string(),
+            sse_customer_algorithm: Some("secret-algorithm".to_string()),
+            sse_customer_key: Some("secret-customer-key".to_string()),
+            sse_customer_key_md5: Some("secret-customer-key-md5".to_string()),
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM s3object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        });
+        let store = EcObjectStore::new_with_snapshot(input, snapshot).expect("snapshot should match SelectObjectContent input");
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("secret-customer-key"));
+
+        let result = store
+            .get_opts(
+                &Path::from(object),
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("HEAD from snapshot metadata");
+
+        assert_eq!(result.meta.last_modified, expected_modified);
+        assert_eq!(result.meta.size, expected_size);
+        assert_eq!(result.meta.e_tag, expected_etag);
+        assert_eq!(result.meta.version, expected_version);
+        assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn snapshot_keeps_csv_header_and_body_on_one_generation_during_overwrite() {
+        const BUCKET: &str = "s3select-snapshot-header-body-race";
+        const OBJECT: &str = "input.csv";
+        const OLD_DATA: &[u8] = b"old_header,value\nskip_old,0\nold_body,1\n";
+        const NEW_DATA: &[u8] = b"new_header,value\nskip_new,0\nnew_body,1\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(OLD_DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put old CSV header/body fixture");
+
+        let selected_start = i64::try_from(b"old_header,value\nskip_old,0\n".len()).expect("fixture offset should fit in i64");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let store = scan_range_csv_store(
+            BUCKET,
+            OBJECT,
+            snapshot,
+            "\n",
+            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+            selected_start,
+            selected_start,
+        );
+        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
+        let writer = tokio::spawn(async move {
+            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
+        });
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !writer.is_finished(),
+            "overwrite must remain blocked while the SelectObjectContent snapshot is alive"
+        );
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("read CSV header and body from one snapshot");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming CSV header/body payload");
+        };
+        let bytes = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect CSV header/body snapshot")
+            .concat();
+
+        assert_eq!(bytes, b"old_header,value\nold_body,1\n");
+        assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 2);
+        assert!(!writer.is_finished(), "overwrite must remain blocked after both snapshot readers finish");
+
+        drop(store);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("overwrite should finish after the snapshot is released")
+            .expect("overwrite task should join");
+        assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn snapshot_keeps_scan_range_context_and_main_reader_on_one_generation_during_overwrite() {
+        const BUCKET: &str = "s3select-snapshot-scan-context-race";
+        const OBJECT: &str = "input.csv";
+        const OLD_DATA: &[u8] = b"111aaa222aa333aa";
+        const NEW_DATA: &[u8] = b"999aaa888aa777aa";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(OLD_DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put old ScanRange context fixture");
+
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let store = scan_range_csv_store(BUCKET, OBJECT, snapshot, "aa", None, 4, 5);
+        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
+        let writer = tokio::spawn(async move {
+            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
+        });
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !writer.is_finished(),
+            "overwrite must remain blocked while the SelectObjectContent snapshot is alive"
+        );
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("read ScanRange context and main body from one snapshot");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming ScanRange context payload");
+        };
+        let bytes = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect ScanRange context snapshot")
+            .concat();
+
+        assert_eq!(bytes, b"a222\r\n");
+        assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 2);
+        assert!(
+            !writer.is_finished(),
+            "overwrite must remain blocked after context and main readers finish"
+        );
+
+        drop(store);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("overwrite should finish after the snapshot is released")
+            .expect("overwrite task should join");
+        assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
     }
 
     #[tokio::test]
@@ -1595,37 +2181,6 @@ mod test {
         assert_eq!(range.end, 19);
     }
 
-    #[test]
-    fn test_select_read_headers_preserves_ssec_context() {
-        let input = SelectObjectContentInput {
-            bucket: "bucket".to_string(),
-            expected_bucket_owner: None,
-            key: "object.csv".to_string(),
-            sse_customer_algorithm: Some("AES256".to_string()),
-            sse_customer_key: Some("customer-key".to_string()),
-            sse_customer_key_md5: Some("customer-key-md5".to_string()),
-            request: SelectObjectContentRequest {
-                expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
-                input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
-                    ..Default::default()
-                },
-                output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
-                    ..Default::default()
-                },
-                request_progress: None,
-                scan_range: None,
-            },
-        };
-
-        let headers = select_read_headers(&input);
-        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).unwrap(), "AES256");
-        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY).unwrap(), "customer-key");
-        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5).unwrap(), "customer-key-md5");
-    }
-
     #[tokio::test]
     async fn test_scan_range_output_can_convert_field_delimiter() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"a&&1\nb&&2\n"))]);
@@ -1679,7 +2234,7 @@ mod test {
             .await
             .expect("put self-overlapping delimiter ScanRange fixture");
 
-        let make_store = |start, end, file_header_info| EcObjectStore {
+        let make_store = |start, end, file_header_info, snapshot| EcObjectStore {
             input: Arc::new(SelectObjectContentInput {
                 bucket: bucket.to_string(),
                 expected_bucket_owner: None,
@@ -1715,10 +2270,12 @@ mod test {
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
-            store: Arc::clone(&env.ecstore),
+            store: None,
+            snapshot: OnceCell::new_with(Some(snapshot)),
+            reader_open_count: Arc::new(AtomicUsize::new(0)),
         };
 
-        let store = make_store(6, 6, None);
+        let store = make_store(6, 6, None, prepare_test_snapshot(bucket, object).await);
         let result = store
             .get_opts(&Path::from(object), GetOptions::default())
             .await
@@ -1728,8 +2285,9 @@ mod test {
         };
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect record-data ScanRange output");
         assert!(chunks.concat().is_empty());
+        drop(store);
 
-        let store = make_store(4, 5, None);
+        let store = make_store(4, 5, None, prepare_test_snapshot(bucket, object).await);
         let result = store
             .get_opts(&Path::from(object), GetOptions::default())
             .await
@@ -1742,13 +2300,14 @@ mod test {
             .await
             .expect("collect overlapping-delimiter ScanRange output");
         assert_eq!(chunks.concat(), b"a222\r\n");
+        drop(store);
 
         let mut reader = SelectPutObjReader::from_vec(b"111aa222aa333aa".to_vec());
         env.ecstore
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
             .expect("put exact review ScanRange fixture");
-        let result = make_store(6, 6, None)
+        let result = make_store(6, 6, None, prepare_test_snapshot(bucket, object).await)
             .get_opts(&Path::from(object), GetOptions::default())
             .await
             .expect("read exact review ScanRange fixture");
@@ -1758,7 +2317,7 @@ mod test {
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect exact review ScanRange output");
         assert!(chunks.concat().is_empty());
 
-        let result = make_store(5, 5, None)
+        let result = make_store(5, 5, None, prepare_test_snapshot(bucket, object).await)
             .get_opts(&Path::from(object), GetOptions::default())
             .await
             .expect("read ScanRange starting after an even delimiter run");
@@ -1773,40 +2332,27 @@ mod test {
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
             .expect("put ScanRange header snapshot fixture");
-        let result = make_store(8, 8, Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)))
-            .get_opts(&Path::from(object), GetOptions::default())
-            .await
-            .expect("read ScanRange with a separate header read");
+        let result = make_store(
+            8,
+            8,
+            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+            prepare_test_snapshot(bucket, object).await,
+        )
+        .get_opts(&Path::from(object), GetOptions::default())
+        .await
+        .expect("read ScanRange with a separate header read");
         let GetResultPayload::Stream(stream) = result.payload else {
             panic!("expected streaming ScanRange header payload");
         };
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect ScanRange header output");
         assert_eq!(chunks.concat(), b"h1\r\nv2\r\n");
 
-        let header_store = make_store(8, 8, Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)));
-        let header_opts = header_store.object_options(&GetOptions::new());
-        let header_snapshot = header_store
-            .object_info(&header_opts)
-            .await
-            .expect("read header snapshot before overwrite");
-        let header_size = validated_object_size(header_snapshot.size).expect("header fixture size should be valid");
-        let mut reader = SelectPutObjReader::from_vec(b"q9aaz8aaz7aa".to_vec());
-        env.ecstore
-            .put_object(bucket, object, &mut reader, &Default::default())
-            .await
-            .expect("overwrite header snapshot fixture");
-        let err = header_store
-            .read_header_record(header_size, b"aa", &header_opts, &header_snapshot)
-            .await
-            .expect_err("stale header snapshot must fail closed");
-        assert!(err.to_string().contains("object changed"));
-
         let mut reader = SelectPutObjReader::from_vec(b"aaa222aa".to_vec());
         env.ecstore
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
             .expect("put object-start delimiter context fixture");
-        let result = make_store(3, 3, None)
+        let result = make_store(3, 3, None, prepare_test_snapshot(bucket, object).await)
             .get_opts(&Path::from(object), GetOptions::default())
             .await
             .expect("read delimiter context that reaches the object start");
@@ -1825,7 +2371,7 @@ mod test {
             .await
             .expect("put large self-overlapping delimiter ScanRange fixture");
         let scan_start = i64::try_from(run_start + 3).expect("fixture offset should fit in i64");
-        let result = make_store(scan_start, scan_start, None)
+        let result = make_store(scan_start, scan_start, None, prepare_test_snapshot(bucket, object).await)
             .get_opts(&Path::from(object), GetOptions::default())
             .await
             .expect("read large ScanRange with bounded delimiter context");
@@ -1844,57 +2390,11 @@ mod test {
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
             .expect("put oversized delimiter context fixture");
-        let err = make_store(scan_start, scan_start, None)
+        let err = make_store(scan_start, scan_start, None, prepare_test_snapshot(bucket, object).await)
             .get_opts(&Path::from(object), GetOptions::default())
             .await
             .expect_err("oversized self-overlapping delimiter context must fail closed");
         assert!(err.to_string().contains("bounded ScanRange context"));
-
-        let store = make_store(0, 0, None);
-        let opts = store.object_options(&GetOptions::new());
-        let snapshot = store.object_info(&opts).await.expect("read snapshot before overwrite");
-        let snapshot_size = usize::try_from(snapshot.size).expect("fixture size should fit in usize");
-        let mut reader = SelectPutObjReader::from_vec(vec![b'x'; snapshot_size]);
-        env.ecstore
-            .put_object(bucket, object, &mut reader, &Default::default())
-            .await
-            .expect("overwrite snapshot fixture");
-        let err = store
-            .read_raw_range_with_opts(0..1, &opts, Some(&snapshot))
-            .await
-            .expect_err("stale ScanRange snapshot must fail closed");
-        assert!(err.to_string().contains("object changed"));
-
-        let original = b"111aa222aa333aa";
-        let mut reader = SelectPutObjReader::from_vec(original.to_vec());
-        env.ecstore
-            .put_object(bucket, object, &mut reader, &Default::default())
-            .await
-            .expect("restore context-to-main race fixture");
-        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        *SCAN_RANGE_BEFORE_MAIN_HOOK.lock().await = Some(ScanRangeBeforeMainHook {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            reached: reached_tx,
-            resume: resume_rx,
-        });
-        let store = make_store(6, 6, None);
-        let read_task = tokio::spawn(async move { store.get_opts(&Path::from("input.csv"), GetOptions::default()).await });
-        reached_rx
-            .await
-            .expect("ScanRange read should pause before opening its main reader");
-        let mut reader = SelectPutObjReader::from_vec(b"999aa888aa777aa".to_vec());
-        env.ecstore
-            .put_object(bucket, object, &mut reader, &Default::default())
-            .await
-            .expect("overwrite between ScanRange context and main reads");
-        resume_tx.send(()).expect("resume ScanRange main read");
-        let err = read_task
-            .await
-            .expect("ScanRange read task should join")
-            .expect_err("context-to-main overwrite must fail closed");
-        assert!(err.to_string().contains("object changed"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1947,6 +2447,7 @@ mod test {
                 scan_range: None,
             },
         });
+        let snapshot = prepare_test_snapshot(bucket, object).await;
         let store = Arc::new(EcObjectStore {
             input,
             need_convert: false,
@@ -1955,7 +2456,9 @@ mod test {
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024)),
             query_tracker: None,
-            store: Arc::clone(&env.ecstore),
+            store: None,
+            snapshot: OnceCell::new_with(Some(snapshot)),
+            reader_open_count: Arc::new(AtomicUsize::new(0)),
         });
 
         let config = SessionConfig::new()
@@ -2040,6 +2543,7 @@ mod test {
                 scan_range: None,
             },
         });
+        let snapshot = prepare_test_snapshot(bucket, object).await;
         let store = super::EcObjectStore {
             input,
             need_convert: true,
@@ -2048,7 +2552,9 @@ mod test {
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
-            store: Arc::clone(&env.ecstore),
+            store: None,
+            snapshot: OnceCell::new_with(Some(snapshot)),
+            reader_open_count: Arc::new(AtomicUsize::new(0)),
         };
 
         let result = store
