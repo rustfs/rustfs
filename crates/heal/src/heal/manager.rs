@@ -14,7 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils, replacement_recovery_error_requires_block},
+    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -1233,6 +1233,14 @@ impl HealManager {
             .contains(set_disk_id)
     }
 
+    async fn validate_replacement_recovery_records(disk: &crate::heal::DiskStore) -> Result<()> {
+        ResumeUtils::migrate_legacy_replacement_records(disk).await?;
+        for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await? {
+            ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
+        }
+        Ok(())
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         Self::new_with_workload_provider(storage, config, None)
@@ -1385,9 +1393,7 @@ impl HealManager {
                 // Legacy flat records are inspected only while starting. The
                 // periodic scanner lists the dedicated replacement directory.
                 if let Err(error) = ResumeUtils::migrate_legacy_replacement_records(disk).await {
-                    if replacement_recovery_error_requires_block(&error)
-                        && let Some(set_disk_id) = &disk_set_disk_id
-                    {
+                    if let Some(set_disk_id) = &disk_set_disk_id {
                         self.block_replacement_recovery_set(set_disk_id);
                     }
                     warn!(
@@ -1403,9 +1409,7 @@ impl HealManager {
                 let replacement_task_ids = match ResumeUtils::get_replacement_intent_tasks(disk).await {
                     Ok(task_ids) => task_ids,
                     Err(error) => {
-                        if replacement_recovery_error_requires_block(&error)
-                            && let Some(set_disk_id) = &disk_set_disk_id
-                        {
+                        if let Some(set_disk_id) = &disk_set_disk_id {
                             self.block_replacement_recovery_set(set_disk_id);
                         }
                         warn!(
@@ -1424,9 +1428,7 @@ impl HealManager {
                     let manager = match ResumeManager::load_replacement_intent(disk.clone(), &task_id).await {
                         Ok(manager) => manager,
                         Err(error) => {
-                            if replacement_recovery_error_requires_block(&error)
-                                && let Some(set_disk_id) = &disk_set_disk_id
-                            {
+                            if let Some(set_disk_id) = &disk_set_disk_id {
                                 self.block_replacement_recovery_set(set_disk_id);
                             }
                             warn!(
@@ -2480,8 +2482,53 @@ impl HealManager {
                             local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
                         };
                         let local_endpoints = local_disks.iter().map(|disk| disk.endpoint()).collect::<Vec<_>>();
+                        let blocked_sets = replacement_recovery_blocked_sets
+                            .lock()
+                            .expect("replacement recovery blocked set lock poisoned")
+                            .clone();
+                        if !blocked_sets.is_empty() {
+                            let mut retry_succeeded = HashSet::new();
+                            let mut retry_failed = HashSet::new();
                             for disk in &local_disks {
                                 let endpoint = disk.endpoint();
+                                let Some(set_disk_id) =
+                                    crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
+                                else {
+                                    continue;
+                                };
+                                if !blocked_sets.contains(&set_disk_id) {
+                                    continue;
+                                }
+                                match Self::validate_replacement_recovery_records(disk).await {
+                                    Ok(()) => {
+                                        retry_succeeded.insert(set_disk_id);
+                                    }
+                                    Err(error) => {
+                                        retry_failed.insert(set_disk_id.clone());
+                                        conflicted_recovery_sets.insert(set_disk_id);
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %endpoint,
+                                            error = %error,
+                                            "Replacement recovery retry failed"
+                                        );
+                                    }
+                                }
+                            }
+                            let mut blocked = replacement_recovery_blocked_sets
+                                .lock()
+                                .expect("replacement recovery blocked set lock poisoned");
+                            for set_disk_id in retry_succeeded {
+                                if !retry_failed.contains(&set_disk_id) {
+                                    blocked.remove(&set_disk_id);
+                                }
+                            }
+                        }
+                        for disk in &local_disks {
+                            let endpoint = disk.endpoint();
                                 let runtime_state = disk.runtime_state();
                                 let set_disk_id =
                                     crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
@@ -4447,16 +4494,24 @@ mod tests {
 
     #[test]
     fn replacement_recovery_blocks_only_confirmed_conflicts() {
-        assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
-            message: "replacement recovery conflict: proof mismatch".to_string(),
-        }));
-        assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
-            message: "replacement recovery corruption: malformed legacy intent".to_string(),
-        }));
-        assert!(!replacement_recovery_error_requires_block(&Error::Disk(DiskError::Timeout)));
-        assert!(!replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
-            message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
-        }));
+        assert!(crate::heal::resume::replacement_recovery_error_requires_block(
+            &Error::TaskExecutionFailed {
+                message: "replacement recovery conflict: proof mismatch".to_string(),
+            }
+        ));
+        assert!(crate::heal::resume::replacement_recovery_error_requires_block(
+            &Error::TaskExecutionFailed {
+                message: "replacement recovery corruption: malformed legacy intent".to_string(),
+            }
+        ));
+        assert!(!crate::heal::resume::replacement_recovery_error_requires_block(&Error::Disk(
+            DiskError::Timeout
+        )));
+        assert!(!crate::heal::resume::replacement_recovery_error_requires_block(
+            &Error::TaskExecutionFailed {
+                message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
+            }
+        ));
     }
 
     #[test]
