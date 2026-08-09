@@ -15,7 +15,7 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::cli::default_server_opts;
+    use crate::config::cli::{InspectCommands, default_server_opts};
     use crate::config::{CommandResult, Config, Opt, TlsCommands};
     use crate::storage_api::config_test::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
@@ -98,6 +98,31 @@ mod tests {
                 TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
             },
             _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_inspect_subcommand_survives_legacy_preprocessing() {
+        let result = Opt::parse_command([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+        ])
+        .expect("inspect command should survive legacy preprocessing");
+
+        match result {
+            CommandResult::Inspect(opts) => match opts.command {
+                InspectCommands::BucketMeta(opts) => {
+                    assert_eq!(opts.paths, ["/data/drive-1"]);
+                    assert_eq!(opts.bucket, "example-bucket");
+                }
+            },
+            _ => panic!("expected inspect command result"),
         }
     }
 

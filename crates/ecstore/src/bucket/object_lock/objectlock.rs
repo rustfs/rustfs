@@ -200,6 +200,29 @@ mod tests {
         assert!(retention.retain_until_date.is_some());
     }
 
+    /// backlog#1733 g-key-002: the persisted literal keys must still be read
+    /// through the current header constants, or WORM metadata fails open.
+    #[test]
+    fn persisted_compliance_lock_metadata_remains_effective() {
+        let mut meta = HashMap::new();
+        meta.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        meta.insert("x-amz-object-lock-retain-until-date".to_string(), "9999-01-01T00:00:00Z".to_string());
+        meta.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+
+        let retention = get_object_retention_meta(&meta);
+        assert_eq!(
+            retention.mode.as_ref().map(|mode| mode.as_str()),
+            Some(ObjectLockRetentionMode::COMPLIANCE)
+        );
+        assert!(retention.retain_until_date.is_some(), "persisted retention date must remain readable");
+
+        let legal_hold = get_object_legalhold_meta(&meta);
+        assert_eq!(
+            legal_hold.status.as_ref().map(|status| status.as_str()),
+            Some(ObjectLockLegalHoldStatus::ON)
+        );
+    }
+
     #[test]
     fn test_get_object_legalhold_meta_empty() {
         let meta = HashMap::new();

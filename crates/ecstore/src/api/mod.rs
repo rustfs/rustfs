@@ -453,6 +453,11 @@ pub mod rpc {
 pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
 
+    /// Return the canonical object-metadata identity used for read-quorum grouping.
+    pub fn file_info_quorum_hash(meta: &rustfs_filemeta::FileInfo) -> [u8; 32] {
+        crate::set_disk::SetDisks::file_info_quorum_hash(meta)
+    }
+
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};

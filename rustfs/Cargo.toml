@@ -35,6 +35,10 @@ path = "src/lib.rs"
 name = "rustfs"
 path = "src/main.rs"
 
+[[bin]]
+name = "rustfs-cli"
+path = "src/bin/rustfs-cli.rs"
+
 [features]
 default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]
