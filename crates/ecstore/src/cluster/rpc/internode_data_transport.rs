@@ -76,7 +76,7 @@ enum PutFileCapabilityState {
 struct PutFileCapabilityProbeFailure(Error);
 
 impl PutFileCapabilityProbeFailure {
-    fn into_error(&self) -> Error {
+    fn to_error(&self) -> Error {
         match &self.0 {
             Error::Io(error) => rustfs_rio::clone_internode_http_io_error(error)
                 .map(Error::Io)
@@ -416,7 +416,7 @@ where
         Ok(Some(server_epoch)) => Ok(Some(*server_epoch)),
         Ok(None) if flight.v1_was_pinned => Err(Error::other("remote put_file capability downgrade rejected")),
         Ok(None) => Ok(None),
-        Err(failure) => Err(failure.into_error()),
+        Err(failure) => Err(failure.to_error()),
     }
 }
 
@@ -686,7 +686,7 @@ mod tests {
                     .as_ref()
                     .map(|flight| Arc::strong_count(&flight.outcome))
                     .unwrap_or_default();
-                if strong_count >= waiters + 1 {
+                if strong_count > waiters {
                     return;
                 }
                 tokio::task::yield_now().await;
