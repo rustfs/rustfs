@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -126,6 +126,27 @@ impl PersistThrottle {
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| Error::other(format!("Invalid UTF-8 path: {path:?}")))
+}
+
+/// Resume task IDs become part of metadata file names. Persisted filenames are
+/// untrusted, so only accept a UUID encoded as one normal path component.
+fn validate_resume_task_id(task_id: &str) -> Result<()> {
+    let mut components = Path::new(task_id).components();
+    let is_single_normal_component = matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+
+    let Ok(uuid) = Uuid::parse_str(task_id) else {
+        return Err(Error::TaskExecutionFailed {
+            message: "Invalid resume task id".to_string(),
+        });
+    };
+
+    if is_single_normal_component && uuid.hyphenated().to_string() == task_id {
+        return Ok(());
+    }
+
+    Err(Error::TaskExecutionFailed {
+        message: "Invalid resume task id".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -402,6 +423,7 @@ impl ResumeManager {
         set_disk_id: String,
         buckets: Vec<String>,
     ) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
         let state = ResumeState::new(task_id, task_type, set_disk_id, buckets);
         let manager = Self {
             disk,
@@ -425,6 +447,7 @@ impl ResumeManager {
         mut replacement_targets: Vec<String>,
         mut replacement_target_identities: Vec<ReplacementTargetIdentity>,
     ) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
         replacement_targets.sort_unstable();
         replacement_targets.dedup();
         replacement_target_identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
@@ -565,13 +588,14 @@ impl ResumeManager {
 
     /// load resume state from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
+        validate_resume_task_id(task_id)?;
         let state_data = Self::read_state_file(&disk, task_id).await?;
         let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
         if state.task_id != task_id {
             return Err(Error::TaskExecutionFailed {
-                message: format!("Resume state task ID does not match its file name: {task_id}"),
+                message: "Resume state task id does not match filename".to_string(),
             });
         }
 
@@ -617,6 +641,9 @@ impl ResumeManager {
 
     /// check if resume state exists
     pub async fn has_resume_state(disk: &DiskStore, task_id: &str) -> bool {
+        if validate_resume_task_id(task_id).is_err() {
+            return false;
+        }
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
         match path_to_str(&file_path) {
             Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
@@ -730,6 +757,7 @@ impl ResumeManager {
     /// cleanup resume state
     pub async fn cleanup(&self) -> Result<()> {
         let task_id = self.state.read().await.task_id.clone();
+        validate_resume_task_id(&task_id)?;
 
         let state_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
         let progress_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_PROGRESS_FILE}"));
@@ -761,6 +789,7 @@ impl ResumeManager {
 
     async fn save_state_with_unformatted_policy(&self, allow_unformatted: bool) -> Result<()> {
         let state = self.state.read().await;
+        validate_resume_task_id(&state.task_id)?;
         let state_data = serde_json::to_vec(&*state).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to serialize resume state: {e}"),
         })?;
@@ -800,6 +829,7 @@ impl ResumeManager {
 
     /// read state file from disk
     async fn read_state_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
+        validate_resume_task_id(task_id)?;
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
 
         let path_str = path_to_str(&file_path)?;
@@ -899,6 +929,7 @@ pub struct CheckpointManager {
 impl CheckpointManager {
     /// create new checkpoint manager
     pub async fn new(disk: DiskStore, task_id: String) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
         let checkpoint = ResumeCheckpoint::new(task_id);
         let manager = Self {
             disk,
@@ -923,11 +954,18 @@ impl CheckpointManager {
 
     /// load checkpoint from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
+        validate_resume_task_id(task_id)?;
         let checkpoint_data = Self::read_checkpoint_file(&disk, task_id).await?;
         let mut checkpoint: ResumeCheckpoint =
             serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to deserialize checkpoint: {e}"),
             })?;
+
+        if checkpoint.task_id != task_id {
+            return Err(Error::TaskExecutionFailed {
+                message: "Resume checkpoint task id does not match filename".to_string(),
+            });
+        }
 
         // A checkpoint from an older schema stored latest-only dedup identities
         // that are not comparable to the new per-version `compose_key`
@@ -970,6 +1008,9 @@ impl CheckpointManager {
 
     /// check if checkpoint exists
     pub async fn has_checkpoint(disk: &DiskStore, task_id: &str) -> bool {
+        if validate_resume_task_id(task_id).is_err() {
+            return false;
+        }
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
         match path_to_str(&file_path) {
             Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
@@ -1056,6 +1097,7 @@ impl CheckpointManager {
     /// cleanup checkpoint
     pub async fn cleanup(&self) -> Result<()> {
         let task_id = self.checkpoint.read().await.task_id.clone();
+        validate_resume_task_id(&task_id)?;
 
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
         delete_resume_file(&self.disk, &checkpoint_file).await?;
@@ -1075,6 +1117,7 @@ impl CheckpointManager {
     /// save checkpoint to disk
     async fn save_checkpoint(&self) -> Result<()> {
         let checkpoint = self.checkpoint.read().await;
+        validate_resume_task_id(&checkpoint.task_id)?;
         let checkpoint_data = serde_json::to_vec(&*checkpoint).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to serialize checkpoint: {e}"),
         })?;
@@ -1103,6 +1146,7 @@ impl CheckpointManager {
 
     /// read checkpoint file from disk
     async fn read_checkpoint_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
+        validate_resume_task_id(task_id)?;
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
 
         let path_str = path_to_str(&file_path)?;
@@ -1155,7 +1199,7 @@ impl ResumeUtils {
             if entry.ends_with(&format!("_{RESUME_STATE_FILE}")) {
                 // Extract task ID from filename: {task_id}_ahm_resume_state.json
                 if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}"))
-                    && !task_id.is_empty()
+                    && validate_resume_task_id(task_id).is_ok()
                 {
                     task_ids.push(task_id.to_string());
                 }
@@ -1537,7 +1581,7 @@ mod tests {
         let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
         let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
 
-        let task_id = "replacement-generation".to_string();
+        let task_id = ResumeUtils::generate_task_id();
         let targets = vec!["replacement-a".to_string()];
         let first = ReplacementTargetIdentity {
             endpoint: "replacement-a".to_string(),
@@ -1782,12 +1826,14 @@ mod tests {
             "max_retries": 3,
             "resume_cursor": "v1:stale-token"
         }"#;
-        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_STATE_FILE}");
+        let task_id = "00000000-0000-4000-8000-000000000001";
+        let legacy = legacy.replace("old-task", task_id);
+        let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
         disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
             .await
             .unwrap();
 
-        let manager = ResumeManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let manager = ResumeManager::load_from_disk(disk.clone(), task_id).await.unwrap();
         let state = manager.get_state().await;
         assert_eq!(state.schema_version, CURRENT_RESUME_SCHEMA, "schema must be stamped current");
         assert_eq!(state.resume_cursor, None, "stale cursor must be cleared");
@@ -1821,9 +1867,10 @@ mod tests {
 
         // The previous checkpoint schema is unsafe once its paired resume
         // state is discarded: retaining either position would skip work.
+        let task_id = "00000000-0000-4000-8000-000000000002";
         let legacy = r#"{
             "schema_version": 4,
-            "task_id": "old-task",
+            "task_id": "00000000-0000-4000-8000-000000000002",
             "checkpoint_time": 1700000000,
             "current_bucket_index": 2,
             "current_object_index": 500,
@@ -1831,12 +1878,12 @@ mod tests {
             "failed_objects": ["c"],
             "skipped_objects": ["d"]
         }"#;
-        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_CHECKPOINT_FILE}");
+        let file_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
         disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
             .await
             .unwrap();
 
-        let manager = CheckpointManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let manager = CheckpointManager::load_from_disk(disk.clone(), task_id).await.unwrap();
         let checkpoint = manager.get_checkpoint().await;
         assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA, "schema must be stamped current");
         assert_eq!(checkpoint.current_bucket_index, 0, "stale bucket position must be reset");
@@ -1879,7 +1926,7 @@ mod tests {
             Err(err) => panic!("create metadata volume for resume persistence test: {err}"),
         }
 
-        let task_id = "completion-persistence".to_string();
+        let task_id = ResumeUtils::generate_task_id();
         let manager = ResumeManager::new(
             disk.clone(),
             task_id.clone(),
@@ -1943,6 +1990,9 @@ mod tests {
         assert_ne!(task_id1, task_id2);
         assert_eq!(task_id1.len(), 36); // UUID length
         assert_eq!(task_id2.len(), 36);
+        assert!(validate_resume_task_id(&task_id1).is_ok());
+        assert!(validate_resume_task_id(&format!("pool_0_set_0_{task_id1}")).is_err());
+        assert!(validate_resume_task_id(&task_id1.to_uppercase()).is_err());
     }
 
     #[tokio::test]
@@ -1969,9 +2019,9 @@ mod tests {
 
         // Create some test resume state files
         let task_ids = vec![
-            "test-task-1".to_string(),
-            "test-task-2".to_string(),
-            "test-task-3".to_string(),
+            ResumeUtils::generate_task_id(),
+            ResumeUtils::generate_task_id(),
+            ResumeUtils::generate_task_id(),
         ];
 
         // Save resume state files for each task
@@ -1997,6 +2047,8 @@ mod tests {
             "task4_ahm_checkpoint.json",
             "task5_ahm_progress.json",
             "_ahm_resume_state.json", // Invalid: empty task ID
+            "not-a-uuid_ahm_resume_state.json",
+            "00000000-0000-4000-8000-000000000001_extra_ahm_resume_state.json",
         ];
 
         for file_name in non_resume_files {
@@ -2019,8 +2071,87 @@ mod tests {
         assert!(!found_task_ids.contains(&"".to_string()));
         assert!(!found_task_ids.contains(&"task4".to_string()));
         assert!(!found_task_ids.contains(&"task5".to_string()));
+        assert!(!found_task_ids.contains(&"not-a-uuid".to_string()));
+
+        let error = match ResumeManager::load_from_disk(disk.clone(), "../not-a-uuid").await {
+            Ok(_) => panic!("a traversal-like task id must be rejected before reading metadata"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::TaskExecutionFailed { message } if message == "Invalid resume task id"
+        ));
 
         // Clean up
         temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_state_rejects_filename_and_json_task_id_mismatch() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create resume mismatch test directory");
+        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create test disk endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create resume mismatch test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(error) => panic!("create metadata volume for resume mismatch test: {error}"),
+        }
+
+        let filename_task_id = ResumeUtils::generate_task_id();
+        let state = ResumeState::new(
+            ResumeUtils::generate_task_id(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        );
+        let path = format!("{BUCKET_META_PREFIX}/{filename_task_id}_{RESUME_STATE_FILE}");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &path,
+            serde_json::to_vec(&state).expect("serialize mismatched resume state").into(),
+        )
+        .await
+        .expect("write mismatched resume state");
+
+        let error = match ResumeManager::load_from_disk(disk.clone(), &filename_task_id).await {
+            Ok(_) => panic!("resume state task id must match its filename"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::TaskExecutionFailed { message } if message == "Resume state task id does not match filename"
+        ));
+
+        let checkpoint_filename_task_id = ResumeUtils::generate_task_id();
+        let checkpoint = ResumeCheckpoint::new(ResumeUtils::generate_task_id());
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{checkpoint_filename_task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &checkpoint_path,
+            serde_json::to_vec(&checkpoint)
+                .expect("serialize mismatched resume checkpoint")
+                .into(),
+        )
+        .await
+        .expect("write mismatched resume checkpoint");
+
+        let error = match CheckpointManager::load_from_disk(disk, &checkpoint_filename_task_id).await {
+            Ok(_) => panic!("resume checkpoint task id must match its filename"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::TaskExecutionFailed { message } if message == "Resume checkpoint task id does not match filename"
+        ));
     }
 }

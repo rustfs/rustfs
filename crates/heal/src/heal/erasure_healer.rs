@@ -336,7 +336,7 @@ impl ErasureSetHealer {
         }
 
         // create new task id
-        let task_id = format!("{}_{}", set_disk_id, ResumeUtils::generate_task_id());
+        let task_id = ResumeUtils::generate_task_id();
         debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -1103,7 +1103,12 @@ mod resume_loop_tests {
     use super::{ErasureSetHealer, target_outcomes_complete};
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
-        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, compose_key,
+<<<<<<< HEAD
+        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
+        compose_key,
+=======
+        CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, ResumeUtils, compose_key,
+>>>>>>> 5e2705bf9 (fix(heal): validate persisted resume task identifiers)
     };
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
@@ -1355,6 +1360,7 @@ mod resume_loop_tests {
         storage: Arc<FakeStorage>,
         resume: ResumeManager,
         checkpoint: CheckpointManager,
+        task_id: String,
         _temp: TempDir,
     }
 
@@ -1366,6 +1372,7 @@ mod resume_loop_tests {
         let temp = TempDir::new().unwrap();
         let disk = make_disk(&temp).await;
         let storage = Arc::new(FakeStorage::default());
+        let task_id = ResumeUtils::generate_task_id();
         let healer = ErasureSetHealer::new(
             storage.clone(),
             Arc::new(RwLock::new(HealProgress::new())),
@@ -1377,19 +1384,20 @@ mod resume_loop_tests {
         .with_replacement_targets(target_endpoints, None);
         let resume = ResumeManager::new(
             disk.clone(),
-            "task".to_string(),
+            task_id.clone(),
             "erasure_set".to_string(),
             "pool_0_set_0".to_string(),
             vec!["b".to_string()],
         )
         .await
         .unwrap();
-        let checkpoint = CheckpointManager::new(disk, "task".to_string()).await.unwrap();
+        let checkpoint = CheckpointManager::new(disk, task_id.clone()).await.unwrap();
         Env {
             healer,
             storage,
             resume,
             checkpoint,
+            task_id,
             _temp: temp,
         }
     }
@@ -1505,7 +1513,7 @@ mod resume_loop_tests {
         let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
         ResumeManager::new_replacement_intent(
             env.healer.disk.clone(),
-            "generation-a".to_string(),
+            ResumeUtils::generate_task_id(),
             "pool_0_set_0".to_string(),
             vec!["b".to_string()],
             vec!["replacement-a".to_string()],
@@ -1527,7 +1535,7 @@ mod resume_loop_tests {
             HealOpts::default(),
             HealRequestSource::AutoHeal,
         )
-        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-b".to_string()));
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(ResumeUtils::generate_task_id()));
 
         let error = healer
             .get_or_create_task_id("pool_0_set_0")
@@ -1592,13 +1600,14 @@ mod resume_loop_tests {
             .await
             .expect("new heal should allocate a task id");
 
-        assert_ne!(task_id, "task", "a completed resume state must not suppress a new heal");
+        assert_ne!(task_id, env.task_id, "a completed resume state must not suppress a new heal");
+        assert!(uuid::Uuid::parse_str(&task_id).is_ok(), "new resume task ids must be UUIDs");
     }
 
     #[tokio::test]
     async fn cleanup_failure_keeps_erasure_set_heal_incomplete() {
         let env = make_env().await;
-        let checkpoint_path = format!("{BUCKET_META_PREFIX}/task_{RESUME_CHECKPOINT_FILE}");
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{}_{RESUME_CHECKPOINT_FILE}", env.task_id);
         let _failure = ResumeDeleteFailure::install(checkpoint_path, crate::heal::DiskError::DiskAccessDenied);
 
         let error = env
@@ -1608,7 +1617,7 @@ mod resume_loop_tests {
             .expect_err("checkpoint cleanup failure must fail the erasure-set heal");
 
         assert!(matches!(error, Error::Disk(crate::heal::DiskError::DiskAccessDenied)));
-        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), "task")
+        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
             .await
             .expect("completed state must remain discoverable after cleanup failure")
             .get_state()
@@ -1725,7 +1734,7 @@ mod resume_loop_tests {
 
         let (_, checkpoint) = env
             .healer
-            .initialize_resume_state("task", "pool_0_set_0", &["b".to_string()])
+            .initialize_resume_state(&env.task_id, "pool_0_set_0", &["b".to_string()])
             .await
             .expect("resume initialization should repair a stale checkpoint");
         let checkpoint = checkpoint.get_checkpoint().await;
