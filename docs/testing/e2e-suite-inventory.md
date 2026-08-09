@@ -12,8 +12,9 @@
 > lane and 28 slow / `_real_dual_node` / `_real_three_node` / `_real_single_node` tests into the
 > nightly lane (`.github/workflows/e2e-replication-nightly.yml`).
 > Note: counts exclude `#[ignore]`d tests (nextest lists them separately).
-> The SSE-S3 replication contract is ignored under backlog#1291 until its
-> plaintext downgrade is fixed.
+> Managed-SSE (SSE-S3/SSE-KMS) replication contracts assert successful
+> re-encryption on the target (backlog#1783); SSE-C replication still pins a
+> fail-closed FAILED contract until ciphertext passthrough lands.
 
 | module | tests | PR smoke |
 |---|---|---|
@@ -75,7 +76,7 @@
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 3 |  |
 | reliant | 24 | 18 ✅ |
-| replication_extension_test | 48 | 20 ✅ +28 🌙 |
+| replication_extension_test | 50 | 20 ✅ +30 🌙 |
 | security_boundary_test | 4 |  |
 | ssec_copy_test | 2 | ✅ |
 | server_startup_failfast_test | 1 |  |
@@ -88,4 +89,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 528 tests across 70 modules · PR smoke subset: 148 tests / 33 modules** (31 full modules + 18 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 28 tests** · generated 2026-08-04.
+**Total listed: 530 tests across 70 modules · PR smoke subset: 148 tests / 33 modules** (31 full modules + 18 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 30 tests** · updated 2026-08-09.
