@@ -69,16 +69,17 @@ use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
 };
-use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
+use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
@@ -86,6 +87,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 
 const BACKGROUND_WALKDIR_TIMEOUT: TokioDuration = TokioDuration::from_secs(60);
+const ENV_REPL_RESYNC_MAX_JOBS: &str = "RUSTFS_REPL_RESYNC_MAX_JOBS";
+const DEFAULT_REPL_RESYNC_MAX_JOBS: usize = 2;
+const MAX_REPL_RESYNC_MAX_JOBS: usize = 32;
 use uuid::Uuid;
 
 const EVENT_RESYNC_STATUS_UPDATE_SKIPPED: &str = "replication_resync_status_update_skipped";
@@ -256,11 +260,20 @@ fn resync_status_duration(
 
 type ResyncCancelKey = (String, String, String);
 
+fn configured_resync_max_jobs() -> usize {
+    bounded_resync_max_jobs(get_env_usize(ENV_REPL_RESYNC_MAX_JOBS, DEFAULT_REPL_RESYNC_MAX_JOBS))
+}
+
+fn bounded_resync_max_jobs(value: usize) -> usize {
+    value.clamp(1, MAX_REPL_RESYNC_MAX_JOBS)
+}
+
 #[derive(Debug)]
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
     pub(crate) cancel_tokens: Arc<RwLock<HashMap<ResyncCancelKey, CancellationToken>>>,
+    resync_admission: Arc<Semaphore>,
 }
 
 impl ReplicationResyncer {
@@ -269,6 +282,14 @@ impl ReplicationResyncer {
             status_map: Arc::new(RwLock::new(HashMap::new())),
             worker_size: RESYNC_WORKER_COUNT,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            resync_admission: Arc::new(Semaphore::new(configured_resync_max_jobs())),
+        }
+    }
+
+    async fn acquire_resync_admission(&self, cancellation_token: &CancellationToken) -> Option<OwnedSemaphorePermit> {
+        tokio::select! {
+            permit = self.resync_admission.clone().acquire_owned() => permit.ok(),
+            _ = cancellation_token.cancelled() => None,
         }
     }
 
@@ -603,6 +624,10 @@ impl ReplicationResyncer {
             }
         };
 
+        let Some(_resync_admission_permit) = self.acquire_resync_admission(&cancellation_token).await else {
+            return;
+        };
+
         let cfg = match get_replication_config(&opts.bucket).await {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -715,55 +740,36 @@ impl ReplicationResyncer {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-
-        if let Err(err) = storage
-            .clone()
-            .walk(
-                cancellation_token.clone(),
-                &opts.bucket,
-                "",
-                tx.clone(),
-                WalkOptions::default().with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
-            )
-            .await
-        {
-            error!(
-                event = EVENT_RESYNC_RUNTIME_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %opts.bucket,
-                arn = %opts.arn,
-                reason = "walk_failed",
-                error = %err,
-                "Replication resync bucket walk failed"
-            );
-            self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
-                .await;
-            return;
-        }
-        drop(tx);
-
-        let status = {
-            self.status_map
-                .read()
+        let walk_failed = Arc::new(AtomicBool::new(false));
+        let walk_failed_task = walk_failed.clone();
+        let walk_storage = storage.clone();
+        let walk_cancellation = cancellation_token.clone();
+        let walk_bucket = opts.bucket.clone();
+        let walk_arn = opts.arn.clone();
+        let walk_task = tokio::spawn(async move {
+            if let Err(err) = walk_storage
+                .walk(
+                    walk_cancellation,
+                    &walk_bucket,
+                    "",
+                    tx,
+                    WalkOptions::default().with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
+                )
                 .await
-                .get(&opts.bucket)
-                .and_then(|status| status.targets_map.get(&opts.arn))
-                .cloned()
-                .unwrap_or_default()
-        };
-
-        // An empty checkpoint means no per-object progress was persisted before the
-        // interruption: resume from the beginning, otherwise `object.name != checkpoint`
-        // below would skip every object and mark the resync completed without work.
-        let mut last_checkpoint = if (status.resync_status == ResyncStatusType::ResyncStarted
-            || status.resync_status == ResyncStatusType::ResyncFailed)
-            && !status.object.is_empty()
-        {
-            Some(status.object)
-        } else {
-            None
-        };
+            {
+                walk_failed_task.store(true, Ordering::Relaxed);
+                error!(
+                    event = EVENT_RESYNC_RUNTIME_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %walk_bucket,
+                    arn = %walk_arn,
+                    reason = "walk_failed",
+                    error = %err,
+                    "Replication resync bucket walk failed"
+                );
+            }
+        });
 
         let mut worker_txs = Vec::new();
         // mpsc, not broadcast: a lagging broadcast receiver returns Err(Lagged) which
@@ -773,7 +779,7 @@ impl ReplicationResyncer {
         let opts_clone = opts.clone();
         let self_clone = self.clone();
 
-        let mut futures = Vec::new();
+        let mut futures = vec![walk_task];
 
         let results_fut = tokio::spawn(async move {
             while let Some(st) = results_rx.recv().await {
@@ -962,6 +968,8 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to receive resync object info"
                 );
+                cancellation_token.cancel();
+                drop(rx);
                 let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
                 if worker_failed {
                     error!(
@@ -980,6 +988,7 @@ impl ReplicationResyncer {
             }
 
             if cancellation_token.is_cancelled() {
+                drop(rx);
                 finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
@@ -989,14 +998,6 @@ impl ReplicationResyncer {
             let Some(object) = res.item else {
                 continue;
             };
-
-            if heal
-                && let Some(checkpoint) = &last_checkpoint
-                && &object.name != checkpoint
-            {
-                continue;
-            }
-            last_checkpoint = None;
 
             let roi = match get_heal_replicate_object_info(&object, &rcfg).await {
                 Ok(roi) => roi,
@@ -1011,6 +1012,8 @@ impl ReplicationResyncer {
                         error = %err,
                         "Failed to classify object for replication resync"
                     );
+                    cancellation_token.cancel();
+                    drop(rx);
                     let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
                     if worker_failed {
                         error!(
@@ -1033,6 +1036,7 @@ impl ReplicationResyncer {
             }
 
             if cancellation_token.is_cancelled() {
+                drop(rx);
                 finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
@@ -1052,6 +1056,8 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to send resync object to worker"
                 );
+                cancellation_token.cancel();
+                drop(rx);
                 let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
                 if worker_failed {
                     error!(
@@ -1072,7 +1078,7 @@ impl ReplicationResyncer {
 
         let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
         let target_failed = self.target_has_resync_failures(&opts).await;
-        let status = if worker_failed || target_failed {
+        let status = if walk_failed.load(Ordering::Relaxed) || worker_failed || target_failed {
             ResyncStatusType::ResyncFailed
         } else {
             ResyncStatusType::ResyncCompleted
@@ -2355,16 +2361,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        if self.target_replication_status(&tgt_client.arn) == ReplicationStatusType::Completed
-            && !self.existing_obj_resync.is_empty()
-            && self.existing_obj_resync.must_resync_target(&tgt_client.arn)
-        {
-            rinfo.replication_status = ReplicationStatusType::Completed;
-            rinfo.replication_resynced = true;
-
-            return rinfo;
-        }
-
         if ReplicationTargetStore::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -2722,15 +2718,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let object_info = gr.object_info.clone();
 
         rinfo.prev_replication_status = object_info.target_replication_status(&tgt_client.arn);
-
-        if rinfo.prev_replication_status == ReplicationStatusType::Completed
-            && !self.existing_obj_resync.is_empty()
-            && self.existing_obj_resync.must_resync_target(&tgt_client.arn)
-        {
-            rinfo.replication_status = ReplicationStatusType::Completed;
-            rinfo.replication_resynced = true;
-            return rinfo;
-        }
 
         let size = match object_info.get_actual_size() {
             Ok(size) => size,
@@ -3249,6 +3236,48 @@ mod tests {
 
     async fn register_test_target(target: &Arc<TargetClient>) {
         ReplicationTargetStore::register_test_target(target).await;
+    }
+
+    #[test]
+    fn resync_admission_configuration_is_bounded() {
+        assert_eq!(ENV_REPL_RESYNC_MAX_JOBS, "RUSTFS_REPL_RESYNC_MAX_JOBS");
+        assert_eq!(bounded_resync_max_jobs(0), 1);
+        assert_eq!(bounded_resync_max_jobs(DEFAULT_REPL_RESYNC_MAX_JOBS), 2);
+        assert_eq!(bounded_resync_max_jobs(1000), MAX_REPL_RESYNC_MAX_JOBS);
+    }
+
+    #[tokio::test]
+    async fn resync_admission_limits_jobs_and_wait_is_cancelable() {
+        let resyncer = ReplicationResyncer {
+            resync_admission: Arc::new(Semaphore::new(2)),
+            ..ReplicationResyncer::new().await
+        };
+        let first = resyncer
+            .acquire_resync_admission(&CancellationToken::new())
+            .await
+            .expect("first resync should acquire admission");
+        let second = resyncer
+            .acquire_resync_admission(&CancellationToken::new())
+            .await
+            .expect("second resync should acquire admission");
+        let cancellation = CancellationToken::new();
+        let blocked = resyncer.acquire_resync_admission(&cancellation);
+        tokio::pin!(blocked);
+
+        assert!(
+            tokio::time::timeout(TokioDuration::from_millis(25), &mut blocked)
+                .await
+                .is_err()
+        );
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(TokioDuration::from_secs(1), &mut blocked)
+                .await
+                .expect("canceled admission wait should finish")
+                .is_none()
+        );
+
+        drop((first, second));
     }
 
     #[test]
