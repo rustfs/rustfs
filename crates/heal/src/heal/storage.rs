@@ -378,6 +378,23 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(false)
     }
 
+    /// Read target-specific physical evidence for one replacement version.
+    ///
+    /// This is only used by automatic replacement healing after the normal
+    /// transaction returns success. The conservative default prevents an
+    /// alternate backend from turning an unverified replacement into a
+    /// completed generation.
+    async fn replacement_targets_have_version(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _opts: &HealOpts,
+        _targets: &[String],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// List object versions for healing (returns all versions, may use significant memory for large buckets)
     ///
     /// WARNING: This method loads all object versions into memory at once. For buckets with many
@@ -1368,6 +1385,26 @@ impl HealStorageAPI for ECStoreHealStorage {
 
     async fn replacement_targets_ready(&self, targets: &[String]) -> Result<bool> {
         Ok(super::replacement_readiness::auto_replacement_targets_ready(targets).await)
+    }
+
+    async fn replacement_targets_have_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<bool> {
+        let pool_index = opts
+            .pool
+            .ok_or_else(|| Error::other("replacement target readback is missing pool scope"))?;
+        let set_index = opts
+            .set
+            .ok_or_else(|| Error::other("replacement target readback is missing set scope"))?;
+        self.ecstore
+            .replacement_targets_have_version(bucket, object, version_id.unwrap_or(""), pool_index, set_index, targets)
+            .await
+            .map_err(Error::Storage)
     }
 
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {

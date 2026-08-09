@@ -757,6 +757,7 @@ impl ErasureSetHealer {
                 let heal_opts = self.heal_opts;
                 let semaphore = semaphore.clone();
                 let target_endpoints = self.target_endpoints.clone();
+                let replacement_commit_evidence_required = self.replacement_task_id.is_some();
 
                 page_tasks.push(async move {
                     let permit = semaphore
@@ -784,7 +785,32 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
-                            Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => Ok(true),
+                            Ok((result, None))
+                                if target_outcomes_complete(&result, &target_endpoints) =>
+                            {
+                                if !replacement_commit_evidence_required {
+                                    Ok(true)
+                                } else {
+                                    match storage
+                                        .replacement_targets_have_version(
+                                            &bucket_name,
+                                            &object_name,
+                                            version_id.as_deref(),
+                                            &heal_opts,
+                                            &target_endpoints,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => Ok(true),
+                                        Ok(false) => Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
+                                        ))),
+                                        Err(err) => Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
+                                        ))),
+                                    }
+                                }
+                            }
                             Ok((_result, None)) if !target_endpoints.is_empty() => Err(Error::transient_skip(format!(
                                 "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
                             ))),
@@ -1206,6 +1232,9 @@ mod resume_loop_tests {
         outcomes: Mutex<HashMap<String, HealOutcome>>,
         /// successful low-level result per `compose_key`; default has no drive outcomes.
         results: Mutex<HashMap<String, HealResultItem>>,
+        /// Target-specific physical readback evidence per `compose_key`; the
+        /// fake models a healthy backend unless a test explicitly revokes it.
+        replacement_commit_evidence: Mutex<HashMap<String, bool>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
@@ -1221,6 +1250,12 @@ mod resume_loop_tests {
         }
         fn set_result(&self, name: &str, version: Option<&str>, result: HealResultItem) {
             self.results.lock().unwrap().insert(compose_key(name, version), result);
+        }
+        fn set_replacement_commit_evidence(&self, name: &str, version: Option<&str>, committed: bool) {
+            self.replacement_commit_evidence
+                .lock()
+                .unwrap()
+                .insert(compose_key(name, version), committed);
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
@@ -1305,6 +1340,21 @@ mod resume_loop_tests {
         }
         async fn heal_format(&self, _dry: bool) -> Result<(HealResultItem, Option<Error>)> {
             Ok((HealResultItem::default(), None))
+        }
+        async fn replacement_targets_have_version(
+            &self,
+            _bucket: &str,
+            object: &str,
+            version_id: Option<&str>,
+            _opts: &HealOpts,
+            _targets: &[String],
+        ) -> Result<bool> {
+            Ok(*self
+                .replacement_commit_evidence
+                .lock()
+                .unwrap()
+                .get(&compose_key(object, version_id))
+                .unwrap_or(&true))
         }
         async fn list_objects_for_heal(&self, _b: &str, _p: &str) -> Result<Vec<HealListItem>> {
             Ok(Vec::new())
@@ -2040,5 +2090,94 @@ mod resume_loop_tests {
         assert_eq!(state.retry_count, 1);
         assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
         assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_target_readback_evidence_must_confirm_the_healed_version() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()));
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+        env.storage.set_replacement_commit_evidence("object", Some("v1"), false);
+
+        let result = healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        result.expect_err("a success result without target readback evidence must retry");
+        assert_eq!(env.resume.get_state().await.retry_count, 1);
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_targeted_heal_keeps_existing_best_effort_result_semantics() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::Admin,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], None);
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+        env.storage.set_replacement_commit_evidence("object", Some("v1"), false);
+
+        healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("manual targeted healing must retain its existing success semantics");
+
+        assert_eq!(env.resume.get_state().await.retry_count, 0);
     }
 }

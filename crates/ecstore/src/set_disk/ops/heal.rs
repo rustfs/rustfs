@@ -331,6 +331,85 @@ fn warn_heal_writer_failures(
 }
 
 impl SetDisks {
+    /// Read back one healed version from every explicitly admitted replacement
+    /// target. This is intentionally separate from the normal heal result: a
+    /// successful result describes the transaction attempt, while automatic
+    /// replacement completion needs physical evidence that survives a crash
+    /// before its checkpoint is persisted.
+    pub(crate) async fn replacement_targets_have_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        targets: &[String],
+    ) -> disk::error::Result<bool> {
+        let disks = self.get_disks_internal().await;
+        let mut target_disks = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let Some(index) = self.set_endpoints.iter().position(|endpoint| endpoint.to_string() == *target) else {
+                return Ok(false);
+            };
+            let Some(disk) = disks.get(index).and_then(Option::as_ref) else {
+                return Ok(false);
+            };
+            target_disks.push(disk.clone());
+        }
+
+        let read_options = ReadOptions {
+            incl_free_versions: false,
+            read_data: true,
+            healing: true,
+        };
+        let checks = target_disks.into_iter().map(|disk| {
+            let read_options = read_options.clone();
+            async move {
+                let file_info = match disk.read_version("", bucket, object, version_id, &read_options).await {
+                    Ok(file_info) => file_info,
+                    Err(
+                        DiskError::DiskNotFound
+                        | DiskError::VolumeNotFound
+                        | DiskError::FileNotFound
+                        | DiskError::FileVersionNotFound
+                        | DiskError::PathNotFound,
+                    ) => return Ok(false),
+                    Err(err) => return Err(err),
+                };
+                if !file_info_is_valid_for_metadata(&file_info) {
+                    return Ok(false);
+                }
+                if !version_id.is_empty() && file_info.version_id.as_ref().map(ToString::to_string).as_deref() != Some(version_id)
+                {
+                    return Ok(false);
+                }
+                if file_info.is_canonical_delete_marker() || file_info.is_remote() {
+                    return Ok(true);
+                }
+                if (file_info.data.is_some() || file_info.size == 0) && !file_info.parts.is_empty() {
+                    return Ok(true);
+                }
+
+                let check = match disk.check_parts(bucket, object, &file_info).await {
+                    Ok(check) => check,
+                    Err(
+                        DiskError::DiskNotFound
+                        | DiskError::VolumeNotFound
+                        | DiskError::FileNotFound
+                        | DiskError::FileVersionNotFound
+                        | DiskError::PathNotFound,
+                    ) => return Ok(false),
+                    Err(err) => return Err(err),
+                };
+                Ok(!check.results.is_empty() && check.results.iter().all(|result| *result == CHECK_PART_SUCCESS))
+            }
+        });
+
+        Ok(futures::future::try_join_all(checks)
+            .await?
+            .into_iter()
+            .all(|committed| committed))
+    }
+
     #[tracing::instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(in crate::set_disk) async fn heal_object(
         &self,
@@ -2433,6 +2512,50 @@ mod heal_result_report_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_target_readback_requires_the_committed_shard() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "replacement-target-readback";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
+        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let source = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("source metadata should be readable");
+        let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+        let targets = vec![set.set_endpoints[0].to_string(), set.set_endpoints[1].to_string()];
+
+        assert!(
+            set.replacement_targets_have_version(bucket, object, "", &targets)
+                .await
+                .expect("healthy target shards should be readable")
+        );
+
+        tokio::fs::remove_file(
+            temp_dirs[1]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join("part.1"),
+        )
+        .await
+        .expect("target shard should be removed after the initial commit");
+
+        assert!(
+            !set.replacement_targets_have_version(bucket, object, "", &targets)
+                .await
+                .expect("missing target shard should be observable")
+        );
     }
 
     #[tokio::test]
