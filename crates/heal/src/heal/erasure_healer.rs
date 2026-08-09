@@ -257,8 +257,13 @@ impl ErasureSetHealer {
         result?;
         self.verify_replacement_identity_fence("completion").await?;
 
-        // The healing marker is cleared by the caller only after both cleanup
-        // operations succeed. Cleanup is idempotent, so a retry is safe.
+        if self.replacement_task_id.is_some() {
+            // A replacement marker must outlive the successful data scan. The
+            // task clears that owner marker before deleting these artifacts.
+            resume_manager.mark_replacement_verified().await?;
+            return Ok(());
+        }
+
         checkpoint_manager.cleanup().await?;
         resume_manager.cleanup().await?;
         Ok(())
@@ -576,10 +581,10 @@ impl ErasureSetHealer {
                 )));
             }
 
-            // Retry budget exhausted: drop the resume/checkpoint state so this
-            // task does not loop, but keep the healing markers (return Err) so a
-            // later heal cycle / the background scanner starts a fresh attempt.
-            // Never silently claim a clean completion while objects are unhealed.
+            // Retry budget exhausted: keep the resume/checkpoint state while
+            // the replacement marker remains. A later repair must retain the
+            // durable evidence of the incomplete generation instead of
+            // starting from an indistinguishable blank state.
             error!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -592,8 +597,6 @@ impl ErasureSetHealer {
                 state = "failed_after_retries",
                 "Erasure set heal exhausted retries with unrecovered versions"
             );
-            checkpoint_manager.cleanup().await?;
-            resume_manager.cleanup().await?;
             return Err(Error::other(format!(
                 "Erasure set heal exhausted retries with {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped"
             )));
@@ -1597,6 +1600,85 @@ mod resume_loop_tests {
             .get_state()
             .await;
         assert!(state.completed, "successful data heal must be persisted before cleanup is attempted");
+    }
+
+    #[tokio::test]
+    async fn replacement_completion_keeps_resume_artifacts_until_marker_cleanup() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let replacement_task_id = "replacement-completion".to_string();
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        let checkpoint = CheckpointManager::new(env.healer.disk.clone(), replacement_task_id.clone())
+            .await
+            .expect("replacement checkpoint should persist");
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+            vec!["replacement-a".to_string()],
+            Some(replacement_task_id.clone()),
+        );
+
+        healer
+            .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
+            .await
+            .expect("replacement data scan should complete");
+
+        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("verified replacement state must remain after data scan")
+            .get_state()
+            .await;
+        assert!(state.completed, "the verified state must record a completed data scan");
+        assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+        assert!(
+            CheckpointManager::has_checkpoint(&env.healer.disk, &replacement_task_id).await,
+            "the checkpoint must survive until the caller clears the healing marker"
+        );
+        drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_keeps_resume_artifacts_for_recovery() {
+        let env = make_env().await;
+        for _ in 0..3 {
+            assert!(env.resume.schedule_retry().await.expect("retry state should persist"));
+            env.checkpoint
+                .reset_for_retry()
+                .await
+                .expect("checkpoint reset should persist");
+        }
+        env.storage.fail_listing();
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("exhausted retry state must report the incomplete heal");
+
+        assert!(
+            ResumeManager::has_resume_state(&env.healer.disk, "task").await,
+            "retry exhaustion must not delete the resumable state while a marker may remain"
+        );
+        assert!(
+            CheckpointManager::has_checkpoint(&env.healer.disk, "task").await,
+            "retry exhaustion must retain the checkpoint with the resumable state"
+        );
     }
 
     #[tokio::test]

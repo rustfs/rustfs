@@ -1351,11 +1351,22 @@ impl HealManager {
                         continue;
                     };
                     let state = manager.get_state().await;
-                    if !state.completed
+                    let active_replacement = !state.completed
+                        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding);
+                    let verified_replacement = state.completed
+                        && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
+                    if (active_replacement || verified_replacement)
                         && state.replacement_generation.as_deref() == Some(task_id.as_str())
-                        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
                         && !state.replacement_targets.is_empty()
                     {
+                        if matches!(state.replacement_phase, ReplacementPhase::CleanupPending) {
+                            replacement_intents.entry(task_id).or_insert((
+                                state.set_disk_id,
+                                state.replacement_targets,
+                                state.replacement_buckets,
+                            ));
+                            continue;
+                        }
                         match self.storage.replacement_target_identities(&state.replacement_targets).await {
                             Ok(identities) if identities == state.replacement_target_identities => {
                                 replacement_intents.entry(task_id).or_insert((

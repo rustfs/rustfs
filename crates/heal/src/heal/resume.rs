@@ -40,7 +40,7 @@ pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 /// older schema (which tracked latest-only object names and a positional
 /// cursor) are incompatible with the per-version resume cursor, so they are
 /// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 4;
+const CURRENT_RESUME_SCHEMA: u32 = 5;
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
@@ -53,6 +53,8 @@ pub enum ReplacementPhase {
     None,
     Intent,
     Rebuilding,
+    Verified,
+    CleanupPending,
     Abandoned,
 }
 
@@ -445,7 +447,13 @@ impl ResumeManager {
                 || state.replacement_targets != replacement_targets
                 || state.replacement_target_identities != replacement_target_identities
                 || state.replacement_generation.as_deref() != Some(task_id.as_str())
-                || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                || !matches!(
+                    state.replacement_phase,
+                    ReplacementPhase::Intent
+                        | ReplacementPhase::Rebuilding
+                        | ReplacementPhase::Verified
+                        | ReplacementPhase::CleanupPending
+                )
             {
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Replacement intent does not match task {task_id}"),
@@ -499,6 +507,37 @@ impl ResumeManager {
             });
         }
         state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    /// Record that the replacement data scan completed before its healing
+    /// marker is removed. The marker-clear caller must advance this to
+    /// `CleanupPending` before it deletes the resume artifacts.
+    pub async fn mark_replacement_verified(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if !state.completed || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement verification is not active for task {}", state.task_id),
+            });
+        }
+        state.replacement_phase = ReplacementPhase::Verified;
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    /// Record that the healing markers have been removed, so a later retry can
+    /// safely delete the remaining resume artifacts without touching markers.
+    pub async fn mark_replacement_cleanup_pending(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if !state.completed || !matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement cleanup is not ready for task {}", state.task_id),
+            });
+        }
+        state.replacement_phase = ReplacementPhase::CleanupPending;
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         drop(state);
         self.save_state_strict().await
@@ -1216,6 +1255,94 @@ mod tests {
             ["bucket-a"],
             "recovery must retain the original positional bucket plan"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_terminal_phases_are_durable() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create replacement phase test directory");
+        let endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("create test disk endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create test disk");
+        match disk.make_volume(RUSTFS_META_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("create metadata volume for replacement phase test: {err}"),
+        }
+
+        let task_id = "replacement-terminal-phase".to_string();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        manager
+            .mark_completed()
+            .await
+            .expect("completion must persist before verification");
+        manager
+            .mark_replacement_verified()
+            .await
+            .expect("verified phase must persist");
+
+        let verified = ResumeManager::load_from_disk(disk.clone(), &task_id)
+            .await
+            .expect("verified phase must survive a restart")
+            .get_state()
+            .await;
+        assert!(verified.completed);
+        assert_eq!(verified.replacement_phase, ReplacementPhase::Verified);
+
+        let resumed = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["ignored-after-restart".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("verified replacement must be reopenable for terminal cleanup");
+        assert_eq!(
+            resumed.get_state().await.replacement_buckets,
+            ["bucket"],
+            "terminal recovery must preserve the original generation bucket plan"
+        );
+
+        manager
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("cleanup-pending phase must persist after marker removal");
+        let cleanup_pending = ResumeManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("cleanup-pending phase must survive a restart")
+            .get_state()
+            .await;
+        assert!(cleanup_pending.completed);
+        assert_eq!(cleanup_pending.replacement_phase, ReplacementPhase::CleanupPending);
     }
 
     #[tokio::test]

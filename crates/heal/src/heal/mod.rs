@@ -78,12 +78,14 @@ pub(crate) const HEALING_MARKER_PATH: &str = ECSTORE_HEALING_MARKER_PATH;
 /// Write the healing marker on the local disks matching `endpoints` so their
 /// `DiskInfo.healing` reports true while the erasure-set heal rebuilds them.
 pub(crate) async fn set_healing_markers(endpoints: &[String], marker: &str) -> crate::Result<()> {
-    apply_healing_markers(endpoints, Some(marker), None).await
+    apply_healing_markers(endpoints, Some(marker), None, false).await
 }
 
-/// Remove the healing markers written by [`set_healing_markers`].
-pub(crate) async fn clear_healing_markers(endpoints: &[String], marker: &str) -> crate::Result<()> {
-    apply_healing_markers(endpoints, None, Some(marker)).await
+/// Remove an owner marker after the replacement scan's verified state is
+/// durable. A missing marker is idempotent here because a crash may have
+/// happened after the previous terminal clear and before resume cleanup.
+pub(crate) async fn clear_healing_markers_after_verified(endpoints: &[String], marker: &str) -> crate::Result<()> {
+    apply_healing_markers(endpoints, None, Some(marker), true).await
 }
 
 fn marker_matches(current: &[u8], expected_marker: Option<&str>) -> bool {
@@ -94,7 +96,12 @@ fn all_marker_targets_matched(endpoints: &[String], matched_endpoints: &std::col
     endpoints.iter().all(|endpoint| matched_endpoints.contains(endpoint))
 }
 
-async fn apply_healing_markers(endpoints: &[String], marker: Option<&str>, expected_marker: Option<&str>) -> crate::Result<()> {
+async fn apply_healing_markers(
+    endpoints: &[String],
+    marker: Option<&str>,
+    expected_marker: Option<&str>,
+    allow_missing: bool,
+) -> crate::Result<()> {
     if endpoints.is_empty() {
         return Ok(());
     }
@@ -127,6 +134,7 @@ async fn apply_healing_markers(endpoints: &[String], marker: Option<&str>, expec
                     .await
                 }
                 Ok(_) => Err(DiskError::other("healing marker ownership changed")),
+                Err(DiskError::FileNotFound) if allow_missing => Ok(()),
                 Err(DiskError::FileNotFound) => Err(DiskError::other("healing marker is missing")),
                 Err(err) => Err(err),
             },

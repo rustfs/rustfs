@@ -16,7 +16,9 @@ use crate::heal::{
     DiskError, EcstoreError, ErasureSetHealer,
     erasure_healer::target_outcomes_complete,
     progress::HealProgress,
-    resume::{ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match},
+    resume::{
+        CheckpointManager, ReplacementPhase, ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match,
+    },
     storage::{HealStorageAPI, next_heal_listing_token},
 };
 use crate::{Error, Result};
@@ -2162,6 +2164,37 @@ impl HealTask {
             });
         }
 
+        let replacement_resume_disk = if is_auto_replacement {
+            let mut requested_targets = self.heal_endpoints.clone();
+            requested_targets.sort_unstable();
+            requested_targets.dedup();
+            let disk = self
+                .await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
+                .await?;
+            if ResumeManager::has_resume_state(&disk, &self.id).await {
+                let resume_manager = ResumeManager::load_from_disk(disk.clone(), &self.id).await?;
+                let state = resume_manager.get_state().await;
+                if state.completed
+                    && matches!(state.replacement_phase, ReplacementPhase::CleanupPending)
+                    && state.set_disk_id == set_disk_id
+                    && state.replacement_targets == requested_targets
+                    && state.replacement_generation.as_deref() == Some(self.id.as_str())
+                {
+                    if CheckpointManager::has_checkpoint(&disk, &self.id).await {
+                        CheckpointManager::load_from_disk(disk.clone(), &self.id)
+                            .await?
+                            .cleanup()
+                            .await?;
+                    }
+                    resume_manager.cleanup().await?;
+                    return Ok(());
+                }
+            }
+            Some(disk)
+        } else {
+            None
+        };
+
         let mut buckets = if buckets.is_empty() {
             debug!(
                 target: "rustfs::heal::task",
@@ -2187,9 +2220,9 @@ impl HealTask {
             let identities = self
                 .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
                 .await?;
-            let disk = self
-                .await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
-                .await?;
+            let disk = replacement_resume_disk.clone().ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Replacement resume disk is missing for automatic heal {set_disk_id}"),
+            })?;
             let manager = ResumeManager::new_replacement_intent(
                 disk.clone(),
                 self.id.clone(),
@@ -2204,6 +2237,23 @@ impl HealTask {
         } else {
             None
         };
+
+        let healing_marker = format!("{set_disk_id}:{}", self.id);
+        if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
+            let state = resume_manager.get_state().await;
+            if state.completed && matches!(state.replacement_phase, ReplacementPhase::Verified) {
+                super::clear_healing_markers_after_verified(&self.heal_endpoints, &healing_marker).await?;
+                resume_manager.mark_replacement_cleanup_pending().await?;
+                if CheckpointManager::has_checkpoint(disk, &self.id).await {
+                    CheckpointManager::load_from_disk(disk.clone(), &self.id)
+                        .await?
+                        .cleanup()
+                        .await?;
+                }
+                resume_manager.cleanup().await?;
+                return Ok(());
+            }
+        }
 
         // Step 1: Perform disk format heal using ecstore
         debug!(
@@ -2339,7 +2389,6 @@ impl HealTask {
 
         // The rebuilt disks are formatted now: mark them as healing so
         // DiskInfo.healing reflects the rebuild until it completes.
-        let healing_marker = format!("{set_disk_id}:{}", self.id);
         super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
 
         // Step 2: Get disk for resume functionality
@@ -2354,8 +2403,8 @@ impl HealTask {
             "Heal erasure set stage entered"
         );
         let replacement_target_identities = replacement_resume.as_ref().map(|(_, _, identities)| identities.clone());
-        let disk = match replacement_resume {
-            Some((disk, _, _)) => disk,
+        let disk = match replacement_resume.as_ref() {
+            Some((disk, _, _)) => disk.clone(),
             None => {
                 self.await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
                     .await?
@@ -2475,7 +2524,18 @@ impl HealTask {
                     self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "marker completion")
                         .await?;
                 }
-                super::clear_healing_markers(&self.heal_endpoints, &healing_marker).await
+                super::clear_healing_markers_after_verified(&self.heal_endpoints, &healing_marker).await?;
+                if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
+                    resume_manager.mark_replacement_cleanup_pending().await?;
+                    if CheckpointManager::has_checkpoint(disk, &self.id).await {
+                        CheckpointManager::load_from_disk(disk.clone(), &self.id)
+                            .await?
+                            .cleanup()
+                            .await?;
+                    }
+                    resume_manager.cleanup().await?;
+                }
+                Ok(())
             }
             Err(err) => Err(err),
         };
