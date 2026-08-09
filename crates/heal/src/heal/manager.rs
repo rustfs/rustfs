@@ -1225,7 +1225,6 @@ impl HealManager {
             .insert(set_disk_id.to_string());
     }
 
-    #[cfg(test)]
     fn replacement_recovery_set_is_blocked(&self, set_disk_id: &str) -> bool {
         self.replacement_recovery_blocked_sets
             .lock()
@@ -1524,6 +1523,18 @@ impl HealManager {
             let Ok((pool_index, set_index)) = crate::heal::utils::parse_set_disk_id(&set_disk_id) else {
                 continue;
             };
+            if self.replacement_recovery_set_is_blocked(&set_disk_id) {
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    set_disk_id,
+                    recovery_count = recoveries.len(),
+                    "Replacement recovery deferred because durable recovery validation is blocked"
+                );
+                continue;
+            }
             if conflicted_replacement_sets.contains(&set_disk_id) || recoveries.len() != 1 {
                 self.block_replacement_recovery_set(&set_disk_id);
                 debug!(
