@@ -44,7 +44,7 @@ const CURRENT_RESUME_SCHEMA: u32 = 3;
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
-const CURRENT_CHECKPOINT_SCHEMA: u32 = 2;
+const CURRENT_CHECKPOINT_SCHEMA: u32 = 3;
 
 /// Build the canonical, provably-injective dedup identity for an object
 /// version. Length-prefixing the object key makes the encoding injective: no
@@ -717,6 +717,7 @@ impl CheckpointManager {
             checkpoint.processed_objects.clear();
             checkpoint.failed_objects.clear();
             checkpoint.skipped_objects.clear();
+            checkpoint.current_bucket_index = 0;
             checkpoint.current_object_index = 0;
             checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
         }
@@ -1204,7 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_checkpoint_schema_v0_discarded_on_load() {
+    async fn test_checkpoint_schema_v2_discarded_on_load() {
         use super::super::{DiskOption, Endpoint, new_disk};
         use tempfile::TempDir;
 
@@ -1224,8 +1225,10 @@ mod tests {
         let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
         let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
 
-        // Legacy checkpoint: no schema_version, stale position and dedup sets.
+        // The previous checkpoint schema is unsafe once its paired resume
+        // state is discarded: retaining either position would skip work.
         let legacy = r#"{
+            "schema_version": 2,
             "task_id": "old-task",
             "checkpoint_time": 1700000000,
             "current_bucket_index": 2,
@@ -1242,6 +1245,7 @@ mod tests {
         let manager = CheckpointManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
         let checkpoint = manager.get_checkpoint().await;
         assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA, "schema must be stamped current");
+        assert_eq!(checkpoint.current_bucket_index, 0, "stale bucket position must be reset");
         assert_eq!(checkpoint.current_object_index, 0, "stale position must be reset");
         assert!(checkpoint.processed_objects.is_empty());
         assert!(checkpoint.failed_objects.is_empty());
