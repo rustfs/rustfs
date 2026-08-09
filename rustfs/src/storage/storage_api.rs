@@ -208,6 +208,12 @@ pub(crate) mod rpc_consumer {
     pub(crate) use super::super::rpc::InternodeRpcService;
 
     pub(crate) mod http_service {
+        #[cfg(test)]
+        pub(crate) use super::super::Endpoint;
+        #[cfg(test)]
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
+        #[cfg(test)]
+        pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{
@@ -220,8 +226,8 @@ pub(crate) mod rpc_consumer {
             WALK_DIR_STREAM_COMPLETION_V1,
         };
         pub(crate) use super::super::{
-            StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-            sign_ns_scanner_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+            DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
+            find_local_disk_by_ref, sign_ns_scanner_capability, verify_put_file_auth_trailer, verify_rpc_signature,
         };
     }
 
@@ -1118,6 +1124,7 @@ pub(crate) trait StorageDiskRpcExt {
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
+    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
     async fn rename_part(
@@ -1264,6 +1271,10 @@ where
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
         ecstore_disk::DiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
+    }
+
+    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader> {
+        ecstore_disk::DiskAPI::read_file(self, volume, path).await
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader> {
