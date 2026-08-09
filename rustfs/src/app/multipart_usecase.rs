@@ -382,6 +382,7 @@ impl DefaultMultipartUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -664,6 +665,7 @@ impl DefaultMultipartUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -845,6 +847,7 @@ impl DefaultMultipartUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
@@ -1180,6 +1183,7 @@ impl DefaultMultipartUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part_copy(
         &self,
         req: S3Request<UploadPartCopyInput>,

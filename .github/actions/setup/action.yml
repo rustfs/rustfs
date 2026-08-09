@@ -57,7 +57,7 @@ runs:
   using: "composite"
   steps:
     # protobuf-compiler is deliberately absent: the setup-protoc step below
-    # installs 34.1 into the tool cache and prepends it to PATH, so the apt
+    # installs 35.1 into the tool cache and prepends it to PATH, so the apt
     # build (older, and never version-matched) was shadowed on every run and
     # simply never used.
     - name: Install system dependencies (Ubuntu)
@@ -81,7 +81,7 @@ runs:
     - name: Install protoc
       uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
       with:
-        version: "34.1"
+        version: "35.1"
         repo-token: ${{ github.token }}
 
     - name: Install flatc
