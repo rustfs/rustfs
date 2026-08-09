@@ -286,7 +286,7 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
-    fn get_disks_for_heal_object(&self, key: &str, opts: &HealOpts) -> Result<Arc<SetDisks>> {
+    pub(crate) fn get_disks_for_heal_object(&self, key: &str, opts: &HealOpts) -> Result<Arc<SetDisks>> {
         match opts.set {
             Some(set_idx) => self.disk_set.get(set_idx).cloned().ok_or_else(|| {
                 StorageError::InvalidArgument(
