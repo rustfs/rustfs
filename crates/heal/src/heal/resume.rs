@@ -938,31 +938,71 @@ impl ResumeManager {
 
     /// Load the durable terminal proof from the healthy survivor anchor.
     pub(crate) async fn load_replacement_completion_proof(disk: DiskStore, task_id: &str) -> Result<ReplacementCompletionProof> {
+        Self::replacement_completion_proof_if_present(disk, task_id)
+            .await?
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Failed to read replacement completion proof: proof is missing for task {task_id}"),
+            })
+    }
+
+    async fn replacement_completion_proof_if_present(
+        disk: DiskStore,
+        task_id: &str,
+    ) -> Result<Option<ReplacementCompletionProof>> {
         validate_resume_task_id(task_id)?;
-        let path = replacement_completion_proof_path(task_id);
-        let path_str = path_to_str(&path)?;
-        let bytes = match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
-            Ok(bytes) => bytes,
-            Err(DiskError::FileNotFound) => {
-                let legacy_path = legacy_replacement_completion_proof_path(task_id);
-                let legacy_path = path_to_str(&legacy_path)?;
-                disk.read_all(RUSTFS_META_BUCKET, legacy_path)
-                    .await
-                    .map_err(|error| Error::TaskExecutionFailed {
+        for path in [
+            replacement_completion_proof_path(task_id),
+            legacy_replacement_completion_proof_path(task_id),
+        ] {
+            let path_str = path_to_str(&path)?;
+            let bytes = match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
+                Ok(bytes) => bytes,
+                Err(DiskError::FileNotFound) => continue,
+                Err(error) => {
+                    return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to read replacement completion proof: {error}"),
-                    })?
-            }
-            Err(error) => {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to read replacement completion proof: {error}"),
-                });
-            }
+                    });
+                }
+            };
+            let proof: ReplacementCompletionProof =
+                serde_json::from_slice(&bytes).map_err(|error| Error::TaskExecutionFailed {
+                    message: format!("Failed to deserialize replacement completion proof: {error}"),
+                })?;
+            proof.validate(task_id)?;
+            return Ok(Some(proof));
+        }
+        Ok(None)
+    }
+
+    /// Reconcile the proof-first publication order after a crash. A matching
+    /// proof is durable evidence that rebuilding finished, so it must win over
+    /// an older active state before a retry may format the target again.
+    async fn reconcile_replacement_completion_proof(&self) -> Result<()> {
+        let task_id = self.state.read().await.task_id.clone();
+        let Some(proof) = Self::replacement_completion_proof_if_present(self.disk.clone(), &task_id).await? else {
+            return Ok(());
         };
-        let proof: ReplacementCompletionProof = serde_json::from_slice(&bytes).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to deserialize replacement completion proof: {e}"),
-        })?;
-        proof.validate(task_id)?;
-        Ok(proof)
+
+        let mut state = self.state.write().await;
+        if !proof.matches_state(&state) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement completion proof does not match active intent for task {}", state.task_id),
+            });
+        }
+        if state.completed && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending) {
+            return Ok(());
+        }
+        if state.completed || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement completion proof conflicts with state for task {}", state.task_id),
+            });
+        }
+
+        state.mark_completed();
+        state.replacement_phase = ReplacementPhase::Verified;
+        state.last_update = proof.verified_at;
+        drop(state);
+        self.save_state_strict().await
     }
 
     async fn migrate_legacy_replacement_completion_proof(disk: &DiskStore, task_id: &str) -> Result<bool> {
@@ -1088,6 +1128,7 @@ impl ResumeManager {
                 legacy.cleanup().await?;
             }
             delete_resume_file(&disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
+            isolated.reconcile_replacement_completion_proof().await?;
             return Ok(isolated);
         }
 
@@ -1113,6 +1154,7 @@ impl ResumeManager {
         migrated.ensure_replacement_intent_seal().await?;
         legacy.cleanup().await?;
         delete_resume_file(&migrated.disk, &legacy_replacement_recovery_marker_path(task_id)).await?;
+        migrated.reconcile_replacement_completion_proof().await?;
         Ok(migrated)
     }
 
@@ -2280,6 +2322,96 @@ mod tests {
             .await;
         assert!(cleanup_pending.completed);
         assert_eq!(cleanup_pending.replacement_phase, ReplacementPhase::CleanupPending);
+    }
+
+    #[tokio::test]
+    async fn replacement_proof_before_verified_state_is_reconciled_after_restart() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+
+        let proof = ReplacementCompletionProof::from_state(&manager.get_state().await, 42)
+            .expect("active replacement state should build a completion proof");
+        let proof_path = replacement_completion_proof_path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            proof_path.to_str().expect("completion proof path must be UTF-8"),
+            serde_json::to_vec(&proof)
+                .expect("completion proof fixture should serialize")
+                .into(),
+        )
+        .await
+        .expect("proof-first crash fixture should persist");
+
+        let recovered = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .expect("matching completion proof must prevent another rebuild")
+            .get_state()
+            .await;
+        assert!(recovered.completed);
+        assert_eq!(recovered.replacement_phase, ReplacementPhase::Verified);
+        assert_eq!(recovered.last_update, proof.verified_at);
+
+        let records = ResumeUtils::get_replacement_recovery_records(&disk)
+            .await
+            .expect("reconciled replacement state should be observable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, ReplacementRecoveryState::CleanupPending);
+    }
+
+    #[tokio::test]
+    async fn replacement_proof_conflicting_with_active_state_fails_closed_after_restart() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+
+        let mut proof = ReplacementCompletionProof::from_state(&manager.get_state().await, 42)
+            .expect("active replacement state should build a completion proof");
+        proof.set_disk_id = "pool_0_set_1".to_string();
+        let proof_path = replacement_completion_proof_path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            proof_path.to_str().expect("completion proof path must be UTF-8"),
+            serde_json::to_vec(&proof)
+                .expect("completion proof fixture should serialize")
+                .into(),
+        )
+        .await
+        .expect("conflicting proof fixture should persist");
+
+        let error = match ResumeManager::load_replacement_intent(disk, &task_id).await {
+            Ok(_) => panic!("a mismatched proof must not permit another rebuild"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match active intent"));
     }
 
     #[tokio::test]
