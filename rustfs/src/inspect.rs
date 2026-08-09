@@ -822,6 +822,65 @@ mod tests {
         (drive_path, object_dir)
     }
 
+    fn xml_sentinel_metadata() -> BucketMetadata {
+        let timestamp = |seconds| OffsetDateTime::from_unix_timestamp(seconds).expect("sentinel timestamp");
+        let mut metadata = BucketMetadata::default();
+        metadata.notification_config_xml = b"notification-sentinel".to_vec();
+        metadata.notification_config_updated_at = timestamp(1);
+        metadata.lifecycle_config_xml = b"lifecycle-sentinel".to_vec();
+        metadata.lifecycle_config_updated_at = timestamp(2);
+        metadata.object_lock_config_xml = b"object-lock-sentinel".to_vec();
+        metadata.object_lock_config_updated_at = timestamp(3);
+        metadata.versioning_config_xml = b"versioning-sentinel".to_vec();
+        metadata.versioning_config_updated_at = timestamp(4);
+        metadata.encryption_config_xml = b"encryption-sentinel".to_vec();
+        metadata.encryption_config_updated_at = timestamp(5);
+        metadata.tagging_config_xml = b"tagging-sentinel".to_vec();
+        metadata.tagging_config_updated_at = timestamp(6);
+        metadata.replication_config_xml = b"replication-sentinel".to_vec();
+        metadata.replication_config_updated_at = timestamp(7);
+        metadata.cors_config_xml = b"cors-sentinel".to_vec();
+        metadata.cors_config_updated_at = timestamp(8);
+        metadata.logging_config_xml = b"logging-sentinel".to_vec();
+        metadata.logging_config_updated_at = timestamp(9);
+        metadata.website_config_xml = b"website-sentinel".to_vec();
+        metadata.website_config_updated_at = timestamp(10);
+        metadata.accelerate_config_xml = b"accelerate-sentinel".to_vec();
+        metadata.accelerate_config_updated_at = timestamp(11);
+        metadata.request_payment_config_xml = b"request-payment-sentinel".to_vec();
+        metadata.request_payment_config_updated_at = timestamp(12);
+        metadata.public_access_block_config_xml = b"public-access-block-sentinel".to_vec();
+        metadata.public_access_block_config_updated_at = timestamp(13);
+        metadata
+    }
+
+    fn expected_xml_sentinels() -> Vec<(&'static str, &'static [u8], OffsetDateTime)> {
+        let timestamp = |seconds| OffsetDateTime::from_unix_timestamp(seconds).expect("sentinel timestamp");
+        vec![
+            ("notification.xml", b"notification-sentinel", timestamp(1)),
+            ("lifecycle.xml", b"lifecycle-sentinel", timestamp(2)),
+            ("object-lock.xml", b"object-lock-sentinel", timestamp(3)),
+            ("versioning.xml", b"versioning-sentinel", timestamp(4)),
+            ("bucket-encryption.xml", b"encryption-sentinel", timestamp(5)),
+            ("tagging.xml", b"tagging-sentinel", timestamp(6)),
+            ("replication.xml", b"replication-sentinel", timestamp(7)),
+            ("cors.xml", b"cors-sentinel", timestamp(8)),
+            ("logging.xml", b"logging-sentinel", timestamp(9)),
+            ("website.xml", b"website-sentinel", timestamp(10)),
+            ("accelerate.xml", b"accelerate-sentinel", timestamp(11)),
+            ("request-payment.xml", b"request-payment-sentinel", timestamp(12)),
+            ("public-access-block.xml", b"public-access-block-sentinel", timestamp(13)),
+        ]
+    }
+
+    fn marshal_bucket_metadata_blob(metadata: &BucketMetadata) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_u16.to_le_bytes());
+        blob.extend_from_slice(&1_u16.to_le_bytes());
+        blob.extend_from_slice(&metadata.marshal_msg().expect("marshal bucket metadata"));
+        blob
+    }
+
     fn inspect_opts(drives: &[tempfile::TempDir]) -> InspectBucketMetaOpts {
         InspectBucketMetaOpts {
             paths: drives
@@ -924,39 +983,10 @@ mod tests {
 
     #[test]
     fn export_list_contains_only_persisted_xml_configs() {
-        let mut bm = BucketMetadata::default();
-        bm.notification_config_xml = b"notification-sentinel".to_vec();
-        bm.lifecycle_config_xml = b"lifecycle-sentinel".to_vec();
-        bm.object_lock_config_xml = b"object-lock-sentinel".to_vec();
-        bm.versioning_config_xml = b"versioning-sentinel".to_vec();
-        bm.encryption_config_xml = b"encryption-sentinel".to_vec();
-        bm.tagging_config_xml = b"tagging-sentinel".to_vec();
-        bm.replication_config_xml = b"replication-sentinel".to_vec();
-        bm.cors_config_xml = b"cors-sentinel".to_vec();
-        bm.logging_config_xml = b"logging-sentinel".to_vec();
-        bm.website_config_xml = b"website-sentinel".to_vec();
-        bm.accelerate_config_xml = b"accelerate-sentinel".to_vec();
-        bm.request_payment_config_xml = b"request-payment-sentinel".to_vec();
-        bm.public_access_block_config_xml = b"public-access-block-sentinel".to_vec();
+        let bm = xml_sentinel_metadata();
         let configs = stored_configs(&bm);
 
-        let actual = configs.iter().map(|(name, bytes, _)| (*name, *bytes)).collect::<Vec<_>>();
-        let expected: Vec<(&str, &[u8])> = vec![
-            ("notification.xml", b"notification-sentinel"),
-            ("lifecycle.xml", b"lifecycle-sentinel"),
-            ("object-lock.xml", b"object-lock-sentinel"),
-            ("versioning.xml", b"versioning-sentinel"),
-            ("bucket-encryption.xml", b"encryption-sentinel"),
-            ("tagging.xml", b"tagging-sentinel"),
-            ("replication.xml", b"replication-sentinel"),
-            ("cors.xml", b"cors-sentinel"),
-            ("logging.xml", b"logging-sentinel"),
-            ("website.xml", b"website-sentinel"),
-            ("accelerate.xml", b"accelerate-sentinel"),
-            ("request-payment.xml", b"request-payment-sentinel"),
-            ("public-access-block.xml", b"public-access-block-sentinel"),
-        ];
-        assert_eq!(actual, expected);
+        assert_eq!(configs, expected_xml_sentinels());
     }
 
     #[tokio::test]
@@ -1102,6 +1132,39 @@ mod tests {
         let files = std::fs::read_dir(&out).expect("read export directory").count();
         assert_eq!(files, 14, ".metadata.bin plus all 13 persisted XML fields");
         assert_eq!(std::fs::read(out.join("cors.xml")).expect("empty CORS field exists"), b"");
+    }
+
+    #[tokio::test]
+    async fn raw_export_writes_blob_and_every_xml_field_byte_for_byte() {
+        let metadata = xml_sentinel_metadata();
+        let blob = marshal_bucket_metadata_blob(&metadata);
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_METADATA_FILE, &blob, true).await;
+        let export = tempfile::tempdir().expect("export tempdir");
+        let out = export.path().join("raw");
+        let opts = InspectBucketMetaOpts {
+            paths: drives
+                .iter()
+                .map(|drive| drive.path().to_string_lossy().into_owned())
+                .collect(),
+            bucket: "interop".to_string(),
+            raw: true,
+            out: Some(out.clone()),
+        };
+
+        execute_bucket_meta(&opts).await.expect("raw export");
+
+        assert_eq!(std::fs::read_dir(&out).expect("read export directory").count(), 14);
+        assert_eq!(std::fs::read(out.join(BUCKET_METADATA_FILE)).expect("read raw metadata blob"), blob);
+        for (name, expected_bytes, _) in expected_xml_sentinels() {
+            assert_eq!(
+                std::fs::read(out.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}")),
+                expected_bytes,
+                "{name} must preserve exact persisted bytes"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1273,11 +1336,7 @@ mod tests {
     fn bucket_metadata_blob(incarnation: Uuid) -> Vec<u8> {
         let mut metadata = BucketMetadata::new("interop");
         metadata.bucket_incarnation_id = incarnation;
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&1_u16.to_le_bytes());
-        blob.extend_from_slice(&1_u16.to_le_bytes());
-        blob.extend_from_slice(&metadata.marshal_msg().expect("marshal bucket metadata"));
-        blob
+        marshal_bucket_metadata_blob(&metadata)
     }
 
     #[tokio::test]
