@@ -242,6 +242,7 @@ impl ErasureSetHealer {
                     let state = manager.get_state().await;
                     if !state.completed
                         && state.set_disk_id == set_disk_id
+                        && state.replacement_targets == self.target_endpoints
                         && ResumeUtils::can_resume_task(&self.disk, &task_id).await
                     {
                         debug!(
@@ -351,6 +352,7 @@ impl ErasureSetHealer {
                 buckets.to_vec(),
             )
             .await?;
+            resume_manager.set_replacement_targets(self.target_endpoints.clone()).await?;
 
             let checkpoint_manager = CheckpointManager::new(self.disk.clone(), task_id.to_string()).await?;
 

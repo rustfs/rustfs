@@ -40,7 +40,7 @@ pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 /// older schema (which tracked latest-only object names and a positional
 /// cursor) are incompatible with the per-version resume cursor, so they are
 /// discarded on load and the scan restarts from the beginning.
-const CURRENT_RESUME_SCHEMA: u32 = 2;
+const CURRENT_RESUME_SCHEMA: u32 = 3;
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
@@ -169,6 +169,8 @@ pub struct ResumeState {
     /// set disk identifier (for erasure set tasks)
     #[serde(default)]
     pub set_disk_id: String,
+    #[serde(default)]
+    pub replacement_targets: Vec<String>,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -209,6 +211,7 @@ impl ResumeState {
             task_id,
             task_type,
             set_disk_id,
+            replacement_targets: Vec::new(),
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -338,18 +341,16 @@ impl ResumeManager {
         };
 
         // save initial state
-        if let Err(e) = manager.save_state().await {
-            warn!(
-                target: "rustfs::heal::resume",
-                event = EVENT_HEAL_RESUME_STATE,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_RESUME,
-                state = "initial_save_failed",
-                error = %e,
-                "Heal resume state persistence failed"
-            );
-        }
+        manager.save_state().await?;
         Ok(manager)
+    }
+
+    pub async fn set_replacement_targets(&self, replacement_targets: Vec<String>) -> Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state.replacement_targets = replacement_targets;
+        }
+        self.save_state().await
     }
 
     /// load resume state from disk
@@ -380,6 +381,7 @@ impl ResumeManager {
             state.failed_objects = 0;
             state.skipped_objects = 0;
             state.completed = false;
+            state.completed_buckets.clear();
             state.schema_version = CURRENT_RESUME_SCHEMA;
         }
 
