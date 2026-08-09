@@ -115,7 +115,7 @@ use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
 use crate::table_catalog;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
@@ -198,7 +198,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
-use tokio_util::io::{ReaderStream, StreamReader};
+#[cfg(test)]
+use tokio_util::io::ReaderStream;
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -868,7 +870,9 @@ where
 pin_project! {
     struct GetObjectReaderStream<R> {
         #[pin]
-        inner: ReaderStream<R>,
+        reader: Option<R>,
+        buf: BytesMut,
+        capacity: usize,
         strategy: &'static str,
         buffer_source: &'static str,
         remaining: usize,
@@ -918,7 +922,9 @@ where
             rustfs_io_metrics::record_get_object_reader_stream_buffer_size(strategy, buffer_source, capacity);
         }
         Self {
-            inner: ReaderStream::with_capacity(reader, capacity),
+            reader: Some(reader),
+            buf: BytesMut::with_capacity(capacity.min(remaining)),
+            capacity,
             strategy,
             buffer_source,
             remaining,
@@ -1331,12 +1337,28 @@ where
         }
 
         let remaining_before = *this.remaining;
-        let poll_start = std::time::Instant::now();
-        let result: Poll<Option<Self::Item>> = match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(mut bytes))) => {
-                if bytes.len() > *this.remaining {
-                    bytes.truncate(*this.remaining);
-                }
+        let attribution_enabled = is_get_output_handoff_attribution_enabled();
+        let poll_start = attribution_enabled.then(std::time::Instant::now);
+        let reader = match this.reader.as_mut().as_pin_mut() {
+            Some(reader) => reader,
+            None => return Poll::Ready(None),
+        };
+        let read_capacity = (*this.capacity).min(*this.remaining);
+        this.buf.resize(read_capacity, 0);
+
+        let poll_read = {
+            let mut read_buf = ReadBuf::new(&mut this.buf[..read_capacity]);
+            match reader.poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        };
+
+        let result: Poll<Option<Self::Item>> = match poll_read {
+            Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
+                let bytes = this.buf.split_to(bytes_read).freeze();
+                this.buf.clear();
                 *this.remaining -= bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
@@ -1354,7 +1376,23 @@ where
                     Poll::Ready(Some(Ok(bytes)))
                 }
             }
-            Poll::Ready(Some(Err(err))) => {
+            Poll::Ready(Ok(_)) => {
+                this.buf.clear();
+                this.reader.set(None);
+                let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
+                let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
+                #[cfg(feature = "tracing-chunk-debug")]
+                tracing::error!(
+                    emitted = *this.emitted,
+                    expected = *this.expected,
+                    error = %err,
+                    "GetObject ReaderStream ended before expected length"
+                );
+                Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
+            }
+            Poll::Ready(Err(err)) => {
+                this.buf.clear();
+                this.reader.set(None);
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1364,8 +1402,10 @@ where
                 );
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                this.buf.clear();
+                Poll::Pending
+            }
         };
 
         let emitted_bytes = match &result {
@@ -1378,14 +1418,14 @@ where
             Poll::Ready(Some(Err(_))) => GET_READER_STREAM_POLL_READY_ERROR,
             Poll::Pending => GET_READER_STREAM_POLL_PENDING,
         };
-        if is_get_output_handoff_attribution_enabled() {
+        if attribution_enabled {
             rustfs_io_metrics::record_get_object_reader_stream_poll(
                 this.strategy,
                 this.buffer_source,
                 outcome,
                 remaining_before,
                 emitted_bytes,
-                poll_start.elapsed().as_secs_f64(),
+                poll_start.map_or(0.0, |start| start.elapsed().as_secs_f64()),
             );
         }
 
@@ -1393,7 +1433,11 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        if self.remaining == 0 || self.reader.is_none() {
+            (0, Some(0))
+        } else {
+            (1, None)
+        }
     }
 }
 
@@ -14780,6 +14824,108 @@ mod tests {
         });
 
         assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_bounds_read_buffer_to_remaining() {
+        struct RecordingReader {
+            data: &'static [u8],
+            pos: usize,
+            observed_remaining: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl AsyncRead for RecordingReader {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                let requested = buf.remaining();
+                self.observed_remaining
+                    .lock()
+                    .expect("observed buffer sizes should not poison")
+                    .push(requested);
+                let available = self.data.len().saturating_sub(self.pos);
+                let to_copy = requested.min(available);
+                if to_copy > 0 {
+                    let end = self.pos + to_copy;
+                    buf.put_slice(&self.data[self.pos..end]);
+                    self.pos = end;
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let observed_remaining = Arc::new(Mutex::new(Vec::new()));
+        let stream = GetObjectReaderStream::new(
+            RecordingReader {
+                data: b"hello",
+                pos: 0,
+                observed_remaining: Arc::clone(&observed_remaining),
+            },
+            64,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
+
+        let chunks = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reader stream should read exact payload");
+        assert_eq!(chunks, vec![Bytes::from_static(b"hello")]);
+        assert_eq!(
+            *observed_remaining.lock().expect("observed buffer sizes should not poison"),
+            vec![5],
+            "stream should not ask the reader for more bytes than the response has left"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_bounds_multi_chunk_final_read() {
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(vec![b'a'; 66]),
+            64,
+            65,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
+
+        let chunks = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reader stream should ignore bytes past declared length");
+        let chunk_lengths = chunks.iter().map(Bytes::len).collect::<Vec<_>>();
+        let body = chunks.into_iter().fold(Vec::new(), |mut acc, chunk| {
+            acc.extend_from_slice(&chunk);
+            acc
+        });
+
+        assert_eq!(chunk_lengths, vec![64, 1]);
+        assert_eq!(body, vec![b'a'; 65]);
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_errors_on_short_eof() {
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(b"he".to_vec()),
+            64,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
+
+        let err = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("short reader should fail the streaming body");
+
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
     }
 
     #[tokio::test]
