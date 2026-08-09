@@ -12761,7 +12761,7 @@ mod test {
             .await
             .expect("staged part should be written");
         let staged_metadata = disk
-            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+            .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
             .expect("staged metadata path should resolve");
 
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -12934,9 +12934,12 @@ mod test {
             .expect("staged part should be written");
 
         let backup_path = object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        let backup_hook_path = disk
+            .get_object_path_for_io(bucket, &path_join_buf(&[object, &old_data_dir.to_string(), STORAGE_FORMAT_FILE_BACKUP]))
+            .expect("rollback backup io path should resolve");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_owned_file_write_before_open(&backup_path, move || {
+        set_owned_file_write_before_open(&backup_hook_path, move || {
             entered_tx.send(()).expect("signal backup write entry");
             release_rx.recv().expect("wait until cancellation has been observed");
         });

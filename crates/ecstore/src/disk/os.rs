@@ -341,7 +341,7 @@ pub(crate) mod file_sync_probe {
     use tokio::sync::Notify;
     use tokio::time::timeout;
 
-    static ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+    static ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
     static BLOCK_MUTEX: Mutex<()> = Mutex::new(());
     static BLOCK_CONDVAR: Condvar = Condvar::new();
     static ACTIVE_CHANGED: Notify = Notify::const_new();
@@ -375,7 +375,7 @@ pub(crate) mod file_sync_probe {
         fn drop(&mut self) {
             release();
             FAIL_ON_ATTEMPT.store(usize::MAX, Ordering::SeqCst);
-            *ROOT.write().expect("file sync probe lock poisoned") = None;
+            ROOTS.write().expect("file sync probe lock poisoned").clear();
         }
     }
 
@@ -388,7 +388,13 @@ pub(crate) mod file_sync_probe {
             let _guard = BLOCK_MUTEX.lock().expect("file sync probe blocker poisoned");
             BLOCK.store(block, Ordering::SeqCst);
         }
-        *ROOT.write().expect("file sync probe lock poisoned") = Some(root.to_path_buf());
+        let mut roots = vec![root.to_path_buf()];
+        if let Ok(canonical) = root.canonicalize()
+            && canonical != root
+        {
+            roots.push(canonical);
+        }
+        *ROOTS.write().expect("file sync probe lock poisoned") = roots;
         ProbeGuard
     }
 
@@ -409,11 +415,11 @@ pub(crate) mod file_sync_probe {
     }
 
     pub(super) fn enter(path: &Path) -> Option<ActiveGuard> {
-        let enabled = ROOT
-            .read()
-            .expect("file sync probe lock poisoned")
-            .as_ref()
-            .is_some_and(|root| path.starts_with(root));
+        let canonical_path = path.canonicalize().ok();
+        let enabled =
+            ROOTS.read().expect("file sync probe lock poisoned").iter().any(|root| {
+                path.starts_with(root) || canonical_path.as_ref().is_some_and(|canonical| canonical.starts_with(root))
+            });
         if !enabled {
             return None;
         }
