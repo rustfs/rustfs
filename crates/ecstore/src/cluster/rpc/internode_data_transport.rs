@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{build_auth_headers, verify_ns_scanner_capability};
+use crate::cluster::rpc::{build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability};
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
-    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY,
-    WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY,
+    PUT_FILE_AUTH_V1, PUT_FILE_NONCE_QUERY, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY,
+    WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -29,9 +30,11 @@ use rustfs_config::{
 };
 use rustfs_rio::{HttpReader, HttpWriter};
 use sha2::{Digest, Sha256};
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use uuid::Uuid;
 
 static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeDataTransport>, String>> = OnceLock::new();
@@ -166,10 +169,12 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
-        let url = build_put_file_stream_url(&request);
+        let nonce = Uuid::new_v4();
+        let url = build_put_file_stream_url(&request, Some(nonce));
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::PUT, &mut headers)?;
-        Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
+        let writer = HttpWriter::new(url.clone(), Method::PUT, headers).await?;
+        Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce)))
     }
 
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
@@ -236,8 +241,8 @@ fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
     )
 }
 
-fn build_put_file_stream_url(request: &WriteStreamRequest) -> String {
-    format!(
+fn build_put_file_stream_url(request: &WriteStreamRequest, auth_nonce: Option<Uuid>) -> String {
+    let mut url = format!(
         "{}{}?disk={}&volume={}&path={}&append={}&size={}",
         request.endpoint,
         PUT_FILE_STREAM_PATH,
@@ -246,7 +251,104 @@ fn build_put_file_stream_url(request: &WriteStreamRequest) -> String {
         urlencoding::encode(&request.path),
         request.append,
         request.size
-    )
+    );
+    if let Some(nonce) = auth_nonce {
+        url.push_str(&format!(
+            "&{}={}&{}={}",
+            PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_NONCE_QUERY, nonce
+        ));
+    }
+    url
+}
+
+struct PutFileAuthWriter<W> {
+    inner: W,
+    url: String,
+    nonce: Uuid,
+    hasher: Sha256,
+    trailer: Option<Vec<u8>>,
+    trailer_offset: usize,
+}
+
+impl<W> PutFileAuthWriter<W> {
+    fn new(inner: W, url: String, nonce: Uuid) -> Self {
+        Self {
+            inner,
+            url,
+            nonce,
+            hasher: Sha256::new(),
+            trailer: None,
+            trailer_offset: 0,
+        }
+    }
+
+    fn ensure_trailer(&mut self) -> std::io::Result<()> {
+        if self.trailer.is_some() {
+            return Ok(());
+        }
+        let digest = hex_simd::encode_to_string(self.hasher.clone().finalize(), hex_simd::AsciiCase::Lower);
+        self.trailer = Some(build_put_file_auth_trailer(&self.url, &Method::PUT, self.nonce, &digest)?);
+        Ok(())
+    }
+
+    fn poll_write_trailer(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.ensure_trailer()?;
+        let Some(trailer) = self.trailer.as_ref() else {
+            return Poll::Ready(Err(std::io::Error::other("put_file auth trailer missing")));
+        };
+        while self.trailer_offset < trailer.len() {
+            let written = match Pin::new(&mut self.inner).poll_write(cx, &trailer[self.trailer_offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write put_file auth trailer",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => written,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            };
+            self.trailer_offset += written;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<W> AsyncWrite for PutFileAuthWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        if self.trailer.is_some() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "cannot write after put_file auth trailer",
+            )));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                self.hasher.update(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.poll_write_trailer(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
@@ -455,19 +557,79 @@ mod tests {
 
     #[test]
     fn put_file_stream_url_encodes_query_values() {
-        let url = build_put_file_stream_url(&WriteStreamRequest {
-            endpoint: "http://node1:9000".to_string(),
-            disk: "http://node1:9000/data/rustfs0".to_string(),
-            volume: "bucket".to_string(),
-            path: "object/part.1".to_string(),
-            append: false,
-            size: 4096,
-        });
+        let url = build_put_file_stream_url(
+            &WriteStreamRequest {
+                endpoint: "http://node1:9000".to_string(),
+                disk: "http://node1:9000/data/rustfs0".to_string(),
+                volume: "bucket".to_string(),
+                path: "object/part.1".to_string(),
+                append: false,
+                size: 4096,
+            },
+            None,
+        );
 
         assert_eq!(
             url,
             "http://node1:9000/rustfs/rpc/put_file_stream?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0&volume=bucket&path=object%2Fpart.1&append=false&size=4096"
         );
+    }
+
+    #[test]
+    fn put_file_stream_url_advertises_auth_nonce_when_enabled() {
+        let nonce = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let url = build_put_file_stream_url(
+            &WriteStreamRequest {
+                endpoint: "http://node1:9000".to_string(),
+                disk: "http://node1:9000/data/rustfs0".to_string(),
+                volume: "bucket".to_string(),
+                path: "object/part.1".to_string(),
+                append: false,
+                size: 4096,
+            },
+            Some(nonce),
+        );
+
+        assert_eq!(
+            url,
+            concat!(
+                "http://node1:9000/rustfs/rpc/put_file_stream?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0",
+                "&volume=bucket&path=object%2Fpart.1&append=false&size=4096",
+                "&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_writer_appends_trailer_on_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-writer-test-secret".to_string());
+        let nonce = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let url = concat!(
+            "http://node1:9000/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
+        )
+        .to_string();
+        let mut sink = Vec::new();
+
+        {
+            let mut writer = PutFileAuthWriter::new(&mut sink, url.clone(), nonce);
+            writer.write_all(b"hello world").await.expect("body write should succeed");
+            writer.shutdown().await.expect("shutdown should append auth trailer");
+            let err = writer
+                .write_all(b"!")
+                .await
+                .expect_err("post-trailer writes must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+
+        assert_eq!(&sink[..11], b"hello world");
+        let trailer = &sink[11..];
+        let expected_digest = hex_simd::encode_to_string(Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let verified = crate::cluster::rpc::verify_put_file_auth_trailer(&url, &Method::PUT, nonce, trailer)
+            .expect("emitted trailer should verify");
+        assert_eq!(verified, expected_digest);
     }
 
     #[test]
