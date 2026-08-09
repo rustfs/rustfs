@@ -2210,7 +2210,7 @@ impl HealTask {
                     && state.replacement_generation.as_deref() == Some(self.id.as_str())
                 {
                     resume_manager.ensure_replacement_completion_proof().await?;
-                    if CheckpointManager::has_checkpoint(&disk, &self.id).await {
+                    if CheckpointManager::has_checkpoint(disk, &self.id).await {
                         CheckpointManager::load_from_disk(disk.clone(), &self.id)
                             .await?
                             .cleanup()
