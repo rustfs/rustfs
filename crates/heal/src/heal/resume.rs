@@ -962,12 +962,6 @@ impl CheckpointManager {
             })?;
         if checkpoint.task_id != task_id {
             return Err(Error::TaskExecutionFailed {
-                message: format!("Resume checkpoint task ID does not match its file name: {task_id}"),
-            });
-        }
-
-        if checkpoint.task_id != task_id {
-            return Err(Error::TaskExecutionFailed {
                 message: "Resume checkpoint task id does not match filename".to_string(),
             });
         }
@@ -1369,7 +1363,7 @@ mod tests {
             Err(err) => panic!("create metadata volume for replacement phase test: {err}"),
         }
 
-        let task_id = "replacement-terminal-phase".to_string();
+        let task_id = ResumeUtils::generate_task_id();
         let manager = ResumeManager::new_replacement_intent(
             disk.clone(),
             task_id.clone(),
@@ -1459,9 +1453,15 @@ mod tests {
             physical_device_ids: vec!["device-a".to_string()],
             filesystem_identity: "1:2:3".to_string(),
         };
+        let intent_task_id = ResumeUtils::generate_task_id();
+        let rebuilding_task_id = ResumeUtils::generate_task_id();
+        let verified_task_id = ResumeUtils::generate_task_id();
+        let cleanup_pending_task_id = ResumeUtils::generate_task_id();
+        let abandoned_task_id = ResumeUtils::generate_task_id();
+        let ordinary_task_id = ResumeUtils::generate_task_id();
         let intent = ResumeManager::new_replacement_intent(
             disk.clone(),
-            "replacement-expiry-intent".to_string(),
+            intent_task_id.clone(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
@@ -1471,7 +1471,7 @@ mod tests {
         .expect("replacement intent should persist");
         let rebuilding = ResumeManager::new_replacement_intent(
             disk.clone(),
-            "replacement-expiry-rebuilding".to_string(),
+            rebuilding_task_id.clone(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
@@ -1485,7 +1485,7 @@ mod tests {
             .expect("replacement rebuilding phase should persist");
         let verified = ResumeManager::new_replacement_intent(
             disk.clone(),
-            "replacement-expiry-verified".to_string(),
+            verified_task_id.clone(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
@@ -1499,7 +1499,7 @@ mod tests {
             .expect("replacement verified phase should persist");
         let cleanup_pending = ResumeManager::new_replacement_intent(
             disk.clone(),
-            "replacement-expiry-cleanup-pending".to_string(),
+            cleanup_pending_task_id.clone(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
@@ -1517,7 +1517,7 @@ mod tests {
             .expect("replacement cleanup-pending phase should persist");
         let abandoned = ResumeManager::new_replacement_intent(
             disk.clone(),
-            "replacement-expiry-abandoned".to_string(),
+            abandoned_task_id.clone(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
@@ -1531,7 +1531,7 @@ mod tests {
             .expect("replacement abandoned phase should persist");
         let ordinary = ResumeManager::new(
             disk.clone(),
-            "replacement-expiry-ordinary".to_string(),
+            ordinary_task_id.clone(),
             "erasure_set".to_string(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
@@ -1549,10 +1549,10 @@ mod tests {
             .expect("replacement expiry cleanup should complete");
 
         for (task_id, expected_phase) in [
-            ("replacement-expiry-intent", ReplacementPhase::Intent),
-            ("replacement-expiry-rebuilding", ReplacementPhase::Rebuilding),
-            ("replacement-expiry-verified", ReplacementPhase::Verified),
-            ("replacement-expiry-cleanup-pending", ReplacementPhase::CleanupPending),
+            (intent_task_id.as_str(), ReplacementPhase::Intent),
+            (rebuilding_task_id.as_str(), ReplacementPhase::Rebuilding),
+            (verified_task_id.as_str(), ReplacementPhase::Verified),
+            (cleanup_pending_task_id.as_str(), ReplacementPhase::CleanupPending),
         ] {
             let state = ResumeManager::load_from_disk(disk.clone(), task_id)
                 .await
@@ -1562,11 +1562,11 @@ mod tests {
             assert_eq!(state.replacement_phase, expected_phase);
         }
         assert!(
-            !ResumeManager::has_resume_state(&disk, "replacement-expiry-abandoned").await,
+            !ResumeManager::has_resume_state(&disk, &abandoned_task_id).await,
             "an abandoned replacement must expire"
         );
         assert!(
-            !ResumeManager::has_resume_state(&disk, "replacement-expiry-ordinary").await,
+            !ResumeManager::has_resume_state(&disk, &ordinary_task_id).await,
             "an ordinary expired resume must expire"
         );
     }
@@ -1894,9 +1894,9 @@ mod tests {
     #[tokio::test]
     async fn current_normal_resume_schema_preserves_progress() {
         let (temp_dir, disk) = schema_test_disk().await;
-        let task_id = "normal-current-schema";
+        let task_id = ResumeUtils::generate_task_id();
         let mut state = ResumeState::new(
-            task_id.to_string(),
+            task_id.clone(),
             "erasure_set".to_string(),
             "pool_0_set_0".to_string(),
             vec!["bucket-b".to_string()],
@@ -1912,7 +1912,7 @@ mod tests {
             .await
             .expect("write current normal resume state");
 
-        let restored = ResumeManager::load_from_disk(disk.clone(), task_id)
+        let restored = ResumeManager::load_from_disk(disk.clone(), &task_id)
             .await
             .expect("load current normal resume state")
             .get_state()
@@ -1933,8 +1933,8 @@ mod tests {
     #[tokio::test]
     async fn future_resume_and_checkpoint_schemas_are_rejected() {
         let (temp_dir, disk) = schema_test_disk().await;
-        let task_id = "future-schema";
-        let mut state = ResumeState::new(task_id.to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), Vec::new());
+        let task_id = ResumeUtils::generate_task_id();
+        let mut state = ResumeState::new(task_id.clone(), "erasure_set".to_string(), "pool_0_set_0".to_string(), Vec::new());
         state.schema_version = CURRENT_RESUME_SCHEMA + 1;
         let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
         let state_data = serde_json::to_vec(&state).expect("serialize future resume state");
@@ -1942,14 +1942,14 @@ mod tests {
             .await
             .expect("write future resume state");
 
-        let resume_error = match ResumeManager::load_from_disk(disk.clone(), task_id).await {
+        let resume_error = match ResumeManager::load_from_disk(disk.clone(), &task_id).await {
             Ok(_) => panic!("future resume schema must not load"),
             Err(error) => error,
         };
         assert!(matches!(resume_error, Error::TaskExecutionFailed { .. }));
         assert!(resume_error.to_string().contains("newer than supported schema"));
 
-        let mut checkpoint = ResumeCheckpoint::new(task_id.to_string());
+        let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
         checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA + 1;
         let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
         let checkpoint_data = serde_json::to_vec(&checkpoint).expect("serialize future checkpoint");
@@ -1957,7 +1957,7 @@ mod tests {
             .await
             .expect("write future checkpoint");
 
-        let checkpoint_error = match CheckpointManager::load_from_disk(disk.clone(), task_id).await {
+        let checkpoint_error = match CheckpointManager::load_from_disk(disk.clone(), &task_id).await {
             Ok(_) => panic!("future checkpoint schema must not load"),
             Err(error) => error,
         };
@@ -2076,8 +2076,8 @@ mod tests {
             Err(err) => panic!("create checkpoint binding metadata volume: {err}"),
         }
 
-        let requested_task_id = "checkpoint-file-task";
-        let checkpoint = ResumeCheckpoint::new("other-task".to_string());
+        let requested_task_id = ResumeUtils::generate_task_id();
+        let checkpoint = ResumeCheckpoint::new(ResumeUtils::generate_task_id());
         let checkpoint_path = format!("{BUCKET_META_PREFIX}/{requested_task_id}_{RESUME_CHECKPOINT_FILE}");
         disk.write_all(
             RUSTFS_META_BUCKET,
@@ -2089,12 +2089,12 @@ mod tests {
         .await
         .expect("persist mismatched checkpoint");
 
-        let error = match CheckpointManager::load_from_disk(disk, requested_task_id).await {
+        let error = match CheckpointManager::load_from_disk(disk, &requested_task_id).await {
             Ok(_) => panic!("checkpoint task id must be bound to its file name"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("does not match its file name"));
+        assert!(error.to_string().contains("does not match"));
         temp_dir.close().expect("remove checkpoint binding test directory");
     }
 

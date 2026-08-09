@@ -1628,7 +1628,7 @@ mod resume_loop_tests {
     #[tokio::test]
     async fn replacement_completion_keeps_resume_artifacts_until_marker_cleanup() {
         let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
-        let replacement_task_id = "replacement-completion".to_string();
+        let replacement_task_id = ResumeUtils::generate_task_id();
         ResumeManager::new_replacement_intent(
             env.healer.disk.clone(),
             replacement_task_id.clone(),
@@ -1694,11 +1694,11 @@ mod resume_loop_tests {
             .expect_err("exhausted retry state must report the incomplete heal");
 
         assert!(
-            ResumeManager::has_resume_state(&env.healer.disk, "task").await,
+            ResumeManager::has_resume_state(&env.healer.disk, &env.task_id).await,
             "retry exhaustion must not delete the resumable state while a marker may remain"
         );
         assert!(
-            CheckpointManager::has_checkpoint(&env.healer.disk, "task").await,
+            CheckpointManager::has_checkpoint(&env.healer.disk, &env.task_id).await,
             "retry exhaustion must retain the checkpoint with the resumable state"
         );
     }

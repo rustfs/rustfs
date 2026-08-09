@@ -2829,7 +2829,7 @@ mod tests {
     async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
         let temp = TempDir::new().expect("temporary resume disk directory should be created");
         let anchor = make_resume_disk(&temp).await;
-        let task_id = "replacement-existing-anchor".to_string();
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
         let identity = ReplacementTargetIdentity {
             endpoint: "replacement-a".to_string(),
             canonical_path: "/replacement/replacement-a".to_string(),
