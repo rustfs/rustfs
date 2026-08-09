@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability};
+use crate::cluster::rpc::{
+    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability, verify_put_file_capability,
+};
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
     NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY,
-    PUT_FILE_AUTH_V1, PUT_FILE_NONCE_QUERY, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY,
-    WALK_DIR_STREAM_COMPLETION_V1,
+    PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION,
+    PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY,
+    WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -30,10 +33,12 @@ use rustfs_config::{
 };
 use rustfs_rio::{HttpReader, HttpWriter};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use uuid::Uuid;
 
@@ -41,9 +46,14 @@ static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeD
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
+const PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
+const PUT_FILE_LEGACY_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+const PUT_FILE_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_MSGPACK: &str = "application/msgpack";
 
@@ -52,6 +62,31 @@ fn unsupported_transport_message(transport: &str) -> String {
         "invalid {ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?}; supported values: {}",
         KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS.join(", ")
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PutFileCapabilityState {
+    LegacyUntil(Instant),
+    V1 { server_epoch: Uuid, revalidate_after: Instant },
+}
+
+type PutFileCapabilityCacheEntry = Arc<tokio::sync::RwLock<Option<PutFileCapabilityState>>>;
+
+static PUT_FILE_CAPABILITY_CACHE: LazyLock<Mutex<HashMap<String, PutFileCapabilityCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn put_file_capability_cache_entry(endpoint: &str) -> Result<PutFileCapabilityCacheEntry> {
+    let mut cache = PUT_FILE_CAPABILITY_CACHE
+        .lock()
+        .map_err(|_| Error::other("put_file capability cache lock poisoned"))?;
+    Ok(cache
+        .entry(endpoint.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(None)))
+        .clone())
+}
+
+fn put_file_capability_status_is_legacy(status: u16) -> bool {
+    status == 404
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -169,12 +204,16 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
-        let nonce = Uuid::new_v4();
-        let url = build_put_file_stream_url(&request, Some(nonce));
+        let server_epoch = self.put_file_auth_capability(&request.endpoint).await?;
+        let nonce = server_epoch.map(|_| Uuid::new_v4());
+        let url = build_put_file_stream_url(&request, nonce.zip(server_epoch));
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::PUT, &mut headers)?;
         let writer = HttpWriter::new(url.clone(), Method::PUT, headers).await?;
-        Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce)))
+        match nonce {
+            Some(nonce) => Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce))),
+            None => Ok(Box::new(writer)),
+        }
     }
 
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
@@ -228,6 +267,105 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 }
 
+impl TcpHttpInternodeDataTransport {
+    async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
+        resolve_put_file_auth_capability(endpoint, || async {
+            tokio::time::timeout(PUT_FILE_CAPABILITY_PROBE_TIMEOUT, self.probe_put_file_auth(endpoint))
+                .await
+                .map_err(|_| Error::other("remote put_file capability probe timed out"))?
+        })
+        .await
+    }
+
+    async fn probe_put_file_auth(&self, endpoint: &str) -> Result<Option<Uuid>> {
+        let challenge = Uuid::new_v4();
+        let url = build_put_file_capability_url(endpoint, challenge);
+        let mut headers = msgpack_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        let reader = match HttpReader::new(url, Method::GET, headers, None).await {
+            Ok(reader) => reader,
+            Err(err) => {
+                let err = Error::from(err);
+                if matches!(
+                    err.internode_http_error_kind(),
+                    Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status))
+                        if put_file_capability_status_is_legacy(status.as_u16())
+                ) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        };
+        let mut body = Vec::new();
+        reader
+            .take(u64::try_from(PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut body)
+            .await?;
+        Ok(Some(verify_put_file_capability_response(challenge, &body)?))
+    }
+}
+
+async fn resolve_put_file_auth_capability<F, Fut>(endpoint: &str, probe: F) -> Result<Option<Uuid>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<Uuid>>>,
+{
+    let entry = put_file_capability_cache_entry(endpoint)?;
+    match *entry.read().await {
+        Some(PutFileCapabilityState::V1 {
+            server_epoch,
+            revalidate_after,
+        }) if Instant::now() < revalidate_after => {
+            return Ok(Some(server_epoch));
+        }
+        Some(PutFileCapabilityState::V1 { .. }) => {}
+        Some(PutFileCapabilityState::LegacyUntil(expires_at)) if Instant::now() < expires_at => return Ok(None),
+        Some(PutFileCapabilityState::LegacyUntil(_)) | None => {}
+    }
+    let mut state = entry.write().await;
+    match *state {
+        Some(PutFileCapabilityState::V1 {
+            server_epoch,
+            revalidate_after,
+        }) if Instant::now() < revalidate_after => {
+            return Ok(Some(server_epoch));
+        }
+        Some(PutFileCapabilityState::V1 { .. }) => {}
+        Some(PutFileCapabilityState::LegacyUntil(expires_at)) if Instant::now() < expires_at => return Ok(None),
+        Some(PutFileCapabilityState::LegacyUntil(_)) | None => {}
+    }
+
+    let v1_was_pinned = matches!(*state, Some(PutFileCapabilityState::V1 { .. }));
+    match probe().await? {
+        Some(server_epoch) => {
+            *state = Some(PutFileCapabilityState::V1 {
+                server_epoch,
+                revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+            });
+            Ok(Some(server_epoch))
+        }
+        None if v1_was_pinned => Err(Error::other("remote put_file capability downgrade rejected")),
+        None => {
+            *state = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
+            Ok(None)
+        }
+    }
+}
+
+fn verify_put_file_capability_response(challenge: Uuid, body: &[u8]) -> Result<Uuid> {
+    if body.is_empty() || body.len() > PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE {
+        return Err(Error::other("invalid remote put_file capability response size"));
+    }
+    let response: PutFileCapabilityResponse =
+        rmp_serde::from_slice(body).map_err(|_| Error::other("invalid remote put_file capability response"))?;
+    if response.version != PUT_FILE_CAPABILITY_VERSION || response.server_epoch.is_nil() {
+        return Err(Error::other("incompatible remote put_file capability response"));
+    }
+    verify_put_file_capability(challenge, response.server_epoch, response.version, &response.proof)
+        .map_err(|err| Error::other(format!("remote put_file capability authentication failed: {err}")))?;
+    Ok(response.server_epoch)
+}
+
 fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
     format!(
         "{}{}?disk={}&volume={}&path={}&offset={}&length={}",
@@ -241,24 +379,41 @@ fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
     )
 }
 
-fn build_put_file_stream_url(request: &WriteStreamRequest, auth_nonce: Option<Uuid>) -> String {
+fn build_put_file_stream_url(request: &WriteStreamRequest, auth_scope: Option<(Uuid, Uuid)>) -> String {
+    let stream_path = if auth_scope.is_some() {
+        PUT_FILE_AUTH_STREAM_PATH
+    } else {
+        PUT_FILE_STREAM_PATH
+    };
     let mut url = format!(
         "{}{}?disk={}&volume={}&path={}&append={}&size={}",
         request.endpoint,
-        PUT_FILE_STREAM_PATH,
+        stream_path,
         urlencoding::encode(&request.disk),
         urlencoding::encode(&request.volume),
         urlencoding::encode(&request.path),
         request.append,
         request.size
     );
-    if let Some(nonce) = auth_nonce {
+    if let Some((nonce, server_epoch)) = auth_scope {
         url.push_str(&format!(
-            "&{}={}&{}={}",
-            PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_NONCE_QUERY, nonce
+            "&{}={}&{}={}&{}={}",
+            PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_NONCE_QUERY, nonce, PUT_FILE_SERVER_EPOCH_QUERY, server_epoch
         ));
     }
     url
+}
+
+fn build_put_file_capability_url(endpoint: &str, challenge: Uuid) -> String {
+    format!(
+        "{}{}?{}={}&{}={}",
+        endpoint,
+        PUT_FILE_STREAM_PATH,
+        PUT_FILE_CAPABILITY_QUERY,
+        PUT_FILE_CAPABILITY_VERSION,
+        PUT_FILE_CAPABILITY_CHALLENGE_QUERY,
+        challenge
+    )
 }
 
 struct PutFileAuthWriter<W> {
@@ -578,6 +733,7 @@ mod tests {
     #[test]
     fn put_file_stream_url_advertises_auth_nonce_when_enabled() {
         let nonce = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let server_epoch = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("server epoch");
         let url = build_put_file_stream_url(
             &WriteStreamRequest {
                 endpoint: "http://node1:9000".to_string(),
@@ -587,17 +743,170 @@ mod tests {
                 append: false,
                 size: 4096,
             },
-            Some(nonce),
+            Some((nonce, server_epoch)),
         );
 
         assert_eq!(
             url,
             concat!(
-                "http://node1:9000/rustfs/rpc/put_file_stream?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0",
+                "http://node1:9000/rustfs/rpc/put_file_stream_v1?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0",
                 "&volume=bucket&path=object%2Fpart.1&append=false&size=4096",
-                "&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
+                "&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555",
+                "&put_file_server_epoch=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
             )
         );
+    }
+
+    #[test]
+    fn put_file_capability_url_binds_version_and_challenge() {
+        let challenge = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("challenge");
+
+        assert_eq!(
+            build_put_file_capability_url("http://node1:9000", challenge),
+            concat!(
+                "http://node1:9000/rustfs/rpc/put_file_stream?put_file_capability=1",
+                "&put_file_challenge=11111111-2222-4333-8444-555555555555"
+            )
+        );
+    }
+
+    #[test]
+    fn put_file_capability_legacy_statuses_are_exact() {
+        assert!(put_file_capability_status_is_legacy(404));
+        for status in [200, 400, 401, 403, 405, 408, 426, 429, 500, 503] {
+            assert!(!put_file_capability_status_is_legacy(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_cache_pins_v1_and_honors_live_legacy_ttl() {
+        let transport = TcpHttpInternodeDataTransport;
+        let v1_endpoint = format!("http://v1-{}.invalid", Uuid::new_v4());
+        let v1_entry = put_file_capability_cache_entry(&v1_endpoint).expect("cache entry");
+        let server_epoch = Uuid::new_v4();
+        *v1_entry.write().await = Some(PutFileCapabilityState::V1 {
+            server_epoch,
+            revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+        });
+        assert_eq!(
+            transport.put_file_auth_capability(&v1_endpoint).await.expect("v1 cache"),
+            Some(server_epoch)
+        );
+        *v1_entry.write().await = Some(PutFileCapabilityState::V1 {
+            server_epoch,
+            revalidate_after: Instant::now(),
+        });
+        assert!(
+            resolve_put_file_auth_capability(&v1_endpoint, || async { Ok(None) })
+                .await
+                .is_err()
+        );
+        let replacement_epoch = Uuid::new_v4();
+        assert_eq!(
+            resolve_put_file_auth_capability(&v1_endpoint, || async { Ok(Some(replacement_epoch)) })
+                .await
+                .expect("authenticated replacement should refresh the epoch"),
+            Some(replacement_epoch)
+        );
+
+        let legacy_endpoint = format!("http://legacy-{}.invalid", Uuid::new_v4());
+        let legacy_entry = put_file_capability_cache_entry(&legacy_endpoint).expect("cache entry");
+        *legacy_entry.write().await = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
+        assert!(
+            transport
+                .put_file_auth_capability(&legacy_endpoint)
+                .await
+                .expect("legacy cache")
+                .is_none()
+        );
+
+        let expired_endpoint = format!("http://expired-legacy-{}.invalid", Uuid::new_v4());
+        let expired_entry = put_file_capability_cache_entry(&expired_endpoint).expect("cache entry");
+        *expired_entry.write().await = Some(PutFileCapabilityState::LegacyUntil(Instant::now()));
+        let reprobed = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            resolve_put_file_auth_capability(&expired_endpoint, || async {
+                reprobed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(server_epoch))
+            })
+            .await
+            .expect("expired legacy cache should reprobe"),
+            Some(server_epoch)
+        );
+        assert!(reprobed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn legacy_put_file_capability_omits_the_auth_trailer_protocol() {
+        let endpoint = format!("http://legacy-selection-{}.invalid", Uuid::new_v4());
+        let server_epoch = resolve_put_file_auth_capability(&endpoint, || async { Ok(None) })
+            .await
+            .expect("legacy capability result");
+        let auth_scope = server_epoch.map(|epoch| (Uuid::new_v4(), epoch));
+        let url = build_put_file_stream_url(
+            &WriteStreamRequest {
+                endpoint,
+                disk: "http://node1:9000/data/rustfs0".to_string(),
+                volume: "bucket".to_string(),
+                path: "object/part.1".to_string(),
+                append: false,
+                size: 4096,
+            },
+            auth_scope,
+        );
+
+        assert!(auth_scope.is_none());
+        assert!(!url.contains(PUT_FILE_AUTH_QUERY));
+        assert!(!url.contains(PUT_FILE_NONCE_QUERY));
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_probe_is_singleflight_per_endpoint() {
+        let endpoint = format!("http://singleflight-{}.invalid", Uuid::new_v4());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let second_calls = Arc::clone(&calls);
+        let server_epoch = Uuid::new_v4();
+
+        let (first, second) = tokio::join!(
+            resolve_put_file_auth_capability(&endpoint, || async move {
+                first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(Some(server_epoch))
+            }),
+            resolve_put_file_auth_capability(&endpoint, || async move {
+                second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(server_epoch))
+            })
+        );
+
+        assert_eq!(first.expect("first capability result"), Some(server_epoch));
+        assert_eq!(second.expect("second capability result"), Some(server_epoch));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn put_file_capability_response_fails_closed_on_malformed_or_unbound_data() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-capability-response-test-secret".to_string());
+        let challenge = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("challenge");
+        let server_epoch = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("server epoch");
+        let proof = crate::cluster::rpc::sign_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION)
+            .expect("proof should build");
+        let response = PutFileCapabilityResponse {
+            version: PUT_FILE_CAPABILITY_VERSION,
+            server_epoch,
+            proof,
+        };
+        let body = rmp_serde::to_vec_named(&response).expect("response should encode");
+
+        assert_eq!(
+            verify_put_file_capability_response(challenge, &body).expect("response should verify"),
+            server_epoch
+        );
+        assert!(verify_put_file_capability_response(Uuid::new_v4(), &body).is_err());
+        assert!(verify_put_file_capability_response(challenge, &body[..body.len() - 1]).is_err());
+        assert!(verify_put_file_capability_response(challenge, &[]).is_err());
+        assert!(verify_put_file_capability_response(challenge, &vec![0_u8; PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE + 1]).is_err());
     }
 
     #[tokio::test]

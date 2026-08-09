@@ -29,7 +29,7 @@
 use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
 use crate::storage_api_contracts::internode::{
     NS_SCANNER_PROTOCOL_VERSION, PUT_FILE_AUTH_TRAILER_DIGEST_LEN, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_TRAILER_MAC_LEN,
-    PUT_FILE_AUTH_TRAILER_MAGIC,
+    PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose;
@@ -75,6 +75,7 @@ const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
 const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
+const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
@@ -581,6 +582,36 @@ pub fn verify_put_file_auth_trailer(url: &str, method: &Method, nonce: Uuid, tra
     let mac_end = mac_start + PUT_FILE_AUTH_TRAILER_MAC_LEN;
     verify_put_file_auth_mac(url, method, nonce, body_sha256, &trailer[mac_start..mac_end])?;
     Ok(body_sha256.to_string())
+}
+
+fn update_put_file_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid, version: u16) {
+    mac.update(HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN);
+    mac.update(challenge.as_bytes());
+    mac.update(server_epoch.as_bytes());
+    mac.update(&version.to_be_bytes());
+}
+
+fn put_file_capability_mac(challenge: Uuid, server_epoch: Uuid, version: u16) -> std::io::Result<HmacSha256> {
+    if challenge.is_nil() || server_epoch.is_nil() || version != PUT_FILE_CAPABILITY_VERSION {
+        return Err(std::io::Error::other("Invalid put_file capability scope"));
+    }
+    let mut mac = HmacSha256::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC secret"))?;
+    update_put_file_capability_mac(&mut mac, challenge, server_epoch, version);
+    Ok(mac)
+}
+
+pub fn sign_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: u16) -> std::io::Result<Vec<u8>> {
+    Ok(put_file_capability_mac(challenge, server_epoch, version)?
+        .finalize()
+        .into_bytes()
+        .to_vec())
+}
+
+pub fn verify_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: u16, proof: &[u8]) -> std::io::Result<()> {
+    put_file_capability_mac(challenge, server_epoch, version)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid put_file capability proof"))
 }
 
 fn update_ns_scanner_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid) {
@@ -2329,6 +2360,20 @@ mod tests {
         let err =
             verify_put_file_auth_trailer(url, &Method::PUT, nonce, &tampered).expect_err("trailer must bind the digest bytes");
         assert_eq!(err.to_string(), "Invalid put_file auth trailer");
+    }
+
+    #[test]
+    fn put_file_capability_proof_binds_challenge_epoch_and_version() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("challenge");
+        let server_epoch = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("server epoch");
+        let proof = sign_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION)
+            .expect("capability proof should build");
+
+        assert!(verify_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION, &proof).is_ok());
+        assert!(verify_put_file_capability(Uuid::new_v4(), server_epoch, PUT_FILE_CAPABILITY_VERSION, &proof).is_err());
+        assert!(verify_put_file_capability(challenge, Uuid::new_v4(), PUT_FILE_CAPABILITY_VERSION, &proof).is_err());
+        assert!(verify_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION + 1, &proof).is_err());
     }
 
     #[test]
