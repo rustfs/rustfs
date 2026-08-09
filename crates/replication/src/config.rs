@@ -795,6 +795,33 @@ mod tests {
     }
 
     #[test]
+    fn structure_validation_counts_rule_id_limit_in_bytes() {
+        let mut within_byte_limit = replication_rule(&"\u{00e9}".repeat(127), "arn:target:a");
+        within_byte_limit.priority = Some(1);
+        assert_eq!(
+            within_byte_limit.id.as_ref().expect("rule id should be present").len(),
+            REPLICATION_CONFIG_MAX_RULE_ID_LEN - 1
+        );
+        assert_eq!(validate_replication_config_structure(&structure_config(vec![within_byte_limit])), Ok(()));
+
+        let mut over_byte_limit = replication_rule(&"\u{00e9}".repeat(128), "arn:target:a");
+        over_byte_limit.priority = Some(1);
+        assert!(
+            over_byte_limit
+                .id
+                .as_ref()
+                .expect("rule id should be present")
+                .chars()
+                .count()
+                < REPLICATION_CONFIG_MAX_RULE_ID_LEN
+        );
+        assert_eq!(
+            validate_replication_config_structure(&structure_config(vec![over_byte_limit])),
+            Err(ReplicationConfigStructureError::RuleIdTooLong)
+        );
+    }
+
+    #[test]
     fn structure_validation_rejects_filter_with_both_prefix_and_tag() {
         let mut rule = replication_rule("rule-1", "arn:target:a");
         let mut filter = tag_filter();
