@@ -17,6 +17,7 @@ pub mod erasure_healer;
 pub mod event;
 pub mod manager;
 pub mod progress;
+pub(crate) mod replacement_readiness;
 pub mod resume;
 pub mod storage;
 pub(crate) mod storage_api;

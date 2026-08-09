@@ -368,6 +368,11 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
+    /// Recheck admitted replacement targets immediately before destructive work.
+    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
     /// List object versions for healing (returns all versions, may use significant memory for large buckets)
     ///
     /// WARNING: This method loads all object versions into memory at once. For buckets with many
@@ -1332,6 +1337,10 @@ impl HealStorageAPI for ECStoreHealStorage {
             .await
             .map(|(result, error)| (result, error.map(Error::Storage)))
             .map_err(Error::Storage)
+    }
+
+    async fn replacement_targets_ready(&self, targets: &[String]) -> Result<bool> {
+        Ok(super::replacement_readiness::auto_replacement_targets_ready(targets).await)
     }
 
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {

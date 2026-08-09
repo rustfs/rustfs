@@ -2132,6 +2132,17 @@ impl HealTask {
             progress.update_progress(0, 4, 0, 0);
         }
 
+        let is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
+        if is_auto_replacement
+            && !self
+                .await_with_control(self.storage.replacement_targets_ready(&self.heal_endpoints))
+                .await?
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement target is no longer ready for automatic heal {set_disk_id}"),
+            });
+        }
+
         let buckets = if buckets.is_empty() {
             debug!(
                 target: "rustfs::heal::task",
@@ -2160,7 +2171,16 @@ impl HealTask {
             stage = "heal_format",
             "Heal erasure set stage entered"
         );
-        let format_result = if matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty() {
+        if is_auto_replacement
+            && !self
+                .await_with_control(self.storage.replacement_targets_ready(&self.heal_endpoints))
+                .await?
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement target changed before automatic format heal {set_disk_id}"),
+            });
+        }
+        let format_result = if is_auto_replacement {
             let pool_index = self.options.pool_index.ok_or_else(|| Error::TaskExecutionFailed {
                 message: format!("Missing pool scope for automatic replacement heal {set_disk_id}"),
             })?;
@@ -2479,7 +2499,10 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_replacement_uses_target_scoped_format() {
-        let storage = Arc::new(MockStorage::default());
+        let storage = Arc::new(MockStorage {
+            replacement_targets_ready: Mutex::new(true),
+            ..Default::default()
+        });
         let mut request = HealRequest::new(
             HealType::ErasureSet {
                 buckets: Vec::new(),
@@ -2512,6 +2535,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_replacement_defers_before_bucket_listing_when_target_is_unready() {
+        let storage = Arc::new(MockStorage::default());
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: Vec::new(),
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..Default::default()
+            },
+            HealPriority::Low,
+        );
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        HealTask::from_request(request, storage.clone())
+            .execute()
+            .await
+            .expect_err("an unsafe replacement must defer before any scan work");
+
+        assert!(!*storage.listed.lock().unwrap(), "unsafe targets must not list buckets");
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "unsafe targets must not format"
+        );
+    }
+
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
@@ -2528,6 +2581,7 @@ mod tests {
         format_no_heal_required: Mutex<bool>,
         global_format_calls: Mutex<u32>,
         replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
+        replacement_targets_ready: Mutex<bool>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
         include_object_dir_candidate: Mutex<bool>,
@@ -2845,6 +2899,10 @@ mod tests {
                 },
                 None,
             ))
+        }
+
+        async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
+            Ok(*self.replacement_targets_ready.lock().unwrap())
         }
 
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>> {

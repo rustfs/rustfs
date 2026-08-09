@@ -26,7 +26,6 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::LazyLock;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -54,43 +53,6 @@ const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
-
-async fn auto_replacement_path_ready(endpoint: &Endpoint, local_endpoints: &[Endpoint]) -> bool {
-    if !endpoint.is_local {
-        return false;
-    }
-
-    let path = PathBuf::from(endpoint.get_file_path());
-    let sibling_paths = local_endpoints
-        .iter()
-        .filter(|sibling| sibling.is_local && *sibling != endpoint)
-        .map(|sibling| sibling.get_file_path())
-        .collect::<Vec<_>>();
-    tokio::task::spawn_blocking(move || {
-        let path = path.to_string_lossy();
-        let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(path.as_ref()) else {
-            return false;
-        };
-        let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
-            return false;
-        };
-        if target_device_ids.is_empty()
-            || root_device_ids.is_empty()
-            || target_device_ids.iter().any(|target| root_device_ids.contains(target))
-            || !rustfs_utils::os::is_mount_point(Path::new(path.as_ref())).unwrap_or(false)
-        {
-            return false;
-        }
-
-        !sibling_paths.iter().any(|sibling| {
-            rustfs_utils::os::get_physical_device_ids(sibling)
-                .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
-                .unwrap_or(true)
-        })
-    })
-    .await
-    .unwrap_or(false)
-}
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -2204,7 +2166,6 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let cancel_token = self.cancel_token.clone();
-        let storage = self.storage.clone();
         let notify = self.notify.clone();
         let mut duration = {
             let config = config.read().await;
@@ -2265,7 +2226,9 @@ impl HealManager {
                             // detect unformatted disk via get_disk_id()
                             match disk.get_disk_id().await {
                                 Err(DiskError::UnformattedDisk) => {
-                                    if !auto_replacement_path_ready(&endpoint, &local_endpoints).await {
+                                    if !super::replacement_readiness::auto_replacement_target_ready(&endpoint, &local_endpoints)
+                                        .await
+                                    {
                                         skipped_invalid_count += 1;
                                         debug!(
                                             target: "rustfs::heal::manager",
@@ -2342,23 +2305,6 @@ impl HealManager {
                             continue;
                         }
 
-                        // Get bucket list for erasure set healing
-                        let buckets = match storage.list_buckets().await {
-                            Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
-                            Err(e) => {
-                                error!(
-                                    target: "rustfs::heal::manager",
-                                    event = EVENT_HEAL_AUTO_SCAN_STATE,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                    state = "bucket_list_failed",
-                                    error = %e,
-                                    "Heal auto-scan bucket listing failed"
-                                );
-                                continue;
-                            }
-                        };
-
                         // Admit one set task with every ready replacement target. Queue deduplication is
                         // set-scoped, so admitting endpoints independently would silently drop later targets.
                         for (set_disk_id, endpoints) in endpoints {
@@ -2402,7 +2348,7 @@ impl HealManager {
                             // enqueue erasure set heal request for all ready replacements in this set
                             let mut req = HealRequest::new(
                                 HealType::ErasureSet {
-                                    buckets: buckets.clone(),
+                                    buckets: Vec::new(),
                                     set_disk_id: set_disk_id.clone(),
                                 },
                                 HealOptions {
@@ -2439,7 +2385,7 @@ impl HealManager {
                                     subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
                                     endpoint_count,
                                     set_disk_id,
-                                    bucket_count = buckets.len(),
+                                    bucket_count = 0,
                                     result = "enqueued",
                                     "Heal auto-scan task enqueued"
                                 );
@@ -2462,7 +2408,7 @@ impl HealManager {
                                     subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
                                     endpoint_count,
                                     set_disk_id,
-                                    bucket_count = buckets.len(),
+                                    bucket_count = 0,
                                     admission = admission.result_label(),
                                     reason = admission.reason_label(),
                                     result = "not_enqueued",
@@ -3027,8 +2973,10 @@ mod tests {
         let missing = Endpoint::try_from(temp.path().join("missing").to_string_lossy().as_ref())
             .expect("missing replacement endpoint should parse");
 
-        assert!(!auto_replacement_path_ready(&ready, std::slice::from_ref(&ready)).await);
-        assert!(!auto_replacement_path_ready(&missing, std::slice::from_ref(&missing)).await);
+        assert!(!super::super::replacement_readiness::auto_replacement_target_ready(&ready, std::slice::from_ref(&ready),).await);
+        assert!(
+            !super::super::replacement_readiness::auto_replacement_target_ready(&missing, std::slice::from_ref(&missing),).await
+        );
     }
 
     #[derive(Debug)]
