@@ -4450,6 +4450,10 @@ mod tests {
         assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
             message: "replacement recovery conflict: proof mismatch".to_string(),
         }));
+        assert!(replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
+            message: "replacement recovery corruption: malformed legacy intent".to_string(),
+        }));
+        assert!(!replacement_recovery_error_requires_block(&Error::Disk(DiskError::Timeout)));
         assert!(!replacement_recovery_error_requires_block(&Error::TaskExecutionFailed {
             message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
         }));

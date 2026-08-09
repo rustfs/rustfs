@@ -347,11 +347,16 @@ pub(crate) fn replacement_recovery_error_requires_block(error: &Error) -> bool {
     )
 }
 
-fn replacement_recovery_corruption_unless_classified(message: impl std::fmt::Display, error: Error) -> Error {
+fn replacement_recovery_corruption_for_state_load(message: impl std::fmt::Display, error: Error) -> Error {
     if replacement_recovery_error_requires_block(&error) {
         error
-    } else {
+    } else if matches!(
+        error,
+        Error::TaskExecutionFailed { .. } | Error::Serialization(_) | Error::InvalidCheckpoint(_)
+    ) {
         replacement_recovery_corruption(format!("{message}: {error}"))
+    } else {
+        error
     }
 }
 
@@ -1167,7 +1172,14 @@ impl ResumeManager {
                 if !Self::has_state_file(&disk, task_id, legacy_file).await {
                     continue;
                 }
-                let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file).await?;
+                let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file)
+                    .await
+                    .map_err(|error| {
+                        replacement_recovery_corruption_for_state_load(
+                            format!("Failed to load legacy replacement state {task_id}"),
+                            error,
+                        )
+                    })?;
                 let legacy_state = legacy.get_state().await;
                 if !is_replacement_intent(&legacy_state) || legacy_state != isolated.get_state().await {
                     return Err(replacement_recovery_conflict(format!(
@@ -1186,7 +1198,14 @@ impl ResumeManager {
         } else {
             ResumeStateFile::Ordinary
         };
-        let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file).await?;
+        let legacy = Self::load_from_disk_at(disk.clone(), task_id, legacy_file)
+            .await
+            .map_err(|error| {
+                replacement_recovery_corruption_for_state_load(
+                    format!("Failed to load legacy replacement state {task_id}"),
+                    error,
+                )
+            })?;
         if !is_replacement_intent(&legacy.get_state().await) {
             return Err(Error::TaskExecutionFailed {
                 message: format!("Resume state is not a replacement intent for task {task_id}"),
@@ -1649,9 +1668,7 @@ impl ResumeManager {
         disk.read_all(RUSTFS_META_BUCKET, path_str)
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|e| Error::TaskExecutionFailed {
-                message: format!("Failed to read resume state file: {e}"),
-            })
+            .map_err(Error::Disk)
     }
 }
 
@@ -2109,9 +2126,10 @@ impl ResumeUtils {
             let has_flat_intent = ResumeManager::has_state_file(disk, &task_id, ResumeStateFile::LegacyReplacementIntent).await;
             if !has_flat_intent {
                 let manager = ResumeManager::load_from_disk(disk.clone(), &task_id).await.map_err(|error| {
-                    replacement_recovery_corruption(format!(
-                        "Failed to load legacy replacement recovery candidate {task_id}: {error}"
-                    ))
+                    replacement_recovery_corruption_for_state_load(
+                        format!("Failed to load legacy replacement recovery candidate {task_id}"),
+                        error,
+                    )
                 })?;
                 if !is_replacement_intent(&manager.get_state().await) {
                     continue;
@@ -2120,7 +2138,7 @@ impl ResumeUtils {
             ResumeManager::load_replacement_intent(disk.clone(), &task_id)
                 .await
                 .map_err(|error| {
-                    replacement_recovery_corruption_unless_classified(
+                    replacement_recovery_corruption_for_state_load(
                         format!("Failed to migrate legacy replacement state {task_id}"),
                         error,
                     )
