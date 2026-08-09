@@ -580,7 +580,7 @@ impl SetDisks {
         }
     }
 
-    pub(super) fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
+    pub(crate) fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
         let mut hasher = Sha256::new();
         Self::update_file_info_quorum_hash(&mut hasher, meta);
         let digest = hasher.finalize();

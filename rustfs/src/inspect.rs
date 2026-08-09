@@ -21,17 +21,20 @@
 //! go through `parse_all_configs`, so it works on buckets whose config XML no
 //! longer parses — that is its forensic purpose: "what bytes are actually on
 //! disk". It never writes to any drive; `--raw` output goes to `--out` only.
+//! Normal filesystem reads may update access times, so strict offline forensic
+//! use requires mounting source media read-only.
 //!
 use crate::config::{InspectBucketMetaOpts, InspectCommands, InspectOpts};
 use crate::storage_api::inspect::bucket_metadata::BucketMetadata;
-use crate::storage_api::inspect::{BitrotReader, Erasure, check_valid_bucket_name_strict};
+use crate::storage_api::inspect::{BitrotReader, Erasure, check_valid_bucket_name_strict, file_info_quorum_hash};
 use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_utils::HashAlgorithm;
 use std::ffi::OsString;
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::io::AsyncWriteExt;
 
 const META_BUCKET: &str = ".rustfs.sys";
 const BUCKET_META_PREFIX: &str = "buckets";
@@ -52,6 +55,7 @@ struct DriveShard {
     /// 1-based erasure shard index (`ErasureInfo::index`).
     index: usize,
     data: Vec<u8>,
+    file_info: FileInfo,
 }
 
 async fn execute_bucket_meta(opts: &InspectBucketMetaOpts) -> Result<()> {
@@ -87,12 +91,12 @@ async fn execute_bucket_meta(opts: &InspectBucketMetaOpts) -> Result<()> {
     }
 
     if let Some(out) = output {
-        tokio::fs::create_dir_all(&out).await?;
+        tokio::fs::create_dir(&out).await?;
         let blob_path = out.join(BUCKET_METADATA_FILE);
-        tokio::fs::write(&blob_path, &blob).await?;
+        write_new_file(&blob_path, &blob).await?;
         let mut written = 1usize;
         for (name, bytes, _) in &configs {
-            tokio::fs::write(out.join(name), bytes).await?;
+            write_new_file(&out.join(name), bytes).await?;
             written += 1;
         }
         println!();
@@ -152,6 +156,22 @@ fn stored_configs(bm: &BucketMetadata) -> Vec<(&'static str, &[u8], OffsetDateTi
 }
 
 fn ensure_output_outside_source_drives(out: &Path, drives: &[String]) -> Result<()> {
+    match std::fs::symlink_metadata(out) {
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "output path {} already exists or is a symbolic link; choose a new directory",
+                    out.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::new(error.kind(), format!("inspect output path {}: {error}", out.display())));
+        }
+    }
+
     let out = resolve_path(out)?;
     for drive in drives {
         let drive = resolve_path(Path::new(drive))?;
@@ -164,6 +184,12 @@ fn ensure_output_outside_source_drives(out: &Path, drives: &[String]) -> Result<
         }
     }
     Ok(())
+}
+
+async fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(path).await?;
+    file.write_all(bytes).await?;
+    file.flush().await
 }
 
 /// Resolve symlinks in the existing prefix while preserving a not-yet-created tail.
@@ -201,7 +227,6 @@ async fn reconstruct_metadata_blob(opts: &InspectBucketMetaOpts) -> Result<Vec<u
     check_valid_bucket_name_strict(&opts.bucket).map_err(|e| Error::other(format!("invalid bucket {:?}: {e}", opts.bucket)))?;
 
     let mut shards: Vec<DriveShard> = Vec::new();
-    let mut reference: Option<FileInfo> = None;
     let mut failures: Vec<String> = Vec::new();
 
     for drive in &opts.paths {
@@ -214,46 +239,29 @@ async fn reconstruct_metadata_blob(opts: &InspectBucketMetaOpts) -> Result<Vec<u
         match read_drive_shard(drive, &xl_path).await {
             Ok((fi, shard)) => {
                 let index = fi.erasure.index;
-                if let Some(reference) = &reference {
-                    if fi.size != reference.size
-                        || fi.mod_time != reference.mod_time
-                        || fi.version_id != reference.version_id
-                        || fi.data_dir != reference.data_dir
-                        || fi.parts != reference.parts
-                        || fi.uses_legacy_checksum != reference.uses_legacy_checksum
-                        || fi.erasure.algorithm != reference.erasure.algorithm
-                        || fi.erasure.data_blocks != reference.erasure.data_blocks
-                        || fi.erasure.parity_blocks != reference.erasure.parity_blocks
-                        || fi.erasure.block_size != reference.erasure.block_size
-                        || fi.erasure.distribution != reference.erasure.distribution
-                        || fi.erasure.get_checksum_info(1).algorithm != reference.erasure.get_checksum_info(1).algorithm
-                    {
-                        failures.push(format!("{drive}: object metadata disagrees with the first readable drive; skipping"));
-                        continue;
-                    }
-                } else {
-                    reference = Some(fi);
-                }
                 shards.push(DriveShard {
                     drive: drive.clone(),
                     index,
                     data: shard,
+                    file_info: fi,
                 });
             }
             Err(e) => failures.push(format!("{drive}: {e}")),
         }
     }
 
-    let Some(fi) = reference else {
+    if shards.is_empty() {
         return Err(Error::other(format!(
             "no drive yielded a readable bucket-metadata shard for bucket {:?}:\n  {}",
             opts.bucket,
             failures.join("\n  ")
         )));
-    };
+    }
     for failure in &failures {
         eprintln!("warning: {failure}");
     }
+
+    let (fi, shards) = select_quorum_shards(shards)?;
 
     let k = fi.erasure.data_blocks;
     let m = fi.erasure.parity_blocks;
@@ -262,6 +270,84 @@ async fn reconstruct_metadata_blob(opts: &InspectBucketMetaOpts) -> Result<Vec<u
         .map_err(|e| Error::other(format!("invalid erasure geometry in xl.meta (k={k}, m={m}): {e}")))?;
 
     reconstruct_shards(&erasure, size, shards)
+}
+
+struct ShardGroup {
+    hash: [u8; 32],
+    file_info: FileInfo,
+    shards: Vec<DriveShard>,
+}
+
+/// Select the newest object identity that has enough distinct shards for a read quorum.
+fn select_quorum_shards(shards: Vec<DriveShard>) -> Result<(FileInfo, Vec<DriveShard>)> {
+    let mut groups: Vec<ShardGroup> = Vec::new();
+    for shard in shards {
+        let hash = file_info_quorum_hash(&shard.file_info);
+        if let Some(group) = groups.iter_mut().find(|group| group.hash == hash) {
+            group.shards.push(shard);
+        } else {
+            groups.push(ShardGroup {
+                hash,
+                file_info: shard.file_info.clone(),
+                shards: vec![shard],
+            });
+        }
+    }
+
+    let mut eligible = groups
+        .into_iter()
+        .filter(|group| {
+            let total = group.file_info.erasure.data_blocks + group.file_info.erasure.parity_blocks;
+            let mut indices = group
+                .shards
+                .iter()
+                .map(|shard| shard.index)
+                .filter(|index| *index > 0 && *index <= total)
+                .collect::<Vec<_>>();
+            indices.sort_unstable();
+            indices.dedup();
+            group.file_info.erasure.data_blocks > 0 && indices.len() >= group.file_info.erasure.data_blocks
+        })
+        .collect::<Vec<_>>();
+
+    let Some(latest) = eligible.iter().map(|group| group.file_info.mod_time).max() else {
+        return Err(Error::other("no consistent object-metadata identity reached read quorum"));
+    };
+    let latest_count = eligible.iter().filter(|group| group.file_info.mod_time == latest).count();
+    if latest_count != 1 {
+        return Err(Error::other(format!(
+            "{latest_count} different object-metadata identities reached read quorum at the latest modification time"
+        )));
+    }
+
+    let selected = eligible
+        .iter()
+        .position(|group| group.file_info.mod_time == latest)
+        .ok_or_else(|| Error::other("latest read-quorum identity disappeared during selection"))?;
+    let mut group = eligible.swap_remove(selected);
+    let total = group.file_info.erasure.data_blocks + group.file_info.erasure.parity_blocks;
+    group.shards.retain(|shard| shard.index > 0 && shard.index <= total);
+    group
+        .shards
+        .sort_by(|left, right| left.index.cmp(&right.index).then_with(|| left.drive.cmp(&right.drive)));
+
+    let mut distinct: Vec<DriveShard> = Vec::with_capacity(group.shards.len());
+    for shard in group.shards {
+        if let Some(previous) = distinct.last()
+            && previous.index == shard.index
+        {
+            if previous.data != shard.data {
+                return Err(Error::other(format!(
+                    "object-metadata identity has conflicting verified bytes for erasure shard {}",
+                    shard.index
+                )));
+            }
+            continue;
+        }
+        distinct.push(shard);
+    }
+
+    Ok((group.file_info, distinct))
 }
 
 /// Reconstruct verified data-or-parity shards block by block.
@@ -585,6 +671,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_export_rejects_an_existing_output_directory() {
+        let drive = tempfile::tempdir().expect("drive tempdir");
+        let export = tempfile::tempdir().expect("existing export directory");
+        let sentinel = export.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").expect("write sentinel");
+        let opts = InspectBucketMetaOpts {
+            paths: vec![drive.path().to_string_lossy().into_owned()],
+            bucket: "interop".to_string(),
+            raw: true,
+            out: Some(export.path().to_path_buf()),
+        };
+
+        let err = execute_bucket_meta(&opts)
+            .await
+            .expect_err("existing output must be rejected");
+        assert!(err.to_string().contains("already exists"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(sentinel).expect("read sentinel"), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_export_rejects_a_symlink_to_a_source_drive_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let drive = tempfile::tempdir().expect("drive tempdir");
+        let target = drive.path().join("existing-target");
+        std::fs::create_dir(&target).expect("create target");
+        let sentinel = target.join("sentinel");
+        std::fs::write(&sentinel, b"source-bytes").expect("write sentinel");
+        let export_parent = tempfile::tempdir().expect("export parent");
+        let out = export_parent.path().join("raw");
+        symlink(&target, &out).expect("create output symlink");
+        let opts = InspectBucketMetaOpts {
+            paths: vec![drive.path().to_string_lossy().into_owned()],
+            bucket: "interop".to_string(),
+            raw: true,
+            out: Some(out),
+        };
+
+        let err = execute_bucket_meta(&opts).await.expect_err("output symlink must be rejected");
+        assert!(err.to_string().contains("already exists"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(sentinel).expect("read sentinel"), b"source-bytes");
+    }
+
+    #[tokio::test]
+    async fn raw_export_file_creation_never_overwrites_an_existing_file() {
+        let export = tempfile::tempdir().expect("export tempdir");
+        let path = export.path().join("versioning.xml");
+        std::fs::write(&path, b"original").expect("write existing file");
+
+        let err = write_new_file(&path, b"replacement")
+            .await
+            .expect_err("existing file must not be overwritten");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(path).expect("read existing file"), b"original");
+    }
+
+    #[tokio::test]
     async fn raw_export_writes_every_persisted_xml_field_including_empty_ones() {
         let xlmeta = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata_full.xlmeta.hex"));
         let drive = tempfile::tempdir().expect("drive tempdir");
@@ -625,10 +769,72 @@ mod tests {
                 drive: format!("drive-{index}"),
                 index: index + 1,
                 data: data.to_vec(),
+                file_info: FileInfo::default(),
             })
             .collect();
 
         let body = reconstruct_shards(&erasure, payload.len(), shards).expect("reconstruct from parity");
         assert_eq!(body, payload);
+    }
+
+    fn quorum_test_shard(drive: &str, mod_time: OffsetDateTime, index: usize) -> DriveShard {
+        let file_info = FileInfo {
+            size: 32,
+            mod_time: Some(mod_time),
+            erasure: rustfs_filemeta::ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 2,
+                block_size: 64,
+                distribution: vec![1, 2, 3, 4],
+                index,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        DriveShard {
+            drive: drive.to_string(),
+            index,
+            data: vec![index as u8; 16],
+            file_info,
+        }
+    }
+
+    #[test]
+    fn metadata_selection_ignores_stale_first_drive_and_is_order_independent() {
+        let stale_time = OffsetDateTime::from_unix_timestamp(1).expect("stale timestamp");
+        let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
+        let stale_first = vec![
+            quorum_test_shard("stale-1", stale_time, 1),
+            quorum_test_shard("stale-2", stale_time, 2),
+            quorum_test_shard("current-2", current_time, 2),
+            quorum_test_shard("current-1", current_time, 1),
+        ];
+        let current_first = vec![
+            quorum_test_shard("current-1", current_time, 1),
+            quorum_test_shard("current-2", current_time, 2),
+            quorum_test_shard("stale-1", stale_time, 1),
+            quorum_test_shard("stale-2", stale_time, 2),
+        ];
+
+        for shards in [stale_first, current_first] {
+            let (selected, selected_shards) = select_quorum_shards(shards).expect("current identity reaches read quorum");
+            assert_eq!(selected.mod_time, Some(current_time));
+            assert_eq!(selected_shards.len(), 2);
+            assert!(selected_shards.iter().all(|shard| shard.drive.starts_with("current-")));
+        }
+    }
+
+    #[test]
+    fn metadata_selection_requires_distinct_erasure_indices_for_quorum() {
+        let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
+        let shards = vec![
+            quorum_test_shard("current-a", current_time, 1),
+            quorum_test_shard("current-b", current_time, 1),
+        ];
+
+        let Err(err) = select_quorum_shards(shards) else {
+            panic!("duplicate shard indices must not form quorum");
+        };
+        assert!(err.to_string().contains("reached read quorum"), "unexpected error: {err}");
     }
 }

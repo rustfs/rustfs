@@ -139,7 +139,8 @@ pub enum InspectCommands {
 #[derive(Args, Clone)]
 pub struct InspectBucketMetaOpts {
     /// Drive root path(s). Repeat for multi-drive nodes: erasure-coded metadata
-    /// needs at least data-shard-count drives to reconstruct.
+    /// needs at least data-shard-count drives to reconstruct. Mount source media
+    /// read-only when filesystem atime changes are unacceptable.
     #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
     pub paths: Vec<String>,
 
@@ -151,7 +152,7 @@ pub struct InspectBucketMetaOpts {
     #[arg(long)]
     pub raw: bool,
 
-    /// Output directory for --raw (default: ./bucket-meta-<bucket>)
+    /// New output directory for --raw (default: ./bucket-meta-<bucket>)
     #[arg(long, requires = "raw")]
     pub out: Option<std::path::PathBuf>,
 }

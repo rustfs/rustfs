@@ -543,7 +543,9 @@ pub(crate) mod ecstore_test_support {
 }
 
 pub(crate) mod ecstore_set_disk {
-    pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout, is_valid_storage_class};
+    pub(crate) use rustfs_ecstore::api::set_disk::{
+        DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,
+    };
 }
 
 /// Offline erasure primitives for `rustfs inspect bucket-meta` (backlog#1733):

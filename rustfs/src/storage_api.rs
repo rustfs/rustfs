@@ -30,6 +30,7 @@ pub(crate) mod inspect {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata as bucket_metadata;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_erasure::{BitrotReader, Erasure};
+    pub(crate) use crate::storage::storage_api::ecstore_set_disk::file_info_quorum_hash;
 }
 
 pub(crate) mod cluster {
