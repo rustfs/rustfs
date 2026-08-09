@@ -35,12 +35,15 @@ use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 const META_BUCKET: &str = ".rustfs.sys";
 const BUCKET_META_PREFIX: &str = "buckets";
 const BUCKET_METADATA_FILE: &str = ".metadata.bin";
+const BUCKET_INCARNATION_FILE: &str = ".bucket-incarnation";
 const MAX_XL_META_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BUCKET_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SHARD_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Execute an offline inspection command without initializing server state.
 pub async fn execute_inspect(opts: &InspectOpts) -> Result<()> {
@@ -59,6 +62,9 @@ struct DriveShard {
 }
 
 async fn execute_bucket_meta(opts: &InspectBucketMetaOpts) -> Result<()> {
+    eprintln!(
+        "warning: mount source drives read-only for forensic use; writable mounts allow atime changes and path replacement races"
+    );
     let output = opts.raw.then(|| {
         opts.out
             .clone()
@@ -226,17 +232,67 @@ fn format_ts(ts: OffsetDateTime) -> String {
 async fn reconstruct_metadata_blob(opts: &InspectBucketMetaOpts) -> Result<Vec<u8>> {
     check_valid_bucket_name_strict(&opts.bucket).map_err(|e| Error::other(format!("invalid bucket {:?}: {e}", opts.bucket)))?;
 
+    let blob = reconstruct_system_object(opts, BUCKET_METADATA_FILE).await?;
+    BucketMetadata::check_header(&blob).map_err(|e| Error::other(format!("reconstructed blob failed header check: {e}")))?;
+    let metadata = BucketMetadata::unmarshal(&blob[4..]).map_err(|e| Error::other(format!("unmarshal bucket metadata: {e}")))?;
+    validate_bucket_incarnation(opts, &metadata).await?;
+    Ok(blob)
+}
+
+async fn validate_bucket_incarnation(opts: &InspectBucketMetaOpts, metadata: &BucketMetadata) -> Result<()> {
+    let mut sidecar_present = false;
+    for drive in &opts.paths {
+        let path = system_object_dir(drive, &opts.bucket, BUCKET_INCARNATION_FILE).join("xl.meta");
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => sidecar_present = true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::new(
+                    error.kind(),
+                    format!("inspect bucket incarnation sidecar {}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+
+    if !sidecar_present {
+        if metadata.bucket_incarnation_id.is_nil() {
+            return Ok(());
+        }
+        return Err(Error::other(format!(
+            "bucket incarnation sidecar is missing for new-format metadata: {}",
+            opts.bucket
+        )));
+    }
+
+    let bytes = reconstruct_system_object(opts, BUCKET_INCARNATION_FILE).await?;
+    let incarnation =
+        Uuid::from_slice(&bytes).map_err(|error| Error::other(format!("persisted bucket incarnation is invalid: {error}")))?;
+    if incarnation.is_nil() {
+        return Err(Error::other("persisted bucket incarnation is nil"));
+    }
+    if !metadata.bucket_incarnation_id.is_nil() && metadata.bucket_incarnation_id != incarnation {
+        return Err(Error::other("bucket incarnation sidecar does not match bucket metadata"));
+    }
+    Ok(())
+}
+
+fn system_object_dir(drive: &str, bucket: &str, object: &str) -> PathBuf {
+    Path::new(drive)
+        .join(META_BUCKET)
+        .join(BUCKET_META_PREFIX)
+        .join(bucket)
+        .join(object)
+}
+
+async fn reconstruct_system_object(opts: &InspectBucketMetaOpts, object: &str) -> Result<Vec<u8>> {
     let mut shards: Vec<DriveShard> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
     for drive in &opts.paths {
-        let xl_path = Path::new(drive)
-            .join(META_BUCKET)
-            .join(BUCKET_META_PREFIX)
-            .join(&opts.bucket)
-            .join(BUCKET_METADATA_FILE)
-            .join("xl.meta");
-        match read_drive_shard(drive, &xl_path).await {
+        let object_dir = system_object_dir(drive, &opts.bucket, object);
+        let xl_path = object_dir.join("xl.meta");
+        match read_drive_shard(drive, object, &object_dir, &xl_path).await {
             Ok((fi, shard)) => {
                 let index = fi.erasure.index;
                 shards.push(DriveShard {
@@ -252,7 +308,7 @@ async fn reconstruct_metadata_blob(opts: &InspectBucketMetaOpts) -> Result<Vec<u
 
     if shards.is_empty() {
         return Err(Error::other(format!(
-            "no drive yielded a readable bucket-metadata shard for bucket {:?}:\n  {}",
+            "no drive yielded a readable shard for object {object:?} in bucket {:?}:\n  {}",
             opts.bucket,
             failures.join("\n  ")
         )));
@@ -297,7 +353,19 @@ fn select_quorum_shards(shards: Vec<DriveShard>) -> Result<(FileInfo, Vec<DriveS
     let mut eligible = groups
         .into_iter()
         .filter(|group| {
-            let total = group.file_info.erasure.data_blocks + group.file_info.erasure.parity_blocks;
+            let data_blocks = group.file_info.erasure.data_blocks;
+            let parity_blocks = group.file_info.erasure.parity_blocks;
+            let Some(total) = data_blocks.checked_add(parity_blocks) else {
+                return false;
+            };
+            let write_quorum = if data_blocks == parity_blocks {
+                data_blocks.checked_add(1)
+            } else {
+                Some(data_blocks)
+            };
+            let Some(write_quorum) = write_quorum else {
+                return false;
+            };
             let mut indices = group
                 .shards
                 .iter()
@@ -306,17 +374,17 @@ fn select_quorum_shards(shards: Vec<DriveShard>) -> Result<(FileInfo, Vec<DriveS
                 .collect::<Vec<_>>();
             indices.sort_unstable();
             indices.dedup();
-            group.file_info.erasure.data_blocks > 0 && indices.len() >= group.file_info.erasure.data_blocks
+            data_blocks > 0 && indices.len() >= write_quorum
         })
         .collect::<Vec<_>>();
 
     let Some(latest) = eligible.iter().map(|group| group.file_info.mod_time).max() else {
-        return Err(Error::other("no consistent object-metadata identity reached read quorum"));
+        return Err(Error::other("no consistent object-metadata identity reached write quorum"));
     };
     let latest_count = eligible.iter().filter(|group| group.file_info.mod_time == latest).count();
     if latest_count != 1 {
         return Err(Error::other(format!(
-            "{latest_count} different object-metadata identities reached read quorum at the latest modification time"
+            "{latest_count} different object-metadata identities reached write quorum at the latest modification time"
         )));
     }
 
@@ -325,7 +393,12 @@ fn select_quorum_shards(shards: Vec<DriveShard>) -> Result<(FileInfo, Vec<DriveS
         .position(|group| group.file_info.mod_time == latest)
         .ok_or_else(|| Error::other("latest read-quorum identity disappeared during selection"))?;
     let mut group = eligible.swap_remove(selected);
-    let total = group.file_info.erasure.data_blocks + group.file_info.erasure.parity_blocks;
+    let total = group
+        .file_info
+        .erasure
+        .data_blocks
+        .checked_add(group.file_info.erasure.parity_blocks)
+        .ok_or_else(|| Error::other("erasure shard count overflow"))?;
     group.shards.retain(|shard| shard.index > 0 && shard.index <= total);
     group
         .shards
@@ -423,8 +496,8 @@ fn reconstruct_shards(erasure: &Erasure, size: usize, mut shards: Vec<DriveShard
     Ok(body)
 }
 
-/// Read one drive's xl.meta and return the bitrot-verified inline shard bytes.
-async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<u8>)> {
+/// Read one drive's xl.meta and return its bitrot-verified inline or `part.1` shard.
+async fn read_drive_shard(drive: &str, object: &str, object_dir: &Path, xl_path: &Path) -> Result<(FileInfo, Vec<u8>)> {
     let metadata = tokio::fs::metadata(xl_path)
         .await
         .map_err(|e| Error::other(format!("inspect {}: {e}", xl_path.display())))?;
@@ -441,15 +514,8 @@ async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<
         .map_err(|e| Error::other(format!("read {}: {e}", xl_path.display())))?;
     let fm = FileMeta::load(&bytes).map_err(|e| Error::other(format!("parse {}: {e}", xl_path.display())))?;
     let fi = fm
-        .into_fileinfo(META_BUCKET, BUCKET_METADATA_FILE, "", true, false, false)
+        .into_fileinfo(META_BUCKET, object, "", true, false, true)
         .map_err(|e| Error::other(format!("resolve version in {}: {e}", xl_path.display())))?;
-
-    let Some(inline) = fi.data.clone() else {
-        return Err(Error::other(format!(
-            "{}: bucket metadata is not inlined in xl.meta on drive {drive}; this tool only reads inline shards",
-            xl_path.display()
-        )));
-    };
 
     let checksum_info = fi.erasure.get_checksum_info(1);
     let algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -464,7 +530,7 @@ async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<
     let size = usize::try_from(fi.size).map_err(|_| Error::other(format!("negative object size {}", fi.size)))?;
     if size > MAX_BUCKET_METADATA_BYTES {
         return Err(Error::other(format!(
-            "{}: bucket metadata body is {size} bytes, above the {MAX_BUCKET_METADATA_BYTES}-byte inspection limit",
+            "{}: system object body is {size} bytes, above the {MAX_BUCKET_METADATA_BYTES}-byte inspection limit",
             xl_path.display()
         )));
     }
@@ -476,29 +542,87 @@ async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<
     } else {
         shard_total.div_ceil(erasure.shard_size().max(1))
     };
-    let hash_bytes = n_blocks
-        .checked_mul(algo.size())
-        .ok_or_else(|| Error::other(format!("{}: bitrot framing size overflow", xl_path.display())))?;
+    let streaming = matches!(algo, HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy);
+    let hash_bytes = if streaming {
+        n_blocks
+            .checked_mul(algo.size())
+            .ok_or_else(|| Error::other(format!("{}: bitrot framing size overflow", xl_path.display())))?
+    } else {
+        0
+    };
     let framed = shard_total
         .checked_add(hash_bytes)
-        .ok_or_else(|| Error::other(format!("{}: inline shard size overflow", xl_path.display())))?;
+        .ok_or_else(|| Error::other(format!("{}: shard source size overflow", xl_path.display())))?;
+
+    let source = if let Some(inline) = fi.data.as_ref() {
+        inline.to_vec()
+    } else {
+        let Some(part) = fi.parts.first().filter(|part| part.number == 1) else {
+            return Err(Error::other(format!("{}: system object has no supported part.1", xl_path.display())));
+        };
+        if fi.parts.len() != 1 {
+            return Err(Error::other(format!(
+                "{}: system object has {} parts; offline inspection supports exactly one",
+                xl_path.display(),
+                fi.parts.len()
+            )));
+        }
+        let mut part_path = object_dir.to_path_buf();
+        if let Some(data_dir) = fi.data_dir {
+            part_path.push(data_dir.to_string());
+        }
+        part_path.push(format!("part.{}", part.number));
+        let metadata = tokio::fs::metadata(&part_path)
+            .await
+            .map_err(|error| Error::other(format!("inspect {} on drive {drive}: {error}", part_path.display())))?;
+        if metadata.len() > MAX_SHARD_SOURCE_BYTES {
+            return Err(Error::other(format!(
+                "{}: shard source is {} bytes, above the {}-byte inspection limit",
+                part_path.display(),
+                metadata.len(),
+                MAX_SHARD_SOURCE_BYTES
+            )));
+        }
+        tokio::fs::read(&part_path)
+            .await
+            .map_err(|error| Error::other(format!("read {}: {error}", part_path.display())))?
+    };
 
     // Writers differ in shard padding (RustFS legacy even padding vs MinIO's
     // exact sizes), so trust the bytes actually present when the computed
     // framing disagrees but a single-frame interpretation is consistent.
-    let (shard_total, n_blocks) = if framed == inline.len() {
+    let (shard_total, n_blocks) = if framed == source.len() {
         (shard_total, n_blocks)
-    } else if inline.len() >= algo.size() && n_blocks <= 1 {
-        (inline.len() - algo.size(), 1)
+    } else if streaming && source.len() >= algo.size() && n_blocks <= 1 {
+        (source.len() - algo.size(), 1)
     } else {
         return Err(Error::other(format!(
-            "{}: inline shard is {} bytes but the erasure layout expects {framed} ({} data + {n_blocks} bitrot hashes of {}); refusing to guess",
+            "{}: shard source is {} bytes but the erasure layout expects {framed} ({} data + {n_blocks} bitrot hashes of {}); refusing to guess",
             xl_path.display(),
-            inline.len(),
+            source.len(),
             shard_total,
-            algo.size()
+            if streaming { algo.size() } else { 0 }
         )));
     };
+
+    if !streaming {
+        if checksum_info.hash.len() != algo.size() {
+            return Err(Error::other(format!(
+                "{}: legacy whole-file bitrot checksum has {} bytes, expected {} for {:?}",
+                xl_path.display(),
+                checksum_info.hash.len(),
+                algo.size(),
+                algo
+            )));
+        }
+        let actual = algo.hash_encode(&source);
+        let matches = actual.as_ref() == checksum_info.hash.as_ref();
+        drop(actual);
+        if !matches {
+            return Err(Error::other(format!("{}: legacy whole-file bitrot checksum mismatch", xl_path.display())));
+        }
+        return Ok((fi, source));
+    }
 
     // Per-frame data capacity: the erasure shard size, except in the
     // single-frame fallback where the whole shard is one bitrot frame.
@@ -507,7 +631,7 @@ async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<
     } else {
         erasure.shard_size().max(1)
     };
-    let mut reader = BitrotReader::new(std::io::Cursor::new(inline.to_vec()), frame_cap, algo, false);
+    let mut reader = BitrotReader::new(std::io::Cursor::new(source), frame_cap, algo, false);
     let mut shard = vec![0u8; shard_total];
     let mut off = 0usize;
     for _ in 0..n_blocks {
@@ -531,6 +655,7 @@ async fn read_drive_shard(drive: &str, xl_path: &Path) -> Result<(FileInfo, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_filemeta::{ChecksumInfo, ObjectPartInfo};
 
     fn decode_hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
@@ -538,6 +663,93 @@ mod tests {
             .chunks(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    fn streaming_frame(raw: &[u8], frame_size: usize, algorithm: &HashAlgorithm) -> Vec<u8> {
+        let mut framed = Vec::new();
+        for block in raw.chunks(frame_size) {
+            let hash = algorithm.hash_encode(block);
+            framed.extend_from_slice(hash.as_ref());
+            framed.extend_from_slice(block);
+        }
+        framed
+    }
+
+    fn encode_object_shards(erasure: &Erasure, payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut shards = vec![Vec::new(); erasure.data_shards + erasure.parity_shards];
+        for block in payload.chunks(erasure.block_size) {
+            let encoded = erasure.encode_data(block).expect("encode test block");
+            for (target, shard) in shards.iter_mut().zip(encoded) {
+                target.extend_from_slice(&shard);
+            }
+        }
+        shards
+    }
+
+    async fn write_modern_object_fixture(
+        drives: &[tempfile::TempDir],
+        indices: &[usize],
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+        inline: bool,
+    ) {
+        let erasure = Erasure::try_new(2, 2, 64).expect("test erasure geometry");
+        let encoded = encode_object_shards(&erasure, payload);
+        let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("test data dir");
+        let algorithm = HashAlgorithm::HighwayHash256S;
+
+        for (drive, index) in drives.iter().zip(indices.iter().copied()) {
+            let raw = encoded[index - 1].as_slice();
+            let framed = streaming_frame(raw, erasure.shard_size(), &algorithm);
+            let mut file_info = FileInfo::new(object, 2, 2);
+            file_info.name = object.to_string();
+            file_info.data_dir = Some(data_dir);
+            file_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp"));
+            file_info.size = payload.len() as i64;
+            file_info.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                actual_size: payload.len() as i64,
+                ..Default::default()
+            }];
+            file_info.erasure.block_size = 64;
+            file_info.erasure.index = index;
+            file_info.erasure.distribution = vec![1, 2, 3, 4];
+            file_info.erasure.checksums = vec![ChecksumInfo {
+                part_number: 1,
+                algorithm: algorithm.clone(),
+                ..Default::default()
+            }];
+            if inline {
+                file_info.data = Some(framed.clone().into());
+                file_info.set_inline_data();
+            }
+
+            let mut file_meta = FileMeta::new();
+            file_meta.add_version(file_info).expect("add test object version");
+            let object_dir = system_object_dir(drive.path().to_string_lossy().as_ref(), bucket, object);
+            std::fs::create_dir_all(&object_dir).expect("create test object directory");
+            std::fs::write(object_dir.join("xl.meta"), file_meta.marshal_msg().expect("marshal test xl.meta"))
+                .expect("write test xl.meta");
+            if !inline {
+                let part_dir = object_dir.join(data_dir.to_string());
+                std::fs::create_dir_all(&part_dir).expect("create test part directory");
+                std::fs::write(part_dir.join("part.1"), framed).expect("write test part");
+            }
+        }
+    }
+
+    fn inspect_opts(drives: &[tempfile::TempDir]) -> InspectBucketMetaOpts {
+        InspectBucketMetaOpts {
+            paths: drives
+                .iter()
+                .map(|drive| drive.path().to_string_lossy().into_owned())
+                .collect(),
+            bucket: "interop".to_string(),
+            raw: false,
+            out: None,
+        }
     }
 
     /// End-to-end over the drive layout this tool reads: a MinIO-written
@@ -633,15 +845,17 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_bucket_before_reading_drive_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let opts = InspectBucketMetaOpts {
-            paths: vec![dir.path().to_string_lossy().into_owned()],
-            bucket: "../escape".to_string(),
-            raw: false,
-            out: None,
-        };
+        for bucket in ["../escape", "Uppercase", "under_score", "colon:name"] {
+            let opts = InspectBucketMetaOpts {
+                paths: vec![dir.path().to_string_lossy().into_owned()],
+                bucket: bucket.to_string(),
+                raw: false,
+                out: None,
+            };
 
-        let err = reconstruct_metadata_blob(&opts).await.expect_err("invalid bucket must fail");
-        assert!(err.to_string().contains("invalid bucket"), "unexpected error: {err}");
+            let err = reconstruct_metadata_blob(&opts).await.expect_err("invalid bucket must fail");
+            assert!(err.to_string().contains("invalid bucket"), "{bucket}: unexpected error: {err}");
+        }
     }
 
     #[tokio::test]
@@ -756,25 +970,143 @@ mod tests {
         assert_eq!(std::fs::read(out.join("cors.xml")).expect("empty CORS field exists"), b"");
     }
 
-    #[test]
-    fn reconstructs_from_parity_when_a_data_shard_is_missing() {
-        let payload = b"bucket metadata needs parity recovery";
-        let erasure = Erasure::try_new(2, 2, 64).expect("valid erasure geometry");
-        let encoded = erasure.encode_data(payload).expect("encode payload");
-        let shards = encoded
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| *index != 0)
-            .map(|(index, data)| DriveShard {
-                drive: format!("drive-{index}"),
-                index: index + 1,
-                data: data.to_vec(),
-                file_info: FileInfo::default(),
-            })
-            .collect();
+    #[tokio::test]
+    async fn reconstructs_complete_drive_layout_from_parity_when_a_data_shard_is_missing() {
+        let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        write_modern_object_fixture(&drives, &[2, 3, 4], "interop", BUCKET_METADATA_FILE, &payload, true).await;
 
-        let body = reconstruct_shards(&erasure, payload.len(), shards).expect("reconstruct from parity");
+        let raw = reconstruct_system_object(&inspect_opts(&drives), BUCKET_METADATA_FILE)
+            .await
+            .expect("reconstruct raw system object");
+        assert_eq!(raw, payload, "drive fixture must reproduce the source blob exactly");
+        let body = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect("reconstruct from parity drives");
+        assert_eq!(body, payload, "missing data shard must be restored byte-for-byte from parity");
+    }
+
+    #[tokio::test]
+    async fn reconstructs_a_valid_non_inline_part_one() {
+        let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_METADATA_FILE, &payload, false).await;
+
+        let body = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect("reconstruct non-inline metadata");
         assert_eq!(body, payload);
+    }
+
+    fn bucket_metadata_blob(incarnation: Uuid) -> Vec<u8> {
+        let mut metadata = BucketMetadata::new("interop");
+        metadata.bucket_incarnation_id = incarnation;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_u16.to_le_bytes());
+        blob.extend_from_slice(&1_u16.to_le_bytes());
+        blob.extend_from_slice(&metadata.marshal_msg().expect("marshal bucket metadata"));
+        blob
+    }
+
+    #[tokio::test]
+    async fn bucket_incarnation_sidecar_must_match_persisted_metadata() {
+        let metadata_incarnation = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("metadata incarnation");
+        let stale_incarnation = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("stale incarnation");
+        let drives = (0..3)
+            .map(|_| tempfile::tempdir().expect("drive tempdir"))
+            .collect::<Vec<_>>();
+        let blob = bucket_metadata_blob(metadata_incarnation);
+        write_modern_object_fixture(&drives, &[1, 2, 3], "interop", BUCKET_METADATA_FILE, &blob, true).await;
+
+        let missing = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect_err("new-format metadata without a sidecar must fail");
+        assert!(missing.to_string().contains("sidecar is missing"), "unexpected error: {missing}");
+
+        write_modern_object_fixture(
+            &drives,
+            &[1, 2, 3],
+            "interop",
+            BUCKET_INCARNATION_FILE,
+            stale_incarnation.as_bytes(),
+            true,
+        )
+        .await;
+
+        let err = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect_err("stale bucket metadata must be rejected");
+        assert!(err.to_string().contains("does not match"), "unexpected error: {err}");
+
+        write_modern_object_fixture(
+            &drives,
+            &[1, 2, 3],
+            "interop",
+            BUCKET_INCARNATION_FILE,
+            metadata_incarnation.as_bytes(),
+            true,
+        )
+        .await;
+        let restored = reconstruct_metadata_blob(&inspect_opts(&drives))
+            .await
+            .expect("matching sidecar must pass");
+        assert_eq!(restored, blob);
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_whole_file_bitrot_fixtures_support_all_persisted_algorithms() {
+        let payload = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let erasure = Erasure::try_new(4, 2, 1_048_576).expect("legacy erasure geometry");
+        let encoded = erasure.encode_data(&payload).expect("encode legacy payload");
+        let algorithms = [
+            ("sha256", HashAlgorithm::SHA256),
+            ("highwayhash256", HashAlgorithm::HighwayHash256),
+            ("blake2b", HashAlgorithm::BLAKE2b512),
+            ("md5", HashAlgorithm::Md5),
+        ];
+
+        for (name, algorithm) in algorithms {
+            let drives = (0..4)
+                .map(|_| tempfile::tempdir().expect("drive tempdir"))
+                .collect::<Vec<_>>();
+            for (offset, drive) in drives.iter().enumerate() {
+                let index = offset + 1;
+                let raw = encoded[index - 1].as_ref();
+                let hash = algorithm.hash_encode(raw);
+                let xlmeta = rustfs_filemeta::test_data::create_legacy_v1_object_xlmeta_with_checksum(
+                    index,
+                    name,
+                    hash.as_ref(),
+                    payload.len(),
+                )
+                .expect("create legacy V1 fixture");
+                let object_dir = system_object_dir(drive.path().to_string_lossy().as_ref(), "interop", BUCKET_METADATA_FILE);
+                let part_dir = object_dir.join("fedcba98-7654-3210-fedc-ba9876543210");
+                std::fs::create_dir_all(&part_dir).expect("create legacy fixture directory");
+                std::fs::write(object_dir.join("xl.meta"), xlmeta).expect("write legacy xl.meta");
+                std::fs::write(part_dir.join("part.1"), raw).expect("write legacy whole-file shard");
+            }
+
+            let restored = reconstruct_metadata_blob(&inspect_opts(&drives))
+                .await
+                .unwrap_or_else(|error| panic!("{name} legacy fixture failed: {error}"));
+            assert_eq!(restored, payload, "{name} fixture must reconstruct byte-for-byte");
+
+            let object_dir = system_object_dir(drives[0].path().to_string_lossy().as_ref(), "interop", BUCKET_METADATA_FILE);
+            let part_path = object_dir.join("fedcba98-7654-3210-fedc-ba9876543210/part.1");
+            let mut corrupt = std::fs::read(&part_path).expect("read legacy whole-file shard");
+            corrupt[0] ^= 0xff;
+            std::fs::write(&part_path, corrupt).expect("corrupt legacy whole-file shard");
+            let drive = drives[0].path().to_string_lossy().into_owned();
+            let err = read_drive_shard(&drive, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+                .await
+                .expect_err("whole-file bitrot corruption must fail at the drive boundary");
+            assert!(err.to_string().contains("checksum mismatch"), "{name}: unexpected error: {err}");
+        }
     }
 
     fn quorum_test_shard(drive: &str, mod_time: OffsetDateTime, index: usize) -> DriveShard {
@@ -800,28 +1132,45 @@ mod tests {
     }
 
     #[test]
-    fn metadata_selection_ignores_stale_first_drive_and_is_order_independent() {
+    fn metadata_selection_uses_newest_write_quorum_independent_of_order() {
         let stale_time = OffsetDateTime::from_unix_timestamp(1).expect("stale timestamp");
         let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
         let stale_first = vec![
             quorum_test_shard("stale-1", stale_time, 1),
-            quorum_test_shard("stale-2", stale_time, 2),
+            quorum_test_shard("current-3", current_time, 3),
             quorum_test_shard("current-2", current_time, 2),
             quorum_test_shard("current-1", current_time, 1),
         ];
         let current_first = vec![
             quorum_test_shard("current-1", current_time, 1),
             quorum_test_shard("current-2", current_time, 2),
+            quorum_test_shard("current-3", current_time, 3),
             quorum_test_shard("stale-1", stale_time, 1),
-            quorum_test_shard("stale-2", stale_time, 2),
         ];
 
         for shards in [stale_first, current_first] {
-            let (selected, selected_shards) = select_quorum_shards(shards).expect("current identity reaches read quorum");
+            let (selected, selected_shards) = select_quorum_shards(shards).expect("current identity reaches write quorum");
             assert_eq!(selected.mod_time, Some(current_time));
-            assert_eq!(selected_shards.len(), 2);
+            assert_eq!(selected_shards.len(), 3);
             assert!(selected_shards.iter().all(|shard| shard.drive.starts_with("current-")));
         }
+    }
+
+    #[test]
+    fn metadata_selection_rejects_old_and_new_read_quorums_without_a_committed_group() {
+        let stale_time = OffsetDateTime::from_unix_timestamp(1).expect("stale timestamp");
+        let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
+        let shards = vec![
+            quorum_test_shard("stale-1", stale_time, 1),
+            quorum_test_shard("stale-2", stale_time, 2),
+            quorum_test_shard("current-3", current_time, 3),
+            quorum_test_shard("current-4", current_time, 4),
+        ];
+
+        let Err(err) = select_quorum_shards(shards) else {
+            panic!("two uncommitted read quorums must fail closed");
+        };
+        assert!(err.to_string().contains("write quorum"), "unexpected error: {err}");
     }
 
     #[test]
@@ -835,6 +1184,6 @@ mod tests {
         let Err(err) = select_quorum_shards(shards) else {
             panic!("duplicate shard indices must not form quorum");
         };
-        assert!(err.to_string().contains("reached read quorum"), "unexpected error: {err}");
+        assert!(err.to_string().contains("reached write quorum"), "unexpected error: {err}");
     }
 }

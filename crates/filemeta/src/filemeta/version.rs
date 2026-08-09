@@ -1855,6 +1855,7 @@ impl From<MetaObjectV1ChecksumInfo> for ChecksumInfo {
                 "highwayhash256" => HashAlgorithm::HighwayHash256,
                 "highwayhash256S" => HashAlgorithm::HighwayHash256S,
                 "blake2b" | "blake2b512" => HashAlgorithm::BLAKE2b512,
+                "md5" => HashAlgorithm::Md5,
                 _ => HashAlgorithm::HighwayHash256S,
             },
             hash: Bytes::from(value.hash),

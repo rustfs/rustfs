@@ -137,10 +137,13 @@ pub enum InspectCommands {
 
 /// `inspect bucket-meta` options
 #[derive(Args, Clone)]
+#[command(
+    after_help = "IMPORTANT: Mount every source drive read-only for forensic use. Read-only application calls cannot prevent filesystem atime updates or path replacement races on writable mounts."
+)]
 pub struct InspectBucketMetaOpts {
     /// Drive root path(s). Repeat for multi-drive nodes: erasure-coded metadata
-    /// needs at least data-shard-count drives to reconstruct. Mount source media
-    /// read-only when filesystem atime changes are unacceptable.
+    /// needs enough drives for write quorum. Source media must be mounted
+    /// read-only for strict forensic use.
     #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
     pub paths: Vec<String>,
 
