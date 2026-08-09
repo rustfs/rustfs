@@ -5668,11 +5668,7 @@ impl DefaultObjectUsecase {
         } else {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
-                let eager_body = hotpath::future!(
-                    read_zero_copy_put_body_exact(body, actual_size as usize),
-                    label = "s3.put.body.zero_copy_eager"
-                )
-                .await?;
+                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
                 rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             } else if use_small_eager_put_path {
