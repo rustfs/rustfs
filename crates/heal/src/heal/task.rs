@@ -2517,6 +2517,7 @@ mod tests {
         OkWithOtherError(&'static str),
         ErrOther(&'static str),
         RetryableReadQuorum,
+        RetryableSlowDown,
         PermanentOther(&'static str),
     }
 
@@ -2650,6 +2651,9 @@ mod tests {
                         bucket.to_string(),
                         object.to_string(),
                     ))),
+                    MockHealObjectOutcome::RetryableSlowDown => {
+                        Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
+                    }
                     MockHealObjectOutcome::PermanentOther(message) => Err(Error::other(message)),
                     MockHealObjectOutcome::OkWithOtherError(message) => {
                         Ok((HealResultItem::default(), Some(Error::other(message))))
@@ -2669,6 +2673,9 @@ mod tests {
                         bucket.to_string(),
                         object.to_string(),
                     ))),
+                    MockHealObjectOutcome::RetryableSlowDown => {
+                        Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
+                    }
                 };
             }
             if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
@@ -2759,6 +2766,42 @@ mod tests {
                 .clone()
                 .ok_or_else(|| Error::other("not implemented in tests"))
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_object_heal_slowdown_is_not_treated_as_deleted() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(true)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetryableSlowDown)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                HealOptions {
+                    pool_index: Some(0),
+                    set_index: Some(1),
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+
+        let err = task.execute().await.expect_err("SlowDown must fail the current heal attempt");
+
+        assert!(matches!(err, Error::Storage(EcstoreError::SlowDown)));
+        assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
+        let opts = storage
+            .object_heal_opts
+            .lock()
+            .expect("heal options lock should be available");
+        assert_eq!(opts[0].pool, Some(0));
+        assert_eq!(opts[0].set, Some(1));
     }
 
     async fn make_resume_disk(temp: &TempDir) -> DiskStore {

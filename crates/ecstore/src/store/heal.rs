@@ -129,7 +129,30 @@ impl ECStore {
 
         let mut futures = Vec::with_capacity(pools.len());
         for pool in pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            let suspended_complete = {
+                let pool_meta = self.pool_meta.read().await;
+                pool_meta.is_suspended(pool.pool_idx).then(|| {
+                    pool_meta
+                        .pools
+                        .get(pool.pool_idx)
+                        .and_then(|status| status.decommission.as_ref())
+                        .is_some_and(|decommission| decommission.complete)
+                })
+            };
+            if let Some(complete) = suspended_complete {
+                if opts.pool.is_some() {
+                    let _ = pool.get_disks_for_heal_object(&object, opts)?;
+                    let err = if complete {
+                        StorageError::InvalidArgument(
+                            "heal".to_string(),
+                            "pool".to_string(),
+                            format!("heal pool {} has completed decommission", pool.pool_idx),
+                        )
+                    } else {
+                        Error::SlowDown
+                    };
+                    return Ok((HealResultItem::default(), Some(err)));
+                }
                 continue;
             }
             futures.push(pool.heal_object(bucket, &object, version_id, opts));
@@ -196,6 +219,7 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
     use crate::disk::{DiskOption, format::FormatV3, new_disk};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
     use crate::store::init_format::{load_format_erasure, save_format_file};
@@ -274,6 +298,134 @@ mod tests {
                 if field == "pool" && reason.contains("invalid heal pool index 2 for 2 pools")),
             "unexpected invalid pool error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_heal_object_defers_when_requested_pool_is_suspended() {
+        let mut store = minimal_heal_store().await;
+        store.pool_meta = RwLock::new(PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        });
+
+        let (_, err) = store
+            .handle_heal_object(
+                "bucket",
+                "object",
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended pool should return a deferred heal result");
+
+        assert!(matches!(err, Some(StorageError::SlowDown)));
+
+        let (_, err) = store
+            .handle_heal_object(
+                "bucket",
+                "object",
+                "",
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unscoped heal should return the active pool result");
+
+        assert!(matches!(err, Some(StorageError::InvalidArgument(_, ref field, _)) if field == "set"));
+
+        let err = store
+            .handle_heal_object(
+                "bucket",
+                "object",
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("invalid set scope should fail before suspended pool deferral");
+
+        assert!(matches!(err, StorageError::InvalidArgument(_, ref field, _) if field == "set"));
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let decommission = pool_meta.pools[1]
+                .decommission
+                .as_mut()
+                .expect("test pool should have decommission state");
+            decommission.complete = true;
+        }
+        let (_, err) = store
+            .handle_heal_object(
+                "bucket",
+                "object",
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("completed pool should return a terminal heal result");
+
+        assert!(matches!(
+            err,
+            Some(StorageError::InvalidArgument(_, ref field, ref reason))
+                if field == "pool" && reason.contains("completed decommission")
+        ));
+
+        for canceled in [false, true] {
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                let decommission = pool_meta.pools[1]
+                    .decommission
+                    .as_mut()
+                    .expect("test pool should have decommission state");
+                decommission.complete = false;
+                decommission.failed = !canceled;
+                decommission.canceled = canceled;
+            }
+            let (_, err) = store
+                .handle_heal_object(
+                    "bucket",
+                    "object",
+                    "",
+                    &HealOpts {
+                        pool: Some(1),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("clearable terminal pool should return a deferred heal result");
+
+            assert!(matches!(err, Some(StorageError::SlowDown)));
+        }
     }
 
     #[tokio::test]
