@@ -263,6 +263,12 @@ pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Err
     InternodeHttpError::new_for_test(kind).into_io_error()
 }
 
+/// Build a retryable internode timeout error with the request's operation context.
+#[doc(hidden)]
+pub fn internode_http_timeout_error(method: &Method, url: &str) -> io::Error {
+    internode_kind_error(method, url, internode_rpc_operation(url), InternodeHttpErrorKind::ConnectTimeout)
+}
+
 /// Clone an internode HTTP I/O error while retaining its structured classification.
 ///
 /// The underlying transport source is intentionally omitted because it is not
@@ -1963,6 +1969,21 @@ mod tests {
             internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
             None
         );
+    }
+
+    #[test]
+    fn internode_http_timeout_error_retains_operation_context() {
+        let error =
+            internode_http_timeout_error(&Method::GET, "http://node:9000/rustfs/rpc/put_file_capability?put_file_capability=1");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("timeout should retain internode classification");
+
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectTimeout);
+        assert_eq!(source.context().method(), "GET");
+        assert_eq!(source.context().target(), PUT_FILE_CAPABILITY_PATH);
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY));
     }
 
     #[test]

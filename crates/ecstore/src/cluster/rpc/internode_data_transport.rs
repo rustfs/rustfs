@@ -316,7 +316,12 @@ impl TcpHttpInternodeDataTransport {
         resolve_put_file_auth_capability(endpoint, || async {
             tokio::time::timeout(PUT_FILE_CAPABILITY_PROBE_TIMEOUT, self.probe_put_file_auth(endpoint))
                 .await
-                .map_err(|_| Error::other("remote put_file capability probe timed out"))?
+                .map_err(|_| {
+                    Error::from(rustfs_rio::internode_http_timeout_error(
+                        &Method::GET,
+                        &format!("{endpoint}{PUT_FILE_CAPABILITY_PATH}"),
+                    ))
+                })?
         })
         .await
     }
@@ -866,6 +871,20 @@ mod tests {
         for status in [200, 400, 401, 403, 405, 408, 426, 429, 500, 503] {
             assert!(!put_file_capability_status_is_legacy(status));
         }
+    }
+
+    #[test]
+    fn put_file_capability_timeout_is_retryable() {
+        let error = Error::from(rustfs_rio::internode_http_timeout_error(
+            &Method::GET,
+            "http://node:9000/rustfs/rpc/put_file_capability",
+        ));
+
+        assert_eq!(
+            error.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::ConnectTimeout)
+        );
+        assert!(error.is_retryable_internode_write_failure());
     }
 
     #[tokio::test]
