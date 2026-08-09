@@ -87,6 +87,7 @@ fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_CHECK).is_some()
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).is_some()
         || get_header(headers, SUFFIX_SOURCE_VERSION_ID).is_some()
+        || rustfs_utils::http::has_ssec_transport_headers(headers)
 }
 
 async fn authorize_replication_only_put_headers<T>(req: &mut S3Request<T>) -> S3Result<()> {
@@ -2247,6 +2248,16 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
+
+        // A replication convergence check HEADs the replica to compare
+        // etag/size/mtime. For SSE-C replicas the worker holds no customer key,
+        // so authorize it as a replication action and let the handler skip the
+        // SSE-C read validation.
+        if get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true") {
+            authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+            req_info_mut(req)?.replication_request_authorized = true;
+            return Ok(());
+        }
 
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }

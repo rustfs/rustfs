@@ -66,14 +66,23 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 
 ### STS, OIDC, and federation flows
 - Every STS endpoint must have an explicit authentication story: SigV4 where required, OIDC token verification for web identity, and role/session policy validation before issuing credentials.
+- For web identity, the JWT is the credential; exemption from SigV4 is not itself an authentication bypass. Treat pre-verification claims only as untrusted routing hints, bound token size, normalize public failures, rate-limit discovery, and issue credentials only after signature, issuer, audience, and expiration checks.
 - JWT session tokens must be signed and verified by a trusted issuer/key path, not by service-account-controlled material or a reused root secret.
 - JWT verification must enforce required claims and expiration for every bearer token path; "allow missing exp" is never acceptable for user-presented credentials.
 - Public OIDC bootstrap and callback routes must treat `Host`, `X-Forwarded-Proto`, redirect targets, `state`, and callback parameters as untrusted; credential-bearing redirects require a configured, allowlisted origin.
 - OIDC discovery and validation URLs are SSRF sinks. Resolve and classify hostnames at connection time, reject rebinding to loopback/private/link-local ranges, and do not rely on literal string checks.
 
-### S3 copy, multipart, and presigned POST
+### IAM policy conditions and plugins
+- Treat request headers as attacker-controlled even after SigV4; callers sign their own spoofed headers. Do not merge them into server-derived condition keys such as identity, groups, version ID, signature version, JWT, or LDAP claims.
+- Keep the condition-key namespace explicit. Reserved server-derived keys must reject or ignore colliding headers, while intentional request-header keys such as `s3:x-amz-*` remain available.
+- Quantified IAM condition tests need partially overlapping multi-value sets. Fully contained and fully disjoint sets cannot distinguish `ForAllValues` from `ForAnyValue` bugs.
+- External policy plugins must receive the same security context as built-in policy evaluation. If OPA or another plugin depends on existing object tags, load and pass `ExistingObjectTag/*` before the plugin decision.
+
+### S3 object actions, copy, multipart, and presigned POST
+- Version-aware object requests need version-aware actions. Explicit `versionId` reads and copy sources must authorize `s3:GetObjectVersion`, not only `s3:GetObject`.
 - Multipart copy must enforce source `GetObject` and destination `PutObject` semantics equivalent to `CopyObject`, including copy-source and policy conditions.
 - Do not let `CreateMultipartUpload`, `UploadPartCopy`, `CompleteMultipartUpload`, or `AbortMultipartUpload` return success without authorization.
+- Fallbacks from version actions to non-version actions must still pass the same public-access-block, anonymous-deny, and post-authorization gates as a direct allow.
 - Presigned POST policies are server-side contracts. Enforce `content-length-range`, key prefix, exact metadata/content-type, and all signed policy conditions.
 
 ### Protocol frontends and IAM parity
@@ -132,6 +141,11 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - When touching reader/writer wrappers such as hashing, encryption, compression, or warp readers, verify wrapper order and inspect stored bytes in regression tests.
 - Avoid helper shortcuts that unwrap nested readers and accidentally bypass encryption or integrity layers.
 
+### Object Lock and retention invariants
+- Object Lock state must fail closed when bucket metadata is unreadable, fabricated, or unparsable. Only a confirmed absence of Object Lock configuration may permit unprotected deletes or writes.
+- Do not collapse metadata read faults, missing persisted metadata, parse failures, and genuinely absent Object Lock config into one "not configured" result.
+- Retention enforcement must cover foreground deletes, batch deletes, force-delete helpers, default-retention materialization on PUT, lifecycle expiry, scanner sweeps, and all-versions expiry.
+
 ## Review Prompts
 
 Use these prompts while reviewing a diff:
@@ -148,5 +162,9 @@ Use these prompts while reviewing a diff:
 - Does this outbound validation path resolve attacker-supplied hostnames and reject private, loopback, link-local, and rebound addresses at the actual connection boundary?
 - Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?
+- Does an explicit object version, fallback action, or plugin authorization path pass through the same action and post-authorization gates as the direct S3 path?
+- Can a caller-controlled header populate a condition key that should be derived only by the server?
+- Do condition tests include partially overlapping multi-value inputs for quantified operators?
+- Does unreadable bucket metadata make Object Lock or retention enforcement fail closed rather than disappear?
 - Does a preview or browser-surface fix preserve the original security invariant when adding alternate viewers or file-type detection?
 - Does the test prove the exploit form is denied, or only that the intended form still works?

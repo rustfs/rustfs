@@ -1897,6 +1897,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        // The SSE-C passthrough session marker is upload-scoped; drop it from
+        // the completed object's metadata.
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT,
+        );
+
         if checksum_type.is_set() {
             checksum_type
                 .merge(rustfs_rio::ChecksumType::MULTIPART)
@@ -1919,13 +1926,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         // etag
-        let etag = {
-            if let Some(etag) = opts.user_defined.get("etag") {
-                etag.clone()
-            } else {
-                get_complete_multipart_md5(&uploaded_parts)
-            }
-        };
+        let etag = resolve_complete_etag(opts, &uploaded_parts);
 
         fi.metadata.insert("etag".to_owned(), etag);
 
@@ -2165,6 +2166,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
+}
+
+/// Final ETag for a completed multipart object. An authorized replication
+/// request preserves the source ETag so the replication HEAD comparison
+/// converges even when the source ETag is not derivable from the uploaded
+/// parts (foreign-origin objects, ciphertext-derived ETags); the internal
+/// metadata override comes next; otherwise the ETag is computed from parts.
+fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) -> String {
+    if let Some(etag) = opts.preserve_etag.as_ref().filter(|etag| !etag.is_empty()) {
+        return etag.clone();
+    }
+    if let Some(etag) = opts.user_defined.get("etag") {
+        return etag.clone();
+    }
+    get_complete_multipart_md5(uploaded_parts)
 }
 
 #[cfg(test)]
@@ -5189,5 +5205,29 @@ mod tests {
             let (body_after, _) = read_object(&set_disks, bucket, object).await;
             assert_eq!(body_after, new, "reclaiming the leftover upload must not disturb the committed object");
         }
+    }
+
+    #[test]
+    fn resolve_complete_etag_prefers_preserved_source_etag() {
+        // A replication-preserved ETag that no part combination can derive
+        // (foreign-origin object) must win over the computed md5-of-parts.
+        let foreign_etag = "11111111111111111111111111111111-7".to_string();
+        let opts = ObjectOptions {
+            preserve_etag: Some(foreign_etag.clone()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_complete_etag(&opts, &[]), foreign_etag);
+
+        // Empty preserve value degrades to the next source.
+        let opts_empty = ObjectOptions {
+            preserve_etag: Some(String::new()),
+            user_defined: std::collections::HashMap::from([("etag".to_string(), "override-etag".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(resolve_complete_etag(&opts_empty, &[]), "override-etag");
+
+        // Without either source the ETag is computed from the parts.
+        let computed = resolve_complete_etag(&ObjectOptions::default(), &[]);
+        assert_eq!(computed, get_complete_multipart_md5(&[]));
     }
 }

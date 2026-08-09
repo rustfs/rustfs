@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::startup_runtime_sources;
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
-    ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
-    try_migrate_iam_config,
+    ECStore, get_global_replication_pool, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents,
+    try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
     io::{Error, Result},
@@ -60,7 +59,7 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     init_bucket_metadata_sys(store, buckets.clone()).await;
     reconcile_bucket_resync_target_intents(&buckets).await?;
 
-    if let Some(pool) = startup_runtime_sources::replication_pool_handle() {
+    if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx, buckets.clone()).await?;
     }
 

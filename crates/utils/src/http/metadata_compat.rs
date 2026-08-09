@@ -28,6 +28,9 @@ pub const SUFFIX_DATA_MOV: &str = "data-mov";
 /// Transient flag for healing
 pub const SUFFIX_HEALING: &str = "healing";
 pub const SUFFIX_COMPRESSION: &str = "compression";
+/// Session marker for SSE-C replication passthrough multipart uploads: parts
+/// arrive as ciphertext and must be stored without re-encryption.
+pub const SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT: &str = "replication-preserve-ciphertext";
 pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
 pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";

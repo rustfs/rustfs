@@ -894,6 +894,7 @@ impl GetObjectReader {
             .await?
             .into_reader(reader, oi)
     }
+    #[hotpath::measure(impl_type = "GetObjectReader")]
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         self.stream.read_to_end(&mut data).await?;

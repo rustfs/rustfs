@@ -16,7 +16,9 @@ use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
     replication_fast_env, rustfs_binary_path,
 };
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
+use crate::fake_s3_target::{
+    FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
+};
 use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -379,6 +381,10 @@ struct ReplicationResetStatusTarget {
     reset_id: String,
     #[serde(rename = "resyncStatus", default)]
     status: String,
+    #[serde(rename = "replicationCount", default)]
+    replicated_count: i64,
+    #[serde(rename = "object", default)]
+    object: String,
 }
 
 async fn signed_request(
@@ -1447,10 +1453,6 @@ where
     }
 }
 
-async fn wait_for_replication_failure_event(response: reqwest::Response, expected_key: &str) -> TestResult {
-    wait_for_replication_failure_event_stream(response.bytes_stream(), expected_key, Duration::from_secs(30)).await
-}
-
 fn target_history_contains_key(output: &ListObjectVersionsOutput, key: &str) -> bool {
     output.versions().iter().any(|version| version.key() == Some(key))
         || output.delete_markers().iter().any(|marker| marker.key() == Some(key))
@@ -1507,41 +1509,24 @@ async fn assert_failed_replication_stays_absent_for(
     }
 }
 
-async fn subscribe_to_replication_failure(
-    env: &RustFSTestEnvironment,
-    bucket: &str,
-    key: &str,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/{bucket}?events={}&prefix={}&ping=1",
-        env.url,
-        urlencoding::encode(REPLICATION_FAILED_EVENT),
-        urlencoding::encode(key)
-    );
-    let response = timeout(
-        Duration::from_secs(30),
-        signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None),
-    )
-    .await
-    .map_err(|_| "replication failure event subscription did not respond within 30 seconds")??;
-    if response.status() != StatusCode::OK {
-        return Err(format!("failed to subscribe to replication failure events: {}", response.status()).into());
-    }
-    Ok(response)
-}
-
 async fn build_sse_replication_pair(
     label: &str,
-    enable_kms: bool,
+    source_kms: bool,
+    target_kms: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String, String), Box<dyn Error + Send + Sync>> {
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut target_env = RustFSTestEnvironment::new().await?;
     let source_kms_key_dir = format!("{}/kms-keys", source_env.temp_dir);
     let target_kms_key_dir = format!("{}/kms-keys", target_env.temp_dir);
-    if enable_kms {
+    if source_kms {
         fs::create_dir_all(&source_kms_key_dir).await?;
-        fs::create_dir_all(&target_kms_key_dir).await?;
         create_key_with_specific_id(&source_kms_key_dir, REPL17_KMS_KEY_ID).await?;
+    }
+    // The two sites share a key id but never key material: each side generates
+    // its own key, which is exactly the independent-KMS topology managed-SSE
+    // replication must survive (target re-encrypts with its own envelope).
+    if target_kms {
+        fs::create_dir_all(&target_kms_key_dir).await?;
         create_key_with_specific_id(&target_kms_key_dir, REPL17_KMS_KEY_ID).await?;
     }
 
@@ -1549,7 +1534,7 @@ async fn build_sse_replication_pair(
     source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
     source_process_env.extend_from_slice(FAST_SCANNER_ENV);
     source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
-    if enable_kms {
+    if source_kms {
         source_process_env.extend_from_slice(&[
             ("RUSTFS_KMS_ENABLE", "true"),
             ("RUSTFS_KMS_BACKEND", "local"),
@@ -1557,15 +1542,15 @@ async fn build_sse_replication_pair(
             ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
             ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
             // Per-key KMS authorization is on so this contract is pinned in the
-            // configuration replication will eventually ship with: the replication
-            // worker carries no request identity and must stay exempt.
+            // configuration replication ships with: the replication worker
+            // carries no request identity and must stay exempt.
             ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ]);
     }
     source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
 
     let mut target_process_env = vec![("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")];
-    if enable_kms {
+    if target_kms {
         target_process_env.extend_from_slice(&[
             ("RUSTFS_KMS_ENABLE", "true"),
             ("RUSTFS_KMS_BACKEND", "local"),
@@ -1593,13 +1578,12 @@ async fn build_sse_replication_pair(
     Ok((source_env, target_env, source_bucket, target_bucket))
 }
 
-async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool) -> TestResult {
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair(label, true).await?;
+async fn assert_managed_sse_replicates_and_reencrypts(label: &str, kms: bool) -> TestResult {
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair(label, true, true).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = format!("{label}-contract.txt");
     let body = format!("repl-17 {label} payload").into_bytes();
-    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, &key).await?;
 
     let encryption = if kms {
         ServerSideEncryption::AwsKms
@@ -1621,20 +1605,41 @@ async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool)
 
     let source = source_client.get_object().bucket(&source_bucket).key(&key).send().await?;
     assert_eq!(source.server_side_encryption(), Some(&encryption));
+    let source_etag = source.e_tag().map(str::to_string);
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
-    wait_for_replication_failure_event(failure_events, &key).await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, &key, "FAILED", false).await?;
-    assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        &key,
-        false,
-        Duration::from_secs(5),
-    )
-    .await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, &key, "COMPLETED", false).await?;
+
+    // The target sits on an independent KMS (same key id, different material),
+    // so a successful plain GET proves the replica's envelope belongs to the
+    // target's KMS: a forwarded source envelope could never unwrap here.
+    let replica = target_client.get_object().bucket(&target_bucket).key(&key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&encryption));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    let replica_etag = replica.e_tag().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // The replica must keep the source ETag; otherwise every replication HEAD
+    // comparison sees a mismatch and re-replicates the object forever.
+    assert_eq!(replica_etag, source_etag, "replica ETag must match the source ETag");
+
+    // Spanning several fast-scanner cycles, the replica must stay the same
+    // version: a second version appearing here means the ETag comparison did
+    // not converge and the scanner is re-driving the object.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(&key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key.as_str())).collect();
+    assert_eq!(replica_versions.len(), 1, "replica must not accumulate versions from re-replication");
+    assert_eq!(
+        replica_versions[0].version_id().map(str::to_string),
+        replica_version_id,
+        "replica version must stay stable across scanner cycles"
+    );
 
     Ok(())
 }
@@ -4294,6 +4299,8 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
         .create_multipart_upload()
         .bucket(source_bucket)
         .key(object_key)
+        .content_type("application/x-fanout")
+        .metadata("app", "fanout")
         .send()
         .await?;
     let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
@@ -4341,15 +4348,17 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
         wait_for_replicated_sha256(&target_client_b, target_bucket_b, object_key, expected_sha256),
     )?;
 
-    let target_etag_a = target_client_a
+    let target_head_a = target_client_a
         .head_object()
         .bucket(target_bucket_a)
         .key(object_key)
         .send()
-        .await?
-        .e_tag()
-        .ok_or("first target omitted ETag")?
-        .to_string();
+        .await?;
+    // Multipart replicas carry their metadata through CreateMultipartUpload;
+    // this pins the plaintext side of the multipart header fix.
+    assert_eq!(target_head_a.content_type(), Some("application/x-fanout"));
+    assert_eq!(target_head_a.metadata().and_then(|m| m.get("app").map(String::as_str)), Some("fanout"));
+    let target_etag_a = target_head_a.e_tag().ok_or("first target omitted ETag")?.to_string();
     let target_etag_b = target_client_b
         .head_object()
         .bucket(target_bucket_b)
@@ -4411,22 +4420,23 @@ async fn test_repl17_failure_observation_helpers() -> TestResult {
     Ok(())
 }
 
-/// backlog#1147 repl-17: SSE-C currently fails replication explicitly. Pin the
-/// observed contract: the source remains decryptable with its customer key,
-/// reports FAILED, emits the standard failure event, and leaves no target data.
+/// backlog#1147 repl-17 / backlog#1783: SSE-C objects replicate as ciphertext
+/// passthrough — the source cannot decrypt them (no customer key server-side),
+/// so the stored ciphertext and its encryption metadata travel verbatim and
+/// the replica is decryptable only with the original customer key. The
+/// backlog#1291 property still holds: never a silent plaintext replica.
 #[tokio::test]
 #[serial]
 async fn test_bucket_replication_sse_c_contract() -> TestResult {
     init_logging();
 
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec", false).await?;
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec", false, false).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "ssec-contract.txt";
     let body = b"repl-17 SSE-C payload";
     let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
-    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, key).await?;
 
     source_client
         .put_object()
@@ -4448,73 +4458,228 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
         .sse_customer_key_md5(&customer_key_md5)
         .send()
         .await?;
+    let source_etag = source.e_tag().map(str::to_string);
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body);
 
-    wait_for_replication_failure_event(failure_events, key).await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", true).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    // The replica is readable only with the original customer key.
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    let replica_etag = replica.e_tag().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    assert_eq!(replica_etag, source_etag, "replica ETag must match the source ETag");
+
+    // Without the customer key the replica must not be readable — the direct
+    // detection point for a silent-plaintext replica (backlog#1291).
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(plain_read.is_err(), "SSE-C replica must not be readable without the customer key");
+
+    // A wrong customer key must fail too.
+    let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
+    let wrong_key_md5 = sse_customer_key_md5_base64("99999999999999999999999999999999");
+    let wrong_read = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&wrong_key)
+        .sse_customer_key_md5(&wrong_key_md5)
+        .send()
+        .await;
+    assert!(wrong_read.is_err(), "SSE-C replica must reject a wrong customer key");
+
+    Ok(())
+}
+
+/// backlog#1783: SSE-C multipart objects pass through as ciphertext part by
+/// part — part boundaries and the encrypted-multipart marker survive so the
+/// replica decrypts each part with its part-derived nonce.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec-mp", false, false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "ssec-mp-contract.bin";
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(&source_bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    let source_head = source_client
+        .head_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    // The replica must carry the SSE-C marker and the source's multipart ETag
+    // (its -N suffix also pins that the part structure survived).
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.e_tag(), source_head.e_tag(), "replica must keep the source multipart ETag");
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
+
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(
+        plain_read.is_err(),
+        "SSE-C multipart replica must not be readable without the customer key"
+    );
+
+    // Stability across scanner cycles: convergence must hold for passthrough.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "SSE-C replica must not accumulate versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
+    Ok(())
+}
+
+/// backlog#1147 repl-17 / backlog#1783: SSE-S3 objects replicate by decrypting
+/// at the source and re-encrypting on the target with the target's own KMS.
+/// The property backlog#1291 pinned — never a silent plaintext replica — still
+/// holds, but the expectation flips from FAILED to a converged, decryptable
+/// replica: COMPLETED status, byte-identical plain GET on the target
+/// (independent KMS, so success proves target-owned envelopes), preserved
+/// source ETag, and a version that stays stable across scanner cycles.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_s3_contract() -> TestResult {
+    init_logging();
+    assert_managed_sse_replicates_and_reencrypts("sse-s3", false).await
+}
+
+/// backlog#1783: when the target site has no KMS, managed-SSE replication must
+/// fail closed — replication FAILED, and no plaintext (or any) replica ever
+/// materializes on the target.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_s3_fails_closed_without_target_kms() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-nokms", true, false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-nokms-contract.txt";
+    let body = b"repl-17 sse target-without-kms payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
     assert_failed_replication_stays_absent_for(
         &source_client,
         &source_bucket,
         &target_client,
         &target_bucket,
         key,
-        true,
+        false,
         Duration::from_secs(5),
     )
     .await?;
 
-    target_client
-        .put_object()
-        .bucket(&target_bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"observer negative-path fixture"))
-        .send()
-        .await?;
-    target_client.delete_object().bucket(&target_bucket).key(key).send().await?;
-    let history_error = assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        true,
-        Duration::ZERO,
-    )
-    .await
-    .expect_err("target history must violate the failed replication contract");
-    assert!(history_error.to_string().contains("created target history"));
+    let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
+    assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
     Ok(())
 }
 
-/// backlog#1147 repl-17 / backlog#1291: SSE-S3 must fail closed until managed
-/// encryption is supported on the target. The silent plaintext replication
-/// that originally kept this test ignored was fixed by the fail-closed gate in
-/// `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`
-/// (all replication modes route through it), so this now pins the current
-/// fail-closed contract: FAILED status, failure event, readable source, and a
-/// stable absence of all target versions.
+/// P1-22 stage 0 → backlog#1783: the existing-object resync path re-drives
+/// managed-SSE objects through the same target boundary as live replication.
+/// After the live pass completes, a resync over the bucket must converge —
+/// the ETag comparison sees the preserved source ETag on the replica and does
+/// not rewrite it, so the replica's version stays stable through the resync.
 #[tokio::test]
 #[serial]
-async fn test_bucket_replication_sse_s3_contract() -> TestResult {
-    init_logging();
-    assert_managed_sse_replication_fails_explicitly("sse-s3", false).await
-}
-
-/// P1-22 stage 0: the existing-object resync path must fail closed for
-/// managed-SSE objects exactly like inline replication (which
-/// `test_bucket_replication_sse_s3_contract` pins, including the scanner heal
-/// re-drive). Resync re-drives every object version through the same
-/// fail-closed target boundary, so a resync over an encrypted bucket must
-/// terminate without ever materializing a plaintext (or unreadable) replica;
-/// the post-resync stays-absent window also spans further fast-scanner heal
-/// cycles.
-#[tokio::test]
-#[serial]
-async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult {
+async fn test_bucket_replication_sse_s3_resync_converges() -> TestResult {
     init_logging();
 
-    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true).await?;
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true, true).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "sse-resync-contract.txt";
@@ -4528,29 +4693,33 @@ async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult
         .server_side_encryption(ServerSideEncryption::Aes256)
         .send()
         .await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
 
-    // Resync: drive the existing-object resync path over the failed object.
+    let replica = target_client.get_object().bucket(&target_bucket).key(key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // Resync: drive the existing-object resync path over the replicated object.
     let (target_arn, reset_id) = start_bucket_replication_reset(&source_env, &source_bucket).await?;
     let terminal = wait_for_replication_reset_target(&source_env, &source_bucket, &target_arn, |target| {
         target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
     })
     .await?;
     assert_eq!(terminal.reset_id, reset_id);
+    assert_eq!(terminal.status, "Completed", "resync over a managed-SSE bucket must complete");
 
-    // The resync pass must have failed closed: still no target version (the
-    // window also spans further scanner heal cycles), and the source object
-    // stays readable and encrypted.
-    assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        false,
-        Duration::from_secs(5),
-    )
-    .await?;
+    // The resync pass must not have rewritten the converged replica.
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "resync must not create additional replica versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
     let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
     assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
@@ -4558,14 +4727,106 @@ async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult
     Ok(())
 }
 
-/// backlog#1147 repl-17: SSE-KMS currently fails closed rather than creating an
-/// unreadable replica; the shared helper verifies FAILED, the failure event,
-/// source readability, and a stable absence of all target versions.
+/// backlog#1147 repl-17 / backlog#1783: SSE-KMS replicates like SSE-S3 — the
+/// source key id never crosses sites (only the aws:kms intent), and the target
+/// re-encrypts under its own default key. The independent-KMS pair proves the
+/// replica's envelope is target-owned.
 #[tokio::test]
 #[serial]
-async fn test_bucket_replication_sse_kms_failure_contract() -> TestResult {
+async fn test_bucket_replication_sse_kms_contract() -> TestResult {
     init_logging();
-    assert_managed_sse_replication_fails_explicitly("sse-kms", true).await
+    assert_managed_sse_replicates_and_reencrypts("sse-kms", true).await
+}
+
+/// backlog#1783: managed-SSE multipart objects keep their part structure and
+/// their metadata through replication. CreateMultipartUpload on the target
+/// carries the full header set (SSE intent, content-type, user metadata) and
+/// the completed replica preserves the source's multipart ETag.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_s3_multipart_reencrypts() -> TestResult {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-mp", true, true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-mp-contract.bin";
+
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .content_type("application/x-repl17")
+        .metadata("app", "repl17")
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(&source_bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", false).await?;
+
+    let source_head = source_client.head_object().bucket(&source_bucket).key(key).send().await?;
+    let replica = target_client.get_object().bucket(&target_bucket).key(key).send().await?;
+    assert_eq!(replica.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(replica.e_tag(), source_head.e_tag(), "replica must keep the source multipart ETag");
+    assert_eq!(
+        replica.last_modified(),
+        source_head.last_modified(),
+        "replica must keep the source mtime or the multipart HEAD comparison never converges"
+    );
+    assert_eq!(replica.content_type(), Some("application/x-repl17"));
+    assert_eq!(replica.metadata().and_then(|m| m.get("app").map(String::as_str)), Some("repl17"));
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
+
+    // The multipart replica must also stay stable across scanner cycles: a
+    // rewritten or additional version means ETag/mtime convergence failed and
+    // the scanner keeps re-driving the object.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "multipart replica must not accumulate versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
+    Ok(())
 }
 
 /// backlog#1147 repl-5, scenario (a) — target outage + recovery (rustfs#3421 / #2071).
@@ -5203,6 +5464,7 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     init_logging();
     let resync_process_env = [
         ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "100"),
         // Verbose server logging can block startup when this focused test is run
         // through a captured test process rather than nextest.
         ("RUST_LOG", "error"),
@@ -5219,6 +5481,7 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
         .await?;
 
     let source_bucket = "site-repl-resync-src";
+    const RESYNC_OBJECT_COUNT: usize = 128;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -5263,12 +5526,13 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
-    for idx in 0..96 {
+    for idx in 0..RESYNC_OBJECT_COUNT {
+        let size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
         source_client
             .put_object()
             .bucket(source_bucket)
             .key(format!("resync-object-{idx:02}"))
-            .body(ByteStream::from(vec![b'x'; 512 * 1024]))
+            .body(ByteStream::from(vec![b'x'; size]))
             .send()
             .await?;
     }
@@ -5327,6 +5591,22 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
     );
     let restarted_reset_id = restarted.resync_id.clone();
 
+    let partial_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        let replicated = status.replicated_objects;
+        if status.resync_id == restarted_reset_id
+            && replicated > 0
+            && replicated < u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+        {
+            break;
+        }
+        if status.state == "completed" || tokio::time::Instant::now() >= partial_deadline {
+            return Err(format!("resync did not expose a partial durable checkpoint before restart: {status:?}").into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
     source_env.restart_server_preserving_data(vec![], &resync_process_env).await?;
     wait_for_site_replication_enabled(&source_env, 2).await?;
 
@@ -5359,6 +5639,41 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
         )
     })?;
     assert_eq!(restarted_target.reset_id, restarted_reset_id);
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let completed = loop {
+        let status = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+        match status.state.as_str() {
+            "completed" => break status,
+            "failed" => return Err(format!("recovered resync failed: {status:?}").into()),
+            _ if tokio::time::Instant::now() < completion_deadline => sleep(Duration::from_millis(500)).await,
+            _ => return Err(format!("recovered resync did not complete in time: {status:?}").into()),
+        }
+    };
+    assert_eq!(
+        completed.replicated_objects,
+        u64::try_from(RESYNC_OBJECT_COUNT).expect("test object count should fit u64")
+    );
+
+    let replicated = futures::stream::iter(0..RESYNC_OBJECT_COUNT)
+        .map(|idx| {
+            let target_client = target_client.clone();
+            async move {
+                let key = format!("resync-object-{idx:02}");
+                let body = wait_for_object_on_target(&target_client, source_bucket, &key).await?;
+                let expected_size = if idx == 0 { 8 * 1024 * 1024 } else { 8 * 1024 };
+                if body != vec![b'x'; expected_size] {
+                    return Err(format!("recovered resync object body mismatch for {key}").into());
+                }
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    for result in replicated {
+        result?;
+    }
 
     Ok(())
 }
@@ -6860,6 +7175,119 @@ async fn wait_for_target_request_version_id(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_resync_restart_revisits_objects_before_out_of_order_checkpoint() -> TestResult {
+    init_logging();
+
+    const OBJECT_COUNT: usize = 128;
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "resync-checkpoint-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut process_env = replication_fast_env();
+    process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUST_LOG", "error"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_bucket = "resync-checkpoint-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for idx in 0..OBJECT_COUNT {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(format!("checkpoint-{idx:03}"))
+            .body(ByteStream::from(format!("checkpoint payload {idx}").into_bytes()))
+            .send()
+            .await?;
+    }
+    wait_for_source_replication_status(&source_client, source_bucket, "checkpoint-127", "COMPLETED", false).await?;
+    let initial_replication_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let replicated = target
+            .requests()
+            .into_iter()
+            .filter(|request| request.operation == FakeTargetOperation::PutObject)
+            .count();
+        if replicated >= OBJECT_COUNT {
+            break;
+        }
+        if tokio::time::Instant::now() >= initial_replication_deadline {
+            return Err(format!("initial replication only sent {replicated}/{OBJECT_COUNT} objects").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    target.clear_bucket_objects(target_bucket);
+    target.take_requests();
+    target.inject_for_key(
+        FakeTargetOperation::PutObject,
+        "checkpoint-000",
+        FakeTargetFault::Delay(Duration::from_secs(30)),
+        100,
+    );
+
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let partial = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id
+            && status.replicated_count > 0
+            && status.replicated_count < i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+            && status.object.as_str() > "checkpoint-000"
+    })
+    .await
+    .map_err(|err| format!("{err}; target journal: {:?}", target.requests()))?;
+    assert!(target.requests().iter().any(|request| {
+        request.operation == FakeTargetOperation::PutObject
+            && request.key.as_deref() == Some("checkpoint-000")
+            && request.fault == Some(FakeTargetFault::Delay(Duration::from_secs(30)))
+    }));
+    assert!(!target.has_object(target_bucket, "checkpoint-000"));
+    source_env.stop_server();
+    target.clear_faults();
+
+    source_env.start_rustfs_server_without_cleanup_with_env(&process_env).await?;
+    let completed = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id && status.status == "Completed"
+    })
+    .await?;
+    assert_eq!(
+        completed.replicated_count,
+        i64::try_from(OBJECT_COUNT).expect("test object count should fit i64")
+    );
+    assert!(
+        target.has_object(target_bucket, "checkpoint-000"),
+        "restart skipped failed object checkpoint-000 before persisted checkpoint {}",
+        partial.object
+    );
+
+    target.shutdown().await;
+    Ok(())
 }
 
 /// P0-5: MinIO derives the replicated version exclusively from the `versionId`

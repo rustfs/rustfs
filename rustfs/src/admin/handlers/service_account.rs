@@ -631,7 +631,9 @@ impl Operation for UpdateServiceAccount {
             .await
             .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
-        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
+        // The admin action permits updates within a caller's scope; only an
+        // owner may cross service-account parent boundaries.
+        if !owner && !is_service_account_owner_of(&cred, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 

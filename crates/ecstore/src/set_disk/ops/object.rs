@@ -1233,6 +1233,16 @@ impl SetDisks {
                 }
             }
 
+            // SSE-C replication carries the source object's sealed checksum
+            // out of band; store it verbatim like the multipart path does.
+            if let Some(cssum) =
+                rustfs_utils::http::get_header_map(&user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC)
+                && !cssum.is_empty()
+            {
+                fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(bytes::Bytes::from);
+                rustfs_utils::http::remove_header_map(&mut user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC);
+            }
+
             if fi.checksum.is_none()
                 && let Some(content_hash) = data.as_hash_reader().content_hash()
             {
