@@ -1690,13 +1690,15 @@ impl RenameCommitGuard {
         self.destination_directory_guard(directory, true)
     }
 
-    /// Reopen a destination directory without write sharing before a
-    /// pathname-based operation. The returned owned tree rejects an active
-    /// writer or reparse mutation for the full requested subtree.
+    /// Reopen a destination tree for handle-relative child publication.
+    /// Ancestors remain write-exclusive while the final parent shares writes
+    /// required by the kernel's relative rename. Delete sharing stays omitted
+    /// throughout, so every retained directory identity remains pinned.
     fn destination_directory_guard(&self, directory: &Path, create_missing: bool) -> io::Result<RenameDestinationPathGuard> {
         #[cfg(windows)]
         {
             use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
             let relative = directory.strip_prefix(&self.destination_parent).map_err(|_| {
                 io::Error::new(
@@ -1729,16 +1731,35 @@ impl RenameCommitGuard {
             let parent = handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
-            handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
-            for component in relative.components() {
-                let Component::Normal(component) = component else {
-                    continue;
-                };
+            let mut relative_components = relative
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(component) => Some(component),
+                    _ => None,
+                })
+                .peekable();
+            let destination_parent_share = if relative_components.peek().is_none() {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ
+            };
+            handles.push(open_windows_relative_directory_component(
+                parent,
+                component,
+                FILE_OPEN,
+                destination_parent_share,
+            )?);
+            while let Some(component) = relative_components.next() {
                 let parent = handles
                     .last()
                     .ok_or_else(|| io::Error::other("Windows destination path guard lost its parent handle"))?;
                 let disposition = if create_missing { FILE_OPEN_IF } else { FILE_OPEN };
-                handles.push(open_windows_directory_component(parent, component, disposition)?);
+                let share_access = if relative_components.peek().is_none() {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                } else {
+                    FILE_SHARE_READ
+                };
+                handles.push(open_windows_relative_directory_component(parent, component, disposition, share_access)?);
             }
             Ok(RenameDestinationPathGuard {
                 directory: directory.to_path_buf(),
@@ -1772,7 +1793,10 @@ pub(crate) fn prepare_rename_commit_guard(
                 mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
             (destination_parent_guard.clone(), destination_parent_guard)
         } else {
-            let source_parent_guard = lock_windows_directory_tree(source_parent, None, publication_root)?;
+            // The source parent also hosts private rollback staging files.
+            // Their handle-relative publication needs write sharing on this
+            // final directory while delete sharing remains excluded.
+            let source_parent_guard = lock_windows_directory_tree(source_parent, Some(source_parent), publication_root)?;
             let destination_parent_guard =
                 mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
             (source_parent_guard, destination_parent_guard)
