@@ -16,14 +16,14 @@ use crate::admin::runtime_sources::{AppContext, current_app_context, current_obj
 use crate::admin::site_replication_identity::{
     deployment_id_for_endpoint, mark_unknown_peer_sync_enabled, normalize_peer_map_by_identity_with,
 };
-use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::site_replication_state::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock_on};
 use crate::admin::storage_api::error::Error as StorageError;
+use crate::storage::storage_api::{read_config_no_lock, save_config_no_lock};
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};
 use tracing::info;
 
-const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 const SYNC_STATE_INITIALIZED_FIELD: &str = "sync_state_initialized";
 
 fn normalize_peers_map(peers: &Map<String, Value>, initialize_sync_state: bool) -> Map<String, Value> {
@@ -113,25 +113,36 @@ pub async fn reload_site_replication_runtime_state_for_context(context: Option<&
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    match read_admin_config(store.clone(), SITE_REPLICATION_STATE_PATH).await {
-        Ok(data) => {
-            if let Some(normalized) =
-                normalize_site_replication_state_json(&data).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e))?
-            {
-                save_admin_config(store, SITE_REPLICATION_STATE_PATH, normalized)
-                    .await
-                    .map_err(|e| {
-                        S3Error::with_message(S3ErrorCode::InternalError, format!("normalize site replication state failed: {e}"))
-                    })?;
+    // The whole read -> normalize -> save is one RMW: run it inside the
+    // shared state transaction boundary (P1-15) so a cluster-wide reload
+    // fan-out cannot overwrite a concurrent state writer. IO must be the
+    // no-lock variants — the boundary already holds the object lock.
+    let lock_store = store.clone();
+    with_site_replication_state_lock_on(lock_store, move || async move {
+        match read_config_no_lock(store.clone(), SITE_REPLICATION_STATE_PATH).await {
+            Ok(data) => {
+                if let Some(normalized) = normalize_site_replication_state_json(&data)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e))?
+                {
+                    save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, normalized)
+                        .await
+                        .map_err(|e| {
+                            S3Error::with_message(
+                                S3ErrorCode::InternalError,
+                                format!("normalize site replication state failed: {e}"),
+                            )
+                        })?;
+                }
+                Ok(())
             }
-            Ok(())
+            Err(StorageError::ConfigNotFound) => Ok(()),
+            Err(err) => Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("failed to load site replication state: {err}"),
+            )),
         }
-        Err(StorageError::ConfigNotFound) => Ok(()),
-        Err(err) => Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to load site replication state: {err}"),
-        )),
-    }
+    })
+    .await
 }
 
 pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
