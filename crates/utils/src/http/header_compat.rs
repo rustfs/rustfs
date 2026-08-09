@@ -27,9 +27,9 @@ const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 const MINIO_INTERNAL_ENCRYPTION_PREFIX: &str = "x-minio-internal-server-side-encryption-";
 const MINIO_INTERNAL_ENCRYPTED_MULTIPART: &str = "x-minio-internal-encrypted-multipart";
-const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = "x-rustfs-encryption-original-size";
+const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = super::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER;
 const MINIO_ENCRYPTION_ORIGINAL_SIZE: &str = "x-minio-encryption-original-size";
-const SSEC_ORIGINAL_SIZE: &str = "x-amz-server-side-encryption-customer-original-size";
+const SSEC_ORIGINAL_SIZE: &str = super::object_encryption_keys::SSEC_ORIGINAL_SIZE_HEADER;
 
 // Suffix constants (part after x-rustfs- or x-minio-). Use with get_header/insert_header.
 pub const SUFFIX_FORCE_DELETE: &str = "force-delete";
@@ -48,6 +48,13 @@ pub const SUFFIX_REPLICATION_SSEC_CRC: &str = "replication-ssec-crc";
 /// Returns true if the key is object-encryption metadata understood by RustFS or MinIO.
 /// Case-insensitive for metadata filtering.
 pub fn is_encryption_metadata_key(key: &str) -> bool {
+    if key.is_ascii() {
+        return super::starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
+            || super::starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
+            || super::starts_with_ignore_ascii_case(key, MINIO_INTERNAL_ENCRYPTION_PREFIX)
+            || key.eq_ignore_ascii_case(MINIO_INTERNAL_ENCRYPTED_MULTIPART);
+    }
+
     let lower = key.to_lowercase();
     lower.starts_with(RUSTFS_ENCRYPTION_PREFIX)
         || lower.starts_with(MINIO_ENCRYPTION_PREFIX)
@@ -151,7 +158,9 @@ mod tests {
         assert!(is_encryption_metadata_key("x-minio-encryption-iv"));
         assert!(is_encryption_metadata_key("X-Minio-Internal-Server-Side-Encryption-Sealed-Key"));
         assert!(is_encryption_metadata_key("X-Minio-Internal-Encrypted-Multipart"));
+        assert!(is_encryption_metadata_key("X-RUSTFS-ENCRYPTION-\u{212A}EY"));
         assert!(!is_encryption_metadata_key("x-amz-meta-custom"));
+        assert!(!is_encryption_metadata_key("x-minio-internal-encrypted-multipart-extra"));
         assert!(!is_encryption_metadata_key("x-rustfs-internal-healing"));
     }
 

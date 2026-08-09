@@ -176,6 +176,52 @@ impl ECStore {
         })
     }
 
+    /// Acquire the bucket lifecycle read lock and validate the bucket
+    /// incarnation against `expected`, memoizing the validation while this
+    /// node keeps continuous read-lock coverage (see [`super::bucket_fence`]).
+    ///
+    /// Semantics are identical to the pre-existing per-PUT
+    /// `acquire_bucket_lifecycle_read_lock` + from-disk
+    /// `validate_bucket_incarnation` pair: the first PUT in a coverage window
+    /// performs exactly that authoritative disk validation; overlapping PUTs
+    /// reuse its result, which is sound because bucket deletion/recreation
+    /// requires the lifecycle WRITE lock and therefore cannot have run while
+    /// any read guard was continuously held.
+    pub(crate) async fn acquire_bucket_incarnation_fence(
+        &self,
+        bucket: &str,
+        expected: uuid::Uuid,
+    ) -> Result<super::bucket_fence::BucketIncarnationFenceGuard> {
+        let inner = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let pieces = super::bucket_fence::FencePieces {
+            registry: self.bucket_fence_registry.clone(),
+            inner,
+        };
+        let registration = pieces.enter(bucket);
+        let current = match registration.memoized {
+            Some(current) => current,
+            None => match metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await {
+                Ok(current) => {
+                    // Never memoize under lost coverage: a granted lifecycle
+                    // write lock could already have changed the incarnation.
+                    if !pieces.lock_lost() {
+                        pieces.memoize(bucket, current);
+                    }
+                    current
+                }
+                Err(err) => {
+                    pieces.abandon(bucket, registration.token);
+                    return Err(err);
+                }
+            },
+        };
+        if current != expected {
+            pieces.abandon(bucket, registration.token);
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        Ok(pieces.into_guard(bucket, registration.token))
+    }
+
     pub(crate) async fn acquire_bucket_lifecycle_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
         let lock = self.new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT).await?;
         lock.get_write_lock(get_lock_acquire_timeout())

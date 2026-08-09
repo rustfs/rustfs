@@ -1033,7 +1033,8 @@ impl HealTask {
                     bucket,
                     object,
                     object_size = object_size,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal object repaired"
                 );
@@ -1329,7 +1330,8 @@ impl HealTask {
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
                     bucket,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                     recursive = self.options.recursive,
                     result = "ok",
                     "Heal bucket completed"
@@ -1773,7 +1775,8 @@ impl HealTask {
                     task_id = %self.id,
                     bucket,
                     object,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal metadata repaired"
                 );
@@ -1904,7 +1907,8 @@ impl HealTask {
                     meta_path,
                     bucket,
                     object = %object,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal MRF repaired"
                 );
@@ -2068,7 +2072,8 @@ impl HealTask {
                     bucket,
                     object,
                     object_size,
-                    drives_healed = result.after.drives.len(),
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal EC decode repaired"
                 );
@@ -2198,7 +2203,8 @@ impl HealTask {
                         subsystem = LOG_SUBSYSTEM_TASK,
                         task_id = %self.id,
                         set_disk_id,
-                        drives_healed = result.after.drives.len(),
+                        drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
                         result = "format_ok",
                         "Heal erasure set format repaired"
                     );
@@ -2517,6 +2523,7 @@ mod tests {
         OkWithOtherError(&'static str),
         ErrOther(&'static str),
         RetryableReadQuorum,
+        RetryableSlowDown,
         PermanentOther(&'static str),
     }
 
@@ -2650,6 +2657,9 @@ mod tests {
                         bucket.to_string(),
                         object.to_string(),
                     ))),
+                    MockHealObjectOutcome::RetryableSlowDown => {
+                        Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
+                    }
                     MockHealObjectOutcome::PermanentOther(message) => Err(Error::other(message)),
                     MockHealObjectOutcome::OkWithOtherError(message) => {
                         Ok((HealResultItem::default(), Some(Error::other(message))))
@@ -2669,6 +2679,9 @@ mod tests {
                         bucket.to_string(),
                         object.to_string(),
                     ))),
+                    MockHealObjectOutcome::RetryableSlowDown => {
+                        Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
+                    }
                 };
             }
             if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
@@ -2759,6 +2772,42 @@ mod tests {
                 .clone()
                 .ok_or_else(|| Error::other("not implemented in tests"))
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_object_heal_slowdown_is_not_treated_as_deleted() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(true)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetryableSlowDown)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                HealOptions {
+                    pool_index: Some(0),
+                    set_index: Some(1),
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+
+        let err = task.execute().await.expect_err("SlowDown must fail the current heal attempt");
+
+        assert!(matches!(err, Error::Storage(EcstoreError::SlowDown)));
+        assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
+        let opts = storage
+            .object_heal_opts
+            .lock()
+            .expect("heal options lock should be available");
+        assert_eq!(opts[0].pool, Some(0));
+        assert_eq!(opts[0].set, Some(1));
     }
 
     async fn make_resume_disk(temp: &TempDir) -> DiskStore {

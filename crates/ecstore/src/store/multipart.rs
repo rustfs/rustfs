@@ -221,7 +221,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
             return match pool
@@ -284,7 +284,7 @@ impl ECStore {
         let mut source_truncated = false;
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
             let res = list_pool_multipart_uploads_for_incarnation(
@@ -433,7 +433,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
             let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
@@ -472,7 +472,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
 
@@ -510,7 +510,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
 
@@ -551,7 +551,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
 
@@ -761,6 +761,7 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
             ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
         }
     }
 

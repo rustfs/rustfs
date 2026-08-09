@@ -972,8 +972,9 @@ impl SetDisks {
 
         let mut object_lock_guard = None;
         let mut bucket_lifecycle_guard = None;
+        let deferred_data_movement_precondition = opts.data_movement && opts.http_preconditions.is_some();
 
-        if opts.http_preconditions.is_some() {
+        if opts.http_preconditions.is_some() && !deferred_data_movement_precondition {
             if !opts.no_lock {
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
@@ -981,10 +982,9 @@ impl SetDisks {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
                             .await?
-                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
-                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
                 }
                 object_lock_guard = Some(
                     self.acquire_write_lock_diag("put_object_precondition", bucket, object)
@@ -1312,7 +1312,7 @@ impl SetDisks {
             }
 
             if !opts.no_lock && object_lock_guard.is_none() {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
@@ -1320,15 +1320,30 @@ impl SetDisks {
                     bucket_lifecycle_guard = Some(
                         metadata_sys::object_store_in(&self.ctx)
                             .await?
-                            .acquire_bucket_lifecycle_read_lock(bucket)
+                            .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
-                    self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
                 }
-                object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                #[cfg(any(test, feature = "test-util"))]
+                {
+                    object_lock_guard = Some(
+                        self.acquire_write_lock_diag_with_pending_hook("put_object_commit", bucket, object, || {
+                            notify_put_object_commit_namespace_pending(bucket, object);
+                        })
+                        .await?,
+                    );
+                }
+                #[cfg(not(any(test, feature = "test-util")))]
+                {
+                    object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
+
+            if deferred_data_movement_precondition && let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
 
             // Generate ordinary PUT timestamps under the commit lock so version
             // ordering follows durable commit ordering when writers queued on
@@ -2572,41 +2587,43 @@ fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: boo
     requested && fleet_confirmed && fleet_proof_valid
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PutObjectCommitPause {
+pub enum PutObjectCommitPause {
     BeforeNamespace,
     AfterNamespace,
     BeforeMetadata,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct PutObjectCommitBarrierState {
     bucket: String,
     object: String,
     pause: PutObjectCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
 }
 
-#[cfg(test)]
-pub(crate) struct PutObjectCommitBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct PutObjectCommitBarrier {
     state: Arc<PutObjectCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static PUT_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<PutObjectCommitBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl PutObjectCommitBarrier {
-    pub(crate) fn install(bucket: &str, object: &str, pause: PutObjectCommitPause) -> Self {
+    pub fn install(bucket: &str, object: &str, pause: PutObjectCommitPause) -> Self {
         let state = Arc::new(PutObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
             pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
         });
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -2623,18 +2640,27 @@ impl PutObjectCommitBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("put object should reach the deterministic commit barrier");
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
+    }
+
+    pub async fn release_and_wait_until_namespace_pending(&self) {
+        assert_eq!(self.state.pause, PutObjectCommitPause::BeforeNamespace);
+        let namespace_pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), namespace_pending)
+            .await
+            .expect("put object should wait for the namespace lock after leaving the commit barrier");
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for PutObjectCommitBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -2646,7 +2672,7 @@ impl Drop for PutObjectCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
     let barrier = PUT_OBJECT_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -2658,6 +2684,22 @@ async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCom
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_put_object_commit_namespace_pending(bucket: &str, object: &str) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == PutObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.namespace_pending.notify_one();
     }
 }
 
@@ -4411,7 +4453,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         // Guard lock for metadata update
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeMetadata).await;
         let _lock_guard = if !opts.no_lock {
             Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
@@ -5780,7 +5822,7 @@ mod transition_commit_failure_tests {
     use http::HeaderMap;
     use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
     use s3s::dto::RestoreRequest;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
@@ -7578,6 +7620,58 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_aborts_after_outer_lock_loss() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "data-movement-cleanup-lock-lost";
+        let object = "object.bin";
+        let payload = b"lost data movement cleanup lock must preserve the source".repeat(1024);
+        write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let expected = set_disks
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source versions should be readable")
+            .expect("source versions should exist");
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+
+        let cleanup_set = Arc::clone(&set_disks);
+        let cleanup = tokio::spawn(async move {
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                cleanup_set,
+                bucket,
+                object,
+                &expected,
+                &[],
+                "test_data_movement",
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) > 0,
+            "test must drive the real distributed-lock heartbeat before cleanup commit"
+        );
+        barrier.release();
+
+        let error = cleanup
+            .await
+            .expect("cleanup task should not panic")
+            .expect_err("cleanup must fail after its outer namespace lock loses refresh quorum");
+        assert!(matches!(
+            error,
+            crate::data_movement::SourceCleanupError::Storage(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
@@ -8670,6 +8764,87 @@ mod put_object_tmp_cleanup_tests {
                 .is_err(),
             "object must remain absent after bucket lifecycle lock loss"
         );
+    }
+
+    #[tokio::test]
+    async fn data_movement_precondition_is_rechecked_at_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "data-movement-commit-precondition";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let migration_body = vec![b'm'; 64 * 1024];
+        let split = migration_body.len() / 2;
+        let (mut source, stream) = tokio::io::duplex(64);
+        let hash_reader = HashReader::from_stream(
+            stream,
+            i64::try_from(migration_body.len()).expect("migration body length should fit i64"),
+            i64::try_from(migration_body.len()).expect("migration body length should fit i64"),
+            None,
+            None,
+            false,
+        )
+        .expect("migration hash reader should be created");
+        let migration_store = Arc::clone(&set_disks);
+        let migration = tokio::spawn(async move {
+            let mut reader = PutObjReader::new(hash_reader);
+            migration_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        data_movement: true,
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        source
+            .write_all(&migration_body[..split])
+            .await
+            .expect("migration should consume the first half before commit");
+        let mut client_reader = PutObjReader::from_vec(b"new client body".to_vec());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            set_disks.put_object(bucket, object, &mut client_reader, &ObjectOptions::default()),
+        )
+        .await
+        .expect("client write must not wait for the migration body")
+        .expect("client write should commit while migration waits for the remaining source body");
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        source
+            .write_all(&migration_body[split..])
+            .await
+            .expect("migration should consume the remaining source body");
+        drop(source);
+        barrier.wait_until_paused().await;
+        barrier.release();
+
+        let err = migration
+            .await
+            .expect("migration task should join")
+            .expect_err("migration must recheck the target after acquiring its commit lock");
+        assert_eq!(err, StorageError::PreconditionFailed);
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("client object should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("client object should drain");
+        assert_eq!(body, b"new client body");
     }
 
     #[tokio::test]

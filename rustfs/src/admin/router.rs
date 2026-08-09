@@ -123,17 +123,20 @@ enum MiscExtRoute {
     ListenNotification { bucket: Option<String> },
 }
 
+// Wire shape mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags so
+// `mc replicate resync` can decode the response (Go json decoding is
+// case-insensitive per field, but the `target` shell key must match exactly).
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetResponse {
-    #[serde(rename = "Targets")]
+    #[serde(rename = "target")]
     targets: Vec<ReplicationResetTarget>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetTarget {
-    #[serde(rename = "Arn")]
+    #[serde(rename = "arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid")]
     reset_id: String,
 }
 
@@ -149,17 +152,21 @@ struct ReplicationResetStatusRequest {
     arn: Option<String>,
 }
 
+// Wire shape mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags
+// (see `ReplicationResetResponse`). `ResetBeforeDate` and `Error` are RustFS
+// extension keys with no madmin counterpart; Go decoders ignore unknown keys,
+// so they coexist with madmin/mc clients at zero cost.
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetStatusResponse {
-    #[serde(rename = "Targets")]
+    #[serde(rename = "target")]
     targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetStatusTarget {
-    #[serde(rename = "Arn")]
+    #[serde(rename = "arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid")]
     reset_id: String,
     #[serde(
         rename = "ResetBeforeDate",
@@ -168,30 +175,30 @@ struct ReplicationResetStatusTarget {
     )]
     reset_before_date: Option<OffsetDateTime>,
     #[serde(
-        rename = "StartTime",
+        rename = "startTime",
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
     start_time: Option<OffsetDateTime>,
     #[serde(
-        rename = "EndTime",
+        rename = "endTime",
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
     end_time: Option<OffsetDateTime>,
-    #[serde(rename = "Status")]
+    #[serde(rename = "resyncStatus")]
     status: String,
-    #[serde(rename = "ReplicatedCount")]
+    #[serde(rename = "replicationCount")]
     replicated_count: i64,
-    #[serde(rename = "ReplicatedSize")]
+    #[serde(rename = "completedReplicationSize")]
     replicated_size: i64,
-    #[serde(rename = "FailedCount")]
+    #[serde(rename = "failedReplicationCount")]
     failed_count: i64,
-    #[serde(rename = "FailedSize")]
+    #[serde(rename = "failedReplicationSize")]
     failed_size: i64,
-    #[serde(rename = "Bucket", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "bucket", skip_serializing_if = "String::is_empty")]
     bucket: String,
-    #[serde(rename = "Object", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "object", skip_serializing_if = "String::is_empty")]
     object: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -2680,6 +2687,12 @@ fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
+fn is_admin_v4_fallback_path(path: &str) -> bool {
+    path.strip_prefix(ADMIN_PREFIX)
+        .or_else(|| path.strip_prefix(MINIO_ADMIN_PREFIX))
+        .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
+}
+
 impl<T: Operation> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
         let router = Router::new();
@@ -2879,6 +2892,12 @@ where
             return Ok(response);
         }
 
+        if is_admin_v4_fallback_path(req.uri.path()) {
+            let mut resp = S3Response::new(Body::empty());
+            resp.status = Some(StatusCode::UPGRADE_REQUIRED);
+            return Ok(resp);
+        }
+
         Err(s3_error!(NotImplemented))
     }
 }
@@ -2971,6 +2990,29 @@ mod tests {
         }
     }
 
+    struct StatusOperation(StatusCode);
+
+    #[async_trait::async_trait]
+    impl Operation for StatusOperation {
+        async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+            Ok(S3Response::new((self.0, Body::empty())))
+        }
+    }
+
+    fn router_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: uri.parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
         assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
@@ -2981,6 +3023,65 @@ mod tests {
             "/minio/administrator/object"
         );
         assert_eq!(canonicalize_admin_path("/minio/adminx/object").as_ref(), "/minio/adminx/object");
+    }
+
+    #[test]
+    fn admin_v4_fallback_path_matches_only_admin_v4_prefixes() {
+        assert!(is_admin_v4_fallback_path("/rustfs/admin/v4/info-canned-policy"));
+        assert!(is_admin_v4_fallback_path("/minio/admin/v4/add-canned-policy"));
+        assert!(is_admin_v4_fallback_path("/rustfs/admin/v4"));
+        assert!(!is_admin_v4_fallback_path("/rustfs/admin/v3/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/minio/admin/v3/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/rustfs/admin/v40/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/minio/adminx/v4/info-canned-policy"));
+    }
+
+    #[tokio::test]
+    async fn unmatched_admin_v4_request_returns_upgrade_required_for_sdk_downgrade() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+
+        for (method, uri) in [
+            (Method::GET, "/minio/admin/v4/info-canned-policy?name=readwrite"),
+            (Method::PUT, "/rustfs/admin/v4/add-canned-policy?name=repro"),
+        ] {
+            let resp = router
+                .call(router_request(method, uri))
+                .await
+                .expect("unmatched v4 admin request should return downgrade signal");
+
+            assert_eq!(resp.status, Some(StatusCode::UPGRADE_REQUIRED), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_non_v4_admin_request_keeps_not_implemented_error() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+
+        let err = router
+            .call(router_request(Method::GET, "/rustfs/admin/v3/missing-route"))
+            .await
+            .expect_err("unknown v3 admin route must keep the existing error");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn registered_admin_v4_route_is_not_shadowed_by_fallback() {
+        let mut router: S3Router<StatusOperation> = S3Router::new(false);
+        router
+            .insert(
+                Method::GET,
+                "/rustfs/admin/v4/runtime/capabilities",
+                StatusOperation(StatusCode::IM_A_TEAPOT),
+            )
+            .expect("route should insert");
+
+        let resp = router
+            .call(router_request(Method::GET, "/rustfs/admin/v4/runtime/capabilities"))
+            .await
+            .expect("registered v4 route must dispatch normally");
+
+        assert_eq!(resp.status, Some(StatusCode::IM_A_TEAPOT));
     }
 
     #[test]
@@ -3206,6 +3307,22 @@ mod tests {
     }
 
     #[test]
+    fn replication_reset_response_matches_madmin_resync_targets_info_shape() {
+        let payload = serde_json::to_value(ReplicationResetResponse {
+            targets: vec![ReplicationResetTarget {
+                arn: "arn:minio:replication::depl:bucket".to_string(),
+                reset_id: "rid-1".to_string(),
+            }],
+        })
+        .expect("reset response must serialize");
+
+        // madmin-go `ResyncTargetsInfo` json tags: shell `target`, fields `arn`/`resetid`.
+        assert_eq!(payload["target"][0]["arn"], "arn:minio:replication::depl:bucket");
+        assert_eq!(payload["target"][0]["resetid"], "rid-1");
+        assert!(payload.get("Targets").is_none());
+    }
+
+    #[test]
     fn build_replication_reset_status_response_serializes_sorted_targets() {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
@@ -3225,6 +3342,7 @@ mod tests {
             "arn:a".to_string(),
             crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
+                start_time: Some(datetime!(2025-01-01 00:00 UTC)),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
                 resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
@@ -3240,15 +3358,21 @@ mod tests {
             .to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
 
-        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
-        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-a");
-        assert_eq!(payload["Targets"][0]["Status"], "Completed");
-        assert_eq!(payload["Targets"][0]["EndTime"], "2025-01-02T00:00:00Z");
-        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
-        assert_eq!(payload["Targets"][1]["Bucket"], "bucket-z");
-        assert_eq!(payload["Targets"][1]["Status"], "Failed");
-        assert_eq!(payload["Targets"][1]["EndTime"], "2025-01-03T00:00:00Z");
-        assert_eq!(payload["Targets"][1]["Error"], "boom");
+        assert_eq!(payload["target"][0]["arn"], "arn:a");
+        assert_eq!(payload["target"][0]["resetid"], "rid-a");
+        assert_eq!(payload["target"][0]["bucket"], "bucket-a");
+        assert_eq!(payload["target"][0]["resyncStatus"], "Completed");
+        assert_eq!(payload["target"][0]["startTime"], "2025-01-01T00:00:00Z");
+        assert_eq!(payload["target"][0]["endTime"], "2025-01-02T00:00:00Z");
+        assert_eq!(payload["target"][0]["replicationCount"], 3);
+        assert_eq!(payload["target"][0]["completedReplicationSize"], 9);
+        assert_eq!(payload["target"][1]["arn"], "arn:z");
+        assert_eq!(payload["target"][1]["bucket"], "bucket-z");
+        assert_eq!(payload["target"][1]["resyncStatus"], "Failed");
+        assert_eq!(payload["target"][1]["endTime"], "2025-01-03T00:00:00Z");
+        assert_eq!(payload["target"][1]["failedReplicationCount"], 2);
+        assert_eq!(payload["target"][1]["failedReplicationSize"], 4);
+        assert_eq!(payload["target"][1]["Error"], "boom");
     }
 
     #[test]
@@ -3286,12 +3410,12 @@ mod tests {
             .to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
 
-        assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
-        assert_eq!(payload["Targets"][0]["Arn"], "arn:z");
-        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-z");
-        assert_eq!(payload["Targets"][0]["Status"], "Failed");
-        assert_eq!(payload["Targets"][0]["EndTime"], "2025-02-03T00:00:00Z");
-        assert_eq!(payload["Targets"][0]["Error"], "boom");
+        assert_eq!(payload["target"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["target"][0]["arn"], "arn:z");
+        assert_eq!(payload["target"][0]["bucket"], "bucket-z");
+        assert_eq!(payload["target"][0]["resyncStatus"], "Failed");
+        assert_eq!(payload["target"][0]["endTime"], "2025-02-03T00:00:00Z");
+        assert_eq!(payload["target"][0]["Error"], "boom");
     }
 
     fn replication_check_target(arn: &str, status: &str, error: Option<&str>) -> ReplicationCheckTargetStatus {

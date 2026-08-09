@@ -817,7 +817,13 @@ impl VaultTransitKmsClient {
         })
     }
 
-    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    /// Open a data-key envelope, returning the plaintext and the master key
+    /// that wrapped it.
+    pub(crate) async fn decrypt(
+        &self,
+        request: &DecryptRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<(Vec<u8>, String)> {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
 
@@ -839,7 +845,7 @@ impl VaultTransitKmsClient {
             .transit_decrypt(&envelope.master_key_id, encrypted_key, &envelope.encryption_context)
             .await
         {
-            Ok(plaintext) => Ok(plaintext),
+            Ok(plaintext) => Ok((plaintext, envelope.master_key_id)),
             Err(error) => {
                 self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
                 Err(error)
@@ -1384,11 +1390,10 @@ impl KmsBackend for VaultTransitKmsBackend {
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
-        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
-        let plaintext = self.client.decrypt(&request, None).await?;
+        let (plaintext, key_id) = self.client.decrypt(&request, None).await?;
         Ok(DecryptResponse {
             plaintext,
-            key_id: envelope.master_key_id,
+            key_id,
             encryption_algorithm: Some("vault-transit".to_string()),
         })
     }
@@ -1413,13 +1418,19 @@ impl KmsBackend for VaultTransitKmsBackend {
             grant_tokens: Vec::new(),
         };
 
-        let data_key = self.client.generate_data_key(&generate_request, None).await?;
-        let plaintext_key = data_key.plaintext.clone().unwrap_or_default();
-        let ciphertext_blob = data_key.ciphertext.clone();
+        let mut data_key = self.client.generate_data_key(&generate_request, None).await?;
+
+        // Fields are taken, not destructured or cloned: `DataKeyInfo` has a
+        // `Drop` impl, and a clone would leave a second un-zeroized plaintext
+        // DEK on the heap.
+        let plaintext_key = data_key
+            .plaintext
+            .take()
+            .ok_or_else(|| KmsError::internal_error("Generated data key is missing plaintext"))?;
         Ok(GenerateDataKeyResponse {
             key_id: request.key_id,
             plaintext_key,
-            ciphertext_blob,
+            ciphertext_blob: std::mem::take(&mut data_key.ciphertext),
         })
     }
 
@@ -2089,7 +2100,7 @@ mod tests {
         // Historical ciphertext keeps decrypting per Vault's version semantics,
         // interleaved with post-rotation ciphertext.
         for (data_key, label) in [(&dk_v1, "v1"), (&dk_v2, "v2"), (&dk_v1, "v1 again")] {
-            let plaintext = client
+            let (plaintext, _opened_by) = client
                 .decrypt(
                     &DecryptRequest {
                         ciphertext: data_key.ciphertext.clone(),
@@ -2659,7 +2670,7 @@ mod tests {
         let rotated = client.rotate_key("wired-key", None).await.expect("rotation must commit");
         assert_eq!(rotated.version, 2, "the rotation must record the version bump");
 
-        let plaintext = client
+        let (plaintext, opened_by) = client
             .decrypt(
                 &DecryptRequest {
                     ciphertext: data_key.ciphertext.clone(),
@@ -2675,6 +2686,7 @@ mod tests {
             RECOVERED_DEK.to_vec(),
             "the decrypt must hand back the recovered material, not merely avoid an error"
         );
+        assert_eq!(opened_by, "wired-key", "decrypt must report the master key that opened the envelope");
 
         let requests = vault.requests();
         assert_eq!(requests.len(), 7, "{requests:?}");

@@ -14,7 +14,10 @@
 
 use crate::storage_api::capacity::service::{all_local_disk, disk_drive_path, disk_endpoint};
 use rustfs_io_metrics::capacity_metrics::{record_capacity_cache_hit, record_capacity_cache_miss};
-use rustfs_object_capacity::{CapacityDiskRef, capacity_manager};
+use rustfs_object_capacity::{
+    CapacityDiskRef,
+    capacity_manager::{self, CapacityBackgroundTasks},
+};
 use tracing::{info, warn};
 
 const LOG_COMPONENT_CAPACITY: &str = "capacity";
@@ -34,6 +37,12 @@ pub async fn record_capacity_write(scope_token: Option<uuid::Uuid>) {
 }
 
 pub async fn init_capacity_management_for_local_disks() {
+    if let Some(tasks) = init_capacity_management_for_local_disks_managed().await {
+        tasks.detach();
+    }
+}
+
+pub async fn init_capacity_management_for_local_disks_managed() -> Option<CapacityBackgroundTasks> {
     info!(
         component = LOG_COMPONENT_CAPACITY,
         subsystem = LOG_SUBSYSTEM_CAPACITY,
@@ -52,7 +61,7 @@ pub async fn init_capacity_management_for_local_disks() {
             reason = "no_local_disks",
             "Capacity manager state changed"
         );
-        return;
+        return None;
     }
 
     info!(
@@ -75,7 +84,7 @@ pub async fn init_capacity_management_for_local_disks() {
         state = "starting_background_task",
         "Capacity manager state changed"
     );
-    capacity_manager::start_background_task(disk_refs).await;
+    let tasks = capacity_manager::start_background_tasks(disk_refs).await;
 
     info!(
         component = LOG_COMPONENT_CAPACITY,
@@ -84,6 +93,7 @@ pub async fn init_capacity_management_for_local_disks() {
         state = "initialized",
         "Capacity manager state changed"
     );
+    Some(tasks)
 }
 
 pub async fn get_cached_capacity_with_metrics() -> Option<(u64, &'static str)> {

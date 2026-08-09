@@ -10,7 +10,7 @@ and rollback steps.
 | Area | Current owner | Size | Split status |
 |---|---|---:|---|
 | Bucket lifecycle | `crates/lifecycle/` + `crates/ecstore/src/bucket/lifecycle/` | core contracts + ECStore runtime | Core contract extracted |
-| Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Proposal only |
+| Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Contracts extracted; runtime move pending |
 | Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
 | Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
 
@@ -116,6 +116,14 @@ Focused verification for the first code-bearing lifecycle PR:
 `rustfs-replication` now owns the resync status contracts and persisted resync
 status wire format. The remaining `bucket/replication` worker runtime is not
 ready for a full standalone crate yet.
+
+The completion criteria and milestone sequence for this candidate (when the
+split counts as done, the target end state, and the order of the remaining
+moves) live in the module inventory:
+`crates/ecstore/src/bucket/replication/README.md`, sections "Completion
+Criteria" and "Milestones". The originally proposed first code-bearing step
+(event sink / runtime contracts) has landed; remaining work starts from moving
+resyncer pure decision logic.
 
 Current coupling:
 

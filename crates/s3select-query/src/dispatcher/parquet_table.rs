@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
@@ -27,13 +28,15 @@ use datafusion::{
     },
     execution::object_store::ObjectStoreUrl,
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    object_store::{ObjectStoreExt, path::Path},
+    object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path},
     parquet::{
-        arrow::{ParquetRecordBatchStreamBuilder, async_reader::ParquetObjectReader},
-        file::metadata::{ParquetMetaData, RowGroupMetaData},
+        arrow::{ParquetRecordBatchStreamBuilder, arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
+        errors::{ParquetError, Result as ParquetResult},
+        file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData},
     },
     physical_plan::ExecutionPlan,
 };
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use rustfs_s3select_api::{
     QueryError, QueryResult,
     object_store::{SelectScanRange, scan_range_from_bounds},
@@ -60,6 +63,43 @@ impl fmt::Debug for ParquetSelectTable {
     }
 }
 
+struct ObjectStoreParquetReader {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+}
+
+impl AsyncFileReader for ObjectStoreParquetReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        self.store.get_range(&self.path, range).map_err(parquet_store_error).boxed()
+    }
+
+    fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(parquet_store_error) }.boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let metadata_options = options.map(|options| options.metadata_options().clone());
+            let mut metadata_reader = ParquetMetaDataReader::new().with_metadata_options(metadata_options);
+
+            if let Some(options) = options {
+                metadata_reader = metadata_reader
+                    .with_column_index_policy(options.column_index_policy())
+                    .with_offset_index_policy(options.offset_index_policy());
+            }
+
+            let file_size = self.file_size;
+            let metadata = metadata_reader.load_and_finish(self, file_size).await?;
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
 impl ParquetSelectTable {
     pub async fn try_new(state: &dyn Session, input: &SelectObjectContentInput) -> QueryResult<Arc<dyn TableProvider>> {
         let table_path = ListingTableUrl::parse(format!("s3://{}/{}", input.bucket, input.key))?;
@@ -68,7 +108,11 @@ impl ParquetSelectTable {
         let store = state.runtime_env().object_store(&object_store_url)?;
         let object_meta = store.head(&object_location).await.map_err(query_store_error)?;
 
-        let reader = ParquetObjectReader::new(Arc::clone(&store), object_location).with_file_size(object_meta.size);
+        let reader = ObjectStoreParquetReader {
+            store: Arc::clone(&store),
+            path: object_location,
+            file_size: object_meta.size,
+        };
         let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .map_err(query_store_error)?;
@@ -164,6 +208,10 @@ fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
 
 fn non_negative_offset(offset: i64) -> Option<u64> {
     u64::try_from(offset).ok()
+}
+
+fn parquet_store_error(err: ObjectStoreError) -> ParquetError {
+    ParquetError::External(Box::new(err))
 }
 
 fn query_store_error(err: impl fmt::Display) -> QueryError {

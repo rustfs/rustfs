@@ -15,22 +15,23 @@
 #![recursion_limit = "256"]
 
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
-use std::fmt::Display;
+use std::{error::Error as StdError, fmt::Display};
 use thiserror::Error;
 
 pub mod object_store;
 pub mod query;
 pub mod server;
 mod storage_api;
+pub use storage_api::SelectObjectSnapshot;
 
 #[cfg(test)]
 mod test;
 
 pub type QueryResult<T> = Result<T, QueryError>;
 pub(crate) use storage_api::crate_boundary::{
-    SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore, resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
-    select_is_err_version_not_found,
+    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectOptions,
+    SelectObjectSnapshotReadError, SelectStorageError, SelectStore, SnapshotConsistencyError, resolve_select_object_store_handle,
+    select_is_err_bucket_not_found, select_is_err_object_not_found, select_is_err_version_not_found,
 };
 
 #[derive(Debug, Error)]
@@ -79,24 +80,24 @@ pub enum S3SelectPolicyError {
     QueryTimeout { seconds: u64 },
 }
 
-impl S3SelectPolicyError {
-    fn from_error<'a>(mut err: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+impl QueryError {
+    fn source_error<T: StdError + 'static>(&self) -> Option<&T> {
+        let mut err: &(dyn StdError + 'static) = self;
         for _ in 0..16 {
-            if let Some(policy_error) = err.downcast_ref::<Self>() {
-                return Some(policy_error);
+            if let Some(source) = err.downcast_ref::<T>() {
+                return Some(source);
             }
             err = err.source()?;
         }
         None
     }
-}
 
-impl QueryError {
+    pub fn is_snapshot_consistency_error(&self) -> bool {
+        self.source_error::<SnapshotConsistencyError>().is_some()
+    }
+
     pub fn s3_select_policy_error(&self) -> Option<&S3SelectPolicyError> {
-        match self {
-            Self::Datafusion { source } => S3SelectPolicyError::from_error(source.as_ref()),
-            _ => None,
-        }
+        self.source_error()
     }
 }
 
@@ -228,6 +229,17 @@ mod tests {
             err.s3_select_policy_error(),
             Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
         ));
+    }
+
+    #[test]
+    fn snapshot_consistency_error_is_recoverable_without_string_matching() {
+        let err = QueryError::Datafusion {
+            source: Box::new(DataFusionError::External(Box::new(SelectObjectSnapshotReadError::Consistency(
+                SnapshotConsistencyError::LockLost,
+            )))),
+        };
+
+        assert!(err.is_snapshot_consistency_error());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::common::{RustFSTestEnvironment, admin_ok, build_test_s3_config, build
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use serial_test::serial;
+use tokio::time::{Duration, Instant};
 
 fn user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Client {
     Client::from_conf(build_test_s3_config(
@@ -201,8 +202,25 @@ async fn list_buckets_filters_with_iam_bucket_resources() -> Result<(), Box<dyn 
         bucket_names(benchmark_client.list_buckets().send().await?.buckets()),
         vec!["benchmark-artifacts", "benchmark-location-only", "benchmark-test1"]
     );
-    let audit_log =
-        tokio::fs::read_to_string(env.capture_log_path.as_deref().expect("server log path should be configured")).await?;
+    let log_path = env.capture_log_path.as_deref().expect("server log path should be configured");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let audit_log = loop {
+        let audit_log = tokio::fs::read_to_string(log_path).await?;
+        if [
+            "iam_implicit_deny",
+            "s3_authorization_denied",
+            "ListAllMyBucketsAction",
+            "benchmark",
+            "DEBUG",
+        ]
+        .iter()
+        .all(|field| audit_log.contains(field))
+            || Instant::now() >= deadline
+        {
+            break audit_log;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(audit_log.matches("iam_implicit_deny").count(), 1, "{audit_log}");
     for field in ["s3_authorization_denied", "ListAllMyBucketsAction", "benchmark", "DEBUG"] {
         assert!(audit_log.contains(field), "missing {field} in {audit_log}");

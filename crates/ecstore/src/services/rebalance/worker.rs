@@ -2,10 +2,12 @@ use super::migration::MigrationVersionResult;
 use super::{
     DEFAULT_REBALANCE_MAX_ATTEMPTS, EVENT_REBALANCE_LISTING, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, REBAL_META_NAME,
     REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_MAX_ATTEMPTS_ENV, REBALANCE_MIGRATION_LOCK_RETRY_CAP,
-    REBALANCE_MIGRATION_RETRY_BASE_DELAY, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
+    REBALANCE_MIGRATION_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalanceBucketConfigs,
+    RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::core::pools::ListCallback;
+use crate::data_movement::SourceCleanupError;
 use crate::disk::error::DiskError;
 use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
@@ -35,6 +37,12 @@ pub(super) fn resolve_rebalance_worker_result<T>(
 }
 
 pub(super) type RebalanceEntryTask = tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RebalanceEntryCleanupResult {
+    Completed { warning: Option<String> },
+    Deferred { last_error: String },
+}
 
 pub(super) async fn wait_rebalance_entry_tasks(
     set_idx: usize,
@@ -145,14 +153,23 @@ where
 }
 
 pub(super) fn resolve_rebalance_entry_cleanup_delete_result(
-    result: Result<crate::object_api::ObjectInfo>,
+    result: std::result::Result<crate::object_api::ObjectInfo, SourceCleanupError>,
     bucket: &str,
     object_name: &str,
-) -> Result<Option<String>> {
+) -> RebalanceEntryCleanupResult {
     match result {
-        Ok(_) => Ok(None),
-        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
-        Err(err) => Ok(Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
+        Ok(_) => RebalanceEntryCleanupResult::Completed { warning: None },
+        Err(SourceCleanupError::Storage(err)) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+            RebalanceEntryCleanupResult::Completed { warning: None }
+        }
+        Err(SourceCleanupError::SourceChanged) => RebalanceEntryCleanupResult::Deferred {
+            last_error: format!(
+                "{REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX} source changed during cleanup preflight for {bucket}/{object_name}"
+            ),
+        },
+        Err(SourceCleanupError::Storage(err)) => RebalanceEntryCleanupResult::Completed {
+            warning: Some(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}")),
+        },
     }
 }
 
@@ -399,19 +416,24 @@ pub(super) async fn load_rebalance_bucket_configs(api: &ECStore, bucket: &str) -
     })
 }
 
-pub(super) async fn run_rebalance_listing_with_retry(
-    set: Arc<SetDisks>,
+pub(super) async fn run_rebalance_listing_with_retry<List, ListFuture>(
     rx: CancellationToken,
     bucket: String,
     cb: ListCallback,
     set_idx: usize,
     max_attempts: usize,
-) -> Result<()> {
+    entry_tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>,
+    mut list: List,
+) -> Result<()>
+where
+    List: FnMut(ListCallback) -> ListFuture,
+    ListFuture: std::future::Future<Output = Result<()>>,
+{
     let max_attempts = max_attempts.max(1);
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
-        match set.list_objects_to_rebalance(rx.clone(), bucket.clone(), cb.clone()).await {
+        match list(cb.clone()).await {
             Ok(()) => return Ok(()),
             Err(err) if should_retry_rebalance_listing(&err, attempt, max_attempts) => {
                 let next_attempt = attempt + 2;
@@ -426,6 +448,8 @@ pub(super) async fn run_rebalance_listing_with_retry(
                     delay
                 );
                 last_error = Some(err);
+                // The full retry re-evaluates deferred entries; only task failures block the next attempt.
+                let _ = wait_rebalance_entry_tasks(set_idx, entry_tasks.clone()).await?;
                 wait_rebalance_listing_retry(&rx, delay).await?;
                 info!(
                     "rebalance listing retrying bucket {} set {} attempt {}/{}",

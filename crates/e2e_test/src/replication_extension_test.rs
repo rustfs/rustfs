@@ -363,19 +363,21 @@ impl Drop for SlowReplicationTargetGuard {
     }
 }
 
+// Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
+// shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
-    #[serde(rename = "Targets", default)]
+    #[serde(rename = "target", default)]
     targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusTarget {
-    #[serde(rename = "Arn", default)]
+    #[serde(rename = "arn", default)]
     arn: String,
-    #[serde(rename = "ResetID", default)]
+    #[serde(rename = "resetid", default)]
     reset_id: String,
-    #[serde(rename = "Status", default)]
+    #[serde(rename = "resyncStatus", default)]
     status: String,
 }
 
@@ -1655,19 +1657,30 @@ async fn wait_for_source_delete_marker_replication_failed(
         if response.status() != StatusCode::OK {
             return Err(format!("replication diff failed with status {}", response.status()).into());
         }
-        let diff: serde_json::Value = response.json().await?;
-        let failed = diff["Entries"].as_array().is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry["Object"].as_str() == Some(key)
-                    && entry["IsDeleteMarker"].as_bool() == Some(true)
-                    && entry["ReplicationStatus"].as_str() == Some("FAILED")
-            })
+        // The default diff response is a madmin-style stream of bare DiffInfo
+        // JSON documents (one per line) with no envelope; assert the envelope
+        // is gone so an aggregate-shaped regression fails loudly here.
+        let body = response.text().await?;
+        let entries = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        for entry in &entries {
+            if entry.get("Entries").is_some() {
+                return Err(format!("replication diff must stream bare DiffInfo documents, got envelope: {entry}").into());
+            }
+        }
+        let failed = entries.iter().any(|entry| {
+            entry["object"].as_str() == Some(key)
+                && entry["deletemarker"].as_bool() == Some(true)
+                && entry["rStatus"].as_str() == Some("FAILED")
         });
         if failed {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("source delete marker {key} never reported FAILED; last diff={diff}").into());
+            return Err(format!("source delete marker {key} never reported FAILED; last diff={body}").into());
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -2274,6 +2287,30 @@ async fn site_replication_state_edit(
     }
 
     Ok(())
+}
+
+/// Start a bucket-level replication resync (`PUT ?replication-reset`) and
+/// return the target `(arn, reset_id)`, asserting the response carries the
+/// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
+/// that `mc replicate resync start` decodes.
+async fn start_bucket_replication_reset(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{bucket}?replication-reset", env.url);
+    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("replication reset start failed: {status} {body}").into());
+    }
+    let payload: serde_json::Value = response.json().await?;
+    let arn = payload["target"][0]["arn"].as_str().unwrap_or_default().to_string();
+    let reset_id = payload["target"][0]["resetid"].as_str().unwrap_or_default().to_string();
+    if arn.is_empty() || reset_id.is_empty() {
+        return Err(format!("replication reset response missing madmin target[0].arn/resetid: {payload}").into());
+    }
+    Ok((arn, reset_id))
 }
 
 async fn get_replication_reset_status(
@@ -3938,7 +3975,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   <Role></Role>
   <Rule>
     <ID>matrix-prefix</ID>
-    <Priority>100</Priority>
+    <Priority>110</Priority>
     <Status>Enabled</Status>
     <Filter><Prefix>prefix/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
@@ -3949,7 +3986,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-both-prefix</ID>
-    <Priority>100</Priority>
+    <Priority>120</Priority>
     <Status>Enabled</Status>
     <Filter><Prefix>both/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
@@ -3959,7 +3996,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-tag</ID>
-    <Priority>100</Priority>
+    <Priority>130</Priority>
     <Status>Enabled</Status>
     <Filter><Tag><Key>route</Key><Value>tagged</Value></Tag></Filter>
     <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
@@ -3969,7 +4006,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
   </Rule>
   <Rule>
     <ID>matrix-disabled</ID>
-    <Priority>100</Priority>
+    <Priority>140</Priority>
     <Status>Disabled</Status>
     <Filter><Prefix>disabled/</Prefix></Filter>
     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
@@ -4451,14 +4488,74 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
 }
 
 /// backlog#1147 repl-17 / backlog#1291: SSE-S3 must fail closed until managed
-/// encryption is supported on the target. The current plaintext replication is
-/// a known security bug, so this pins the required contract without blessing it.
+/// encryption is supported on the target. The silent plaintext replication
+/// that originally kept this test ignored was fixed by the fail-closed gate in
+/// `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`
+/// (all replication modes route through it), so this now pins the current
+/// fail-closed contract: FAILED status, failure event, readable source, and a
+/// stable absence of all target versions.
 #[tokio::test]
 #[serial]
-#[ignore = "backlog#1291: SSE-S3 replication silently drops encryption"]
 async fn test_bucket_replication_sse_s3_contract() -> TestResult {
     init_logging();
     assert_managed_sse_replication_fails_explicitly("sse-s3", false).await
+}
+
+/// P1-22 stage 0: the existing-object resync path must fail closed for
+/// managed-SSE objects exactly like inline replication (which
+/// `test_bucket_replication_sse_s3_contract` pins, including the scanner heal
+/// re-drive). Resync re-drives every object version through the same
+/// fail-closed target boundary, so a resync over an encrypted bucket must
+/// terminate without ever materializing a plaintext (or unreadable) replica;
+/// the post-resync stays-absent window also spans further fast-scanner heal
+/// cycles.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_s3_resync_stays_fail_closed() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("sse-resync", true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "sse-resync-contract.txt";
+    let body = b"repl-22 sse resync payload".to_vec();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", false).await?;
+
+    // Resync: drive the existing-object resync path over the failed object.
+    let (target_arn, reset_id) = start_bucket_replication_reset(&source_env, &source_bucket).await?;
+    let terminal = wait_for_replication_reset_target(&source_env, &source_bucket, &target_arn, |target| {
+        target.reset_id == reset_id && matches!(target.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+    assert_eq!(terminal.reset_id, reset_id);
+
+    // The resync pass must have failed closed: still no target version (the
+    // window also spans further scanner heal cycles), and the source object
+    // stays readable and encrypted.
+    assert_failed_replication_stays_absent_for(
+        &source_client,
+        &source_bucket,
+        &target_client,
+        &target_bucket,
+        key,
+        false,
+        Duration::from_secs(5),
+    )
+    .await?;
+    let source = source_client.get_object().bucket(&source_bucket).key(key).send().await?;
+    assert_eq!(source.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    Ok(())
 }
 
 /// backlog#1147 repl-17: SSE-KMS currently fails closed rather than creating an
@@ -6876,5 +6973,89 @@ async fn test_replication_put_and_create_multipart_carry_source_version_id_query
     );
 
     target.shutdown().await;
+    Ok(())
+}
+
+/// P1-20: inbound replicas never cascade. An object replicated A->B carries
+/// x-amz-replication-status=REPLICA on B; `must_replicate` returns an empty
+/// decision for replicas, so even an ExistingObjectReplication=Enabled rule
+/// configured on B AFTER the replica landed (making it an "existing object"
+/// for that rule) must never push it onward — while B's own native objects
+/// flow to the onward bucket, proving B's outbound replication and scanner
+/// are live.
+#[tokio::test]
+#[serial]
+async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
+    init_logging();
+
+    let mut env_a = RustFSTestEnvironment::new().await?;
+    let mut env_a_vars = replication_fast_env();
+    env_a_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_a.start_rustfs_server_with_env(vec![], &env_a_vars).await?;
+
+    // B becomes a replication source itself, driven by its scanner.
+    let mut env_b = RustFSTestEnvironment::new().await?;
+    let mut env_b_vars = replication_fast_env();
+    env_b_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_b_vars.extend_from_slice(FAST_SCANNER_ENV);
+    env_b.start_rustfs_server_with_env(vec![], &env_b_vars).await?;
+
+    let bucket_a = "cascade-a-src";
+    let bucket_b = "cascade-b-mid";
+    let bucket_c = "cascade-a-third";
+    let client_a = env_a.create_s3_client();
+    let client_b = env_b.create_s3_client();
+    client_a.create_bucket().bucket(bucket_a).send().await?;
+    client_b.create_bucket().bucket(bucket_b).send().await?;
+    client_a.create_bucket().bucket(bucket_c).send().await?;
+    enable_bucket_versioning(&env_a, bucket_a).await?;
+    enable_bucket_versioning(&env_b, bucket_b).await?;
+    enable_bucket_versioning(&env_a, bucket_c).await?;
+
+    // A -> B first: the replica lands on B before B has any outbound rule.
+    let arn_ab = set_replication_target(&env_a, bucket_a, &env_b, bucket_b).await?;
+    put_bucket_replication(&env_a, bucket_a, &arn_ab).await?;
+
+    let replica_key = "replica-object.txt";
+    let replica_payload = "replica payload";
+    client_a
+        .put_object()
+        .bucket(bucket_a)
+        .key(replica_key)
+        .body(ByteStream::from_static(replica_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_b, bucket_b, replica_key, replica_payload).await?;
+
+    // Precondition for the anti-cascade contract: the inbound copy must carry
+    // REPLICA status on B. If this fails, the break is in inbound status
+    // stamping, not in the scanner guard.
+    let inbound = client_b.head_object().bucket(bucket_b).key(replica_key).send().await?;
+    assert_eq!(
+        inbound.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "inbound replica must be stamped REPLICA on the target"
+    );
+
+    // Now wire B's outbound rule; the replica is an "existing object" for it.
+    let arn_bc = set_replication_target(&env_b, bucket_b, &env_a, bucket_c).await?;
+    put_bucket_replication(&env_b, bucket_b, &arn_bc).await?;
+
+    // B's own native object flows onward through the live path.
+    let native_key = "native-control.txt";
+    let native_payload = "native control payload";
+    client_b
+        .put_object()
+        .bucket(bucket_b)
+        .key(native_key)
+        .body(ByteStream::from_static(native_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&client_a, bucket_c, native_key, native_payload).await?;
+
+    // With B's outbound proven, the inbound replica must stay put across
+    // multiple fast-scanner cycles.
+    assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
     Ok(())
 }

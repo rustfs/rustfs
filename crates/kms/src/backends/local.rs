@@ -1529,14 +1529,7 @@ impl LocalKmsClient {
         ensure_key_status_permits(&request.master_key_id, &key_info.status, StateGatedOperation::GenerateDataKey)?;
 
         // Generate random data key material
-        let key_length = match request.key_spec.as_str() {
-            "AES_256" => 32,
-            "AES_128" => 16,
-            _ => return Err(KmsError::unsupported_algorithm(&request.key_spec)),
-        };
-
-        let mut plaintext_key = vec![0u8; key_length];
-        rand::rng().fill(&mut plaintext_key[..]);
+        let plaintext_key = generate_key_material(&request.key_spec)?;
 
         // Encrypt the data key with the master key
         let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
@@ -1596,11 +1589,19 @@ impl LocalKmsClient {
         })
     }
 
-    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    /// Open a data-key envelope, returning the plaintext and the master key
+    /// that wrapped it.
+    pub(crate) async fn decrypt(
+        &self,
+        request: &DecryptRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<(Vec<u8>, String)> {
         debug!("Decrypting data");
 
-        // Parse the data key envelope from ciphertext
-        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+        // Parse the data key envelope from ciphertext. Mapped to the same
+        // error class the other backends report for unparseable ciphertext.
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|error| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {error}")))?;
 
         // NOTE: this comparison is an authorization check, not a cryptographic
         // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
@@ -1634,7 +1635,7 @@ impl LocalKmsClient {
             .await?;
 
         debug!("Local KMS data decrypted");
-        Ok(plaintext)
+        Ok((plaintext, envelope.master_key_id))
     }
 
     /// Test-only lifecycle driver: the product path goes through [`KmsBackend`].
@@ -1994,16 +1995,11 @@ impl KmsBackend for LocalKmsBackend {
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
-        let plaintext = self.client.decrypt(&request, None).await?;
-
-        // The envelope that was just opened names the master key that opened it.
-        // Reporting "unknown" left every caller unable to tell which key was
-        // actually used, which is what audit and key-rotation checks read.
-        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+        let (plaintext, key_id) = self.client.decrypt(&request, None).await?;
 
         Ok(DecryptResponse {
             plaintext,
-            key_id: envelope.master_key_id,
+            key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
     }
@@ -2017,12 +2013,19 @@ impl KmsBackend for LocalKmsBackend {
             grant_tokens: Vec::new(),
         };
 
-        let data_key = self.client.generate_data_key(&generate_request, None).await?;
+        let mut data_key = self.client.generate_data_key(&generate_request, None).await?;
 
+        // Fields are taken, not destructured or cloned: `DataKeyInfo` has a
+        // `Drop` impl, and a clone would leave a second un-zeroized plaintext
+        // DEK on the heap.
+        let plaintext_key = data_key
+            .plaintext
+            .take()
+            .ok_or_else(|| KmsError::internal_error("Generated data key is missing plaintext"))?;
         Ok(GenerateDataKeyResponse {
             key_id: request.key_id,
-            plaintext_key: data_key.plaintext.clone().unwrap_or_default(),
-            ciphertext_blob: data_key.ciphertext.clone(),
+            plaintext_key,
+            ciphertext_blob: std::mem::take(&mut data_key.ciphertext),
         })
     }
 
@@ -2423,8 +2426,9 @@ mod tests {
         let decrypt_request =
             DecryptRequest::new(data_key.ciphertext.clone()).with_context("bucket".to_string(), "test-bucket".to_string());
 
-        let decrypted = client.decrypt(&decrypt_request, None).await.expect("Failed to decrypt");
+        let (decrypted, opened_by) = client.decrypt(&decrypt_request, None).await.expect("Failed to decrypt");
         assert_eq!(decrypted, data_key.plaintext.clone().expect("No plaintext"));
+        assert_eq!(opened_by, key_id, "decrypt must report the master key that opened the envelope");
     }
 
     #[tokio::test]
@@ -2455,7 +2459,7 @@ mod tests {
         // Pre-fix, each of those regenerated the master key, so this unwrap fails with an AEAD
         // error. Post-fix, the original material is preserved and the DEK still decrypts.
         let decrypt_request = DecryptRequest::new(ciphertext).with_context("bucket".to_string(), "b".to_string());
-        let decrypted = client
+        let (decrypted, _opened_by) = client
             .decrypt(&decrypt_request, None)
             .await
             .expect("DEK must still decrypt after status transitions");
@@ -2796,7 +2800,7 @@ mod tests {
         assert!(matches!(error, KmsError::InvalidOperation { .. }));
 
         for (index, (ciphertext, plaintext)) in batch.iter().enumerate() {
-            let decrypted = client
+            let (decrypted, _opened_by) = client
                 .decrypt(&DecryptRequest::new(ciphertext.clone()), None)
                 .await
                 .unwrap_or_else(|error| panic!("batch member {index} must decrypt: {error}"));

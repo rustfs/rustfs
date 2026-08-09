@@ -306,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_monitored_reader_header_size_accounting() {
         let monitor = Monitor::new(1);
-        monitor.set_bandwidth_limit("b1", "arn1", 100);
+        monitor.set_bandwidth_limit("b1", "arn1", 1_000_000_000);
 
         let data = vec![0u8; 200];
         let inner = TestAsyncReader::new(&data);

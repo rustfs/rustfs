@@ -643,6 +643,20 @@ fn outer_scan_budget(limits: &ScanLimits) -> Duration {
     limits.max_timeout.saturating_mul(2).max(Duration::from_secs(5))
 }
 
+struct ScanCancellationGuard(Arc<AtomicBool>);
+
+impl ScanCancellationGuard {
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ScanCancellationGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::Error> {
     let path = path.to_path_buf();
     let limits = ScanLimits::from_env();
@@ -655,11 +669,12 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
     let cancelled = Arc::new(AtomicBool::new(false));
     let scan_cancelled = cancelled.clone();
     let scan = tokio::task::spawn_blocking(move || scan_dir_blocking(&path, &limits, &scan_cancelled));
+    let cancel_on_drop = ScanCancellationGuard(cancelled);
 
     match tokio::time::timeout(budget, scan).await {
         Ok(join_result) => join_result.map_err(std::io::Error::other)?,
         Err(_) => {
-            cancelled.store(true, Ordering::Relaxed);
+            cancel_on_drop.cancel();
             warn!(
                 event = EVENT_CAPACITY_SCAN_HARD_TIMEOUT,
                 component = LOG_COMPONENT_CAPACITY,
@@ -1454,6 +1469,16 @@ mod tests {
         // degenerate max_timeout values.
         assert_eq!(outer_scan_budget(&tight_limits(Duration::from_secs(15))), Duration::from_secs(30));
         assert_eq!(outer_scan_budget(&tight_limits(Duration::ZERO)), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_scan_cancellation_guard_sets_flag_on_drop() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = ScanCancellationGuard(cancelled.clone());
+
+        drop(guard);
+
+        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[cfg(unix)]

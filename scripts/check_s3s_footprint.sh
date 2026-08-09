@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 # Baselines verified on 2026-08-06. Lower-only; see header.
 S3S_IMPORT_FILES_BASELINE=236
-S3_ERROR_LINES_BASELINE=1679
+S3_ERROR_LINES_BASELINE=1678
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 
 TMP_DIR="$(mktemp -d)"

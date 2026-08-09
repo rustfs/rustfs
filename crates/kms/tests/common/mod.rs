@@ -446,22 +446,6 @@ pub fn assert_configuration_error<T: Debug>(result: Result<T>, message_fragment:
 }
 
 #[track_caller]
-pub fn assert_validation_error<T: Debug>(result: Result<T>) {
-    match result {
-        Err(KmsError::ValidationError { .. }) => {}
-        other => panic!("expected ValidationError, got {other:?}"),
-    }
-}
-
-#[track_caller]
-pub fn assert_cryptographic_error<T: Debug>(result: Result<T>) {
-    match result {
-        Err(KmsError::CryptographicError { .. }) => {}
-        other => panic!("expected CryptographicError, got {other:?}"),
-    }
-}
-
-#[track_caller]
 pub fn assert_invalid_key_size<T: Debug>(result: Result<T>, expected: usize, actual: usize) {
     match result {
         Err(KmsError::InvalidKeySize {

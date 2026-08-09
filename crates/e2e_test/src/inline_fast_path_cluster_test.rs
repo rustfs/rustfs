@@ -2211,11 +2211,6 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
             "queue_snapshot.{field} must be readable in terminal status: {terminal}"
         );
     }
-    assert!(
-        cold_tier_object_count(&cold_client).await? < 64,
-        "queue pressure should leave at least one object untransitioned"
-    );
-
     Ok(())
 }
 

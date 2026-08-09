@@ -322,6 +322,28 @@ High risk: all seven roles.
 - Use environment variables or vault tooling for sensitive configuration.
 - For localhost-sensitive tests, verify proxy settings to avoid traffic leakage.
 
+## Logging
+
+Applies to **every** `tracing` macro you add or edit, including a single line
+added in passing while fixing something else — not only to log-focused changes.
+
+- Fields first, message second: `event`, `component`, `subsystem`,
+  `result`/`state`, then key context. The message is a short label, not a
+  sentence with values interpolated into it.
+- Reuse the existing `EVENT_*` / `LOG_COMPONENT_*` / `LOG_SUBSYSTEM_*`
+  constants of the module you are editing; match the shape of the log sites
+  already in that file rather than introducing a second style next to them.
+- Level policy: `error` for behavior/security-affecting failures, `warn` for
+  degraded or fallback paths, `info` for low-frequency lifecycle, `debug` for
+  targeted diagnostics, `trace` for hot paths. Per-object and per-request
+  success paths are `trace`.
+- Never log secrets, tokens, credential payloads, or merged config dumps.
+- `scripts/check_logging_guardrails.sh` enforces a subset of this on the files
+  it lists; passing it is a floor, not evidence the log matches the house style.
+
+See `.agents/skills/rustfs-logging-governance/SKILL.md` for the full event
+model, level policy, and guardrail-update checklist.
+
 ## Tools
 
 ### xl.meta decode tool Quick Use

@@ -214,6 +214,19 @@ pub(crate) mod runtime {
     ) -> Result<(), crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::init_local_disks(endpoint_pools).await
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_instance_ctx() -> Arc<crate::storage::storage_api::InstanceContext> {
+        crate::storage::storage_api::new_instance_ctx()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn init_local_disks_with_instance_ctx(
+        instance_ctx: &Arc<crate::storage::storage_api::InstanceContext>,
+        endpoint_pools: crate::storage::storage_api::EndpointServerPools,
+    ) -> Result<(), crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools).await
+    }
 }
 
 pub(crate) mod runtime_sources {
@@ -883,6 +896,14 @@ pub(crate) mod bucket {
         ) -> Option<&'static str> {
             replication_contracts::invalid_replication_config_status_field(config)
         }
+
+        pub(crate) type ReplicationConfigStructureError = replication_contracts::ReplicationConfigStructureError;
+
+        pub(crate) fn validate_replication_config_structure(
+            config: &s3s::dto::ReplicationConfiguration,
+        ) -> Result<(), ReplicationConfigStructureError> {
+            replication_contracts::validate_replication_config_structure(config)
+        }
     }
 
     pub(crate) mod tagging {
@@ -1132,14 +1153,13 @@ pub(crate) mod multipart_usecase {
 }
 
 pub(crate) mod select_object {
-    pub(crate) mod contract {
-        pub(crate) mod object {
-            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
-        }
-    }
-
     pub(crate) use super::{options, request_context, sse};
-    pub(crate) use crate::storage::storage_api::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::StorageError;
+    pub(crate) use crate::storage::storage_api::{
+        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
+        validate_ssec_for_read,
+    };
 }
 
 pub(crate) mod context {

@@ -389,16 +389,18 @@ impl Default for AesDekCrypto {
     }
 }
 
-/// Generate random key material for the given algorithm
+/// Generate random key material for the given algorithm.
+///
+/// The lengths must track [`crate::types::KeySpec::key_size`].
 ///
 /// # Arguments
-/// * `algorithm` - The key algorithm (e.g., "AES_256", "AES_128")
+/// * `algorithm` - The key algorithm (e.g., "AES_256", "AES_128", "ChaCha20")
 ///
 /// # Returns
 /// A vector containing the generated key material
 pub fn generate_key_material(algorithm: &str) -> Result<Vec<u8>> {
     let key_size = match algorithm {
-        "AES_256" => 32,
+        "AES_256" | "ChaCha20" => 32,
         "AES_128" => 16,
         _ => return Err(KmsError::unsupported_algorithm(algorithm)),
     };

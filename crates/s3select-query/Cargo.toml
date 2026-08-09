@@ -45,6 +45,7 @@ hotpath.workspace = true
 rustfs-s3select-api = { workspace = true }
 async-recursion = { workspace = true }
 async-trait.workspace = true
+bytes.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 derive_builder = { workspace = true }
 futures = { workspace = true }
@@ -52,6 +53,9 @@ parking_lot = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
 
 [lib]
 doctest = false

@@ -690,6 +690,17 @@ if [[ -n "$unmasked_revoke_fields" ]]; then
   exit 1
 fi
 
+# STS claims carry caller-supplied identity material (parent user, session policy, JWT
+# fields). Interpolating the claims map into any log or error repeats the
+# GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata
+# such as claims.len() may be logged (see trace_assume_role_claims in sts.rs).
+sts_claims_content_logs="$(rg -n '\{:\?\}.*claims|claims.*\{:\?\}|\{&?claims:\?\}|[?%]\s*&?claims\b' rustfs/src/admin/handlers/sts.rs || true)"
+if [[ -n "$sts_claims_content_logs" ]]; then
+  echo "❌ logging guardrail violation: STS handlers must not interpolate JWT claims into logs or errors (GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 class); log derived metadata such as claims.len() instead" >&2
+  echo "$sts_claims_content_logs" >&2
+  exit 1
+fi
+
 heal_hotpath_files=(
   "crates/ecstore/src/store/heal.rs"
   "crates/ecstore/src/store/mod.rs"
@@ -831,6 +842,60 @@ for file in "${disk_logging_files[@]}"; do
   fi
 done
 
+# `forbidden_patterns` above only retires log lines that already shipped, so a
+# newly written sentence-style log passes every check in this script — which is
+# how one reaches review in the first place (PR #5822 added
+# `warn!("heal rename_data: purging ... {:?} failed: {}", ...)` to
+# disk/local.rs with CI green). Assert the RustFS event shape positively on the
+# file sets already governed here: error!/warn!/info! must open with fields
+# (`event = ...`) or a `target:`, never with a bare message string. debug! and
+# trace! stay out of scope — they are targeted diagnostics, not operator
+# events. Extend this list as more files are converted; it is deliberately
+# narrower than `checked_files`, which is only a blocklist surface.
+structured_event_files=(
+  "crates/ecstore/src/disk/mod.rs"
+  "crates/ecstore/src/disk/local.rs"
+  "crates/ecstore/src/cluster/rpc/remote_disk.rs"
+)
+
+# The leading class rejects `my_info!(` while still matching `tracing::warn!(`.
+sentence_style_log_pattern='(?:^|[^A-Za-z0-9_])(?:error|warn|info)!\(\s*"'
+
+for file in "${structured_event_files[@]}"; do
+  # Commented-out macros are dead code, not emitted events.
+  sentence_style_logs="$(rg -n -U "$sentence_style_log_pattern" "$file" | rg -v '^[0-9]+:\s*//' || true)"
+  if [[ -n "$sentence_style_logs" ]]; then
+    echo "❌ logging guardrail violation: error!/warn!/info! must lead with structured fields (event/component/subsystem) in $file" >&2
+    echo "$sentence_style_logs" >&2
+    exit 1
+  fi
+done
+
+# Keep the matcher honest in both directions.
+for fixture in \
+  'warn!("heal rename_data: purging stale destination data dir {:?} failed: {}", dst_data_path, err);' \
+  $'warn!(\n    "rename_data commit failed: {}",\n    err\n);' \
+  'tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");' \
+  'info!("disk scan finished");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: sentence-style log was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'info!(\n    event = EVENT_DISK_LOCAL_RENAME_REJECTED,\n    component = LOG_COMPONENT_ECSTORE,\n    reason = "rename_all_data_path_failed",\n    "Disk local rename flow failed"\n);' \
+  'warn!(target: "rustfs::heal::manager", event = EVENT_HEAL_RETRY, "Heal retry admission decided");' \
+  'my_info!("not a tracing macro");' \
+  'debug!("list_dir raw {:?}", entries);'; do
+  if printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: structured event was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 if rg -n -U 'debug!\([\s\S]{0,600}"Remote disk RPC started"' crates/ecstore/src/cluster/rpc/remote_disk.rs >/dev/null; then
   echo "❌ logging guardrail violation: successful remote disk RPC events must not be emitted at DEBUG" >&2
   exit 1
@@ -854,6 +919,11 @@ fi
 # between the macro open and the message at every retry-admission site.
 if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Heal retry admission decided"' crates/heal/src/heal/manager.rs >/dev/null; then
   echo "❌ logging guardrail violation: heal retry admission decisions repeat per retrying task (per-object under MRF retry storms) and must stay at DEBUG" >&2
+  exit 1
+fi
+
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
   exit 1
 fi
 

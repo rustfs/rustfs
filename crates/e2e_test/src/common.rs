@@ -47,6 +47,8 @@ use walkdir::WalkDir;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
+pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
+    &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
 
@@ -128,6 +130,57 @@ pub fn local_http_client() -> HttpClient {
         .expect("failed to build local reqwest client")
 }
 
+pub(crate) async fn signed_s3_request(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    signed_s3_request_with_session_token(method, url, body, content_type, access_key, secret_key, None).await
+}
+
+async fn signed_s3_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
+    let mut request = http::Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header(HOST, authority)
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_length,
+        access_key,
+        secret_key,
+        session_token.unwrap_or_default(),
+        "us-east-1",
+    );
+
+    let mut request = local_http_client().request(method, url);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    Ok(request.send().await?)
+}
+
 /// Signs and sends an admin HTTP request with the given credentials.
 pub(crate) async fn admin_request(
     base_url: &str,
@@ -150,35 +203,9 @@ pub(crate) async fn admin_request_with_session_token(
     session_token: Option<&str>,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut request = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        request = request.header(CONTENT_TYPE, "application/json");
-    }
-
-    let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "admin request body is too large")?;
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_length,
-        access_key,
-        secret_key,
-        session_token.unwrap_or_default(),
-        "us-east-1",
-    );
-
-    let mut request = local_http_client().request(method, &url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    let response = request.send().await?;
+    let content_type = body.as_ref().map(|_| "application/json");
+    let response =
+        signed_s3_request_with_session_token(method, &url, body, content_type, access_key, secret_key, session_token).await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))
