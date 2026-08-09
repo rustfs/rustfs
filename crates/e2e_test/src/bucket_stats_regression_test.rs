@@ -31,7 +31,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, awscurl_get, init_logging};
+    use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, RustFSTestEnvironment, awscurl_get, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use rustfs_data_usage::DataUsageInfo;
@@ -65,7 +65,7 @@ mod tests {
         info!("RT-09: bucket object count updates after PUT");
 
         let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
-        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+        env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV)
             .await
             .expect("start RustFS");
 
@@ -132,7 +132,7 @@ mod tests {
         info!("RT-09b: bucket object count updates after DELETE");
 
         let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
-        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+        env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV)
             .await
             .expect("start RustFS");
 
@@ -152,6 +152,22 @@ mod tests {
                 .await
                 .expect("put object");
         }
+
+        let mut found_nonzero = false;
+        for attempt in 0..18 {
+            sleep(Duration::from_secs(5)).await;
+
+            if let Ok(usage) = get_data_usage(&env).await
+                && let Some(bucket_usage) = usage.buckets_usage.get(bucket)
+            {
+                info!("  baseline attempt {attempt}: objectsCount = {}", bucket_usage.objects_count);
+                if bucket_usage.objects_count >= 5 {
+                    found_nonzero = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_nonzero, "RT-09b setup failed: scanner did not observe the 5 uploaded objects");
 
         // Delete all objects
         for i in 0..5 {

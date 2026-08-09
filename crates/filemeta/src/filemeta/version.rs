@@ -93,6 +93,8 @@ fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
     read_exact_vec(rd, len)
 }
 
+const MSGP_OBJECT_KEY_STACK_CAP: usize = 16;
+
 /// Writes an `OffsetDateTime` as the ext8 / legacy (type 5, 12-byte
 /// seconds+nanos) msgpack time encoding used by the V1 (Legacy) object body.
 /// `read_msgp_time` decodes exactly this shape via `MSGPACK_TIME_EXT_LEGACY`.
@@ -2060,16 +2062,33 @@ impl MetaObject {
                 tracing::error!(error = %e, "decode_from: read_str_len key failed");
                 e
             })?;
-            let key_buf = read_exact_vec(rd, key_len as usize).map_err(|e| {
-                tracing::error!(error = %e, "decode_from: read key_buf failed");
-                e
-            })?;
-            let key = String::from_utf8(key_buf).map_err(|e| {
-                tracing::error!(error = %e, "decode_from: from_utf8 key failed");
-                e
+            let key_len = usize::try_from(key_len).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: key length conversion failed");
+                Error::other(e)
             })?;
 
-            match key.as_str() {
+            let mut inline_key = [0u8; MSGP_OBJECT_KEY_STACK_CAP];
+            let heap_key;
+            let key_buf = if key_len <= MSGP_OBJECT_KEY_STACK_CAP {
+                rd.read_exact(&mut inline_key[..key_len]).map_err(|e| {
+                    tracing::error!(error = %e, "decode_from: read key_buf failed");
+                    Error::from(e)
+                })?;
+                &inline_key[..key_len]
+            } else {
+                heap_key = read_exact_vec(rd, key_len).map_err(|e| {
+                    tracing::error!(error = %e, "decode_from: read key_buf failed");
+                    e
+                })?;
+                heap_key.as_slice()
+            };
+
+            let key = std::str::from_utf8(key_buf).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: from_utf8 key failed");
+                Error::FromUtf8(e.to_string())
+            })?;
+
+            match key {
                 "ID" => {
                     let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
                         tracing::error!(error = %e, "decode_from: read_bin_len ID failed");
@@ -2285,6 +2304,7 @@ impl MetaObject {
                         Some(n) => n,
                     };
                     self.meta_sys.clear();
+                    self.meta_sys.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let k_len = rmp::decode::read_str_len(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_str_len MetaSys key failed");
@@ -2323,6 +2343,7 @@ impl MetaObject {
                         Some(n) => n,
                     };
                     self.meta_user.clear();
+                    self.meta_user.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let k_len = rmp::decode::read_str_len(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_str_len MetaUsr key failed");
@@ -4822,6 +4843,46 @@ mod tests {
             meta_user: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn meta_object_decode_round_trips_stack_sized_keys() {
+        let object = signed_object();
+        let encoded = object.marshal_msg().expect("object marshal should succeed");
+
+        let mut decoded = MetaObject::default();
+        decoded
+            .decode_from(&mut std::io::Cursor::new(&encoded))
+            .expect("object decode should succeed");
+
+        assert_eq!(decoded, object);
+    }
+
+    #[test]
+    fn meta_object_decode_skips_unknown_valid_utf8_field() {
+        let mut encoded = Vec::new();
+        rmp::encode::write_map_len(&mut encoded, 1).expect("map header should encode");
+        rmp::encode::write_str(&mut encoded, "UnknownFutureField").expect("field key should encode");
+        rmp::encode::write_nil(&mut encoded).expect("nil payload should encode");
+
+        let mut decoded = MetaObject::default();
+        decoded
+            .decode_from(&mut std::io::Cursor::new(&encoded))
+            .expect("unknown valid UTF-8 field should be skipped");
+
+        assert_eq!(decoded, MetaObject::default());
+    }
+
+    #[test]
+    fn meta_object_decode_rejects_invalid_utf8_field_name() {
+        let encoded = [0x81, 0xa1, 0xff, 0xc0];
+        let mut decoded = MetaObject::default();
+
+        let err = decoded
+            .decode_from(&mut std::io::Cursor::new(encoded))
+            .expect_err("invalid UTF-8 field name should fail");
+
+        assert!(matches!(err, Error::FromUtf8(_)), "unexpected error: {err}");
     }
 
     #[test]

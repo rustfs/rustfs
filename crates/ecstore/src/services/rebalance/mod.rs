@@ -27,12 +27,14 @@ const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
 pub(crate) const REBAL_META_NAME: &str = "rebalance.bin";
 const DEFAULT_REBALANCE_MAX_ATTEMPTS: usize = 3;
+pub(crate) const REBALANCE_SOURCE_CLEANUP_MAX_DEFERS: usize = 3;
 const REBALANCE_MAX_ATTEMPTS_ENV: &str = "RUSTFS_REBALANCE_MAX_ATTEMPTS";
 const REBALANCE_STOP_PROPAGATION_ERROR_PREFIX: &str = "rebalance stop propagation incomplete: ";
 const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
 const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
+pub(crate) const REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX: &str = "deferred rebalance source cleanup conflict:";
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 mod control;

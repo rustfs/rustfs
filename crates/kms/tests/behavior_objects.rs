@@ -925,3 +925,181 @@ async fn a_rewritten_context_header_fails_authentication() {
         "a context the object was not sealed under must not open it"
     );
 }
+
+/// The SSE-C flank of the tamper check above: the customer-key path prefers
+/// the stored AAD bytes through the same branch, so a reverted preference —
+/// re-deriving canonical bytes from the parsed map — would open a tampered
+/// object here too, and only an SSE-C probe would notice.
+#[tokio::test]
+async fn a_rewritten_sse_c_context_header_fails_authentication() {
+    let (_kms, service) = service_with_key("sse-c-tampered-context").await;
+    let object_key = "tampered-sse-c.bin";
+    let customer_key = [0x55u8; 32];
+    let data = payload(256);
+
+    let encrypted = service
+        .encrypt_object_with_customer_key(BUCKET, object_key, data.as_slice(), &customer_key, None)
+        .await
+        .expect("SSE-C encrypt should succeed");
+
+    let mut headers = service.metadata_to_headers(&encrypted.metadata);
+    // Same pairs, different serialization: a pure ordering rewrite, so the
+    // rejection can only come from the AAD bytes and not from a changed map.
+    let rewritten = non_canonical_context_json(&encrypted.metadata.encryption_context);
+    assert_ne!(
+        Some(rewritten.as_str()),
+        headers.get("x-rustfs-encryption-context").map(String::as_str),
+        "the rewrite must actually change the stored bytes, or this proves nothing"
+    );
+    headers.insert("x-rustfs-encryption-context".to_string(), rewritten);
+
+    let tampered = service.headers_to_metadata(&headers).expect("tampered headers still parse");
+    assert!(
+        discard(
+            service
+                .decrypt_object_with_customer_key(BUCKET, object_key, encrypted.ciphertext.clone(), &tampered, &customer_key)
+                .await
+        )
+        .is_err(),
+        "a context the SSE-C object was not sealed under must not open it, even with the right key"
+    );
+}
+
+/// An SSE-KMS object written before the internal `x-rustfs-` headers existed
+/// must still open, and must rebuild into a record that names its real cipher.
+///
+/// Back then `x-amz-server-side-encryption: aws:kms` plus the S3 key-id header
+/// was the whole record, and AES-256-GCM was the only cipher in use — which is
+/// exactly the assumption the `aws:kms` fallback in `headers_to_metadata`
+/// encodes. The fallback is a normalization: `aws:kms` also parses as a cipher
+/// alias for AES-256-GCM, so the object opens either way, but only the
+/// normalized record re-projects the cipher header a modern read expects. The
+/// legacy header shape is reconstructed here by rewriting the SSE mode to
+/// `aws:kms`, adding the S3 key-id header, and dropping both internal headers.
+#[tokio::test]
+async fn a_legacy_aws_kms_object_without_the_cipher_header_still_opens() {
+    let (_kms, service) = service_with_key("sse-legacy-mode").await;
+    let object_key = "legacy-aws-kms.bin";
+    let data = payload(512);
+
+    let encrypted = service
+        .encrypt_object(BUCKET, object_key, data.as_slice(), &EncryptionAlgorithm::Aes256, None, None)
+        .await
+        .expect("encrypt should succeed");
+
+    let mut headers = service.metadata_to_headers(&encrypted.metadata);
+    headers.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
+    headers.insert(
+        "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+        encrypted.metadata.key_id.clone(),
+    );
+    for internal in ["x-rustfs-encryption-algorithm", "x-rustfs-encryption-key-id"] {
+        headers
+            .remove(internal)
+            .unwrap_or_else(|| panic!("the modern projection must write the {internal} header this test deletes"));
+    }
+
+    let rebuilt = service
+        .headers_to_metadata(&headers)
+        .expect("a pre-internal-header record must still parse");
+    assert_eq!(rebuilt.key_id, encrypted.metadata.key_id, "the S3 key-id header must resolve the key");
+    assert_eq!(
+        rebuilt.algorithm,
+        EncryptionAlgorithm::Aes256.as_str(),
+        "aws:kms with no cipher header must normalize to the only cipher that era wrote"
+    );
+
+    // The normalization is what a re-projection stores: the upgraded record
+    // writes the modern cipher header instead of perpetuating the gap.
+    let reprojected = service.metadata_to_headers(&rebuilt);
+    assert_eq!(
+        reprojected.get("x-rustfs-encryption-algorithm").map(String::as_str),
+        Some(EncryptionAlgorithm::Aes256.as_str()),
+        "re-projecting the rebuilt record must write the cipher header"
+    );
+
+    let decrypted = read_all(
+        service
+            .decrypt_object(BUCKET, object_key, encrypted.ciphertext.clone(), &rebuilt, None)
+            .await
+            .expect("a legacy aws:kms object must still open"),
+    )
+    .await;
+    assert_eq!(decrypted, data, "the rebuilt record must recover the full plaintext");
+}
+
+/// Metadata persisted before `context_aad` existed deserializes with `None`
+/// there, and decrypt must then re-derive the AAD from the parsed context.
+/// That derived path only opens the object because the seal side canonicalizes
+/// the very same way — this is the independent probe of that pairing, for both
+/// the KMS and the customer-key flavours.
+#[tokio::test]
+async fn metadata_without_stored_context_bytes_still_opens() {
+    let (_kms, service) = service_with_key("sse-derived-aad").await;
+    let data = payload(512);
+    // Several entries, so canonicalization has an ordering to actually decide.
+    let context = ctx(&[("zeta", "26"), ("alpha", "1"), ("mu", "13")]);
+
+    // Byte-equality of the derived and stored AAD is what keeps the `None`
+    // path working, so pin the seal side of that pairing directly: the sealed
+    // record must carry exactly the canonical serialization of its context.
+    let canonical_aad = |context: &HashMap<String, String>| {
+        let canonical: std::collections::BTreeMap<&str, &str> =
+            context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        serde_json::to_vec(&canonical).expect("context serializes")
+    };
+
+    let encrypted = service
+        .encrypt_object(
+            BUCKET,
+            "derived-aad.bin",
+            data.as_slice(),
+            &EncryptionAlgorithm::Aes256,
+            None,
+            Some(&context),
+        )
+        .await
+        .expect("encrypt should succeed");
+    assert_eq!(
+        encrypted.metadata.context_aad.as_deref(),
+        Some(canonical_aad(&encrypted.metadata.encryption_context).as_slice()),
+        "the seal must pin the exact canonical AAD bytes it fed the AEAD"
+    );
+    let stripped = EncryptionMetadata {
+        context_aad: None,
+        ..encrypted.metadata.clone()
+    };
+    let decrypted = read_all(
+        service
+            .decrypt_object(BUCKET, "derived-aad.bin", encrypted.ciphertext.clone(), &stripped, None)
+            .await
+            .expect("metadata with no stored AAD bytes must open through the derived path"),
+    )
+    .await;
+    assert_eq!(decrypted, data, "the derived AAD must match the bytes the object was sealed under");
+
+    // The SSE-C record carries the same optional field through the same serde
+    // default, so its derived path needs its own proof.
+    let customer_key = [0x66u8; 32];
+    let sse_c = service
+        .encrypt_object_with_customer_key(BUCKET, "derived-aad-c.bin", data.as_slice(), &customer_key, None)
+        .await
+        .expect("SSE-C encrypt should succeed");
+    assert_eq!(
+        sse_c.metadata.context_aad.as_deref(),
+        Some(canonical_aad(&sse_c.metadata.encryption_context).as_slice()),
+        "the SSE-C seal must pin the exact canonical AAD bytes it fed the AEAD"
+    );
+    let stripped = EncryptionMetadata {
+        context_aad: None,
+        ..sse_c.metadata.clone()
+    };
+    let decrypted = read_all(
+        service
+            .decrypt_object_with_customer_key(BUCKET, "derived-aad-c.bin", sse_c.ciphertext.clone(), &stripped, &customer_key)
+            .await
+            .expect("SSE-C metadata with no stored AAD bytes must open through the derived path"),
+    )
+    .await;
+    assert_eq!(decrypted, data, "the SSE-C derived AAD must match the bytes the object was sealed under");
+}

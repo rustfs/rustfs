@@ -409,6 +409,14 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
+    // The write path validates arguments here rather than through
+    // check_bucket_and_object_names, so the on-disk segment budget has to be
+    // enforced in both places or an over-NAME_MAX key still reaches the disk
+    // layer and escapes as ENAMETOOLONG → InternalError 500 (rustfs#5785).
+    if !object_key_segments_fit_on_disk(object) {
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
+    }
+
     Ok(())
 }
 
@@ -444,6 +452,31 @@ mod tests {
         assert!(check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget))).is_ok());
         assert!(matches!(
             check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+    }
+
+    /// rustfs#5785 follow-up: the write path validates through
+    /// check_put_object_args, not check_bucket_and_object_names, so the same
+    /// budget has to hold there — otherwise an over-NAME_MAX PUT still reached
+    /// the disk layer and came back as InternalError 500.
+    #[test]
+    fn put_object_args_enforce_the_same_segment_budget() {
+        assert!(check_put_object_args("bucket", &"a".repeat(255)).is_ok());
+        assert!(matches!(
+            check_put_object_args("bucket", &"a".repeat(256)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        assert!(matches!(
+            check_put_object_args("bucket", &"\u{4e2d}".repeat(100)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        let segmented = ["b".repeat(200), "c".repeat(200), "d".repeat(200)].join("/");
+        assert!(check_put_object_args("bucket", &segmented).is_ok());
+        let dir_budget = 255 - rustfs_utils::path::GLOBAL_DIR_SUFFIX.len();
+        assert!(check_put_object_args("bucket", &format!("{}/", "e".repeat(dir_budget))).is_ok());
+        assert!(matches!(
+            check_put_object_args("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
             Err(StorageError::ObjectNameInvalid(_, _))
         ));
     }

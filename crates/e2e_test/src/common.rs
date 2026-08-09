@@ -47,6 +47,8 @@ use walkdir::WalkDir;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
+pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
+    &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
 

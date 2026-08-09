@@ -597,6 +597,10 @@ fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptio
 }
 
 fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    writer_pool_lookup_opts(opts, no_lock)
+}
+
+fn writer_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = version_aware_lookup_opts(opts, no_lock);
     lookup_opts.skip_decommissioned = true;
     lookup_opts.skip_rebalancing = true;
@@ -607,6 +611,7 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
     let mut lookup_opts = opts.clone();
     lookup_opts.skip_decommissioned = true;
+    lookup_opts.skip_rebalancing = true;
     lookup_opts
 }
 
@@ -1358,7 +1363,7 @@ impl ECStore {
 
         if cp_src_dst_same {
             let pool_idx = self
-                .get_pool_info_existing_with_opts(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+                .get_pool_info_existing_with_opts(src_bucket, &src_object, &writer_pool_lookup_opts(src_opts, true))
                 .await?
                 .0
                 .index;
@@ -1671,7 +1676,7 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let gopts = version_aware_lookup_opts(&opts, true);
+        let gopts = writer_pool_lookup_opts(&opts, true);
 
         if opts.data_movement {
             let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
@@ -1787,6 +1792,10 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
+
             match pool.delete_object(bucket, object, opts.clone()).await {
                 Ok(res) => {
                     if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
@@ -1923,6 +1932,9 @@ impl ECStore {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
+            if self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
             futures.push(pool.delete_objects(bucket, objects.clone(), opts.clone()));
         }
 
@@ -2090,7 +2102,7 @@ impl ECStore {
             ..Default::default()
         };
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         let _ = self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
@@ -2181,7 +2193,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         self.pools[idx]
@@ -2224,7 +2236,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(&opts, opts.no_lock))
             .await?;
 
         let result = self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await;
@@ -2259,7 +2271,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(opts, opts.no_lock))
             .await?;
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
@@ -2294,7 +2306,7 @@ impl ECStore {
         }
 
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &writer_pool_lookup_opts(opts, opts.no_lock))
             .await?;
 
         self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
@@ -2924,6 +2936,23 @@ mod tests {
     }
 
     #[test]
+    fn writer_pool_lookup_opts_skips_rebalance_sources() {
+        let lookup_opts = writer_pool_lookup_opts(
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
     fn data_movement_pool_lookup_opts_keeps_no_lock_for_tiered_moves() {
         let lookup_opts = data_movement_pool_lookup_opts(
             &ObjectOptions {
@@ -2948,6 +2977,7 @@ mod tests {
         });
 
         assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
         assert!(!lookup_opts.no_lock);
     }
 
@@ -2959,6 +2989,7 @@ mod tests {
         });
 
         assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
         assert!(lookup_opts.no_lock);
     }
 

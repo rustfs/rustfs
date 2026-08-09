@@ -20,12 +20,21 @@ use bytes::{Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use reed_solomon_simd;
 use smallvec::SmallVec;
-use std::io;
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, OnceLock, RwLock},
+};
 use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
 
 const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
+const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
+
+type ModernReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<ReedSolomon>>>;
+
+static MODERN_REED_SOLOMON_CACHE: OnceLock<ModernReedSolomonCache> = OnceLock::new();
 
 /// Errors returned when constructing an [`Erasure`] codec.
 #[derive(Debug, thiserror::Error)]
@@ -275,7 +284,7 @@ impl LegacyReedSolomonEncoder {
 pub struct ReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
-    encoder: Option<ReedSolomon>,
+    encoder: Option<Arc<ReedSolomon>>,
 }
 
 impl Clone for ReedSolomonEncoder {
@@ -291,7 +300,7 @@ impl Clone for ReedSolomonEncoder {
 impl ReedSolomonEncoder {
     fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, reed_solomon_erasure::Error> {
         let encoder = if parity_shards > 0 {
-            Some(ReedSolomon::new(data_shards, parity_shards)?)
+            Some(cached_modern_reed_solomon(data_shards, parity_shards)?)
         } else {
             None
         };
@@ -360,6 +369,30 @@ impl ReedSolomonEncoder {
     fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
     }
+}
+
+fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, reed_solomon_erasure::Error> {
+    let key = (data_shards, parity_shards);
+    let cache = MODERN_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    if let Some(encoder) = cache
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(encoder);
+    }
+
+    let encoder = Arc::new(ReedSolomon::new(data_shards, parity_shards)?);
+    let mut cache = cache.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.get(&key) {
+        return Ok(Arc::clone(existing));
+    }
+    if cache.len() < MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES {
+        cache.insert(key, Arc::clone(&encoder));
+    }
+    Ok(encoder)
 }
 
 fn encode_parity_shards<F>(shards: &mut [Option<Vec<u8>>], data_shards: usize, parity_shards: usize, encode: F) -> io::Result<()>
@@ -1270,6 +1303,16 @@ mod tests {
         let legacy = Erasure::try_new_with_options(4, 2, 64, true).expect("legacy codec should construct");
         assert!(legacy.encoder.is_none());
         assert!(legacy.legacy_encoder.is_some());
+    }
+
+    #[test]
+    fn modern_encoder_construction_reuses_cached_codec() {
+        let first = ReedSolomonEncoder::try_new_typed(31, 7).expect("modern codec should construct");
+        let second = ReedSolomonEncoder::try_new_typed(31, 7).expect("modern codec should construct");
+
+        let first = first.encoder.as_ref().expect("modern codec should initialize an encoder");
+        let second = second.encoder.as_ref().expect("modern codec should initialize an encoder");
+        assert!(Arc::ptr_eq(first, second));
     }
 
     #[test]
