@@ -18,9 +18,12 @@ pub mod heal;
 pub use error::{Error, Result};
 pub use heal::{
     HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
-    channel::HealChannelProcessor, progress::HealProgress,
+    channel::HealChannelProcessor,
+    progress::HealProgress,
+    resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -72,6 +75,17 @@ static GLOBAL_HEAL_RUNTIME: OnceCell<HealRuntime> = OnceCell::const_new();
 static GLOBAL_HEAL_RUNTIME_INIT: Mutex<()> = Mutex::const_new(());
 static GLOBAL_HEAL_ACTIVE_TASKS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HEAL_QUEUE_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+/// Local view of durable replacement recovery state. `definitive` only covers
+/// the local survivor-disk records; a distributed caller must additionally
+/// establish that every peer returned a compatible snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementRecoverySnapshot {
+    pub records: Vec<ReplacementRecoveryRecord>,
+    pub definitive: bool,
+    pub reason: Option<String>,
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -240,6 +254,81 @@ pub async fn current_heal_progress_snapshot() -> Option<HealProgress> {
         manager.active_progress_snapshot().await
     } else {
         None
+    }
+}
+
+/// Read all local survivor-disk replacement records without conflating an I/O
+/// failure or conflicting copies with successful completion.
+pub async fn current_replacement_recovery_snapshot() -> ReplacementRecoverySnapshot {
+    if !heal_runtime_initialized() {
+        return ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: false,
+            reason: Some("heal runtime is not initialized".to_string()),
+        };
+    }
+
+    let disks = {
+        let local_disk_map = heal::local_disk_map_read().await;
+        local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
+    };
+    if disks.is_empty() {
+        return ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: false,
+            reason: Some("no local survivor disks are available".to_string()),
+        };
+    }
+
+    let mut records = BTreeMap::<String, ReplacementRecoveryRecord>::new();
+    let mut reason = None;
+    for disk in disks {
+        match ResumeUtils::get_replacement_recovery_records(&disk).await {
+            Ok(disk_records) => {
+                for record in disk_records {
+                    let task_id = record.task_id.clone();
+                    if matches!(record.state, ReplacementRecoveryState::Unknown) {
+                        reason.get_or_insert_with(|| "invalid durable replacement record".to_string());
+                    }
+                    match records.entry(task_id.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(record);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if matches!(entry.get().state, ReplacementRecoveryState::CleanupPending)
+                                && matches!(record.state, ReplacementRecoveryState::Completed) => {}
+                        std::collections::btree_map::Entry::Occupied(mut entry)
+                            if matches!(entry.get().state, ReplacementRecoveryState::Completed)
+                                && matches!(record.state, ReplacementRecoveryState::CleanupPending) =>
+                        {
+                            entry.insert(record);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.insert(ReplacementRecoveryRecord {
+                                task_id,
+                                state: ReplacementRecoveryState::Unknown,
+                                generation: None,
+                                set_disk_id: None,
+                                target_slots: Vec::new(),
+                                reason: Some("conflicting durable replacement records across survivor disks".to_string()),
+                                verified_at: None,
+                            });
+                            reason.get_or_insert_with(|| "conflicting durable replacement records".to_string());
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                reason.get_or_insert_with(|| format!("failed to read local replacement recovery records: {error}"));
+            }
+        }
+    }
+
+    ReplacementRecoverySnapshot {
+        records: records.into_values().collect(),
+        definitive: reason.is_none(),
+        reason,
     }
 }
 
