@@ -1097,6 +1097,10 @@ impl LocalDiskWrapper {
         self.disk.get_object_path_for_io(volume, path)
     }
 
+    pub(crate) fn get_bucket_path_for_io(&self, volume: &str) -> crate::disk::error::Result<std::path::PathBuf> {
+        self.disk.get_bucket_path_for_io(volume)
+    }
+
     pub fn replacement_mount_lease_root(&self) -> Option<std::path::PathBuf> {
         self.disk.replacement_mount_lease_root()
     }

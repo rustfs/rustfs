@@ -736,6 +736,13 @@ impl Disk {
         }
     }
 
+    pub(crate) fn get_bucket_path_for_io_if_local(&self, volume: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_bucket_path_for_io(volume)),
+            Disk::Remote(_) => None,
+        }
+    }
+
     /// Return the descriptor-rooted mount path admitted for automatic
     /// replacement, or `None` when the configured endpoint no longer names
     /// that held mount instance.
