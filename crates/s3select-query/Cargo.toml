@@ -54,5 +54,8 @@ s3s = { workspace = true, features = ["minio"] }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 
+[dev-dependencies]
+rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
+
 [lib]
 doctest = false

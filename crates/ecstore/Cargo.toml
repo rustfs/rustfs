@@ -181,6 +181,7 @@ path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }

@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::SelectObjectSnapshot;
 use crate::query::Context;
-use crate::{QueryError, QueryResult, SelectStore, object_store::EcObjectStore};
+use crate::{QueryError, QueryResult, object_store::EcObjectStore};
 use datafusion::{
     arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     },
+    common::DataFusionError,
     execution::{SessionStateBuilder, config::SessionConfig, context::SessionState, runtime_env::RuntimeEnvBuilder},
     object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path},
     parquet::arrow::ArrowWriter,
@@ -38,6 +40,28 @@ use tokio::{
 use tracing::error;
 
 pub type QueryExecutionGuard = Arc<OwnedSemaphorePermit>;
+
+/// A one-shot query admission reservation handed from the request boundary to
+/// the dispatcher that owns the corresponding concurrency semaphore.
+pub struct QueryAdmission {
+    query_guard: Option<QueryExecutionGuard>,
+}
+
+impl QueryAdmission {
+    pub fn new(query_guard: QueryExecutionGuard) -> Self {
+        Self {
+            query_guard: Some(query_guard),
+        }
+    }
+
+    pub fn into_query_guard(mut self) -> Option<QueryExecutionGuard> {
+        self.query_guard.take()
+    }
+
+    pub(crate) fn unmanaged() -> Self {
+        Self { query_guard: None }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct QueryExecutionOwner {
@@ -300,30 +324,30 @@ impl SessionCtxFactory {
         query_tracker: QueryExecutionTracker,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, Some(query_tracker), None, memory_limit_bytes)
+        self.create_session_ctx_inner(context, None, Some(query_tracker), memory_limit_bytes)
             .await
     }
 
-    #[cfg(test)]
-    async fn create_session_ctx_with_tracker_and_store(
+    pub async fn create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
         &self,
         context: &Context,
+        snapshot: Arc<SelectObjectSnapshot>,
         query_tracker: QueryExecutionTracker,
-        store: Arc<SelectStore>,
+        memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, Some(query_tracker), Some(store), DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
+        self.create_session_ctx_inner(context, Some(snapshot), Some(query_tracker), memory_limit_bytes)
             .await
     }
 
     async fn create_session_ctx_inner(
         &self,
         context: &Context,
+        snapshot: Option<Arc<SelectObjectSnapshot>>,
         query_tracker: Option<QueryExecutionTracker>,
-        store: Option<Arc<SelectStore>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
         let df_session_ctx = self
-            .build_df_session_context(context, query_tracker.clone(), store, memory_limit_bytes)
+            .build_df_session_context(context, snapshot, query_tracker.clone(), memory_limit_bytes)
             .await?;
 
         Ok(SessionCtx {
@@ -336,8 +360,8 @@ impl SessionCtxFactory {
     async fn build_df_session_context(
         &self,
         context: &Context,
+        snapshot: Option<Arc<SelectObjectSnapshot>>,
         query_tracker: Option<QueryExecutionTracker>,
-        store: Option<Arc<SelectStore>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionContext> {
         let path = format!("s3://{}", context.input.bucket);
@@ -416,11 +440,13 @@ impl SessionCtxFactory {
         } else {
             let store: EcObjectStore = match query_tracker {
                 Some(query_tracker) => {
-                    EcObjectStore::new_with_query_tracker(context.input.clone(), memory_pool, query_tracker, store)
+                    EcObjectStore::new_with_query_tracker(context.input.clone(), memory_pool, query_tracker, snapshot)
                 }
-                None => EcObjectStore::new_with_memory_pool(context.input.clone(), memory_pool),
+                None => EcObjectStore::new_with_memory_pool(context.input.clone(), memory_pool, snapshot),
             }
-            .map_err(|_| QueryError::NotImplemented { err: String::new() })?;
+            .map_err(|err| QueryError::Datafusion {
+                source: Box::new(DataFusionError::External(Box::new(err))),
+            })?;
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         };
 
@@ -498,6 +524,7 @@ mod tests {
         },
         execution::memory_pool::MemoryLimit,
     };
+    use http::HeaderMap;
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, JSONInput, OutputSerialization, ParquetInput, ScanRange,
         SelectObjectContentInput, SelectObjectContentRequest,
@@ -529,6 +556,16 @@ mod tests {
                 },
             }),
         }
+    }
+
+    async fn prepare_test_snapshot(context: &Context) -> Arc<SelectObjectSnapshot> {
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        Arc::new(
+            env.ecstore
+                .prepare_select_object_snapshot(&context.input.bucket, &context.input.key, &HeaderMap::new(), &Default::default())
+                .await
+                .expect("prepare SelectObjectContent snapshot"),
+        )
     }
 
     #[test]
@@ -679,10 +716,57 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_session_preserves_lazy_snapshot_entry() {
+        let _env = crate::storage_api::select_test_ecstore_env().await;
+        let session = SessionCtxFactory::new(false)
+            .create_session_ctx(&test_context())
+            .await
+            .expect("legacy production session should install a lazy object store");
+
+        assert_eq!(session.inner().config().target_partitions(), SessionConfig::new().target_partitions());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_tracked_production_session_preserves_lazy_snapshot_entry() {
+        let _env = crate::storage_api::select_test_ecstore_env().await;
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("query permit should be available");
+        let tracker = QueryExecutionTracker::new(
+            &QueryExecutionOwner::new(),
+            Arc::new(permit),
+            Instant::now() + std::time::Duration::from_secs(300),
+            300,
+        );
+        let session = SessionCtxFactory::new(false)
+            .create_session_ctx_with_tracker_and_memory_limit(
+                &test_context(),
+                tracker.clone(),
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
+            .await
+            .expect("legacy tracked session should install a lazy object store");
+
+        assert!(session.is_bound_to(&tracker));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn session_factory_propagates_query_guard_to_ec_store() {
         let env = crate::storage_api::select_test_ecstore_env().await;
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input).bucket = "s3select-query-guard-snapshot".to_string();
+        env.make_bucket(&context.input.bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(b"id,name\n1,Alice\n".to_vec());
+        env.ecstore
+            .put_object(&context.input.bucket, &context.input.key, &mut reader, &Default::default())
+            .await
+            .expect("put query guard fixture");
+        let snapshot = prepare_test_snapshot(&context).await;
 
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = Arc::clone(&admission)
@@ -697,13 +781,63 @@ mod tests {
             300,
         );
         let session = SessionCtxFactory::new(false)
-            .create_session_ctx_with_tracker_and_store(&test_context(), query_tracker, Arc::clone(&env.ecstore))
+            .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                &context,
+                snapshot,
+                query_tracker,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
             .await
             .expect("production session should be created with the query guard");
 
         assert!(Arc::strong_count(&query_guard) > 1);
         drop(session);
         assert_eq!(Arc::strong_count(&query_guard), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn session_factory_preserves_snapshot_binding_error_source() {
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let mut source_context = test_context();
+        Arc::make_mut(&mut source_context.input).bucket = "s3select-session-snapshot-identity".to_string();
+        Arc::make_mut(&mut source_context.input).key = "source.csv".to_string();
+        env.make_bucket(&source_context.input.bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(b"source-marker\n".to_vec());
+        env.ecstore
+            .put_object(&source_context.input.bucket, &source_context.input.key, &mut reader, &Default::default())
+            .await
+            .expect("put snapshot identity fixture");
+        let snapshot = prepare_test_snapshot(&source_context).await;
+
+        let mut target_context = source_context.clone();
+        Arc::make_mut(&mut target_context.input).key = "different.csv".to_string();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("query permit should be available");
+        let tracker = QueryExecutionTracker::new(
+            &QueryExecutionOwner::new(),
+            Arc::new(permit),
+            Instant::now() + std::time::Duration::from_secs(300),
+            300,
+        );
+
+        let error = match SessionCtxFactory::new(false)
+            .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                &target_context,
+                snapshot,
+                tracker,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
+            .await
+        {
+            Ok(_) => panic!("a session must reject a snapshot for a different object"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_snapshot_consistency_error());
+        assert!(error.to_string().contains("snapshot consistency failure"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -721,6 +855,7 @@ mod tests {
         assert!(data.len() > 1024 * 1024);
 
         let mut context = test_context();
+        Arc::make_mut(&mut context.input).bucket = "s3select-scan-range-partition-snapshot".to_string();
         let selected_start = i64::try_from(SELECTED_ROW * ROW_WIDTH).expect("selected row offset should fit in i64");
         Arc::make_mut(&mut context.input).request.scan_range = Some(ScanRange {
             start: Some(selected_start),
@@ -732,6 +867,7 @@ mod tests {
             .put_object(&context.input.bucket, &context.input.key, &mut reader, &Default::default())
             .await
             .expect("put large ScanRange CSV fixture");
+        let snapshot = prepare_test_snapshot(&context).await;
 
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = Arc::clone(&admission)
@@ -746,7 +882,12 @@ mod tests {
         );
         let session = SessionCtxFactory::new(false)
             .with_target_partitions(2)
-            .create_session_ctx_with_tracker_and_store(&context, query_tracker, Arc::clone(&env.ecstore))
+            .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                &context,
+                snapshot,
+                query_tracker,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
             .await
             .expect("create production ScanRange session");
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
