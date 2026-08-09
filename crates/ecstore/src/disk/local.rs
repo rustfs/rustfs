@@ -7353,13 +7353,14 @@ impl DiskAPI for LocalDisk {
             let file_path = self.get_object_path(volume, path)?;
             let lock_path = file_path.with_extension("rustfs-cas.lock");
             let path = path.to_string();
+            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             return Ok(tokio::task::spawn_blocking(move || {
                 let lock = std::fs::OpenOptions::new()
                     .create(true)
                     .read(true)
                     .write(true)
                     .open(&lock_path)?;
-                flock(&lock, FlockOperation::LockExclusive).map_err(std::io::Error::from)?;
+                flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)?;
                 let result = (|| {
                     let current = match std::fs::read(&file_path) {
                         Ok(current) => Some(current),
@@ -7387,7 +7388,9 @@ impl DiskAPI for LocalDisk {
                             let write_result = (|| -> std::io::Result<()> {
                                 let mut staged = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
                                 staged.write_all(&replacement)?;
-                                staged.sync_all()?;
+                                if sync_metadata {
+                                    staged.sync_all()?;
+                                }
                                 std::fs::rename(&temporary, &file_path)?;
                                 Ok(())
                             })();
@@ -7395,11 +7398,13 @@ impl DiskAPI for LocalDisk {
                                 let _ = std::fs::remove_file(&temporary);
                                 return Err(err);
                             }
-                            os::fsync_dir_std(parent)?;
+                            if sync_metadata {
+                                os::fsync_dir_std(parent)?;
+                            }
                         }
                         None => {
                             std::fs::remove_file(&file_path)?;
-                            if let Some(parent) = file_path.parent() {
+                            if sync_metadata && let Some(parent) = file_path.parent() {
                                 os::fsync_dir_std(parent)?;
                             }
                         }
@@ -20004,6 +20009,38 @@ mod test {
                 .expect("new owner marker should remain"),
             owner_b
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_file_update_returns_would_block_when_marker_lock_is_contended() {
+        use rustix::fs::{FlockOperation, flock};
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let lock_path = marker_path.with_extension("rustfs-cas.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .expect("marker lock should open");
+        flock(&lock, FlockOperation::LockExclusive).expect("marker lock should be held");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(Bytes::from_static(b"owner"))),
+        )
+        .await
+        .expect("contended conditional update must not block")
+        .expect_err("contended conditional update must retry");
+
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::WouldBlock));
     }
 
     #[cfg(target_os = "linux")]
