@@ -2579,10 +2579,6 @@ impl HealManager {
                                 Ok(task_ids) => task_ids,
                                 Err(error) => {
                                     if let Some(set_disk_id) = &disk_set_disk_id {
-                                        replacement_recovery_blocked_sets
-                                            .lock()
-                                            .expect("replacement recovery blocked set lock poisoned")
-                                            .insert(set_disk_id.clone());
                                         conflicted_recovery_sets.insert(set_disk_id.clone());
                                     }
                                     warn!(
@@ -2602,10 +2598,6 @@ impl HealManager {
                                     Ok(resume_manager) => resume_manager,
                                     Err(error) => {
                                         if let Some(set_disk_id) = &disk_set_disk_id {
-                                            replacement_recovery_blocked_sets
-                                                .lock()
-                                                .expect("replacement recovery blocked set lock poisoned")
-                                                .insert(set_disk_id.clone());
                                             conflicted_recovery_sets.insert(set_disk_id.clone());
                                         }
                                         warn!(
