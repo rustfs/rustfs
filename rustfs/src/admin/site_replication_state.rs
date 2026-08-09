@@ -53,11 +53,21 @@ use super::runtime_sources::current_object_store_handle;
 /// byte-level tolerant reload on the service side.
 pub(crate) const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 
-/// Transitional process-local mutex — see the module docs. `pub(crate)` so
-/// not-yet-migrated call sites in `handlers::site_replication` keep taking
-/// it directly until PR2 migrates them.
-pub(crate) static SITE_REPLICATION_STATE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+/// Transitional process-local mutex — see the module docs. Stays private to
+/// this module (owner-local static, enforced by
+/// `scripts/check_architecture_migration_rules.sh`); callers go through
+/// [`site_replication_state_process_guard`].
+static SITE_REPLICATION_STATE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Owner helper for the transitional process mutex: the RMW call sites in
+/// `handlers::site_replication` that PR2 has not migrated to
+/// [`with_site_replication_state_lock`] yet hold this guard so they stay
+/// mutually exclusive with the migrated ones. Removed together with the
+/// mutex once every call site runs inside the transaction boundary.
+pub(crate) async fn site_replication_state_process_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SITE_REPLICATION_STATE_LOCK.lock().await
+}
 
 /// Run `operation` under the site-replication state transaction boundary:
 /// process mutex first, then the distributed state-object write lock.

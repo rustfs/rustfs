@@ -112,7 +112,7 @@ const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
 use crate::admin::site_replication_state::{
-    SITE_REPLICATION_STATE_LOCK, SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock,
+    SITE_REPLICATION_STATE_PATH, site_replication_state_process_guard, with_site_replication_state_lock,
 };
 const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
 const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
@@ -346,7 +346,8 @@ impl TryFrom<&PeerSite> for PeerConnection {
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
 // Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
-// The state mutex now lives in crate::admin::site_replication_state (P1-15).
+// The state mutex lives in crate::admin::site_replication_state and is
+// taken through site_replication_state_process_guard (P1-15).
 static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
@@ -2687,7 +2688,7 @@ fn is_missing_service_account_error(err: &rustfs_iam::error::Error) -> bool {
 /// disables every control-plane push while `replicate info` still reports the site enabled.
 /// Both used to require deleting and recreating the account by hand.
 async fn reconcile_site_replicator_service_account() -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let state = load_site_replication_state().await?;
     if !state.enabled() || state.service_account_access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
         return Ok(());
@@ -3859,7 +3860,7 @@ async fn persist_site_replication_repair_task(
 ) -> S3Result<()> {
     persist_site_replication_repair_operation(operation).await?;
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut latest = load_site_replication_state().await?;
     let family_status = operation
         .sites
@@ -3937,7 +3938,7 @@ async fn execute_site_replication_repair_locked(
     request: SiteReplicationRepairExecutionRequest,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let state = {
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
         if !state.enabled() || state.service_account_access_key.is_empty() {
             return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -4060,7 +4061,7 @@ async fn execute_site_replication_repair_locked(
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
     let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
     let runtime = {
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let Some(runtime) = runtime_site_replication_targets().await? else {
             return Ok(());
         };
@@ -6053,7 +6054,7 @@ async fn record_pending_rotation_secret_candidate(rotation_id: &str, secret: Str
         return Ok(());
     }
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if let Some(pending) = state.pending_rotation.as_mut()
         && pending.id == rotation_id
@@ -6069,7 +6070,7 @@ async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String)
         return Ok(());
     }
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if let Some(pending) = state.pending_remove.as_mut()
         && pending.id == remove_id
@@ -6109,7 +6110,7 @@ async fn mark_pending_remove_peer_acked(remove_id: &str, deployment_id: &str) ->
 }
 
 async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     let Some(pending) = state.pending_rotation.as_ref() else {
         return Ok(true);
@@ -6127,7 +6128,7 @@ async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &P
 }
 
 async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let state = load_site_replication_state().await?;
     let Some(pending) = state.pending_remove.as_ref() else {
         return Ok(None);
@@ -6143,7 +6144,7 @@ async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo
 }
 
 async fn clear_pending_remove(remove_id: &str) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state
         .pending_remove
@@ -7222,7 +7223,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
             .await
             .map_err(ApiError::from)?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -7543,7 +7544,7 @@ async fn refresh_site_resync_status(mut status: SRResyncOpStatus, peer: &PeerInf
 }
 
 async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state
         .resync_status
@@ -7557,7 +7558,7 @@ async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) ->
 }
 
 async fn persist_new_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state.resync_status.get(peer_id).is_some_and(site_resync_is_active) {
         return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
@@ -8173,7 +8174,7 @@ impl Operation for SiteReplicationAddHandler {
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
-        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let state_guard = site_replication_state_process_guard().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -8196,7 +8197,7 @@ impl Operation for SiteReplicationAddHandler {
         let expected_updated_at = current_state.updated_at;
         drop(state_guard);
         require_add_peer_tls_capability(&sites, &local_peer).await?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let latest_state = load_site_replication_state().await?;
         if latest_state.updated_at != expected_updated_at || pending_endpoint_refresh(&latest_state).is_some() {
             return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
@@ -8338,7 +8339,7 @@ impl Operation for SiteReplicationRemoveHandler {
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let current_state = load_site_replication_state().await?;
             if pending_endpoint_refresh(&current_state).is_some() {
                 return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -8544,7 +8545,7 @@ impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
@@ -8820,7 +8821,7 @@ impl Operation for SiteReplicationEditHandler {
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let body = read_site_replication_body(req, &cred.secret_key, true).await?;
         let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
-        let mut state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+        let mut state_guard = Some(site_replication_state_process_guard().await);
         let current_state = load_site_replication_state().await?;
         apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
@@ -8867,7 +8868,7 @@ impl Operation for SiteReplicationEditHandler {
             if tls_transport_probe_required {
                 probe_proposed_peer_tls_transport(&incoming, &current_state.service_account_access_key, &secret).await?;
             }
-            state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+            state_guard = Some(site_replication_state_process_guard().await);
             let latest_state = load_site_replication_state().await?;
             if latest_state.updated_at != expected_updated_at
                 || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
@@ -8939,7 +8940,7 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+                state_guard = Some(site_replication_state_process_guard().await);
                 let latest_state = load_site_replication_state().await?;
                 if latest_state.updated_at != expected_updated_at
                     || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
@@ -8992,7 +8993,7 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+                let _state_guard = site_replication_state_process_guard().await;
                 let mut state = load_site_replication_state().await?;
                 let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -9007,7 +9008,7 @@ impl Operation for SiteReplicationEditHandler {
                     site_replicator_service_account_secret(&state.service_account_access_key).await?;
                 drop(_state_guard);
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-                let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+                let _state_guard = site_replication_state_process_guard().await;
                 let mut state = load_site_replication_state().await?;
                 let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -9077,7 +9078,7 @@ impl Operation for SRPeerEditHandler {
         let queries = query_pairs(&req.uri);
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
-        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
         if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
             return json_response(&ReplicateEditStatus {
@@ -9161,7 +9162,7 @@ impl Operation for SRPeerEditHandler {
             let pending_id = refresh_id.unwrap_or_default();
             drop(state_guard);
             refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let mut state = load_site_replication_state().await?;
             let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                 return json_response(&ReplicateEditStatus {
@@ -9194,7 +9195,7 @@ impl Operation for SRPeerRemoveHandler {
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -9238,7 +9239,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (peer, existing_status) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let state = load_site_replication_state().await?;
             let local_peer = current_local_runtime_peer(&state);
             let requested_peer = normalize_peer_info(requested_peer);
@@ -9399,7 +9400,7 @@ impl Operation for SRStateEditHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
@@ -9414,7 +9415,7 @@ impl Operation for SiteReplicationRepairHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let (state, local_peer) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let state = load_site_replication_state().await?;
             if !state.enabled() || state.service_account_access_key.is_empty() {
                 return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -9525,7 +9526,7 @@ impl Operation for SRRotateServiceAccountHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let (pending_rotation, local_peer, previous_access_key) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let mut state = load_site_replication_state().await?;
             if !state.enabled() {
                 return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -11669,14 +11670,14 @@ mod tests {
         let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
         let add_guard =
             SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
-        let add_state = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let add_state = site_replication_state_process_guard().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
         let remove = tokio::spawn(async move {
             let _ = started_tx.send(());
             let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
             let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state = site_replication_state_process_guard().await;
             let _ = entered_tx.send(());
         });
         started_rx.await.expect("remove task started");
