@@ -684,9 +684,15 @@ impl ResumeStateFile {
 }
 
 fn is_replacement_intent(state: &ResumeState) -> bool {
-    state.replacement_generation.is_some()
-        || !state.replacement_targets.is_empty()
-        || !matches!(state.replacement_phase, ReplacementPhase::None)
+    state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent
+                | ReplacementPhase::Rebuilding
+                | ReplacementPhase::Verified
+                | ReplacementPhase::CleanupPending
+                | ReplacementPhase::Abandoned
+        )
 }
 
 impl ResumeManager {
@@ -1739,6 +1745,7 @@ impl ResumeUtils {
             })?;
         let proof_suffix = format!("_{REPLACEMENT_COMPLETION_PROOF_FILE}");
         let mut records = Vec::new();
+        let mut intent_task_ids = HashSet::new();
 
         for task_id in Self::get_replacement_intent_tasks(disk).await? {
             let state = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
@@ -1746,6 +1753,7 @@ impl ResumeUtils {
                 .get_state()
                 .await;
             if let Some(record) = ReplacementRecoveryRecord::from_state(state) {
+                intent_task_ids.insert(task_id);
                 records.push(record);
             }
         }
@@ -1755,6 +1763,9 @@ impl ResumeUtils {
                 continue;
             };
             if validate_resume_task_id(task_id).is_err() {
+                continue;
+            }
+            if intent_task_ids.contains(task_id) {
                 continue;
             }
             let proof = ResumeManager::load_replacement_completion_proof(disk.clone(), task_id).await?;
@@ -2174,6 +2185,13 @@ mod tests {
             .mark_replacement_completed_and_verified()
             .await
             .expect("completion proof should persist");
+
+        let cleanup_pending = ResumeUtils::get_replacement_recovery_records(&disk)
+            .await
+            .expect("cleanup-pending replacement record should be readable");
+        assert_eq!(cleanup_pending.len(), 1);
+        assert_eq!(cleanup_pending[0].state, ReplacementRecoveryState::CleanupPending);
+
         manager.cleanup().await.expect("resume state cleanup should succeed");
 
         let completed = ResumeUtils::get_replacement_recovery_records(&disk)
