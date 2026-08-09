@@ -19,13 +19,6 @@ use std::{
 
 use super::{Endpoint, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
 
-// This is compiled into debug builds only so the single-host E2E harness can
-// exercise the automatic replacement path without pretending its temporary
-// directories are separate physical mounts. Release builds always require the
-// physical-device and mount-point checks below.
-#[cfg(debug_assertions)]
-const TEST_AUTO_REPLACEMENT_READINESS_BYPASS: &str = "RUSTFS_TEST_AUTO_REPLACEMENT_READINESS_BYPASS";
-
 pub(crate) async fn auto_replacement_target_ready(endpoint: &Endpoint, local_endpoints: &[Endpoint]) -> bool {
     auto_replacement_target_identity(endpoint, local_endpoints).await.is_some()
 }
@@ -46,39 +39,32 @@ pub(crate) async fn auto_replacement_target_identity(
         .collect::<Vec<_>>();
     let endpoint = endpoint.to_string();
     tokio::task::spawn_blocking(move || {
-        #[cfg(debug_assertions)]
-        let test_bypass = std::env::var_os(TEST_AUTO_REPLACEMENT_READINESS_BYPASS).is_some();
-        #[cfg(not(debug_assertions))]
-        let test_bypass = false;
         let path = path.to_string_lossy().into_owned();
         let canonical_path = fs::canonicalize(&path).ok()?;
         let metadata = fs::metadata(&canonical_path).ok()?;
         let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(path.as_ref()) else {
             return None;
         };
-        if !test_bypass {
-            let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
-                return None;
-            };
-            if target_device_ids.is_empty()
-                || root_device_ids.is_empty()
-                || target_device_ids.iter().any(|target| root_device_ids.contains(target))
-                || !rustfs_utils::os::is_mount_point(Path::new(&path)).unwrap_or(false)
-            {
-                return None;
-            }
-
-            if sibling_paths.iter().any(|sibling| {
-                rustfs_utils::os::get_physical_device_ids(sibling)
-                    .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
-                    .unwrap_or(true)
-            }) {
-                return None;
-            }
+        let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
+            return None;
+        };
+        if target_device_ids.is_empty()
+            || root_device_ids.is_empty()
+            || target_device_ids.iter().any(|target| root_device_ids.contains(target))
+            || !rustfs_utils::os::is_mount_point(Path::new(&path)).unwrap_or(false)
+        {
+            return None;
         }
 
-        let filesystem_identity = filesystem_identity(&metadata, &canonical_path)
-            .or_else(|| test_bypass.then(|| format!("test:{}", canonical_path.to_string_lossy())))?;
+        if sibling_paths.iter().any(|sibling| {
+            rustfs_utils::os::get_physical_device_ids(sibling)
+                .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
+                .unwrap_or(true)
+        }) {
+            return None;
+        }
+
+        let filesystem_identity = filesystem_identity(&metadata, &canonical_path)?;
 
         Some(ReplacementTargetIdentity {
             endpoint,
@@ -148,4 +134,28 @@ fn filesystem_identity(metadata: &fs::Metadata, _canonical_path: &Path) -> Optio
 #[cfg(not(unix))]
 fn filesystem_identity(_metadata: &fs::Metadata, _canonical_path: &Path) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn runtime_environment_cannot_bypass_mount_admission() {
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_TEST_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
+                ("RUSTFS_E2E_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
+            ],
+            async {
+                let temp = TempDir::new().expect("temporary replacement root should be created");
+                let endpoint =
+                    Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("replacement endpoint should parse");
+
+                assert!(!auto_replacement_target_ready(&endpoint, std::slice::from_ref(&endpoint)).await);
+            },
+        )
+        .await;
+    }
 }
