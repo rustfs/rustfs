@@ -84,11 +84,22 @@ pub(crate) mod fsync_dir_recorder {
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     pub(crate) fn record(dir: &Path) {
-        RECORDED.lock().expect("fsync dir recorder poisoned").push(dir.to_path_buf());
+        let mut recorded = RECORDED.lock().expect("fsync dir recorder poisoned");
+        recorded.push(dir.to_path_buf());
+        if let Ok(canonical) = dir.canonicalize()
+            && canonical != dir
+        {
+            recorded.push(canonical);
+        }
     }
 
     pub(crate) fn was_fsynced(dir: &Path) -> bool {
-        RECORDED.lock().expect("fsync dir recorder poisoned").iter().any(|p| p == dir)
+        let canonical = dir.canonicalize().ok();
+        RECORDED
+            .lock()
+            .expect("fsync dir recorder poisoned")
+            .iter()
+            .any(|p| p == dir || canonical.as_ref().is_some_and(|canonical| p == canonical))
     }
 }
 

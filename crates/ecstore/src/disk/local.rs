@@ -542,34 +542,26 @@ fn empty_tree_io_error(err: rustix::io::Errno) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn remove_empty_directory_tree_unix_with(
+fn remove_empty_directory_tree_unix_at(
+    root_parent: impl std::os::fd::AsFd,
+    root_name: &std::ffi::CStr,
     root: &Path,
     mut before_descend: impl FnMut(&Path) -> std::io::Result<()>,
     mut before_remove: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use rustix::{
-        fs::{AtFlags, Dir, Mode, OFlags, fstat, open, openat, statat, unlinkat},
+        fs::{AtFlags, Dir, Mode, OFlags, fstat, openat, statat, unlinkat},
         io::Errno,
     };
-    use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStrExt;
 
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let root_parent_path = root
-        .parent()
-        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
-    let root_name = root
-        .file_name()
-        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?
-        .as_bytes();
-    let root_name = std::ffi::CString::new(root_name).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
-    let root_parent = open(root_parent_path, flags, Mode::empty()).map_err(empty_tree_io_error)?;
-    let root_fd = openat(&root_parent, root_name.as_c_str(), flags, Mode::empty()).map_err(empty_tree_io_error)?;
+    let root_fd = openat(&root_parent, root_name, flags, Mode::empty()).map_err(empty_tree_io_error)?;
     // Each frame owns one directory iterator/FD, so memory and descriptors are
     // bounded by path depth rather than by the number of empty remnants.
     let mut stack = vec![EmptyDirectoryFrame {
         path: root.to_path_buf(),
-        name_in_parent: root_name,
+        name_in_parent: root_name.to_owned(),
         entries: Dir::new(root_fd).map_err(empty_tree_io_error)?,
     }];
 
@@ -633,6 +625,42 @@ fn remove_empty_directory_tree_unix_with(
 }
 
 #[cfg(unix)]
+fn remove_empty_directory_tree_unix_with(
+    root: &Path,
+    before_descend: impl FnMut(&Path) -> std::io::Result<()>,
+    before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags, open};
+    use std::os::unix::ffi::OsStrExt;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root_parent_path = root
+        .parent()
+        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?
+        .as_bytes();
+    let root_name = std::ffi::CString::new(root_name).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
+    let root_parent = open(root_parent_path, flags, Mode::empty()).map_err(empty_tree_io_error)?;
+    remove_empty_directory_tree_unix_at(&root_parent, root_name.as_c_str(), root, before_descend, before_remove)
+}
+
+#[cfg(target_os = "linux")]
+async fn remove_empty_directory_tree_under_mount_lease(
+    mount_lease: &std::fs::File,
+    volume: &str,
+    root: PathBuf,
+) -> std::io::Result<()> {
+    let root_parent = mount_lease.try_clone()?;
+    let root_name = std::ffi::CString::new(volume.as_bytes()).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
+    tokio::task::spawn_blocking(move || {
+        remove_empty_directory_tree_unix_at(&root_parent, root_name.as_c_str(), &root, |_| Ok(()), |_| Ok(()))
+    })
+    .await?
+}
+
+#[cfg(unix)]
 async fn remove_empty_directory_tree_with(
     root: &Path,
     before_descend: impl FnMut(&Path) -> std::io::Result<()>,
@@ -641,7 +669,7 @@ async fn remove_empty_directory_tree_with(
     remove_empty_directory_tree_unix_with(root, before_descend, before_remove)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || remove_empty_directory_tree_unix_with(&root, |_| Ok(()), |_| Ok(()))).await?
@@ -5303,6 +5331,10 @@ impl LocalDisk {
 
     pub(crate) fn get_object_path_for_io(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         self.io_get_object_path(bucket, key)
+    }
+
+    pub(crate) fn get_bucket_path_for_io(&self, bucket: &str) -> Result<PathBuf> {
+        self.io_get_bucket_path(bucket)
     }
 
     fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
@@ -10103,7 +10135,14 @@ impl DiskAPI for LocalDisk {
         let res = if force_delete {
             fs::remove_dir_all(&p).await
         } else {
-            remove_empty_directory_tree(&p).await
+            #[cfg(target_os = "linux")]
+            {
+                remove_empty_directory_tree_under_mount_lease(&self.mount_lease, volume, p.clone()).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                remove_empty_directory_tree(&p).await
+            }
         };
 
         if let Err(err) = res {
@@ -17163,6 +17202,26 @@ mod test {
             .expect("non-force delete should remove an empty directory tree");
 
         assert!(matches!(disk.stat_volume(bucket).await, Err(DiskError::VolumeNotFound)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_volume_non_force_removes_empty_bucket_under_mount_lease_root() {
+        let root = tempfile::tempdir().expect("temporary disk root should be created");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "mount-lease-empty-delete";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+        fs::create_dir_all(root.path().join(bucket).join("deleted/object/path"))
+            .await
+            .expect("empty object remnant should be created");
+
+        disk.delete_volume(bucket, false)
+            .await
+            .expect("non-force delete should remove empty remnants through the held mount lease");
+
+        assert!(!root.path().join(bucket).exists(), "empty bucket should be removed");
     }
 
     #[tokio::test]
