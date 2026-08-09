@@ -397,6 +397,26 @@ fn namespace_write_handlers_bound_request_bodies() {
 }
 
 #[test]
+fn table_ref_write_handlers_install_commit_publication_guard() {
+    let src = table_catalog_handler_source();
+    for handler in ["PutTableRefHandler", "DeleteTableRefHandler"] {
+        let block = operation_block(&src, handler);
+        assert!(
+            block.contains("install_table_catalog_s3_request_info(&mut req, &principal)?;"),
+            "{handler} should install exact-key S3 authorization context"
+        );
+        assert!(
+            block.contains("TableCommitObjectBackend::for_request(metadata_backend, req)"),
+            "{handler} should use the guarded table commit backend"
+        );
+        assert!(
+            block.contains("commit_backend.finish(result).await?"),
+            "{handler} should preserve exact-key authorization errors"
+        );
+    }
+}
+
+#[test]
 fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_state() {
     let src = table_catalog_handler_source();
 
@@ -2581,6 +2601,81 @@ async fn commit_publication_holds_referenced_object_locks_until_pointer_publish(
             "snapshot object lock must be released after catalog publication: {location}"
         );
     }
+}
+
+#[tokio::test]
+async fn commit_publication_acquires_discovered_object_locks_in_key_order() {
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let first = "metadata/a.json";
+    let last = "metadata/z.json";
+    metadata_backend.put_bytes("warehouse", first, b"a".to_vec()).await;
+    metadata_backend.put_bytes("warehouse", last, b"z".to_vec()).await;
+    let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+
+    crate::table_catalog::TableCatalogObjectBackend::read_object(&commit_backend, "warehouse", last)
+        .await
+        .expect("last object discovery should succeed");
+    let first_writer = crate::table_catalog::TableCatalogObjectBackend::acquire_write_lock(&metadata_backend, "warehouse", first)
+        .await
+        .expect("first object writer should acquire its lock");
+    tokio::time::timeout(
+        StdDuration::from_secs(2),
+        crate::table_catalog::TableCatalogObjectBackend::read_object(&commit_backend, "warehouse", first),
+    )
+    .await
+    .expect("discovery must not retain the last object's lock")
+    .expect("first object discovery should succeed");
+
+    metadata_backend.lock_attempts.lock().await.clear();
+    let publication_backend = commit_backend.clone();
+    let publication = tokio::spawn(async move {
+        crate::table_catalog::TableCatalogObjectBackend::prepare_table_commit_publication(&publication_backend).await
+    });
+    metadata_backend.wait_for_lock_attempts(1).await;
+    assert_eq!(
+        metadata_backend.lock_attempts.lock().await.as_slice(),
+        &[("warehouse".to_string(), first.to_string())]
+    );
+
+    let last_writer = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        crate::table_catalog::TableCatalogObjectBackend::acquire_write_lock(&metadata_backend, "warehouse", last),
+    )
+    .await
+    .expect("publication waiting on the first key must not retain the last key")
+    .expect("last object writer should acquire its lock");
+    drop(last_writer);
+    drop(first_writer);
+    tokio::time::timeout(StdDuration::from_secs(2), publication)
+        .await
+        .expect("ordered publication locking should complete")
+        .expect("publication task should join")
+        .expect("publication preparation should succeed");
+    assert_eq!(
+        metadata_backend.lock_attempts.lock().await.as_slice(),
+        &[
+            ("warehouse".to_string(), first.to_string()),
+            ("warehouse".to_string(), last.to_string()),
+        ]
+    );
+    crate::table_catalog::TableCatalogObjectBackend::complete_table_commit_publication(&commit_backend).await;
+}
+
+#[tokio::test]
+async fn commit_publication_revalidates_objects_after_ordered_lock_acquisition() {
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let object = "metadata/current.json";
+    metadata_backend.put_bytes("warehouse", object, b"before".to_vec()).await;
+    let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+    crate::table_catalog::TableCatalogObjectBackend::read_object(&commit_backend, "warehouse", object)
+        .await
+        .expect("object discovery should succeed");
+    metadata_backend.put_bytes("warehouse", object, b"after".to_vec()).await;
+
+    let error = crate::table_catalog::TableCatalogObjectBackend::prepare_table_commit_publication(&commit_backend)
+        .await
+        .expect_err("changed object must fail publication preparation");
+    assert!(matches!(error, crate::table_catalog::TableCatalogStoreError::Conflict(_)));
 }
 
 #[tokio::test]
@@ -5104,7 +5199,7 @@ async fn view_catalog_responses_persist_replace_and_drop_view_metadata() {
 }
 
 #[tokio::test]
-async fn table_ref_write_responses_commit_retention_refs_and_protect_deletes() {
+async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::default();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5143,16 +5238,59 @@ async fn table_ref_write_responses_commit_retention_refs_and_protect_deletes() {
         .await
         .expect("append should commit");
 
-    let ref_request: PutTableRefRequest = serde_json::from_value(serde_json::json!({
+    let ref_request_json = serde_json::json!({
         "snapshot-id": 10,
         "type": "tag",
         "max-ref-age-ms": 86400000,
         "expected-snapshot-id": null
-    }))
-    .expect("ref put request should parse");
-    put_table_ref_response(&store, &metadata_backend, "warehouse", &namespace, "events", "audit", ref_request)
+    });
+    let before = store
+        .load_table("warehouse", "analytics", "events")
         .await
-        .expect("ref put should commit");
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let denied_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let denied_backend = TableCommitObjectBackend::test(
+        metadata_backend.clone(),
+        Arc::clone(&denied_authorizations),
+        Some(before.metadata_location.clone()),
+    );
+    let denied_request: PutTableRefRequest =
+        serde_json::from_value(ref_request_json.clone()).expect("denied ref put request should parse");
+    let denied =
+        put_table_ref_response(&store, &denied_backend, "warehouse", &namespace, "events", "audit", denied_request).await;
+    let error = denied_backend
+        .finish(denied)
+        .await
+        .expect_err("ref writes must honor exact object authorization");
+    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    assert!(
+        denied_authorizations
+            .lock()
+            .await
+            .contains(&(before.metadata_location.clone(), S3Action::GetObjectAction))
+    );
+    let after_denial = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should remain");
+    assert_eq!(after_denial.metadata_location, before.metadata_location);
+    assert_eq!(after_denial.version_token, before.version_token);
+    assert_eq!(after_denial.generation, before.generation);
+
+    let ref_request: PutTableRefRequest = serde_json::from_value(ref_request_json).expect("ref put request should parse");
+    let ref_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let ref_backend = TableCommitObjectBackend::test(metadata_backend.clone(), Arc::clone(&ref_authorizations), None);
+    let result = put_table_ref_response(&store, &ref_backend, "warehouse", &namespace, "events", "audit", ref_request).await;
+    ref_backend.finish(result).await.expect("ref put should commit");
+    assert!(
+        ref_authorizations
+            .lock()
+            .await
+            .iter()
+            .any(|(_, action)| *action == S3Action::PutObjectAction)
+    );
 
     let refs = table_refs_response(&store, &metadata_backend, "warehouse", &namespace, "events")
         .await
@@ -5177,9 +5315,18 @@ async fn table_ref_write_responses_commit_retention_refs_and_protect_deletes() {
 
     let force_delete: DeleteTableRefRequest =
         serde_json::from_value(serde_json::json!({ "force": true })).expect("ref force delete should parse");
-    delete_table_ref_response(&store, &metadata_backend, "warehouse", &namespace, "events", "audit", force_delete)
-        .await
-        .expect("force delete should commit");
+    let delete_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let delete_backend = TableCommitObjectBackend::test(metadata_backend.clone(), Arc::clone(&delete_authorizations), None);
+    let result =
+        delete_table_ref_response(&store, &delete_backend, "warehouse", &namespace, "events", "audit", force_delete).await;
+    delete_backend.finish(result).await.expect("force delete should commit");
+    assert!(
+        delete_authorizations
+            .lock()
+            .await
+            .iter()
+            .any(|(_, action)| *action == S3Action::PutObjectAction)
+    );
     let refs = table_refs_response(&store, &metadata_backend, "warehouse", &namespace, "events")
         .await
         .expect("refs should load after delete");
@@ -5705,6 +5852,7 @@ struct TestTableCatalogObjectBackend {
     objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
     put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
     locks: TestTableCatalogObjectLocks,
+    lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl TestTableCatalogObjectBackend {
@@ -5759,6 +5907,19 @@ impl TestTableCatalogObjectBackend {
             .get(&(bucket.to_string(), object.to_string()))
             .cloned();
         lock.is_some_and(|lock| lock.try_lock_owned().is_err())
+    }
+
+    async fn wait_for_lock_attempts(&self, count: usize) {
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if self.lock_attempts.lock().await.len() >= count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lock acquisition attempts should be observable");
     }
 }
 
@@ -6242,6 +6403,7 @@ impl crate::table_catalog::TableCatalogObjectBackend for TestTableCatalogObjectB
         bucket: &str,
         object: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<Box<dyn Send>> {
+        self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
         let lock = {
             let mut locks = self.locks.lock().await;
             locks

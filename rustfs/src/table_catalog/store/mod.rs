@@ -374,6 +374,12 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
+
+    async fn prepare_table_commit_publication(&self) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    async fn complete_table_commit_publication(&self) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
