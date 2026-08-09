@@ -91,7 +91,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, debug, error, info, instrument, trace, warn};
+use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const LABEL_HTTP_METHOD: &str = "method";
@@ -427,6 +427,72 @@ fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, s
         )
         .record(len as f64);
     }
+}
+
+fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
+    if !tracing::enabled!(Level::INFO) {
+        return Span::none();
+    }
+
+    let request_context = request
+        .extensions()
+        .get::<crate::storage_api::server::http::request_context::RequestContext>();
+    let request_id = request_context.map(|ctx| ctx.request_id.as_str()).unwrap_or("unknown");
+    let trace_id = request_context.and_then(|ctx| ctx.trace_id.as_deref()).unwrap_or("unknown");
+    let span_id = request_context.and_then(|ctx| ctx.span_id.as_deref()).unwrap_or("unknown");
+
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier::new(request.headers())));
+
+    if parent_context.has_active_span() {
+        let span_ref = parent_context.span();
+        trace!(
+            otel_trace_id = %span_ref.span_context().trace_id(),
+            otel_parent_span_id = %span_ref.span_context().span_id(),
+            sampled = span_ref.span_context().is_sampled(),
+            "Extracted trace context from incoming request headers"
+        );
+    } else {
+        trace!("No trace context found in request headers, will create root span");
+    }
+
+    let client_info = request.extensions().get::<ClientInfo>();
+    let peer_addr = client_info
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let span = tracing::info_span!("http-request",
+        request_id = %request_id,
+        trace_id = %trace_id,
+        span_id = %span_id,
+        status_code = tracing::field::Empty,
+        method = %request.method(),
+        peer_addr = %peer_addr,
+        uri = %redact_sensitive_uri_query(request.uri()),
+        version = ?request.version(),
+        user_agent = tracing::field::Empty,
+        content_type = tracing::field::Empty,
+        content_length = tracing::field::Empty,
+    );
+    if span.is_disabled() {
+        return span;
+    }
+    if let Err(e) = span.set_parent(parent_context) {
+        debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
+    }
+    for (header_name, header_value) in request.headers() {
+        let value = header_value.to_str().unwrap_or("invalid");
+        if header_name == "user-agent" {
+            span.record("user_agent", value);
+        } else if header_name == "content-type" {
+            span.record("content_type", value);
+        } else if header_name == "content-length" {
+            span.record("content_length", value);
+        }
+    }
+
+    span
 }
 
 pub async fn start_http_server(
@@ -1379,8 +1445,8 @@ fn process_connection(
         // 10. KeystoneAuthLayer                      — X-Auth-Token validation
         // 11. TraceLayer                             — request span creation + metrics
         // 12. RequestLoggingLayer                    — single completion event per request
-        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
         // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
         // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
         // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
@@ -1431,72 +1497,7 @@ fn process_connection(
                 .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context =
-                                request.extensions().get::<crate::storage_api::server::http::request_context::RequestContext>();
-                            let request_id = request_context
-                                .map(|ctx| ctx.request_id.as_str())
-                                .unwrap_or("unknown");
-                            let trace_id = request_context
-                                .and_then(|ctx| ctx.trace_id.as_deref())
-                                .unwrap_or("unknown");
-                            let span_id = request_context
-                                .and_then(|ctx| ctx.span_id.as_deref())
-                                .unwrap_or("unknown");
-
-                            let parent_context = global::get_text_map_propagator(|propagator| {
-                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                            });
-
-                            if parent_context.has_active_span() {
-                                let span_ref = parent_context.span();
-                                trace!(
-                                    otel_trace_id = %span_ref.span_context().trace_id(),
-                                    otel_parent_span_id = %span_ref.span_context().span_id(),
-                                    sampled = span_ref.span_context().is_sampled(),
-                                    "Extracted trace context from incoming request headers"
-                                );
-                            } else {
-                                trace!("No trace context found in request headers, will create root span");
-                            }
-                            let client_info = request.extensions().get::<ClientInfo>();
-                            let peer_addr = client_info
-                                .map(|info| info.real_ip.to_string())
-                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            let span = tracing::info_span!("http-request",
-                                request_id = %request_id,
-                                trace_id = %trace_id,
-                                span_id = %span_id,
-                                status_code = tracing::field::Empty,
-                                method = %request.method(),
-                                peer_addr = %peer_addr,
-                                uri = %redact_sensitive_uri_query(request.uri()),
-                                version = ?request.version(),
-                                user_agent = tracing::field::Empty,
-                                content_type = tracing::field::Empty,
-                                content_length = tracing::field::Empty,
-                            );
-                            if span.is_disabled() {
-                                return span;
-                            }
-                            if let Err(e) = span.set_parent(parent_context) {
-                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
-                            }
-                            for (header_name, header_value) in request.headers() {
-                                let value = header_value.to_str().unwrap_or("invalid");
-                                if header_name == "user-agent" {
-                                    span.record("user_agent", value);
-                                } else if header_name == "content-type" {
-                                    span.record("content_type", value);
-                                } else if header_name == "content-length" {
-                                    span.record("content_length", value);
-                                }
-                            }
-
-                            span
-                        })
+                        .make_span_with(make_http_trace_span)
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
@@ -1560,7 +1561,7 @@ fn process_connection(
                 )
                 .layer(RequestLoggingLayer)
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .layer(PathCategoryInjectionLayer)
+                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
                 .layer(S3ErrorMessageCompatLayer)
                 .layer(IcebergRestErrorCompatLayer)
                 .layer(ObjectAttributesEtagFixLayer)
@@ -1591,72 +1592,7 @@ fn process_connection(
                 .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context =
-                                request.extensions().get::<crate::storage_api::server::http::request_context::RequestContext>();
-                            let request_id = request_context
-                                .map(|ctx| ctx.request_id.as_str())
-                                .unwrap_or("unknown");
-                            let trace_id = request_context
-                                .and_then(|ctx| ctx.trace_id.as_deref())
-                                .unwrap_or("unknown");
-                            let span_id = request_context
-                                .and_then(|ctx| ctx.span_id.as_deref())
-                                .unwrap_or("unknown");
-
-                            let parent_context = global::get_text_map_propagator(|propagator| {
-                                propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                            });
-
-                            if parent_context.has_active_span() {
-                                let span_ref = parent_context.span();
-                                trace!(
-                                    otel_trace_id = %span_ref.span_context().trace_id(),
-                                    otel_parent_span_id = %span_ref.span_context().span_id(),
-                                    sampled = span_ref.span_context().is_sampled(),
-                                    "Extracted trace context from incoming request headers"
-                                );
-                            } else {
-                                trace!("No trace context found in request headers, will create root span");
-                            }
-                            let client_info = request.extensions().get::<ClientInfo>();
-                            let peer_addr = client_info
-                                .map(|info| info.real_ip.to_string())
-                                .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            let span = tracing::info_span!("http-request",
-                                request_id = %request_id,
-                                trace_id = %trace_id,
-                                span_id = %span_id,
-                                status_code = tracing::field::Empty,
-                                method = %request.method(),
-                                peer_addr = %peer_addr,
-                                uri = %redact_sensitive_uri_query(request.uri()),
-                                version = ?request.version(),
-                                user_agent = tracing::field::Empty,
-                                content_type = tracing::field::Empty,
-                                content_length = tracing::field::Empty,
-                            );
-                            if span.is_disabled() {
-                                return span;
-                            }
-                            if let Err(e) = span.set_parent(parent_context) {
-                                debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
-                            }
-                            for (header_name, header_value) in request.headers() {
-                                let value = header_value.to_str().unwrap_or("invalid");
-                                if header_name == "user-agent" {
-                                    span.record("user_agent", value);
-                                } else if header_name == "content-type" {
-                                    span.record("content_type", value);
-                                } else if header_name == "content-length" {
-                                    span.record("content_length", value);
-                                }
-                            }
-
-                            span
-                        })
+                        .make_span_with(make_http_trace_span)
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
@@ -1720,7 +1656,7 @@ fn process_connection(
                 )
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .layer(PathCategoryInjectionLayer)
+                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
                 .layer(S3ErrorMessageCompatLayer)
                 .layer(IcebergRestErrorCompatLayer)
                 .layer(ObjectAttributesEtagFixLayer)
@@ -2100,6 +2036,21 @@ mod tests {
         use rustfs_config::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE};
         assert_eq!(baseline::HTTP1_HEADER_READ_TIMEOUT_SECS, DEFAULT_HTTP1_HEADER_READ_TIMEOUT);
         assert_eq!(baseline::HTTP1_MAX_BUF_SIZE, DEFAULT_HTTP1_MAX_BUF_SIZE);
+    }
+
+    #[test]
+    fn http_trace_span_is_empty_when_info_is_disabled() {
+        let subscriber = tracing_subscriber::fmt().with_max_level(Level::ERROR).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+
+        let span = make_http_trace_span(&request);
+
+        assert!(span.is_disabled());
     }
 
     #[test]

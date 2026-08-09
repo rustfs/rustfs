@@ -19,8 +19,8 @@ use http::{HeaderMap, Version};
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-    INTERNODE_OPERATION_WALK_DIR,
+    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+    INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
 };
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize};
@@ -43,6 +43,8 @@ use tracing::{error, warn};
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
+const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const HTTP_VERSION_09_LABEL: &str = "http/0.9";
@@ -259,6 +261,31 @@ impl InternodeHttpError {
 #[doc(hidden)]
 pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Error {
     InternodeHttpError::new_for_test(kind).into_io_error()
+}
+
+/// Build a retryable internode timeout error with the request's operation context.
+#[doc(hidden)]
+pub fn internode_http_timeout_error(method: &Method, url: &str) -> io::Error {
+    internode_kind_error(method, url, internode_rpc_operation(url), InternodeHttpErrorKind::ConnectTimeout)
+}
+
+/// Clone an internode HTTP I/O error while retaining its structured classification.
+///
+/// The underlying transport source is intentionally omitted because it is not
+/// cloneable. The request context and remote disk marker remain available to
+/// retry and error-mapping code.
+#[doc(hidden)]
+pub fn clone_internode_http_io_error(error: &io::Error) -> Option<io::Error> {
+    let source = error.get_ref()?.downcast_ref::<InternodeHttpError>()?;
+    Some(
+        InternodeHttpError {
+            kind: source.kind,
+            context: source.context.clone(),
+            remote_disk_error: source.remote_disk_error,
+            source: None,
+        }
+        .into_io_error(),
+    )
 }
 
 #[doc(hidden)]
@@ -1223,7 +1250,8 @@ fn internode_rpc_operation(url: &str) -> Option<&'static str> {
     let url = reqwest::Url::parse(url).ok()?;
     match url.path() {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
-        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
         NS_SCANNER_PATH => Some(INTERNODE_OPERATION_NS_SCANNER),
         _ => None,
@@ -1921,6 +1949,14 @@ mod tests {
             Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
         );
         assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_AUTH_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_CAPABILITY_PATH}?put_file_capability=1")),
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)
+        );
+        assert_eq!(
             internode_rpc_operation(&format!("http://node:9000{WALK_DIR_PATH}?disk=d")),
             Some(INTERNODE_OPERATION_WALK_DIR)
         );
@@ -1933,6 +1969,21 @@ mod tests {
             internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
             None
         );
+    }
+
+    #[test]
+    fn internode_http_timeout_error_retains_operation_context() {
+        let error =
+            internode_http_timeout_error(&Method::GET, "http://node:9000/rustfs/rpc/put_file_capability?put_file_capability=1");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("timeout should retain internode classification");
+
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectTimeout);
+        assert_eq!(source.context().method(), "GET");
+        assert_eq!(source.context().target(), PUT_FILE_CAPABILITY_PATH);
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY));
     }
 
     #[test]
@@ -2383,6 +2434,42 @@ mod tests {
         assert!(source.kind().is_retryable());
         assert_eq!(source.context().method(), "PUT");
         assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
+    }
+
+    #[test]
+    fn cloned_internode_http_error_retains_classification_and_context() {
+        let original = internode_status_error(
+            &Method::GET,
+            "http://node:9000/rustfs/rpc/put_file_capability?put_file_capability=1",
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        );
+        let cloned = clone_internode_http_io_error(&original).expect("internode error should clone");
+        let source = cloned
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("clone should retain internode source");
+
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().method(), "GET");
+        assert_eq!(source.context().target(), PUT_FILE_CAPABILITY_PATH);
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY));
+    }
+
+    #[test]
+    fn cloned_internode_http_error_retains_remote_disk_marker() {
+        let original = new_test_remote_file_not_found_http_io_error();
+        let cloned = clone_internode_http_io_error(&original).expect("internode error should clone");
+        let source = cloned
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("clone should retain internode source");
+
+        assert!(source.is_remote_file_not_found());
     }
 
     #[test]

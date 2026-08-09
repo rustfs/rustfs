@@ -134,6 +134,7 @@ pub struct RequestRecord {
 #[derive(Default)]
 struct ControlState {
     scripts: HashMap<Operation, VecDeque<FaultAction>>,
+    keyed_scripts: HashMap<(Operation, String), VecDeque<FaultAction>>,
     requests: VecDeque<RequestRecord>,
     next_sequence: u64,
 }
@@ -352,25 +353,44 @@ impl FakeS3Target {
         state.buckets.entry(bucket).or_default();
     }
 
+    /// Remove all retained object versions while preserving the bucket.
+    pub fn clear_bucket_objects(&self, bucket: &str) {
+        let mut state = lock(&self.backend.store);
+        let (removed_versions, removed_bytes) = state
+            .buckets
+            .get_mut(bucket)
+            .expect("fake target bucket must exist")
+            .objects
+            .drain()
+            .flat_map(|(_, versions)| versions)
+            .fold((0usize, 0usize), |(count, bytes), version| (count + 1, bytes + version.body.len()));
+        state.total_versions = state
+            .total_versions
+            .checked_sub(removed_versions)
+            .expect("fake target version accounting must not underflow");
+        state.total_bytes = state
+            .total_bytes
+            .checked_sub(removed_bytes)
+            .expect("fake target byte accounting must not underflow");
+    }
+
+    pub fn has_object(&self, bucket: &str, key: &str) -> bool {
+        lock(&self.backend.store)
+            .buckets
+            .get(bucket)
+            .and_then(|bucket| bucket.objects.get(key))
+            .and_then(|versions| versions.last())
+            .is_some_and(|version| !version.delete_marker)
+    }
+
     /// Queue `times` copies of a fault for one operation.
     pub fn inject(&self, operation: Operation, action: FaultAction, times: usize) {
         if times == 0 {
             return;
         }
-        if let FaultAction::SlowDrain { chunk_bytes: 0, .. } = action {
-            panic!("slow-drain chunk size must be non-zero");
-        }
-        match &action {
-            FaultAction::Delay(duration) if *duration > MAX_FAULT_DURATION => {
-                panic!("fault delay must not exceed 30 seconds");
-            }
-            FaultAction::SlowDrain { delay, .. } if *delay >= MAX_FAULT_DURATION => {
-                panic!("slow-drain slice delay must be below 30 seconds");
-            }
-            _ => {}
-        }
+        validate_fault_action(&action);
         let mut state = lock(&self.control);
-        let queued = state.scripts.values().map(VecDeque::len).sum::<usize>();
+        let queued = queued_fault_count(&state);
         if queued.checked_add(times).is_none_or(|total| total > MAX_SCRIPTED_FAULTS) {
             panic!("fake target queues at most 4096 scripted faults");
         }
@@ -381,8 +401,28 @@ impl FakeS3Target {
             .extend(std::iter::repeat_n(action, times));
     }
 
+    /// Queue faults for one exact object key without affecting concurrent requests.
+    pub fn inject_for_key(&self, operation: Operation, key: impl Into<String>, action: FaultAction, times: usize) {
+        if times == 0 {
+            return;
+        }
+        validate_fault_action(&action);
+        let mut state = lock(&self.control);
+        let queued = queued_fault_count(&state);
+        if queued.checked_add(times).is_none_or(|total| total > MAX_SCRIPTED_FAULTS) {
+            panic!("fake target queues at most 4096 scripted faults");
+        }
+        state
+            .keyed_scripts
+            .entry((operation, key.into()))
+            .or_default()
+            .extend(std::iter::repeat_n(action, times));
+    }
+
     pub fn clear_faults(&self) {
-        lock(&self.control).scripts.clear();
+        let mut state = lock(&self.control);
+        state.scripts.clear();
+        state.keyed_scripts.clear();
     }
 
     pub fn requests(&self) -> Vec<RequestRecord> {
@@ -418,6 +458,25 @@ impl Drop for FakeS3Target {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn validate_fault_action(action: &FaultAction) {
+    if let FaultAction::SlowDrain { chunk_bytes: 0, .. } = action {
+        panic!("slow-drain chunk size must be non-zero");
+    }
+    match action {
+        FaultAction::Delay(duration) if *duration > MAX_FAULT_DURATION => {
+            panic!("fault delay must not exceed 30 seconds");
+        }
+        FaultAction::SlowDrain { delay, .. } if *delay >= MAX_FAULT_DURATION => {
+            panic!("slow-drain slice delay must be below 30 seconds");
+        }
+        _ => {}
+    }
+}
+
+fn queued_fault_count(state: &ControlState) -> usize {
+    state.scripts.values().map(VecDeque::len).sum::<usize>() + state.keyed_scripts.values().map(VecDeque::len).sum::<usize>()
 }
 
 #[async_trait]
@@ -492,7 +551,12 @@ fn record_request(
     content_length: Option<u64>,
 ) -> Option<RequestFault> {
     let mut state = lock(control);
-    let action = state.scripts.get_mut(&operation).and_then(VecDeque::pop_front);
+    let action = parsed
+        .key
+        .as_ref()
+        .and_then(|key| state.keyed_scripts.get_mut(&(operation, key.clone())))
+        .and_then(VecDeque::pop_front)
+        .or_else(|| state.scripts.get_mut(&operation).and_then(VecDeque::pop_front));
     state.next_sequence += 1;
     let sequence = state.next_sequence;
     if state.requests.len() == MAX_REQUEST_RECORDS {

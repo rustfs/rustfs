@@ -4487,6 +4487,27 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(internode_metrics)]
+    async fn test_remote_disk_create_file_retries_once_on_capability_probe_timeout() {
+        let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![
+            OpenWriteTestStep::Error(DiskError::from(rustfs_rio::internode_http_timeout_error(
+                &http::Method::GET,
+                "http://remote-node:9000/rustfs/rpc/put_file_capability",
+            ))),
+            OpenWriteTestStep::Success,
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        crate::cluster::rpc::runtime_sources::reset_internode_metrics_for_test();
+
+        let _created = remote_disk
+            .create_file("orig-bucket", "bucket", "object/part.1", 4096)
+            .await
+            .expect("capability probe timeout should recover on retry");
+
+        assert_eq!(transport.calls().len(), 2, "create_file should retry capability probe timeouts once");
+    }
+
+    #[tokio::test]
     async fn test_remote_disk_append_file_does_not_retry_non_retryable_open_write_error() {
         let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![OpenWriteTestStep::Error(DiskError::from(
             rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::Unknown),

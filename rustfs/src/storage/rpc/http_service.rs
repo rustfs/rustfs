@@ -17,15 +17,15 @@ use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::DiskError;
 use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
-    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions,
-    check_and_record_signed_rpc_nonce, find_local_disk_by_ref, sign_ns_scanner_capability, verify_put_file_auth_trailer,
-    verify_rpc_signature,
+    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
+    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
+    sign_ns_scanner_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
-    WALK_DIR_BODY_SHA256_QUERY,
+    PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, WALK_DIR_BODY_SHA256_QUERY,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::tonic_rpc_auth_failure_reason;
@@ -36,8 +36,8 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-    INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+    INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
@@ -70,11 +70,14 @@ const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
+const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
 static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
@@ -331,6 +334,14 @@ struct PutFileQuery {
     size: i64,
     put_file_auth: Option<String>,
     put_file_nonce: Option<uuid::Uuid>,
+    put_file_server_epoch: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutFileCapabilityQuery {
+    put_file_capability: Option<u16>,
+    put_file_challenge: Option<uuid::Uuid>,
 }
 
 fn put_file_auth_nonce(query: &PutFileQuery) -> io::Result<Option<uuid::Uuid>> {
@@ -350,6 +361,10 @@ fn put_file_auth_nonce(query: &PutFileQuery) -> io::Result<Option<uuid::Uuid>> {
         }
         Some(_) => Err(io::Error::other("Unsupported put_file auth version")),
     }
+}
+
+fn put_file_server_epoch_matches(query: &PutFileQuery) -> bool {
+    query.put_file_server_epoch == Some(*PUT_FILE_CAPABILITY_SERVER_EPOCH)
 }
 
 impl<S> Service<Request<Incoming>> for InternodeRpcService<S>
@@ -403,7 +418,18 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
             Err(response) => *response,
         },
         (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
-        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req).await,
+        (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
+            Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
+                match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
+                    Some(challenge) => put_file_capability_response(challenge),
+                    None => response_with_status(StatusCode::BAD_REQUEST, "put_file capability challenge is invalid"),
+                }
+            }
+            Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
+            Err(response) => *response,
+        },
+        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
+        (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
         _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
     };
 
@@ -425,7 +451,8 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
 fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
-        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
         NS_SCANNER_PATH => Some(INTERNODE_OPERATION_NS_SCANNER),
         _ => None,
@@ -492,6 +519,36 @@ fn ns_scanner_capability_response(challenge: uuid::Uuid) -> Response<Body> {
         .headers_mut()
         .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/msgpack"));
     response
+}
+
+fn put_file_capability_response(challenge: uuid::Uuid) -> Response<Body> {
+    let server_epoch = *PUT_FILE_CAPABILITY_SERVER_EPOCH;
+    let proof = match sign_put_file_capability(challenge, server_epoch, PUT_FILE_CAPABILITY_VERSION) {
+        Ok(proof) => proof,
+        Err(err) => {
+            return response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("put_file capability authentication is unavailable: {err}"),
+            );
+        }
+    };
+    match rmp_serde::to_vec_named(&PutFileCapabilityResponse {
+        version: PUT_FILE_CAPABILITY_VERSION,
+        server_epoch,
+        proof,
+    }) {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(Bytes::from(body)));
+            response
+                .headers_mut()
+                .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/msgpack"));
+            response
+        }
+        Err(err) => response_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("put_file capability response encoding failed: {err}"),
+        ),
+    }
 }
 
 fn ns_scanner_server_epoch_matches(server_epoch: uuid::Uuid) -> bool {
@@ -1245,7 +1302,7 @@ where
     }
 }
 
-async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
+async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let url = req.uri().to_string();
@@ -1269,11 +1326,17 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
             return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
         }
     };
+    if require_auth && auth_nonce.is_none() {
+        return response_with_status(StatusCode::FORBIDDEN, "invalid put_file auth: put_file auth required");
+    }
+    if require_auth && !put_file_server_epoch_matches(&query) {
+        return response_with_status(StatusCode::CONFLICT, "put_file capability server epoch changed");
+    }
     if let Some(nonce) = auth_nonce
         && let Err(e) = check_and_record_signed_rpc_nonce(
             req.headers(),
             nonce,
-            PUT_FILE_STREAM_PATH,
+            &path,
             INTERNODE_OPERATION_PUT_FILE_STREAM,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         )
@@ -1576,7 +1639,9 @@ fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
     match operation {
         Some(INTERNODE_OPERATION_WALK_DIR) => LOG_SUBSYSTEM_DIRECTORY_WALK,
         Some(INTERNODE_OPERATION_NS_SCANNER) => LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-        Some(INTERNODE_OPERATION_READ_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_STREAM) => LOG_SUBSYSTEM_FILE_TRANSFER,
+        Some(
+            INTERNODE_OPERATION_READ_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_STREAM | INTERNODE_OPERATION_PUT_FILE_CAPABILITY,
+        ) => LOG_SUBSYSTEM_FILE_TRANSFER,
         _ => LOG_SUBSYSTEM_ROUTING,
     }
 }
@@ -1599,36 +1664,43 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskError, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-        LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY,
-        NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
-        NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_STREAM_PATH, PutFileQuery,
-        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
-        internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
-        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_stage_error_message,
-        put_file_target_lock, read_file_body_stream, remote_scanner_claim_rejection, response_with_disk_error,
-        supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
-        verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
-        write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
+        DiskError, InternodeRpcService, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER,
+        LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY,
+        NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH,
+        NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
+        NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH,
+        PUT_FILE_STREAM_PATH, PutFileQuery, READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery,
+        append_walk_dir_completion, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
+        ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
+        put_file_capability_response, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
+        read_file_body_stream, remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
+        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
+        verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
+        write_put_file_body_chunks_to_writer,
     };
-    use crate::storage::storage_api::ecstore_rpc::build_put_file_auth_trailer;
+    use crate::storage::storage_api::ecstore_rpc::{build_put_file_auth_trailer, gen_signature_headers};
     use crate::storage::storage_api::rpc_consumer::http_service::{DiskAPI as _, DiskOption, DiskStore, Endpoint, new_disk};
     use bytes::Bytes;
-    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
-    use http_body_util::BodyExt;
+    use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
+    use http_body_util::{BodyExt, Empty};
+    use hyper::{client::conn::http1 as client_http1, server::conn::http1 as server_http1};
+    use hyper_util::{rt::TokioIo, service::TowerToHyperService};
     use metrics::with_local_recorder;
     use metrics_util::debugging::DebuggingRecorder;
     use rustfs_io_metrics::internode_metrics::{
-        INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-        INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+        INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        global_internode_metrics,
     };
     use sha2::Digest as _;
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::future::Future as _;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;
 
@@ -1641,6 +1713,117 @@ mod tests {
             .expect("local disk should be created");
         disk.make_volume("bucket").await.expect("test volume should be created");
         (disk, dir)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authenticated_put_route_checks_server_epoch_before_disk_lookup() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener address should be available");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("test server should accept a connection");
+            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(InternodeRpcService::new(fallback)))
+                .await
+                .expect("test connection should complete");
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("test client should connect");
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("HTTP/1 handshake should succeed");
+        let client = tokio::spawn(async move {
+            connection.await.expect("test client connection should complete");
+        });
+
+        let challenge = uuid::Uuid::new_v4();
+        let capability_query = format!(
+            "{}={}&{}={challenge}",
+            super::PUT_FILE_CAPABILITY_QUERY,
+            super::PUT_FILE_CAPABILITY_VERSION,
+            super::PUT_FILE_CAPABILITY_CHALLENGE_QUERY
+        );
+        let capability_uri = format!("{PUT_FILE_CAPABILITY_PATH}?{capability_query}");
+        let mut capability_request = Request::builder()
+            .method(Method::GET)
+            .uri(&capability_uri)
+            .header(http::header::HOST, addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .expect("capability request should build");
+        capability_request
+            .headers_mut()
+            .extend(gen_signature_headers(&capability_uri, &Method::GET).expect("capability signature should build"));
+        let response = sender
+            .send_request(capability_request)
+            .await
+            .expect("capability request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .into_body()
+                .collect()
+                .await
+                .expect("capability response should drain")
+                .to_bytes()
+                .is_empty()
+        );
+
+        let legacy_probe_uri = format!("{PUT_FILE_STREAM_PATH}?{capability_query}");
+        let mut legacy_probe_request = Request::builder()
+            .method(Method::GET)
+            .uri(&legacy_probe_uri)
+            .header(http::header::HOST, addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .expect("legacy-path probe request should build");
+        legacy_probe_request
+            .headers_mut()
+            .extend(gen_signature_headers(&legacy_probe_uri, &Method::GET).expect("legacy-path signature should build"));
+        let response = sender
+            .send_request(legacy_probe_request)
+            .await
+            .expect("legacy-path probe should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("legacy-path response should drain");
+
+        for (server_epoch, expected_status) in [
+            (None, StatusCode::CONFLICT),
+            (Some(uuid::Uuid::new_v4()), StatusCode::CONFLICT),
+            (Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH), StatusCode::BAD_REQUEST),
+        ] {
+            let nonce = uuid::Uuid::new_v4();
+            let mut uri = format!(
+                "{PUT_FILE_AUTH_STREAM_PATH}?disk=definitely-missing&volume=bucket&path=object&append=false&size=0&put_file_auth=digest-trailer-v1&put_file_nonce={nonce}"
+            );
+            if let Some(server_epoch) = server_epoch {
+                uri.push_str(&format!("&put_file_server_epoch={server_epoch}"));
+            }
+            let headers = gen_signature_headers(&uri, &Method::PUT).expect("request signature should build");
+            let mut request = Request::builder()
+                .method(Method::PUT)
+                .uri(&uri)
+                .header(http::header::HOST, addr.to_string())
+                .body(Empty::<Bytes>::new())
+                .expect("test request should build");
+            request.headers_mut().extend(headers);
+
+            let response = sender.send_request(request).await.expect("test request should complete");
+            assert_eq!(response.status(), expected_status, "unexpected status for server epoch {server_epoch:?}");
+            response.into_body().collect().await.expect("response body should drain");
+        }
+
+        drop(sender);
+        client.await.expect("test client task should join");
+        server.await.expect("test server task should join");
     }
 
     struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
@@ -1692,6 +1875,14 @@ mod tests {
             Some(INTERNODE_OPERATION_READ_FILE_STREAM)
         );
         assert_eq!(internode_http_operation(PUT_FILE_STREAM_PATH), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        assert_eq!(
+            internode_http_operation(PUT_FILE_AUTH_STREAM_PATH),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_http_operation(PUT_FILE_CAPABILITY_PATH),
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)
+        );
         assert_eq!(internode_http_operation(WALK_DIR_PATH), Some(INTERNODE_OPERATION_WALK_DIR));
         assert_eq!(internode_http_operation(NS_SCANNER_PATH), Some(INTERNODE_OPERATION_NS_SCANNER));
         assert_eq!(internode_http_operation("/rustfs/rpc/unknown"), None);
@@ -1716,6 +1907,43 @@ mod tests {
         let headers = HeaderMap::new();
         let response = verify_internode_rpc_signature(&uri, &Method::GET, &headers).expect_err("response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn put_file_capability_get_requires_signature() {
+        let challenge = uuid::Uuid::new_v4();
+        let uri: Uri = format!(
+            "{PUT_FILE_CAPABILITY_PATH}?{}={}&{}={challenge}",
+            super::PUT_FILE_CAPABILITY_QUERY,
+            super::PUT_FILE_CAPABILITY_VERSION,
+            super::PUT_FILE_CAPABILITY_CHALLENGE_QUERY
+        )
+        .parse()
+        .expect("uri");
+        let response = verify_internode_rpc_signature(&uri, &Method::GET, &HeaderMap::new()).expect_err("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn put_file_capability_response_is_authenticated() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-capability-server-test-secret".to_string());
+        let challenge = uuid::Uuid::new_v4();
+        let response = put_file_capability_response(challenge);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let capability: super::PutFileCapabilityResponse = rmp_serde::from_slice(&body).expect("capability should decode");
+        assert_eq!(capability.version, super::PUT_FILE_CAPABILITY_VERSION);
+        assert!(!capability.server_epoch.is_nil());
+        crate::storage::storage_api::ecstore_rpc::verify_put_file_capability(
+            challenge,
+            capability.server_epoch,
+            capability.version,
+            &capability.proof,
+        )
+        .expect("capability proof should verify");
     }
 
     #[test]
@@ -1773,6 +2001,7 @@ mod tests {
             size: 1024,
             put_file_auth: None,
             put_file_nonce: None,
+            put_file_server_epoch: None,
         };
 
         let msg = put_file_stage_error_message("write_body", &query, &"connection reset");
@@ -1794,6 +2023,7 @@ mod tests {
             size,
             put_file_auth: None,
             put_file_nonce: None,
+            put_file_server_epoch: None,
         };
 
         // Truncated (or over-long) body on the create path is rejected.
@@ -1814,6 +2044,10 @@ mod tests {
         );
         assert_eq!(
             internode_rpc_subsystem(Some(INTERNODE_OPERATION_PUT_FILE_STREAM)),
+            LOG_SUBSYSTEM_FILE_TRANSFER
+        );
+        assert_eq!(
+            internode_rpc_subsystem(Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)),
             LOG_SUBSYSTEM_FILE_TRANSFER
         );
         assert_eq!(internode_rpc_subsystem(Some(INTERNODE_OPERATION_WALK_DIR)), LOG_SUBSYSTEM_DIRECTORY_WALK);
@@ -1932,9 +2166,19 @@ mod tests {
             size: 11,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
         };
 
         assert_eq!(put_file_auth_nonce(&query).expect("v1 auth should parse"), Some(nonce));
+        assert!(put_file_server_epoch_matches(&query));
+
+        let mut stale_epoch = query.clone();
+        stale_epoch.put_file_server_epoch = Some(uuid::Uuid::new_v4());
+        assert!(!put_file_server_epoch_matches(&stale_epoch));
+
+        let mut missing_epoch = query.clone();
+        missing_epoch.put_file_server_epoch = None;
+        assert!(!put_file_server_epoch_matches(&missing_epoch));
 
         let mut append = query.clone();
         append.append = true;
@@ -1971,6 +2215,7 @@ mod tests {
             size: 11,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
         };
         let mut second = b"world".to_vec();
         second.extend_from_slice(&trailer[..7]);
@@ -2007,6 +2252,7 @@ mod tests {
             size: 11,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
         };
         let mut payload = b"hello worle".to_vec();
         payload.extend_from_slice(&trailer);
@@ -2039,6 +2285,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
         };
         let mut payload = b"append-data".to_vec();
         payload.extend_from_slice(&trailer);
@@ -2068,6 +2315,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
         };
         let body = iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"append-data"))]);
         let mut writer = Vec::new();
@@ -2102,6 +2350,7 @@ mod tests {
             size: 11,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: None,
         };
         let mut payload = b"hello worle".to_vec();
         payload.extend_from_slice(&trailer);
@@ -2140,6 +2389,7 @@ mod tests {
             size: 11,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: None,
         };
 
         let err = write_authenticated_put_file(
@@ -2180,6 +2430,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: None,
         };
 
         let err = write_authenticated_put_file(
@@ -2223,6 +2474,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: None,
         };
         let mut payload = b"append-data".to_vec();
         payload.extend_from_slice(&trailer);
@@ -2279,6 +2531,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(first_nonce),
+            put_file_server_epoch: None,
         };
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -2374,6 +2627,7 @@ mod tests {
             size: 0,
             put_file_auth: Some("digest-trailer-v1".to_string()),
             put_file_nonce: Some(nonce),
+            put_file_server_epoch: None,
         };
 
         let legacy_lock = put_file_target_lock(&disk, &query);

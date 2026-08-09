@@ -710,8 +710,8 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     mrf_save_tx: Sender<MrfReplicateEntry>,
     mrf_save_rx: Mutex<Option<Receiver<MrfReplicateEntry>>>,
 
-    // Control channels
-    mrf_worker_kill_tx: Sender<()>,
+    // MRF worker lifecycle
+    mrf_worker_cancellations: Mutex<Vec<CancellationToken>>,
     mrf_stop_tx: Sender<()>,
 
     // Worker size tracking
@@ -734,7 +734,6 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         // Create MRF channels
         let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(100000);
         let (mrf_save_tx, mrf_save_rx) = mpsc::channel(100000);
-        let (mrf_worker_kill_tx, _mrf_worker_kill_rx) = mpsc::channel(worker_counts.mrf_workers);
         let (mrf_stop_tx, _mrf_stop_rx) = mpsc::channel(1);
 
         let pool = Arc::new(Self {
@@ -752,7 +751,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
-            mrf_worker_kill_tx,
+            mrf_worker_cancellations: Mutex::new(Vec::with_capacity(worker_counts.mrf_workers)),
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
             task_handles: Mutex::new(Vec::new()),
@@ -896,12 +895,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Resizes the failed workers pool
     pub async fn resize_failed_workers(&self, n: i32) {
-        // Spawn workers up to n.  Each worker shares the receiver via Arc<Mutex<...>>.
-        // The mutex is held only while calling recv() — released before processing — so
-        // all workers process entries concurrently (the dequeue step is serialised but
-        // the replication I/O is not).
-        while self.mrf_worker_size.load(Ordering::SeqCst) < n {
-            self.mrf_worker_size.fetch_add(1, Ordering::SeqCst);
+        let target = mrf_worker_size_to_count(n);
+        let mut cancellations = self.mrf_worker_cancellations.lock().await;
+
+        while cancellations.len() < target {
+            let cancellation = CancellationToken::new();
+            cancellations.push(cancellation.clone());
 
             let active_counter = self.active_mrf_workers.clone();
             let stats = self.stats.clone();
@@ -910,7 +909,18 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             let handle = tokio::spawn(async move {
                 loop {
-                    let operation = { mrf_rx.lock().await.recv().await };
+                    let operation = tokio::select! {
+                        biased;
+                        operation = async {
+                            let mut receiver = mrf_rx.lock().await;
+                            tokio::select! {
+                                biased;
+                                operation = receiver.recv() => operation,
+                                _ = cancellation.cancelled() => None,
+                            }
+                        } => operation,
+                        _ = cancellation.cancelled() => break,
+                    };
                     let Some(operation) = operation else { break };
 
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
@@ -920,11 +930,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             self.task_handles.lock().await.push(handle);
         }
 
-        // Remove workers if needed
-        while self.mrf_worker_size.load(Ordering::SeqCst) > n {
-            self.mrf_worker_size.fetch_sub(1, Ordering::SeqCst);
-            let _ = self.mrf_worker_kill_tx.try_send(());
+        while cancellations.len() > target {
+            if let Some(cancellation) = cancellations.pop() {
+                cancellation.cancel();
+            }
         }
+
+        self.mrf_worker_size.store(n.max(0), Ordering::SeqCst);
     }
 
     /// Resizes worker priority and counts
@@ -3350,7 +3362,6 @@ mod tests {
     ) -> Arc<ReplicationPool<LoadResyncNodeStore>> {
         let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(1);
         let (mrf_save_tx, mrf_save_rx) = mpsc::channel(mrf_save_capacity);
-        let (mrf_worker_kill_tx, _) = mpsc::channel(1);
         let (mrf_stop_tx, _) = mpsc::channel(1);
 
         Arc::new(ReplicationPool {
@@ -3368,7 +3379,7 @@ mod tests {
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
             mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
-            mrf_worker_kill_tx,
+            mrf_worker_cancellations: Mutex::new(Vec::new()),
             mrf_stop_tx,
             mrf_worker_size: AtomicI32::new(0),
             task_handles: Mutex::new(Vec::new()),
@@ -3969,6 +3980,54 @@ mod tests {
             current_target_queue(&pool, "runtime-backlog", "arn:rustfs:replication:target-a"),
             Some((1, 2048))
         );
+    }
+
+    #[tokio::test]
+    async fn resize_failed_workers_cancels_idle_workers() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-resize", shared))).await;
+
+        pool.resize_failed_workers(4).await;
+        assert_eq!(pool.mrf_worker_cancellations.lock().await.len(), 4);
+        assert_eq!(pool.mrf_worker_size.load(Ordering::SeqCst), 4);
+
+        pool.resize_failed_workers(1).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let finished = pool
+                    .task_handles
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|handle| handle.is_finished())
+                    .count();
+                if finished == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled MRF workers should exit while the shared queue is idle");
+
+        assert_eq!(pool.mrf_worker_cancellations.lock().await.len(), 1);
+        assert_eq!(pool.mrf_worker_size.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resize_failed_workers_is_idempotent_across_growth_and_shrink() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("mrf-resize-repeat", shared))).await;
+
+        for target in [2, 4, 1, 4, 4] {
+            pool.resize_failed_workers(target).await;
+            assert_eq!(
+                pool.mrf_worker_cancellations.lock().await.len(),
+                usize::try_from(target).expect("test worker count should fit usize")
+            );
+            assert_eq!(pool.mrf_worker_size.load(Ordering::SeqCst), target);
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
+pub const INTERNODE_OPERATION_PUT_FILE_CAPABILITY: &str = "put_file_capability";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
@@ -999,6 +1000,7 @@ mod tests {
     fn operation_metric_names_and_low_cardinality_values_are_stable() {
         assert_eq!(INTERNODE_OPERATION_READ_FILE_STREAM, "read_file_stream");
         assert_eq!(INTERNODE_OPERATION_PUT_FILE_STREAM, "put_file_stream");
+        assert_eq!(INTERNODE_OPERATION_PUT_FILE_CAPABILITY, "put_file_capability");
         assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
         assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");

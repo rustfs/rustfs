@@ -1922,14 +1922,11 @@ impl TargetClient {
         object: &str,
         opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        let mut headers = HeaderMap::new();
+        // Object metadata belongs to CreateMultipartUpload in S3 semantics;
+        // building only the source-version headers here used to drop user
+        // metadata, content-type, and the SSE intent for multipart replicas.
+        let headers = opts.header();
         let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty() {
-            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
-        }
-        if opts.internal.replication_request {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        }
         // The remote version of a multipart replication is decided at initiate
         // time; CompleteMultipartUpload does not read a versionId.
         let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
