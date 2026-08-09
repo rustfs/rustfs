@@ -783,6 +783,45 @@ mod tests {
         }
     }
 
+    fn write_non_inline_part_shape_fixture(drive: &tempfile::TempDir, part_numbers: &[usize]) -> (String, PathBuf) {
+        let object = BUCKET_METADATA_FILE;
+        let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("test data dir");
+        let mut file_info = FileInfo::new(object, 2, 2);
+        file_info.name = object.to_string();
+        file_info.data_dir = Some(data_dir);
+        file_info.mod_time = Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp"));
+        file_info.size = part_numbers.len() as i64;
+        file_info.parts = part_numbers
+            .iter()
+            .map(|number| ObjectPartInfo {
+                number: *number,
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            })
+            .collect();
+        file_info.erasure.block_size = 64;
+        file_info.erasure.index = 1;
+        file_info.erasure.distribution = vec![1, 2, 3, 4];
+        file_info.erasure.checksums = part_numbers
+            .iter()
+            .map(|number| ChecksumInfo {
+                part_number: *number,
+                algorithm: HashAlgorithm::HighwayHash256S,
+                ..Default::default()
+            })
+            .collect();
+
+        let mut file_meta = FileMeta::new();
+        file_meta.add_version(file_info).expect("add part-shape fixture");
+        let drive_path = drive.path().to_string_lossy().into_owned();
+        let object_dir = system_object_dir(&drive_path, "interop", object);
+        std::fs::create_dir_all(&object_dir).expect("create part-shape fixture directory");
+        std::fs::write(object_dir.join("xl.meta"), file_meta.marshal_msg().expect("marshal part-shape fixture"))
+            .expect("write part-shape fixture");
+        (drive_path, object_dir)
+    }
+
     fn inspect_opts(drives: &[tempfile::TempDir]) -> InspectBucketMetaOpts {
         InspectBucketMetaOpts {
             paths: drives
@@ -885,11 +924,39 @@ mod tests {
 
     #[test]
     fn export_list_contains_only_persisted_xml_configs() {
-        let bm = BucketMetadata::default();
+        let mut bm = BucketMetadata::default();
+        bm.notification_config_xml = b"notification-sentinel".to_vec();
+        bm.lifecycle_config_xml = b"lifecycle-sentinel".to_vec();
+        bm.object_lock_config_xml = b"object-lock-sentinel".to_vec();
+        bm.versioning_config_xml = b"versioning-sentinel".to_vec();
+        bm.encryption_config_xml = b"encryption-sentinel".to_vec();
+        bm.tagging_config_xml = b"tagging-sentinel".to_vec();
+        bm.replication_config_xml = b"replication-sentinel".to_vec();
+        bm.cors_config_xml = b"cors-sentinel".to_vec();
+        bm.logging_config_xml = b"logging-sentinel".to_vec();
+        bm.website_config_xml = b"website-sentinel".to_vec();
+        bm.accelerate_config_xml = b"accelerate-sentinel".to_vec();
+        bm.request_payment_config_xml = b"request-payment-sentinel".to_vec();
+        bm.public_access_block_config_xml = b"public-access-block-sentinel".to_vec();
         let configs = stored_configs(&bm);
 
-        assert_eq!(configs.len(), 13);
-        assert!(configs.iter().all(|(name, _, _)| name.ends_with(".xml")));
+        let actual = configs.iter().map(|(name, bytes, _)| (*name, *bytes)).collect::<Vec<_>>();
+        let expected: Vec<(&str, &[u8])> = vec![
+            ("notification.xml", b"notification-sentinel"),
+            ("lifecycle.xml", b"lifecycle-sentinel"),
+            ("object-lock.xml", b"object-lock-sentinel"),
+            ("versioning.xml", b"versioning-sentinel"),
+            ("bucket-encryption.xml", b"encryption-sentinel"),
+            ("tagging.xml", b"tagging-sentinel"),
+            ("replication.xml", b"replication-sentinel"),
+            ("cors.xml", b"cors-sentinel"),
+            ("logging.xml", b"logging-sentinel"),
+            ("website.xml", b"website-sentinel"),
+            ("accelerate.xml", b"accelerate-sentinel"),
+            ("request-payment.xml", b"request-payment-sentinel"),
+            ("public-access-block.xml", b"public-access-block-sentinel"),
+        ];
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -932,6 +999,23 @@ mod tests {
             .await
             .expect_err("source drives must remain read-only");
         assert!(err.to_string().contains("source drive"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_export_resolves_a_symlinked_parent_before_comparing_source_drives() {
+        use std::os::unix::fs::symlink;
+
+        let drive = tempfile::tempdir().expect("drive tempdir");
+        let export_parent = tempfile::tempdir().expect("export parent");
+        let alias = export_parent.path().join("source-alias");
+        symlink(drive.path(), &alias).expect("create source alias");
+        let out = alias.join("new-export");
+        assert!(!out.exists(), "output tail must not exist yet");
+
+        let error = ensure_output_outside_source_drives(&out, &[drive.path().to_string_lossy().into_owned()])
+            .expect_err("symlinked source-drive aliases must be rejected");
+        assert!(error.to_string().contains("inside source drive"), "unexpected error: {error}");
     }
 
     #[tokio::test]
@@ -1050,6 +1134,50 @@ mod tests {
             .await
             .expect("reconstruct non-inline metadata");
         assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_inline_objects_without_exactly_one_part_one() {
+        let only_part_two = tempfile::tempdir().expect("drive tempdir");
+        let (drive, object_dir) = write_non_inline_part_shape_fixture(&only_part_two, &[2]);
+        let error = read_drive_shard(&drive, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+            .await
+            .expect_err("part.2 without part.1 must fail");
+        assert!(error.to_string().contains("no supported part.1"), "unexpected error: {error}");
+
+        let two_parts = tempfile::tempdir().expect("drive tempdir");
+        let (drive, object_dir) = write_non_inline_part_shape_fixture(&two_parts, &[1, 2]);
+        let error = read_drive_shard(&drive, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+            .await
+            .expect_err("part.1 plus part.2 must fail");
+        assert!(error.to_string().contains("supports exactly one"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn rejects_under_limit_inline_source_with_inconsistent_framing() {
+        let payload = b"small fixture data";
+        let drives = vec![tempfile::tempdir().expect("drive tempdir")];
+        write_modern_object_fixture_with_layout(
+            &drives,
+            &[1],
+            "interop",
+            BUCKET_METADATA_FILE,
+            payload,
+            ModernFixtureLayout {
+                inline: true,
+                distribution: &[1, 2, 3, 4],
+                declared_size: 128,
+            },
+        )
+        .await;
+
+        let drive = drives[0].path().to_string_lossy().into_owned();
+        let object_dir = system_object_dir(&drive, "interop", BUCKET_METADATA_FILE);
+        let error = read_drive_shard(&drive, BUCKET_METADATA_FILE, &object_dir, &object_dir.join("xl.meta"))
+            .await
+            .expect_err("inconsistent under-limit framing must fail closed");
+        assert!(error.to_string().contains("refusing to guess"), "unexpected error: {error}");
+        assert!(!error.to_string().contains("inspection limit"), "unexpected error: {error}");
     }
 
     #[tokio::test]
@@ -1348,6 +1476,25 @@ mod tests {
     }
 
     #[test]
+    fn metadata_selection_rejects_conflicting_verified_bytes_for_one_erasure_index() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(2).expect("test timestamp");
+        let mut shards = vec![
+            quorum_test_shard("drive-1", mod_time, 1),
+            quorum_test_shard("drive-2", mod_time, 2),
+            quorum_test_shard("drive-3", mod_time, 3),
+        ];
+        let mut conflict = quorum_test_shard("conflicting-drive-1", mod_time, 1);
+        conflict.data[0] ^= 0xff;
+        shards.push(conflict);
+
+        let Err(error) = select_quorum_shards(shards) else {
+            panic!("conflicting verified bytes for one erasure index must fail closed");
+        };
+        assert!(error.to_string().contains("conflicting verified bytes"), "unexpected error: {error}");
+        assert!(error.to_string().contains("erasure shard 1"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn metadata_selection_rejects_old_and_new_read_quorums_without_a_committed_group() {
         let stale_time = OffsetDateTime::from_unix_timestamp(1).expect("stale timestamp");
         let current_time = OffsetDateTime::from_unix_timestamp(2).expect("current timestamp");
@@ -1370,6 +1517,7 @@ mod tests {
         let shards = vec![
             quorum_test_shard("current-a", current_time, 1),
             quorum_test_shard("current-b", current_time, 1),
+            quorum_test_shard("current-c", current_time, 2),
         ];
 
         let Err(err) = select_quorum_shards(shards) else {
