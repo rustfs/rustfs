@@ -427,6 +427,16 @@ pub fn put_opts_from_headers_with_replication_authorization(
         opts.replication_request = true;
         opts.mod_time = replication_source_mtime(headers);
         opts.preserve_etag = replication_source_etag(headers);
+        // SSE-C ciphertext passthrough: restore the stored encryption metadata
+        // from the transport headers and mark the body as already encrypted so
+        // the write path stores it verbatim.
+        if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
+            opts.user_defined.extend(restored);
+            opts.preserve_ciphertext = true;
+        }
+        if let Some(crc) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
+            insert_header_map(&mut opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, crc.into_owned());
+        }
     }
     Ok(opts)
 }
@@ -1468,6 +1478,56 @@ mod tests {
         assert!(!opts.replication_request);
         assert!(opts.mod_time.is_none());
         assert!(opts.preserve_etag.is_none());
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
+        };
+
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(
+            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("AES256"),
+        );
+        headers.insert(
+            REPLICATION_ENCRYPTION_IV_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("iv-value"),
+        );
+
+        // Unauthorized: the transport headers must be inert — no restored
+        // encryption metadata, no ciphertext-passthrough flag.
+        let untrusted = put_opts_from_headers(&headers, HashMap::new()).expect("ordinary PUT options should be created");
+        assert!(!untrusted.preserve_ciphertext);
+        assert!(!untrusted.user_defined.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            !untrusted
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-algorithm")
+        );
+
+        // Authorized: the stored keys are restored and the write path is told
+        // the body is already ciphertext.
+        let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(trusted.preserve_ciphertext);
+        assert_eq!(
+            trusted.user_defined.get(INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str),
+            Some("iv-value")
+        );
+        assert_eq!(
+            trusted
+                .user_defined
+                .get("x-amz-server-side-encryption-customer-algorithm")
+                .map(String::as_str),
+            Some("AES256")
+        );
+        assert_eq!(
+            trusted.user_defined.get("x-amz-server-side-encryption").map(String::as_str),
+            Some("AES256")
+        );
     }
 
     #[test]

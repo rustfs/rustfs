@@ -2390,6 +2390,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             version_suspended,
             versioned,
             replication_request: true,
+            // SSE-C passthrough reads the stored ciphertext verbatim; the
+            // decrypting reader cannot serve it (no customer key server-side).
+            raw_data_movement_read: self.ssec,
             ..Default::default()
         };
 
@@ -2451,6 +2454,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 return rinfo;
             }
         };
+        // SSE-C passthrough sends the stored ciphertext; the wire length is
+        // the stored size while rinfo keeps the logical size for metering.
+        let transfer_size = if self.ssec { object_info.size } else { size };
 
         if tgt_client.bucket.is_empty() {
             debug!(
@@ -2597,7 +2603,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
             let result = tgt_client
-                .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
+                .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()));
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
@@ -2682,6 +2688,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             version_suspended,
             versioned,
             replication_request: true,
+            // SSE-C passthrough reads the stored ciphertext verbatim; the
+            // decrypting reader cannot serve it (no customer key server-side).
+            raw_data_movement_read: self.ssec,
             ..Default::default()
         };
 
@@ -2742,6 +2751,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 return rinfo;
             }
         };
+        // SSE-C passthrough sends the stored ciphertext; the wire length is
+        // the stored size while rinfo keeps the logical size for metering.
+        let transfer_size = if self.ssec { object_info.size } else { size };
 
         if tgt_client.bucket.is_empty() {
             debug!(
@@ -2998,7 +3010,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
             let result = tgt_client
-                .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
+                .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()));
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
@@ -3137,10 +3149,17 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
+        // Ciphertext passthrough (raw read) ranges over the stored part
+        // bytes; decrypted reads range over the logical plaintext parts.
+        let part_size = if obj_opts.raw_data_movement_read {
+            part_info.size as i64
+        } else {
+            part_info.actual_size
+        };
         let part_plan = replication_multipart_part_plan(ReplicationMultipartPartInput {
             offset,
             part_number: part_info.number,
-            part_size: part_info.actual_size,
+            part_size,
         })
         .map_err(|err| std::io::Error::other(err.to_string()))?;
         let range_spec = HTTPRangeSpec {

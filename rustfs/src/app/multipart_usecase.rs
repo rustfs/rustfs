@@ -81,7 +81,8 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
+    SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_header, get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
@@ -504,19 +505,24 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
-        EncryptionRequest {
-            bucket: &bucket,
-            key: &key,
-            server_side_encryption: None,
-            ssekms_key_id: None,
-            ssekms_context: None,
-            sse_customer_algorithm,
-            sse_customer_key,
-            sse_customer_key_md5,
-            content_size: 0,
-            principal: None,
+        // A ciphertext-passthrough session stores encrypted parts verbatim and
+        // completes without the customer key (the replication client has none),
+        // so the SSE-C completion check must be skipped for it.
+        if !contains_key_str(&multipart_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+            EncryptionRequest {
+                bucket: &bucket,
+                key: &key,
+                server_side_encryption: None,
+                ssekms_key_id: None,
+                ssekms_context: None,
+                sse_customer_algorithm,
+                sse_customer_key,
+                sse_customer_key_md5,
+                content_size: 0,
+                principal: None,
+            }
+            .validate_multipart_ssec(&multipart_info.user_defined)?;
         }
-        .validate_multipart_ssec(&multipart_info.user_defined)?;
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
@@ -759,7 +765,22 @@ impl DefaultMultipartUsecase {
             principal: session_principal.as_ref(),
         };
 
-        let (effective_sse, effective_kms_key_id) = match sse_prepare_encryption(encryption_request).await? {
+        // SSE-C ciphertext passthrough: parts are already encrypted, so no
+        // session DEK is prepared; a session marker tells UploadPart to store
+        // the ciphertext verbatim instead of recovering encryption material.
+        let ciphertext_passthrough = replication_authorized
+            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true")
+            && rustfs_utils::http::ssec_transport_to_stored_metadata(&req.headers).is_some();
+        if ciphertext_passthrough {
+            insert_str(&mut metadata, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, "true".to_string());
+        }
+
+        let prepared_material = if ciphertext_passthrough {
+            None
+        } else {
+            sse_prepare_encryption(encryption_request).await?
+        };
+        let (effective_sse, effective_kms_key_id) = match prepared_material {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
                 let ssekms_key_id = material.kms_key_id.clone();
@@ -951,10 +972,14 @@ impl DefaultMultipartUsecase {
         }
         opts.want_checksum = reader.checksum();
 
-        let has_ssec = fi
-            .user_defined
-            .contains_key("x-amz-server-side-encryption-customer-algorithm");
-        let (server_side_encryption, ssekms_key_id) = if has_ssec {
+        // An SSE-C passthrough session stores ciphertext parts verbatim: no
+        // material recovery, no validation against the (absent) customer key.
+        let preserve_ciphertext = contains_key_str(&fi.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
+        let has_ssec = !preserve_ciphertext
+            && fi
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-algorithm");
+        let (server_side_encryption, ssekms_key_id) = if has_ssec || preserve_ciphertext {
             (None, None)
         } else {
             let sse = fi
@@ -974,19 +999,21 @@ impl DefaultMultipartUsecase {
             };
             (sse, key_id)
         };
-        EncryptionRequest {
-            bucket: &bucket,
-            key: &key,
-            server_side_encryption: server_side_encryption.clone(),
-            ssekms_key_id: ssekms_key_id.clone(),
-            ssekms_context: None,
-            sse_customer_algorithm: sse_customer_algorithm.clone(),
-            sse_customer_key: sse_customer_key.clone(),
-            sse_customer_key_md5: sse_customer_key_md5.clone(),
-            content_size: actual_size,
-            principal: None,
+        if !preserve_ciphertext {
+            EncryptionRequest {
+                bucket: &bucket,
+                key: &key,
+                server_side_encryption: server_side_encryption.clone(),
+                ssekms_key_id: ssekms_key_id.clone(),
+                ssekms_context: None,
+                sse_customer_algorithm: sse_customer_algorithm.clone(),
+                sse_customer_key: sse_customer_key.clone(),
+                sse_customer_key_md5: sse_customer_key_md5.clone(),
+                content_size: actual_size,
+                principal: None,
+            }
+            .validate_multipart_ssec(&fi.user_defined)?;
         }
-        .validate_multipart_ssec(&fi.user_defined)?;
         let (requested_sse, requested_kms_key_id) = if has_ssec {
             let ssec_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,

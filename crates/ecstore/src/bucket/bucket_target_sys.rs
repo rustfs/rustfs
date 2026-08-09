@@ -1832,12 +1832,27 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
     ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+        // Announce the replication check so a RustFS target returns SSE-C
+        // object metadata (etag/size) without the customer key the replication
+        // worker cannot hold; otherwise SSE-C replicas never converge on HEAD.
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
         match self
             .client
             .head_object()
             .bucket(bucket)
             .key(object)
             .set_version_id(version_id)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in headers.clone().into_iter() {
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
+                }
+                Result::<_, std::convert::Infallible>::Ok(req)
+            })
             .send()
             .await
         {

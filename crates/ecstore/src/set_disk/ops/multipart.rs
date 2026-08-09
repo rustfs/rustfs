@@ -1897,6 +1897,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        // The SSE-C passthrough session marker is upload-scoped; drop it from
+        // the completed object's metadata.
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT,
+        );
+
         if checksum_type.is_set() {
             checksum_type
                 .merge(rustfs_rio::ChecksumType::MULTIPART)
