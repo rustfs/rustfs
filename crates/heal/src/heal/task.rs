@@ -1034,7 +1034,7 @@ impl HealTask {
                     object,
                     object_size = object_size,
                     drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal object repaired"
                 );
@@ -1331,7 +1331,7 @@ impl HealTask {
                     task_id = %self.id,
                     bucket,
                     drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                     recursive = self.options.recursive,
                     result = "ok",
                     "Heal bucket completed"
@@ -1776,7 +1776,7 @@ impl HealTask {
                     bucket,
                     object,
                     drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal metadata repaired"
                 );
@@ -1908,7 +1908,7 @@ impl HealTask {
                     bucket,
                     object = %object,
                     drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal MRF repaired"
                 );
@@ -2073,7 +2073,7 @@ impl HealTask {
                     object,
                     object_size,
                     drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                     result = "ok",
                     "Heal EC decode repaired"
                 );
@@ -2204,7 +2204,7 @@ impl HealTask {
                         task_id = %self.id,
                         set_disk_id,
                         drives_healed = result.drives_healed(),
-                    drives_total = result.after.drives.len(),
+                    drives_total = result.drives_reported(),
                         result = "format_ok",
                         "Heal erasure set format repaired"
                     );
