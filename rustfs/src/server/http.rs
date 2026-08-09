@@ -104,6 +104,9 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_SIZE_BYTES: &str = "rustfs_http_server_response_body_chunk_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS: &str = "rustfs_http_server_response_body_chunk_latency_seconds";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS: &str = "rustfs_http_server_response_body_stream_duration_seconds";
 const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_server_connection_cap_saturated_total";
 
 /// Cached handle for the per-response-body-chunk byte counter. A streamed GET
@@ -112,6 +115,12 @@ const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_ser
 /// a registry lookup on every chunk.
 static RESP_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL));
+static RESP_BODY_CHUNK_SIZE_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_SIZE_BYTES));
+static RESP_BODY_CHUNK_LATENCY_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS));
+static RESP_BODY_STREAM_DURATION_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
+    std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS));
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -227,8 +236,32 @@ fn status_class_label(status: http::StatusCode) -> &'static str {
 }
 
 #[inline]
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[inline]
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[inline]
+fn record_response_body_chunk_observation(chunk_len: usize, latency: Duration) {
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+
+    RESP_BODY_CHUNK_SIZE_HISTOGRAM.record(chunk_len as f64);
+    RESP_BODY_CHUNK_LATENCY_HISTOGRAM.record(latency.as_secs_f64());
+}
+
+#[inline]
+fn record_response_body_stream_duration(stream_duration: Duration) {
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+
+    RESP_BODY_STREAM_DURATION_HISTOGRAM.record(stream_duration.as_secs_f64());
 }
 
 fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err: &dyn std::fmt::Display) {
@@ -1523,7 +1556,8 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                            record_response_body_chunk_observation(chunk.len(), latency);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1535,6 +1569,7 @@ fn process_connection(
                             }
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            record_response_body_stream_duration(stream_duration);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1618,7 +1653,8 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                            record_response_body_chunk_observation(chunk.len(), latency);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1630,6 +1666,7 @@ fn process_connection(
                             }
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                            record_response_body_stream_duration(stream_duration);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
