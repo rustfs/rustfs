@@ -3843,6 +3843,36 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_request_for_scoped_slowdown_preserves_scope() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                HealOptions {
+                    pool_index: Some(0),
+                    set_index: Some(1),
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage,
+        );
+        let result = Err(Error::Storage(EcstoreError::SlowDown));
+
+        let (retry_request, retry_delay, _) =
+            retry_request_for_result(&task, &result).expect("SlowDown should defer scoped heal");
+
+        assert_eq!(retry_request.options.pool_index, Some(0));
+        assert_eq!(retry_request.options.set_index, Some(1));
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert!(retry_delay > Duration::ZERO);
+    }
+
+    #[test]
     fn test_retry_request_for_typed_not_found_error_is_not_retryable() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);
