@@ -4633,7 +4633,7 @@ impl LocalDisk {
         {
             use std::os::unix::fs::MetadataExt as _;
 
-            let Ok(configured) = std::fs::metadata(&self.root) else {
+            let Ok(configured) = std::fs::metadata(self.endpoint.get_file_path()) else {
                 return false;
             };
             let Ok(pinned) = self.mount_lease.metadata() else {
@@ -4644,6 +4644,13 @@ impl LocalDisk {
 
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    /// Return the descriptor-rooted path for the mount instance admitted for
+    /// automatic replacement. Callers must not derive destructive identity
+    /// from the mutable endpoint pathname.
+    pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
+        self.has_replacement_mount_lease().then(|| self.io_root.clone())
     }
 
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
@@ -7372,6 +7379,7 @@ impl DiskAPI for LocalDisk {
             return Ok(tokio::task::spawn_blocking(move || {
                 let lock = std::fs::OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(&lock_path)?;
@@ -20045,6 +20053,7 @@ mod test {
         let lock_path = marker_path.with_extension("rustfs-cas.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)
@@ -20127,5 +20136,44 @@ mod test {
 
         drop(disk);
         std::fs::remove_dir_all(&old_root).expect("remove old leased root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn replacement_mount_lease_rejects_a_retargeted_endpoint_symlink() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        let endpoint_path = dir.path().join("replacement");
+        std::fs::create_dir(&first_root).expect("first replacement root should be created");
+        std::fs::create_dir(&second_root).expect("second replacement root should be created");
+        symlink(&first_root, &endpoint_path).expect("replacement endpoint symlink should be created");
+        let endpoint = Endpoint::try_from(endpoint_path.to_str().expect("replacement endpoint should be utf8"))
+            .expect("replacement endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(disk.has_replacement_mount_lease());
+        assert!(disk.replacement_mount_lease_root().is_some());
+
+        std::fs::remove_file(&endpoint_path).expect("original endpoint symlink should be removed");
+        symlink(&second_root, &endpoint_path).expect("replacement endpoint should be retargeted");
+
+        assert!(
+            !disk.has_replacement_mount_lease(),
+            "replacement admission must reject an endpoint symlink retargeted away from the held mount"
+        );
+        assert!(
+            disk.replacement_mount_lease_root().is_none(),
+            "readiness must not expose an identity root after endpoint retargeting"
+        );
+
+        disk.write_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Bytes::from_static(b"owner"))
+            .await
+            .expect("lease-root marker write should succeed");
+        assert!(first_root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
+        assert!(!second_root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
     }
 }

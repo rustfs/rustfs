@@ -99,10 +99,7 @@ pub struct ReplacementRecoveryRecord {
 
 impl ReplacementRecoveryRecord {
     fn from_state(state: ResumeState) -> Option<Self> {
-        let is_replacement = state.replacement_generation.is_some()
-            || !state.replacement_targets.is_empty()
-            || !matches!(state.replacement_phase, ReplacementPhase::None);
-        if !is_replacement {
+        if !is_replacement_intent(&state) {
             return None;
         }
 
@@ -685,6 +682,8 @@ impl ResumeStateFile {
 
 fn is_replacement_intent(state: &ResumeState) -> bool {
     state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && !state.replacement_targets.is_empty()
+        && replacement_targets_match_identities(&state.replacement_targets, &state.replacement_target_identities)
         && matches!(
             state.replacement_phase,
             ReplacementPhase::Intent
@@ -1752,10 +1751,13 @@ impl ResumeUtils {
                 .await?
                 .get_state()
                 .await;
-            if let Some(record) = ReplacementRecoveryRecord::from_state(state) {
-                intent_task_ids.insert(task_id);
-                records.push(record);
-            }
+            intent_task_ids.insert(task_id.clone());
+            records.push(ReplacementRecoveryRecord::from_state(state).unwrap_or_else(|| {
+                ReplacementRecoveryRecord::unknown(
+                    task_id,
+                    "isolated replacement intent violates its generation or target identity binding",
+                )
+            }));
         }
 
         for entry in entries {
@@ -2103,6 +2105,64 @@ mod tests {
             "migration must remove the old-binary-visible state only after the new state is durable"
         );
         assert!(ResumeManager::has_replacement_intent(&disk, &task_id).await);
+    }
+
+    #[tokio::test]
+    async fn ordinary_targeted_resume_is_not_migrated_as_a_replacement_intent() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new(
+            disk.clone(),
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        )
+        .await
+        .expect("ordinary targeted resume should persist");
+        manager
+            .set_replacement_targets(vec!["manual-target".to_string()])
+            .await
+            .expect("ordinary targeted resume should retain its target filter");
+
+        assert!(!ResumeManager::has_replacement_intent(&disk, &task_id).await);
+        assert!(ResumeManager::load_replacement_intent(disk.clone(), &task_id).await.is_err());
+        assert!(ResumeManager::has_resume_state(&disk, &task_id).await);
+        assert!(
+            ResumeUtils::get_resumable_tasks(&disk)
+                .await
+                .expect("ordinary resume listing should succeed")
+                .contains(&task_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_isolated_replacement_intent_is_reported_as_unknown() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let malformed = ResumeState::new(
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        );
+        let path = ResumeStateFile::ReplacementIntent.path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            path.to_str().expect("isolated replacement path must be UTF-8"),
+            serde_json::to_vec(&malformed)
+                .expect("malformed replacement fixture should serialize")
+                .into(),
+        )
+        .await
+        .expect("malformed isolated replacement state should persist");
+
+        let records = ResumeUtils::get_replacement_recovery_records(&disk)
+            .await
+            .expect("isolated replacement listing should succeed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].task_id, task_id);
+        assert_eq!(records[0].state, ReplacementRecoveryState::Unknown);
     }
 
     #[tokio::test]

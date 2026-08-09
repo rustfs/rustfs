@@ -257,7 +257,6 @@ pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<Disk
 
 pub(crate) trait HealDiskExt {
     fn endpoint(&self) -> Endpoint;
-    fn has_replacement_mount_lease(&self) -> bool;
     async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>>;
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<EcstoreDiskBytes>;
     async fn write_all(&self, volume: &str, path: &str, data: EcstoreDiskBytes) -> DiskResult<()>;
@@ -273,10 +272,6 @@ where
 {
     fn endpoint(&self) -> Endpoint {
         EcstoreDiskAPI::endpoint(self)
-    }
-
-    fn has_replacement_mount_lease(&self) -> bool {
-        EcstoreDiskAPI::has_replacement_mount_lease(self)
     }
 
     async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>> {

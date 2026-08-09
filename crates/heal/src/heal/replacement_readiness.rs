@@ -12,37 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
-use super::{Endpoint, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
+#[cfg(test)]
+use super::Endpoint;
+use super::{DiskStore, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
 
-pub(crate) async fn auto_replacement_target_ready(endpoint: &Endpoint, local_endpoints: &[Endpoint]) -> bool {
-    auto_replacement_target_identity(endpoint, local_endpoints).await.is_some()
+pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
+    auto_replacement_target_identity(disk, local_disks).await.is_some()
 }
 
 pub(crate) async fn auto_replacement_target_identity(
-    endpoint: &Endpoint,
-    local_endpoints: &[Endpoint],
+    disk: &DiskStore,
+    local_disks: &[DiskStore],
 ) -> Option<ReplacementTargetIdentity> {
-    if !endpoint.is_local {
-        return None;
-    }
-
-    let path = PathBuf::from(endpoint.get_file_path());
-    let sibling_paths = local_endpoints
+    let lease_root = disk.replacement_mount_lease_root()?;
+    let endpoint = disk.endpoint().to_string();
+    let sibling_lease_roots = local_disks
         .iter()
-        .filter(|sibling| sibling.is_local && *sibling != endpoint)
-        .map(|sibling| sibling.get_file_path())
-        .collect::<Vec<_>>();
-    let endpoint = endpoint.to_string();
+        .filter(|sibling| sibling.endpoint().is_local && sibling.endpoint().to_string() != endpoint)
+        .map(|sibling| sibling.replacement_mount_lease_root())
+        .collect::<Option<Vec<_>>>()?;
     tokio::task::spawn_blocking(move || {
-        let path = path.to_string_lossy().into_owned();
-        let canonical_path = fs::canonicalize(&path).ok()?;
-        let metadata = fs::metadata(&canonical_path).ok()?;
-        let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(path.as_ref()) else {
+        let canonical_path = fs::canonicalize(&lease_root).ok()?;
+        let metadata = fs::metadata(&lease_root).ok()?;
+        let Ok(target_device_ids) = rustfs_utils::os::get_physical_device_ids(lease_root.to_string_lossy().as_ref()) else {
             return None;
         };
         let Ok(root_device_ids) = rustfs_utils::os::get_physical_device_ids("/") else {
@@ -51,13 +45,13 @@ pub(crate) async fn auto_replacement_target_identity(
         if target_device_ids.is_empty()
             || root_device_ids.is_empty()
             || target_device_ids.iter().any(|target| root_device_ids.contains(target))
-            || !rustfs_utils::os::is_mount_point(Path::new(&path)).unwrap_or(false)
+            || !rustfs_utils::os::is_mount_point(&canonical_path).unwrap_or(false)
         {
             return None;
         }
 
-        if sibling_paths.iter().any(|sibling| {
-            rustfs_utils::os::get_physical_device_ids(sibling)
+        if sibling_lease_roots.iter().any(|sibling_lease_root| {
+            rustfs_utils::os::get_physical_device_ids(sibling_lease_root.to_string_lossy().as_ref())
                 .map(|ids| ids.iter().any(|id| target_device_ids.contains(id)))
                 .unwrap_or(true)
         }) {
@@ -90,17 +84,12 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
         .filter(|disk| disk.endpoint().is_local)
         .cloned()
         .collect::<Vec<_>>();
-    let local_endpoints = local_disks.iter().map(|disk| disk.endpoint()).collect::<Vec<_>>();
     drop(local_disk_map);
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
         let disk = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target)?;
-        if !disk.has_replacement_mount_lease() {
-            return None;
-        }
-        let endpoint = disk.endpoint();
-        identities.push(auto_replacement_target_identity(&endpoint, &local_endpoints).await?);
+        identities.push(auto_replacement_target_identity(disk, &local_disks).await?);
     }
     identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     identities.dedup_by(|left, right| left.endpoint == right.endpoint);
@@ -138,6 +127,7 @@ fn filesystem_identity(_metadata: &fs::Metadata, _canonical_path: &Path) -> Opti
 
 #[cfg(test)]
 mod tests {
+    use super::super::{DiskOption, new_disk};
     use super::*;
     use tempfile::TempDir;
 
@@ -153,7 +143,16 @@ mod tests {
                 let endpoint =
                     Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("replacement endpoint should parse");
 
-                assert!(!auto_replacement_target_ready(&endpoint, std::slice::from_ref(&endpoint)).await);
+                let disk = new_disk(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("temporary disk should initialize");
+                assert!(!auto_replacement_target_ready(&disk, std::slice::from_ref(&disk)).await);
             },
         )
         .await;

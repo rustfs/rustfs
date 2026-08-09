@@ -2421,16 +2421,11 @@ impl HealManager {
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
                         let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>, String)>::new();
                         let mut conflicted_recovery_sets = HashSet::<String>::new();
-                        let (local_disks, local_endpoints) = {
+                        let local_disks = {
                             let local_disk_map = local_disk_map_read().await;
-                            let local_disks = local_disk_map.values().flatten().cloned().collect::<Vec<_>>();
-                            let local_endpoints = local_disks
-                                .iter()
-                                .map(|disk| disk.endpoint())
-                                .filter(|endpoint| endpoint.is_local)
-                                .collect::<Vec<_>>();
-                            (local_disks, local_endpoints)
+                            local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
                         };
+                        let local_endpoints = local_disks.iter().map(|disk| disk.endpoint()).collect::<Vec<_>>();
                         for disk in &local_disks {
                             let endpoint = disk.endpoint();
                             let runtime_state = disk.runtime_state();
@@ -2440,11 +2435,7 @@ impl HealManager {
                             // detect unformatted disk via get_disk_id()
                             match disk.get_disk_id().await {
                                 Err(DiskError::UnformattedDisk) => {
-                                    if !disk.has_replacement_mount_lease() {
-                                        skipped_invalid_count += 1;
-                                        continue;
-                                    }
-                                    if !super::replacement_readiness::auto_replacement_target_ready(&endpoint, &local_endpoints)
+                                    if !super::replacement_readiness::auto_replacement_target_ready(disk, &local_disks)
                                         .await
                                     {
                                         skipped_invalid_count += 1;
@@ -3314,7 +3305,7 @@ mod tests {
     use rustfs_madmin::heal_commands::HealResultItem;
     use tempfile::TempDir;
 
-    use super::super::{DiskStore, Endpoint, storage_api::status::BucketInfo};
+    use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
 
     #[tokio::test]
     async fn auto_replacement_path_requires_a_non_root_mount() {
@@ -3323,9 +3314,34 @@ mod tests {
         let missing = Endpoint::try_from(temp.path().join("missing").to_string_lossy().as_ref())
             .expect("missing replacement endpoint should parse");
 
-        assert!(!super::super::replacement_readiness::auto_replacement_target_ready(&ready, std::slice::from_ref(&ready),).await);
+        let ready_disk = new_disk(
+            &ready,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("temporary disk should initialize");
         assert!(
-            !super::super::replacement_readiness::auto_replacement_target_ready(&missing, std::slice::from_ref(&missing),).await
+            !super::super::replacement_readiness::auto_replacement_target_ready(&ready_disk, std::slice::from_ref(&ready_disk),)
+                .await
+        );
+        let missing_disk = new_disk(
+            &missing,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("missing temporary disk root should initialize");
+        assert!(
+            !super::super::replacement_readiness::auto_replacement_target_ready(
+                &missing_disk,
+                std::slice::from_ref(&missing_disk),
+            )
+            .await
         );
     }
 

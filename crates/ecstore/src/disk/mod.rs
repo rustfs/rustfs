@@ -735,6 +735,16 @@ impl Disk {
             Disk::Remote(_) => None,
         }
     }
+
+    /// Return the descriptor-rooted mount path admitted for automatic
+    /// replacement, or `None` when the configured endpoint no longer names
+    /// that held mount instance.
+    pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
+        match self {
+            Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
+            Disk::Remote(_) => None,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {

@@ -322,40 +322,6 @@ pub(crate) fn census_object_version_on_disk(
     })
 }
 
-/// Read the durable automatic-replacement intent for `target` from any
-/// surviving disk. This is deliberately on-disk evidence rather than an admin
-/// status response, which may be stale or unsupported by a mixed-version peer.
-pub(crate) fn replacement_resume_state_for_target(
-    survivor_disks: &[PathBuf],
-    target: &Path,
-) -> ChaosResult<Option<serde_json::Value>> {
-    let target = target.to_string_lossy();
-    for disk in survivor_disks {
-        let resume_dir = disk.join(".rustfs.sys").join("buckets");
-        let Ok(entries) = std::fs::read_dir(resume_dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.ends_with("_ahm_resume_state.json") {
-                continue;
-            }
-            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-            let owns_target = state["replacement_targets"].as_array().is_some_and(|targets| {
-                targets
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .any(|endpoint| endpoint.ends_with(target.as_ref()))
-            });
-            if owns_target {
-                return Ok(Some(state));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// `POST` a signed (SigV4, service `s3`) admin request without relying on the
 /// external `awscurl` binary. Mirrors the admin heal calls used by the heal
 /// regression suite.

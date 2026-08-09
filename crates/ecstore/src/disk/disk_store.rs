@@ -1097,6 +1097,10 @@ impl LocalDiskWrapper {
         self.disk.get_object_path_for_io(volume, path)
     }
 
+    pub fn replacement_mount_lease_root(&self) -> Option<std::path::PathBuf> {
+        self.disk.replacement_mount_lease_root()
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
     }
