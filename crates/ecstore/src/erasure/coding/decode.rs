@@ -1069,13 +1069,11 @@ where
         }
 
         // Pre-claim per-slot buffers so the `self.readers` borrow below stays
-        // disjoint from `self.buffers`.
-        let participating: Vec<bool> = (0..num_readers)
-            .map(|i| self.engaged[i] && self.readers[i].is_some())
-            .collect();
+        // disjoint from `self.buffers`; `Some(buffer)` also records which slots
+        // participate, avoiding a per-stripe sidecar allocation.
         let mut bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_readers);
-        for (i, participates) in participating.iter().enumerate() {
-            bufs.push(if *participates {
+        for i in 0..num_readers {
+            bufs.push(if self.engaged[i] && self.readers[i].is_some() {
                 Some(self.buffers.take(i, shard_size))
             } else {
                 None
@@ -1085,7 +1083,6 @@ where
         let data_shards = self.data_shards;
         let read_timeout = self.read_timeout;
         let metrics_path = self.metrics_path;
-        let read_costs = self.read_costs.clone();
         let locality_preference_enabled = self.locality_preference_enabled;
         let stripe_read_start = metrics_path.map(|_| Instant::now());
 
@@ -1100,19 +1097,21 @@ where
         // before the retirement pass mutates `self.readers` below.
         {
             let mut sets = FuturesUnordered::new();
-            let reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
+            let reader_iter = ReaderLaunchIter::new(&mut self.readers, self.read_costs.as_slice(), locality_preference_enabled);
             for (i, reader) in reader_iter {
-                if reader.is_none() || !participating[i] {
+                if reader.is_none() {
                     continue;
                 }
-                let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
-                let recycled_buf = bufs[i].take();
+                let Some(recycled_buf) = bufs[i].take() else {
+                    continue;
+                };
+                let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                 scheduled += 1;
                 sets.push(read_shard(
                     i,
                     read_cost,
                     reader,
-                    recycled_buf,
+                    Some(recycled_buf),
                     shard_size,
                     data_shards,
                     read_timeout,
@@ -1208,7 +1207,7 @@ where
         // covered by the stripe-aligned parity substitution below.
         if hedged {
             for i in 0..num_readers {
-                if participating[i] && shards[i].is_none() && errs[i].is_none() {
+                if self.engaged[i] && self.readers[i].is_some() && shards[i].is_none() && errs[i].is_none() {
                     errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read hedged after a slow shard")));
                     retire_readers.push(i);
                 }
@@ -1237,7 +1236,7 @@ where
             if !self.try_engage_parity(idx, stripe_index) {
                 continue;
             }
-            let read_cost = read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
+            let read_cost = self.read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
             let recycled_buf = Some(self.buffers.take(idx, shard_size));
             scheduled += 1;
             let (i, _read_cost, result, _should_retire) = read_shard(
