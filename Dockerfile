@@ -91,7 +91,12 @@ LABEL name="RustFS" \
 # Upgrade base-image packages so published images pick up security fixes
 # (e.g. openssl/libssl3 CVEs) without waiting for a new Alpine point release.
 RUN apk upgrade --no-cache && \
-    apk add --no-cache ca-certificates coreutils curl
+    apk add --no-cache \
+    ca-certificates \
+    coreutils \
+    curl \
+    tzdata \
+    && test "$(TZ=Asia/Kolkata date +%z)" = "+0530"
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs

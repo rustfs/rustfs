@@ -96,9 +96,11 @@ LABEL name="RustFS" \
 # Upgrade base-image packages so published images pick up security fixes
 # (e.g. tar/gzip/perl CVEs) without waiting for a new Ubuntu point release.
 RUN apt-get update && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    tzdata \
+    && test "$(TZ=Asia/Kolkata date +%z)" = "+0530" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/rustfs /usr/bin/rustfs
