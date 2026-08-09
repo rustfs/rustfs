@@ -4478,7 +4478,7 @@ pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
     /// I/O root pinned to the mount instance that was opened while the disk
-    /// was initialized. On Linux this is `/proc/self/fd/<dirfd>`; resolving
+    /// was initialized. On Linux this is `/proc/self/fd/<dirfd>/.`; resolving
     /// paths beneath it keeps repair I/O on that mount even if the configured
     /// pathname is later covered by another mount.
     io_root: PathBuf,
@@ -4693,7 +4693,7 @@ impl LocalDisk {
         .map_err(std::io::Error::from)
         .map_err(DiskError::from)?;
         let lease = std::fs::File::from(fd);
-        let io_root = PathBuf::from(format!("/proc/self/fd/{}", lease.as_raw_fd()));
+        let io_root = PathBuf::from(format!("/proc/self/fd/{}/.", lease.as_raw_fd()));
         let mount_id = mount_id_for_fd(&lease);
         Ok((lease, io_root, mount_id))
     }
@@ -20190,6 +20190,12 @@ mod test {
             object_path.starts_with("/proc/self/fd/"),
             "replacement I/O must resolve beneath the held directory descriptor"
         );
+        assert!(
+            std::fs::metadata(disk.io_root())
+                .expect("lease I/O root must be stat-able")
+                .is_dir(),
+            "lease I/O root must remain usable as a directory path"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -20223,6 +20229,31 @@ mod test {
 
         drop(disk);
         std::fs::remove_dir_all(&old_root).expect("remove old leased root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_cleanup_uses_mount_lease_root_as_a_directory() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let tmp_leftover = dir.path().join(RUSTFS_META_TMP_BUCKET).join("leftover").join("data");
+        fs::create_dir_all(tmp_leftover.parent().expect("tmp leftover should have a parent"))
+            .await
+            .expect("tmp leftover parent should be created");
+        fs::write(&tmp_leftover, b"temporary")
+            .await
+            .expect("tmp leftover should be written");
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, true).await.expect("local disk should be created");
+
+        assert!(disk.has_replacement_mount_lease());
+        assert!(
+            !tmp_leftover.exists(),
+            "startup tmp cleanup must be able to rename beneath the procfd I/O root"
+        );
+        assert!(LocalDisk::meta_path(disk.io_root(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
     }
 
     #[cfg(target_os = "linux")]
