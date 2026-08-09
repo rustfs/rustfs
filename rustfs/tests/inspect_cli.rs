@@ -16,6 +16,8 @@
 
 use std::process::Command;
 
+use rustfs_ecstore::api::bucket::metadata::BucketMetadata;
+
 fn decode_hex(source: &str) -> Vec<u8> {
     let digits = source
         .chars()
@@ -52,19 +54,26 @@ fn inspect_subcommand_reaches_the_offline_executor() {
 #[test]
 fn inspect_success_reports_persisted_header_and_all_config_timestamps() {
     let drive = tempfile::tempdir().expect("drive tempdir");
+    let export = tempfile::tempdir().expect("export tempdir");
+    let out = export.path().join("raw");
     let object_dir = drive.path().join(".rustfs.sys/buckets/interop/.metadata.bin");
     std::fs::create_dir_all(&object_dir).expect("create metadata object directory");
     let fixture = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata_full.xlmeta.hex"));
     std::fs::write(object_dir.join("xl.meta"), fixture).expect("write metadata fixture");
+    let drive_path = drive.path().to_string_lossy().into_owned();
+    let out_path = out.to_string_lossy().into_owned();
 
     let output = Command::new(env!("CARGO_BIN_EXE_rustfs-cli"))
         .args([
             "inspect",
             "bucket-meta",
             "--path",
-            drive.path().to_string_lossy().as_ref(),
+            drive_path.as_str(),
             "--bucket",
             "interop",
+            "--raw",
+            "--out",
+            out_path.as_str(),
         ])
         .output()
         .expect("run rustfs-cli inspect");
@@ -92,5 +101,32 @@ fn inspect_success_reports_persisted_header_and_all_config_timestamps() {
     ];
     for expected in expected_lines {
         assert!(stdout.lines().any(|line| line == expected), "missing stdout line {expected:?}:\n{stdout}");
+    }
+
+    let expected_blob = decode_hex(include_str!("../../crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex"));
+    assert_eq!(std::fs::read_dir(&out).expect("read raw output").count(), 14);
+    assert_eq!(std::fs::read(out.join(".metadata.bin")).expect("read raw metadata"), expected_blob);
+    let metadata = BucketMetadata::unmarshal(&expected_blob[4..]).expect("unmarshal expected metadata");
+    let expected_configs = [
+        ("notification.xml", metadata.notification_config_xml.as_slice()),
+        ("lifecycle.xml", metadata.lifecycle_config_xml.as_slice()),
+        ("object-lock.xml", metadata.object_lock_config_xml.as_slice()),
+        ("versioning.xml", metadata.versioning_config_xml.as_slice()),
+        ("bucket-encryption.xml", metadata.encryption_config_xml.as_slice()),
+        ("tagging.xml", metadata.tagging_config_xml.as_slice()),
+        ("replication.xml", metadata.replication_config_xml.as_slice()),
+        ("cors.xml", metadata.cors_config_xml.as_slice()),
+        ("logging.xml", metadata.logging_config_xml.as_slice()),
+        ("website.xml", metadata.website_config_xml.as_slice()),
+        ("accelerate.xml", metadata.accelerate_config_xml.as_slice()),
+        ("request-payment.xml", metadata.request_payment_config_xml.as_slice()),
+        ("public-access-block.xml", metadata.public_access_block_config_xml.as_slice()),
+    ];
+    for (name, expected_bytes) in expected_configs {
+        assert_eq!(
+            std::fs::read(out.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}")),
+            expected_bytes,
+            "{name} must preserve exact persisted bytes"
+        );
     }
 }
