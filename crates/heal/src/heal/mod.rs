@@ -122,6 +122,28 @@ async fn apply_healing_markers(
         targets.push(disk);
     }
 
+    apply_healing_markers_to_targets(targets, marker, expected_marker, allow_missing).await
+}
+
+async fn apply_healing_markers_to_targets(
+    targets: Vec<DiskStore>,
+    marker: Option<&str>,
+    expected_marker: Option<&str>,
+    allow_missing: bool,
+) -> crate::Result<()> {
+    apply_healing_markers_to_targets_with_after_acquire(targets, marker, expected_marker, allow_missing, |_| {}).await
+}
+
+async fn apply_healing_markers_to_targets_with_after_acquire<F>(
+    targets: Vec<DiskStore>,
+    marker: Option<&str>,
+    expected_marker: Option<&str>,
+    allow_missing: bool,
+    mut after_acquire: F,
+) -> crate::Result<()>
+where
+    F: FnMut(&DiskStore),
+{
     let marker_bytes = marker.map(|marker| EcstoreDiskBytes::copy_from_slice(marker.as_bytes()));
     let expected_bytes = expected_marker.map(|marker| EcstoreDiskBytes::copy_from_slice(marker.as_bytes()));
     let mut newly_acquired = Vec::new();
@@ -139,6 +161,7 @@ async fn apply_healing_markers(
                 {
                     Ok(EcstoreConditionalFileUpdate::Updated) => {
                         newly_acquired.push(disk.clone());
+                        after_acquire(&disk);
                         Ok(())
                     }
                     Ok(EcstoreConditionalFileUpdate::Mismatch) => match EcstoreDiskAPI::compare_and_update_file(
@@ -178,15 +201,25 @@ async fn apply_healing_markers(
         };
         if let Err(err) = result {
             if let Some(marker) = marker_bytes.as_ref() {
+                let mut rollback_error = None;
                 for acquired in newly_acquired.iter().rev() {
-                    let _ = EcstoreDiskAPI::compare_and_update_file(
+                    if let Err(rollback) = EcstoreDiskAPI::compare_and_update_file(
                         acquired.as_ref(),
                         RUSTFS_META_BUCKET,
                         HEALING_MARKER_PATH,
                         Some(marker.clone()),
                         None,
                     )
-                    .await;
+                    .await
+                    {
+                        rollback_error.get_or_insert(rollback);
+                    }
+                }
+                if let Some(rollback) = rollback_error {
+                    return Err(DiskError::other(format!(
+                        "healing marker acquisition failed ({err}) and owner-safe rollback failed ({rollback})"
+                    ))
+                    .into());
                 }
             }
             return Err(err.into());
@@ -278,12 +311,192 @@ pub type HealPutObjReader = <ECStore as ObjectIO>::PutObjectReader;
 
 #[cfg(test)]
 mod tests {
-    use super::marker_matches;
+    use super::{
+        DiskError, DiskOption, Endpoint, HEALING_MARKER_PATH, RUSTFS_META_BUCKET, apply_healing_markers_to_targets,
+        apply_healing_markers_to_targets_with_after_acquire, marker_matches, new_disk,
+    };
+    use crate::{
+        Error,
+        heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes},
+    };
+    use tempfile::TempDir;
+
+    async fn make_marker_disk(temp: &TempDir, name: &str) -> super::DiskStore {
+        let path = temp.path().join(name);
+        std::fs::create_dir_all(&path).expect("marker disk directory should be created");
+        let endpoint = Endpoint::try_from(path.to_string_lossy().as_ref()).expect("marker disk endpoint should be valid");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("marker disk should initialize");
+        let metadata_volume = disk.make_volume(RUSTFS_META_BUCKET).await;
+        assert!(
+            matches!(metadata_volume, Ok(()) | Err(DiskError::VolumeExists)),
+            "marker metadata volume should exist: {metadata_volume:?}"
+        );
+        disk
+    }
 
     #[test]
     fn marker_clear_requires_the_current_owner_token() {
         assert!(marker_matches(b"set:task-a", Some("set:task-a")));
         assert!(!marker_matches(b"set:task-b", Some("set:task-a")));
         assert!(!marker_matches(b"set:task-a", None));
+    }
+
+    #[tokio::test]
+    async fn marker_acquisition_rolls_back_after_second_disk_ownership_conflict() {
+        let temp = TempDir::new().expect("marker test directory should be created");
+        let first = make_marker_disk(&temp, "first").await;
+        let second = make_marker_disk(&temp, "second").await;
+        let owner_b = EcstoreDiskBytes::from_static(b"owner-b");
+
+        assert_eq!(
+            EcstoreDiskAPI::compare_and_update_file(
+                second.as_ref(),
+                RUSTFS_META_BUCKET,
+                HEALING_MARKER_PATH,
+                None,
+                Some(owner_b.clone()),
+            )
+            .await
+            .expect("second disk owner should acquire marker"),
+            EcstoreConditionalFileUpdate::Updated
+        );
+
+        let err = apply_healing_markers_to_targets(vec![first.clone(), second.clone()], Some("owner-a"), None, false)
+            .await
+            .expect_err("second disk ownership must reject the partial acquisition");
+        assert!(matches!(err, Error::Disk(DiskError::Io(ref io)) if io.to_string() == "healing marker ownership changed"));
+        assert!(matches!(
+            EcstoreDiskAPI::read_all(first.as_ref(), RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await,
+            Err(DiskError::FileNotFound)
+        ));
+        assert_eq!(
+            EcstoreDiskAPI::read_all(second.as_ref(), RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+                .await
+                .expect("conflicting owner marker must remain"),
+            owner_b
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_acquisition_rolls_back_after_second_disk_io_error() {
+        let temp = TempDir::new().expect("marker test directory should be created");
+        let first = make_marker_disk(&temp, "first").await;
+        let second_path = temp.path().join("second");
+        std::fs::create_dir_all(&second_path).expect("second marker disk directory should be created");
+        let second_endpoint =
+            Endpoint::try_from(second_path.to_string_lossy().as_ref()).expect("second marker endpoint should be valid");
+        let second = new_disk(
+            &second_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("second marker disk should initialize");
+        std::fs::remove_dir_all(second_path.join(RUSTFS_META_BUCKET))
+            .expect("second marker metadata directory should be removed for the I/O failure fixture");
+        std::fs::write(second_path.join(RUSTFS_META_BUCKET), b"not a directory")
+            .expect("second marker volume should become an I/O failure fixture");
+
+        let err = apply_healing_markers_to_targets(vec![first.clone(), second], Some("owner-a"), None, false)
+            .await
+            .expect_err("second disk I/O failure must reject the partial acquisition");
+        assert!(
+            matches!(err, Error::Disk(DiskError::FileAccessDenied)),
+            "second marker operation must report its mapped filesystem failure: {err:?}"
+        );
+        assert!(matches!(
+            EcstoreDiskAPI::read_all(first.as_ref(), RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn marker_acquisition_reports_an_owner_safe_rollback_io_failure() {
+        let temp = TempDir::new().expect("marker test directory should be created");
+        let first = make_marker_disk(&temp, "first").await;
+        let second = make_marker_disk(&temp, "second").await;
+        let owner_b = EcstoreDiskBytes::from_static(b"owner-b");
+        let first_path = EcstoreDiskAPI::path(first.as_ref());
+        let moved_metadata_path = first_path.join("metadata-before-rollback");
+
+        assert_eq!(
+            EcstoreDiskAPI::compare_and_update_file(
+                second.as_ref(),
+                RUSTFS_META_BUCKET,
+                HEALING_MARKER_PATH,
+                None,
+                Some(owner_b),
+            )
+            .await
+            .expect("second disk owner should acquire marker"),
+            EcstoreConditionalFileUpdate::Updated
+        );
+
+        let err =
+            apply_healing_markers_to_targets_with_after_acquire(vec![first, second], Some("owner-a"), None, false, |disk| {
+                let metadata_path = EcstoreDiskAPI::path(disk.as_ref()).join(RUSTFS_META_BUCKET);
+                std::fs::rename(&metadata_path, &moved_metadata_path)
+                    .expect("first marker metadata should move after acquisition");
+                std::fs::write(&metadata_path, b"not a directory")
+                    .expect("first marker metadata should become a rollback I/O failure fixture");
+            })
+            .await
+            .expect_err("rollback I/O failure must remain visible to the caller");
+        let message = err.to_string();
+        assert!(message.contains("healing marker acquisition failed"));
+        assert!(message.contains("owner-safe rollback failed"));
+        assert!(moved_metadata_path.join(HEALING_MARKER_PATH).exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_marker_acquisition_has_one_owner_on_every_disk() {
+        let temp = TempDir::new().expect("marker test directory should be created");
+        let first = make_marker_disk(&temp, "first").await;
+        let second = make_marker_disk(&temp, "second").await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+
+        let owner_a_barrier = barrier.clone();
+        let owner_a_first = first.clone();
+        let owner_a_second = second.clone();
+        let owner_a = tokio::spawn(async move {
+            owner_a_barrier.wait().await;
+            apply_healing_markers_to_targets(vec![owner_a_first, owner_a_second], Some("owner-a"), None, false).await
+        });
+        let owner_b_barrier = barrier.clone();
+        let owner_b_first = first.clone();
+        let owner_b_second = second.clone();
+        let owner_b = tokio::spawn(async move {
+            owner_b_barrier.wait().await;
+            apply_healing_markers_to_targets(vec![owner_b_first, owner_b_second], Some("owner-b"), None, false).await
+        });
+
+        barrier.wait().await;
+        let owner_a_result = owner_a.await.expect("owner a task should join");
+        let owner_b_result = owner_b.await.expect("owner b task should join");
+        assert_ne!(
+            owner_a_result.is_ok(),
+            owner_b_result.is_ok(),
+            "exactly one owner must acquire both markers"
+        );
+
+        let winning_marker = if owner_a_result.is_ok() { b"owner-a" } else { b"owner-b" };
+        for disk in [&first, &second] {
+            assert_eq!(
+                EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+                    .await
+                    .expect("every disk must retain the winning owner marker"),
+                EcstoreDiskBytes::from_static(winning_marker)
+            );
+        }
     }
 }
