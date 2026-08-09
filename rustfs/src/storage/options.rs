@@ -463,6 +463,18 @@ fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mu
         .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
     {
         opts.set_replica_status(ReplicationStatusType::Replica);
+        // Persist REPLICA into the object metadata as well (mirrors the
+        // Snowball inbound path). The read side derives
+        // ObjectInfo::replication_status from this key, and must_replicate's
+        // anti-loop guard consumes it — without it, HEAD/GET report no
+        // status and the scanner's existing-object pass cascades the replica
+        // onward. `opts.delete_replication` alone only reaches delete flows.
+        opts.user_defined
+            .retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+        opts.user_defined.insert(
+            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+            ReplicationStatusType::Replica.as_str().to_string(),
+        );
     }
 }
 
@@ -1498,10 +1510,25 @@ mod tests {
         let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should be ignored");
 
         assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+        assert!(
+            !opts
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+            "an unauthorized client must not forge a persisted REPLICA status"
+        );
 
         let authorized = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replica status header should parse");
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        // The status must reach the object metadata: the read side derives
+        // ObjectInfo::replication_status from this key and the scanner's
+        // anti-cascade guard consumes it.
+        assert_eq!(
+            authorized.user_defined.get(AMZ_BUCKET_REPLICATION_STATUS).map(String::as_str),
+            Some(ReplicationStatusType::Replica.as_str()),
+            "authorized inbound replication must persist REPLICA into object metadata"
+        );
     }
 
     #[tokio::test]
@@ -1541,10 +1568,27 @@ mod tests {
         let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should be ignored");
 
         assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Empty);
+        assert!(
+            !opts
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+            "an unauthorized client must not forge a persisted REPLICA status"
+        );
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized replica status header should parse");
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
+        // For multipart the on-disk stamp actually comes from the SAME header
+        // at initiate time (create-multipart builds its options through
+        // put_opts_with_replication_authorization and persists user_defined
+        // into the upload's metadata); the completion-time insert asserted
+        // here feeds the anti-cascade must_replicate check on completion.
+        assert_eq!(
+            authorized.user_defined.get(AMZ_BUCKET_REPLICATION_STATUS).map(String::as_str),
+            Some(ReplicationStatusType::Replica.as_str()),
+            "authorized inbound multipart completion must carry REPLICA in its metadata"
+        );
     }
 
     #[test]

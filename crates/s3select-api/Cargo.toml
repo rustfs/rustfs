@@ -77,11 +77,12 @@ parking_lot.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }
 tracing.workspace = true
+uuid.workspace = true
 transform-stream.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-rustfs-test-utils.workspace = true
+rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
 serial_test.workspace = true
 
 [lib]
