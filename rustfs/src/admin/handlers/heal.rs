@@ -222,8 +222,6 @@ struct BackgroundHealStatus<'a> {
     cluster_status_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<BackgroundHealProgress>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local_replacement_recovery: Option<rustfs_heal::ReplacementRecoverySnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -932,7 +930,6 @@ fn encode_background_heal_status(
     heal_operations: rustfs_heal::HealOperationsSnapshot,
     progress: Option<BackgroundHealProgress>,
     cluster_status_complete: bool,
-    local_replacement_recovery: Option<rustfs_heal::ReplacementRecoverySnapshot>,
 ) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
@@ -942,7 +939,6 @@ fn encode_background_heal_status(
         heal_operations,
         cluster_status_complete,
         progress,
-        local_replacement_recovery,
     };
     serde_json::to_vec(&status).map_err(|e| {
         warn!(
@@ -1268,14 +1264,12 @@ impl Operation for BackgroundHealStatusHandler {
 
         let local_info = read_background_heal_info(store).await;
         let cluster_status = read_cluster_heal_status(local_info, notification_system.as_deref(), expected_nodes).await?;
-        let local_replacement_recovery = rustfs_heal::current_replacement_recovery_snapshot().await;
         let body = encode_background_heal_status(
             &cluster_status.info,
             cluster_status.state,
             cluster_status.operations,
             cluster_status.progress,
             cluster_status.complete,
-            Some(local_replacement_recovery),
         )?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1795,7 +1789,7 @@ mod tests {
             ..Default::default()
         };
 
-        let encoded = encode_background_heal_status(&info, HealRuntimeState::Active, operations, None, true, None)
+        let encoded = encode_background_heal_status(&info, HealRuntimeState::Active, operations, None, true)
             .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
@@ -1836,7 +1830,6 @@ mod tests {
             rustfs_heal::HealOperationsSnapshot::default(),
             Some(progress),
             true,
-            None,
         )
         .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
@@ -1845,62 +1838,6 @@ mod tests {
         assert_eq!(json["progress"]["objectsHealed"], 3);
         assert_eq!(json["progress"]["objectsFailed"], 1);
         assert_eq!(json["progress"]["bytesProcessed"], 4096);
-    }
-
-    #[test]
-    fn test_encode_background_heal_status_includes_local_replacement_recovery() {
-        let snapshot = rustfs_heal::ReplacementRecoverySnapshot {
-            records: vec![rustfs_heal::ReplacementRecoveryRecord {
-                task_id: "replacement-generation".to_string(),
-                state: rustfs_heal::ReplacementRecoveryState::CleanupPending,
-                generation: Some("replacement-generation".to_string()),
-                set_disk_id: Some("pool-0-set-0".to_string()),
-                target_slots: vec!["/mnt/replacement".to_string()],
-                reason: None,
-                verified_at: Some(42),
-            }],
-            definitive: true,
-            reason: None,
-        };
-
-        let encoded = encode_background_heal_status(
-            &BackgroundHealInfo::default(),
-            HealRuntimeState::Active,
-            rustfs_heal::HealOperationsSnapshot::default(),
-            None,
-            true,
-            Some(snapshot),
-        )
-        .expect("background heal info should serialize");
-        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
-
-        assert_eq!(json["localReplacementRecovery"]["definitive"], true);
-        assert_eq!(json["localReplacementRecovery"]["records"][0]["taskId"], "replacement-generation");
-        assert_eq!(json["localReplacementRecovery"]["records"][0]["state"], "cleanup_pending");
-        assert_eq!(json["localReplacementRecovery"]["records"][0]["targetSlots"][0], "/mnt/replacement");
-
-        let snapshot = rustfs_heal::ReplacementRecoverySnapshot {
-            records: Vec::new(),
-            definitive: false,
-            reason: Some("peer replacement recovery status is unavailable".to_string()),
-        };
-        let encoded = encode_background_heal_status(
-            &BackgroundHealInfo::default(),
-            HealRuntimeState::Degraded,
-            rustfs_heal::HealOperationsSnapshot::default(),
-            None,
-            false,
-            Some(snapshot),
-        )
-        .expect("background heal info should serialize");
-        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
-
-        assert_eq!(json["clusterStatusComplete"], false);
-        assert_eq!(json["localReplacementRecovery"]["definitive"], false);
-        assert_eq!(
-            json["localReplacementRecovery"]["reason"],
-            "peer replacement recovery status is unavailable"
-        );
     }
 
     #[test]
@@ -2114,7 +2051,6 @@ mod tests {
             rustfs_heal::HealOperationsSnapshot::default(),
             None,
             false,
-            None,
         )
         .expect("degraded status must serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("valid json");

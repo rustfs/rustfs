@@ -4724,8 +4724,8 @@ impl LocalDisk {
             let Some(pinned_mount_id) = self.mount_lease_mount_id else {
                 return false;
             };
-            return replacement_mount_identity(&configured, configured_mount_id)
-                == replacement_mount_identity(&pinned, pinned_mount_id);
+            replacement_mount_identity(&configured, configured_mount_id)
+                == replacement_mount_identity(&pinned, pinned_mount_id)
         }
 
         #[cfg(not(target_os = "linux"))]
