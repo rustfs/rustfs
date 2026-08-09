@@ -280,7 +280,7 @@ impl ErasureSetHealer {
     /// get or create task id
     async fn get_or_create_task_id(&self, set_disk_id: &str) -> Result<String> {
         if let Some(task_id) = &self.replacement_task_id {
-            let manager = ResumeManager::load_from_disk(self.disk.clone(), task_id).await?;
+            let manager = ResumeManager::load_replacement_intent(self.disk.clone(), task_id).await?;
             let state = manager.get_state().await;
             if !state.completed
                 && state.set_disk_id == set_disk_id
@@ -358,7 +358,12 @@ impl ErasureSetHealer {
         buckets: &[String],
     ) -> Result<(ResumeManager, CheckpointManager)> {
         // check if resume state exists
-        if ResumeManager::has_resume_state(&self.disk, task_id).await {
+        let has_resume_state = if self.replacement_task_id.is_some() {
+            ResumeManager::has_replacement_intent(&self.disk, task_id).await
+        } else {
+            ResumeManager::has_resume_state(&self.disk, task_id).await
+        };
+        if has_resume_state {
             debug!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -370,7 +375,11 @@ impl ErasureSetHealer {
                 "Erasure set resume state loading"
             );
 
-            let resume_manager = ResumeManager::load_from_disk(self.disk.clone(), task_id).await?;
+            let resume_manager = if self.replacement_task_id.is_some() {
+                ResumeManager::load_replacement_intent(self.disk.clone(), task_id).await?
+            } else {
+                ResumeManager::load_from_disk(self.disk.clone(), task_id).await?
+            };
             let checkpoint_manager = if CheckpointManager::has_checkpoint(&self.disk, task_id).await {
                 CheckpointManager::load_from_disk(self.disk.clone(), task_id).await?
             } else {
@@ -1712,7 +1721,7 @@ mod resume_loop_tests {
             .await
             .expect("replacement data scan should complete");
 
-        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), &replacement_task_id)
+        let state = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
             .await
             .expect("verified replacement state must remain after data scan")
             .get_state()

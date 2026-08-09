@@ -36,6 +36,10 @@ const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 
 /// resume state file constants
 const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
+// Replacement intents must not use the ordinary resume-state suffix. Older
+// binaries enumerate that suffix and can otherwise resume a replacement as a
+// normal heal without its identity and format fences.
+const REPLACEMENT_INTENT_FILE: &str = "ahm_replacement_intent.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 const REPLACEMENT_RECOVERY_MARKER_FILE: &str = "ahm_replacement_recovery.json";
@@ -456,7 +460,7 @@ fn replacement_recovery_marker_path(task_id: &str) -> std::path::PathBuf {
 }
 
 /// resume state
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeState {
     /// on-disk schema version; absent in legacy snapshots (defaults to 0)
     #[serde(default)]
@@ -660,6 +664,29 @@ pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
     throttle: Mutex<PersistThrottle>,
+    state_file: ResumeStateFile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeStateFile {
+    Ordinary,
+    ReplacementIntent,
+}
+
+impl ResumeStateFile {
+    fn path(self, task_id: &str) -> std::path::PathBuf {
+        let file = match self {
+            Self::Ordinary => RESUME_STATE_FILE,
+            Self::ReplacementIntent => REPLACEMENT_INTENT_FILE,
+        };
+        Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{file}"))
+    }
+}
+
+fn is_replacement_intent(state: &ResumeState) -> bool {
+    state.replacement_generation.is_some()
+        || !state.replacement_targets.is_empty()
+        || !matches!(state.replacement_phase, ReplacementPhase::None)
 }
 
 impl ResumeManager {
@@ -677,6 +704,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::Ordinary,
         };
 
         // save initial state
@@ -711,8 +739,8 @@ impl ResumeManager {
             });
         }
 
-        if Self::has_resume_state(&disk, &task_id).await {
-            let manager = Self::load_from_disk(disk, &task_id).await?;
+        if Self::has_replacement_intent(&disk, &task_id).await {
+            let manager = Self::load_replacement_intent(disk, &task_id).await?;
             let state = manager.get_state().await;
             if state.set_disk_id != set_disk_id
                 || state.replacement_targets != replacement_targets
@@ -746,6 +774,7 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::ReplacementIntent,
         };
         manager.save_state_strict().await?;
         manager.ensure_replacement_recovery_marker().await?;
@@ -900,10 +929,51 @@ impl ResumeManager {
         self.save_state().await
     }
 
-    /// load resume state from disk
+    /// Load an ordinary resume state from disk. Replacement intents have a
+    /// separate namespace so they cannot be mistaken for ordinary work by an
+    /// older binary.
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
+        Self::load_from_disk_at(disk, task_id, ResumeStateFile::Ordinary).await
+    }
+
+    /// Load a replacement intent, migrating the temporary legacy location
+    /// only after the isolated replacement record has been written.
+    pub async fn load_replacement_intent(disk: DiskStore, task_id: &str) -> Result<Self> {
+        if Self::has_state_file(&disk, task_id, ResumeStateFile::ReplacementIntent).await {
+            let isolated = Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::ReplacementIntent).await?;
+            if Self::has_state_file(&disk, task_id, ResumeStateFile::Ordinary).await {
+                let legacy = Self::load_from_disk_at(disk, task_id, ResumeStateFile::Ordinary).await?;
+                if !is_replacement_intent(&legacy.get_state().await) || legacy.get_state().await != isolated.get_state().await {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Replacement intent has conflicting legacy state for task {task_id}"),
+                    });
+                }
+                legacy.cleanup().await?;
+            }
+            return Ok(isolated);
+        }
+
+        let legacy = Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::Ordinary).await?;
+        if !is_replacement_intent(&legacy.get_state().await) {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Resume state is not a replacement intent for task {task_id}"),
+            });
+        }
+
+        let migrated = Self {
+            disk,
+            state: legacy.state.clone(),
+            throttle: Mutex::new(PersistThrottle::new()),
+            state_file: ResumeStateFile::ReplacementIntent,
+        };
+        migrated.save_state_strict().await?;
+        legacy.cleanup().await?;
+        Ok(migrated)
+    }
+
+    async fn load_from_disk_at(disk: DiskStore, task_id: &str, state_file: ResumeStateFile) -> Result<Self> {
         validate_resume_task_id(task_id)?;
-        let state_data = Self::read_state_file(&disk, task_id).await?;
+        let state_data = Self::read_state_file(&disk, task_id, state_file).await?;
         let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
@@ -950,15 +1020,33 @@ impl ResumeManager {
             disk,
             state: Arc::new(RwLock::new(state)),
             throttle: Mutex::new(PersistThrottle::new()),
+            state_file,
         })
     }
 
     /// check if resume state exists
     pub async fn has_resume_state(disk: &DiskStore, task_id: &str) -> bool {
+        Self::has_state_file(disk, task_id, ResumeStateFile::Ordinary).await
+    }
+
+    /// Check for a replacement intent in its isolated namespace. A legacy
+    /// replacement record is recognized so the next new-binary resume can
+    /// migrate it, but ordinary states never match.
+    pub async fn has_replacement_intent(disk: &DiskStore, task_id: &str) -> bool {
+        if Self::has_state_file(disk, task_id, ResumeStateFile::ReplacementIntent).await {
+            return true;
+        }
+        match Self::load_from_disk_at(disk.clone(), task_id, ResumeStateFile::Ordinary).await {
+            Ok(manager) => is_replacement_intent(&manager.get_state().await),
+            Err(_) => false,
+        }
+    }
+
+    async fn has_state_file(disk: &DiskStore, task_id: &str, state_file: ResumeStateFile) -> bool {
         if validate_resume_task_id(task_id).is_err() {
             return false;
         }
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+        let file_path = state_file.path(task_id);
         match path_to_str(&file_path) {
             Ok(path_str) => match disk.read_all(RUSTFS_META_BUCKET, path_str).await {
                 Ok(data) => !data.is_empty(),
@@ -1078,7 +1166,7 @@ impl ResumeManager {
         drop(state);
         validate_resume_task_id(&task_id)?;
 
-        let state_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+        let state_file = self.state_file.path(&task_id);
         let progress_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_PROGRESS_FILE}"));
 
         delete_resume_file(&self.disk, &progress_file).await?;
@@ -1188,7 +1276,7 @@ impl ResumeManager {
             message: format!("Failed to serialize resume state: {e}"),
         })?;
 
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", state.task_id, RESUME_STATE_FILE));
+        let file_path = self.state_file.path(&state.task_id);
 
         let path_str = path_to_str(&file_path)?;
         if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
@@ -1222,9 +1310,9 @@ impl ResumeManager {
     }
 
     /// read state file from disk
-    async fn read_state_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
+    async fn read_state_file(disk: &DiskStore, task_id: &str, state_file: ResumeStateFile) -> Result<Vec<u8>> {
         validate_resume_task_id(task_id)?;
-        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_STATE_FILE}"));
+        let file_path = state_file.path(task_id);
 
         let path_str = path_to_str(&file_path)?;
         disk.read_all(RUSTFS_META_BUCKET, path_str)
@@ -1611,33 +1699,30 @@ impl ResumeUtils {
         Ok(task_ids)
     }
 
-    /// List only durable replacement generations. The marker is written after
-    /// its resume state, so scanning this suffix never needs to deserialize
-    /// ordinary background-heal state on the periodic replacement retry path.
-    pub(crate) async fn get_replacement_resumable_tasks(disk: &DiskStore) -> Result<Vec<String>> {
-        let entries = match disk.list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                debug!(
-                    target: "rustfs::heal::resume",
-                    event = EVENT_HEAL_RESUME_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_RESUME,
-                    state = "replacement_list_failed",
-                    error = %error,
-                    "Replacement recovery marker listing failed"
-                );
-                return Ok(Vec::new());
+    /// Return replacement intent task IDs without exposing them through the
+    /// ordinary resume enumeration that older binaries consume. Legacy
+    /// replacement records are included once so the caller can migrate them.
+    pub async fn get_replacement_intent_tasks(disk: &DiskStore) -> Result<Vec<String>> {
+        let entries = disk
+            .list_dir("", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1)
+            .await
+            .map_err(|error| Error::TaskExecutionFailed {
+                message: format!("Failed to list replacement intents: {error}"),
+            })?;
+        let suffix = format!("_{REPLACEMENT_INTENT_FILE}");
+        let mut task_ids = HashSet::new();
+
+        for entry in entries {
+            if let Some(task_id) = entry.strip_suffix(&suffix)
+                && validate_resume_task_id(task_id).is_ok()
+            {
+                task_ids.insert(task_id.to_string());
+                continue;
             }
-        };
-        let marker_suffix = format!("_{REPLACEMENT_RECOVERY_MARKER_FILE}");
-        let mut task_ids = entries
-            .into_iter()
-            .filter_map(|entry| entry.strip_suffix(&marker_suffix).map(ToOwned::to_owned))
-            .filter(|task_id| validate_resume_task_id(task_id).is_ok())
-            .collect::<Vec<_>>();
+        }
+
+        let mut task_ids = task_ids.into_iter().collect::<Vec<_>>();
         task_ids.sort_unstable();
-        task_ids.dedup();
         Ok(task_ids)
     }
 
@@ -1652,18 +1737,14 @@ impl ResumeUtils {
             .map_err(|error| Error::TaskExecutionFailed {
                 message: format!("Failed to list replacement recovery records: {error}"),
             })?;
-        let state_suffix = format!("_{RESUME_STATE_FILE}");
         let proof_suffix = format!("_{REPLACEMENT_COMPLETION_PROOF_FILE}");
         let mut records = Vec::new();
 
-        for entry in &entries {
-            let Some(task_id) = entry.strip_suffix(&state_suffix) else {
-                continue;
-            };
-            if validate_resume_task_id(task_id).is_err() {
-                continue;
-            }
-            let state = ResumeManager::load_from_disk(disk.clone(), task_id).await?.get_state().await;
+        for task_id in Self::get_replacement_intent_tasks(disk).await? {
+            let state = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+                .await?
+                .get_state()
+                .await;
             if let Some(record) = ReplacementRecoveryRecord::from_state(state) {
                 records.push(record);
             }
@@ -1728,6 +1809,39 @@ impl ResumeUtils {
                             "Heal resume state cleanup failed"
                         );
                     }
+                }
+            }
+        }
+
+        for task_id in Self::get_replacement_intent_tasks(disk).await? {
+            if let Ok(resume_manager) = ResumeManager::load_replacement_intent(disk.clone(), &task_id).await {
+                let state = resume_manager.get_state().await;
+                let age_hours = current_time.saturating_sub(state.last_update) / 3600;
+
+                if !state.completed && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+                {
+                    continue;
+                }
+                if state.completed
+                    && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)
+                {
+                    continue;
+                }
+
+                if age_hours > max_age_hours
+                    && let Err(e) = resume_manager.cleanup().await
+                {
+                    warn!(
+                        target: "rustfs::heal::resume",
+                        event = EVENT_HEAL_RESUME_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_RESUME,
+                        task_id,
+                        age_hours,
+                        state = "expired_cleanup_failed",
+                        error = %e,
+                        "Replacement intent cleanup failed"
+                    );
                 }
             }
         }
@@ -1851,7 +1965,7 @@ mod tests {
             .await
             .expect("completion and verified phase must persist together");
 
-        let verified = ResumeManager::load_from_disk(disk.clone(), &task_id)
+        let verified = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
             .await
             .expect("verified phase must survive a restart")
             .get_state()
@@ -1884,13 +1998,100 @@ mod tests {
             .mark_replacement_cleanup_pending()
             .await
             .expect("cleanup-pending phase must persist after marker removal");
-        let cleanup_pending = ResumeManager::load_from_disk(disk, &task_id)
+        let cleanup_pending = ResumeManager::load_replacement_intent(disk, &task_id)
             .await
             .expect("cleanup-pending phase must survive a restart")
             .get_state()
             .await;
         assert!(cleanup_pending.completed);
         assert_eq!(cleanup_pending.replacement_phase, ReplacementPhase::CleanupPending);
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_is_not_an_ordinary_resumable_task() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist in its isolated namespace");
+
+        assert!(
+            !ResumeManager::has_resume_state(&disk, &task_id).await,
+            "an old ordinary-resume lookup must not discover a replacement intent"
+        );
+        assert!(ResumeManager::has_replacement_intent(&disk, &task_id).await);
+        assert!(
+            !ResumeUtils::get_resumable_tasks(&disk)
+                .await
+                .expect("ordinary resume listing should succeed")
+                .contains(&task_id),
+            "the old filename enumeration must not return replacement work"
+        );
+        assert_eq!(
+            ResumeUtils::get_replacement_intent_tasks(&disk)
+                .await
+                .expect("replacement intent listing should succeed"),
+            vec![task_id.clone()]
+        );
+        assert_eq!(
+            ResumeManager::load_replacement_intent(disk, &task_id)
+                .await
+                .expect("new replacement reader should load the isolated state")
+                .get_state()
+                .await,
+            manager.get_state().await
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_migrates_from_legacy_resume_filename() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let legacy = ResumeState::replacement_intent(
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        );
+        let legacy_path = ResumeStateFile::Ordinary.path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_path.to_str().expect("legacy resume path must be UTF-8"),
+            serde_json::to_vec(&legacy)
+                .expect("serialize legacy replacement state")
+                .into(),
+        )
+        .await
+        .expect("write legacy replacement state");
+
+        let migrated = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .expect("new binary should migrate a legacy replacement state");
+        assert_eq!(migrated.get_state().await, legacy);
+        assert!(
+            !ResumeManager::has_resume_state(&disk, &task_id).await,
+            "migration must remove the old-binary-visible state only after the new state is durable"
+        );
+        assert!(ResumeManager::has_replacement_intent(&disk, &task_id).await);
     }
 
     #[tokio::test]
@@ -1930,7 +2131,7 @@ mod tests {
 
         manager.cleanup().await.expect("resume cleanup should succeed");
         assert!(
-            !ResumeManager::has_resume_state(&disk, &proof.task_id).await,
+            !ResumeManager::has_replacement_intent(&disk, &proof.task_id).await,
             "completion cleanup must remove the resumable state"
         );
         assert_eq!(
@@ -2235,7 +2436,7 @@ mod tests {
             (verified_task_id.as_str(), ReplacementPhase::Verified),
             (cleanup_pending_task_id.as_str(), ReplacementPhase::CleanupPending),
         ] {
-            let state = ResumeManager::load_from_disk(disk.clone(), task_id)
+            let state = ResumeManager::load_replacement_intent(disk.clone(), task_id)
                 .await
                 .expect("durable replacement state must survive expiry cleanup")
                 .get_state()
@@ -2243,7 +2444,7 @@ mod tests {
             assert_eq!(state.replacement_phase, expected_phase);
         }
         assert!(
-            !ResumeManager::has_resume_state(&disk, &abandoned_task_id).await,
+            !ResumeManager::has_replacement_intent(&disk, &abandoned_task_id).await,
             "an abandoned replacement must expire"
         );
         assert!(

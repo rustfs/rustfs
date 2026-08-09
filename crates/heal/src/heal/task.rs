@@ -2199,9 +2199,9 @@ impl HealTask {
                 }
             };
             if let Some(disk) = disk.as_ref()
-                && ResumeManager::has_resume_state(disk, &self.id).await
+                && ResumeManager::has_replacement_intent(disk, &self.id).await
             {
-                let resume_manager = ResumeManager::load_from_disk(disk.clone(), &self.id).await?;
+                let resume_manager = ResumeManager::load_replacement_intent(disk.clone(), &self.id).await?;
                 let state = resume_manager.get_state().await;
                 if state.completed
                     && matches!(state.replacement_phase, ReplacementPhase::CleanupPending)
@@ -2831,7 +2831,7 @@ mod tests {
         assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
         assert!(storage.heal_object_calls.lock().unwrap().is_empty());
 
-        let state = ResumeManager::load_from_disk(disk, &task.id)
+        let state = ResumeManager::load_replacement_intent(disk, &task.id)
             .await
             .expect("durable replacement intent should remain available")
             .get_state()
@@ -2896,7 +2896,7 @@ mod tests {
             storage.resume_disk.lock().unwrap().is_none(),
             "the fresh resume-anchor fallback must remain unused"
         );
-        let state = ResumeManager::load_from_disk(anchor, &task_id)
+        let state = ResumeManager::load_replacement_intent(anchor, &task_id)
             .await
             .expect("the existing non-target anchor should retain the generation")
             .get_state()

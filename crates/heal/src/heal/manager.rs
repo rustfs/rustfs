@@ -1363,8 +1363,8 @@ impl HealManager {
                     set_disk_ids.insert(set_disk_id);
                 }
 
-                for task_id in ResumeUtils::get_resumable_tasks(disk).await.unwrap_or_default() {
-                    let Ok(manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
+                for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await.unwrap_or_default() {
+                    let Ok(manager) = ResumeManager::load_replacement_intent(disk.clone(), &task_id).await else {
                         continue;
                     };
                     let state = manager.get_state().await;
@@ -2501,8 +2501,8 @@ impl HealManager {
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
                         for disk in &local_disks {
-                            for task_id in ResumeUtils::get_replacement_resumable_tasks(disk).await.unwrap_or_default() {
-                                let Ok(resume_manager) = ResumeManager::load_from_disk(disk.clone(), &task_id).await else {
+                            for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await.unwrap_or_default() {
+                                let Ok(resume_manager) = ResumeManager::load_replacement_intent(disk.clone(), &task_id).await else {
                                     continue;
                                 };
                                 let state = resume_manager.get_state().await;
