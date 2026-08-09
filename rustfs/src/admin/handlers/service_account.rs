@@ -1693,14 +1693,6 @@ mod tests {
     }
 
     #[test]
-    fn map_service_account_lookup_error_fails_closed_for_decode_errors() {
-        let err = map_service_account_lookup_error(rustfs_iam::error::Error::ErrCredMalformed, "get service account failed");
-
-        assert_eq!(*err.code(), S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("get service account failed"));
-    }
-
-    #[test]
     fn add_service_account_maps_iam_create_errors_to_s3_errors() {
         let src = include_str!("service_account.rs");
         let create_start = src

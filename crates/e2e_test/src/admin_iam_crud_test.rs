@@ -195,6 +195,13 @@ async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestRe
     create_user_with_service_account_update_policy(&env, outsider, outsider_secret, "update-outsider-policy").await?;
     admin_ok(
         &env,
+        http::Method::POST,
+        "/rustfs/admin/v3/idp/builtin/policy/attach",
+        Some(serde_json::json!({ "policies": ["consoleAdmin"], "user": outsider }).to_string()),
+    )
+    .await?;
+    admin_ok(
+        &env,
         http::Method::PUT,
         &format!("/rustfs/admin/v3/add-user?accessKey={ordinary}"),
         Some(serde_json::json!({ "secretKey": ordinary_secret, "status": "enabled" }).to_string()),
@@ -262,7 +269,7 @@ async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestRe
         &target_path,
         takeover.clone(),
         StatusCode::FORBIDDEN,
-        "non-owner with UpdateServiceAccount must not update across parents",
+        "non-owner consoleAdmin must not update across parents",
     )
     .await?;
 
