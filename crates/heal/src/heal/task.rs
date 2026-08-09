@@ -2168,16 +2168,6 @@ impl HealTask {
         }
 
         let is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
-        if is_auto_replacement
-            && !self
-                .await_with_control(self.storage.replacement_targets_ready(&self.heal_endpoints))
-                .await?
-        {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Replacement target is no longer ready for automatic heal {set_disk_id}"),
-            });
-        }
-
         let replacement_resume_disk = if is_auto_replacement {
             let mut requested_targets = self.heal_endpoints.clone();
             requested_targets.sort_unstable();
@@ -2197,7 +2187,7 @@ impl HealTask {
                             message: format!("Replacement resume anchor changed for automatic heal {set_disk_id}"),
                         });
                     }
-                    disk
+                    Some(disk)
                 }
                 crate::heal::storage::ReplacementResumeDisk::Fresh => {
                     if self.replacement_resume_endpoint.is_some() {
@@ -2205,11 +2195,12 @@ impl HealTask {
                             message: format!("Replacement resume anchor is unavailable for automatic heal {set_disk_id}"),
                         });
                     }
-                    self.await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
-                        .await?
+                    None
                 }
             };
-            if ResumeManager::has_resume_state(&disk, &self.id).await {
+            if let Some(disk) = disk.as_ref()
+                && ResumeManager::has_resume_state(disk, &self.id).await
+            {
                 let resume_manager = ResumeManager::load_from_disk(disk.clone(), &self.id).await?;
                 let state = resume_manager.get_state().await;
                 if state.completed
@@ -2229,7 +2220,29 @@ impl HealTask {
                     return Ok(());
                 }
             }
-            Some(disk)
+            disk
+        } else {
+            None
+        };
+
+        if is_auto_replacement
+            && !self
+                .await_with_control(self.storage.replacement_targets_ready(&self.heal_endpoints))
+                .await?
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement target is no longer ready for automatic heal {set_disk_id}"),
+            });
+        }
+
+        let replacement_resume_disk = if is_auto_replacement {
+            Some(match replacement_resume_disk {
+                Some(disk) => disk,
+                None => {
+                    self.await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
+                        .await?
+                }
+            })
         } else {
             None
         };
@@ -2919,6 +2932,69 @@ mod tests {
             storage.replacement_format_calls.lock().unwrap().is_empty(),
             "unsafe targets must not format"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_recovery_skips_target_readiness_and_format() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+        let identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![identity],
+        )
+        .await
+        .expect("terminal replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("terminal replacement proof should persist before cleanup");
+        resume_manager
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("failed cleanup must retain a cleanup-pending state");
+
+        let storage = Arc::new(MockStorage {
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        HealTask::from_replacement_recovery_request(request, storage.clone(), Some(anchor.endpoint().to_string()))
+            .execute()
+            .await
+            .expect("cleanup-pending recovery must not require a mounted replacement target");
+
+        assert!(
+            !ResumeManager::has_resume_state(&anchor, &task_id).await,
+            "terminal cleanup must remove the retained resume state"
+        );
+        assert_eq!(*storage.global_format_calls.lock().unwrap(), 0);
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "terminal cleanup must not format replacement targets"
+        );
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(!*storage.listed.lock().unwrap());
     }
 
     #[derive(Default)]

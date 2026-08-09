@@ -56,11 +56,13 @@ const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bool {
-    !state.completed
-        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
-        && state.replacement_generation.as_deref() == Some(task_id)
+    state.replacement_generation.as_deref() == Some(task_id)
         && !state.replacement_targets.is_empty()
-        && state.retry_count >= state.max_retries
+        && ((!state.completed
+            && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+            && state.retry_count >= state.max_retries)
+            || (state.completed
+                && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
@@ -2493,8 +2495,9 @@ impl HealManager {
 
                         // Once formatting succeeds a replacement is no longer
                         // discoverable as UnformattedDisk. Re-admit exactly one
-                        // durable generation per set after bounded scheduler
-                        // retries are exhausted. Multiple generations are a
+                        // incomplete durable generation per set after bounded
+                        // scheduler retries are exhausted, or re-admit its
+                        // verified terminal cleanup. Multiple generations are a
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
                         for disk in &local_disks {
@@ -2506,11 +2509,13 @@ impl HealManager {
                                 if !durable_replacement_recovery_is_due(&state, &task_id) {
                                     continue;
                                 }
-                                let Ok(identities) = storage.replacement_target_identities(&state.replacement_targets).await else {
-                                    continue;
-                                };
-                                if identities != state.replacement_target_identities {
-                                    continue;
+                                if !matches!(state.replacement_phase, ReplacementPhase::CleanupPending) {
+                                    let Ok(identities) = storage.replacement_target_identities(&state.replacement_targets).await else {
+                                        continue;
+                                    };
+                                    if identities != state.replacement_target_identities {
+                                        continue;
+                                    }
                                 }
                                 let targets = state
                                     .replacement_targets
@@ -4216,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_replacement_recovery_re_admits_only_the_exhausted_generation() {
+    fn durable_replacement_recovery_re_admits_only_the_matching_generation() {
         let task_id = "replacement-generation";
         let mut state = crate::heal::resume::ResumeState::new(
             task_id.to_string(),
@@ -4233,9 +4238,17 @@ mod tests {
         assert!(durable_replacement_recovery_is_due(&state, task_id));
 
         state.completed = true;
+        state.retry_count = 0;
+        state.replacement_phase = ReplacementPhase::Verified;
         assert!(
-            !durable_replacement_recovery_is_due(&state, task_id),
-            "a completed generation must not be re-admitted"
+            durable_replacement_recovery_is_due(&state, task_id),
+            "verified terminal cleanup must be re-admitted without re-running recovery"
+        );
+
+        state.replacement_phase = ReplacementPhase::CleanupPending;
+        assert!(
+            durable_replacement_recovery_is_due(&state, task_id),
+            "cleanup-pending terminal cleanup must be periodically re-admitted"
         );
 
         state.completed = false;
@@ -4256,7 +4269,7 @@ mod tests {
         state.replacement_phase = ReplacementPhase::Verified;
         assert!(
             !durable_replacement_recovery_is_due(&state, task_id),
-            "verified completion cleanup must not re-run an erasure-set heal"
+            "a task must not adopt another generation's terminal cleanup"
         );
     }
 
