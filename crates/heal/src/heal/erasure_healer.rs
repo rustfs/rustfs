@@ -86,7 +86,14 @@ pub struct ErasureSetHealer {
     disk: DiskStore,
     heal_opts: HealOpts,
     source: HealRequestSource,
-    target_endpoints: Vec<String>,
+    target_endpoints: Arc<[String]>,
+}
+
+pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
+    target_endpoints.iter().all(|endpoint| {
+        let mut drives = result.after.drives.iter().filter(|drive| drive.endpoint == *endpoint);
+        matches!(drives.next(), Some(drive) if drive.state == "ok") && drives.next().is_none()
+    })
 }
 
 impl ErasureSetHealer {
@@ -169,13 +176,6 @@ impl ErasureSetHealer {
         HealObjectOutcome::Failed
     }
 
-    fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
-        target_endpoints.iter().all(|endpoint| {
-            let mut drives = result.after.drives.iter().filter(|drive| drive.endpoint == *endpoint);
-            matches!(drives.next(), Some(drive) if drive.state == "ok") && drives.next().is_none()
-        })
-    }
-
     pub fn new(
         storage: Arc<dyn HealStorageAPI>,
         progress: Arc<RwLock<HealProgress>>,
@@ -183,8 +183,10 @@ impl ErasureSetHealer {
         disk: DiskStore,
         heal_opts: HealOpts,
         source: HealRequestSource,
-        target_endpoints: Vec<String>,
+        mut target_endpoints: Vec<String>,
     ) -> Self {
+        target_endpoints.sort_unstable();
+        target_endpoints.dedup();
         Self {
             storage,
             progress,
@@ -192,7 +194,7 @@ impl ErasureSetHealer {
             disk,
             heal_opts,
             source,
-            target_endpoints,
+            target_endpoints: target_endpoints.into(),
         }
     }
 
@@ -242,7 +244,7 @@ impl ErasureSetHealer {
                     let state = manager.get_state().await;
                     if !state.completed
                         && state.set_disk_id == set_disk_id
-                        && state.replacement_targets == self.target_endpoints
+                        && state.replacement_targets.as_slice() == self.target_endpoints.as_ref()
                         && ResumeUtils::can_resume_task(&self.disk, &task_id).await
                     {
                         debug!(
@@ -352,7 +354,9 @@ impl ErasureSetHealer {
                 buckets.to_vec(),
             )
             .await?;
-            resume_manager.set_replacement_targets(self.target_endpoints.clone()).await?;
+            resume_manager
+                .set_replacement_targets(self.target_endpoints.as_ref().to_vec())
+                .await?;
 
             let checkpoint_manager = CheckpointManager::new(self.disk.clone(), task_id.to_string()).await?;
 
@@ -713,7 +717,7 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
-                            Ok((result, None)) if Self::target_outcomes_complete(&result, &target_endpoints) => Ok(true),
+                            Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => Ok(true),
                             Ok((_result, None)) if !target_endpoints.is_empty() => Err(Error::transient_skip(format!(
                                 "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
                             ))),
@@ -1029,7 +1033,7 @@ mod resume_loop_tests {
     //! that emits programmable multi-version pages. These exercise the real loop
     //! logic (cursor seeding, per-version dedup, anti-loop guard, absence
     //! handling) — not merely a mock's own output.
-    use super::ErasureSetHealer;
+    use super::{ErasureSetHealer, target_outcomes_complete};
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, compose_key};
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
@@ -1075,12 +1079,31 @@ mod resume_loop_tests {
             ..Default::default()
         };
 
-        assert!(ErasureSetHealer::target_outcomes_complete(&result, &["replacement-a".to_string()]));
-        assert!(!ErasureSetHealer::target_outcomes_complete(
+        assert!(target_outcomes_complete(&result, &["replacement-a".to_string()]));
+        assert!(!target_outcomes_complete(
             &result,
             &["replacement-a".to_string(), "replacement-b".to_string()]
         ));
-        assert!(!ErasureSetHealer::target_outcomes_complete(&result, &["replacement-c".to_string()]));
+        assert!(!target_outcomes_complete(&result, &["replacement-c".to_string()]));
+
+        let duplicate = HealResultItem {
+            after: Infos {
+                drives: vec![
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    },
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        assert!(!target_outcomes_complete(&duplicate, &["replacement-a".to_string()]));
     }
 
     #[derive(Clone)]
@@ -1331,6 +1354,18 @@ mod resume_loop_tests {
         assert_eq!(skipped, 0);
         assert!(env.storage.calls().is_empty());
         assert_eq!(env.resume.resume_cursor().await, None);
+    }
+
+    #[tokio::test]
+    async fn replacement_targets_use_a_canonical_order() {
+        let env = make_env_with_targets(vec![
+            "replacement-b".to_string(),
+            "replacement-a".to_string(),
+            "replacement-b".to_string(),
+        ])
+        .await;
+
+        assert_eq!(env.healer.target_endpoints.as_ref(), ["replacement-a", "replacement-b"]);
     }
 
     #[tokio::test]

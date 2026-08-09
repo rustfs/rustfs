@@ -2286,6 +2286,11 @@ impl HealManager {
                             }
                         }
 
+                        for target_endpoints in endpoints.values_mut() {
+                            target_endpoints.sort_by_key(ToString::to_string);
+                            target_endpoints.dedup_by(|left, right| left.to_string() == right.to_string());
+                        }
+
                         if endpoints.is_empty() {
                             debug!(
                                 target: "rustfs::heal::manager",

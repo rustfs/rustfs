@@ -14,6 +14,7 @@
 
 use crate::heal::{
     DiskError, EcstoreError, ErasureSetHealer,
+    erasure_healer::target_outcomes_complete,
     progress::HealProgress,
     storage::{HealStorageAPI, next_heal_listing_token},
 };
@@ -550,16 +551,6 @@ impl HealTask {
             Error::Other(message) => matches!(message.as_str(), "No heal required" | "No healing is required"),
             _ => matches!(err.to_string().as_str(), "No heal required" | "No healing is required"),
         }
-    }
-
-    fn format_result_contains_targets(result: &HealResultItem, endpoints: &[String]) -> bool {
-        endpoints.iter().all(|endpoint| {
-            result
-                .after
-                .drives
-                .iter()
-                .any(|drive| drive.endpoint == *endpoint && drive.state == "ok")
-        })
     }
 
     fn is_object_not_found_heal_error(err: &Error) -> bool {
@@ -2219,7 +2210,7 @@ impl HealTask {
                         "Heal erasure set format repaired"
                     );
                 }
-                if !self.options.dry_run && !Self::format_result_contains_targets(&result, &self.heal_endpoints) {
+                if !self.options.dry_run && !target_outcomes_complete(&result, &self.heal_endpoints) {
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to verify formatted replacement targets for {set_disk_id}"),
                     });
@@ -2465,12 +2456,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(HealTask::format_result_contains_targets(&result, &["disk-a".to_string()]));
-        assert!(!HealTask::format_result_contains_targets(
-            &result,
-            &["disk-a".to_string(), "disk-b".to_string()]
-        ));
-        assert!(!HealTask::format_result_contains_targets(&result, &["disk-c".to_string()]));
+        assert!(target_outcomes_complete(&result, &["disk-a".to_string()]));
+        assert!(!target_outcomes_complete(&result, &["disk-a".to_string(), "disk-b".to_string()]));
+        assert!(!target_outcomes_complete(&result, &["disk-c".to_string()]));
     }
     #[derive(Default)]
     struct MockStorage {
