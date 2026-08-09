@@ -2809,6 +2809,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_migration_moves_ordinary_replacement_resume_to_dedicated_directory() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let state = ResumeState::replacement_intent(
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        );
+        let legacy_resume = ResumeStateFile::Ordinary.path(&task_id);
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_resume.to_str().expect("legacy resume path must be UTF-8"),
+            serde_json::to_vec(&state)
+                .expect("serialize legacy ordinary replacement state")
+                .into(),
+        )
+        .await
+        .expect("write legacy ordinary replacement state");
+
+        ResumeUtils::migrate_legacy_replacement_records(&disk)
+            .await
+            .expect("startup migration should move ordinary replacement state");
+
+        assert_eq!(
+            ResumeUtils::get_replacement_intent_tasks(&disk)
+                .await
+                .expect("dedicated replacement listing should succeed"),
+            vec![task_id.clone()]
+        );
+        assert_eq!(
+            ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+                .await
+                .expect("migrated replacement intent should be readable")
+                .get_state()
+                .await,
+            state
+        );
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_resume.to_str().expect("legacy resume path must be UTF-8"))
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_migration_preserves_conflicting_dedicated_and_legacy_state() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("dedicated replacement intent should persist");
+        let dedicated_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+        let dedicated_bytes = disk
+            .read_all(RUSTFS_META_BUCKET, dedicated_path.to_str().expect("dedicated intent path must be UTF-8"))
+            .await
+            .expect("dedicated replacement intent should be readable");
+
+        let legacy_state = ResumeState::replacement_intent(
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_1".to_string(),
+            vec!["other-bucket".to_string()],
+            vec!["replacement-b".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-b".to_string(),
+                canonical_path: "/mnt/replacement-b".to_string(),
+                physical_device_ids: vec!["device-b".to_string()],
+                filesystem_identity: "4:5:6".to_string(),
+            }],
+        );
+        let legacy_path = ResumeStateFile::LegacyReplacementIntent.path(&task_id);
+        let legacy_bytes = serde_json::to_vec(&legacy_state).expect("serialize conflicting legacy replacement state");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_path.to_str().expect("legacy intent path must be UTF-8"),
+            legacy_bytes.clone().into(),
+        )
+        .await
+        .expect("conflicting legacy replacement intent should persist");
+
+        let error = ResumeUtils::migrate_legacy_replacement_records(&disk)
+            .await
+            .expect_err("conflicting replacement states must fail closed");
+        assert!(error.to_string().contains("conflicting legacy state"));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, dedicated_path.to_str().expect("dedicated intent path must be UTF-8"),)
+                .await
+                .expect("dedicated state must remain after conflict"),
+            dedicated_bytes
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_path.to_str().expect("legacy intent path must be UTF-8"),)
+                .await
+                .expect("legacy state must remain after conflict"),
+            legacy_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_migration_preserves_conflicting_dedicated_and_legacy_proof() {
+        let (_temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("dedicated replacement intent should persist");
+        manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("dedicated completion proof should persist");
+        let dedicated_path = replacement_completion_proof_path(&task_id);
+        let dedicated_bytes = disk
+            .read_all(RUSTFS_META_BUCKET, dedicated_path.to_str().expect("dedicated proof path must be UTF-8"))
+            .await
+            .expect("dedicated completion proof should be readable");
+
+        let mut legacy_proof = ReplacementCompletionProof::from_state(&manager.get_state().await, 42)
+            .expect("legacy completion proof fixture should build");
+        legacy_proof.set_disk_id = "pool_0_set_1".to_string();
+        let legacy_path = legacy_replacement_completion_proof_path(&task_id);
+        let legacy_bytes = serde_json::to_vec(&legacy_proof).expect("serialize conflicting legacy completion proof");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            legacy_path.to_str().expect("legacy proof path must be UTF-8"),
+            legacy_bytes.clone().into(),
+        )
+        .await
+        .expect("conflicting legacy completion proof should persist");
+
+        let error = ResumeUtils::migrate_legacy_replacement_records(&disk)
+            .await
+            .expect_err("conflicting completion proofs must fail closed");
+        assert!(error.to_string().contains("conflicts with legacy proof"));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, dedicated_path.to_str().expect("dedicated proof path must be UTF-8"),)
+                .await
+                .expect("dedicated proof must remain after conflict"),
+            dedicated_bytes
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, legacy_path.to_str().expect("legacy proof path must be UTF-8"),)
+                .await
+                .expect("legacy proof must remain after conflict"),
+            legacy_bytes
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_discovery_does_not_read_ordinary_resume_directory() {
         let (_temp_dir, disk) = schema_test_disk().await;
         for _ in 0..3 {
