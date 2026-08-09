@@ -2583,6 +2583,7 @@ impl HealManager {
                                             .lock()
                                             .expect("replacement recovery blocked set lock poisoned")
                                             .insert(set_disk_id.clone());
+                                        conflicted_recovery_sets.insert(set_disk_id.clone());
                                     }
                                     warn!(
                                         target: "rustfs::heal::manager",
@@ -2605,6 +2606,7 @@ impl HealManager {
                                                 .lock()
                                                 .expect("replacement recovery blocked set lock poisoned")
                                                 .insert(set_disk_id.clone());
+                                            conflicted_recovery_sets.insert(set_disk_id.clone());
                                         }
                                         warn!(
                                             target: "rustfs::heal::manager",
@@ -2733,6 +2735,23 @@ impl HealManager {
                         // Admit one set task with every ready replacement target. Queue deduplication is
                         // set-scoped, so admitting endpoints independently would silently drop later targets.
                         for (set_disk_id, endpoints) in endpoints {
+                            if replacement_recovery_blocked_sets
+                                .lock()
+                                .expect("replacement recovery blocked set lock poisoned")
+                                .contains(&set_disk_id)
+                            {
+                                skipped_invalid_count += 1;
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    set_disk_id,
+                                    result = "replacement_recovery_blocked",
+                                    "Heal auto-scan replacement admission deferred because durable recovery is blocked"
+                                );
+                                continue;
+                            }
                             // skip if already queued or healing
                             // Use consistent lock order: queue first, then active_heals to avoid deadlock
                             let mut skip = false;
