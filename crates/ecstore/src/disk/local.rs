@@ -4967,7 +4967,7 @@ impl LocalDisk {
             startup_cleanup_notify,
             exit_signal: None,
             io_backend: build_local_io_backend(io_root.clone()),
-            file_sync_permits: os::disk_file_sync_limiter(&io_root),
+            file_sync_permits: os::disk_file_sync_limiter(&root),
             snapshot_leases: Arc::new(Mutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
