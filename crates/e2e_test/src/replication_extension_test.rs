@@ -7488,6 +7488,10 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     // With B's outbound proven, the inbound replica must stay put across
     // multiple fast-scanner cycles.
     assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
 /// P1-19 (backlog#1675): the supported replication contract is targets that
 /// adopt the source version id (RustFS/MinIO semantics). A target that mints
 /// its own version ids silently breaks every version-addressed operation that
