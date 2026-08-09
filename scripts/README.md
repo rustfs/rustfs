@@ -74,6 +74,8 @@ their issue closes.
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_gt1g_multipart_put_matrix.sh` | dev-tool | >1 GiB multipart PUT matrix | `docs/testing/ecstore-validation-suite-design.md` |
+| `sample_remote_rustfs_rss.sh` | dev-tool | Remote RustFS PID CPU/RSS TSV sampler for hotpath profiling runs | `test_sample_remote_rustfs_rss.sh`; backlog#1647 |
+| `summarize_samply_profile_symbols.py` | dev-tool | Offline samply `profile.json.gz` + `.syms.json` function-level hotpath summarizer | `test_summarize_samply_profile_symbols.py`; backlog#1647 |
 | `run_scanner_benchmarks.sh` | dev-tool (disposition pending) | Scanner performance benchmark runner. Contains a hardcoded stale path; **disposition owned by backlog perf-10 — do not fix, move, or delete it here** | — |
 
 ## Local development & operations
