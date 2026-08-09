@@ -4129,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_replacement_recovery_waits_for_scheduler_budget_exhaustion() {
+    fn durable_replacement_recovery_re_admits_only_the_exhausted_generation() {
         let task_id = "replacement-generation";
         let mut state = crate::heal::resume::ResumeState::new(
             task_id.to_string(),
@@ -4144,6 +4144,33 @@ mod tests {
 
         state.retry_count = state.max_retries;
         assert!(durable_replacement_recovery_is_due(&state, task_id));
+
+        state.completed = true;
+        assert!(
+            !durable_replacement_recovery_is_due(&state, task_id),
+            "a completed generation must not be re-admitted"
+        );
+
+        state.completed = false;
+        state.replacement_generation = Some("another-generation".to_string());
+        assert!(
+            !durable_replacement_recovery_is_due(&state, task_id),
+            "a task must not adopt another generation's durable intent"
+        );
+
+        state.replacement_generation = Some(task_id.to_string());
+        state.replacement_targets.clear();
+        assert!(
+            !durable_replacement_recovery_is_due(&state, task_id),
+            "a durable retry without a target is not safe to re-admit"
+        );
+
+        state.replacement_targets = vec!["replacement-a".to_string()];
+        state.replacement_phase = ReplacementPhase::Verified;
+        assert!(
+            !durable_replacement_recovery_is_due(&state, task_id),
+            "verified completion cleanup must not re-run an erasure-set heal"
+        );
     }
 
     #[test]

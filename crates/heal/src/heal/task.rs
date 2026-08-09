@@ -2764,6 +2764,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = "replacement-existing-anchor".to_string();
+        let identity = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/replacement/replacement-a".to_string(),
+            physical_device_ids: vec!["replacement-a".to_string()],
+            filesystem_identity: "identity-replacement-a".to_string(),
+        };
+        ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![identity],
+        )
+        .await
+        .expect("existing intent should be stored on the non-target anchor");
+        let storage = Arc::new(MockStorage {
+            replacement_targets_ready: Mutex::new(true),
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        HealTask::from_request(request, storage.clone())
+            .execute()
+            .await
+            .expect_err("the test has no mounted marker target after format");
+
+        assert_eq!(
+            storage.replacement_format_calls.lock().unwrap().len(),
+            1,
+            "an existing non-target anchor must be reused instead of falling back to a fresh anchor"
+        );
+        assert!(
+            storage.resume_disk.lock().unwrap().is_none(),
+            "the fresh resume-anchor fallback must remain unused"
+        );
+        let state = ResumeManager::load_from_disk(anchor, &task_id)
+            .await
+            .expect("the existing non-target anchor should retain the generation")
+            .get_state()
+            .await;
+        assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    }
+
+    #[tokio::test]
     async fn automatic_replacement_defers_before_bucket_listing_when_target_is_unready() {
         let storage = Arc::new(MockStorage::default());
         let mut request = HealRequest::new(
@@ -2819,6 +2883,7 @@ mod tests {
         bucket_heal_calls: Mutex<Vec<String>>,
         block_heal_object: Mutex<bool>,
         resume_disk: Mutex<Option<DiskStore>>,
+        replacement_resume_disk: Mutex<Option<DiskStore>>,
     }
 
     #[test]
@@ -3201,6 +3266,9 @@ mod tests {
             _task_id: &str,
             _excluded_targets: &[String],
         ) -> Result<crate::heal::storage::ReplacementResumeDisk> {
+            if let Some(disk) = self.replacement_resume_disk.lock().unwrap().clone() {
+                return Ok(crate::heal::storage::ReplacementResumeDisk::Existing(disk));
+            }
             Ok(crate::heal::storage::ReplacementResumeDisk::Fresh)
         }
 

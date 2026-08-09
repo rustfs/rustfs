@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_expired_states_keeps_durable_replacement_recovery() {
+    async fn cleanup_expired_states_keeps_all_durable_replacement_phases() {
         use super::super::{DiskOption, Endpoint, new_disk};
         use tempfile::TempDir;
 
@@ -1378,35 +1378,122 @@ mod tests {
             Err(err) => panic!("create metadata volume for replacement expiry test: {err}"),
         }
 
-        let task_id = "replacement-expiry-test".to_string();
-        let manager = ResumeManager::new_replacement_intent(
+        let target = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        };
+        let intent = ResumeManager::new_replacement_intent(
             disk.clone(),
-            task_id.clone(),
+            "replacement-expiry-intent".to_string(),
             "pool_0_set_0".to_string(),
             vec!["bucket".to_string()],
             vec!["replacement-a".to_string()],
-            vec![ReplacementTargetIdentity {
-                endpoint: "replacement-a".to_string(),
-                canonical_path: "/mnt/replacement-a".to_string(),
-                physical_device_ids: vec!["device-a".to_string()],
-                filesystem_identity: "1:2:3".to_string(),
-            }],
+            vec![target.clone()],
         )
         .await
         .expect("replacement intent should persist");
-        manager.state.write().await.last_update = 0;
-        manager.save_state_strict().await.expect("persist expired replacement intent");
+        let rebuilding = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            "replacement-expiry-rebuilding".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![target.clone()],
+        )
+        .await
+        .expect("replacement rebuilding state should persist");
+        rebuilding
+            .mark_replacement_rebuilding(vec![target.clone()])
+            .await
+            .expect("replacement rebuilding phase should persist");
+        let verified = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            "replacement-expiry-verified".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![target.clone()],
+        )
+        .await
+        .expect("replacement verified state should persist");
+        verified
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("replacement verified phase should persist");
+        let cleanup_pending = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            "replacement-expiry-cleanup-pending".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![target.clone()],
+        )
+        .await
+        .expect("replacement cleanup-pending state should persist");
+        cleanup_pending
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("replacement completion should persist");
+        cleanup_pending
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("replacement cleanup-pending phase should persist");
+        let abandoned = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            "replacement-expiry-abandoned".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![target],
+        )
+        .await
+        .expect("replacement abandoned state should persist");
+        abandoned
+            .abandon_replacement_intent()
+            .await
+            .expect("replacement abandoned phase should persist");
+        let ordinary = ResumeManager::new(
+            disk.clone(),
+            "replacement-expiry-ordinary".to_string(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        )
+        .await
+        .expect("ordinary resume state should persist");
+
+        for manager in [&intent, &rebuilding, &verified, &cleanup_pending, &abandoned, &ordinary] {
+            manager.state.write().await.last_update = 0;
+            manager.save_state_strict().await.expect("persist expired resume state");
+        }
 
         ResumeUtils::cleanup_expired_states(&disk, 0)
             .await
             .expect("replacement expiry cleanup should complete");
 
-        let state = ResumeManager::load_from_disk(disk, &task_id)
-            .await
-            .expect("active replacement intent must survive expiry cleanup")
-            .get_state()
-            .await;
-        assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+        for (task_id, expected_phase) in [
+            ("replacement-expiry-intent", ReplacementPhase::Intent),
+            ("replacement-expiry-rebuilding", ReplacementPhase::Rebuilding),
+            ("replacement-expiry-verified", ReplacementPhase::Verified),
+            ("replacement-expiry-cleanup-pending", ReplacementPhase::CleanupPending),
+        ] {
+            let state = ResumeManager::load_from_disk(disk.clone(), task_id)
+                .await
+                .expect("durable replacement state must survive expiry cleanup")
+                .get_state()
+                .await;
+            assert_eq!(state.replacement_phase, expected_phase);
+        }
+        assert!(
+            !ResumeManager::has_resume_state(&disk, "replacement-expiry-abandoned").await,
+            "an abandoned replacement must expire"
+        );
+        assert!(
+            !ResumeManager::has_resume_state(&disk, "replacement-expiry-ordinary").await,
+            "an ordinary expired resume must expire"
+        );
     }
 
     #[tokio::test]
