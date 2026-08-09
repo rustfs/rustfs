@@ -1742,6 +1742,59 @@ mod tests {
             connection.await.expect("test client connection should complete");
         });
 
+        let challenge = uuid::Uuid::new_v4();
+        let capability_query = format!(
+            "{}={}&{}={challenge}",
+            super::PUT_FILE_CAPABILITY_QUERY,
+            super::PUT_FILE_CAPABILITY_VERSION,
+            super::PUT_FILE_CAPABILITY_CHALLENGE_QUERY
+        );
+        let capability_uri = format!("{PUT_FILE_CAPABILITY_PATH}?{capability_query}");
+        let mut capability_request = Request::builder()
+            .method(Method::GET)
+            .uri(&capability_uri)
+            .header(http::header::HOST, addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .expect("capability request should build");
+        capability_request
+            .headers_mut()
+            .extend(gen_signature_headers(&capability_uri, &Method::GET).expect("capability signature should build"));
+        let response = sender
+            .send_request(capability_request)
+            .await
+            .expect("capability request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .into_body()
+                .collect()
+                .await
+                .expect("capability response should drain")
+                .to_bytes()
+                .is_empty()
+        );
+
+        let legacy_probe_uri = format!("{PUT_FILE_STREAM_PATH}?{capability_query}");
+        let mut legacy_probe_request = Request::builder()
+            .method(Method::GET)
+            .uri(&legacy_probe_uri)
+            .header(http::header::HOST, addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .expect("legacy-path probe request should build");
+        legacy_probe_request
+            .headers_mut()
+            .extend(gen_signature_headers(&legacy_probe_uri, &Method::GET).expect("legacy-path signature should build"));
+        let response = sender
+            .send_request(legacy_probe_request)
+            .await
+            .expect("legacy-path probe should complete");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("legacy-path response should drain");
+
         for (server_epoch, expected_status) in [
             (None, StatusCode::CONFLICT),
             (Some(uuid::Uuid::new_v4()), StatusCode::CONFLICT),
