@@ -955,6 +955,7 @@ impl ResumeManager {
         task_id: &str,
     ) -> Result<Option<ReplacementCompletionProof>> {
         validate_resume_task_id(task_id)?;
+        let mut proofs = Vec::new();
         for path in [
             replacement_completion_proof_path(task_id),
             legacy_replacement_completion_proof_path(task_id),
@@ -974,9 +975,17 @@ impl ResumeManager {
                     message: format!("Failed to deserialize replacement completion proof: {error}"),
                 })?;
             proof.validate(task_id)?;
-            return Ok(Some(proof));
+            proofs.push(proof);
         }
-        Ok(None)
+
+        match proofs.as_slice() {
+            [] => Ok(None),
+            [proof] => Ok(Some(proof.clone())),
+            [proof, legacy_proof] if proof == legacy_proof => Ok(Some(proof.clone())),
+            _ => Err(Error::TaskExecutionFailed {
+                message: format!("Replacement completion proof conflicts with legacy proof for task {task_id}"),
+            }),
+        }
     }
 
     /// Reconcile the proof-first publication order after a crash. A matching
@@ -2985,6 +2994,11 @@ mod tests {
                 .expect("legacy proof must remain after conflict"),
             legacy_bytes
         );
+        let error = match ResumeManager::load_replacement_intent(disk.clone(), &task_id).await {
+            Ok(_) => panic!("a conflicting legacy proof must not be ignored during recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("conflicts with legacy proof"));
     }
 
     #[tokio::test]
