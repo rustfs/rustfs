@@ -40,6 +40,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -47,6 +48,34 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 type ChaosResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// Physical `xl.meta` and shard-file census for one object version on one disk.
+///
+/// A successful S3 GET only proves that a quorum can serve an object. Replacement
+/// tests need this lower-level record to prove that the rebuilt target holds the
+/// `xl.meta` selected for a specific version and every `part.N` it declares.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VersionShardCensus {
+    pub version_id: Option<String>,
+    pub has_xl_meta: bool,
+    pub data_dir: Option<String>,
+    pub expected_part_numbers: BTreeSet<usize>,
+    pub present_part_numbers: BTreeSet<usize>,
+}
+
+impl VersionShardCensus {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.has_xl_meta && self.expected_part_numbers == self.present_part_numbers
+    }
+
+    pub(crate) fn matches_manifest(&self, manifest: &Self) -> bool {
+        self.version_id == manifest.version_id
+            && self.is_complete()
+            && manifest.is_complete()
+            && self.data_dir == manifest.data_dir
+            && self.expected_part_numbers == manifest.expected_part_numbers
+    }
+}
 
 /// Single-node RustFS server with `disk_count` local volume directories that
 /// can be faulted individually while the server is running.
@@ -218,6 +247,67 @@ impl DiskFaultHarness {
     /// polling heal progress on a replaced disk.
     pub fn object_metadata_exists_on_disk(&self, disk_index: usize, bucket: &str, key: &str) -> bool {
         self.disks[disk_index].join(bucket).join(key).join("xl.meta").is_file()
+    }
+
+    /// Census the physical files selected by `version_id` on one disk.
+    ///
+    /// Missing metadata and missing shard files are represented in the returned
+    /// census rather than as an error so callers can poll replacement progress.
+    /// Invalid metadata or an unknown requested version remains an error: treating
+    /// either as an incomplete rebuild would hide corruption or a wrong-version
+    /// recovery result.
+    pub(crate) fn census_object_version(
+        &self,
+        disk_index: usize,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> ChaosResult<VersionShardCensus> {
+        let version_id = version_id.map(str::to_owned);
+        let object_dir = self.disks[disk_index].join(bucket).join(key);
+        let meta_path = object_dir.join("xl.meta");
+        if !meta_path.is_file() {
+            return Ok(VersionShardCensus {
+                version_id,
+                has_xl_meta: false,
+                data_dir: None,
+                expected_part_numbers: BTreeSet::new(),
+                present_part_numbers: BTreeSet::new(),
+            });
+        }
+
+        let metadata = rustfs_filemeta::FileMeta::load(&std::fs::read(&meta_path)?)?;
+        let file_info = metadata.into_fileinfo(bucket, key, version_id.as_deref().unwrap_or_default(), true, false, true)?;
+        let expected_part_numbers = if file_info.inline_data() {
+            BTreeSet::new()
+        } else {
+            file_info.parts.iter().map(|part| part.number).collect()
+        };
+        let data_dir = file_info.data_dir.map(|id| id.to_string());
+        let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
+        let present_part_numbers = match std::fs::read_dir(&part_dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    entry
+                        .file_type()
+                        .ok()
+                        .filter(|kind| kind.is_file())
+                        .and_then(|_| entry.file_name().to_str().map(str::to_owned))
+                })
+                .filter_map(|name| name.strip_prefix("part.").and_then(|number| number.parse::<usize>().ok()))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(VersionShardCensus {
+            version_id,
+            has_xl_meta: true,
+            data_dir,
+            expected_part_numbers,
+            present_part_numbers,
+        })
     }
 }
 
