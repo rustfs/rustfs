@@ -2221,7 +2221,7 @@ mod tests {
         let set = set_level_heal_view(&sets).await;
 
         let (result, error) = set
-            .heal_replacement_format(false, &[target.clone()])
+            .heal_replacement_format(false, std::slice::from_ref(&target))
             .await
             .expect("target-scoped replacement format should run");
 
