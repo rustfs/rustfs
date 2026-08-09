@@ -17,6 +17,14 @@
 pub const WALK_DIR_STREAM_COMPLETION_QUERY: &str = "walk_dir_stream_completion";
 pub const WALK_DIR_STREAM_COMPLETION_V1: &str = "error-v1";
 pub const WALK_DIR_BODY_SHA256_QUERY: &str = "walk_dir_body_sha256";
+pub const PUT_FILE_AUTH_QUERY: &str = "put_file_auth";
+pub const PUT_FILE_AUTH_V1: &str = "digest-trailer-v1";
+pub const PUT_FILE_NONCE_QUERY: &str = "put_file_nonce";
+pub const PUT_FILE_AUTH_TRAILER_MAGIC: &[u8; 16] = b"RFS-PUT-AUTH-V1\0";
+pub const PUT_FILE_AUTH_TRAILER_DIGEST_LEN: usize = 64;
+pub const PUT_FILE_AUTH_TRAILER_MAC_LEN: usize = 32;
+pub const PUT_FILE_AUTH_TRAILER_LEN: usize =
+    PUT_FILE_AUTH_TRAILER_MAGIC.len() + PUT_FILE_AUTH_TRAILER_DIGEST_LEN + PUT_FILE_AUTH_TRAILER_MAC_LEN;
 pub const NS_SCANNER_BODY_SHA256_QUERY: &str = "ns_scanner_body_sha256";
 pub const NS_SCANNER_CAPABILITY_CHALLENGE_QUERY: &str = "ns_scanner_challenge";
 pub const NS_SCANNER_CYCLE_QUERY: &str = "ns_scanner_cycle";

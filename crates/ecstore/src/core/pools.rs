@@ -91,6 +91,8 @@ const DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD: usize = 1000;
 const DECOMMISSION_BUCKET_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY";
 const DECOMMISSION_BUCKET_CONCURRENCY_DEFAULT_CAP: usize = 4;
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
+const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
+const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -885,9 +887,149 @@ fn ensure_pool_not_left_in_cmdline_after_decommission(position: usize, cmd_line:
 
 fn resolve_decommission_listing_worker_result(
     set_idx: usize,
-    worker_result: std::result::Result<(), tokio::task::JoinError>,
+    worker_result: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
-    worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))
+    worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))?
+}
+
+fn should_retry_decommission_listing(err: &Error, attempt: usize, max_attempts: usize) -> bool {
+    !is_err_bucket_not_found(err) && attempt + 1 < max_attempts
+}
+
+async fn wait_decommission_listing_retry(rx: &CancellationToken, delay: std::time::Duration) -> bool {
+    tokio::select! {
+        _ = rx.cancelled() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
+async fn run_decommission_listing_with_retry<List, ListFuture>(
+    rx: CancellationToken,
+    bucket: String,
+    cb: ListCallback,
+    pool_idx: usize,
+    set_idx: usize,
+    max_attempts: usize,
+    mut list: List,
+) -> Result<()>
+where
+    List: FnMut(ListCallback) -> ListFuture,
+    ListFuture: std::future::Future<Output = Result<()>>,
+{
+    let max_attempts = max_attempts.max(1);
+
+    for attempt in 0..max_attempts {
+        if rx.is_cancelled() {
+            debug!(
+                event = EVENT_DECOMMISSION_BUCKET,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = pool_idx,
+                set_index = set_idx,
+                bucket = %bucket,
+                state = "listing_worker_cancelled",
+                "Decommission listing worker cancelled"
+            );
+            return Ok(());
+        }
+
+        debug!(
+            event = EVENT_DECOMMISSION_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = pool_idx,
+            set_index = set_idx,
+            bucket = %bucket,
+            attempt = attempt + 1,
+            max_attempts,
+            state = "listing_started",
+            "Decommission listing started"
+        );
+
+        match list(cb.clone()).await {
+            Ok(()) => {
+                debug!(
+                    event = EVENT_DECOMMISSION_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_idx,
+                    set_index = set_idx,
+                    bucket = %bucket,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    state = "listing_completed",
+                    "Decommission listing completed"
+                );
+                return Ok(());
+            }
+            Err(err) if is_err_bucket_not_found(&err) => {
+                warn!(
+                    event = EVENT_DECOMMISSION_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_idx,
+                    set_index = set_idx,
+                    bucket = %bucket,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    state = "listing_bucket_missing",
+                    "Decommission listing bucket missing"
+                );
+                return Ok(());
+            }
+            Err(err) if should_retry_decommission_listing(&err, attempt, max_attempts) => {
+                error!(
+                    event = EVENT_DECOMMISSION_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_idx,
+                    set_index = set_idx,
+                    bucket = %bucket,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    retry_delay_ms = DECOMMISSION_LISTING_RETRY_DELAY.as_millis(),
+                    state = "listing_failed_retrying",
+                    error = ?err,
+                    "Decommission listing failed; retrying"
+                );
+                if wait_decommission_listing_retry(&rx, DECOMMISSION_LISTING_RETRY_DELAY).await {
+                    debug!(
+                        event = EVENT_DECOMMISSION_BUCKET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = pool_idx,
+                        set_index = set_idx,
+                        bucket = %bucket,
+                        state = "listing_worker_cancelled",
+                        "Decommission listing worker cancelled during retry wait"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                error!(
+                    event = EVENT_DECOMMISSION_BUCKET,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_idx,
+                    set_index = set_idx,
+                    bucket = %bucket,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    state = "listing_failed",
+                    error = ?err,
+                    "Decommission listing failed"
+                );
+                return Err(Error::other(format!(
+                    "decommission listing failed for bucket {bucket} pool {pool_idx} set {set_idx} attempt {}/{}: {err}",
+                    attempt + 1,
+                    max_attempts
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: bool, failure: bool) -> bool {
@@ -3261,78 +3403,21 @@ impl ECStore {
             let set_id = set_idx;
             let worker = tokio::spawn(async move {
                 let _listing_permit = listing_permit;
-                loop {
-                    if rx_clone.is_cancelled() {
-                        debug!(
-                            event = EVENT_DECOMMISSION_BUCKET,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            set_index = set_id,
-                            bucket = %bi.name,
-                            state = "listing_worker_cancelled",
-                            "Decommission listing worker cancelled"
-                        );
-                        break;
-                    }
-                    debug!(
-                        event = EVENT_DECOMMISSION_BUCKET,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_POOLS,
-                        pool_index = idx,
-                        set_index = set_id,
-                        bucket = %bi.name,
-                        state = "listing_started",
-                        "Decommission listing started"
-                    );
-
-                    match set
-                        .list_objects_to_decommission(rx_clone.clone(), bi.clone(), decommission_entry.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            debug!(
-                                event = EVENT_DECOMMISSION_BUCKET,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_POOLS,
-                                pool_index = idx,
-                                set_index = set_id,
-                                bucket = %bi.name,
-                                state = "listing_completed",
-                                "Decommission listing completed"
-                            );
-                            break;
-                        }
-                        Err(err) => {
-                            error!(
-                                event = EVENT_DECOMMISSION_BUCKET,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_POOLS,
-                                pool_index = idx,
-                                set_index = set_id,
-                                bucket = %bi.name,
-                                state = "listing_failed",
-                                error = ?err,
-                                "Decommission listing failed"
-                            );
-                            if is_err_bucket_not_found(&err) {
-                                warn!(
-                                    event = EVENT_DECOMMISSION_BUCKET,
-                                    component = LOG_COMPONENT_ECSTORE,
-                                    subsystem = LOG_SUBSYSTEM_POOLS,
-                                    pool_index = idx,
-                                    set_index = set_id,
-                                    bucket = %bi.name,
-                                    state = "listing_bucket_missing",
-                                    "Decommission listing bucket missing"
-                                );
-                                break;
-                            }
-
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        }
-                    }
-                }
+                run_decommission_listing_with_retry(
+                    rx_clone.clone(),
+                    bi.name.clone(),
+                    decommission_entry.clone(),
+                    idx,
+                    set_id,
+                    DECOMMISSION_LISTING_MAX_ATTEMPTS,
+                    |callback| {
+                        let set = set.clone();
+                        let rx = rx_clone.clone();
+                        let bucket = bi.clone();
+                        async move { set.list_objects_to_decommission(rx, bucket, callback).await }
+                    },
+                )
+                .await
             });
             listing_workers.push((set_id, worker));
         }
@@ -4959,8 +5044,8 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo,
-        DecommissionStartPoolState, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
-        apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        DecommissionStartPoolState, DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo,
+        PoolStatus, apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
@@ -4982,17 +5067,18 @@ mod pools_tests {
         resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
         resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
-        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, touch_decommission_progress, track_decommission_current_object,
-        track_decommission_current_object_stage, validate_start_decommission_request, wait_decommission_worker_drain,
+        run_decommission_buckets_bounded, run_decommission_listing_with_retry, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
+        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
+        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
+        touch_decommission_progress, track_decommission_current_object, track_decommission_current_object_stage,
+        validate_start_decommission_request, wait_decommission_listing_retry, wait_decommission_worker_drain,
         with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
-    use crate::error::Error;
+    use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
@@ -5005,6 +5091,10 @@ mod pools_tests {
     use time::{Duration, OffsetDateTime};
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
+
+    fn noop_decommission_list_callback() -> ListCallback {
+        Arc::new(|_| Box::pin(async {}))
+    }
 
     fn decommission_test_pool_endpoint(idx: usize, is_local: bool) -> PoolEndpoints {
         let port = 9000usize + idx;
@@ -6046,7 +6136,15 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_listing_worker_result_passthrough_ok() {
-        assert!(resolve_decommission_listing_worker_result(2, Ok(())).is_ok());
+        assert!(resolve_decommission_listing_worker_result(2, Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_listing_worker_result_passthrough_worker_error() {
+        let err = resolve_decommission_listing_worker_result(2, Ok(Err(Error::SlowDown)))
+            .expect_err("listing worker error should be returned");
+
+        assert!(matches!(err, Error::SlowDown));
     }
 
     #[tokio::test]
@@ -6062,6 +6160,80 @@ mod pools_tests {
         let message = err.to_string();
         assert!(message.contains("decommission listing worker 4 task join error"));
         assert!(message.contains("panic"));
+    }
+
+    #[test]
+    fn test_should_retry_decommission_listing_respects_attempt_limit_and_bucket_missing() {
+        assert!(should_retry_decommission_listing(&Error::SlowDown, 0, 2));
+        assert!(!should_retry_decommission_listing(&Error::SlowDown, 1, 2));
+        assert!(!should_retry_decommission_listing(
+            &StorageError::BucketNotFound("bucket".to_string()),
+            0,
+            2
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wait_decommission_listing_retry_reports_canceled_without_sleeping() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        assert!(wait_decommission_listing_retry(&token, StdDuration::from_secs(30)).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_decommission_listing_with_retry_stops_after_attempt_limit() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let err = run_decommission_listing_with_retry(
+            CancellationToken::new(),
+            "bucket-a".to_string(),
+            noop_decommission_list_callback(),
+            1,
+            2,
+            3,
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::SlowDown)
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("permanent listing failure must not retry forever");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(err.to_string().contains("attempt 3/3"));
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_listing_with_retry_treats_bucket_missing_as_complete() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        run_decommission_listing_with_retry(
+            CancellationToken::new(),
+            "bucket-a".to_string(),
+            noop_decommission_list_callback(),
+            1,
+            2,
+            3,
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(StorageError::BucketNotFound("bucket-a".to_string()))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("missing bucket should keep previous decommission listing behavior");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
