@@ -135,25 +135,27 @@ async fn apply_healing_markers(
                     None,
                     Some(marker.clone()),
                 )
-                .await?
+                .await
                 {
-                    EcstoreConditionalFileUpdate::Updated => {
+                    Ok(EcstoreConditionalFileUpdate::Updated) => {
                         newly_acquired.push(disk.clone());
                         Ok(())
                     }
-                    EcstoreConditionalFileUpdate::Mismatch => match EcstoreDiskAPI::compare_and_update_file(
+                    Ok(EcstoreConditionalFileUpdate::Mismatch) => match EcstoreDiskAPI::compare_and_update_file(
                         disk.as_ref(),
                         RUSTFS_META_BUCKET,
                         HEALING_MARKER_PATH,
                         Some(marker.clone()),
                         Some(marker.clone()),
                     )
-                    .await?
+                    .await
                     {
-                        EcstoreConditionalFileUpdate::Updated => Ok(()),
-                        _ => Err(DiskError::other("healing marker ownership changed")),
+                        Ok(EcstoreConditionalFileUpdate::Updated) => Ok(()),
+                        Ok(_) => Err(DiskError::other("healing marker ownership changed")),
+                        Err(err) => Err(err),
                     },
-                    EcstoreConditionalFileUpdate::Missing => Err(DiskError::other("healing marker disappeared")),
+                    Ok(EcstoreConditionalFileUpdate::Missing) => Err(DiskError::other("healing marker disappeared")),
+                    Err(err) => Err(err),
                 }
             }
             None => {
@@ -164,12 +166,13 @@ async fn apply_healing_markers(
                     expected_bytes.clone(),
                     None,
                 )
-                .await?
+                .await
                 {
-                    EcstoreConditionalFileUpdate::Updated => Ok(()),
-                    EcstoreConditionalFileUpdate::Missing if allow_missing => Ok(()),
-                    EcstoreConditionalFileUpdate::Missing => Err(DiskError::other("healing marker is missing")),
-                    EcstoreConditionalFileUpdate::Mismatch => Err(DiskError::other("healing marker ownership changed")),
+                    Ok(EcstoreConditionalFileUpdate::Updated) => Ok(()),
+                    Ok(EcstoreConditionalFileUpdate::Missing) if allow_missing => Ok(()),
+                    Ok(EcstoreConditionalFileUpdate::Missing) => Err(DiskError::other("healing marker is missing")),
+                    Ok(EcstoreConditionalFileUpdate::Mismatch) => Err(DiskError::other("healing marker ownership changed")),
+                    Err(err) => Err(err),
                 }
             }
         };

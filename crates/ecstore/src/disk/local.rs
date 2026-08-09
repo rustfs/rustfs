@@ -4626,7 +4626,21 @@ impl LocalDisk {
     /// Auto-replacement is destructive, so it is admitted only when local
     /// I/O is bound to the mounted directory rather than the endpoint path.
     pub fn has_replacement_mount_lease(&self) -> bool {
-        cfg!(target_os = "linux")
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Ok(configured) = std::fs::metadata(&self.root) else {
+                return false;
+            };
+            let Ok(pinned) = std::fs::metadata(self.io_root()) else {
+                return false;
+            };
+            return configured.dev() == pinned.dev() && configured.ino() == pinned.ino();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
@@ -4855,9 +4869,9 @@ impl LocalDisk {
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
 
-        let root = disk.root.clone();
+        let io_root = disk.io_root.clone();
         let publication_root = disk.publication_root.clone();
-        tokio::spawn(Self::cleanup_deleted_objects_loop(root, publication_root, exit_rx));
+        tokio::spawn(Self::cleanup_deleted_objects_loop(io_root, publication_root, exit_rx));
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -20002,5 +20016,33 @@ mod test {
             object_path.starts_with("/proc/self/fd/"),
             "replacement I/O must resolve beneath the held directory descriptor"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn replacement_mount_lease_rejects_a_replaced_endpoint_path() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let root = dir.path().to_path_buf();
+        let old_root = root.with_extension("leased");
+        let endpoint = Endpoint::try_from(root.to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        std::fs::rename(&root, &old_root).expect("move leased mount root aside");
+        std::fs::create_dir(&root).expect("replace configured endpoint directory");
+
+        assert!(
+            !disk.has_replacement_mount_lease(),
+            "replacement admission must reject a path that no longer names the lease"
+        );
+        disk.write_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Bytes::from_static(b"owner"))
+            .await
+            .expect("lease-root marker write should succeed");
+        assert!(old_root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
+        assert!(!root.join(RUSTFS_META_BUCKET).join(HEALING_MARKER_PATH).exists());
+
+        drop(disk);
+        std::fs::remove_dir_all(&old_root).expect("remove old leased root");
     }
 }

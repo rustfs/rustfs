@@ -2168,9 +2168,19 @@ impl HealTask {
             let mut requested_targets = self.heal_endpoints.clone();
             requested_targets.sort_unstable();
             requested_targets.dedup();
-            let disk = self
-                .await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
+            let selection = self
+                .await_with_control(
+                    self.storage
+                        .get_replacement_resume_disk(&set_disk_id, &self.id, &self.heal_endpoints),
+                )
                 .await?;
+            let disk = match selection {
+                crate::heal::storage::ReplacementResumeDisk::Existing(disk) => disk,
+                crate::heal::storage::ReplacementResumeDisk::Fresh => {
+                    self.await_with_control(self.storage.get_disk_for_resume_excluding(&set_disk_id, &self.heal_endpoints))
+                        .await?
+                }
+            };
             if ResumeManager::has_resume_state(&disk, &self.id).await {
                 let resume_manager = ResumeManager::load_from_disk(disk.clone(), &self.id).await?;
                 let state = resume_manager.get_state().await;
@@ -3184,6 +3194,15 @@ mod tests {
 
         async fn get_disk_for_resume_excluding(&self, set_disk_id: &str, _excluded_targets: &[String]) -> Result<DiskStore> {
             self.get_disk_for_resume(set_disk_id).await
+        }
+
+        async fn get_replacement_resume_disk(
+            &self,
+            _set_disk_id: &str,
+            _task_id: &str,
+            _excluded_targets: &[String],
+        ) -> Result<crate::heal::storage::ReplacementResumeDisk> {
+            Ok(crate::heal::storage::ReplacementResumeDisk::Fresh)
         }
 
         async fn replacement_target_identities(

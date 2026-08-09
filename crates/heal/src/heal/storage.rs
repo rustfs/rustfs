@@ -37,6 +37,11 @@ const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
 
+pub enum ReplacementResumeDisk {
+    Fresh,
+    Existing(DiskStore),
+}
+
 pub(crate) fn next_heal_listing_token(
     bucket: &str,
     prefix: &str,
@@ -415,6 +420,18 @@ pub trait HealStorageAPI: Send + Sync {
     /// Get a healthy non-target disk for durable replacement state.
     async fn get_disk_for_resume_excluding(&self, _set_disk_id: &str, _excluded_targets: &[String]) -> Result<DiskStore> {
         Err(Error::other("target-excluding resume disk selection is unsupported"))
+    }
+
+    /// Reopen the exact surviving disk that owns an existing replacement
+    /// intent. Falling back to another disk would create a second copy of the
+    /// same generation and split its progress.
+    async fn get_replacement_resume_disk(
+        &self,
+        _set_disk_id: &str,
+        _task_id: &str,
+        _excluded_targets: &[String],
+    ) -> Result<ReplacementResumeDisk> {
+        Err(Error::other("durable replacement resume selection is unsupported"))
     }
 
     /// Capture the mounted replacement instance before it is formatted.
@@ -1644,6 +1661,37 @@ impl HealStorageAPI for ECStoreHealStorage {
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+
+    async fn get_replacement_resume_disk(
+        &self,
+        set_disk_id: &str,
+        task_id: &str,
+        excluded_targets: &[String],
+    ) -> Result<ReplacementResumeDisk> {
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
+            })?;
+        let mut existing = None;
+        for disk_store in disks.into_iter().flatten() {
+            if !disk_store.endpoint().is_local || excluded_targets.contains(&disk_store.endpoint().to_string()) {
+                continue;
+            }
+            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                continue;
+            }
+            if super::resume::ResumeManager::has_resume_state(&disk_store, task_id).await {
+                if existing.replace(disk_store).is_some() {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
+                    });
+                }
+            }
+        }
+        Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))
     }
 
     async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {

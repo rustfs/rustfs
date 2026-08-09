@@ -569,6 +569,11 @@ impl ResumeManager {
         let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
+        if state.task_id != task_id {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Resume state task ID does not match its file name: {task_id}"),
+            });
+        }
 
         // A snapshot written by an older schema tracked a latest-only positional
         // cursor that is meaningless under per-version resume. Discard the stale

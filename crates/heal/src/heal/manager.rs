@@ -14,7 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeManager, ResumeUtils},
+    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -54,6 +54,14 @@ const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bool {
+    !state.completed
+        && matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
+        && state.replacement_generation.as_deref() == Some(task_id)
+        && !state.replacement_targets.is_empty()
+        && state.retry_count >= state.max_retries
+}
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -1294,7 +1302,7 @@ impl HealManager {
     async fn process_unclean_shutdown(&self) {
         let mut unclean = false;
         let mut set_disk_ids = HashSet::new();
-        let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>)>::new();
+        let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>, String)>::new();
         let mut replacement_restarts = HashMap::<String, (String, Vec<String>)>::new();
 
         {
@@ -1364,6 +1372,7 @@ impl HealManager {
                                 state.set_disk_id,
                                 state.replacement_targets,
                                 state.replacement_buckets,
+                                endpoint.to_string(),
                             ));
                             continue;
                         }
@@ -1373,6 +1382,7 @@ impl HealManager {
                                     state.set_disk_id,
                                     state.replacement_targets,
                                     state.replacement_buckets,
+                                    endpoint.to_string(),
                                 ));
                             }
                             Ok(_) => {
@@ -1393,28 +1403,40 @@ impl HealManager {
             return;
         }
 
-        let mut recovery_by_set = HashMap::<String, Vec<(Option<String>, Vec<String>, Vec<String>)>>::new();
-        for (task_id, (set_disk_id, heal_endpoints, buckets)) in replacement_intents {
+        let mut recovery_by_set = HashMap::<String, Vec<(Option<String>, Vec<String>, Vec<String>, Option<String>)>>::new();
+        for (task_id, (set_disk_id, heal_endpoints, buckets, resume_endpoint)) in replacement_intents {
             recovery_by_set
                 .entry(set_disk_id)
                 .or_default()
-                .push((Some(task_id), heal_endpoints, buckets));
+                .push((Some(task_id), heal_endpoints, buckets, Some(resume_endpoint)));
         }
         for (_abandoned_task_id, (set_disk_id, heal_endpoints)) in replacement_restarts {
             recovery_by_set
                 .entry(set_disk_id)
                 .or_default()
-                .push((None, heal_endpoints, Vec::new()));
+                .push((None, heal_endpoints, Vec::new(), None));
         }
 
         for (set_disk_id, mut recoveries) in recovery_by_set {
             let Ok((pool_index, set_index)) = crate::heal::utils::parse_set_disk_id(&set_disk_id) else {
                 continue;
             };
+            if recoveries.len() != 1 {
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    set_disk_id,
+                    recovery_count = recoveries.len(),
+                    "Replacement recovery deferred because multiple durable generations exist"
+                );
+                continue;
+            }
             let reuse_single_generation = recoveries.len() == 1 && recoveries[0].0.is_some();
             let mut heal_endpoints = recoveries
                 .iter_mut()
-                .flat_map(|(_, targets, _)| std::mem::take(targets))
+                .flat_map(|(_, targets, _, _)| std::mem::take(targets))
                 .collect::<Vec<_>>();
             heal_endpoints.sort_unstable();
             heal_endpoints.dedup();
@@ -2325,7 +2347,7 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
-                        let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>)>::new();
+                        let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>, String)>::new();
                         let mut conflicted_recovery_sets = HashSet::<String>::new();
                         let (local_disks, local_endpoints) = {
                             let local_disk_map = local_disk_map_read().await;
@@ -2424,11 +2446,7 @@ impl HealManager {
                                     continue;
                                 };
                                 let state = resume_manager.get_state().await;
-                                if state.completed
-                                    || !matches!(state.replacement_phase, ReplacementPhase::Intent | ReplacementPhase::Rebuilding)
-                                    || state.replacement_generation.as_deref() != Some(task_id.as_str())
-                                    || state.replacement_targets.is_empty()
-                                {
+                                if !durable_replacement_recovery_is_due(&state, &task_id) {
                                     continue;
                                 }
                                 let Ok(identities) = storage.replacement_target_identities(&state.replacement_targets).await else {
@@ -2463,15 +2481,17 @@ impl HealManager {
                                 }) {
                                     continue;
                                 }
+                                let resume_endpoint = disk.endpoint().to_string();
                                 match durable_recoveries.get(&set_disk_id) {
-                                    Some((existing_task_id, _, _)) if existing_task_id != &task_id => {
+                                    Some((existing_task_id, _, _, existing_anchor))
+                                        if existing_task_id != &task_id || existing_anchor != &resume_endpoint => {
                                         conflicted_recovery_sets.insert(set_disk_id);
                                     }
                                     Some(_) => {}
                                     None => {
                                         durable_recoveries.insert(
                                             set_disk_id,
-                                            (task_id, targets, state.replacement_buckets),
+                                            (task_id, targets, state.replacement_buckets, resume_endpoint),
                                         );
                                     }
                                 }
@@ -2492,7 +2512,7 @@ impl HealManager {
                             );
                         }
 
-                        for (set_disk_id, (_, targets, _)) in &durable_recoveries {
+                        for (set_disk_id, (_, targets, _, _)) in &durable_recoveries {
                             let expected = targets.iter().map(ToString::to_string).collect::<HashSet<_>>();
                             let observed = endpoints
                                 .get(set_disk_id)
@@ -2572,7 +2592,7 @@ impl HealManager {
                                 HealType::ErasureSet {
                                     buckets: recovery
                                         .as_ref()
-                                        .map(|(_, _, buckets)| buckets.clone())
+                                        .map(|(_, _, buckets, _)| buckets.clone())
                                         .unwrap_or_default(),
                                     set_disk_id: set_disk_id.clone(),
                                 },
@@ -2588,7 +2608,7 @@ impl HealManager {
                                 },
                                 HealPriority::Low,
                             );
-                            if let Some((task_id, _, _)) = recovery {
+                            if let Some((task_id, _, _, _)) = recovery {
                                 req.id = task_id;
                             }
                             req.source = HealRequestSource::AutoHeal;
@@ -4108,6 +4128,24 @@ mod tests {
         assert_eq!(retry_request.retry_attempts, 1);
         assert!(retry_delay > Duration::ZERO);
         assert!(retry_error.contains("Replacement erasure set heal incomplete"));
+    }
+
+    #[test]
+    fn durable_replacement_recovery_waits_for_scheduler_budget_exhaustion() {
+        let task_id = "replacement-generation";
+        let mut state = crate::heal::resume::ResumeState::new(
+            task_id.to_string(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        );
+        state.replacement_generation = Some(task_id.to_string());
+        state.replacement_phase = ReplacementPhase::Intent;
+        state.replacement_targets = vec!["replacement-a".to_string()];
+        assert!(!durable_replacement_recovery_is_due(&state, task_id));
+
+        state.retry_count = state.max_retries;
+        assert!(durable_replacement_recovery_is_due(&state, task_id));
     }
 
     #[test]
