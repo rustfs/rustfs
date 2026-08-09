@@ -137,8 +137,8 @@ use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP,
-    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_SOURCE_REPLICATION_REQUEST,
-    get_header,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, get_header,
     headers::{
         AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
         AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
@@ -5349,6 +5349,11 @@ impl DefaultObjectUsecase {
         if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
+        // SSE-C ciphertext passthrough (authorized replication only): the body
+        // is already ciphertext and must be stored verbatim — no compression,
+        // no bucket-default encryption.
+        let ciphertext_passthrough =
+            inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(&req.headers).is_some();
 
         let input = std::mem::take(&mut req.input);
 
@@ -5421,7 +5426,8 @@ impl DefaultObjectUsecase {
         self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
 
         let ingress_stage_start = std::time::Instant::now();
-        let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
+        let should_compress =
+            is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
@@ -5530,6 +5536,13 @@ impl DefaultObjectUsecase {
                 })
             })
         });
+
+        if ciphertext_passthrough {
+            // The replica keeps the source's SSE-C metadata; the bucket
+            // default must not claim managed encryption on it.
+            effective_sse = None;
+            effective_kms_key_id = None;
+        }
 
         // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
         validate_sse_headers_for_write(
@@ -5734,12 +5747,20 @@ impl DefaultObjectUsecase {
             principal: write_principal.as_ref(),
         };
 
-        let encryption_material = match sse_encryption(encryption_request).await {
-            Ok(material) => material,
-            Err(err) => {
-                let result = Err(err.into());
-                let _ = helper.complete(&result);
-                return result;
+        // SSE-C ciphertext passthrough must skip sse_encryption entirely: an
+        // explicit guard is required because prepare_sse_configuration inside
+        // it falls back to the bucket default encryption config and would
+        // double-encrypt the already-encrypted body.
+        let encryption_material = if opts.preserve_ciphertext {
+            None
+        } else {
+            match sse_encryption(encryption_request).await {
+                Ok(material) => material,
+                Err(err) => {
+                    let result = Err(err.into());
+                    let _ = helper.complete(&result);
+                    return result;
+                }
             }
         };
 
@@ -8275,15 +8296,22 @@ impl DefaultObjectUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
-        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+        // An authorized replication convergence check only needs etag/size/mtime
+        // to compare source and replica; it holds no customer key, so the SSE-C
+        // read validation is skipped for it (and only it).
+        let replication_check = replication_request_authorized(&req)
+            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true");
+        if !replication_check {
+            validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
 
-        // Validate SSE-C: if the object was encrypted with a customer-provided key,
-        // the caller must supply the matching key even for HEAD requests (per S3 spec).
-        validate_ssec_for_read(
-            &info.user_defined,
-            req.input.sse_customer_key.as_ref(),
-            req.input.sse_customer_key_md5.as_ref(),
-        )?;
+            // Validate SSE-C: if the object was encrypted with a customer-provided key,
+            // the caller must supply the matching key even for HEAD requests (per S3 spec).
+            validate_ssec_for_read(
+                &info.user_defined,
+                req.input.sse_customer_key.as_ref(),
+                req.input.sse_customer_key_md5.as_ref(),
+            )?;
+        }
 
         // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
         let expiration_header = resolve_put_object_expiration(&bucket, &info).await;

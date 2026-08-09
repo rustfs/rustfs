@@ -22,7 +22,10 @@
 //! ciphertext passthrough; every other encryption key must be stripped from
 //! outbound replication metadata via [`is_replication_stripped_encryption_key`].
 
-use super::headers::{AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5};
+// The lowercase stored forms, matching exactly what encryption_material_to_metadata
+// persists. The read-path SSE-C check is case-sensitive, so restoring under any
+// other casing would classify the replica as managed-SSE and reject SSE-C GETs.
+use super::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
 
 pub const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 pub const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
@@ -56,8 +59,8 @@ pub const REPLICATION_ENCRYPTED_MULTIPART_HEADER: &str = "X-Rustfs-Replication-E
 /// Source keys must match what `encryption_material_to_metadata` persists; the
 /// reconciliation test in `rustfs::storage::sse` pins that correspondence.
 pub const SSEC_REPLICATION_TRANSPORT_HEADERS: &[(&str, &str)] = &[
-    (AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, REPLICATION_SSEC_ALGORITHM_HEADER),
-    (AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, REPLICATION_SSEC_KEY_MD5_HEADER),
+    (SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER),
+    (SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER),
     (SSEC_ORIGINAL_SIZE_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER),
     (INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER),
     (MINIO_INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_SSE_IV_HEADER),
@@ -73,6 +76,41 @@ pub const REPLICATION_SSE_TRANSPORT_PREFIXES: &[&str] = &[
     "x-rustfs-replication-encryption-",
     "x-rustfs-replication-ssec-",
 ];
+
+/// Returns true when the request carries any SSE-C replication transport
+/// header — the signal that an authorized replication PUT is a ciphertext
+/// passthrough and the receiver must not re-encrypt or compress the body.
+pub fn has_ssec_transport_headers(headers: &http::HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        REPLICATION_SSE_TRANSPORT_PREFIXES
+            .iter()
+            .any(|prefix| super::starts_with_ignore_ascii_case(name, prefix))
+            || name.eq_ignore_ascii_case(REPLICATION_ENCRYPTED_MULTIPART_HEADER)
+    })
+}
+
+/// Restores the stored SSE-C metadata keys from their replication transport
+/// names. Returns None when the request carries no transport headers. When the
+/// customer algorithm is present, the AES256 SSE marker is re-added so the
+/// restored metadata matches the shape `encryption_material_to_metadata`
+/// persists (SSE-C Direct writes both IV twins; each travels under its own
+/// transport name, so the 1:1 reverse mapping restores the dual-key pair).
+pub fn ssec_transport_to_stored_metadata(headers: &http::HeaderMap) -> Option<std::collections::HashMap<String, String>> {
+    let mut restored = std::collections::HashMap::new();
+    for (stored, transport) in SSEC_REPLICATION_TRANSPORT_HEADERS {
+        if let Some(value) = headers.get(*transport).and_then(|value| value.to_str().ok()) {
+            restored.insert((*stored).to_string(), value.to_string());
+        }
+    }
+    if restored.is_empty() {
+        return None;
+    }
+    if restored.contains_key(SSEC_ALGORITHM_HEADER) {
+        restored.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+    }
+    Some(restored)
+}
 
 /// Maps a stored SSE-C metadata key to its replication transport name.
 pub fn ssec_replication_transport_header(stored_key: &str) -> Option<&'static str> {
@@ -99,6 +137,45 @@ pub fn is_replication_stripped_encryption_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_metadata_roundtrip_restores_stored_keys() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-rustfs-replication-ssec-algorithm"),
+            http::HeaderValue::from_static("AES256"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-rustfs-replication-encryption-iv"),
+            http::HeaderValue::from_static("iv-direct"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-rustfs-replication-server-side-encryption-iv"),
+            http::HeaderValue::from_static("iv-minio"),
+        );
+
+        assert!(has_ssec_transport_headers(&headers));
+        let restored = ssec_transport_to_stored_metadata(&headers).expect("transport headers must restore");
+        // Restore MUST use the exact lowercase stored key: the read-path SSE-C
+        // check is case-sensitive, so a TitleCase key would classify the
+        // replica as managed-SSE and reject SSE-C GETs.
+        assert_eq!(
+            restored
+                .get("x-amz-server-side-encryption-customer-algorithm")
+                .map(String::as_str),
+            Some("AES256")
+        );
+        assert!(!restored.keys().any(|k| k != "x-amz-server-side-encryption-customer-algorithm"
+            && k.eq_ignore_ascii_case("x-amz-server-side-encryption-customer-algorithm")));
+        assert_eq!(restored.get(INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str), Some("iv-direct"));
+        assert_eq!(restored.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str), Some("iv-minio"));
+        // The SSE marker is re-added to match the stored SSE-C shape.
+        assert_eq!(restored.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+
+        let plain = http::HeaderMap::new();
+        assert!(!has_ssec_transport_headers(&plain));
+        assert!(ssec_transport_to_stored_metadata(&plain).is_none());
+    }
 
     #[test]
     fn transport_lookup_is_case_insensitive() {
@@ -137,7 +214,7 @@ mod tests {
         // SSE intent headers, including the KMS key id.
         assert!(is_replication_stripped_encryption_key("x-amz-server-side-encryption"));
         assert!(is_replication_stripped_encryption_key("x-amz-server-side-encryption-aws-kms-key-id"));
-        assert!(is_replication_stripped_encryption_key(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM));
+        assert!(is_replication_stripped_encryption_key(SSEC_ALGORITHM_HEADER));
         // is_sse_header does not cover the SSE-C original-size key; the
         // predicate must add it explicitly.
         assert!(is_replication_stripped_encryption_key(SSEC_ORIGINAL_SIZE_HEADER));

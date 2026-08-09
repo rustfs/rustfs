@@ -1453,10 +1453,6 @@ where
     }
 }
 
-async fn wait_for_replication_failure_event(response: reqwest::Response, expected_key: &str) -> TestResult {
-    wait_for_replication_failure_event_stream(response.bytes_stream(), expected_key, Duration::from_secs(30)).await
-}
-
 fn target_history_contains_key(output: &ListObjectVersionsOutput, key: &str) -> bool {
     output.versions().iter().any(|version| version.key() == Some(key))
         || output.delete_markers().iter().any(|marker| marker.key() == Some(key))
@@ -1511,29 +1507,6 @@ async fn assert_failed_replication_stays_absent_for(
         Ok(result) => result,
         Err(_) => Err(format!("timed out while checking failed replication stability for {target_bucket}/{key}").into()),
     }
-}
-
-async fn subscribe_to_replication_failure(
-    env: &RustFSTestEnvironment,
-    bucket: &str,
-    key: &str,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/{bucket}?events={}&prefix={}&ping=1",
-        env.url,
-        urlencoding::encode(REPLICATION_FAILED_EVENT),
-        urlencoding::encode(key)
-    );
-    let response = timeout(
-        Duration::from_secs(30),
-        signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None),
-    )
-    .await
-    .map_err(|_| "replication failure event subscription did not respond within 30 seconds")??;
-    if response.status() != StatusCode::OK {
-        return Err(format!("failed to subscribe to replication failure events: {}", response.status()).into());
-    }
-    Ok(response)
 }
 
 async fn build_sse_replication_pair(
@@ -4447,9 +4420,11 @@ async fn test_repl17_failure_observation_helpers() -> TestResult {
     Ok(())
 }
 
-/// backlog#1147 repl-17: SSE-C currently fails replication explicitly. Pin the
-/// observed contract: the source remains decryptable with its customer key,
-/// reports FAILED, emits the standard failure event, and leaves no target data.
+/// backlog#1147 repl-17 / backlog#1783: SSE-C objects replicate as ciphertext
+/// passthrough — the source cannot decrypt them (no customer key server-side),
+/// so the stored ciphertext and its encryption metadata travel verbatim and
+/// the replica is decryptable only with the original customer key. The
+/// backlog#1291 property still holds: never a silent plaintext replica.
 #[tokio::test]
 #[serial]
 async fn test_bucket_replication_sse_c_contract() -> TestResult {
@@ -4462,7 +4437,6 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     let body = b"repl-17 SSE-C payload";
     let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
-    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, key).await?;
 
     source_client
         .put_object()
@@ -4484,41 +4458,157 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
         .sse_customer_key_md5(&customer_key_md5)
         .send()
         .await?;
+    let source_etag = source.e_tag().map(str::to_string);
     assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body);
 
-    wait_for_replication_failure_event(failure_events, key).await?;
-    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", true).await?;
-    assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        true,
-        Duration::from_secs(5),
-    )
-    .await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
 
-    target_client
-        .put_object()
+    // The replica is readable only with the original customer key.
+    let replica = target_client
+        .get_object()
         .bucket(&target_bucket)
         .key(key)
-        .body(ByteStream::from_static(b"observer negative-path fixture"))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
         .send()
         .await?;
-    target_client.delete_object().bucket(&target_bucket).key(key).send().await?;
-    let history_error = assert_failed_replication_stays_absent_for(
-        &source_client,
-        &source_bucket,
-        &target_client,
-        &target_bucket,
-        key,
-        true,
-        Duration::ZERO,
-    )
-    .await
-    .expect_err("target history must violate the failed replication contract");
-    assert!(history_error.to_string().contains("created target history"));
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    let replica_etag = replica.e_tag().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    assert_eq!(replica_etag, source_etag, "replica ETag must match the source ETag");
+
+    // Without the customer key the replica must not be readable — the direct
+    // detection point for a silent-plaintext replica (backlog#1291).
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(plain_read.is_err(), "SSE-C replica must not be readable without the customer key");
+
+    // A wrong customer key must fail too.
+    let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
+    let wrong_key_md5 = sse_customer_key_md5_base64("99999999999999999999999999999999");
+    let wrong_read = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&wrong_key)
+        .sse_customer_key_md5(&wrong_key_md5)
+        .send()
+        .await;
+    assert!(wrong_read.is_err(), "SSE-C replica must reject a wrong customer key");
+
+    Ok(())
+}
+
+/// backlog#1783: SSE-C multipart objects pass through as ciphertext part by
+/// part — part boundaries and the encrypted-multipart marker survive so the
+/// replica decrypts each part with its part-derived nonce.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec-mp", false, false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "ssec-mp-contract.bin";
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(&source_bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(&source_bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    let source_head = source_client
+        .head_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    // The replica must carry the SSE-C marker and the source's multipart ETag
+    // (its -N suffix also pins that the part structure survived).
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.e_tag(), source_head.e_tag(), "replica must keep the source multipart ETag");
+    let replica_version_id = replica.version_id().map(str::to_string);
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
+
+    let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
+    assert!(
+        plain_read.is_err(),
+        "SSE-C multipart replica must not be readable without the customer key"
+    );
+
+    // Stability across scanner cycles: convergence must hold for passthrough.
+    sleep(Duration::from_secs(5)).await;
+    let versions = target_client
+        .list_object_versions()
+        .bucket(&target_bucket)
+        .prefix(key)
+        .send()
+        .await?;
+    let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
+    assert_eq!(replica_versions.len(), 1, "SSE-C replica must not accumulate versions");
+    assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
 
     Ok(())
 }
