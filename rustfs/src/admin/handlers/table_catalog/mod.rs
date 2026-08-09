@@ -121,6 +121,7 @@ const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_VIEW_RESOURCE_ROOT: &str = "views";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const TABLE_COMMIT_PUBLICATION_MAX_OBJECTS: usize = 10_000;
 const DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID: &str = "rustfs-maintenance-scheduler";
 const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED: &str = "bridge-unconfigured";
@@ -1191,12 +1192,16 @@ enum TableCommitObjectAuthorization {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum TableCommitObservedObject {
-    Content {
-        object: Option<crate::table_catalog::TableCatalogObject>,
-        max_size: Option<usize>,
-    },
-    Existence(bool),
+enum TableCommitObjectIdentity {
+    Missing,
+    Metadata(crate::table_catalog::TableCatalogObjectMetadata),
+    ContentSha256(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TableCommitObservedObject {
+    identity: TableCommitObjectIdentity,
+    max_size: Option<usize>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -1331,48 +1336,78 @@ where
                     "table commit accessed an unvalidated object after publication preparation: {bucket}/{object}"
                 )));
             }
+            if publication.observed_objects.len() >= TABLE_COMMIT_PUBLICATION_MAX_OBJECTS {
+                return Err(crate::table_catalog::TableCatalogStoreError::Invalid(format!(
+                    "table commit references more than {TABLE_COMMIT_PUBLICATION_MAX_OBJECTS} objects"
+                )));
+            }
             publication.observed_objects.insert(key, observation);
             return Ok(());
         };
-        let matches = match observation {
-            TableCommitObservedObject::Content {
-                object: actual,
-                max_size: actual_max_size,
-            } => match existing {
-                TableCommitObservedObject::Content {
-                    object: expected,
-                    max_size: expected_max_size,
-                } if *expected == actual => {
-                    *expected_max_size = match (*expected_max_size, actual_max_size) {
-                        (Some(expected), Some(actual)) => Some(expected.min(actual)),
-                        (Some(expected), None) => Some(expected),
-                        (None, actual) => actual,
-                    };
-                    true
-                }
-                TableCommitObservedObject::Existence(expected) if *expected == actual.is_some() => {
-                    *existing = TableCommitObservedObject::Content {
-                        object: actual,
-                        max_size: actual_max_size,
-                    };
-                    true
-                }
-                _ => false,
-            },
-            TableCommitObservedObject::Existence(actual) => match existing {
-                TableCommitObservedObject::Content { object, .. } => object.is_some() == actual,
-                TableCommitObservedObject::Existence(expected) => *expected == actual,
-            },
-        };
-        if !matches {
+        if existing.identity != observation.identity {
             return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                 "table commit object changed during validation: {bucket}/{object}"
             )));
         }
+        existing.max_size = match (existing.max_size, observation.max_size) {
+            (Some(expected), Some(actual)) => Some(expected.min(actual)),
+            (Some(expected), None) => Some(expected),
+            (None, actual) => actual,
+        };
         Ok(())
     }
 
-    async fn prepare_publication(&self) -> crate::table_catalog::TableCatalogStoreResult<()> {
+    fn observed_content(
+        object: Option<&crate::table_catalog::TableCatalogObject>,
+        max_size: Option<usize>,
+    ) -> TableCommitObservedObject {
+        let identity = match object {
+            None => TableCommitObjectIdentity::Missing,
+            Some(object) if object.etag.is_some() => {
+                TableCommitObjectIdentity::Metadata(crate::table_catalog::TableCatalogObjectMetadata {
+                    etag: object.etag.clone(),
+                    mod_time: object.mod_time,
+                })
+            }
+            Some(object) => TableCommitObjectIdentity::ContentSha256(hex_sha256(&object.data, str::to_string)),
+        };
+        TableCommitObservedObject { identity, max_size }
+    }
+
+    fn observed_metadata(
+        bucket: &str,
+        object: &str,
+        metadata: Option<crate::table_catalog::TableCatalogObjectMetadata>,
+    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
+        let identity = match metadata {
+            None => TableCommitObjectIdentity::Missing,
+            Some(metadata) if metadata.etag.is_some() || metadata.mod_time.is_some() => {
+                TableCommitObjectIdentity::Metadata(metadata)
+            }
+            Some(_) => {
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(format!(
+                    "catalog object {bucket}/{object} does not expose a stable fingerprint"
+                )));
+            }
+        };
+        Ok(TableCommitObservedObject {
+            identity,
+            max_size: None,
+        })
+    }
+
+    async fn prepare_publication(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let namespace = crate::table_catalog::Namespace::parse(namespace)
+            .map_err(|err| crate::table_catalog::TableCatalogStoreError::Invalid(format!("invalid namespace: {err}")))?;
+        let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+            .map_err(|err| crate::table_catalog::TableCatalogStoreError::Invalid(format!("invalid table: {err}")))?;
+        let publication_lock = crate::table_catalog::default_table_publication_lock_path(&namespace, &table);
+        let publication_lock_key = (table_bucket.to_string(), publication_lock.clone());
         let expected = {
             let mut publication = self.publication.lock().await;
             match publication.phase {
@@ -1395,27 +1430,25 @@ where
         };
 
         let prepared = async {
-            let mut guards = Vec::with_capacity(expected.len());
-            for (bucket, object) in expected.keys() {
+            let mut guards = Vec::with_capacity(expected.len().saturating_add(1));
+            guards.push(self.backend.acquire_write_lock(table_bucket, &publication_lock).await?);
+            for (bucket, object) in expected.keys().filter(|key| *key != &publication_lock_key) {
                 guards.push(self.backend.acquire_read_lock(bucket, object).await?);
             }
             for ((bucket, object), expected_object) in &expected {
-                let matches = match expected_object {
-                    TableCommitObservedObject::Content {
-                        object: expected,
-                        max_size,
-                    } => {
-                        let actual = match max_size {
-                            Some(max_size) => self.backend.read_object_unlocked_limited(bucket, object, *max_size).await?,
+                let actual = match &expected_object.identity {
+                    TableCommitObjectIdentity::ContentSha256(_) => {
+                        let object = match expected_object.max_size {
+                            Some(max_size) => self.backend.read_object_unlocked_limited(bucket, object, max_size).await?,
                             None => self.backend.read_object_unlocked(bucket, object).await?,
                         };
-                        actual == *expected
+                        Self::observed_content(object.as_ref(), expected_object.max_size)
                     }
-                    TableCommitObservedObject::Existence(expected) => {
-                        self.backend.object_exists_unlocked(bucket, object).await? == *expected
+                    TableCommitObjectIdentity::Missing | TableCommitObjectIdentity::Metadata(_) => {
+                        Self::observed_metadata(bucket, object, self.backend.object_metadata_unlocked(bucket, object).await?)?
                     }
                 };
-                if !matches {
+                if actual.identity != expected_object.identity {
                     return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                         "table commit object changed before catalog publication: {bucket}/{object}"
                     )));
@@ -1475,15 +1508,8 @@ where
         } else {
             self.backend.read_object(bucket, object).await?
         };
-        self.record_observation(
-            bucket,
-            object,
-            TableCommitObservedObject::Content {
-                object: result.clone(),
-                max_size: None,
-            },
-        )
-        .await?;
+        self.record_observation(bucket, object, Self::observed_content(result.as_ref(), None))
+            .await?;
         Ok(result)
     }
 
@@ -1499,15 +1525,8 @@ where
         } else {
             self.backend.read_object_limited(bucket, object, max_size).await?
         };
-        self.record_observation(
-            bucket,
-            object,
-            TableCommitObservedObject::Content {
-                object: result.clone(),
-                max_size: Some(max_size),
-            },
-        )
-        .await?;
+        self.record_observation(bucket, object, Self::observed_content(result.as_ref(), Some(max_size)))
+            .await?;
         Ok(result)
     }
 
@@ -1530,13 +1549,14 @@ where
 
     async fn object_exists(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
         self.authorize(bucket, object, S3Action::GetObjectAction).await?;
-        let exists = if self.read_without_nested_lock(bucket, object).await? {
-            self.backend.object_exists_unlocked(bucket, object).await?
+        let metadata = if self.read_without_nested_lock(bucket, object).await? {
+            self.backend.object_metadata_unlocked(bucket, object).await?
         } else {
-            self.backend.object_exists(bucket, object).await?
+            self.backend.object_metadata(bucket, object).await?
         };
-        self.record_observation(bucket, object, TableCommitObservedObject::Existence(exists))
-            .await?;
+        let observation = Self::observed_metadata(bucket, object, metadata)?;
+        let exists = observation.identity != TableCommitObjectIdentity::Missing;
+        self.record_observation(bucket, object, observation).await?;
         Ok(exists)
     }
 
@@ -1596,8 +1616,13 @@ where
         self.backend.acquire_write_lock(bucket, object).await
     }
 
-    async fn prepare_table_commit_publication(&self) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.prepare_publication().await
+    async fn prepare_table_commit_publication(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.prepare_publication(table_bucket, namespace, table).await
     }
 
     async fn complete_table_commit_publication(&self) {
@@ -2819,6 +2844,7 @@ fn initial_view_metadata_json(
         "format-version": entry.format_version,
         "view-uuid": entry.view_uuid,
         "location": entry.warehouse_location,
+        "last-updated-ms": current_time_millis(),
         "current-version-id": version_id,
         "schemas": [schema],
         "versions": [view_version],
@@ -4753,7 +4779,7 @@ where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
     metadata_backend
-        .prepare_table_commit_publication()
+        .prepare_table_commit_publication(&request.table_bucket, &request.namespace, &request.table)
         .await
         .map_err(catalog_store_error)?;
     let result = store.commit_table(request).await;
@@ -4813,7 +4839,7 @@ where
     .await?;
     let requirements = match existing_commit.as_ref() {
         Some(existing_commit) => replay_commit_requirements(existing_commit, &[], &target_metadata)?,
-        None => vec![metadata_digest_requirement(&target_metadata)?],
+        None => Vec::new(),
     };
     let commit_id = existing_commit
         .as_ref()
@@ -4935,7 +4961,6 @@ where
         &target_metadata,
     )
     .await?;
-    request.requirements.push(metadata_digest_requirement(&target_metadata)?);
     let result = publish_table_commit(store, metadata_backend, request).await?;
     Ok(commit_table_response_from_result(result, target_metadata))
 }
@@ -5051,8 +5076,6 @@ where
         Err(err) => return Err(catalog_store_error(err)),
     }
 
-    let mut requirements = request.requirements;
-    requirements.push(metadata_digest_requirement(&next_metadata)?);
     let commit_request = crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -5063,7 +5086,7 @@ where
         expected_version_token: current.version_token,
         expected_metadata_location: current.metadata_location,
         new_metadata_location: next_metadata_location,
-        requirements,
+        requirements: request.requirements,
         writer: request.writer,
     };
     let result = publish_table_commit(store, metadata_backend, commit_request).await?;
@@ -5194,15 +5217,21 @@ where
     }
 
     let previous_metadata = read_table_metadata_json(metadata_backend, bucket, &commit.previous_metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &previous_metadata)?;
     validate_table_commit_requirements(&previous_metadata, &request.requirements)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &commit.new_metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let commit_timestamp_ms = target_metadata
         .get("last-updated-ms")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| s3_error!(InvalidRequest, "committed metadata is missing last-updated-ms"))?;
     let previous_metadata_location = table_metadata_location_for_client(bucket, &commit.previous_metadata_location);
-    let rebuilt_metadata =
-        apply_table_commit_updates_at(previous_metadata, &request.updates, &previous_metadata_location, commit_timestamp_ms)?;
+    let rebuilt_metadata = apply_table_commit_updates_at(
+        previous_metadata.clone(),
+        &request.updates,
+        &previous_metadata_location,
+        commit_timestamp_ms,
+    )?;
     if rebuilt_metadata != target_metadata {
         return Err(iceberg_rest_error(
             ICEBERG_ERROR_COMMIT_FAILED,
@@ -5220,6 +5249,34 @@ where
             StatusCode::CONFLICT,
             "commit retry operation does not match the original commit",
         ));
+    }
+    if crate::table_catalog::table_matches_staged_base(current, &commit) {
+        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+        validate_table_metadata_snapshot_graph_result(
+            metadata_backend,
+            bucket,
+            namespace,
+            &table_name,
+            current,
+            Some(&previous_metadata),
+            &target_metadata,
+        )
+        .await
+        .map_err(|err| match err {
+            crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
+            err => catalog_store_error(err),
+        })?;
+        validate_table_snapshot_commit_conflicts(
+            metadata_backend,
+            bucket,
+            namespace,
+            &table_name,
+            current,
+            &previous_metadata,
+            &request.updates,
+        )
+        .await?;
     }
     let requirements = replay_commit_requirements(&commit, &request.requirements, &target_metadata)?;
     let committed_metadata_location = commit.new_metadata_location.clone();
@@ -5902,9 +5959,9 @@ where
     Ok(external_catalog_bridge_response_from_entry(bucket, namespace, table, Some(entry)))
 }
 
-async fn sync_external_catalog_bridge_response<B>(
+async fn sync_external_catalog_bridge_response<B, M>(
     store: &crate::table_catalog::ObjectTableCatalogStore<B>,
-    metadata_backend: &B,
+    metadata_backend: &M,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -5913,6 +5970,7 @@ async fn sync_external_catalog_bridge_response<B>(
 ) -> S3Result<ExternalCatalogBridgeSyncResponse>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
+    M: crate::table_catalog::TableCatalogObjectBackend,
 {
     let mut request = request;
     request.metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
@@ -5954,8 +6012,10 @@ where
             &target_metadata,
         )
         .await?;
-        let result = store
-            .commit_table(crate::table_catalog::TableCommitRequest {
+        let result = publish_table_commit(
+            store,
+            metadata_backend,
+            crate::table_catalog::TableCommitRequest {
                 table_bucket: bucket.to_string(),
                 namespace: namespace.public_name(),
                 table: table.to_string(),
@@ -5967,9 +6027,9 @@ where
                 new_metadata_location: request.metadata_location.clone(),
                 requirements: Vec::new(),
                 writer: Some(EXTERNAL_CATALOG_SYNC_WRITER.to_string()),
-            })
-            .await
-            .map_err(catalog_store_error)?;
+            },
+        )
+        .await?;
         (
             EXTERNAL_CATALOG_ACTION_COMMITTED.to_string(),
             load_table_response_from_entry(result.table, target_metadata),
@@ -5993,7 +6053,13 @@ where
         adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table_name, &entry, None, &target_metadata)
             .await?;
-        store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+        metadata_backend
+            .prepare_table_commit_publication(bucket, &namespace.public_name(), table)
+            .await
+            .map_err(catalog_store_error)?;
+        let register_result = store.register_table(entry.clone()).await;
+        metadata_backend.complete_table_commit_publication().await;
+        register_result.map_err(catalog_store_error)?;
         (
             EXTERNAL_CATALOG_ACTION_REGISTERED.to_string(),
             load_table_response_from_entry(entry, target_metadata),
@@ -6113,7 +6179,7 @@ where
             requirements: Vec::new(),
             writer: Some("rustfs-catalog-rollback-api".to_string()),
         };
-        let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+        let result = publish_table_commit(store, metadata_backend, commit_request).await?;
         Ok(commit_table_response_from_result(result, target_metadata))
     }
     .await;

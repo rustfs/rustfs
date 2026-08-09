@@ -177,6 +177,10 @@ pub(crate) fn default_table_root_prefix(namespace: &Namespace) -> String {
     format!("{}{}/{}/", default_namespace_root_prefix(), namespace.storage_id(), TABLE_ROOT)
 }
 
+pub(crate) fn default_table_publication_lock_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
+    format!("{}{}/publication.lock", default_table_root_prefix(namespace), table.as_str())
+}
+
 pub(crate) fn default_table_marker_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), TABLE_MARKER_FILE)
 }

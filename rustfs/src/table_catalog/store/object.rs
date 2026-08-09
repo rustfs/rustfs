@@ -3263,6 +3263,8 @@ where
             ));
         }
 
+        let publication_lock = default_table_publication_lock_path(&namespace, &table);
+        let _publication_guard = self.backend.acquire_write_lock(table_bucket, &publication_lock).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
         let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {

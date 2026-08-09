@@ -287,17 +287,20 @@ pub struct RollbackTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RollbackTableCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled(&warehouse).await?;
-        let request = read_json_body::<RollbackTableRequest>(req.input).await?;
+        let request = read_json_body::<RollbackTableRequest>(std::mem::take(&mut req.input)).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = rollback_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result = rollback_table_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

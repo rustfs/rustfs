@@ -73,8 +73,9 @@ pub(crate) use iceberg::*;
 pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use identifier::{
     default_table_data_dir_path, default_table_delete_dir_path, default_table_metadata_dir_path,
-    default_table_metadata_file_path, default_view_metadata_file_path, is_valid_table_metadata_location,
-    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
+    default_table_metadata_file_path, default_table_publication_lock_path, default_view_metadata_file_path,
+    is_valid_table_metadata_location, is_valid_view_metadata_location, metadata_location_from_metadata_file_path,
+    validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;

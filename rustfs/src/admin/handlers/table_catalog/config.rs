@@ -154,12 +154,13 @@ pub struct SyncExternalCatalogBridgeHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SyncExternalCatalogBridgeHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        let principal =
+            authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_object_store()?;
@@ -171,18 +172,21 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         {
             authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
         }
-        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(std::mem::take(&mut req.input)).await?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
-        let response = sync_external_catalog_bridge_response(
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result = sync_external_catalog_bridge_response(
             &store,
-            &metadata_backend,
+            &commit_backend,
             &warehouse,
             &namespace,
             &table,
             request,
             table_bucket_enabled,
         )
-        .await?;
+        .await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

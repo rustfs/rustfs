@@ -317,6 +317,20 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             }))
     }
 
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        Ok(self
+            .read_object_unlocked(bucket, object)
+            .await?
+            .map(|object| TableCatalogObjectMetadata {
+                etag: object.etag,
+                mod_time: object.mod_time,
+            }))
+    }
+
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool>;
 
     async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
@@ -375,7 +389,12 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
 
-    async fn prepare_table_commit_publication(&self) -> TableCatalogStoreResult<()> {
+    async fn prepare_table_commit_publication(
+        &self,
+        _table_bucket: &str,
+        _namespace: &str,
+        _table: &str,
+    ) -> TableCatalogStoreResult<()> {
         Ok(())
     }
 
@@ -1206,6 +1225,32 @@ where
 
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
+            Ok(info) => Ok(Some(TableCatalogObjectMetadata {
+                etag: info.etag,
+                mod_time: info.mod_time,
+            })),
+            Err(err) if is_missing_storage_error(&err) => Ok(None),
+            Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
+        }
+    }
+
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        match self
+            .store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 etag: info.etag,
                 mod_time: info.mod_time,
