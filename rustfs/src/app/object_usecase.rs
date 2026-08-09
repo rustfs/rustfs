@@ -1968,12 +1968,17 @@ impl GetObjectResumeContext {
         store: Arc<ECStore>,
         bucket: &str,
         key: &str,
-        opts: ObjectOptions,
+        mut opts: ObjectOptions,
         request_headers: &HeaderMap,
         info: &ObjectInfo,
         range_start: i64,
         range_end: i64,
     ) -> Self {
+        if opts.version_id.is_none()
+            && let Some(version_id) = info.version_id
+        {
+            opts.version_id = Some(version_id.to_string());
+        }
         let mut ssec_headers = HeaderMap::new();
         for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
             if let Some(value) = request_headers.get(name) {
@@ -5104,7 +5109,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
-        buffered_body: Option<Bytes>,
+        mut buffered_body: Option<Bytes>,
         cache_hook_served: bool,
         cache_hook_probed: bool,
         cache_fill_allowed: bool,
@@ -5120,7 +5125,7 @@ impl DefaultObjectUsecase {
         // ODC-16 (backlog#1121): when the ecstore hook or shared cold fill
         // already supplied this body, the request-level plan was built before
         // the authoritative lookup. Serve it without planning a second time.
-        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+        if cache_hook_served && let Some(bytes) = buffered_body.take() {
             return Ok(Self::build_memory_bytes_blob(
                 bytes,
                 response_content_length,
@@ -5314,6 +5319,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "info", skip(self, _fs, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
@@ -6253,6 +6259,7 @@ impl DefaultObjectUsecase {
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -8785,6 +8792,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
@@ -13181,6 +13189,67 @@ mod tests {
             matches!(result, Err(GetObjectResumeFailure::Fatal)),
             "reopening a replaced version must fail closed"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_resume_context_pins_latest_read_to_resolved_version() {
+        let (_disk_paths, store, _context) = real_get_resume_test_context().await;
+        let resolved_version = Uuid::new_v4();
+        let info = ObjectInfo {
+            version_id: Some(resolved_version),
+            ..Default::default()
+        };
+
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            ObjectOptions::default(),
+            &HeaderMap::new(),
+            &info,
+            0,
+            -1,
+        );
+        assert_eq!(
+            ctx.opts.version_id,
+            Some(resolved_version.to_string()),
+            "latest GET resume must reopen the initially resolved version, not the moving latest"
+        );
+
+        let explicit_version = Uuid::new_v4().to_string();
+        let explicit_opts = ObjectOptions {
+            version_id: Some(explicit_version.clone()),
+            ..Default::default()
+        };
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            explicit_opts,
+            &HeaderMap::new(),
+            &info,
+            0,
+            -1,
+        );
+        assert_eq!(
+            ctx.opts.version_id.as_deref(),
+            Some(explicit_version.as_str()),
+            "an explicit request version must stay authoritative"
+        );
+
+        let unversioned_info = ObjectInfo::default();
+        let ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            "bucket",
+            "object.bin",
+            ObjectOptions::default(),
+            &HeaderMap::new(),
+            &unversioned_info,
+            0,
+            -1,
+        );
+        assert_eq!(ctx.opts.version_id, None, "unversioned reads have no version to pin");
     }
 
     #[tokio::test]

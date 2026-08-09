@@ -692,6 +692,8 @@ const DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: bool = true;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
+#[cfg(test)]
+pub(crate) use core::io_primitives::disk_call_counters;
 mod ctx;
 mod metadata;
 mod ops;
@@ -702,8 +704,8 @@ pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCl
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(test)]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
-#[cfg(test)]
-pub(crate) use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
+#[cfg(any(test, feature = "test-util"))]
+pub use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
 mod read;
 mod replication;
 pub(crate) mod shard_source;
@@ -730,6 +732,10 @@ impl PreparedGetObjectMetadata {
         self.object_info
             .take()
             .expect("prepared GET metadata ObjectInfo must be consumed exactly once")
+    }
+
+    pub(crate) fn read_semantics_identity(&self) -> [u8; 32] {
+        SetDisks::file_info_quorum_hash(&self.fi)
     }
 }
 
@@ -2532,6 +2538,53 @@ impl SetDisks {
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?;
+        let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+        self.log_object_lock_acquire_if_slow(
+            op,
+            bucket,
+            object,
+            "write",
+            owner.as_deref(),
+            acquire_start.elapsed(),
+            diag_enabled,
+        );
+        Ok(ObjectLockDiagGuard::new(
+            guard,
+            diag_enabled,
+            op,
+            diag_enabled.then(|| bucket.to_string()),
+            diag_enabled.then(|| object.to_string()),
+            owner,
+            "write",
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    async fn acquire_write_lock_diag_with_pending_hook(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        on_pending: impl FnOnce(),
+    ) -> Result<ObjectLockDiagGuard> {
+        crate::hp_guard!("SetDisks::acquire_write_lock");
+        let diag_enabled = is_object_lock_diag_enabled();
+        let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let acquire_start = Instant::now();
+        let acquire = ns_lock.get_write_lock(get_lock_acquire_timeout());
+        tokio::pin!(acquire);
+        let mut on_pending = Some(on_pending);
+        let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+            std::task::Poll::Pending => {
+                if let Some(on_pending) = on_pending.take() {
+                    on_pending();
+                }
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+        })
+        .await
+        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
             op,
@@ -7390,6 +7443,12 @@ mod tests {
         let err = Some(DiskError::FileNotFound);
         let (should_heal, _, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
+
+        let err = Some(DiskError::FileCorrupt);
+        let (should_heal, is_meta, reason) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        assert!(should_heal);
+        assert!(is_meta);
+        assert_eq!(reason, Some(DiskError::FileCorrupt));
 
         // Test with no error and no part errors
         let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &meta, &latest_meta);

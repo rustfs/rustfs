@@ -414,7 +414,10 @@ pub mod object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
-    pub use crate::store::PreparedGetObjectReader;
+    pub use crate::store::{
+        PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
+        SnapshotConsistencyError,
+    };
 }
 
 pub mod rebalance {
@@ -436,18 +439,24 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
-        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
-        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
-        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
-        tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_rpc_signature, verify_tonic_boot_epoch_response,
-        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
+        check_and_record_signed_rpc_nonce, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+        gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
+        normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+        verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 
 pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+    }
 }
 
 pub mod store_list {

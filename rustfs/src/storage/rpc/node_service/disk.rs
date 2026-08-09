@@ -37,6 +37,11 @@ const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
 
+struct DecodedRpcPayload<T> {
+    value: T,
+    from_msgpack: bool,
+}
+
 fn snapshot_lease_disabled_response() -> SnapshotLeaseResponse {
     SnapshotLeaseResponse {
         success: false,
@@ -50,6 +55,14 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
     json: &str,
     value_name: &'static str,
 ) -> std::result::Result<T, DiskError> {
+    Ok(decode_msgpack_or_json_with_source(binary, json, value_name)?.value)
+}
+
+fn decode_msgpack_or_json_with_source<T: DeserializeOwned>(
+    binary: &[u8],
+    json: &str,
+    value_name: &'static str,
+) -> std::result::Result<DecodedRpcPayload<T>, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return match T::deserialize(&mut deserializer) {
@@ -59,7 +72,10 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
                     value_name,
                     INTERNODE_MSGPACK_CODEC_MSGPACK,
                 );
-                Ok(value)
+                Ok(DecodedRpcPayload {
+                    value,
+                    from_msgpack: true,
+                })
             }
             Err(err) => {
                 global_internode_metrics().record_msgpack_json_decode_error(
@@ -82,7 +98,10 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
                 value_name,
                 INTERNODE_MSGPACK_CODEC_JSON,
             );
-            Ok(value)
+            Ok(DecodedRpcPayload {
+                value,
+                from_msgpack: false,
+            })
         }
         Err(err) => {
             global_internode_metrics().record_msgpack_json_decode_error(
@@ -175,13 +194,14 @@ fn encode_read_multiple_response_payloads(
 
 fn encode_batch_read_version_response_payloads(
     batch_read_version_resps: &[BatchReadVersionResp],
+    request_decoded_from_msgpack: bool,
 ) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
     let mut batch_read_version_resps_json = Vec::with_capacity(batch_read_version_resps.len());
     let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
 
     for batch_read_version_resp in batch_read_version_resps {
         batch_read_version_resps_json.push(
-            compat_response_json(batch_read_version_resp, false)
+            compat_response_json(batch_read_version_resp, request_decoded_from_msgpack)
                 .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
         );
         batch_read_version_resps_bin.push(Bytes::from(encode_msgpack_with_capacity(
@@ -385,7 +405,7 @@ impl NodeService {
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let batch_read_version_req: BatchReadVersionReq = match decode_msgpack_or_json(
+            let decoded_batch_read_version_req: DecodedRpcPayload<BatchReadVersionReq> = match decode_msgpack_or_json_with_source(
                 &request.batch_read_version_req_bin,
                 &request.batch_read_version_req,
                 "BatchReadVersionReq",
@@ -400,6 +420,8 @@ impl NodeService {
                     }));
                 }
             };
+            let request_decoded_from_msgpack = decoded_batch_read_version_req.from_msgpack;
+            let batch_read_version_req = decoded_batch_read_version_req.value;
 
             if let Err(err) = validate_batch_read_version_item_count(batch_read_version_req.items.len()) {
                 return Ok(Response::new(BatchReadVersionResponse {
@@ -413,7 +435,8 @@ impl NodeService {
             match disk.batch_read_version(batch_read_version_req).await {
                 Ok(batch_read_version_resps) => {
                     let (batch_read_version_resps, batch_read_version_resps_bin) =
-                        match encode_batch_read_version_response_payloads(&batch_read_version_resps) {
+                        match encode_batch_read_version_response_payloads(&batch_read_version_resps, request_decoded_from_msgpack)
+                        {
                             Ok(payloads) => payloads,
                             Err(err) => {
                                 return Ok(Response::new(BatchReadVersionResponse {
@@ -1776,7 +1799,7 @@ mod tests {
         }];
 
         let (json_payloads, msgpack_payloads) =
-            encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+            encode_batch_read_version_response_payloads(&responses, false).expect("batch read version responses should encode");
 
         assert_eq!(json_payloads.len(), responses.len());
         assert_eq!(msgpack_payloads.len(), responses.len());
@@ -1807,8 +1830,8 @@ mod tests {
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
             ],
             || {
-                let (json_payloads, msgpack_payloads) =
-                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, false)
+                    .expect("batch read version responses should encode");
 
                 assert_eq!(json_payloads, vec![String::new()]);
                 assert_eq!(msgpack_payloads.len(), responses.len());
@@ -1824,14 +1847,42 @@ mod tests {
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
             ],
             || {
-                let (json_payloads, msgpack_payloads) =
-                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, false)
+                    .expect("batch read version responses should encode");
 
                 assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
                 assert_eq!(msgpack_payloads.len(), responses.len());
                 let json_decoded: BatchReadVersionResp =
                     serde_json::from_str(&json_payloads[0]).expect("json batch read version response should decode");
                 assert_eq!(json_decoded.path, responses[0].path);
+            },
+        );
+    }
+
+    #[test]
+    fn encode_batch_read_version_response_payloads_omits_json_for_msgpack_decoded_request() {
+        let responses = vec![BatchReadVersionResp {
+            index: 5,
+            path: "object-c".to_string(),
+            version_id: "version-c".to_string(),
+            success: true,
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, true)
+                    .expect("batch read version responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<BatchReadVersionResp>(&msgpack_payloads[0], "", "BatchReadVersionResp")
+                    .expect("msgpack batch read version response should decode");
+                assert_eq!(decoded.path, responses[0].path);
             },
         );
     }

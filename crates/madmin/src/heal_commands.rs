@@ -29,6 +29,11 @@ pub struct Infos {
     pub drives: Vec<HealDriveInfo>,
 }
 
+/// String form of `DriveState::Ok` as recorded in `HealDriveInfo::state`
+/// (this crate stores drive states as strings and does not depend on the
+/// enum's crate).
+const DRIVE_STATE_OK: &str = "ok";
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
     #[serde(rename = "resultId")]
@@ -57,4 +62,82 @@ pub struct HealResultItem {
     pub after: Infos,
     #[serde(rename = "objectSize")]
     pub object_size: usize,
+}
+
+impl HealResultItem {
+    /// Number of drives this heal repaired: pairwise `before`/`after` state
+    /// transitions to ok (issue #5863). `None` when the result carries no
+    /// aligned drive data (e.g. remote bucket results) — not the same as zero.
+    pub fn drives_healed(&self) -> Option<usize> {
+        if self.after.drives.is_empty() || self.before.drives.len() != self.after.drives.len() {
+            return None;
+        }
+        Some(
+            self.before
+                .drives
+                .iter()
+                .zip(&self.after.drives)
+                .filter(|(before, after)| before.state != after.state && after.state == DRIVE_STATE_OK)
+                .count(),
+        )
+    }
+
+    /// Drives consulted, or `None` when the result has no drive entries.
+    pub fn drives_reported(&self) -> Option<usize> {
+        if self.after.drives.is_empty() {
+            None
+        } else {
+            Some(self.after.drives.len())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive(state: &str) -> HealDriveInfo {
+        HealDriveInfo {
+            uuid: String::new(),
+            endpoint: String::new(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn drives_healed_counts_transitions_to_ok_not_consulted_drives() {
+        let mut item = HealResultItem::default();
+        item.before.drives = vec![drive("ok"), drive("missing"), drive("corrupt"), drive("offline")];
+        item.after.drives = vec![drive("ok"), drive("ok"), drive("ok"), drive("offline")];
+        // 4 drives consulted, 2 repaired (missing->ok, corrupt->ok); the
+        // already-ok drive and the still-offline drive are not repairs.
+        assert_eq!(item.drives_healed(), Some(2));
+        assert_eq!(item.drives_reported(), Some(4));
+
+        let mut noop = HealResultItem::default();
+        noop.before.drives = vec![drive("ok"); 12];
+        noop.after.drives = vec![drive("ok"); 12];
+        assert_eq!(noop.drives_healed(), Some(0));
+    }
+
+    #[test]
+    fn drives_healed_reports_unknown_not_zero_without_drive_data() {
+        // Empty successful remote result (RemotePeerS3Client::heal_bucket
+        // default) is "unknown", never a definitive zero.
+        let remote = HealResultItem::default();
+        assert_eq!(remote.drives_healed(), None);
+        assert_eq!(remote.drives_reported(), None);
+
+        // A local missing -> ok result keeps its real count.
+        let mut local = HealResultItem::default();
+        local.before.drives = vec![drive("ok"), drive("missing")];
+        local.after.drives = vec![drive("ok"), drive("ok")];
+        assert_eq!(local.drives_healed(), Some(1));
+
+        // Misaligned arrays cannot be paired: also unknown.
+        let mut misaligned = HealResultItem::default();
+        misaligned.before.drives = vec![drive("missing")];
+        misaligned.after.drives = vec![drive("ok"), drive("ok")];
+        assert_eq!(misaligned.drives_healed(), None);
+    }
 }

@@ -48,6 +48,7 @@ use metrics::counter;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    io::IoSlice,
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
@@ -74,6 +75,16 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
         Pin::new(&mut self.inner)
             .poll_write(cx, buf)
             .map(|result| result.map_err(mark_get_object_downstream_closed))
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write_vectored(cx, bufs)
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -3101,7 +3112,7 @@ mod metadata_cache_tests {
 mod tests {
     use super::*;
     use crate::erasure::coding::BitrotWriter;
-    use std::io::{Cursor, ErrorKind};
+    use std::io::{Cursor, ErrorKind, IoSlice};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -3126,6 +3137,63 @@ mod tests {
             GetObjectFailureReason::DownstreamClosed,
             "only the output adapter may classify a broken pipe as a downstream close"
         );
+    }
+
+    #[tokio::test]
+    async fn downstream_writer_preserves_vectored_write_support() {
+        #[derive(Default)]
+        struct VectoredSink {
+            writes: usize,
+            vectored_writes: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl AsyncWrite for VectoredSink {
+            fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bufs: &[IoSlice<'_>],
+            ) -> Poll<std::io::Result<usize>> {
+                self.vectored_writes += 1;
+                let mut written = 0;
+                for buf in bufs {
+                    written += buf.len();
+                    self.bytes.extend_from_slice(buf);
+                }
+                Poll::Ready(Ok(written))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = GetObjectDownstreamWriter::new(VectoredSink::default());
+        assert!(writer.is_write_vectored(), "downstream writer must preserve vectored-write capability");
+
+        let written = writer
+            .write_vectored(&[IoSlice::new(b"hello "), IoSlice::new(b"world")])
+            .await
+            .expect("vectored write through downstream adapter must succeed");
+
+        assert_eq!(written, 11);
+        assert_eq!(writer.inner.vectored_writes, 1);
+        assert_eq!(writer.inner.writes, 0);
+        assert_eq!(writer.inner.bytes, b"hello world");
     }
 
     async fn local_test_disks(count: usize, bucket: &str) -> (Vec<tempfile::TempDir>, Vec<Option<crate::disk::DiskStore>>) {

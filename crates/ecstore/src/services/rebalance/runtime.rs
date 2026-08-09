@@ -10,18 +10,34 @@ use super::worker::{
     resolve_rebalance_terminal_error, send_rebalance_done_signal,
 };
 use super::{
-    EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE, RebalSaveOpt, RebalStatus,
+    EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
+    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalSaveOpt, RebalStatus,
     RebalanceBucketOutcome,
 };
 use crate::error::{Error, Result};
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+pub(super) fn should_fail_repeated_rebalance_bucket_defer(
+    deferred_buckets: &mut HashSet<String>,
+    bucket: &str,
+    source_cleanup_deferred: bool,
+) -> bool {
+    !source_cleanup_deferred && !deferred_buckets.insert(bucket.to_string())
+}
+
+pub(super) fn source_cleanup_defer_attempt(deferred_attempts: &mut HashMap<String, usize>, bucket: &str) -> usize {
+    let attempts = deferred_attempts.entry(bucket.to_string()).or_default();
+    *attempts = attempts.saturating_add(1);
+    *attempts
+}
 
 impl ECStore {
     #[tracing::instrument(skip_all)]
@@ -298,6 +314,7 @@ impl ECStore {
         );
         let mut final_result: Result<()> = Ok(());
         let mut deferred_buckets = HashSet::new();
+        let mut source_cleanup_deferred_attempts = HashMap::new();
 
         loop {
             if rx.is_cancelled() {
@@ -375,7 +392,8 @@ impl ECStore {
                 };
 
                 if let RebalanceBucketOutcome::Deferred { last_error } = outcome {
-                    if !deferred_buckets.insert(bucket.clone()) {
+                    let source_cleanup_deferred = last_error.starts_with(REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX);
+                    if should_fail_repeated_rebalance_bucket_defer(&mut deferred_buckets, &bucket, source_cleanup_deferred) {
                         let err = Error::other(format!(
                             "rebalance bucket {bucket} deferred repeatedly due to transient object failures: {last_error}"
                         ));
@@ -396,6 +414,11 @@ impl ECStore {
                         break;
                     }
 
+                    let source_cleanup_attempt = if source_cleanup_deferred {
+                        source_cleanup_defer_attempt(&mut source_cleanup_deferred_attempts, &bucket)
+                    } else {
+                        0
+                    };
                     warn!(
                         event = EVENT_REBALANCE_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -406,7 +429,10 @@ impl ECStore {
                         error = %last_error,
                         "Deferred rebalance bucket after transient object failures"
                     );
-                    if let Err(err) = self.defer_rebalance_bucket(pool_index, bucket.clone(), last_error).await {
+                    if let Err(err) = self
+                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone())
+                        .await
+                    {
                         error!(
                             event = EVENT_REBALANCE_BUCKET,
                             component = LOG_COMPONENT_ECSTORE,
@@ -423,6 +449,38 @@ impl ECStore {
                         ));
                         break;
                     }
+                    if source_cleanup_deferred {
+                        if source_cleanup_attempt >= super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS {
+                            let err = Error::other(format!(
+                                "rebalance bucket {bucket} source cleanup remained unstable after {} deferrals: {last_error}",
+                                super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
+                            ));
+                            warn!(
+                                event = EVENT_REBALANCE_BUCKET,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                pool_index,
+                                bucket = %bucket,
+                                state = "source_cleanup_defer_limit",
+                                error = ?err,
+                                "Rebalance bucket failed after repeated source cleanup conflicts"
+                            );
+                            final_result = Err(resolve_rebalance_terminal_error(
+                                err.clone(),
+                                send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                            ));
+                            break;
+                        }
+                        if let Err(err) =
+                            super::worker::wait_rebalance_listing_retry(&rx, REBALANCE_LISTING_RETRY_BASE_DELAY).await
+                        {
+                            final_result = Err(resolve_rebalance_terminal_error(
+                                err.clone(),
+                                send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                            ));
+                            break;
+                        }
+                    }
                     continue;
                 }
 
@@ -435,6 +493,7 @@ impl ECStore {
                     state = "completed",
                     "Completed rebalance bucket"
                 );
+                source_cleanup_deferred_attempts.remove(&bucket);
                 if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
                     error!(
                         event = EVENT_REBALANCE_BUCKET,

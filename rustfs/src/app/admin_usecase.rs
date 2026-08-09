@@ -216,14 +216,45 @@ impl DefaultAdminUsecase {
         result.map_err(|_| Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed"))
     }
 
-    fn data_usage_snapshot_covers_namespace(info: &DataUsageInfo, buckets: impl IntoIterator<Item = String>) -> bool {
+    /// Narrow a snapshot to the buckets it actually measured, or discard it.
+    ///
+    /// The wire shape must never let a partial snapshot read as a confirmed
+    /// zero, but blanking the whole document to serve that rule costs far more
+    /// than it protects: a single freshly created bucket is by definition
+    /// absent from the last completed scan, so every bucket creation used to
+    /// zero out usage reporting for the entire deployment until the next cycle
+    /// covered it (rustfs#5806).
+    ///
+    /// Keep what was measured instead. Buckets the scan did not cover stay
+    /// absent from `buckets_usage` — absent already means "unknown" on the
+    /// wire, distinct from a present zero — and the snapshot is marked
+    /// non-converged so clients can tell it is not the whole namespace. A
+    /// snapshot that is structurally incomplete, or that measured nothing the
+    /// namespace still contains, carries no usable information and is dropped
+    /// exactly as before.
+    fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
         if !info.is_complete_bucket_usage_snapshot() {
-            return false;
+            *info = DataUsageInfo::default();
+            return;
         }
 
         let current_buckets: HashSet<String> = buckets.into_iter().filter(|bucket| !bucket.starts_with('.')).collect();
-        current_buckets.len() == info.buckets_usage.len()
-            && current_buckets.iter().all(|bucket| info.buckets_usage.contains_key(bucket))
+        // Buckets deleted since the scan must not linger in the response.
+        info.buckets_usage.retain(|bucket, _| current_buckets.contains(bucket));
+        info.bucket_sizes.retain(|bucket, _| current_buckets.contains(bucket));
+
+        if info.buckets_usage.is_empty() && !current_buckets.is_empty() {
+            *info = DataUsageInfo::default();
+            return;
+        }
+
+        let covers_namespace = current_buckets.len() == info.buckets_usage.len();
+        info.buckets_count = info.buckets_usage.len() as u64;
+        if !covers_namespace {
+            // Some bucket in the namespace was never measured, so the totals
+            // below are a floor rather than the converged truth.
+            info.usage_snapshot_converged = Some(false);
+        }
     }
 
     async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
@@ -277,10 +308,11 @@ impl DefaultAdminUsecase {
             })
             .await
             .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
-        if !Self::data_usage_snapshot_covers_namespace(&info, buckets.into_iter().map(|bucket| bucket.name)) {
-            // The default wire shape distinguishes unknown usage from a confirmed zero snapshot.
-            info = DataUsageInfo::default();
-        }
+        // Serve what the scan measured; buckets it never reached stay absent
+        // (absent means unknown on the wire, unlike a present zero) and the
+        // snapshot is flagged non-converged. See rustfs#5806 for why blanking
+        // the whole document instead was worse than the rule it enforced.
+        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, buckets.into_iter().map(|bucket| bucket.name));
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -671,30 +703,67 @@ mod tests {
         });
     }
 
+    /// rustfs#5806: a bucket the last scan never reached must not blank the
+    /// usage the scan *did* measure — that turned every bucket creation into a
+    /// deployment-wide usage blackout until the next cycle.
     #[test]
-    fn data_usage_snapshot_must_cover_the_current_bucket_namespace() {
+    fn partial_snapshot_keeps_measured_buckets_and_flags_non_convergence() {
+        let measured = |name: &str| {
+            let mut info = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+                usage_snapshot_complete: true,
+                buckets_count: 1,
+                objects_total_count: 7,
+                ..Default::default()
+            };
+            info.buckets_usage.insert(name.to_string(), Default::default());
+            info.bucket_sizes.insert(name.to_string(), 160);
+            info
+        };
+
+        // A brand-new bucket the scan never saw: keep bucket-a, omit bucket-new,
+        // and say so via the convergence flag.
+        let mut info = measured("bucket-a");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
+            &mut info,
+            ["bucket-a".to_string(), "bucket-new".to_string(), ".rustfs.sys".to_string()],
+        );
+        assert!(info.buckets_usage.contains_key("bucket-a"), "measured usage must survive");
+        assert!(!info.buckets_usage.contains_key("bucket-new"), "unmeasured bucket stays absent");
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert_eq!(info.buckets_count, 1);
+        assert_eq!(info.objects_total_count, 7, "measured totals are preserved");
+
+        // Full coverage leaves the snapshot untouched.
+        let mut info = measured("bucket-a");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
+            &mut info,
+            ["bucket-a".to_string(), ".rustfs.sys".to_string()],
+        );
+        assert_eq!(info.usage_snapshot_converged, None, "a covering snapshot is not downgraded");
+        assert_eq!(info.buckets_count, 1);
+
+        // A bucket deleted since the scan must not linger in the response.
+        let mut info = measured("bucket-gone");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-live".to_string()]);
+        assert_eq!(info, DataUsageInfo::default(), "nothing measured is still in the namespace");
+
+        // Structurally incomplete snapshots carry no usable information.
+        let mut info = measured("bucket-a");
+        info.usage_snapshot_complete = false;
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        assert_eq!(info, DataUsageInfo::default());
+
+        // An empty namespace with an empty snapshot stays a confirmed zero.
         let mut info = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH),
             usage_snapshot_complete: true,
-            buckets_count: 1,
+            buckets_count: 0,
             ..Default::default()
         };
-        info.buckets_usage.insert("bucket-a".to_string(), Default::default());
-
-        assert!(DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
-            &info,
-            ["bucket-a".to_string(), ".rustfs.sys".to_string()]
-        ));
-        assert!(!DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
-            &info,
-            ["bucket-a".to_string(), "bucket-b".to_string()]
-        ));
-
-        info.usage_snapshot_complete = false;
-        assert!(!DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
-            &info,
-            ["bucket-a".to_string()]
-        ));
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, [".rustfs.sys".to_string()]);
+        assert_eq!(info.usage_snapshot_converged, None);
+        assert_eq!(info.buckets_count, 0);
     }
 
     #[tokio::test]

@@ -89,6 +89,8 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
+pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
@@ -208,6 +210,12 @@ pub(crate) mod rpc_consumer {
     pub(crate) use super::super::rpc::InternodeRpcService;
 
     pub(crate) mod http_service {
+        #[cfg(test)]
+        pub(crate) use super::super::Endpoint;
+        #[cfg(test)]
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
+        #[cfg(test)]
+        pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{
@@ -216,10 +224,12 @@ pub(crate) mod rpc_consumer {
             NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, WALK_DIR_BODY_SHA256_QUERY,
         };
         pub(crate) use super::super::storage_contracts::{
-            NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
+            NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
+            WALK_DIR_STREAM_COMPLETION_V1,
         };
         pub(crate) use super::super::{
-            StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, sign_ns_scanner_capability, verify_rpc_signature,
+            DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
+            find_local_disk_by_ref, sign_ns_scanner_capability, verify_put_file_auth_trailer, verify_rpc_signature,
         };
     }
 
@@ -498,13 +508,15 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
         PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX,
-        normalize_tonic_rpc_audience, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
-        tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_rpc_signature,
-        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
+        check_and_record_signed_rpc_nonce, normalize_tonic_rpc_audience, sign_ns_scanner_capability,
+        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        gen_signature_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
+        verify_tonic_rpc_response_proof,
     };
 }
 
@@ -513,9 +525,10 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
-        ObjectEncryptionResolver, ObjectMutationHook, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
+        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 
@@ -1114,6 +1127,7 @@ pub(crate) trait StorageDiskRpcExt {
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
+    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
     async fn rename_part(
@@ -1260,6 +1274,10 @@ where
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
         ecstore_disk::DiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
+    }
+
+    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader> {
+        ecstore_disk::DiskAPI::read_file(self, volume, path).await
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader> {
@@ -1653,6 +1671,25 @@ pub(crate) async fn collect_local_metrics(
 
 pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_rpc_signature(url, method, headers)
+}
+
+pub(crate) fn check_and_record_signed_rpc_nonce(
+    headers: &http::HeaderMap,
+    nonce: uuid::Uuid,
+    rpc_path: &str,
+    operation: &'static str,
+    backend: &'static str,
+) -> std::io::Result<()> {
+    ecstore_rpc::check_and_record_signed_rpc_nonce(headers, nonce, rpc_path, operation, backend)
+}
+
+pub(crate) fn verify_put_file_auth_trailer(
+    url: &str,
+    method: &http::Method,
+    nonce: uuid::Uuid,
+    trailer: &[u8],
+) -> std::io::Result<String> {
+    ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
 }
 
 pub(crate) fn sign_ns_scanner_capability(challenge: uuid::Uuid, server_epoch: uuid::Uuid) -> std::io::Result<Vec<u8>> {

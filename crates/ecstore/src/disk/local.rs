@@ -827,6 +827,10 @@ const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
+/// A healing commit could not trash the stale destination data dir it is about
+/// to replace. Best effort — the rename that follows fails closed — but a
+/// recurring signal means heal is stuck on that drive.
+const EVENT_DISK_LOCAL_HEAL_PURGE_FAILED: &str = "disk_local_heal_purge_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
 // io_uring read-backend gray-release observability (rustfs/backlog#1172).
@@ -8215,6 +8219,9 @@ impl DiskAPI for LocalDisk {
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
         let no_inline = fi.data.is_none() && fi.size > 0;
+        // Captured before `fi` is consumed by add_version; gates the stale
+        // destination purge below.
+        let fi_healing = fi.is_healing();
 
         // Resolved once for the whole commit so a concurrent configuration
         // change can never leave a single rename_data half-synced. The tier is
@@ -8371,6 +8378,26 @@ impl DiskAPI for LocalDisk {
                 drop(prepared_metadata_source);
                 std::fs::remove_file(&src_file_path).map_err(to_file_error)?;
                 return Err(DiskError::FileNotFound);
+            }
+
+            // Heal reuses the version's data_dir, so for in-place corruption
+            // the destination dir still exists — and rename(2) cannot replace
+            // a non-empty directory (EEXIST on XFS, ENOTEMPTY on ext4). Purge
+            // it first, healing commits only; fresh PUTs mint a new data_dir
+            // and never collide. Best effort: a real failure surfaces in the
+            // rename below.
+            if fi_healing
+                && let Some((_, dst_data_path)) = has_data_dir_path.as_ref()
+                && let Err(err) = self.move_to_trash(dst_data_path, true, false).await
+            {
+                warn!(
+                    event = EVENT_DISK_LOCAL_HEAL_PURGE_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    dst_path = ?dst_data_path,
+                    error = ?err,
+                    "Healing commit could not purge the stale destination data dir"
+                );
             }
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = os::rename_all_with_commit_guard(
@@ -11830,6 +11857,86 @@ mod test {
             .await
             .expect("rename_data should commit the new object");
         (disk, dir)
+    }
+
+    // Stage the bitrot-heal collision: a committed version whose data_dir is
+    // present and non-empty, plus a replacement shard staged in tmp for the
+    // SAME data_dir (heal repairs in place, it does not mint a new data_dir).
+    async fn stage_healing_collision(
+        bucket: &str,
+        object: &str,
+        tmp_object: &str,
+    ) -> (LocalDisk, tempfile::TempDir, std::path::PathBuf, FileInfo) {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let version_id = Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").expect("version id should parse");
+        let data_dir = Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").expect("data dir should parse");
+
+        let object_dir = dir.path().join(bucket).join(object);
+        let dst_data_dir = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&dst_data_dir)
+            .await
+            .expect("dst data dir should be created");
+        fs::write(dst_data_dir.join("part.1"), b"stale-corrupt-shard")
+            .await
+            .expect("stale shard should be written");
+        let old_fi = test_file_info(object, version_id, Some(data_dir), None);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"healed-shard")
+            .await
+            .expect("healed shard should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(data_dir), None);
+        (disk, dir, dst_data_dir.join("part.1"), new_fi)
+    }
+
+    // A healing commit must replace a still-existing destination data dir;
+    // without the purge it failed on every attempt and bitrot was never
+    // repaired.
+    #[tokio::test]
+    async fn rename_data_healing_commit_replaces_stale_destination_data_dir() {
+        let (disk, _dir, dst_part, mut new_fi) = stage_healing_collision("bucket", "bitrot-object", "tmp-heal-object").await;
+        new_fi.set_healing();
+
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-heal-object", new_fi, "bucket", "bitrot-object")
+            .await
+            .expect("a healing rename_data must replace the stale destination data dir");
+
+        let content = fs::read(&dst_part).await.expect("healed shard should be readable");
+        assert_eq!(content, b"healed-shard", "the healed shard must replace the stale corrupt content");
+    }
+
+    // The purge is healing-gated: an ordinary commit colliding with a
+    // non-empty data dir must keep failing loudly.
+    #[tokio::test]
+    async fn rename_data_non_healing_destination_collision_still_fails() {
+        let (disk, _dir, dst_part, new_fi) = stage_healing_collision("bucket", "collision-object", "tmp-collision-object").await;
+
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-collision-object", new_fi, "bucket", "collision-object")
+            .await
+            .expect_err("a non-healing rename_data onto a non-empty destination data dir must fail");
+
+        let content = fs::read(&dst_part).await.expect("stale shard should still be readable");
+        assert_eq!(
+            content, b"stale-corrupt-shard",
+            "a failed non-healing commit must leave the existing content untouched"
+        );
     }
 
     #[tokio::test]

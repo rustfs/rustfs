@@ -59,6 +59,10 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "tls12", "logging", "aws-lc-rs"] }
 lapin = { workspace = true, default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 libc = { workspace = true }
+# pulsar regenerates its protobuf bindings from `PulsarApi.proto` in build.rs on every
+# build, which needs `protoc`. Keep this dependency lean and install a system
+# protobuf compiler on platforms where it is not provided by the base image.
+# See https://github.com/rustfs/rustfs/issues/3195.
 pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 regex = { workspace = true }
 rayon = { workspace = true }

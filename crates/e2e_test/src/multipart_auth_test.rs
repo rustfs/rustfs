@@ -6028,6 +6028,33 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
     }
 
     let version_condition_client = restricted_user_client(&env, version_condition_user, version_condition_secret);
+    let mismatching_version_pax = HashMap::from([("minio.versionId", Uuid::new_v4().to_string())]);
+    let archive = make_tar_with_pax_entry("version-mismatch-entry.txt", b"must-not-write", None, &mismatching_version_pax).await;
+    let err = version_condition_client
+        .put_object()
+        .bucket(bucket)
+        .key("version-mismatch.tar")
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await
+        .expect_err("a mismatching PAX version ID must fail the replication condition");
+    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("AccessDenied"));
+    let err = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key("version-mismatch-entry.txt")
+        .send()
+        .await
+        .expect_err("a denied PAX entry must not be written");
+    assert!(matches!(
+        err.as_service_error().and_then(|error| error.meta().code()),
+        Some("NoSuchKey" | "NotFound")
+    ));
+
     let matching_version_pax = HashMap::from([("minio.versionId", conditional_version_id)]);
     let archive = make_tar_with_pax_entry("condition-entry.txt", b"condition-body", None, &matching_version_pax).await;
     version_condition_client
@@ -6041,6 +6068,13 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
         })
         .send()
         .await?;
+    let stored = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("condition-entry.txt")
+        .send()
+        .await?;
+    assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), b"condition-body");
 
     let pax_context_client = restricted_user_client(&env, pax_context_user, pax_context_secret);
     let tag_pax = HashMap::from([("minio.metadata.x-amz-tagging", "classification=public".to_string())]);

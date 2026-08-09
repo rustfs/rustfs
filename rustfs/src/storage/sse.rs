@@ -112,21 +112,15 @@ use tracing::{debug, error};
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_SSE: &str = "sse";
 
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
-const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
-const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
-const INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "x-rustfs-encryption-algorithm";
-const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
-const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
-const MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER: &str = "X-Minio-Internal-Encrypted-Multipart";
-const MINIO_INTERNAL_ENCRYPTION_IV_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Iv";
-const MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm";
-const MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
-const MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key";
-const MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key";
-const MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
-const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key";
-const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_CONTEXT_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+    INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
+    INTERNAL_ENCRYPTION_TAG_HEADER, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEC_ORIGINAL_SIZE_HEADER,
+};
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
 #[cfg(feature = "rio-v2")]
@@ -1378,8 +1372,8 @@ fn normalize_encryption_metadata_case(
         INTERNAL_ENCRYPTION_KEY_HEADER,
         INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER,
-        "x-rustfs-encryption-context",
-        "x-rustfs-encryption-tag",
+        INTERNAL_ENCRYPTION_CONTEXT_HEADER,
+        INTERNAL_ENCRYPTION_TAG_HEADER,
         INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
         MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
         MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
@@ -1783,7 +1777,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
                 && !kms_context.is_empty()
             {
                 if let Ok(serialized) = serde_json::to_string(kms_context) {
-                    metadata.insert("x-rustfs-encryption-context".to_string(), serialized);
+                    metadata.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), serialized);
                 }
                 if matches!(material.sse_type, SSEType::SseKms)
                     && let Ok(encoded) = encode_minio_kms_context(kms_context)
@@ -3153,9 +3147,9 @@ pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>)
         INTERNAL_ENCRYPTION_KEY_ID_HEADER,
         INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER,
-        "x-rustfs-encryption-tag",
+        INTERNAL_ENCRYPTION_TAG_HEADER,
         INTERNAL_ENCRYPTION_KEY_HEADER,
-        "x-rustfs-encryption-context",
+        INTERNAL_ENCRYPTION_CONTEXT_HEADER,
         INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
         MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
         MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
@@ -3261,13 +3255,13 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
         normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.clone());
     }
 
-    if !normalized.contains_key("x-rustfs-encryption-context")
+    if !normalized.contains_key(INTERNAL_ENCRYPTION_CONTEXT_HEADER)
         && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
         && let Ok(decoded) = BASE64_STANDARD.decode(value)
         && let Ok(context) = serde_json::from_slice::<HashMap<String, String>>(&decoded)
         && let Ok(encoded) = serde_json::to_string(&context)
     {
-        normalized.insert("x-rustfs-encryption-context".to_string(), encoded);
+        normalized.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
     }
 
     normalized
@@ -4260,6 +4254,86 @@ mod tests {
         .expect("ssec original-size metadata should serialize");
 
         assert_eq!(metadata.get(SSEC_ORIGINAL_SIZE_HEADER).map(String::as_str), Some("1024"));
+    }
+
+    fn material_variant(sse_type: SSEType, key_kind: EncryptionKeyKind) -> EncryptionMaterial {
+        let (server_side_encryption, kms_key_id, encrypted_data_key, customer_key_md5, managed_kms_context) = match sse_type {
+            SSEType::SseC => (
+                ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                None,
+                None,
+                Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+                None,
+            ),
+            SSEType::SseS3 => (
+                ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                None,
+                Some(vec![0u8; 32]),
+                None,
+                None,
+            ),
+            SSEType::SseKms => (
+                ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                Some("kms-key-1".to_string()),
+                Some(vec![0u8; 32]),
+                None,
+                Some(HashMap::from([("app".to_string(), "test".to_string())])),
+            ),
+        };
+        EncryptionMaterial {
+            sse_type,
+            server_side_encryption,
+            kms_key_id,
+            algorithm: SSECustomerAlgorithm::from("AES256".to_string()),
+            key_bytes: [0u8; 32],
+            base_nonce: [0u8; 12],
+            encrypted_data_key,
+            customer_key_md5,
+            original_size: Some(1024),
+            key_kind,
+            managed_kms_context,
+            managed_sealed_key: None,
+        }
+    }
+
+    /// Reconciliation contract with the replication boundary (backlog#1783):
+    /// every metadata key this module persists must either be remapped by the
+    /// SSE-C transport table or be caught by the replication strip predicate.
+    /// A new stored key that is in neither turns this test red before it can
+    /// silently leak through outbound replication metadata.
+    #[test]
+    fn test_encryption_metadata_keys_reconcile_with_replication_transport_and_strip() {
+        use rustfs_utils::http::object_encryption_keys::{
+            is_replication_stripped_encryption_key, ssec_replication_transport_header,
+        };
+
+        let variants = [
+            (SSEType::SseC, EncryptionKeyKind::Direct),
+            (SSEType::SseS3, EncryptionKeyKind::Direct),
+            (SSEType::SseKms, EncryptionKeyKind::Direct),
+        ];
+
+        for (sse_type, key_kind) in variants {
+            let metadata = encryption_material_to_metadata(&material_variant(sse_type, key_kind))
+                .expect("encryption material should serialize");
+            assert!(!metadata.is_empty());
+
+            for key in metadata.keys() {
+                assert!(
+                    ssec_replication_transport_header(key).is_some() || is_replication_stripped_encryption_key(key),
+                    "stored key {key} ({sse_type:?}/{key_kind:?}) is neither transport-mapped nor stripped for replication"
+                );
+                if !matches!(sse_type, SSEType::SseC) {
+                    // Managed SSE never takes the transport mapping; every key
+                    // must be structurally stripped so envelopes cannot leave
+                    // the source site.
+                    assert!(
+                        is_replication_stripped_encryption_key(key),
+                        "managed-SSE stored key {key} ({sse_type:?}) escapes the replication strip predicate"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

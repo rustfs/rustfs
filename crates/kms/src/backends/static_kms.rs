@@ -26,7 +26,7 @@
 
 use crate::backends::{BackendCapabilities, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
-use crate::encryption::{DataKeyEnvelope, context_aad};
+use crate::encryption::{DataKeyEnvelope, context_aad, generate_key_material};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -124,16 +124,7 @@ impl StaticKmsBackend {
         // The requested spec decides the DEK length; a caller that asked for
         // AES_128 and silently got 256 bits would build objects whose recorded
         // spec does not match their key material.
-        // Lengths track `KeySpec::key_size`; the request carries the spec as a
-        // string, so the mapping is repeated here rather than shared.
-        let key_length = match request.key_spec.as_str() {
-            "AES_256" | "ChaCha20" => 32,
-            "AES_128" => 16,
-            _ => return Err(KmsError::unsupported_algorithm(&request.key_spec)),
-        };
-
-        let mut plaintext = vec![0u8; key_length];
-        rand::rng().fill(&mut plaintext[..]);
+        let plaintext = generate_key_material(&request.key_spec)?;
 
         // Encrypt DEK with AES-256-GCM using the static key directly
         let key = Key::<Aes256Gcm>::from(*self.key);
@@ -167,7 +158,7 @@ impl StaticKmsBackend {
         Ok(DataKeyInfo::new(
             self.key_id.clone(),
             0,
-            Some(plaintext.to_vec()),
+            Some(plaintext),
             ciphertext,
             request.key_spec.clone(),
         ))
@@ -360,17 +351,20 @@ impl KmsBackend for StaticKmsBackend {
             encryption_context: request.encryption_context,
             grant_tokens: Vec::new(),
         };
-        let data_key = self.generate_data_key_envelope(&gen_req)?;
+        let mut data_key = self.generate_data_key_envelope(&gen_req)?;
 
+        // Fields are taken, not destructured or cloned: `DataKeyInfo` has a
+        // `Drop` impl, and a clone would leave a second un-zeroized plaintext
+        // DEK on the heap.
         let plaintext_key = data_key
             .plaintext
-            .clone()
+            .take()
             .ok_or_else(|| KmsError::internal_error("Generated data key is missing plaintext"))?;
 
         Ok(GenerateDataKeyResponse {
-            key_id: data_key.key_id.clone(),
+            key_id: std::mem::take(&mut data_key.key_id),
             plaintext_key,
-            ciphertext_blob: data_key.ciphertext.clone(),
+            ciphertext_blob: std::mem::take(&mut data_key.ciphertext),
         })
     }
 
