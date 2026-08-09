@@ -327,16 +327,8 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, bucktes))]
     pub async fn init_and_start_rebalance(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
-        let _start_guard = self.start_gate.lock().await;
-
-        let decommission_running = self.is_decommission_running().await;
-        {
-            let rebalance_meta = self.rebalance_meta.read().await;
-            validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
-        }
-
-        let id = self.init_rebalance_meta(bucktes).await?;
-        if let Err(start_err) = self.start_rebalance().await {
+        let id = self.init_rebalance_start(bucktes).await?;
+        if let Err(start_err) = self.start_rebalance_for_id(&id).await {
             if let Err(rollback_err) = self
                 .rollback_rebalance_start_without_worker_for_id(Some(&id), start_err.to_string())
                 .await
@@ -352,6 +344,47 @@ impl ECStore {
         }
 
         Ok(id)
+    }
+
+    #[tracing::instrument(skip(self, bucktes))]
+    pub async fn init_rebalance_start(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
+        let _start_guard = self.start_gate.lock().await;
+
+        let decommission_running = self.is_decommission_running().await;
+        {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
+        }
+
+        self.init_rebalance_meta(bucktes).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn start_rebalance_for_id(self: &Arc<Self>, expected_id: &str) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+
+        {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            let Some(meta) = rebalance_meta.as_ref() else {
+                return Err(Error::ConfigNotFound);
+            };
+            if meta.id != expected_id {
+                return Err(Error::other(format!(
+                    "rebalance metadata changed before start: expected {expected_id}, found {}",
+                    meta.id
+                )));
+            }
+            if meta.stopped_at.is_some() {
+                return Err(Error::other(format!("rebalance {expected_id} was stopped before start")));
+            }
+        }
+
+        self.start_rebalance().await
+    }
+
+    pub async fn rollback_rebalance_start_for_id(self: &Arc<Self>, expected_id: Option<&str>, start_error: String) -> Result<()> {
+        self.rollback_rebalance_start_without_worker_for_id(expected_id, start_error)
+            .await
     }
 
     #[tracing::instrument(skip(self, fi))]

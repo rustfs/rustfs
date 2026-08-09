@@ -16,8 +16,10 @@ use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::DiskError;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    DEFAULT_READ_BUFFER_SIZE, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, StorageDiskRpcExt as _,
-    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, find_local_disk_by_ref, sign_ns_scanner_capability, verify_rpc_signature,
+    DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
+    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions,
+    check_and_record_signed_rpc_nonce, find_local_disk_by_ref, sign_ns_scanner_capability, verify_put_file_auth_trailer,
+    verify_rpc_signature,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -43,13 +45,14 @@ use s3s::dto::StreamingBlob;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_bytes;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tower::Service;
 use tracing::{error, warn};
@@ -72,6 +75,14 @@ const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
+    )
+});
+static PUT_FILE_TARGET_LOCKS: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 macro_rules! log_internode_rpc_response_failure {
     ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, Some(($context_key:expr, $context_value:expr)), Some($error_text:expr)) => {{
@@ -311,13 +322,34 @@ fn validate_walk_dir_completion_request(query: &WalkDirQuery, body: &[u8]) -> Op
     Some(propagate_completion_errors)
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 struct PutFileQuery {
     disk: String,
     volume: String,
     path: String,
     append: bool,
     size: i64,
+    put_file_auth: Option<String>,
+    put_file_nonce: Option<uuid::Uuid>,
+}
+
+fn put_file_auth_nonce(query: &PutFileQuery) -> io::Result<Option<uuid::Uuid>> {
+    match query.put_file_auth.as_deref() {
+        None => {
+            if *PUT_FILE_AUTH_STRICT {
+                return Err(io::Error::other("put_file auth required"));
+            }
+            Ok(None)
+        }
+        Some(PUT_FILE_AUTH_V1) => {
+            let nonce = query
+                .put_file_nonce
+                .filter(|nonce| !nonce.is_nil())
+                .ok_or_else(|| io::Error::other("Invalid RPC nonce"))?;
+            Ok(Some(nonce))
+        }
+        Some(_) => Err(io::Error::other("Unsupported put_file auth version")),
+    }
 }
 
 impl<S> Service<Request<Incoming>> for InternodeRpcService<S>
@@ -1114,13 +1146,150 @@ where
     Body::from(StreamingBlob::wrap(stream.chain(completion)))
 }
 
+fn put_file_target_lock(disk: &DiskStore, query: &PutFileQuery) -> Arc<Mutex<()>> {
+    let key = format!("{:p}\0{}\0{}", Arc::as_ptr(disk), query.volume, query.path);
+    let mut locks = PUT_FILE_TARGET_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> Result<(), BoxError> {
+    disk.delete(
+        volume,
+        path,
+        DeleteOptions {
+            immediate: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn write_authenticated_put_file<S, E>(
+    disk: &DiskStore,
+    body: S,
+    query: &PutFileQuery,
+    nonce: uuid::Uuid,
+    url: &str,
+) -> Result<u64, (&'static str, BoxError)>
+where
+    S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+    E: Into<BoxError>,
+{
+    let target_lock = put_file_target_lock(disk, query);
+    let _target_guard = target_lock.lock_owned().await;
+    let staging_name = format!(".rustfs-put-{}", uuid::Uuid::new_v4());
+    let staging_path = match query.path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{staging_name}"),
+        None => staging_name,
+    };
+
+    let result = async {
+        let mut file = disk
+            .create_file("", &query.volume, &staging_path, query.size)
+            .await
+            .map_err(|err| ("create_staging", Box::new(err) as BoxError))?;
+
+        if query.append {
+            match disk.read_file(&query.volume, &query.path).await {
+                Ok(mut source) => {
+                    tokio::io::copy(&mut source, &mut file)
+                        .await
+                        .map_err(|err| ("copy_existing", Box::new(err) as BoxError))?;
+                }
+                Err(DiskError::FileNotFound) => {}
+                Err(err) => return Err(("read_existing", Box::new(err) as BoxError)),
+            }
+        }
+
+        let copied = write_put_file_body_chunks_to_writer(body, &mut file, query, Some(nonce), url)
+            .await
+            .map_err(|err| ("write_body", Box::new(err) as BoxError))?;
+        if put_body_size_mismatch(query, copied) {
+            return Err((
+                "verify_size",
+                Box::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("body size mismatch: expected {} bytes, received {copied}", query.size),
+                )) as BoxError,
+            ));
+        }
+        file.shutdown().await.map_err(|err| ("shutdown", Box::new(err) as BoxError))?;
+        drop(file);
+
+        disk.rename_file(&query.volume, &staging_path, &query.volume, &query.path)
+            .await
+            .map_err(|err| ("publish", Box::new(err) as BoxError))?;
+        Ok(copied)
+    }
+    .await;
+
+    match result {
+        Ok(copied) => Ok(copied),
+        Err((stage, primary)) => {
+            if let Err(cleanup) = remove_put_file_staging(disk, &query.volume, &staging_path).await {
+                return Err((
+                    stage,
+                    Box::new(io::Error::other(format!("{primary}; staging cleanup failed: {cleanup}"))) as BoxError,
+                ));
+            }
+            Err((stage, primary))
+        }
+    }
+}
+
 async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let url = req.uri().to_string();
     let query = match parse_query::<PutFileQuery>(&req) {
         Ok(query) => query,
         Err(response) => return *response,
     };
+    let auth_nonce = match put_file_auth_nonce(&query) {
+        Ok(nonce) => nonce,
+        Err(e) => {
+            log_internode_rpc_response_failure!(
+                StatusCode::FORBIDDEN,
+                &path,
+                &method,
+                Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+                "put_file_auth_invalid",
+                "rejected",
+                Some(("disk", query.disk.as_str())),
+                Some(&e)
+            );
+            return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
+        }
+    };
+    if let Some(nonce) = auth_nonce
+        && let Err(e) = check_and_record_signed_rpc_nonce(
+            req.headers(),
+            nonce,
+            PUT_FILE_STREAM_PATH,
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        )
+    {
+        log_internode_rpc_response_failure!(
+            StatusCode::FORBIDDEN,
+            &path,
+            &method,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            "put_file_replay_rejected",
+            "rejected",
+            Some(("disk", query.disk.as_str())),
+            Some(&e)
+        );
+        return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
+    }
 
     let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
         log_internode_rpc_response_failure!(
@@ -1135,6 +1304,22 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::BAD_REQUEST, "disk not found");
     };
+
+    if let Some(nonce) = auth_nonce {
+        let copied = match write_authenticated_put_file(&disk, req.into_body().into_data_stream(), &query, nonce, &url).await {
+            Ok(copied) => copied,
+            Err((stage, e)) => {
+                let message = put_file_stage_error_message(stage, &query, e.as_ref());
+                log_internode_put_file_stage_failure!(stage, query, e);
+                return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+            }
+        };
+        record_put_file_metrics(copied);
+        return empty_ok();
+    }
+
+    let target_lock = put_file_target_lock(&disk, &query);
+    let _target_guard = target_lock.lock_owned().await;
 
     let mut file = if query.append {
         match disk.append_file(&query.volume, &query.path).await {
@@ -1156,25 +1341,18 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    let copied = match write_body_chunks_to_writer(req.into_body().into_data_stream(), &mut file).await {
-        Ok(copied) => copied,
-        Err(e) => {
-            let message = put_file_stage_error_message("write_body", &query, &e);
-            log_internode_put_file_stage_failure!("write_body", query, e);
-            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
-        }
-    };
+    let copied =
+        match write_put_file_body_chunks_to_writer(req.into_body().into_data_stream(), &mut file, &query, auth_nonce, &url).await
+        {
+            Ok(copied) => copied,
+            Err(e) => {
+                let message = put_file_stage_error_message("write_body", &query, &e);
+                log_internode_put_file_stage_failure!("write_body", query, e);
+                return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+            }
+        };
 
-    let metrics = runtime_sources::current_internode_metrics();
-    metrics.record_incoming_request_for_operation_and_backend(
-        INTERNODE_OPERATION_PUT_FILE_STREAM,
-        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-    );
-    metrics.record_recv_bytes_for_operation_and_backend(
-        INTERNODE_OPERATION_PUT_FILE_STREAM,
-        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-        usize::try_from(copied).unwrap_or(usize::MAX),
-    );
+    record_put_file_metrics(copied);
 
     if put_body_size_mismatch(&query, copied) {
         let err = std::io::Error::new(
@@ -1193,6 +1371,19 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     }
 
     empty_ok()
+}
+
+fn record_put_file_metrics(copied: u64) {
+    let metrics = runtime_sources::current_internode_metrics();
+    metrics.record_incoming_request_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    );
+    metrics.record_recv_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        usize::try_from(copied).unwrap_or(usize::MAX),
+    );
 }
 
 async fn write_body_chunks_to_writer<S, E, W>(body: S, writer: &mut W) -> io::Result<u64>
@@ -1219,6 +1410,112 @@ where
         writer.write_all(&pending).await?;
     }
 
+    Ok(copied)
+}
+
+async fn write_put_file_body_chunks_to_writer<S, E, W>(
+    body: S,
+    writer: &mut W,
+    query: &PutFileQuery,
+    auth_nonce: Option<uuid::Uuid>,
+    url: &str,
+) -> io::Result<u64>
+where
+    S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+    E: Into<BoxError>,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(nonce) = auth_nonce else {
+        return write_body_chunks_to_writer(body, writer).await;
+    };
+
+    let expected_size = (!query.append && query.size >= 0)
+        .then(|| {
+            u64::try_from(query.size)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "put_file auth size cannot be represented"))
+        })
+        .transpose()?;
+    let mut body = body;
+    let mut remaining = expected_size;
+    let mut copied = 0_u64;
+    let mut trailer = Vec::with_capacity(PUT_FILE_AUTH_TRAILER_LEN);
+    let mut hasher = Sha256::new();
+
+    while let Some(bytes) = body.try_next().await.map_err(io::Error::other)? {
+        if let Some(remaining) = remaining.as_mut() {
+            let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let data_len = usize::try_from((*remaining).min(chunk_len))
+                .map_err(|_| io::Error::other("put_file body length cannot be represented"))?;
+            if data_len > 0 {
+                hasher.update(&bytes[..data_len]);
+                copied = copied
+                    .checked_add(
+                        u64::try_from(data_len).map_err(|_| io::Error::other("put_file body length cannot be represented"))?,
+                    )
+                    .ok_or_else(|| io::Error::other("put_file body length overflow"))?;
+                *remaining -=
+                    u64::try_from(data_len).map_err(|_| io::Error::other("put_file body length cannot be represented"))?;
+                writer.write_all(&bytes[..data_len]).await?;
+            }
+
+            if data_len < bytes.len() {
+                trailer.extend_from_slice(&bytes[data_len..]);
+                if trailer.len() > PUT_FILE_AUTH_TRAILER_LEN {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "put_file auth trailer has trailing data"));
+                }
+            }
+        } else {
+            let write_len = trailer
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(PUT_FILE_AUTH_TRAILER_LEN);
+            if write_len > 0 {
+                let buffered_write_len = write_len.min(trailer.len());
+                if buffered_write_len > 0 {
+                    writer.write_all(&trailer[..buffered_write_len]).await?;
+                    hasher.update(&trailer[..buffered_write_len]);
+                    copied = copied
+                        .checked_add(
+                            u64::try_from(buffered_write_len)
+                                .map_err(|_| io::Error::other("put_file body length cannot be represented"))?,
+                        )
+                        .ok_or_else(|| io::Error::other("put_file body length overflow"))?;
+                    trailer = trailer.split_off(buffered_write_len);
+                }
+
+                let chunk_write_len = write_len - buffered_write_len;
+                if chunk_write_len > 0 {
+                    writer.write_all(&bytes[..chunk_write_len]).await?;
+                    hasher.update(&bytes[..chunk_write_len]);
+                }
+                copied = copied
+                    .checked_add(
+                        u64::try_from(chunk_write_len)
+                            .map_err(|_| io::Error::other("put_file body length cannot be represented"))?,
+                    )
+                    .ok_or_else(|| io::Error::other("put_file body length overflow"))?;
+                trailer.extend_from_slice(&bytes[chunk_write_len..]);
+            } else {
+                trailer.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    if remaining.is_some_and(|remaining| remaining != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("body size mismatch: expected {} bytes, received {copied}", query.size),
+        ));
+    }
+    if trailer.len() != PUT_FILE_AUTH_TRAILER_LEN {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "put_file auth trailer is incomplete"));
+    }
+
+    let expected = verify_put_file_auth_trailer(url, &Method::PUT, nonce, &trailer)?;
+    let actual = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
+    if actual != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "put_file body digest mismatch"));
+    }
     Ok(copied)
 }
 
@@ -1308,11 +1605,14 @@ mod tests {
         NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_STREAM_PATH, PutFileQuery,
         READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
         internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
-        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_stage_error_message, read_file_body_stream,
-        remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
-        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
-        verify_walk_dir_body_digest, walk_dir_response_body, write_body_chunks_to_writer,
+        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_stage_error_message,
+        put_file_target_lock, read_file_body_stream, remote_scanner_claim_rejection, response_with_disk_error,
+        supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
+        verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
+        write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
     };
+    use crate::storage::storage_api::ecstore_rpc::build_put_file_auth_trailer;
+    use crate::storage::storage_api::rpc_consumer::http_service::{DiskAPI as _, DiskOption, DiskStore, Endpoint, new_disk};
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use http_body_util::BodyExt;
@@ -1324,10 +1624,24 @@ mod tests {
     };
     use sha2::Digest as _;
     use std::collections::HashMap;
+    use std::future::Future as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;
+
+    async fn new_put_file_test_disk() -> (DiskStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp directory should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp path should be utf8")).expect("disk endpoint should parse");
+        let disk = new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("test volume should be created");
+        (disk, dir)
+    }
 
     struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -1335,6 +1649,30 @@ mod tests {
         fn drop(&mut self) {
             if let Some(sender) = self.0.take() {
                 let _ = sender.send(());
+            }
+        }
+    }
+
+    struct GatedPutBody {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        payload: Option<Bytes>,
+    }
+
+    impl futures_util::Stream for GatedPutBody {
+        type Item = io::Result<Bytes>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            if self.payload.is_none() {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut self.release).poll(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(self.payload.take().map(Ok)),
+                Poll::Ready(Err(_)) => Poll::Ready(Some(Err(io::Error::other("gated body release dropped")))),
+                Poll::Pending => Poll::Pending,
             }
         }
     }
@@ -1433,6 +1771,8 @@ mod tests {
             path: "tmp/object/part.1".to_string(),
             append: false,
             size: 1024,
+            put_file_auth: None,
+            put_file_nonce: None,
         };
 
         let msg = put_file_stage_error_message("write_body", &query, &"connection reset");
@@ -1452,6 +1792,8 @@ mod tests {
             path: "object/part.1".to_string(),
             append,
             size,
+            put_file_auth: None,
+            put_file_nonce: None,
         };
 
         // Truncated (or over-long) body on the create path is rejected.
@@ -1577,6 +1919,507 @@ mod tests {
 
         assert_eq!(copied, 11);
         assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn put_file_auth_nonce_accepts_v1_requests_with_non_nil_nonce() {
+        let nonce = uuid::Uuid::new_v4();
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 11,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+
+        assert_eq!(put_file_auth_nonce(&query).expect("v1 auth should parse"), Some(nonce));
+
+        let mut append = query.clone();
+        append.append = true;
+        assert_eq!(put_file_auth_nonce(&append).expect("append auth should parse"), Some(nonce));
+
+        let mut unknown_size = query.clone();
+        unknown_size.size = -1;
+        assert_eq!(put_file_auth_nonce(&unknown_size).expect("unknown-size auth should parse"), Some(nonce));
+
+        let mut nil = query.clone();
+        nil.put_file_nonce = Some(uuid::Uuid::nil());
+        assert!(put_file_auth_nonce(&nil).is_err());
+
+        let mut unknown = query;
+        unknown.put_file_auth = Some("digest-trailer-v2".to_string());
+        assert!(put_file_auth_nonce(&unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_body_writes_only_data_and_verifies_trailer() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let nonce = uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
+        );
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 11,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let mut second = b"world".to_vec();
+        second.extend_from_slice(&trailer[..7]);
+        let body = iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from(second)),
+            Ok(Bytes::copy_from_slice(&trailer[7..])),
+        ]);
+        let mut writer = Vec::new();
+
+        let copied = write_put_file_body_chunks_to_writer(body, &mut writer, &query, Some(nonce), url)
+            .await
+            .expect("authenticated body should verify");
+
+        assert_eq!(copied, 11);
+        assert_eq!(writer, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_body_rejects_tampered_data() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let nonce = uuid::Uuid::parse_str("22222222-3333-4444-8555-666666666666").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=22222222-3333-4444-8555-666666666666"
+        );
+        let signed_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &signed_digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 11,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let mut payload = b"hello worle".to_vec();
+        payload.extend_from_slice(&trailer);
+        let body = iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]);
+        let mut writer = Vec::new();
+
+        let err = write_put_file_body_chunks_to_writer(body, &mut writer, &query, Some(nonce), url)
+            .await
+            .expect_err("tampered body must fail digest verification");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "put_file body digest mismatch");
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_append_body_uses_trailing_auth_record() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let nonce = uuid::Uuid::parse_str("33333333-4444-4555-8666-777777777777").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=33333333-4444-4555-8666-777777777777"
+        );
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let mut payload = b"append-data".to_vec();
+        payload.extend_from_slice(&trailer);
+        let body = iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]);
+        let mut writer = Vec::new();
+
+        let copied = write_put_file_body_chunks_to_writer(body, &mut writer, &query, Some(nonce), url)
+            .await
+            .expect("append body should verify");
+
+        assert_eq!(copied, 11);
+        assert_eq!(writer, b"append-data");
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_append_body_rejects_missing_trailer() {
+        let nonce = uuid::Uuid::parse_str("44444444-5555-4666-8777-888888888888").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=44444444-5555-4666-8777-888888888888"
+        );
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let body = iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"append-data"))]);
+        let mut writer = Vec::new();
+
+        let err = write_put_file_body_chunks_to_writer(body, &mut writer, &query, Some(nonce), url)
+            .await
+            .expect_err("missing trailer must fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "put_file auth trailer is incomplete");
+    }
+
+    #[tokio::test]
+    async fn authenticated_create_tamper_preserves_existing_local_file() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+        let nonce = uuid::Uuid::parse_str("55555555-6666-4777-8888-999999999999").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=55555555-6666-4777-8888-999999999999"
+        );
+        let signed_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &signed_digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 11,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let mut payload = b"hello worle".to_vec();
+        payload.extend_from_slice(&trailer);
+
+        let err =
+            write_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
+                .await
+                .expect_err("tampered body must not publish");
+
+        assert_eq!(err.0, "write_body");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("existing data should remain"),
+            Bytes::from_static(b"old-data")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_create_truncation_preserves_existing_local_file() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+        let nonce = uuid::Uuid::parse_str("66666666-7777-4888-8999-aaaaaaaaaaaa").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=66666666-7777-4888-8999-aaaaaaaaaaaa"
+        );
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 11,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+
+        let err = write_authenticated_put_file(
+            &disk,
+            iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"short"))]),
+            &query,
+            nonce,
+            url,
+        )
+        .await
+        .expect_err("truncated body must not publish");
+
+        assert_eq!(err.0, "write_body");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("existing data should remain"),
+            Bytes::from_static(b"old-data")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_append_missing_trailer_preserves_existing_local_file() {
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+        let nonce = uuid::Uuid::parse_str("77777777-8888-4999-8aaa-bbbbbbbbbbbb").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+        );
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+
+        let err = write_authenticated_put_file(
+            &disk,
+            iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"append-data"))]),
+            &query,
+            nonce,
+            url,
+        )
+        .await
+        .expect_err("missing trailer must not publish");
+
+        assert_eq!(err.0, "write_body");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("existing data should remain"),
+            Bytes::from_static(b"old-data")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_append_publishes_existing_and_new_bytes() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+        let nonce = uuid::Uuid::parse_str("88888888-9999-4aaa-8bbb-cccccccccccc").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=88888888-9999-4aaa-8bbb-cccccccccccc"
+        );
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+        let mut payload = b"append-data".to_vec();
+        payload.extend_from_slice(&trailer);
+
+        let copied =
+            write_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
+                .await
+                .expect("authenticated append should publish");
+
+        assert_eq!(copied, 11);
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("published data should be readable"),
+            Bytes::from_static(b"old-dataappend-data")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_authenticated_appends_preserve_both_payloads_without_staging() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let (disk, dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+
+        let first_nonce = uuid::Uuid::parse_str("99999999-aaaa-4bbb-8ccc-dddddddddddd").expect("first nonce");
+        let first_url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=99999999-aaaa-4bbb-8ccc-dddddddddddd"
+        );
+        let first_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"first"), hex_simd::AsciiCase::Lower);
+        let first_trailer =
+            build_put_file_auth_trailer(first_url, &Method::PUT, first_nonce, &first_digest).expect("first trailer should build");
+        let mut first_payload = b"first".to_vec();
+        first_payload.extend_from_slice(&first_trailer);
+
+        let second_nonce = uuid::Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("second nonce");
+        let second_url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        );
+        let second_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"second"), hex_simd::AsciiCase::Lower);
+        let second_trailer = build_put_file_auth_trailer(second_url, &Method::PUT, second_nonce, &second_digest)
+            .expect("second trailer should build");
+        let mut second_payload = b"second".to_vec();
+        second_payload.extend_from_slice(&second_trailer);
+
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(first_nonce),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_disk = disk.clone();
+        let first_query = query.clone();
+        let first = tokio::spawn(async move {
+            write_authenticated_put_file(
+                &first_disk,
+                GatedPutBody {
+                    started: Some(started_tx),
+                    release: release_rx,
+                    payload: Some(Bytes::from(first_payload)),
+                },
+                &first_query,
+                first_nonce,
+                first_url,
+            )
+            .await
+        });
+        started_rx.await.expect("first append should start reading its body");
+
+        let second_disk = disk.clone();
+        let mut second_query = query;
+        second_query.put_file_nonce = Some(second_nonce);
+        let second = tokio::spawn(async move {
+            write_authenticated_put_file(
+                &second_disk,
+                iter(vec![Ok::<Bytes, io::Error>(Bytes::from(second_payload))]),
+                &second_query,
+                second_nonce,
+                second_url,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "second append must wait while the first holds the target lock");
+
+        release_tx.send(()).expect("first append should still be waiting");
+        assert_eq!(
+            first
+                .await
+                .expect("first append task should join")
+                .expect("first append should succeed"),
+            5
+        );
+        assert_eq!(
+            second
+                .await
+                .expect("second append task should join")
+                .expect("second append should succeed"),
+            6
+        );
+        let final_data = disk
+            .read_all("bucket", "object/part.1")
+            .await
+            .expect("final data should be readable");
+        assert!(
+            final_data == Bytes::from_static(b"old-datafirstsecond") || final_data == Bytes::from_static(b"old-datasecondfirst"),
+            "both complete append payloads must be preserved: {final_data:?}"
+        );
+
+        let object_dir = dir.path().join("bucket/object");
+        let entries = std::fs::read_dir(object_dir).expect("object directory should be readable");
+        assert!(
+            entries
+                .map(|entry| entry.expect("directory entry should be readable").file_name())
+                .all(|name| !name.to_string_lossy().starts_with(".rustfs-put-")),
+            "successful concurrent appends must not leave staging files"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_and_authenticated_appends_share_the_target_lock() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let (disk, _dir) = new_put_file_test_disk().await;
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old-data"))
+            .await
+            .expect("existing data should be written");
+        let nonce = uuid::Uuid::parse_str("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        );
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"authenticated"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
+        let mut payload = b"authenticated".to_vec();
+        payload.extend_from_slice(&trailer);
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: true,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+        };
+
+        let legacy_lock = put_file_target_lock(&disk, &query);
+        let (legacy_started_tx, legacy_started_rx) = tokio::sync::oneshot::channel();
+        let (legacy_release_tx, legacy_release_rx) = tokio::sync::oneshot::channel();
+        let legacy_disk = disk.clone();
+        let legacy = tokio::spawn(async move {
+            let _guard = legacy_lock.lock_owned().await;
+            legacy_started_tx.send(()).expect("test should observe legacy lock");
+            legacy_release_rx.await.expect("legacy append should be released");
+            let mut file = legacy_disk
+                .append_file("bucket", "object/part.1")
+                .await
+                .expect("legacy append should open");
+            file.write_all(b"legacy").await.expect("legacy append should write");
+            file.shutdown().await.expect("legacy append should finish");
+        });
+        legacy_started_rx.await.expect("legacy append should hold the target lock");
+
+        let authenticated_disk = disk.clone();
+        let authenticated_query = query.clone();
+        let authenticated = tokio::spawn(async move {
+            write_authenticated_put_file(
+                &authenticated_disk,
+                iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]),
+                &authenticated_query,
+                nonce,
+                url,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!authenticated.is_finished(), "authenticated append must wait for legacy append");
+
+        legacy_release_tx.send(()).expect("legacy append should still be waiting");
+        legacy.await.expect("legacy append task should join");
+        authenticated
+            .await
+            .expect("authenticated append task should join")
+            .expect("authenticated append should succeed");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("final data should be readable"),
+            Bytes::from_static(b"old-datalegacyauthenticated")
+        );
     }
 
     #[tokio::test]

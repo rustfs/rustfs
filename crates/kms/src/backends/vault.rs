@@ -875,7 +875,13 @@ impl VaultKmsClient {
         })
     }
 
-    pub(crate) async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    /// Open a data-key envelope, returning the plaintext and the master key
+    /// that wrapped it.
+    pub(crate) async fn decrypt(
+        &self,
+        request: &DecryptRequest,
+        _context: Option<&OperationContext>,
+    ) -> Result<(Vec<u8>, String)> {
         debug!("Decrypting data");
 
         // Parse the data key envelope from ciphertext
@@ -929,7 +935,7 @@ impl VaultKmsClient {
         };
 
         debug!("Vault KMS data decrypted");
-        Ok(plaintext)
+        Ok((plaintext, envelope.master_key_id))
     }
 
     /// Report which master key version wraps an envelope, and whether that is
@@ -1626,16 +1632,11 @@ impl KmsBackend for VaultKmsBackend {
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
-        let plaintext = self.client.decrypt(&request, None).await?;
-
-        // The envelope that was just opened names the master key that opened it.
-        // Reporting "unknown" left every caller unable to tell which key was
-        // actually used, which is what audit and key-rotation checks read.
-        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
+        let (plaintext, key_id) = self.client.decrypt(&request, None).await?;
 
         Ok(DecryptResponse {
             plaintext,
-            key_id: envelope.master_key_id,
+            key_id,
             encryption_algorithm: Some("AES-256-GCM".to_string()),
         })
     }
@@ -1660,12 +1661,19 @@ impl KmsBackend for VaultKmsBackend {
             grant_tokens: Vec::new(),
         };
 
-        let data_key = self.client.generate_data_key(&generate_request, None).await?;
+        let mut data_key = self.client.generate_data_key(&generate_request, None).await?;
 
+        // Fields are taken, not destructured or cloned: `DataKeyInfo` has a
+        // `Drop` impl, and a clone would leave a second un-zeroized plaintext
+        // DEK on the heap.
+        let plaintext_key = data_key
+            .plaintext
+            .take()
+            .ok_or_else(|| KmsError::internal_error("Generated data key is missing plaintext"))?;
         Ok(GenerateDataKeyResponse {
             key_id: request.key_id,
-            plaintext_key: data_key.plaintext.clone().unwrap_or_default(),
-            ciphertext_blob: data_key.ciphertext.clone(),
+            plaintext_key,
+            ciphertext_blob: std::mem::take(&mut data_key.ciphertext),
         })
     }
 
@@ -2525,7 +2533,7 @@ mod tests {
 
         // A mixed batch of envelopes from every historical version must decrypt.
         for (data_key, label) in [(&dk_v1, "v1"), (&dk_v3, "v3"), (&dk_v2, "v2"), (&dk_v1, "v1 again")] {
-            let plaintext = client
+            let (plaintext, _opened_by) = client
                 .decrypt(&integration_decrypt_request(data_key.ciphertext.clone()), None)
                 .await
                 .unwrap_or_else(|error| panic!("envelope wrapped under {label} must stay decryptable: {error}"));
@@ -2561,7 +2569,7 @@ mod tests {
 
         // The baseline rule must route the legacy envelope to the frozen version 1
         // material even though the current version has moved on.
-        let plaintext = client
+        let (plaintext, _opened_by) = client
             .decrypt(&integration_decrypt_request(legacy_ciphertext), None)
             .await
             .expect("legacy envelope must stay decryptable after rotation");
@@ -2605,7 +2613,7 @@ mod tests {
         );
 
         // The untampered envelope still decrypts through its recorded version.
-        let plaintext = client
+        let (plaintext, _opened_by) = client
             .decrypt(&integration_decrypt_request(data_key.ciphertext.clone()), None)
             .await
             .expect("untampered envelope must still decrypt");
@@ -2870,7 +2878,7 @@ mod tests {
         assert_eq!(envelope.master_key_id, "wired-key");
         assert_eq!(envelope.master_key_version, Some(1));
 
-        let decrypted = client
+        let (decrypted, opened_by) = client
             .decrypt(
                 &DecryptRequest {
                     ciphertext: encrypted.ciphertext.clone(),
@@ -2882,6 +2890,7 @@ mod tests {
             .await
             .expect("decrypt must round-trip the envelope");
         assert_eq!(decrypted, b"kv2-direct-encrypt".to_vec());
+        assert_eq!(opened_by, "wired-key", "decrypt must report the master key that opened the envelope");
 
         // A different object context must not decrypt (checked before any
         // Vault read, so no scripted response is consumed).
@@ -4181,7 +4190,7 @@ mod tests {
 
         let (vault, client) = scripted_client(vec![ScriptedResponse::ok(kv2_read_data(&key_data))]).await;
 
-        let plaintext = client
+        let (plaintext, _opened_by) = client
             .decrypt(
                 &DecryptRequest {
                     ciphertext,
@@ -4315,7 +4324,7 @@ mod tests {
         }
         let (vault, client) = scripted_client(responses).await;
 
-        let plaintext = client
+        let (plaintext, _opened_by) = client
             .decrypt(
                 &DecryptRequest {
                     ciphertext: ciphertext.to_vec(),

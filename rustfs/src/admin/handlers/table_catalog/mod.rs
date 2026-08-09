@@ -3764,7 +3764,7 @@ fn table_commit_object_key(
     let object_kind =
         crate::table_catalog::table_maintenance_object_kind(namespace, table, Some(&warehouse_object_prefix), &object_key)
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot object is outside the table warehouse"))?;
-    if object_kind != expected_kind {
+    if !crate::table_catalog::table_maintenance_object_kind_matches_reference(&object_kind, &expected_kind) {
         return Err(s3_error!(InvalidRequest, "snapshot object kind does not match manifest metadata"));
     }
     Ok(object_key)

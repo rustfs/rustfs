@@ -438,6 +438,15 @@ struct SourceCleanupPartIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceCleanupErasureIdentity {
+    algorithm: String,
+    data_blocks: usize,
+    parity_blocks: usize,
+    block_size: usize,
+    distribution: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceCleanupVersionIdentity {
     name: String,
     version_id: Option<uuid::Uuid>,
@@ -447,8 +456,26 @@ pub(crate) struct SourceCleanupVersionIdentity {
     etag: Option<String>,
     checksum: Option<Vec<u8>>,
     data_dir: Option<uuid::Uuid>,
+    transition_status: String,
+    transitioned_objname: String,
+    transition_tier: String,
+    transition_version_id: Option<uuid::Uuid>,
+    transition_version: Option<String>,
+    transition_version_state: u8,
+    expire_restored: bool,
+    erasure: SourceCleanupErasureIdentity,
     metadata: BTreeMap<String, String>,
     parts: Vec<SourceCleanupPartIdentity>,
+}
+
+fn source_cleanup_erasure_identity(erasure: &rustfs_filemeta::ErasureInfo) -> SourceCleanupErasureIdentity {
+    SourceCleanupErasureIdentity {
+        algorithm: erasure.algorithm.clone(),
+        data_blocks: erasure.data_blocks,
+        parity_blocks: erasure.parity_blocks,
+        block_size: erasure.block_size,
+        distribution: erasure.distribution.clone(),
+    }
 }
 
 fn source_cleanup_part_identity(part: &ObjectPartInfo) -> SourceCleanupPartIdentity {
@@ -480,6 +507,19 @@ pub(crate) fn source_cleanup_version_identity(version: &FileInfo) -> SourceClean
         etag: version.get_etag(),
         checksum: version.checksum.as_ref().map(|checksum| checksum.to_vec()),
         data_dir: version.data_dir,
+        transition_status: version.transition_status.clone(),
+        transitioned_objname: version.transitioned_objname.clone(),
+        transition_tier: version.transition_tier.clone(),
+        transition_version_id: version.transition_version_id,
+        transition_version: version.transition_version.clone(),
+        transition_version_state: match version.transition_version_state {
+            rustfs_filemeta::TransitionVersionState::Unknown => 0,
+            rustfs_filemeta::TransitionVersionState::KnownDisabled => 1,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull => 2,
+            rustfs_filemeta::TransitionVersionState::Exact => 3,
+        },
+        expire_restored: version.expire_restored,
+        erasure: source_cleanup_erasure_identity(&version.erasure),
         metadata: version
             .metadata
             .iter()
@@ -493,10 +533,6 @@ fn source_cleanup_version_identities(fivs: &FileInfoVersions) -> Vec<SourceClean
     let mut identities: Vec<_> = fivs.versions.iter().map(source_cleanup_version_identity).collect();
     identities.sort();
     identities
-}
-
-fn source_cleanup_versions_match(expected: &FileInfoVersions, current: &FileInfoVersions) -> bool {
-    source_cleanup_versions_match_with_allowed_missing(expected, current, &[])
 }
 
 fn source_cleanup_versions_match_with_allowed_missing(
@@ -530,6 +566,26 @@ fn source_cleanup_versions_match_with_allowed_missing(
         .all(|(identity, count)| allowed_counts.get(&identity).copied().unwrap_or_default() >= count)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SourceCleanupError {
+    #[error("source versions changed after migration started")]
+    SourceChanged,
+    #[error(transparent)]
+    Storage(#[from] Error),
+}
+
+fn ensure_source_cleanup_versions_match(
+    expected: &FileInfoVersions,
+    current: &FileInfoVersions,
+    allowed_missing: &[SourceCleanupVersionIdentity],
+) -> std::result::Result<(), SourceCleanupError> {
+    if source_cleanup_versions_match_with_allowed_missing(expected, current, allowed_missing) {
+        Ok(())
+    } else {
+        Err(SourceCleanupError::SourceChanged)
+    }
+}
+
 fn source_cleanup_preflight_error(op_label: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
     Error::other(format!("{op_label}: source cleanup preflight failed for {bucket}/{object}: {err}"))
 }
@@ -552,21 +608,12 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
     op_label: &str,
-) -> Result<()> {
+) -> std::result::Result<(), SourceCleanupError> {
     let Some(current) = load_source_cleanup_versions(set, bucket, object, op_label).await? else {
         return Ok(());
     };
 
-    if source_cleanup_versions_match_with_allowed_missing(expected, &current, allowed_missing) {
-        return Ok(());
-    }
-
-    Err(source_cleanup_preflight_error(
-        op_label,
-        bucket,
-        object,
-        "source versions changed after migration started",
-    ))
+    ensure_source_cleanup_versions_match(expected, &current, allowed_missing)
 }
 
 #[cfg(test)]
@@ -651,10 +698,13 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
     op_label: &str,
-) -> Result<ObjectInfo> {
+) -> std::result::Result<ObjectInfo, SourceCleanupError> {
     let cleanup_key = encode_dir_object(object);
     let ns_lock = set.new_ns_lock(bucket, cleanup_key.as_str()).await?;
-    let _guard = ns_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+    let _guard = ns_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(Error::from)?;
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
@@ -673,7 +723,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     if result.is_ok() {
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
     }
-    result
+    result.map_err(SourceCleanupError::from)
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -1182,7 +1232,7 @@ mod tests {
         let expected = cleanup_test_versions(vec![first.clone(), second.clone()]);
         let current = cleanup_test_versions(vec![second, first]);
 
-        assert!(source_cleanup_versions_match(&expected, &current));
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
     }
 
     #[test]
@@ -1190,7 +1240,40 @@ mod tests {
         let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
         let current = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "changed")]);
 
-        assert!(!source_cleanup_versions_match(&expected, &current));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("changed source metadata must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+    }
+
+    #[test]
+    fn test_source_cleanup_preflight_rejects_changed_transition_or_erasure() {
+        let expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        let mut current = expected.clone();
+        current.versions[0].transition_tier = "COLD".to_string();
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("transition metadata changes must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+
+        let mut current = expected.clone();
+        current.versions[0].erasure.algorithm = "changed".to_string();
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("erasure metadata changes must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+    }
+
+    #[test]
+    fn test_source_cleanup_preflight_ignores_per_disk_erasure_fields() {
+        let mut expected = cleanup_test_versions(vec![cleanup_test_file_info("object.txt", Uuid::from_u128(1), "source")]);
+        expected.versions[0].erasure.checksums = vec![rustfs_filemeta::ChecksumInfo {
+            part_number: 1,
+            hash: Bytes::from_static(b"disk-a-checksum"),
+            ..Default::default()
+        }];
+        let mut current = expected.clone();
+        current.versions[0].erasure.index = 7;
+        current.versions[0].erasure.checksums[0].hash = Bytes::from_static(b"disk-b-checksum");
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
     }
 
     #[test]
@@ -1201,7 +1284,9 @@ mod tests {
             cleanup_test_file_info("object.txt", Uuid::from_u128(2), "new-version"),
         ]);
 
-        assert!(!source_cleanup_versions_match(&expected, &current));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("an added source version must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]
@@ -1222,7 +1307,9 @@ mod tests {
         let expected = cleanup_test_versions(vec![migrated.clone(), protected]);
         let current = cleanup_test_versions(vec![migrated]);
 
-        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &[]));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &[])
+            .expect_err("an unexpected missing version must defer cleanup");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]
@@ -1234,7 +1321,9 @@ mod tests {
         let current = cleanup_test_versions(vec![migrated, new_version]);
         let allowed_missing = vec![source_cleanup_version_identity(&expired)];
 
-        assert!(!source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+        let err = ensure_source_cleanup_versions_match(&expected, &current, &allowed_missing)
+            .expect_err("a new source version must defer cleanup even when an expired version may be missing");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
     }
 
     #[test]

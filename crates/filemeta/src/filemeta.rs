@@ -1463,6 +1463,35 @@ mod test {
     /// Regression test for rustfs/rustfs#2715: a corrupted version count in
     /// xl.meta must yield a decode error instead of sizing a huge allocation
     /// from the bogus count (which aborts the whole process).
+    /// A CRC mismatch means the bytes on disk are not the bytes that were
+    /// written — bitrot. It must surface as `Error::FileCorrupt` specifically:
+    /// that variant converts to `DiskError::FileCorrupt`, which is the only
+    /// corruption signal `should_heal_object_on_disk` recognises. As a generic
+    /// error the drive is skipped, the heal reports success, and the damaged
+    /// `xl.meta` is never rewritten.
+    #[test]
+    fn test_unmarshal_reports_file_corrupt_on_crc_mismatch() {
+        let mut fm = FileMeta::default();
+        let mut buf = fm.marshal_msg().expect("serialize default FileMeta");
+        // Flip one byte inside the meta blob: past the 8-byte XL2 header and
+        // the 5-byte bin32 length prefix, before the CRC trailer.
+        let idx = 8 + 5;
+        buf[idx] ^= 0xff;
+        let err = fm.unmarshal_msg(&buf).expect_err("corrupted meta must fail to decode");
+        assert_eq!(err, Error::FileCorrupt, "CRC mismatch must classify as FileCorrupt, got: {err}");
+    }
+
+    #[test]
+    fn test_is_indexed_meta_reports_file_corrupt_on_crc_mismatch() {
+        let fm = FileMeta::default();
+        let mut buf = fm.marshal_msg().expect("serialize default FileMeta");
+        let idx = 8 + 5;
+        buf[idx] ^= 0xff;
+
+        let err = FileMeta::is_indexed_meta(&buf).expect_err("corrupted indexed metadata must fail");
+        assert_eq!(err, Error::FileCorrupt, "indexed CRC mismatch must classify as FileCorrupt, got: {err}");
+    }
+
     #[test]
     fn test_unmarshal_rejects_absurd_version_count() {
         let mut meta = Vec::new();

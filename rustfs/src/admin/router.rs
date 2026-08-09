@@ -2687,6 +2687,12 @@ fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
+fn is_admin_v4_fallback_path(path: &str) -> bool {
+    path.strip_prefix(ADMIN_PREFIX)
+        .or_else(|| path.strip_prefix(MINIO_ADMIN_PREFIX))
+        .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
+}
+
 impl<T: Operation> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
         let router = Router::new();
@@ -2886,6 +2892,12 @@ where
             return Ok(response);
         }
 
+        if is_admin_v4_fallback_path(req.uri.path()) {
+            let mut resp = S3Response::new(Body::empty());
+            resp.status = Some(StatusCode::UPGRADE_REQUIRED);
+            return Ok(resp);
+        }
+
         Err(s3_error!(NotImplemented))
     }
 }
@@ -2978,6 +2990,29 @@ mod tests {
         }
     }
 
+    struct StatusOperation(StatusCode);
+
+    #[async_trait::async_trait]
+    impl Operation for StatusOperation {
+        async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+            Ok(S3Response::new((self.0, Body::empty())))
+        }
+    }
+
+    fn router_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: uri.parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
         assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
@@ -2988,6 +3023,65 @@ mod tests {
             "/minio/administrator/object"
         );
         assert_eq!(canonicalize_admin_path("/minio/adminx/object").as_ref(), "/minio/adminx/object");
+    }
+
+    #[test]
+    fn admin_v4_fallback_path_matches_only_admin_v4_prefixes() {
+        assert!(is_admin_v4_fallback_path("/rustfs/admin/v4/info-canned-policy"));
+        assert!(is_admin_v4_fallback_path("/minio/admin/v4/add-canned-policy"));
+        assert!(is_admin_v4_fallback_path("/rustfs/admin/v4"));
+        assert!(!is_admin_v4_fallback_path("/rustfs/admin/v3/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/minio/admin/v3/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/rustfs/admin/v40/info-canned-policy"));
+        assert!(!is_admin_v4_fallback_path("/minio/adminx/v4/info-canned-policy"));
+    }
+
+    #[tokio::test]
+    async fn unmatched_admin_v4_request_returns_upgrade_required_for_sdk_downgrade() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+
+        for (method, uri) in [
+            (Method::GET, "/minio/admin/v4/info-canned-policy?name=readwrite"),
+            (Method::PUT, "/rustfs/admin/v4/add-canned-policy?name=repro"),
+        ] {
+            let resp = router
+                .call(router_request(method, uri))
+                .await
+                .expect("unmatched v4 admin request should return downgrade signal");
+
+            assert_eq!(resp.status, Some(StatusCode::UPGRADE_REQUIRED), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_non_v4_admin_request_keeps_not_implemented_error() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+
+        let err = router
+            .call(router_request(Method::GET, "/rustfs/admin/v3/missing-route"))
+            .await
+            .expect_err("unknown v3 admin route must keep the existing error");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn registered_admin_v4_route_is_not_shadowed_by_fallback() {
+        let mut router: S3Router<StatusOperation> = S3Router::new(false);
+        router
+            .insert(
+                Method::GET,
+                "/rustfs/admin/v4/runtime/capabilities",
+                StatusOperation(StatusCode::IM_A_TEAPOT),
+            )
+            .expect("route should insert");
+
+        let resp = router
+            .call(router_request(Method::GET, "/rustfs/admin/v4/runtime/capabilities"))
+            .await
+            .expect("registered v4 route must dispatch normally");
+
+        assert_eq!(resp.status, Some(StatusCode::IM_A_TEAPOT));
     }
 
     #[test]

@@ -3412,6 +3412,18 @@ impl SetDisks {
     }
 
     async fn recover_part_transaction(&self, dst_object: &str, write_quorum: usize) -> disk::error::Result<bool> {
+        struct PartTransactionObservation {
+            transaction_meta: Option<Bytes>,
+            current_meta: Option<Bytes>,
+            rollback: bool,
+            err: Option<DiskError>,
+        }
+
+        enum PartTransactionOutcome {
+            Commit,
+            Rollback,
+        }
+
         let disks = self.get_disks_internal().await;
         let transaction_path = part_transaction_path(dst_object);
         let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
@@ -3425,35 +3437,75 @@ impl SetDisks {
             let current_meta_path = current_meta_path.clone();
             async move {
                 let Some(disk) = disk else {
-                    return Ok((None, None, false));
+                    return PartTransactionObservation {
+                        transaction_meta: None,
+                        current_meta: None,
+                        rollback: false,
+                        err: Some(DiskError::DiskNotFound),
+                    };
                 };
                 let transaction_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
                     Ok(meta) => Some(meta),
                     Err(DiskError::FileNotFound) => None,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        return PartTransactionObservation {
+                            transaction_meta: None,
+                            current_meta: None,
+                            rollback: false,
+                            err: Some(err),
+                        };
+                    }
                 };
                 let rollback = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
                     Ok(_) => true,
                     Err(DiskError::FileNotFound) => false,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        return PartTransactionObservation {
+                            transaction_meta,
+                            current_meta: None,
+                            rollback: false,
+                            err: Some(err),
+                        };
+                    }
                 };
                 let current_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
                     Ok(meta) => Some(meta),
                     Err(DiskError::FileNotFound | DiskError::DiskNotFound) => None,
                     Err(_) => None,
                 };
-                Ok((transaction_meta, current_meta, rollback))
+                PartTransactionObservation {
+                    transaction_meta,
+                    current_meta,
+                    rollback,
+                    err: None,
+                }
             }
         });
-        let observations = join_all(reads).await.into_iter().collect::<disk::error::Result<Vec<_>>>()?;
-        if observations.iter().all(|(transaction, _, _)| transaction.is_none()) {
+        let observations = join_all(reads).await;
+        let read_errs = observations
+            .iter()
+            .map(|observation| observation.err.clone())
+            .collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&read_errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+
+        if observations
+            .iter()
+            .filter(|observation| observation.err.is_none())
+            .all(|observation| observation.transaction_meta.is_none())
+        {
             return Ok(false);
         }
 
         let mut current_counts: HashMap<Bytes, usize> = HashMap::new();
-        for (_, current, _) in &observations {
-            if let Some(current) = current {
+        let mut transaction_meta_values = HashSet::new();
+        for observation in observations.iter().filter(|observation| observation.err.is_none()) {
+            if let Some(current) = &observation.current_meta {
                 *current_counts.entry(current.clone()).or_default() += 1;
+            }
+            if let Some(transaction_meta) = &observation.transaction_meta {
+                transaction_meta_values.insert(transaction_meta.clone());
             }
         }
         let current_quorum = current_counts
@@ -3462,11 +3514,29 @@ impl SetDisks {
 
         let old_meta_path = format!("{transaction_path}/{PART_TRANSACTION_OLD_META}");
         let old_meta_absent_path = format!("{transaction_path}/old.meta.absent");
+        let mut outcomes = Vec::with_capacity(observations.len());
+        for observation in &observations {
+            let outcome = if observation.err.is_none() && observation.transaction_meta.is_none() {
+                match &observation.current_meta {
+                    Some(current_meta) if transaction_meta_values.contains(current_meta) => Some(PartTransactionOutcome::Commit),
+                    _ => Some(PartTransactionOutcome::Rollback),
+                }
+            } else {
+                None
+            };
+            outcomes.push(outcome);
+        }
         let decisions = observations
             .iter()
             .enumerate()
-            .filter_map(|(index, (transaction_meta, _, rollback))| {
-                transaction_meta.as_ref().map(|meta| (index, meta.clone(), *rollback))
+            .filter_map(|(index, observation)| {
+                if observation.err.is_some() {
+                    return None;
+                }
+                observation
+                    .transaction_meta
+                    .as_ref()
+                    .map(|meta| (index, meta.clone(), observation.rollback))
             })
             .map(|(index, transaction_meta, rollback)| {
                 let disk = disks[index].clone();
@@ -3475,38 +3545,68 @@ impl SetDisks {
                 let current_quorum = current_quorum.clone();
                 async move {
                     let Some(disk) = disk else {
-                        return Err(DiskError::DiskNotFound);
+                        return (index, Err(DiskError::DiskNotFound));
                     };
-                    let action = if rollback {
-                        PartTransactionAction::Rollback
-                    } else if current_quorum.as_ref() == Some(&transaction_meta) {
-                        PartTransactionAction::Commit
-                    } else if let Some(current_quorum) = current_quorum {
-                        match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_path).await {
-                            Ok(old_meta) if old_meta == current_quorum => PartTransactionAction::Rollback,
-                            Ok(_) => PartTransactionAction::Commit,
-                            Err(DiskError::FileNotFound) => {
-                                match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_absent_path).await {
-                                    Ok(_) => PartTransactionAction::Commit,
-                                    Err(_) => return Err(DiskError::FileCorrupt),
+                    let result = async {
+                        let action = if rollback {
+                            PartTransactionAction::Rollback
+                        } else if current_quorum.as_ref() == Some(&transaction_meta) {
+                            PartTransactionAction::Commit
+                        } else if let Some(current_quorum) = current_quorum {
+                            match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_path).await {
+                                Ok(old_meta) if old_meta == current_quorum => PartTransactionAction::Rollback,
+                                Ok(_) => PartTransactionAction::Commit,
+                                Err(DiskError::FileNotFound) => {
+                                    match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_absent_path).await {
+                                        Ok(_) => PartTransactionAction::Commit,
+                                        Err(_) => return Err(DiskError::FileCorrupt),
+                                    }
                                 }
+                                Err(err) => return Err(err),
                             }
-                            Err(err) => return Err(err),
-                        }
-                    } else {
-                        PartTransactionAction::Rollback
+                        } else {
+                            PartTransactionAction::Rollback
+                        };
+                        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_object, action)
+                            .await?;
+                        let outcome = match action {
+                            PartTransactionAction::Commit => PartTransactionOutcome::Commit,
+                            PartTransactionAction::Rollback => PartTransactionOutcome::Rollback,
+                        };
+                        Ok(outcome)
                     };
-                    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_object, action)
-                        .await?;
-                    Ok(action == PartTransactionAction::Commit)
+                    (index, result.await)
                 }
             });
 
         let results = join_all(decisions).await;
-        if let Some(err) = results.iter().find_map(|result| result.as_ref().err()) {
-            return Err(err.clone());
+        let mut settle_errs = read_errs;
+        for result in results {
+            match result {
+                (index, Ok(outcome)) => outcomes[index] = Some(outcome),
+                (index, Err(err)) => settle_errs[index] = Some(err),
+            }
         }
-        Ok(results.iter().any(|result| matches!(result, Ok(true))))
+        if let Some(err) = reduce_write_quorum_errs(&settle_errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+
+        let commit_count = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Some(PartTransactionOutcome::Commit)))
+            .count();
+        if commit_count >= write_quorum {
+            return Ok(true);
+        }
+        let rollback_count = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Some(PartTransactionOutcome::Rollback)))
+            .count();
+        if rollback_count >= write_quorum {
+            return Ok(false);
+        }
+
+        Err(DiskError::ErasureWriteQuorum)
     }
 
     pub(in crate::set_disk) async fn recover_part_transactions(
@@ -4551,7 +4651,7 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
 /// unobserved object records nothing, keeping the registry bounded, and each
 /// [`CallCounterScope`] clears only its own object's counts on drop.
 #[cfg(test)]
-pub(in crate::set_disk) mod disk_call_counters {
+pub(crate) mod disk_call_counters {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex, OnceLock};
 

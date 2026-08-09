@@ -12,6 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Allocator memory reclaim runtime.
+//!
+//! RustFS uses mimalloc on the supported production targets. Under bursty PUT,
+//! GET, scanner, and heal workloads, mimalloc can retain freed pages in process
+//! heaps for later reuse instead of immediately returning them to the OS. That
+//! behavior is usually good for latency, but it can make process RSS look high
+//! after a workload has gone idle. This module provides an opt-in background
+//! loop that waits for a configurable idle window and then asks the allocator to
+//! collect retained memory.
+//!
+//! The loop is intentionally conservative:
+//!
+//! - enablement and intervals are read from startup environment configuration;
+//! - the periodic tick only samples cheap process-wide counters;
+//! - reclaim is skipped while request, delete-tail, scanner, heal, EC encode,
+//!   or whole-object GET buffering activity is still visible;
+//! - cancellation is driven by the shared runtime `CancellationToken`;
+//! - the controller surface is read-only and reports intent/status without
+//!   mutating the worker lifecycle.
+//!
+//! `init_observability_runtime` passes a cloned cancellation token into this
+//! module. Cloning a `CancellationToken` only creates another handle to the
+//! same cancellation source; it does not duplicate the runtime state or spawn
+//! work by itself.
+
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use std::time::Duration;
@@ -20,38 +45,57 @@ use tracing::{debug, warn};
 
 const ALLOCATOR_RECLAIM_SERVICE_NAME: &str = "allocator_reclaim";
 
+/// Externally visible lifecycle state for the allocator reclaim service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorReclaimServiceState {
+    /// Reclaim is disabled by configuration, so no background loop is spawned.
     Disabled,
+    /// Reclaim is enabled and the background loop is expected to be alive.
     Running,
+    /// Runtime cancellation has been requested and the loop is exiting.
     Stopping,
 }
 
+/// Source that stops the reclaim loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorReclaimCancellationSource {
+    /// The loop is tied to the process runtime cancellation token.
     RuntimeToken,
 }
 
+/// Shutdown ownership model for the reclaim worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorReclaimShutdownHandle {
+    /// There is no dedicated join handle in the controller surface today.
     RuntimeTokenOnly,
 }
 
+/// Read-only status returned to background-controller/status callers.
+///
+/// This snapshot is intentionally derived from current configuration and the
+/// runtime cancellation token. It does not prove that a spawned Tokio task is
+/// currently scheduled; the controller pilot for this service does not own
+/// worker mutation or task supervision yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocatorReclaimStatusSnapshot {
     pub service: &'static str,
     pub state: AllocatorReclaimServiceState,
+    /// Allocator backend label used in metrics and status responses.
     pub backend: &'static str,
+    /// Effective force flag after backend-specific support is applied.
     pub effective_force: bool,
+    /// Number of consecutive idle ticks required before reclaim runs.
     pub idle_intervals: u64,
+    /// Tick interval in seconds.
     pub interval_secs: u64,
     pub cancellation_source: AllocatorReclaimCancellationSource,
     pub shutdown_handle: AllocatorReclaimShutdownHandle,
 }
 
+/// Desired enablement from environment configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorReclaimDesiredState {
@@ -59,26 +103,36 @@ pub enum AllocatorReclaimDesiredState {
     Enabled,
 }
 
+/// Desired allocator reclaim configuration.
+///
+/// Values are clamped to a minimum of one interval/tick to keep the background
+/// loop from becoming a zero-duration busy loop if an operator supplies `0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocatorReclaimDesiredSnapshot {
     pub state: AllocatorReclaimDesiredState,
+    /// Raw force preference before backend-specific support is applied.
     pub configured_force: bool,
     pub idle_intervals: u64,
     pub interval_secs: u64,
 }
 
+/// Combined desired/status view for controller reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocatorReclaimControllerSnapshot {
     pub desired: AllocatorReclaimDesiredSnapshot,
     pub status: AllocatorReclaimStatusSnapshot,
 }
 
+/// Worker mutation requested by reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorReclaimWorkerMutation {
+    /// The current controller surface reports only; it must not start, stop,
+    /// resize, or wake the reclaim worker.
     None,
 }
 
+/// Idempotent reconcile output for the allocator reclaim controller surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocatorReclaimReconcilePlan {
     pub service: &'static str,
@@ -91,15 +145,18 @@ pub struct AllocatorReclaimReconcilePlan {
 pub struct AllocatorReclaimController;
 
 impl AllocatorReclaimController {
+    /// Build a fresh controller snapshot from current process state.
     pub fn snapshot(&self, ctx: &CancellationToken) -> AllocatorReclaimControllerSnapshot {
         allocator_reclaim_controller_snapshot(ctx)
     }
 
+    /// Reconcile current desired/status state without mutating the worker.
     pub fn reconcile(&self, ctx: &CancellationToken) -> AllocatorReclaimReconcilePlan {
         let snapshot = self.snapshot(ctx);
         self.reconcile_snapshot(snapshot)
     }
 
+    /// Convert a prebuilt snapshot into an idempotent reconcile plan.
     pub fn reconcile_snapshot(&self, snapshot: AllocatorReclaimControllerSnapshot) -> AllocatorReclaimReconcilePlan {
         AllocatorReclaimReconcilePlan {
             service: ALLOCATOR_RECLAIM_SERVICE_NAME,
@@ -110,6 +167,7 @@ impl AllocatorReclaimController {
     }
 }
 
+/// Return the allocator backend name used by reclaim and memory metrics.
 pub fn allocator_backend() -> &'static str {
     #[cfg(not(target_os = "windows"))]
     {
@@ -138,6 +196,12 @@ fn current_heal_activity() -> u64 {
     rustfs_heal::current_heal_active_tasks() + rustfs_heal::current_heal_queue_length()
 }
 
+/// Snapshot of activity classes that make allocator reclaim undesirable.
+///
+/// A non-zero field does not mean memory is definitely unreclaimable. It means
+/// a workload that commonly allocates or owns large buffers is still in flight,
+/// so reclaim should wait for a quieter interval to avoid fighting the
+/// allocator while hot paths are active.
 #[derive(Clone, Copy, Debug, Default)]
 struct ReclaimableWorkSnapshot {
     active_requests: u64,
@@ -149,6 +213,7 @@ struct ReclaimableWorkSnapshot {
 }
 
 impl ReclaimableWorkSnapshot {
+    /// Count how many independent activity classes are currently non-idle.
     fn active_signal_count(self) -> u64 {
         u64::from(self.active_requests > 0)
             + u64::from(self.delete_tail_activity > 0)
@@ -159,6 +224,7 @@ impl ReclaimableWorkSnapshot {
     }
 }
 
+/// Collect the current cheap activity gauges used to gate reclaim.
 fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
     ReclaimableWorkSnapshot {
         active_requests: active_requests(),
@@ -170,6 +236,10 @@ fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
     }
 }
 
+/// Read the startup enablement switch.
+///
+/// The code default is disabled. Local developer scripts may choose to export
+/// the variable as enabled for their own launch profile.
 fn configured_allocator_reclaim_enabled() -> bool {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_ENABLED,
@@ -177,10 +247,12 @@ fn configured_allocator_reclaim_enabled() -> bool {
     )
 }
 
+/// Read whether reclaim should ask the allocator for a forceful collection.
 fn configured_allocator_reclaim_force() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_ALLOCATOR_RECLAIM_FORCE, rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_FORCE)
 }
 
+/// Read the number of consecutive idle ticks required before reclaim.
 fn configured_allocator_reclaim_idle_intervals() -> u64 {
     rustfs_utils::get_env_u64(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS,
@@ -189,6 +261,7 @@ fn configured_allocator_reclaim_idle_intervals() -> u64 {
     .max(1)
 }
 
+/// Read the reclaim-loop tick interval in seconds.
 fn configured_allocator_reclaim_interval_secs() -> u64 {
     rustfs_utils::get_env_u64(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS,
@@ -197,6 +270,7 @@ fn configured_allocator_reclaim_interval_secs() -> u64 {
     .max(1)
 }
 
+/// Apply backend support constraints to the configured force flag.
 fn effective_allocator_reclaim_force(backend: &str, configured_force: bool) -> bool {
     configured_force && backend != "mimalloc-windows"
 }
@@ -311,6 +385,7 @@ fn collect_allocator_memory(_force: bool) -> Result<(), String> {
     Err("allocator reclaim is not supported on Windows".to_string())
 }
 
+/// Execute one allocator collection and publish the outcome metrics.
 fn run_allocator_reclaim(force: bool) {
     let backend = allocator_backend();
     let start = std::time::Instant::now();
@@ -338,6 +413,14 @@ fn run_allocator_reclaim(force: bool) {
     }
 }
 
+/// Start the allocator reclaim loop when `RUSTFS_ALLOCATOR_RECLAIM_ENABLED` is true.
+///
+/// The loop samples activity once per configured interval. Reclaim runs only
+/// after `RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS` consecutive samples show no
+/// tracked work. With the current defaults, an enabled loop waits for roughly
+/// 90 seconds of observed quiet time before calling mimalloc collection
+/// (`30s * 3`). Configuration is sampled once at startup; changing the
+/// environment later does not start, stop, or retune the existing worker.
 pub fn init_allocator_reclaim(ctx: CancellationToken) {
     let backend = allocator_backend();
     let enabled = configured_allocator_reclaim_enabled();
@@ -356,6 +439,9 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // Avoid catch-up bursts after the runtime has been busy or suspended.
+        // Reclaim decisions are based on current idleness, not on the number
+        // of missed historical ticks.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut idle_streak = 0_u64;
 
@@ -384,6 +470,9 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
                     }
 
                     if idle_streak >= idle_intervals {
+                        // This can return memory to the OS, but it may also
+                        // reduce allocator locality for the next burst. Keep
+                        // it outside active workload windows.
                         run_allocator_reclaim(force);
                         idle_streak = 0;
                         gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(0.0);

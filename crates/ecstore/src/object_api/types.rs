@@ -1041,7 +1041,10 @@ impl ObjectInfo {
         if let Some(data) = &self.checksum {
             if self.is_encrypted() {
                 // Object-level encrypted checksum bytes require SSE decrypt material,
-                // so do not expose them as plaintext checksum headers here.
+                // so do not expose them as plaintext checksum headers here. The
+                // `false` multipart flag feeds the response-path COMPOSITE
+                // fallback; callers that need accurate multipart routing must
+                // consult `is_multipart()` instead of this value.
                 return Ok((HashMap::new(), false));
             }
 
@@ -1710,6 +1713,34 @@ mod tests {
 
         assert!(!is_multipart);
         assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn decrypt_checksums_keeps_encrypted_multipart_flag_false_for_response_paths() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            // Multipart ETag shape: md5-of-md5s with a part-count suffix.
+            etag: Some("0123456789abcdef0123456789abcdef-3".to_string()),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("encrypted checksum should fail closed");
+
+        // The response path infers COMPOSITE from is_multipart=true when the
+        // checksum type is unreadable, so encrypted objects must keep the
+        // flag false here even when the object itself is multipart. Callers
+        // that need routing (replication) consult is_multipart() directly.
+        assert!(checksums.is_empty());
+        assert!(!is_multipart);
+        assert!(info.is_multipart());
     }
 
     #[test]

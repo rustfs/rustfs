@@ -48,8 +48,8 @@ use rustfs_s3select_api::{
         logical_planner::{LogicalPlanner, Plan},
         parser::Parser,
         session::{
-            DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES, QueryExecutionOwner, QueryExecutionStatus, QueryExecutionTracker, SessionCtx,
-            SessionCtxFactory,
+            DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES, QueryAdmission, QueryExecutionOwner, QueryExecutionStatus,
+            QueryExecutionTracker, SessionCtx, SessionCtxFactory,
         },
     },
 };
@@ -120,13 +120,20 @@ impl Drop for QueryPhaseGuard<'_> {
 #[async_trait]
 impl QueryDispatcher for SimpleQueryDispatcher {
     async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
-        let query_state_machine = self.build_query_state_machine(query.clone()).await?;
-        let logical_plan = self.build_logical_plan(Arc::clone(&query_state_machine)).await?;
-        let Some(logical_plan) = logical_plan else {
-            return Ok(Output::Nil(()));
-        };
+        self.execute_query_inner(query, None).await
+    }
 
-        self.execute_logical_plan(logical_plan, query_state_machine).await
+    fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
+        let permit = self
+            .query_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
+        Ok(QueryAdmission::new(Arc::new(permit)))
+    }
+
+    async fn execute_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<Output> {
+        self.execute_query_inner(query, Some(admission)).await
     }
 
     async fn build_logical_plan(&self, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>> {
@@ -205,20 +212,64 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<Arc<QueryStateMachine>> {
-        let permit = self
-            .query_admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
+        self.build_query_state_machine_inner(query, None).await
+    }
+}
+
+impl SimpleQueryDispatcher {
+    async fn execute_query_inner(&self, query: &Query, admission: Option<QueryAdmission>) -> QueryResult<Output> {
+        let query_state_machine = self.build_query_state_machine_inner(query.clone(), admission).await?;
+        let logical_plan = self.build_logical_plan(Arc::clone(&query_state_machine)).await?;
+        let Some(logical_plan) = logical_plan else {
+            return Ok(Output::Nil(()));
+        };
+
+        self.execute_logical_plan(logical_plan, query_state_machine).await
+    }
+
+    async fn build_query_state_machine_inner(
+        &self,
+        query: Query,
+        admission: Option<QueryAdmission>,
+    ) -> QueryResult<Arc<QueryStateMachine>> {
+        let query_guard = match admission {
+            Some(admission) => {
+                let query_guard = admission.into_query_guard().ok_or(QueryError::Cancel)?;
+                if !Arc::ptr_eq(query_guard.semaphore(), &self.query_admission) {
+                    return Err(QueryError::Cancel);
+                }
+                query_guard
+            }
+            None => {
+                let permit = self
+                    .query_admission
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
+                Arc::new(permit)
+            }
+        };
         let query_tracker = QueryExecutionTracker::new(
             &self.query_execution_owner,
-            Arc::new(permit),
+            query_guard,
             Instant::now() + self.query_timeout,
             self.query_timeout.as_secs(),
         );
         let phase_guard = QueryPhaseGuard::new(&query_tracker, &self.query_execution_owner);
-        let session = self
-            .run_with_query_deadline(
+        let session = if let Some(snapshot) = query.snapshot().cloned() {
+            self.run_with_query_deadline(
+                &query_tracker,
+                self.session_factory
+                    .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                        query.context(),
+                        snapshot,
+                        query_tracker.clone(),
+                        self.memory_limit_bytes,
+                    ),
+            )
+            .await?
+        } else {
+            self.run_with_query_deadline(
                 &query_tracker,
                 self.session_factory.create_session_ctx_with_tracker_and_memory_limit(
                     query.context(),
@@ -226,7 +277,8 @@ impl QueryDispatcher for SimpleQueryDispatcher {
                     self.memory_limit_bytes,
                 ),
             )
-            .await?;
+            .await?
+        };
         if !query_tracker.mark_admitted(&self.query_execution_owner) {
             drop(session);
             return Err(self.query_tracker_error(&query_tracker));
@@ -234,9 +286,6 @@ impl QueryDispatcher for SimpleQueryDispatcher {
         phase_guard.disarm();
         Ok(Arc::new(QueryStateMachine::begin_tracked(query, session, query_tracker)?))
     }
-}
-
-impl SimpleQueryDispatcher {
     async fn run_with_query_deadline<T>(
         &self,
         query_tracker: &QueryExecutionTracker,
@@ -730,15 +779,17 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
-            datatypes::{Schema, SchemaRef},
+            array::{Int32Array, StringArray},
+            datatypes::{DataType, Field, Schema, SchemaRef},
             record_batch::RecordBatch,
         },
         common::DataFusionError,
         execution::object_store::ObjectStoreUrl,
         object_store::{ObjectStoreExt, path::Path},
+        parquet::arrow::ArrowWriter,
         physical_plan::{RecordBatchStream, stream::RecordBatchStreamAdapter},
     };
-    use futures::{StreamExt, stream};
+    use futures::{StreamExt, TryStreamExt, stream};
     use rustfs_s3select_api::{
         QueryError, QueryResult, S3SelectPolicyError,
         query::{
@@ -749,14 +800,15 @@ mod tests {
             },
             logical_planner::Plan,
             session::{
-                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES, QueryExecutionOwner, QueryExecutionStatus, QueryExecutionTracker,
-                SessionCtxFactory,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES, QueryAdmission, QueryExecutionOwner, QueryExecutionStatus,
+                QueryExecutionTracker, SessionCtxFactory,
             },
         },
     };
+    use rustfs_test_utils::{PutObjectCommitBarrier, TestECStoreEnv};
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization, SelectObjectContentInput,
-        SelectObjectContentRequest,
+        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
+        OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::{
         pin::Pin,
@@ -998,6 +1050,260 @@ mod tests {
         (dispatcher, input)
     }
 
+    async fn snapshot_test_env() -> &'static TestECStoreEnv {
+        static ENV: tokio::sync::OnceCell<TestECStoreEnv> = tokio::sync::OnceCell::const_new();
+        ENV.get_or_init(|| async { TestECStoreEnv::builder().prefix("s3select_query_snapshot").build().await })
+            .await
+    }
+
+    fn production_dispatcher(input: Arc<SelectObjectContentInput>) -> Arc<SimpleQueryDispatcher> {
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        SimpleQueryDispatcherBuilder::default()
+            .with_input(input)
+            .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+            .with_session_factory(Arc::new(SessionCtxFactory::new(false)))
+            .with_parser(Arc::new(DefaultParser::default()))
+            .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)))
+            .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+            .build()
+            .expect("production query dispatcher should build")
+    }
+
+    async fn collect_utf8_output(output: Output) -> Vec<String> {
+        let Output::StreamData(stream) = output else {
+            panic!("snapshot query should return rows");
+        };
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect snapshot query output")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("snapshot marker column should be Utf8")
+                    .iter()
+                    .map(|value| value.expect("snapshot marker should not be null").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn run_snapshot_generation_race(
+        input: Arc<SelectObjectContentInput>,
+        old_generation: Vec<u8>,
+        new_generation: Vec<u8>,
+        expected_old_markers: &[&str],
+    ) {
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, old_generation).await;
+
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query.clone())
+            .await
+            .expect("build production snapshot session");
+        let logical_plan = dispatcher
+            .build_logical_plan(Arc::clone(&query_state_machine))
+            .await
+            .expect("infer old-generation schema")
+            .expect("SELECT should produce a logical plan");
+
+        let commit_barrier = PutObjectCommitBarrier::before_namespace(&input.bucket, &input.key);
+        let writer_env = env;
+        let writer_bucket = input.bucket.clone();
+        let writer_object = input.key.clone();
+        let writer = tokio::spawn(async move {
+            writer_env
+                .put_object_bytes(&writer_bucket, &writer_object, new_generation)
+                .await;
+        });
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(!writer.is_finished(), "overwrite must wait for the SelectObjectContent snapshot");
+
+        let output = dispatcher
+            .execute_logical_plan(logical_plan, query_state_machine)
+            .await
+            .expect("scan old-generation rows");
+        let values = collect_utf8_output(output).await;
+        assert_eq!(values, expected_old_markers);
+        assert!(!writer.is_finished(), "overwrite must remain blocked while Query owns the snapshot");
+
+        drop(query);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("overwrite should finish after snapshot release")
+            .expect("overwrite task should join");
+    }
+
+    fn json_snapshot_input() -> Arc<SelectObjectContentInput> {
+        Arc::new(SelectObjectContentInput {
+            bucket: "s3select-json-snapshot-race".to_string(),
+            expected_bucket_owner: None,
+            key: "input.jsonl".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT old_marker FROM S3Object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    json: Some(JSONInput {
+                        type_: Some(JSONType::from_static(JSONType::LINES)),
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        })
+    }
+
+    fn parquet_snapshot_input() -> Arc<SelectObjectContentInput> {
+        Arc::new(SelectObjectContentInput {
+            bucket: "s3select-parquet-snapshot-race".to_string(),
+            expected_bucket_owner: None,
+            key: "input.parquet".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT old_marker FROM S3Object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    parquet: Some(ParquetInput {}),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        })
+    }
+
+    fn old_parquet_generation() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("old_marker", DataType::Utf8, false)]));
+        let first = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vec!["parquet-old-footer"]))])
+            .expect("build first old-generation parquet row group");
+        let second = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vec!["parquet-old-row-group"]))])
+            .expect("build second old-generation parquet row group");
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("create old-generation parquet writer");
+        writer.write(&first).expect("write first old-generation parquet row group");
+        writer.flush().expect("flush first old-generation parquet row group");
+        writer.write(&second).expect("write second old-generation parquet row group");
+        writer.close().expect("close old-generation parquet writer");
+        bytes
+    }
+
+    fn new_parquet_generation() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("new_schema_poison", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1629]))])
+            .expect("build new-generation parquet poison row group");
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("create new-generation parquet writer");
+        writer.write(&batch).expect("write new-generation parquet poison row group");
+        writer.close().expect("close new-generation parquet writer");
+        bytes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_schema_inference_and_scan_use_one_snapshot_generation() {
+        run_snapshot_generation_race(
+            json_snapshot_input(),
+            b"{\"old_marker\":\"json-old-schema\"}\n{\"old_marker\":\"json-old-scan\"}\n".to_vec(),
+            b"{\"new_schema_poison\":1629}\n".to_vec(),
+            &["json-old-schema", "json-old-scan"],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parquet_footer_and_row_group_reads_use_one_snapshot_generation() {
+        run_snapshot_generation_race(
+            parquet_snapshot_input(),
+            old_parquet_generation(),
+            new_parquet_generation(),
+            &["parquet-old-footer", "parquet-old-row-group"],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planner_failure_drops_snapshot_and_unblocks_overwrite() {
+        let mut input = json_snapshot_input();
+        let input_mut = Arc::make_mut(&mut input);
+        input_mut.bucket = "s3select-planner-failure-snapshot".to_string();
+        input_mut.request.expression = "SELECT missing_binding FROM S3Object".to_string();
+
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{\"old_marker\":\"old\"}\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query.clone())
+            .await
+            .expect("build production snapshot session");
+
+        let commit_barrier = PutObjectCommitBarrier::before_namespace(&input.bucket, &input.key);
+        let writer_env = env;
+        let writer_bucket = input.bucket.clone();
+        let writer_object = input.key.clone();
+        let writer = tokio::spawn(async move {
+            writer_env
+                .put_object_bytes(&writer_bucket, &writer_object, b"{\"new_schema_poison\":1629}\n".to_vec())
+                .await;
+        });
+        commit_barrier.wait_until_paused().await;
+        commit_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(!writer.is_finished(), "overwrite must wait for the planner's snapshot");
+
+        let Err(error) = dispatcher.build_logical_plan(Arc::clone(&query_state_machine)).await else {
+            panic!("missing schema binding must fail planning");
+        };
+        assert!(error.to_string().contains("missing_binding"));
+        assert!(
+            !writer.is_finished(),
+            "planner failure must not release snapshots still owned by Query/qsm"
+        );
+
+        drop(query_state_machine);
+        drop(query);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("overwrite should finish after failed-plan snapshot release")
+            .expect("overwrite task should join");
+    }
+
     fn test_query_tracker(
         permit: tokio::sync::OwnedSemaphorePermit,
         deadline: Instant,
@@ -1116,6 +1422,42 @@ mod tests {
             result,
             Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryConcurrencyLimit))
         ));
+    }
+
+    #[tokio::test]
+    async fn reserved_admission_is_handed_to_tracker_without_reacquiring() {
+        let admission = Arc::new(Semaphore::new(1));
+        let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(300));
+        let reservation = dispatcher.try_reserve_query().expect("query reservation should succeed");
+        assert_eq!(admission.available_permits(), 0);
+
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+        let query_state_machine = dispatcher
+            .build_query_state_machine_inner(query, Some(reservation))
+            .await
+            .expect("reserved query should not acquire a second permit");
+
+        assert_eq!(admission.available_permits(), 0);
+        drop(query_state_machine);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_admission_rejects_a_foreign_semaphore() {
+        let admission = Arc::new(Semaphore::new(1));
+        let foreign_admission = Arc::new(Semaphore::new(1));
+        let foreign_permit = Arc::clone(&foreign_admission)
+            .try_acquire_owned()
+            .expect("foreign permit should be available");
+        let reservation = QueryAdmission::new(Arc::new(foreign_permit));
+        let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(300));
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+
+        let result = dispatcher.build_query_state_machine_inner(query, Some(reservation)).await;
+
+        assert!(matches!(result, Err(QueryError::Cancel)));
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(foreign_admission.available_permits(), 1);
     }
 
     #[tokio::test]

@@ -1312,7 +1312,7 @@ impl SetDisks {
             }
 
             if !opts.no_lock && object_lock_guard.is_none() {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
@@ -1324,9 +1324,21 @@ impl SetDisks {
                             .await?,
                     );
                 }
-                object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                #[cfg(any(test, feature = "test-util"))]
+                {
+                    object_lock_guard = Some(
+                        self.acquire_write_lock_diag_with_pending_hook("put_object_commit", bucket, object, || {
+                            notify_put_object_commit_namespace_pending(bucket, object);
+                        })
+                        .await?,
+                    );
+                }
+                #[cfg(not(any(test, feature = "test-util")))]
+                {
+                    object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
 
             if deferred_data_movement_precondition && let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -2575,41 +2587,43 @@ fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: boo
     requested && fleet_confirmed && fleet_proof_valid
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PutObjectCommitPause {
+pub enum PutObjectCommitPause {
     BeforeNamespace,
     AfterNamespace,
     BeforeMetadata,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct PutObjectCommitBarrierState {
     bucket: String,
     object: String,
     pause: PutObjectCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
 }
 
-#[cfg(test)]
-pub(crate) struct PutObjectCommitBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct PutObjectCommitBarrier {
     state: Arc<PutObjectCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static PUT_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<PutObjectCommitBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl PutObjectCommitBarrier {
-    pub(crate) fn install(bucket: &str, object: &str, pause: PutObjectCommitPause) -> Self {
+    pub fn install(bucket: &str, object: &str, pause: PutObjectCommitPause) -> Self {
         let state = Arc::new(PutObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
             pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
         });
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -2626,18 +2640,27 @@ impl PutObjectCommitBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("put object should reach the deterministic commit barrier");
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
+    }
+
+    pub async fn release_and_wait_until_namespace_pending(&self) {
+        assert_eq!(self.state.pause, PutObjectCommitPause::BeforeNamespace);
+        let namespace_pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), namespace_pending)
+            .await
+            .expect("put object should wait for the namespace lock after leaving the commit barrier");
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for PutObjectCommitBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -2649,7 +2672,7 @@ impl Drop for PutObjectCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
     let barrier = PUT_OBJECT_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -2661,6 +2684,22 @@ async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCom
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_put_object_commit_namespace_pending(bucket: &str, object: &str) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == PutObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.namespace_pending.notify_one();
     }
 }
 
@@ -4414,7 +4453,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         // Guard lock for metadata update
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeMetadata).await;
         let _lock_guard = if !opts.no_lock {
             Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
@@ -7626,7 +7665,10 @@ mod transition_upload_integrity_tests {
             .await
             .expect("cleanup task should not panic")
             .expect_err("cleanup must fail after its outer namespace lock loses refresh quorum");
-        assert!(matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }));
+        assert!(matches!(
+            error,
+            crate::data_movement::SourceCleanupError::Storage(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 

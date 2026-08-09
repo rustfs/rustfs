@@ -1,6 +1,6 @@
 ---
 name: rustfs-logging-governance
-description: Standardize and review RustFS logging with structured `tracing` events, lower noise on hot paths, preserve security-sensitive diagnostics, and extend guardrails to prevent legacy logging patterns from returning. Use when editing or reviewing RustFS logs, startup/config diagnostics, cloud metadata logs, request validation logs, or `scripts/check_logging_guardrails.sh`.
+description: Standardize and review RustFS logging with structured `tracing` events, lower noise on hot paths, preserve security-sensitive diagnostics, and extend guardrails to prevent legacy logging patterns from returning. Use whenever a change adds or edits any `tracing` macro call (`error!`/`warn!`/`info!`/`debug!`/`trace!`/`#[instrument]`) — including a single log line added in passing while fixing unrelated logic, which is how most new log sites enter the repo — and when reviewing RustFS logs, startup/config diagnostics, cloud metadata logs, request validation logs, or `scripts/check_logging_guardrails.sh`.
 ---
 
 # RustFS Logging Governance

@@ -10774,7 +10774,18 @@ mod tests {
     #[serial]
     async fn tier_free_version_recovery_real_enqueue_failure_retries_same_object() {
         let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-enqueue-failure-{}", Uuid::new_v4());
+        let object = "free-version-b";
+        let start_marker = "free-version-a0";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = {
+            let state = runtime_state.read().await;
+            Arc::clone(&state.tasks_rx[0])
+        };
+        let mut recovery_rx = recovery_rx.lock().await;
         assert!(
             super::enqueue_recovered_free_version(ObjectInfo {
                 bucket: "prefill".to_string(),
@@ -10784,20 +10795,29 @@ mod tests {
             .await,
             "the production recovery queue should accept its first task"
         );
-        let bucket = format!("recovery-enqueue-failure-{}", Uuid::new_v4());
-        let object = "free-version";
-        create_test_bucket(&ecstore, &bucket).await;
-        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
 
-        let first = recover_tier_free_versions_with_cancel(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
-            .await
-            .expect("queue failure should return retry markers");
+        let first = recover_tier_free_versions_with_cancel(
+            Arc::clone(&ecstore),
+            1,
+            Some(bucket.clone()),
+            Some(start_marker.to_string()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("queue failure should return retry markers");
         assert_eq!(first.scanned, 1);
         assert_eq!(first.enqueued, 0);
         assert_eq!(first.failed, 1);
         assert!(first.truncated);
         assert_eq!(first.next_bucket_marker.as_deref(), Some(bucket.as_str()));
-        assert!(first.next_object_marker.is_none());
+        assert_eq!(first.next_object_marker.as_deref(), Some(start_marker));
+
+        drop(
+            recovery_rx
+                .try_recv()
+                .expect("the failed recovery attempt must leave the prefilled task queued")
+                .expect("the prefilled recovery queue entry should contain a task"),
+        );
 
         let retried = recover_tier_free_versions_with_cancel(
             Arc::clone(&ecstore),
@@ -10809,7 +10829,19 @@ mod tests {
         .await
         .expect("retry markers should revisit the failed free version");
         assert_eq!(retried.scanned, 1);
-        assert_eq!(retried.failed, 1);
+        assert_eq!(retried.enqueued, 1);
+        assert_eq!(retried.failed, 0);
+
+        let retried_task = recovery_rx
+            .try_recv()
+            .expect("the retry should enqueue the recovered free-version task")
+            .expect("the recovered queue entry should contain a task");
+        let retried_task = retried_task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("the recovered queue entry should be a free-version task");
+        assert_eq!(retried_task.0.bucket, bucket);
+        assert_eq!(retried_task.0.name, object);
 
         remove_seeded_free_version(&disk_paths, &bucket, object).await;
         ecstore
