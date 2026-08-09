@@ -287,7 +287,7 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    use crate::policy::function::key_name::S3KeyName::S3LocationConstraint;
+    use crate::policy::function::key_name::S3KeyName::{S3LocationConstraint, S3ObjectLockMode};
     use test_case::test_case;
 
     fn new_func(name: KeyName, variable: Option<String>, values: Vec<&str>) -> StringFunc {
@@ -308,6 +308,7 @@ mod tests {
     ))]
     #[test_case(r#"{"aws:username/value": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe", "aaa"]
     ))]
+    #[test_case(r#"{"s3:object-lock-mode": "COMPLIANCE"}"#, new_func(S3(S3ObjectLockMode), None, vec!["COMPLIANCE"]))]
     fn test_deser(input: &str, expect: StringFunc) -> Result<(), serde_json::Error> {
         let v: StringFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);
@@ -410,6 +411,7 @@ mod tests {
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["webapp"])] => false ; "21")]
     #[test_case(new_fkv("s3:VersionId", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "aws_version_id")]
     #[test_case(new_fkv("s3:versionid", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "minio_version_id")]
+    #[test_case(new_fkv("s3:object-lock-mode", vec!["COMPLIANCE"]), false, vec![("object-lock-mode", vec!["COMPLIANCE"])] => true ; "object_lock_mode")]
     fn test_string_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
         test_eval(s, for_all, false, false, values)
     }
