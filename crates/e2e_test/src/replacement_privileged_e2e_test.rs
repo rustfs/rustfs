@@ -32,13 +32,13 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::error::Error;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tokio::time::{Duration, Instant, interval};
     use tracing::info;
 
     const ENABLE_ENV: &str = "RUSTFS_PRIVILEGED_REPLACEMENT_E2E";
+    const NAMESPACE_ENV: &str = "RUSTFS_PRIVILEGED_REPLACEMENT_E2E_IN_NAMESPACE";
     const TARGET_NODE: usize = 1;
     const TARGET_DRIVE: usize = 0;
     const MOUNT_SIZE: &str = "size=128m,mode=0700";
@@ -58,11 +58,7 @@ mod tests {
 
     impl MountNamespaceGuard {
         fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
-            let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
-            if rc != 0 {
-                return Err(format!("unshare(CLONE_NEWNS) failed: {}", std::io::Error::last_os_error()).into());
-            }
-            mount_private_root()?;
+            run_command("mount", ["--make-rprivate", "/"])?;
             Ok(Self { mounts: Vec::new() })
         }
 
@@ -87,54 +83,33 @@ mod tests {
         }
     }
 
-    fn c_path(path: &Path) -> Result<CString, Box<dyn Error + Send + Sync>> {
-        Ok(CString::new(path.as_os_str().as_bytes())?)
-    }
-
-    fn mount_private_root() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let root = CString::new("/")?;
-        let rc = unsafe {
-            libc::mount(
-                std::ptr::null(),
-                root.as_ptr(),
-                std::ptr::null(),
-                (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
-                std::ptr::null(),
-            )
-        };
-        if rc != 0 {
-            return Err(format!("making the mount namespace private failed: {}", std::io::Error::last_os_error()).into());
+    fn run_command<const N: usize>(program: &str, args: [&str; N]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let output = Command::new(program).args(args).output()?;
+        if output.status.success() {
+            return Ok(());
         }
-        Ok(())
+        Err(format!(
+            "{program} {} failed with status {}: stdout={} stderr={}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
     }
 
     fn mount_tmpfs(target: &Path, label: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let source = CString::new(label)?;
-        let target_c = c_path(target)?;
-        let fstype = CString::new("tmpfs")?;
-        let data = CString::new(MOUNT_SIZE)?;
-        let rc = unsafe {
-            libc::mount(
-                source.as_ptr(),
-                target_c.as_ptr(),
-                fstype.as_ptr(),
-                (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-                data.as_ptr().cast(),
-            )
-        };
-        if rc != 0 {
-            return Err(format!("mount(tmpfs) failed for {target:?}: {}", std::io::Error::last_os_error()).into());
-        }
-        Ok(())
+        let target = target
+            .to_str()
+            .ok_or_else(|| format!("tmpfs target path is not UTF-8: {target:?}"))?;
+        run_command("mount", ["-t", "tmpfs", "-o", MOUNT_SIZE, label, target])
     }
 
     fn detach_mount(target: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let target_c = c_path(target)?;
-        let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
-        if rc != 0 {
-            return Err(format!("umount2(MNT_DETACH) failed for {target:?}: {}", std::io::Error::last_os_error()).into());
-        }
-        Ok(())
+        let target = target
+            .to_str()
+            .ok_or_else(|| format!("umount target path is not UTF-8: {target:?}"))?;
+        run_command("umount", ["-l", target])
     }
 
     fn privileged_run_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -145,12 +120,27 @@ mod tests {
             info!("{ENABLE_ENV}=1 is not set; privileged replacement E2E is skipped");
             return Ok(false);
         }
-        if unsafe { libc::geteuid() } != 0 {
-            return Err(
-                format!("{ENABLE_ENV}=1 requires root or CAP_SYS_ADMIN so the test can unshare and mount tmpfs drives").into(),
-            );
-        }
         Ok(true)
+    }
+
+    fn run_current_test_in_mount_namespace(test_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let test_binary = std::env::current_exe()?;
+        let status = Command::new("unshare")
+            .arg("--mount")
+            .arg("--propagation")
+            .arg("private")
+            .arg("--")
+            .arg(test_binary)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(NAMESPACE_ENV, "1")
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(format!("{ENABLE_ENV}=1 requires root or CAP_SYS_ADMIN; unshare exited with status {status}").into())
     }
 
     fn payload(len: usize, seed: u8) -> Vec<u8> {
@@ -421,10 +411,13 @@ mod tests {
         }
     }
 
-    async fn run_replacement_e2e(parity: usize) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn run_replacement_e2e(parity: usize, test_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         if !privileged_run_enabled()? {
             return Ok(());
+        }
+        if std::env::var_os(NAMESPACE_ENV).is_none() {
+            return run_current_test_in_mount_namespace(test_name);
         }
 
         let mut mount_ns = MountNamespaceGuard::new()?;
@@ -484,7 +477,11 @@ mod tests {
     #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_REPLACEMENT_E2E=1"]
     async fn test_privileged_3x4_auto_replacement_rebuilds_ec8_plus_4_without_admin_heal()
     -> Result<(), Box<dyn Error + Send + Sync>> {
-        run_replacement_e2e(4).await
+        run_replacement_e2e(
+            4,
+            "replacement_privileged_e2e_test::tests::test_privileged_3x4_auto_replacement_rebuilds_ec8_plus_4_without_admin_heal",
+        )
+        .await
     }
 
     /// Linux mount namespaces are per-thread; keep mount setup and process
@@ -494,6 +491,10 @@ mod tests {
     #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_REPLACEMENT_E2E=1"]
     async fn test_privileged_3x4_auto_replacement_rebuilds_ec6_plus_6_without_admin_heal()
     -> Result<(), Box<dyn Error + Send + Sync>> {
-        run_replacement_e2e(6).await
+        run_replacement_e2e(
+            6,
+            "replacement_privileged_e2e_test::tests::test_privileged_3x4_auto_replacement_rebuilds_ec6_plus_6_without_admin_heal",
+        )
+        .await
     }
 }

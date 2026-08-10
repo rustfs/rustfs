@@ -3756,7 +3756,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "libc",
  "local-ip-address",
  "md-5 0.11.0",
  "opentelemetry-proto",
