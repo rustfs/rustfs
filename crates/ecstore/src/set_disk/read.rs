@@ -3834,25 +3834,24 @@ mod tests {
                 assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
                 // observe=false (non-observed fanout) also disables early-stop.
                 assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
-                // Data reads require their own explicit rollout gate.
                 assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
             },
         );
     }
 
     #[test]
-    fn metadata_early_stop_requires_explicit_data_read_opt_in() {
+    fn metadata_early_stop_keeps_data_reads_opt_in_by_default() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
-                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, None),
                 (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
             ],
             || {
                 assert!(!should_allow_metadata_early_stop(true, "", false, false));
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
-                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+                assert!(!should_allow_metadata_early_stop(false, "version-id", false, false));
             },
         );
         temp_env::with_vars(
@@ -3864,6 +3863,19 @@ mod tests {
             || {
                 assert!(should_allow_metadata_early_stop(true, "", false, false));
                 assert!(should_allow_metadata_early_stop(true, "version-id", false, false));
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
+                assert!(should_allow_metadata_early_stop(false, "", false, false));
+                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
             },
         );
     }

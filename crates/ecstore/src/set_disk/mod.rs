@@ -672,10 +672,10 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
-// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
-// reads by default, without version_id / healing / free-version needs) and
-// still requires a full read-quorum agreement before stopping. Set the env var
-// to `false` to fall back to full-wait metadata fanout.
+// requests `should_allow_metadata_early_stop` classifies as safe (latest-version
+// metadata-only reads by default, without version_id / healing / free-version
+// needs) and still requires a full read-quorum agreement before stopping. Set
+// the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
@@ -836,10 +836,10 @@ mod prepared_get_object_metadata_tests {
                     .prepare_get_object_metadata(bucket, object, &opts)
                     .await
                     .expect("prepared metadata should resolve");
+                let prepared_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
                 assert_eq!(
-                    calls.total(disk_call_counters::KIND_READ_VERSION),
-                    4,
-                    "preparation should fan out to each online disk exactly once"
+                    prepared_calls, 3,
+                    "default prepared GET metadata should stop after the 2+2 read/write quorum"
                 );
 
                 let mut reader = set_disks
@@ -864,7 +864,7 @@ mod prepared_get_object_metadata_tests {
         );
         assert_eq!(
             calls.total(disk_call_counters::KIND_READ_VERSION),
-            4,
+            3,
             "reader construction must consume prepared metadata instead of repeating the fanout"
         );
     }
