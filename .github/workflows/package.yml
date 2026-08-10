@@ -225,7 +225,9 @@ jobs:
           VERSION="${{ needs.resolve.outputs.version }}"
           DEB_ARCH="${{ matrix.deb_arch }}"
           # DEB version: replace - with ~ (1.0.0-beta.12 -> 1.0.0~beta.12)
-          DEB_VERSION="${VERSION/-/~}"
+          # Use a variable for ~ to prevent tilde expansion by bash
+          TILDE='~'
+          DEB_VERSION="${VERSION/-/$TILDE}"
           PKG_DIR="rustfs_${DEB_VERSION}_${DEB_ARCH}"
 
           echo "Building DEB: ${PKG_DIR}.deb"
