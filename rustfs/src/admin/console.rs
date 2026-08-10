@@ -28,7 +28,7 @@ use crate::server::{
 };
 use crate::version::build;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::Request,
     middleware,
@@ -632,13 +632,22 @@ fn setup_console_middleware_stack(
 /// # Returns:
 /// - A `Response` containing the health check result.
 #[instrument]
-async fn health_check(method: Method, uri: Uri) -> Response {
+async fn health_check(
+    method: Method,
+    uri: Uri,
+    server_ctx: Option<Extension<Arc<crate::runtime_sources::ServerContextSlot>>>,
+) -> Response {
     let probe = if uri.path().strip_prefix(CONSOLE_PREFIX) == Some(HEALTH_READY_PATH) {
         HealthProbe::Readiness
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = collect_probe_readiness(probe).await;
+    let app_context = match server_ctx {
+        Some(Extension(server_ctx)) => server_ctx.installed_app_context(),
+        None => crate::runtime_sources::current_app_context(),
+    };
+    let object_traffic_health = app_context.map(|context| context.object_traffic_health());
+    let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -917,6 +926,44 @@ mod tests {
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn console_readiness_uses_the_request_server_object_progress() {
+        temp_env::async_with_vars([(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"))], async {
+            let object_traffic_health =
+                Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+            let stalled = object_traffic_health
+                .track_write_storage()
+                .expect("write tracking must be enabled");
+            let app_context =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+            let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+            assert!(server_ctx.install(app_context));
+
+            let response = health_check(
+                Method::GET,
+                format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}")
+                    .parse()
+                    .expect("console readiness URI"),
+                Some(Extension(server_ctx)),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("console readiness body")
+                .to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("console readiness JSON");
+            assert_eq!(payload["ready"], false);
+            assert_eq!(payload["degradedReasons"], serde_json::json!(["object_write_stalled"]));
+            drop(stalled);
+        })
+        .await;
     }
 
     // setup_console_middleware_stack reads ENV_HEALTH_ENDPOINT_ENABLE (see above).
