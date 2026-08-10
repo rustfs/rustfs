@@ -8385,7 +8385,7 @@ async fn test_scanner_never_compensates_when_existing_object_replication_disable
         .body(ByteStream::from_static(witness_payload.as_bytes()))
         .send()
         .await?;
-    wait_for_source_replication_pending_or_failed(&source_client, source_bucket, witness_key).await?;
+    wait_for_source_replication_status(&source_client, source_bucket, witness_key, "FAILED", false).await?;
     target_env.restart_server_preserving_data(vec![], &[]).await?;
     let target_client = target_env.create_s3_client();
     wait_for_replicated_object(&target_client, target_bucket, witness_key, witness_payload).await?;
