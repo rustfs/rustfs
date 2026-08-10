@@ -2207,7 +2207,7 @@ mod tests {
         let req = build_request(input, Method::GET);
 
         let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid key marker"));
     }
 
