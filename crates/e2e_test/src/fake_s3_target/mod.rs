@@ -110,6 +110,8 @@ pub enum FaultAction {
     /// already have buffered the rest of the current frame; the journal reports
     /// the threshold, and the backend never receives or stores the request.
     DisconnectAfterBytes(usize),
+    /// Apply the request, then close the connection before returning its response.
+    DisconnectAfterResponse,
     /// Drain a request body in fixed-size slices, sleeping after every slice.
     SlowDrain { chunk_bytes: usize, delay: Duration },
     /// Store the request normally but replace the response ETag.
@@ -396,6 +398,10 @@ impl FakeS3Target {
     /// that adopts PutObject version ids but not CreateMultipartUpload ones.
     pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
         lock(&self.backend.store).assign_own_multipart_version_ids = enabled;
+    }
+
+    pub fn active_multipart_upload_count(&self) -> usize {
+        lock(&self.backend.store).uploads.len()
     }
 
     /// Queue `times` copies of a fault for one operation.
@@ -819,7 +825,10 @@ async fn apply_non_body_fault(fault: Option<&RequestFault>, control: &Mutex<Cont
             update_consumed(control, fault.expect("matched fault").sequence, 0);
             Err(scripted_disconnect_error())
         }
-        Some(FaultAction::SlowDrain { .. }) | Some(FaultAction::WrongEtag) | None => Ok(()),
+        Some(FaultAction::SlowDrain { .. })
+        | Some(FaultAction::WrongEtag)
+        | Some(FaultAction::DisconnectAfterResponse)
+        | None => Ok(()),
     }
 }
 
@@ -860,7 +869,7 @@ async fn collect_stream(
             Some(FaultAction::SlowDrain { chunk_bytes, delay }) => {
                 return collect_stream_slow(body, capacity, *chunk_bytes, *delay).await;
             }
-            Some(FaultAction::WrongEtag) | None => {}
+            Some(FaultAction::WrongEtag) | Some(FaultAction::DisconnectAfterResponse) | None => {}
         }
 
         let mut output = BytesMut::with_capacity(capacity);
@@ -921,6 +930,9 @@ fn maybe_wrong_etag(fault: Option<&RequestFault>, e_tag: String) -> String {
 fn apply_response_fault<T>(mut response: S3Response<T>, fault: Option<&RequestFault>) -> S3Response<T> {
     if fault.is_some_and(|fault| fault.action == FaultAction::WrongEtag) {
         response.headers.insert(ETAG, HeaderValue::from_static(WRONG_ETAG));
+    }
+    if fault.is_some_and(|fault| fault.action == FaultAction::DisconnectAfterResponse) {
+        response.headers.insert(DISCONNECT_HEADER, HeaderValue::from_static("true"));
     }
     response
 }

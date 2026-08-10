@@ -7569,6 +7569,160 @@ async fn test_replication_check_flags_multipart_only_version_minting_target() ->
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-cleanup-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-cleanup-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for failed_operation in [FakeTargetOperation::UploadPart, FakeTargetOperation::CompleteMultipartUpload] {
+        target.clear_faults();
+        target.take_requests();
+        target.inject(failed_operation, FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE), 16);
+
+        let response = run_replication_check(&source_env, source_bucket).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await?;
+        assert_eq!(
+            payload["Status"], "FAILED",
+            "the injected multipart failure must fail the check: {payload}"
+        );
+
+        let requests = target.requests();
+        assert!(
+            requests.iter().any(|request| {
+                request.operation == failed_operation
+                    && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+            }),
+            "the check must reach the injected {failed_operation:?} failure: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+            "the failed {failed_operation:?} probe must be aborted: {requests:?}"
+        );
+        assert_eq!(
+            target.active_multipart_upload_count(),
+            0,
+            "the failed {failed_operation:?} probe must not leave multipart state"
+        );
+        assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+    }
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::CompleteMultipartUpload, FakeTargetFault::DisconnectAfterResponse, 16);
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "OK",
+        "NoSuchUpload after an ambiguous complete means the multipart artifact is gone: {payload}"
+    );
+    let requests = target.requests();
+    let completed_key = requests
+        .iter()
+        .find(|request| {
+            request.operation == FakeTargetOperation::CompleteMultipartUpload
+                && request.fault == Some(FakeTargetFault::DisconnectAfterResponse)
+        })
+        .and_then(|request| request.key.as_deref())
+        .expect("the scripted complete response disconnect must be observed");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+        "the ambiguous complete must still attempt abort: {requests:?}"
+    );
+    assert_eq!(target.active_multipart_upload_count(), 0);
+    assert!(
+        target.stored_versions(target_bucket, completed_key).is_empty(),
+        "outer cleanup must remove the object committed before the response disconnect"
+    );
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::UploadPart, FakeTargetFault::Status(StatusCode::FORBIDDEN), 16);
+    target.inject(
+        FakeTargetOperation::AbortMultipartUpload,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        16,
+    );
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "FAILED",
+        "an unremoved multipart probe must be reported as a cleanup failure: {payload}"
+    );
+    assert_eq!(
+        target_report["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "the primary multipart error must remain the target error: {payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["VersionFidelity"]["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "{payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Error"], "failed to abort multipart replication probe",
+        "{payload}"
+    );
+    assert!(
+        target.requests().iter().any(|request| {
+            request.operation == FakeTargetOperation::AbortMultipartUpload
+                && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+        }),
+        "the abort failure must be observed"
+    );
+    assert_eq!(
+        target.active_multipart_upload_count(),
+        1,
+        "the report must match the retained multipart state"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
 /// P1-19 (backlog#1675): the supported replication contract is targets that
 /// adopt the source version id (RustFS/MinIO semantics). A target that mints
 /// its own version ids silently breaks every version-addressed operation that

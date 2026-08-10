@@ -2075,6 +2075,20 @@ struct ReplicationProbePutOutcome {
     response_version_id: Option<String>,
 }
 
+struct ReplicationProbeMultipartError {
+    primary: S3ClientError,
+    cleanup_error: Option<String>,
+}
+
+impl From<S3ClientError> for ReplicationProbeMultipartError {
+    fn from(primary: S3ClientError) -> Self {
+        Self {
+            primary,
+            cleanup_error: None,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 trait ReplicationProbeOperations {
     async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
@@ -2082,7 +2096,7 @@ trait ReplicationProbeOperations {
     /// it on completion, so the identity contract has to be probed separately
     /// there: a target can adopt PutObject version ids and still mint its own
     /// for CreateMultipartUpload.
-    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError>;
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
     async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
     async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String>;
@@ -2101,7 +2115,7 @@ impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
         put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
-    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
         multipart_put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
@@ -2151,6 +2165,7 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
     let mut multipart_probe_version_id = None;
     let mut delete_marker_version_id = None;
     let mut cleanup_required = true;
+    let mut multipart_cleanup_error = None;
 
     match operations.put().await {
         Ok(outcome) => {
@@ -2195,9 +2210,10 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
                 }
             }
             Err(err) => {
-                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+                let error = format_replication_check_client_error(&err.primary, ReplicationCheckFailureContext::ReplicateObject);
                 result.phases.version_fidelity = ReplicationCheckPhaseStatus::failed(&error);
                 fail_replication_check_target(result, error);
+                multipart_cleanup_error = err.cleanup_error;
             }
         }
     }
@@ -2225,23 +2241,31 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
-    if cleanup_required {
-        match operations
+    let cleanup_result = if cleanup_required {
+        operations
             .cleanup([
                 probe_version_id.as_deref(),
                 multipart_probe_version_id.as_deref(),
                 delete_marker_version_id.as_deref(),
             ])
             .await
-        {
-            Ok(()) => result.phases.cleanup = ReplicationCheckPhaseStatus::passed(),
-            Err(error) => {
-                result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
-                fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
-            }
-        }
     } else {
+        Ok(())
+    };
+
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = multipart_cleanup_error {
+        cleanup_errors.push(error);
+    }
+    if let Err(error) = cleanup_result {
+        cleanup_errors.push(error);
+    }
+    if cleanup_errors.is_empty() {
         result.phases.cleanup = ReplicationCheckPhaseStatus::passed();
+    } else {
+        let error = cleanup_errors.join("; ");
+        result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
+        fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
     }
 }
 
@@ -2341,7 +2365,7 @@ async fn multipart_put_replication_probe_object(
     target_bucket: &str,
     probe_key: &str,
     now: OffsetDateTime,
-) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
     let options = build_replication_probe_put_options(now);
     let sent_version_id = options.internal.source_version_id.clone();
     let headers = build_replication_probe_headers(&options);
@@ -2364,13 +2388,15 @@ async fn multipart_put_replication_probe_object(
         })
         .send()
         .await
-        .map_err(S3ClientError::from)?;
+        .map_err(S3ClientError::from)
+        .map_err(ReplicationProbeMultipartError::from)?;
     let upload_id = created
         .upload_id()
-        .ok_or_else(|| S3ClientError::new("target multipart initiate returned no upload id"))?
+        .ok_or_else(|| S3ClientError::new("target multipart initiate returned no upload id"))
+        .map_err(ReplicationProbeMultipartError::from)?
         .to_string();
 
-    let uploaded = target_client
+    let uploaded = match target_client
         .client
         .upload_part()
         .bucket(target_bucket)
@@ -2381,14 +2407,26 @@ async fn multipart_put_replication_probe_object(
         .body(AwsByteStream::from_static(b"aaaaaaaa"))
         .send()
         .await
-        .map_err(S3ClientError::from)?;
+    {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            return Err(abort_failed_replication_probe_multipart(
+                target_client,
+                target_bucket,
+                probe_key,
+                &upload_id,
+                S3ClientError::from(error),
+            )
+            .await);
+        }
+    };
 
     let completed_part = CompletedPart::builder()
         .part_number(1)
         .set_e_tag(uploaded.e_tag().map(ToOwned::to_owned))
         .build();
     let complete_headers = headers.clone();
-    let completed = target_client
+    let completed = match target_client
         .client
         .complete_multipart_upload()
         .bucket(target_bucket)
@@ -2408,12 +2446,55 @@ async fn multipart_put_replication_probe_object(
         })
         .send()
         .await
-        .map_err(S3ClientError::from)?;
+    {
+        Ok(completed) => completed,
+        Err(error) => {
+            return Err(abort_failed_replication_probe_multipart(
+                target_client,
+                target_bucket,
+                probe_key,
+                &upload_id,
+                S3ClientError::from(error),
+            )
+            .await);
+        }
+    };
 
     Ok(ReplicationProbePutOutcome {
         sent_version_id,
         response_version_id: completed.version_id().map(ToOwned::to_owned),
     })
+}
+
+async fn abort_failed_replication_probe_multipart(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    upload_id: &str,
+    primary_error: S3ClientError,
+) -> ReplicationProbeMultipartError {
+    match target_client
+        .client
+        .abort_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(upload_id)
+        .send()
+        .await
+    {
+        Ok(_) => ReplicationProbeMultipartError::from(primary_error),
+        Err(error) => {
+            let abort_error = S3ClientError::from(error);
+            if abort_error.code.as_deref() == Some("NoSuchUpload") {
+                ReplicationProbeMultipartError::from(primary_error)
+            } else {
+                ReplicationProbeMultipartError {
+                    primary: primary_error,
+                    cleanup_error: Some("failed to abort multipart replication probe".to_string()),
+                }
+            }
+        }
+    }
 }
 
 async fn put_replication_probe_object(
@@ -3658,7 +3739,7 @@ mod tests {
             }
         }
 
-        async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+        async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
             self.calls.push("multipart-put");
             Ok(ReplicationProbePutOutcome {
                 sent_version_id: "multipart-version".to_string(),
