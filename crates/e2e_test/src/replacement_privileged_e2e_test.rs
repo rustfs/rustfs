@@ -15,10 +15,11 @@
 //! Privileged Linux replacement-heal E2E.
 //!
 //! These ignored tests exercise the documented drive-swap path from rustfs#5869:
-//! a 3-node x 4-drive cluster, a runtime target detach observed by the scanner,
-//! a blank replacement mounted back at the same endpoint, and automatic recovery
-//! without an Admin deep-heal request. The final assertion is a per-version
-//! physical census of the replacement target's `xl.meta` and `part.N` files.
+//! a 3-node x 4-drive cluster, a restarted target node whose absent endpoint is
+//! observed by the scanner, a blank replacement mounted back at the same
+//! endpoint, and automatic recovery without an Admin deep-heal request. The final
+//! assertion is a per-version physical census of the replacement target's
+//! `xl.meta` and `part.N` files.
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -43,10 +44,10 @@ mod tests {
     const TARGET_NODE: usize = 1;
     const TARGET_DRIVE: usize = 0;
     const MOUNT_SIZE: &str = "size=128m,mode=0700";
-    const ABSENT_OBSERVATION_SECS: u64 = 20;
+    const ABSENT_SCANNER_OBSERVATION_TIMEOUT_SECS: u64 = 180;
     const REPLACEMENT_RECOVERY_DIR: &str = ".rustfs.sys/buckets/ahm-replacement";
     const REPLACEMENT_INTENT_SUFFIX: &str = "_ahm_replacement_intent.json";
-    const REPLACEMENT_INTENT_SEAL_SUFFIX: &str = "_ahm_replacement_intent_seal";
+    const REPLACEMENT_COMPLETION_PROOF_SUFFIX: &str = "_ahm_replacement_completion_proof.json";
     const RESUME_CHECKPOINT_SUFFIX: &str = "_ahm_checkpoint.json";
 
     #[derive(Debug)]
@@ -60,11 +61,6 @@ mod tests {
 
     struct MountNamespaceGuard {
         mounts: Vec<PathBuf>,
-    }
-
-    #[derive(Debug)]
-    struct ReplacementIntentWitness {
-        task_id: String,
     }
 
     impl MountNamespaceGuard {
@@ -149,7 +145,7 @@ mod tests {
         let target = target
             .to_str()
             .ok_or_else(|| format!("umount target path is not UTF-8: {target:?}"))?;
-        run_command("umount", ["-l", target])
+        run_command("umount", [target])
     }
 
     fn privileged_run_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -377,99 +373,136 @@ mod tests {
         Ok(serde_json::from_str(&body)?)
     }
 
-    fn replacement_intent_witness(
+    fn replacement_artifact_targets_disk(
+        artifact: &serde_json::Value,
+        target_disk: &Path,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        let target = target_disk.to_string_lossy();
+        Ok(artifact["replacement_targets"]
+            .as_array()
+            .ok_or("replacement artifact has no replacement_targets")?
+            .iter()
+            .any(|slot| slot.as_str().is_some_and(|slot| slot.contains(target.as_ref()))))
+    }
+
+    fn assert_no_replacement_admission_artifacts(
         cluster: &RustFSTestClusterEnvironment,
         target_disk: &Path,
-    ) -> Result<ReplacementIntentWitness, Box<dyn Error + Send + Sync>> {
-        let target = target_disk.to_string_lossy();
-        let mut witness = None::<ReplacementIntentWitness>;
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         for node in &cluster.nodes {
             for drive in &node.data_dirs {
                 let drive = Path::new(drive);
-                if drive == target_disk {
-                    continue;
-                }
                 let recovery_dir = drive.join(REPLACEMENT_RECOVERY_DIR);
-                let entries = match fs::read_dir(&recovery_dir) {
-                    Ok(entries) => entries,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                match fs::read_dir(&recovery_dir) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let entry = entry?;
+                            let file_name = entry.file_name().to_string_lossy().into_owned();
+                            if file_name.ends_with(REPLACEMENT_INTENT_SUFFIX)
+                                || file_name.ends_with(REPLACEMENT_COMPLETION_PROOF_SUFFIX)
+                            {
+                                let artifact: serde_json::Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+                                if replacement_artifact_targets_disk(&artifact, target_disk)? {
+                                    return Err(format!(
+                                        "absent replacement target was admitted before it became ready: {:?}",
+                                        entry.path()
+                                    )
+                                    .into());
+                                }
+                                continue;
+                            }
+                            if file_name.ends_with(RESUME_CHECKPOINT_SUFFIX) {
+                                return Err(format!(
+                                    "replacement created checkpoint while target was absent: {:?}",
+                                    entry.path()
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Err(format!("failed to read replacement recovery dir {recovery_dir:?}: {error}").into());
                     }
+                }
+
+                let bucket_meta_dir = drive.join(".rustfs.sys").join("buckets");
+                let entries = match fs::read_dir(&bucket_meta_dir) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(format!("failed to read bucket metadata dir {bucket_meta_dir:?}: {error}").into()),
                 };
                 for entry in entries {
                     let entry = entry?;
-                    let file_name = entry.file_name().to_string_lossy().into_owned();
-                    let Some(task_id) = file_name.strip_suffix(REPLACEMENT_INTENT_SUFFIX) else {
-                        continue;
-                    };
-                    let state: serde_json::Value = serde_json::from_slice(&fs::read(entry.path())?)?;
-                    let targets = state["replacement_targets"]
-                        .as_array()
-                        .ok_or_else(|| format!("replacement intent {file_name} has no replacement_targets"))?;
-                    if !targets
-                        .iter()
-                        .any(|slot| slot.as_str().is_some_and(|slot| slot.contains(target.as_ref())))
-                    {
-                        continue;
-                    }
-                    if state["task_id"].as_str() != Some(task_id) {
-                        return Err(format!("replacement intent {file_name} task_id does not match filename").into());
-                    }
-                    if state["replacement_generation"].as_str() != Some(task_id) {
-                        return Err(format!("replacement intent {file_name} generation does not match task id").into());
-                    }
-                    if state["replacement_phase"].as_str() != Some("intent") {
-                        return Err(format!(
-                            "replacement intent {file_name} advanced while target is absent: phase={:?}",
-                            state["replacement_phase"]
-                        )
-                        .into());
-                    }
-                    if state["replacement_buckets"].as_array().is_none_or(Vec::is_empty) {
-                        return Err(format!("replacement intent {file_name} has no bucket plan").into());
-                    }
-                    let seal = recovery_dir.join(format!("{task_id}{REPLACEMENT_INTENT_SEAL_SUFFIX}"));
-                    if !seal.is_file() {
-                        return Err(format!("replacement intent {file_name} has no durable seal at {seal:?}").into());
-                    }
-                    match &witness {
-                        Some(existing) if existing.task_id != task_id => {
-                            return Err(format!(
-                                "multiple replacement intents exist for absent target {target}: {} and {task_id}",
-                                existing.task_id
-                            )
-                            .into());
-                        }
-                        Some(_) => {}
-                        None => {
-                            witness = Some(ReplacementIntentWitness {
-                                task_id: task_id.to_string(),
-                            });
-                        }
+                    let file_name = entry.file_name().to_string_lossy();
+                    if file_name.ends_with(RESUME_CHECKPOINT_SUFFIX) {
+                        return Err(format!("replacement created checkpoint while target was absent: {:?}", entry.path()).into());
                     }
                 }
             }
         }
-        witness.ok_or_else(|| format!("no durable replacement intent found for absent target {target_disk:?}").into())
+
+        let marker = target_disk.join(".rustfs.sys").join("healing.bin");
+        if marker.exists() {
+            return Err(format!("replacement created healing marker while target was absent: {marker:?}").into());
+        }
+        Ok(())
     }
 
-    fn assert_no_checkpoint_for_replacement_task(
-        cluster: &RustFSTestClusterEnvironment,
-        task_id: &str,
+    fn log_tail(log: &str) -> String {
+        let mut lines = log.lines().rev().take(80).collect::<Vec<_>>();
+        lines.reverse();
+        lines.join("\n")
+    }
+
+    async fn wait_for_absent_scanner_observation(
+        log_path: &Path,
+        target_disk: &Path,
+        timeout_secs: u64,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        for node in &cluster.nodes {
-            for drive in &node.data_dirs {
-                let checkpoint = Path::new(drive)
-                    .join(".rustfs.sys")
-                    .join("buckets")
-                    .join(format!("{task_id}{RESUME_CHECKPOINT_SUFFIX}"));
-                if checkpoint.exists() {
-                    return Err(
-                        format!("replacement task {task_id} created checkpoint while target was absent: {checkpoint:?}").into(),
-                    );
-                }
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut tick = interval(Duration::from_secs(1));
+        let target = target_disk.to_string_lossy();
+        loop {
+            let log = match fs::read_to_string(log_path) {
+                Ok(log) => log,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(format!("failed to read target node log {log_path:?}: {error}").into()),
+            };
+            if log.contains("replacement_path_unavailable") && log.contains(target.as_ref()) {
+                return Ok(());
             }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "scanner did not observe absent replacement target {target_disk:?} within {timeout_secs}s; log tail:\n{}",
+                    log_tail(&log)
+                )
+                .into());
+            }
+            tick.tick().await;
+        }
+    }
+
+    async fn assert_absent_target_not_admitted(
+        cluster: &RustFSTestClusterEnvironment,
+        target_disk: &Path,
+        versions: &[BaselineVersion],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let status = replacement_status(cluster).await?;
+        let states = target_record_states(&status, target_disk);
+        if !states.is_empty() {
+            return Err(format!(
+                "absent replacement target must not have durable recovery records; observed states {states:?} in status {status}"
+            )
+            .into());
+        }
+        assert_no_replacement_admission_artifacts(cluster, target_disk)?;
+        let missing = incomplete_versions(target_disk, versions)?;
+        if missing.len() != versions.len() {
+            return Err(format!(
+                "absent target unexpectedly exposed baseline shards while scanner deferred replacement: {missing:?}"
+            )
+            .into());
         }
         Ok(())
     }
@@ -496,51 +529,6 @@ mod tests {
                 target_matches.then(|| state.to_string())
             })
             .collect()
-    }
-
-    async fn assert_replacement_stays_waiting_while_absent(
-        cluster: &RustFSTestClusterEnvironment,
-        target_disk: &Path,
-        versions: &[BaselineVersion],
-        duration_secs: u64,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let deadline = Instant::now() + Duration::from_secs(duration_secs);
-        let mut tick = interval(Duration::from_secs(1));
-        let mut observed_task_id = None::<String>;
-        loop {
-            let status = replacement_status(cluster).await?;
-            let states = target_record_states(&status, target_disk);
-            if states.len() != 1 || !states.contains("waiting_for_replacement") {
-                return Err(format!(
-                    "replacement target must stay waiting while absent; observed states {states:?} in status {status}"
-                )
-                .into());
-            }
-            let witness = replacement_intent_witness(cluster, target_disk)?;
-            if let Some(task_id) = &observed_task_id {
-                if task_id != &witness.task_id {
-                    return Err(format!(
-                        "replacement task id changed while target was absent: first={task_id}, current={}",
-                        witness.task_id
-                    )
-                    .into());
-                }
-            } else {
-                observed_task_id = Some(witness.task_id.clone());
-            }
-            assert_no_checkpoint_for_replacement_task(cluster, &witness.task_id)?;
-            let missing = incomplete_versions(target_disk, versions)?;
-            if missing.len() != versions.len() {
-                return Err(format!(
-                    "detached target unexpectedly exposed baseline shards while replacement was waiting: {missing:?}"
-                )
-                .into());
-            }
-            if Instant::now() >= deadline {
-                return Ok(());
-            }
-            tick.tick().await;
-        }
     }
 
     async fn wait_for_replacement_state(
@@ -615,6 +603,8 @@ mod tests {
 
         let mut mount_ns = MountNamespaceGuard::new()?;
         let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(3, 4)).await?;
+        let target_log_path = PathBuf::from(&cluster.temp_dir).join(format!("replacement-node{TARGET_NODE}.log"));
+        cluster.nodes[TARGET_NODE].capture_log_path = Some(target_log_path.to_string_lossy().into_owned());
         // Each drive below is an independent tmpfs mount, so this privileged
         // path must exercise the production distinct-device/readiness fences.
         cluster.extra_env.retain(|(key, _)| key != "RUSTFS_UNSAFE_BYPASS_DISK_CHECK");
@@ -630,6 +620,7 @@ mod tests {
         cluster.set_env("RUSTFS_SCANNER_CYCLE", "1");
         cluster.set_env("RUSTFS_SCANNER_START_DELAY_SECS", "0");
         cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
+        cluster.set_node_env(TARGET_NODE, "RUST_LOG", "rustfs=info,rustfs::heal::manager=debug,rustfs_notify=debug")?;
         cluster.start().await?;
 
         let clients = cluster.create_all_clients()?;
@@ -637,6 +628,7 @@ mod tests {
         let versions = seed_baseline(&clients[0], &target_disk).await?;
         verify_bodies(&clients[0], &versions).await?;
 
+        cluster.stop_node(TARGET_NODE)?;
         mount_ns.detach(&target_disk)?;
         let missing_after_detach = incomplete_versions(&target_disk, &versions)?;
         assert_eq!(
@@ -644,8 +636,9 @@ mod tests {
             versions.len(),
             "detached target path must not still expose baseline shards"
         );
-        wait_for_replacement_state(&cluster, &target_disk, &["waiting_for_replacement"], 180).await?;
-        assert_replacement_stays_waiting_while_absent(&cluster, &target_disk, &versions, ABSENT_OBSERVATION_SECS).await?;
+        cluster.start_node(TARGET_NODE).await?;
+        wait_for_absent_scanner_observation(&target_log_path, &target_disk, ABSENT_SCANNER_OBSERVATION_TIMEOUT_SECS).await?;
+        assert_absent_target_not_admitted(&cluster, &target_disk, &versions).await?;
 
         cluster.stop_node(TARGET_NODE)?;
         mount_ns.mount_tmpfs(&target_disk, &format!("rustfs-e2e-p{parity}-replacement"))?;

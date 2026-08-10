@@ -1036,6 +1036,7 @@ pub struct ClusterNode {
     /// Index of the pool this node belongs to.
     pub pool_idx: usize,
     pub process: Option<Child>,
+    pub capture_log_path: Option<String>,
 }
 
 /// Test environment for managing a multi-node RustFS cluster.
@@ -1134,6 +1135,7 @@ impl RustFSTestClusterEnvironment {
                 data_dirs,
                 pool_idx,
                 process: None,
+                capture_log_path: None,
             });
         }
 
@@ -1268,6 +1270,11 @@ impl RustFSTestClusterEnvironment {
             for (key, value) in &self.node_extra_env[i] {
                 command.env(key, value);
             }
+            if let Some(log_path) = &node.capture_log_path {
+                let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+                let stderr_file = file.try_clone()?;
+                command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
+            }
 
             let process = command.current_dir(&node.data_dir).spawn()?;
 
@@ -1311,6 +1318,11 @@ impl RustFSTestClusterEnvironment {
         }
         for (key, value) in &self.node_extra_env[node_idx] {
             command.env(key, value);
+        }
+        if let Some(log_path) = &node.capture_log_path {
+            let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+            let stderr_file = file.try_clone()?;
+            command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
         }
 
         let process = command.current_dir(&node.data_dir).spawn()?;
@@ -1552,6 +1564,7 @@ mod tests {
                     data_dirs,
                     pool_idx: pool_of_node[i],
                     process: None,
+                    capture_log_path: None,
                 }
             })
             .collect();
