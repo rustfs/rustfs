@@ -54,6 +54,8 @@ const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
+const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HealInitParams {
@@ -173,6 +175,12 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
         AdminOperation(&BackgroundHealStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&ReplacementRecoveryStatusHandler {}),
     )?;
 
     Ok(())
@@ -1014,6 +1022,54 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, B
     S3Response::with_headers((status, Body::from(body)), headers)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplacementRecoveryStatusResponse {
+    pub contract_version: u32,
+    pub path: String,
+    pub scope: &'static str,
+    pub local: rustfs_heal::ReplacementRecoverySnapshot,
+    pub cluster: ReplacementRecoveryClusterStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReplacementRecoveryClusterStatus {
+    pub definitive: bool,
+    pub reason: &'static str,
+}
+
+fn build_replacement_recovery_status_response(
+    local: rustfs_heal::ReplacementRecoverySnapshot,
+) -> ReplacementRecoveryStatusResponse {
+    ReplacementRecoveryStatusResponse {
+        contract_version: REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION,
+        path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
+        scope: "local_survivor_disks",
+        local,
+        cluster: ReplacementRecoveryClusterStatus {
+            definitive: false,
+            reason: "distributed replacement recovery status requires a peer capability RPC",
+        },
+    }
+}
+
+fn encode_replacement_recovery_status(response: &ReplacementRecoveryStatusResponse) -> S3Result<Vec<u8>> {
+    serde_json::to_vec(response).map_err(|e| {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "failed",
+            reason = "serialize_replacement_recovery_status_failed",
+            error = %e,
+            "admin request failed"
+        );
+        s3_error!(InternalError, "failed to serialize replacement recovery status: {e}")
+    })
+}
+
 async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -1284,16 +1340,39 @@ impl Operation for BackgroundHealStatusHandler {
     }
 }
 
+pub struct ReplacementRecoveryStatusHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ReplacementRecoveryStatusHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_heal_admin_request(&req).await?;
+
+        let local = rustfs_heal::current_replacement_recovery_snapshot().await;
+        let response = build_replacement_recovery_status_response(local);
+        let body = encode_replacement_recovery_status(&response)?;
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "success",
+            "admin response emitted"
+        );
+
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::extract_heal_init_params;
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
-        background_heal_runtime_state, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
-        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
-        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, reject_heal_admission,
-        should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        background_heal_runtime_state, build_heal_channel_request, build_replacement_recovery_status_response,
+        encode_background_heal_status, encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability,
+        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, json_response,
+        map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        reject_heal_admission, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use crate::storage::rpc::node_service::heal::{NodeHealProgress, NodeHealStatusSnapshot};
@@ -1339,6 +1418,35 @@ mod tests {
         .await
         .unwrap();
         assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn replacement_recovery_status_response_never_claims_cluster_completion() {
+        let response = build_replacement_recovery_status_response(rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![rustfs_heal::ReplacementRecoveryRecord {
+                task_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                state: rustfs_heal::ReplacementRecoveryState::Completed,
+                generation: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                set_disk_id: Some("pool_0_set_0".to_string()),
+                target_slots: vec!["http://node-a:9000/mnt/disk1".to_string()],
+                reason: None,
+                verified_at: Some(42),
+            }],
+            definitive: true,
+            reason: None,
+        });
+        let value = serde_json::to_value(response).expect("replacement status response should serialize");
+
+        assert_eq!(value["contractVersion"], 1);
+        assert_eq!(value["path"], "/rustfs/admin/v4/heal/replacement-recovery");
+        assert_eq!(value["scope"], "local_survivor_disks");
+        assert_eq!(value["local"]["definitive"], true);
+        assert_eq!(value["local"]["records"][0]["state"], "completed");
+        assert_eq!(value["cluster"]["definitive"], false);
+        assert_eq!(
+            value["cluster"]["reason"],
+            "distributed replacement recovery status requires a peer capability RPC"
+        );
     }
 
     #[test]
