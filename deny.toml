@@ -40,9 +40,9 @@ allow-git = [
     # SigV4 payload-checksum fix until it is available in a crates.io release.
     # owner: marshawcoco  review: 2026-10
     "https://github.com/s3s-project/s3s.git",
-    # Presigned expiry and constant-time authentication fixes pending upstream merge.
-    # owner: cxymds  review: 2026-10
-    "https://github.com/cxymds/s3s.git",
+    # RustFS fork carrying presigned expiry and constant-time authentication fixes.
+    # owner: rustfs-maintainers  review: 2026-10
+    "https://github.com/rustfs/s3s.git",
     # MiMalloc fork pinned for hotpath allocation counting support.
     # owner: houseme  review: 2026-10
     "https://github.com/xonatius/mimalloc_rust.git",
