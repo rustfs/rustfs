@@ -1,5 +1,13 @@
 use super::*;
 use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
+use datafusion::{
+    arrow::{
+        array::Int32Array,
+        datatypes::{DataType, Field, Schema, SchemaRef},
+        record_batch::RecordBatch,
+    },
+    parquet::arrow::ArrowWriter,
+};
 use std::sync::Arc;
 
 #[test]
@@ -2726,28 +2734,51 @@ async fn commit_publication_holds_referenced_object_locks_until_pointer_publish(
         metadata_backend.write_lock_is_held("warehouse", &publication_lock).await,
         "table publication fence must remain held during catalog publication"
     );
-    for location in [&manifest_list, &manifest, &data_file] {
+    for location in [&manifest_list, &manifest] {
         let object = test_snapshot_object_key("warehouse", location);
         assert!(
             metadata_backend.write_lock_is_held("warehouse", &object).await,
-            "snapshot object lock must remain held during catalog publication: {location}"
+            "snapshot metadata lock must remain held during catalog publication: {location}"
         );
     }
+    let data_object = test_snapshot_object_key("warehouse", &data_file);
+    assert!(
+        !metadata_backend.write_lock_is_held("warehouse", &data_object).await,
+        "live data files must not consume one retained publication lock per object"
+    );
+    metadata_backend.lock_attempts.lock().await.clear();
+    let data_plane_backend = metadata_backend.clone();
+    let data_plane_publication_lock = publication_lock.clone();
+    let data_plane = tokio::spawn(async move {
+        crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(
+            &data_plane_backend,
+            "warehouse",
+            &data_plane_publication_lock,
+        )
+        .await
+    });
+    metadata_backend.wait_for_lock_attempts(1).await;
+    assert!(!data_plane.is_finished(), "a data-plane mutation must wait for catalog publication");
     pause.release();
     tokio::time::timeout(StdDuration::from_secs(2), commit)
         .await
         .expect("commit task should complete")
         .expect("commit task should join")
         .expect("standard commit should succeed");
+    tokio::time::timeout(StdDuration::from_secs(2), data_plane)
+        .await
+        .expect("data-plane publication guard should unblock")
+        .expect("data-plane guard task should join")
+        .expect("data-plane guard acquisition should succeed");
     assert!(
         !metadata_backend.write_lock_is_held("warehouse", &publication_lock).await,
         "table publication fence must be released after catalog publication"
     );
-    for location in [&manifest_list, &manifest, &data_file] {
+    for location in [&manifest_list, &manifest] {
         let object = test_snapshot_object_key("warehouse", location);
         assert!(
             !metadata_backend.write_lock_is_held("warehouse", &object).await,
-            "snapshot object lock must be released after catalog publication: {location}"
+            "snapshot metadata lock must be released after catalog publication: {location}"
         );
     }
 }
@@ -2975,43 +3006,7 @@ async fn commit_publication_binds_fingerprint_to_returned_bytes() {
 }
 
 #[tokio::test]
-async fn commit_publication_rejects_object_sets_above_the_guard_limit() {
-    let commit_backend = TableCommitObjectBackend::trusted(TestTableCatalogObjectBackend::default());
-    for index in 0..TABLE_COMMIT_PUBLICATION_MAX_OBJECTS {
-        commit_backend
-            .record_observation(
-                "warehouse",
-                &format!("data/{index:05}.parquet"),
-                TableCommitObservedObject {
-                    identity: TableCommitObjectIdentity::Missing,
-                    max_size: None,
-                },
-            )
-            .await
-            .expect("objects within the publication limit should be retained");
-    }
-
-    let error = commit_backend
-        .record_observation(
-            "warehouse",
-            "data/overflow.parquet",
-            TableCommitObservedObject {
-                identity: TableCommitObjectIdentity::Missing,
-                max_size: None,
-            },
-        )
-        .await
-        .expect_err("an object set above the publication limit must be rejected");
-
-    assert!(matches!(error, crate::table_catalog::TableCatalogStoreError::Invalid(_)));
-    assert_eq!(
-        commit_backend.publication.lock().observed_objects.len(),
-        TABLE_COMMIT_PUBLICATION_MAX_OBJECTS
-    );
-}
-
-#[tokio::test]
-async fn standard_commit_publishes_snapshot_at_the_graph_object_budget() {
+async fn standard_commit_publishes_more_than_ten_thousand_live_files() {
     let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::default();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -3021,7 +3016,7 @@ async fn standard_commit_publishes_snapshot_at_the_graph_object_budget() {
         .expect("created metadata should include the table location");
     let manifest_list = format!("{table_location}/metadata/boundary-list.avro");
     let manifest = format!("{table_location}/metadata/boundary-manifest.avro");
-    let data_file_count = crate::table_catalog::TABLE_COMMIT_MAX_GRAPH_OBJECTS - 2;
+    let data_file_count = 10_001;
     let data_files = (0..data_file_count)
         .map(|index| format!("{table_location}/data/part-{index:05}.parquet"))
         .collect::<Vec<_>>();
@@ -3084,7 +3079,7 @@ async fn standard_commit_publishes_snapshot_at_the_graph_object_budget() {
     let response = commit_backend
         .finish(result)
         .await
-        .expect("a snapshot at the graph object budget should publish");
+        .expect("a valid snapshot with more than ten thousand live files should publish");
 
     assert_eq!(response.metadata["current-snapshot-id"], 20);
     assert_eq!(
@@ -3690,6 +3685,102 @@ async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
             .contains(&(bucket.to_string(), publication_lock)),
         "internal snapshot expiration commits should enter through the table publication fence"
     );
+    assert!(
+        backend.lock_attempts.lock().await.contains(&(bucket.to_string(), current)),
+        "snapshot expiration must retain the metadata observation through pointer publication"
+    );
+}
+
+#[tokio::test]
+async fn table_metadata_maintenance_helper_commits_compaction_through_publication_observer() {
+    let backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "warehouse";
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+    let metadata_dir = crate::table_catalog::default_table_metadata_dir_path(&namespace, &table);
+    let data_dir = crate::table_catalog::default_table_data_dir_path(&namespace, &table);
+    let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let manifest_list = format!("{metadata_dir}/snap-20.avro");
+    let manifest = format!("{metadata_dir}/manifest-20.avro");
+    let left_data = format!("{data_dir}/part-left.parquet");
+    let right_data = format!("{data_dir}/part-right.parquet");
+
+    seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+    backend
+        .put_bytes(bucket, &manifest_list, test_manifest_list_avro_bytes(&[&manifest], 7, 20))
+        .await;
+    backend
+        .put_bytes(
+            bucket,
+            &manifest,
+            test_manifest_avro_bytes(&[(&left_data, 0, 0, 20, 7), (&right_data, 0, 0, 20, 7)]),
+        )
+        .await;
+    backend.put_bytes(bucket, &left_data, test_parquet_i32_bytes(&[1, 2])).await;
+    backend.put_bytes(bucket, &right_data, test_parquet_i32_bytes(&[3, 4])).await;
+    backend
+        .put_json(
+            bucket,
+            &current,
+            serde_json::json!({
+                "format-version": 2,
+                "table-uuid": "table-uuid",
+                "location": "s3://warehouse/tables/table-id",
+                "last-sequence-number": 7,
+                "last-updated-ms": 2000,
+                "metadata-log": [],
+                "snapshots": [{
+                    "snapshot-id": 20,
+                    "sequence-number": 7,
+                    "timestamp-ms": 2000,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                }],
+                "current-snapshot-id": 20,
+                "refs": {
+                    "main": {
+                        "snapshot-id": 20,
+                        "type": "branch"
+                    }
+                }
+            }),
+        )
+        .await;
+    backend.lock_attempts.lock().await.clear();
+
+    let report = table_metadata_maintenance_response(
+        &store,
+        &backend,
+        bucket,
+        &namespace,
+        "events",
+        TableMetadataMaintenanceRequest {
+            retain_recent_metadata_files: 0,
+            delete: false,
+            snapshot_expiration: None,
+            commit_snapshot_expiration: false,
+            compaction: Some(crate::table_catalog::TableCompactionPlanningConfig {
+                target_file_size_bytes: 64 * 1024,
+                small_file_threshold_bytes: 64 * 1024,
+                min_input_files: 2,
+                max_rewrite_bytes_per_job: 128 * 1024,
+            }),
+            commit_compaction: true,
+        },
+    )
+    .await
+    .expect("compaction maintenance commit should succeed");
+
+    let compaction = report.compaction.expect("maintenance report should include compaction");
+    assert_eq!(compaction.status, crate::table_catalog::TableCompactionPlanningStatus::Committed);
+    let lock_attempts = backend.lock_attempts.lock().await;
+    for observed_object in [current, manifest_list, manifest, left_data, right_data] {
+        assert!(
+            lock_attempts.contains(&(bucket.to_string(), observed_object.clone())),
+            "compaction must retain its content observation through pointer publication: {observed_object}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6493,6 +6584,19 @@ fn test_table_metadata_json(table_uuid: &str, location: &str) -> serde_json::Val
 fn test_snapshot_object_key(bucket: &str, location: &str) -> String {
     crate::table_catalog::table_catalog_object_key_from_location(bucket, location)
         .expect("test snapshot object location should be valid")
+}
+
+fn test_parquet_i32_bytes(values: &[i32]) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema) as SchemaRef, vec![Arc::new(Int32Array::from(values.to_vec()))])
+        .expect("parquet test batch should build");
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("parquet writer should build");
+        writer.write(&batch).expect("parquet batch should write");
+        writer.close().expect("parquet writer should close");
+    }
+    bytes
 }
 
 fn test_manifest_list_avro_bytes(manifest_paths: &[&str], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {

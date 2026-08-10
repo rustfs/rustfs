@@ -50,7 +50,7 @@ use rustfs_utils::http::{
 };
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 use url::{Url, form_urlencoded};
 
@@ -111,6 +111,12 @@ pub(crate) struct PostObjectRequestMarker;
 
 #[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
+
+#[derive(Clone, Default)]
+struct TableDataPlanePublicationGuards {
+    keys: Arc<parking_lot::Mutex<BTreeSet<(String, String)>>>,
+    guards: Arc<parking_lot::Mutex<Vec<Box<dyn Send>>>>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct BucketGenerationGuard {
@@ -1068,6 +1074,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         if iam_allowed {
             if !internal_object_authorization {
                 authorize_table_data_plane_if_needed(
+                    req,
                     action,
                     bucket.as_str(),
                     object.as_str(),
@@ -1101,6 +1108,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         if policy_allowed_fallback {
             if !internal_object_authorization {
                 authorize_table_data_plane_if_needed(
+                    req,
                     action,
                     bucket.as_str(),
                     object.as_str(),
@@ -1390,12 +1398,61 @@ fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
     }
 }
 
-fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+fn table_data_plane_content_mutation(action: Action) -> bool {
+    matches!(
+        action,
+        Action::S3Action(
+            S3Action::PutObjectAction
+                | S3Action::DeleteObjectAction
+                | S3Action::DeleteObjectVersionAction
+                | S3Action::RestoreObjectAction
+                | S3Action::ReplicateObjectAction
+                | S3Action::ReplicateDeleteAction
+                | S3Action::PutObjectFanOutAction
+        )
+    )
+}
+
+fn table_catalog_backend_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
     let store =
         runtime_sources::current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
-    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
+}
+
+fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    let backend = table_catalog_backend_for_data_plane()?;
     crate::table_catalog::ConfiguredTableCatalogStore::from_env(backend)
         .map_err(|err| s3_error!(InternalError, "failed to configure table catalog backing: {}", err))
+}
+
+async fn retain_table_data_plane_publication_guard<T>(
+    req: &mut S3Request<T>,
+    resource: &crate::table_catalog::TableDataPlaneResource,
+) -> S3Result<()> {
+    let namespace = crate::table_catalog::Namespace::parse(&resource.namespace)
+        .map_err(|err| s3_error!(InternalError, "persisted table namespace is invalid: {}", err))?;
+    let table = crate::table_catalog::IdentifierSegment::parse(resource.table.clone())
+        .map_err(|err| s3_error!(InternalError, "persisted table name is invalid: {}", err))?;
+    let lock_object = crate::table_catalog::default_table_publication_lock_path(&namespace, &table);
+    let key = (resource.table_bucket.clone(), lock_object.clone());
+    let retained = req
+        .extensions
+        .get::<TableDataPlanePublicationGuards>()
+        .cloned()
+        .unwrap_or_default();
+    if retained.keys.lock().contains(&key) {
+        return Ok(());
+    }
+
+    let backend = table_catalog_backend_for_data_plane()?;
+    let guard =
+        crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, &resource.table_bucket, &lock_object)
+            .await
+            .map_err(|err| s3_error!(InternalError, "failed to acquire table publication guard: {}", err))?;
+    retained.keys.lock().insert(key);
+    retained.guards.lock().push(guard);
+    req.extensions.insert(retained);
+    Ok(())
 }
 
 async fn table_data_plane_resource_for_request(
@@ -1434,7 +1491,8 @@ async fn table_data_plane_resource_for_request(
         })
 }
 
-async fn authorize_table_data_plane_if_needed(
+async fn authorize_table_data_plane_if_needed<T>(
+    req: &mut S3Request<T>,
     action: Action,
     bucket: &str,
     object: &str,
@@ -1468,6 +1526,9 @@ async fn authorize_table_data_plane_if_needed(
         })
         .await;
     if allowed {
+        if table_data_plane_content_mutation(action) {
+            retain_table_data_plane_publication_guard(req, &resource).await?;
+        }
         return Ok(());
     }
 
@@ -2784,7 +2845,8 @@ mod tests {
         load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions,
         merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
         put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
-        table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
+        table_data_plane_admin_action, table_data_plane_content_mutation, validate_post_object_success_controls,
+        versioned_read_action,
     };
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -2921,6 +2983,29 @@ mod tests {
             Some(rustfs_policy::policy::action::AdminAction::GetTableMetadataAction)
         );
         assert_eq!(table_data_plane_admin_action(Action::S3Action(S3Action::ListBucketAction)), None);
+    }
+
+    #[test]
+    fn table_data_plane_publication_guard_covers_content_mutations_only() {
+        for action in [
+            S3Action::PutObjectAction,
+            S3Action::DeleteObjectAction,
+            S3Action::DeleteObjectVersionAction,
+            S3Action::RestoreObjectAction,
+            S3Action::ReplicateObjectAction,
+            S3Action::ReplicateDeleteAction,
+            S3Action::PutObjectFanOutAction,
+        ] {
+            assert!(table_data_plane_content_mutation(Action::S3Action(action)));
+        }
+        for action in [
+            S3Action::GetObjectAction,
+            S3Action::PutObjectTaggingAction,
+            S3Action::DeleteObjectTaggingAction,
+            S3Action::ListBucketAction,
+        ] {
+            assert!(!table_data_plane_content_mutation(Action::S3Action(action)));
+        }
     }
 
     #[test]

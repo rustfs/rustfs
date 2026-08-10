@@ -1559,7 +1559,7 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
 }
 
 #[tokio::test]
-async fn iceberg_snapshot_graph_enforces_the_publication_object_budget() {
+async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
@@ -1574,7 +1574,7 @@ async fn iceberg_snapshot_graph_enforces_the_publication_object_budget() {
         )
         .await;
 
-    let data_file_count = TABLE_COMMIT_MAX_GRAPH_OBJECTS - 2;
+    let data_file_count = 10_001;
     let data_files = (0..data_file_count)
         .map(|index| format!("s3://warehouse/tables/table-id/data/part-{index:05}.parquet"))
         .collect::<Vec<_>>();
@@ -1589,7 +1589,7 @@ async fn iceberg_snapshot_graph_enforces_the_publication_object_budget() {
             )
             .await;
     }
-    let mut references = data_files.iter().map(|data_file| (data_file.as_str(), 0)).collect::<Vec<_>>();
+    let references = data_files.iter().map(|data_file| (data_file.as_str(), 0)).collect::<Vec<_>>();
     backend
         .seed_object(
             "warehouse",
@@ -1613,25 +1613,7 @@ async fn iceberg_snapshot_graph_enforces_the_publication_object_budget() {
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
-        .expect("a graph at the publication object boundary should validate");
-
-    let overflow = "s3://warehouse/tables/table-id/data/overflow.parquet";
-    backend
-        .seed_object("warehouse", "tables/table-id/data/overflow.parquet", vec![1])
-        .await;
-    references.push((overflow, 0));
-    backend
-        .seed_object(
-            "warehouse",
-            "tables/table-id/metadata/boundary-manifest.avro",
-            manifest_avro_bytes(&references),
-        )
-        .await;
-
-    let error = validate_table_snapshot_changes(&context, None, &metadata)
-        .await
-        .expect_err("a graph above the publication object boundary must be rejected during validation");
-    assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("graph objects")));
+        .expect("a valid graph with more than ten thousand live files should validate");
 }
 
 #[tokio::test]

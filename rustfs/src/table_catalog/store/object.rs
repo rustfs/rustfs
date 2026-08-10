@@ -2457,6 +2457,21 @@ where
         table: &str,
         config: TableSnapshotExpirationConfig,
     ) -> TableCatalogStoreResult<TableSnapshotExpirationReport> {
+        self.plan_table_snapshot_expiration_with_backend(&self.backend, table_bucket, namespace, table, config)
+            .await
+    }
+
+    pub(crate) async fn plan_table_snapshot_expiration_with_backend<P>(
+        &self,
+        metadata_backend: &P,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableSnapshotExpirationConfig,
+    ) -> TableCatalogStoreResult<TableSnapshotExpirationReport>
+    where
+        P: TableCatalogObjectBackend,
+    {
         validate_table_snapshot_expiration_config(&config)?;
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
@@ -2475,7 +2490,7 @@ where
             ));
         }
 
-        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        let Some(current_metadata) = read_table_metadata_value(metadata_backend, table_bucket, &entry.metadata_location).await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
@@ -2537,6 +2552,21 @@ where
         table: &str,
         config: TableCompactionPlanningConfig,
     ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
+        self.commit_table_compaction_with_publication(&self.backend, table_bucket, namespace, table, config)
+            .await
+    }
+
+    pub(crate) async fn commit_table_compaction_with_publication<P>(
+        &self,
+        publication_backend: &P,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport>
+    where
+        P: TableCatalogObjectBackend,
+    {
         validate_table_compaction_planning_config(&config)?;
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
@@ -2555,21 +2585,30 @@ where
             ));
         }
 
-        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
+        let Some(current_metadata) =
+            read_table_metadata_value(publication_backend, table_bucket, &entry.metadata_location).await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
             )));
         };
-        let mut report =
-            table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config)
-                .await?;
+        let mut report = table_compaction_planning_report(
+            publication_backend,
+            table_bucket,
+            &namespace,
+            &table,
+            &entry,
+            &current_metadata,
+            config,
+        )
+        .await?;
         if report.status != TableCompactionPlanningStatus::RewriteCandidates {
             return Err(TableCatalogStoreError::Invalid("compaction has no safe rewrite candidates".to_string()));
         }
         let current_data_files =
-            compaction_current_data_files(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata).await?;
+            compaction_current_data_files(publication_backend, table_bucket, &namespace, &table, &entry, &current_metadata)
+                .await?;
         let current_data_files_by_key = current_data_files
             .iter()
             .map(|file| (file.object_key.as_str(), file))
@@ -2604,14 +2643,14 @@ where
             let sort_order_id = compaction_rewrite_group_sort_order(&current_data_files_by_key, rewrite_group)?;
             let mut input_files = Vec::with_capacity(rewrite_group.input_file_locations.len());
             for input_file in &rewrite_group.input_file_locations {
-                let Some(input_object) = self.backend.read_object(table_bucket, input_file).await? else {
+                let Some(input_object) = publication_backend.read_object(table_bucket, input_file).await? else {
                     return Err(TableCatalogStoreError::NotFound(format!("compaction input data file {input_file}")));
                 };
                 input_files.push((input_file.clone(), input_object.data));
             }
             let compacted_file = compact_parquet_data_files(&input_files)?;
             let output_bytes = u64::try_from(compacted_file.data.len()).unwrap_or(u64::MAX);
-            self.backend
+            publication_backend
                 .put_object(table_bucket, &output_file, compacted_file.data, TableCatalogPutPrecondition::IfAbsent)
                 .await?;
             rewrite_group.output_file_location = Some(output_file_path.clone());
@@ -2638,7 +2677,7 @@ where
             default_table_metadata_file_path(&namespace, &table, &format!("compaction-{compaction_id}.metadata.json"));
         let manifest_data = compacted_manifest_avro_bytes(&manifest_data_files)?;
         let manifest_length = u64::try_from(manifest_data.len()).unwrap_or(u64::MAX);
-        self.backend
+        publication_backend
             .put_object(table_bucket, &new_manifest, manifest_data, TableCatalogPutPrecondition::IfAbsent)
             .await?;
         let added_files_count = compacted_files.len();
@@ -2661,7 +2700,7 @@ where
             added_rows_count,
             existing_rows_count,
         })?;
-        self.backend
+        publication_backend
             .put_object(
                 table_bucket,
                 &new_manifest_list,
@@ -2678,24 +2717,27 @@ where
             &entry.metadata_location,
             now,
         )?;
-        self.backend
+        publication_backend
             .put_object(table_bucket, &new_metadata, new_metadata_data, TableCatalogPutPrecondition::IfAbsent)
             .await?;
 
         let commit_result = self
-            .commit_table(TableCommitRequest {
-                table_bucket: table_bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                commit_id: format!("compaction-{compaction_id}"),
-                idempotency_key: Some(format!("compaction-{compaction_id}")),
-                operation: "compaction".to_string(),
-                expected_version_token: entry.version_token,
-                expected_metadata_location: entry.metadata_location,
-                new_metadata_location: new_metadata.clone(),
-                requirements: Vec::new(),
-                writer: Some("rustfs-maintenance".to_string()),
-            })
+            .commit_table_with_publication(
+                TableCommitRequest {
+                    table_bucket: table_bucket.to_string(),
+                    namespace: namespace.public_name(),
+                    table: table.as_str().to_string(),
+                    commit_id: format!("compaction-{compaction_id}"),
+                    idempotency_key: Some(format!("compaction-{compaction_id}")),
+                    operation: "compaction".to_string(),
+                    expected_version_token: entry.version_token,
+                    expected_metadata_location: entry.metadata_location,
+                    new_metadata_location: new_metadata.clone(),
+                    requirements: Vec::new(),
+                    writer: Some("rustfs-maintenance".to_string()),
+                },
+                publication_backend,
+            )
             .await?;
 
         report.status = TableCompactionPlanningStatus::Committed;

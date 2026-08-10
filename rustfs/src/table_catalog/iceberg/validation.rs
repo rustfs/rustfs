@@ -882,7 +882,6 @@ impl<'a, B> TableSnapshotGraphValidationContext<'a, B> {
 
 #[derive(Default)]
 struct SnapshotGraphReadBudget {
-    graph_object_count: usize,
     manifest_count: usize,
     avro_bytes: usize,
     decoded_avro_bytes: usize,
@@ -893,19 +892,6 @@ struct SnapshotGraphReadBudget {
 }
 
 impl SnapshotGraphReadBudget {
-    fn charge_graph_objects(&mut self, count: usize) -> TableCatalogStoreResult<()> {
-        self.graph_object_count = self
-            .graph_object_count
-            .checked_add(count)
-            .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot graph objects exceed the commit limit".to_string()))?;
-        if self.graph_object_count > TABLE_COMMIT_MAX_GRAPH_OBJECTS {
-            return Err(TableCatalogStoreError::Invalid(
-                "snapshot graph objects exceed the commit limit".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     fn charge_manifests(&mut self, count: usize) -> TableCatalogStoreResult<()> {
         self.manifest_count = self
             .manifest_count
@@ -1121,7 +1107,6 @@ where
         let references = if let Some(references) = budget.manifests.get(&manifest_key).cloned() {
             references
         } else {
-            budget.charge_graph_objects(1)?;
             budget.charge_manifests(1)?;
             let manifest_object = context
                 .backend
@@ -1169,7 +1154,6 @@ where
         let references = if let Some(references) = budget.manifest_lists.get(&manifest_list_key).cloned() {
             references
         } else {
-            budget.charge_graph_objects(1)?;
             let manifest_list_object = context
                 .backend
                 .read_object_limited(context.table_bucket, &manifest_list_key, TABLE_MANIFEST_AVRO_MAX_SIZE)
@@ -1409,7 +1393,6 @@ where
         let object_key = snapshot_graph_object_key(context, &reference.location, reference.object_kind.clone())?;
         match reference.entry_status {
             Some(0 | 1) if budget.validated_live_objects.insert(object_key.clone()) => {
-                budget.charge_graph_objects(1)?;
                 live_object_keys.push(object_key);
             }
             Some(0 | 1) => {}
