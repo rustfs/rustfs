@@ -91,6 +91,7 @@ metrics = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rustfs-test-utils = { workspace = true }
 serial_test = { workspace = true }

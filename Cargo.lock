@@ -9457,6 +9457,7 @@ dependencies = [
  "futures",
  "hotpath",
  "http 1.5.0",
+ "libc",
  "metrics",
  "rustfs-common",
  "rustfs-concurrency",
