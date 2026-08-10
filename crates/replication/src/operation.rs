@@ -651,6 +651,9 @@ mod tests {
         for (status, expected) in [
             (ReplicationStatusType::Empty, true),
             (ReplicationStatusType::Completed, false),
+            // "COMPLETE" on disk parses to this legacy variant, so objects
+            // written by older versions reach the decision through it.
+            (ReplicationStatusType::CompletedLegacy, false),
             (ReplicationStatusType::Pending, false),
             (ReplicationStatusType::Failed, false),
             (ReplicationStatusType::Replica, false),

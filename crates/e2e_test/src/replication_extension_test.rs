@@ -8336,7 +8336,7 @@ async fn test_scanner_never_compensates_when_existing_object_replication_disable
     init_logging();
     let source_bucket = "scanner-disabled-src";
     let target_bucket = "scanner-disabled-dst";
-    let (source_env, target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let (source_env, mut target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
@@ -8367,8 +8367,31 @@ async fn test_scanner_never_compensates_when_existing_object_replication_disable
         .await?;
     wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
 
-    // With the live path proven, the pre-existing key must stay absent across
-    // multiple fast-scanner cycles.
+    // Scanner-only witness. A live-path control key alone would let this test
+    // pass while the existing-object scanner is disabled or wedged, so make
+    // the scanner itself observable: an object whose replication FAILED while
+    // the target was down can only be re-driven by the data scanner's
+    // replication heal pass (see FAST_SCANNER_ENV), and that pass is NOT
+    // gated by ExistingObjectReplication. The witness lives in the same
+    // bucket and prefix as the pre-existing key, so a heal pass that reached
+    // it necessarily walked the pre-existing key in the same scan.
+    let witness_key = "scanner-witness.txt";
+    let witness_payload = "scanner witness payload";
+    target_env.stop_server();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(witness_key)
+        .body(ByteStream::from_static(witness_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_source_replication_pending_or_failed(&source_client, source_bucket, witness_key).await?;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+    let target_client = target_env.create_s3_client();
+    wait_for_replicated_object(&target_client, target_bucket, witness_key, witness_payload).await?;
+
+    // The scanner demonstrably swept this bucket; the pre-existing key must
+    // still be absent, and stay absent over further cycles.
     assert_replication_key_absent(&target_client, target_bucket, existing_key, Duration::from_secs(6)).await?;
 
     Ok(())
