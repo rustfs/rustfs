@@ -121,7 +121,7 @@ const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_VIEW_RESOURCE_ROOT: &str = "views";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
-const TABLE_COMMIT_PUBLICATION_MAX_OBJECTS: usize = 10_000;
+const TABLE_COMMIT_PUBLICATION_MAX_OBJECTS: usize = crate::table_catalog::TABLE_COMMIT_MAX_GRAPH_OBJECTS + 16;
 const DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID: &str = "rustfs-maintenance-scheduler";
 const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED: &str = "bridge-unconfigured";
@@ -1225,7 +1225,7 @@ struct TableCommitObjectBackend<B> {
     backend: B,
     authorization: TableCommitObjectAuthorization,
     authorization_error: Arc<tokio::sync::Mutex<Option<S3Error>>>,
-    publication: Arc<tokio::sync::Mutex<TableCommitPublicationState>>,
+    publication: Arc<parking_lot::Mutex<TableCommitPublicationState>>,
 }
 
 impl<B> TableCommitObjectBackend<B>
@@ -1237,7 +1237,7 @@ where
             backend,
             authorization: TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
             authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
-            publication: Arc::new(tokio::sync::Mutex::new(TableCommitPublicationState::default())),
+            publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
         }
     }
 
@@ -1247,7 +1247,7 @@ where
             backend,
             authorization: TableCommitObjectAuthorization::Trusted,
             authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
-            publication: Arc::new(tokio::sync::Mutex::new(TableCommitPublicationState::default())),
+            publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
         }
     }
 
@@ -1264,7 +1264,7 @@ where
                 denied_object,
             },
             authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
-            publication: Arc::new(tokio::sync::Mutex::new(TableCommitPublicationState::default())),
+            publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
         }
     }
 
@@ -1306,7 +1306,7 @@ where
 
     async fn read_without_nested_lock(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
         let key = (bucket.to_string(), object.to_string());
-        let publication = self.publication.lock().await;
+        let publication = self.publication.lock();
         match publication.phase {
             TableCommitPublicationPhase::Discovering | TableCommitPublicationPhase::Complete => Ok(false),
             TableCommitPublicationPhase::Preparing => Err(crate::table_catalog::TableCatalogStoreError::Internal(
@@ -1326,7 +1326,7 @@ where
         observation: TableCommitObservedObject,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
         let key = (bucket.to_string(), object.to_string());
-        let mut publication = self.publication.lock().await;
+        let mut publication = self.publication.lock();
         if publication.phase == TableCommitPublicationPhase::Complete {
             return Ok(());
         }
@@ -1363,12 +1363,6 @@ where
     ) -> TableCommitObservedObject {
         let identity = match object {
             None => TableCommitObjectIdentity::Missing,
-            Some(object) if object.etag.is_some() => {
-                TableCommitObjectIdentity::Metadata(crate::table_catalog::TableCatalogObjectMetadata {
-                    etag: object.etag.clone(),
-                    mod_time: object.mod_time,
-                })
-            }
             Some(object) => TableCommitObjectIdentity::ContentSha256(hex_sha256(&object.data, str::to_string)),
         };
         TableCommitObservedObject { identity, max_size }
@@ -1409,7 +1403,7 @@ where
         let publication_lock = crate::table_catalog::default_table_publication_lock_path(&namespace, &table);
         let publication_lock_key = (table_bucket.to_string(), publication_lock.clone());
         let expected = {
-            let mut publication = self.publication.lock().await;
+            let mut publication = self.publication.lock();
             match publication.phase {
                 TableCommitPublicationPhase::Prepared => return Ok(()),
                 TableCommitPublicationPhase::Discovering => {
@@ -1458,7 +1452,7 @@ where
         }
         .await;
 
-        let mut publication = self.publication.lock().await;
+        let mut publication = self.publication.lock();
         match prepared {
             Ok(guards) if publication.observed_objects == expected => {
                 publication.guards = guards;
@@ -1478,8 +1472,8 @@ where
         }
     }
 
-    async fn complete_publication(&self) {
-        let mut publication = self.publication.lock().await;
+    fn complete_publication(&self) {
+        let mut publication = self.publication.lock();
         publication.guards.clear();
         publication.phase = TableCommitPublicationPhase::Complete;
     }
@@ -1625,8 +1619,8 @@ where
         self.prepare_publication(table_bucket, namespace, table).await
     }
 
-    async fn complete_table_commit_publication(&self) {
-        self.complete_publication().await;
+    fn complete_table_commit_publication(&self) {
+        self.complete_publication();
     }
 }
 
@@ -4403,7 +4397,7 @@ where
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table, &entry, None, &metadata).await?;
     store
-        .register_table(entry.clone())
+        .register_table_with_publication(entry.clone(), metadata_backend)
         .await
         .map_err(catalog_store_already_exists_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
@@ -4778,13 +4772,10 @@ async fn publish_table_commit<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    metadata_backend
-        .prepare_table_commit_publication(&request.table_bucket, &request.namespace, &request.table)
+    store
+        .commit_table_with_publication(request, metadata_backend)
         .await
-        .map_err(catalog_store_error)?;
-    let result = store.commit_table(request).await;
-    metadata_backend.complete_table_commit_publication().await;
-    result.map_err(catalog_store_error)
+        .map_err(catalog_store_error)
 }
 
 async fn update_table_metadata_location_response<S>(
@@ -5130,12 +5121,12 @@ where
         None => None,
     };
     if let (Some(by_commit_id), Some(by_idempotency_key)) = (&by_commit_id, &by_idempotency_key)
-        && by_commit_id.commit_id != by_idempotency_key.commit_id
+        && !crate::table_catalog::commit_logs_share_recovery_payload(by_commit_id, by_idempotency_key)
     {
         return Err(iceberg_rest_error(
             ICEBERG_ERROR_COMMIT_FAILED,
             StatusCode::CONFLICT,
-            "commit id and idempotency key identify different commits",
+            "commit id and idempotency key identify different commit payloads",
         ));
     }
     Ok(by_commit_id.or(by_idempotency_key))
@@ -6053,13 +6044,10 @@ where
         adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table_name, &entry, None, &target_metadata)
             .await?;
-        metadata_backend
-            .prepare_table_commit_publication(bucket, &namespace.public_name(), table)
+        store
+            .register_table_with_publication(entry.clone(), metadata_backend)
             .await
             .map_err(catalog_store_error)?;
-        let register_result = store.register_table(entry.clone()).await;
-        metadata_backend.complete_table_commit_publication().await;
-        register_result.map_err(catalog_store_error)?;
         (
             EXTERNAL_CATALOG_ACTION_REGISTERED.to_string(),
             load_table_response_from_entry(entry, target_metadata),
@@ -6117,7 +6105,10 @@ where
                 "catalog import target already exists with different table identity or metadata pointer"
             ));
         }
-        store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+        store
+            .register_table_with_publication(entry.clone(), metadata_backend)
+            .await
+            .map_err(catalog_store_error)?;
         Ok(load_table_response_from_entry(entry, metadata))
     }
     .await;

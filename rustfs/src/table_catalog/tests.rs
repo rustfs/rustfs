@@ -230,6 +230,18 @@ impl TableCatalogStore for NoopTableCatalogStore {
         Ok(())
     }
 
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.register_table(entry).await
+    }
+
     async fn list_tables(&self, _table_bucket: &str, _namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         Ok(Vec::new())
     }
@@ -284,6 +296,18 @@ impl TableCatalogStore for NoopTableCatalogStore {
         };
 
         Ok(TableCommitResult { table, commit_log })
+    }
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.commit_table(request).await
     }
 
     async fn drop_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
@@ -392,6 +416,74 @@ async fn table_catalog_store_trait_has_atomic_commit_shape() {
     assert_eq!(result.table.version_token, "token-v2");
     assert_eq!(result.table.generation, 2);
     assert_eq!(result.commit_log.status, CommitLogStatus::Committed);
+}
+
+async fn assert_direct_commit_uses_publication_lock<S>(store: &S, backend: &TestCatalogObjectBackend)
+where
+    S: TableCatalogStore + ?Sized,
+{
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let publication_lock = default_table_publication_lock_path(&namespace, &table);
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    let acquisitions_before = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
+
+    store
+        .commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "commit-1".to_string(),
+            idempotency_key: None,
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata,
+            new_metadata_location: new_metadata,
+            requirements: Vec::new(),
+            writer: Some("rustfs-maintenance".to_string()),
+        })
+        .await
+        .expect("direct commit should succeed");
+
+    assert_eq!(
+        backend.write_lock_acquisition_count(bucket, &publication_lock).await,
+        acquisitions_before + 1
+    );
+    let guard = tokio::time::timeout(
+        StdDuration::from_secs(1),
+        TableCatalogObjectBackend::acquire_write_lock(backend, bucket, &publication_lock),
+    )
+    .await
+    .expect("publication lock should be released after commit")
+    .expect("publication lock should be reacquired");
+    drop(guard);
+}
+
+#[tokio::test]
+async fn catalog_backings_fence_direct_commits_with_publication_lock() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_direct_commit_uses_publication_lock(&object_store, &object_backend).await;
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
+    assert_direct_commit_uses_publication_lock(&strong_store, &strong_backend).await;
 }
 
 #[test]
@@ -1340,6 +1432,82 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
     validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
         .expect("shared manifest objects must consume the commit budget only once");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_enforces_the_publication_object_budget() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/boundary-list.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/boundary-manifest.avro";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/boundary-list.avro",
+            manifest_list_avro_bytes(&[manifest]),
+        )
+        .await;
+
+    let data_file_count = TABLE_COMMIT_MAX_GRAPH_OBJECTS - 2;
+    let data_files = (0..data_file_count)
+        .map(|index| format!("s3://warehouse/tables/table-id/data/part-{index:05}.parquet"))
+        .collect::<Vec<_>>();
+    for data_file in &data_files {
+        backend
+            .seed_object(
+                "warehouse",
+                data_file
+                    .strip_prefix("s3://warehouse/")
+                    .expect("test data location should be in warehouse"),
+                vec![1],
+            )
+            .await;
+    }
+    let mut references = data_files.iter().map(|data_file| (data_file.as_str(), 0)).collect::<Vec<_>>();
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/boundary-manifest.avro",
+            manifest_avro_bytes(&references),
+        )
+        .await;
+
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 20,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(20);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 20}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+
+    validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect("a graph at the publication object boundary should validate");
+
+    let overflow = "s3://warehouse/tables/table-id/data/overflow.parquet";
+    backend
+        .seed_object("warehouse", "tables/table-id/data/overflow.parquet", vec![1])
+        .await;
+    references.push((overflow, 0));
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/boundary-manifest.avro",
+            manifest_avro_bytes(&references),
+        )
+        .await;
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("a graph above the publication object boundary must be rejected during validation");
+    assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("graph objects")));
 }
 
 #[tokio::test]
@@ -8878,9 +9046,41 @@ fn failed_commit_does_not_prove_historical_staged_commit() {
         updated_at: None,
     };
 
-    assert!(!table_commit_history_proves_committed(&table, &target, &[target.clone(), failed.clone()]));
+    let commits = [target.clone(), failed.clone()];
+    assert!(!TableCommitHistoryIndex::new(&table, commits.iter()).proves_committed(&target));
     let recovery = table_commit_recovery_entry(&table, &failed, None, false);
     assert_eq!(recovery.recovery_state, TableCommitRecoveryState::ManualReview);
+}
+
+#[test]
+fn commit_history_index_scales_across_a_long_table_history() {
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table_name = IdentifierSegment::parse("orders").expect("table should parse");
+    let commit_count = 10_000;
+    let commits = (0..commit_count)
+        .map(|index| CommitLogEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            commit_id: format!("commit-{index:05}"),
+            idempotency_key: None,
+            table_id: "table-id".to_string(),
+            operation: "append".to_string(),
+            expected_version_token: format!("token-{index:05}"),
+            new_version_token: format!("token-{:05}", index + 1),
+            previous_metadata_location: format!("metadata/v{index:05}.metadata.json"),
+            new_metadata_location: format!("metadata/v{:05}.metadata.json", index + 1),
+            requirements: Vec::new(),
+            status: CommitLogStatus::Staged,
+            writer: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .collect::<Vec<_>>();
+    let mut table = test_table_entry("analytics", &namespace, &table_name, format!("metadata/v{commit_count:05}.metadata.json"));
+    table.version_token = format!("token-{commit_count:05}");
+
+    let history = TableCommitHistoryIndex::new(&table, commits.iter());
+
+    assert!(commits.iter().all(|commit| history.proves_committed(commit)));
 }
 
 #[tokio::test]
@@ -9303,7 +9503,7 @@ async fn table_commit_recovery_does_not_overwrite_conflicting_idempotency_index(
     };
     let committed = store.commit_table(request.clone()).await.expect("commit should succeed");
     let mut conflicting_index = committed.commit_log;
-    conflicting_index.new_metadata_location = "different/metadata.json".to_string();
+    conflicting_index.new_version_token = "different-token".to_string();
     backend
         .seed_object(
             RUSTFS_META_BUCKET,
@@ -9362,6 +9562,78 @@ async fn table_commit_recovery_does_not_overwrite_conflicting_idempotency_index(
             .expect("conflicting index should remain")
             .data,
         index_before
+    );
+}
+
+#[tokio::test]
+async fn strong_table_commit_retry_rejects_token_only_idempotency_conflict() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    let request = TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        commit_id: "commit-1".to_string(),
+        idempotency_key: Some("client-request-1".to_string()),
+        operation: "append".to_string(),
+        expected_version_token: "token-v1".to_string(),
+        expected_metadata_location: current_metadata,
+        new_metadata_location: new_metadata,
+        requirements: Vec::new(),
+        writer: None,
+    };
+    store
+        .commit_table(request.clone())
+        .await
+        .expect("initial strong catalog commit should succeed");
+
+    let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+    let snapshot_object = backend
+        .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+        .await
+        .expect("strong snapshot lookup should succeed")
+        .expect("strong snapshot should exist");
+    let mut snapshot = serde_json::from_slice::<serde_json::Value>(&snapshot_object.data).expect("strong snapshot should decode");
+    assert_eq!(snapshot["commits"].as_array().map(Vec::len), Some(1));
+    assert_eq!(snapshot["idempotency"].as_array().map(Vec::len), Some(1));
+    snapshot["idempotency"][0]["commit"]["new_version_token"] = serde_json::json!("different-token");
+    let conflicting_snapshot = serde_json::to_vec(&snapshot).expect("conflicting strong snapshot should encode");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &snapshot_path, conflicting_snapshot.clone())
+        .await;
+
+    let retry_error = store
+        .commit_table(request)
+        .await
+        .expect_err("token-only idempotency mismatch must fail closed in strong mode");
+    assert_matches!(retry_error, TableCatalogStoreError::Conflict(_));
+    assert_eq!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &snapshot_path)
+            .await
+            .expect("strong snapshot lookup should succeed")
+            .expect("strong snapshot should remain")
+            .data,
+        conflicting_snapshot
     );
 }
 

@@ -53,17 +53,20 @@ pub struct RestRegisterTableHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestRegisterTableHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        let request = read_json_body::<RegisterTableRequest>(req.input).await?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<RegisterTableRequest>(std::mem::take(&mut req.input)).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
-        let response =
-            register_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result =
+            register_table_response(&store, &commit_backend, &warehouse, &namespace, request, table_bucket_enabled).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -209,19 +212,21 @@ pub struct ImportTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ImportTableCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        let request = read_json_body::<CatalogImportRequest>(req.input).await?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<CatalogImportRequest>(std::mem::take(&mut req.input)).await?;
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
-        let response =
-            catalog_import_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, table_bucket_enabled)
-                .await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result =
+            catalog_import_response(&store, &commit_backend, &warehouse, &namespace, &table, request, table_bucket_enabled).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

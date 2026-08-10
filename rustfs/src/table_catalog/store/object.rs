@@ -959,6 +959,17 @@ where
         entry: TableEntry,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        self.write_table_entry_with_publication(entry, precondition, &publication)
+            .await
+    }
+
+    async fn write_table_entry_with_publication(
+        &self,
+        entry: TableEntry,
+        precondition: TableCatalogPutPrecondition,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
         validate_catalog_entry_version("table", entry.version)?;
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
@@ -974,6 +985,11 @@ where
             .await?;
         let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
         let _table_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let reservation = self.reserve_table_warehouse_index(&entry).await?;
         let result = self
             .write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
@@ -1091,12 +1107,9 @@ where
         finalized_count: usize,
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
         let commit_logs_with_paths = self.read_table_commit_logs(entry).await?;
-        let commit_logs = commit_logs_with_paths
-            .iter()
-            .map(|(_, commit_log)| commit_log.clone())
-            .collect::<Vec<_>>();
-        let mut commits = Vec::with_capacity(commit_logs.len());
-        for (_, commit_log) in commit_logs_with_paths {
+        let history = TableCommitHistoryIndex::new(entry, commit_logs_with_paths.iter().map(|(_, commit_log)| commit_log));
+        let mut commits = Vec::with_capacity(commit_logs_with_paths.len());
+        for (_, commit_log) in &commit_logs_with_paths {
             let idempotency_commit = match commit_log.idempotency_key.as_deref() {
                 Some(idempotency_key) => {
                     let idempotency_path =
@@ -1108,9 +1121,9 @@ where
             };
             commits.push(table_commit_recovery_entry(
                 entry,
-                &commit_log,
+                commit_log,
                 idempotency_commit.as_ref(),
-                table_commit_history_proves_committed(entry, &commit_log, &commit_logs),
+                history.proves_committed(commit_log),
             ));
         }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
@@ -1190,12 +1203,9 @@ where
         };
 
         let commit_logs_with_paths = self.read_table_commit_logs(&entry).await?;
-        let commit_logs = commit_logs_with_paths
-            .iter()
-            .map(|(_, commit_log)| commit_log.clone())
-            .collect::<Vec<_>>();
+        let history = TableCommitHistoryIndex::new(&entry, commit_logs_with_paths.iter().map(|(_, commit_log)| commit_log));
         let mut finalized_count = 0;
-        for (commit_path, commit_log) in commit_logs_with_paths {
+        for (commit_path, commit_log) in &commit_logs_with_paths {
             let idempotency_path = commit_log.idempotency_key.as_deref().map(|idempotency_key| {
                 self.paths
                     .commit_idempotency_entry_path(table_bucket, &entry.table_id, idempotency_key)
@@ -1206,17 +1216,17 @@ where
             };
             let recovery_entry = table_commit_recovery_entry(
                 &entry,
-                &commit_log,
+                commit_log,
                 idempotency_commit.as_ref(),
-                table_commit_history_proves_committed(&entry, &commit_log, &commit_logs),
+                history.proves_committed(commit_log),
             );
             if matches!(
                 recovery_entry.recovery_state,
                 TableCommitRecoveryState::FinalizationRequired | TableCommitRecoveryState::IdempotencyIndexRepairRequired
             ) {
-                let mut committed = commit_log;
+                let mut committed = commit_log.clone();
                 committed.status = CommitLogStatus::Committed;
-                self.finalize_commit_log(&commit_path, idempotency_path.as_deref(), &committed)
+                self.finalize_commit_log(commit_path, idempotency_path.as_deref(), &committed)
                     .await?;
                 finalized_count += 1;
             }
@@ -3263,10 +3273,10 @@ where
             ));
         }
 
-        let publication_lock = default_table_publication_lock_path(&namespace, &table);
-        let _publication_guard = self.backend.acquire_write_lock(table_bucket, &publication_lock).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        let publication_lock = default_table_publication_lock_path(&namespace, &table);
+        let _publication_guard = self.backend.acquire_write_lock(table_bucket, &publication_lock).await?;
         let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
@@ -3657,6 +3667,15 @@ where
         self.write_table_entry(entry, TableCatalogPutPrecondition::IfAbsent).await
     }
 
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        self.write_table_entry_with_publication(entry, TableCatalogPutPrecondition::IfAbsent, publication)
+            .await
+    }
+
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
         let mut entries = Vec::new();
@@ -3756,6 +3775,15 @@ where
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        self.commit_table_with_publication(request, &publication).await
+    }
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
@@ -3763,6 +3791,11 @@ where
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?;
         let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
 
         let Some((current, current_etag)) = self
             .read_table_with_etag_unlocked(&request.table_bucket, &namespace, &table)
@@ -3795,6 +3828,21 @@ where
             None => None,
         };
 
+        if let (Some(existing), Some(indexed)) = (&existing_commit, &existing_idempotency_commit)
+            && !commit_logs_share_recovery_payload(existing, indexed)
+        {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Conflict(
+                    "commit record and idempotency index contain different payloads".to_string(),
+                )),
+            );
+        }
         if let Some(existing) = existing_idempotency_commit.as_ref()
             && !commit_log_matches_request(existing, &request, &current.table_id)
         {
@@ -3871,7 +3919,7 @@ where
                     .into_iter()
                     .map(|(_, commit_log)| commit_log)
                     .collect::<Vec<_>>();
-                table_commit_history_proves_committed(&current, existing, &commit_logs)
+                TableCommitHistoryIndex::new(&current, commit_logs.iter()).proves_committed(existing)
             } else {
                 false
             };

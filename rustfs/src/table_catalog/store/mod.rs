@@ -166,6 +166,12 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()>;
+
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
@@ -200,6 +206,12 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     /// Callers publishing client-supplied Iceberg metadata must validate its logical shape and the physical graph of
     /// newly introduced or changed snapshots before invoking this persistence boundary.
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult>;
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
 
@@ -241,6 +253,68 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         table_id: &str,
         idempotency_key: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait TableCommitPublication: Send + Sync {
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
+
+    fn complete(&self);
+}
+
+pub(crate) struct TableCommitPublicationCompletion<'a> {
+    publication: &'a (dyn TableCommitPublication + Sync),
+}
+
+impl<'a> TableCommitPublicationCompletion<'a> {
+    pub(crate) fn new(publication: &'a (dyn TableCommitPublication + Sync)) -> Self {
+        Self { publication }
+    }
+}
+
+impl Drop for TableCommitPublicationCompletion<'_> {
+    fn drop(&mut self) {
+        self.publication.complete();
+    }
+}
+
+struct TableCommitLockPublication<'a, B> {
+    backend: &'a B,
+    guard: parking_lot::Mutex<Option<Box<dyn Send>>>,
+}
+
+impl<'a, B> TableCommitLockPublication<'a, B> {
+    fn new(backend: &'a B) -> Self {
+        Self {
+            backend,
+            guard: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a, B> TableCommitPublication for TableCommitLockPublication<'a, B>
+where
+    B: TableCatalogObjectBackend,
+{
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication_lock = default_table_publication_lock_path(&namespace, &table);
+        let guard = self.backend.acquire_write_lock(table_bucket, &publication_lock).await?;
+        let mut current = self.guard.lock();
+        if current.is_some() {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit publication lock is already held".to_string(),
+            ));
+        }
+        *current = Some(guard);
+        Ok(())
+    }
+
+    fn complete(&self) {
+        drop(self.guard.lock().take());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +472,21 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         Ok(())
     }
 
-    async fn complete_table_commit_publication(&self) {}
+    fn complete_table_commit_publication(&self) {}
+}
+
+#[async_trait::async_trait]
+impl<B> TableCommitPublication for B
+where
+    B: TableCatalogObjectBackend,
+{
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        self.prepare_table_commit_publication(table_bucket, namespace, table).await
+    }
+
+    fn complete(&self) {
+        self.complete_table_commit_publication();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,6 +896,17 @@ where
         }
     }
 
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.register_table_with_publication(entry, publication).await,
+            Self::DurableStrong(store) => store.register_table_with_publication(entry, publication).await,
+        }
+    }
+
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
@@ -857,6 +956,17 @@ where
         match self {
             Self::ObjectBacked(store) => store.commit_table(request).await,
             Self::DurableStrong(store) => store.commit_table(request).await,
+        }
+    }
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => store.commit_table_with_publication(request, publication).await,
+            Self::DurableStrong(store) => store.commit_table_with_publication(request, publication).await,
         }
     }
 

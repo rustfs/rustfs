@@ -709,12 +709,14 @@ where
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
-        let commit_logs = state
-            .commits
-            .iter()
-            .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
-            .map(|(_, commit_log)| commit_log.clone())
-            .collect::<Vec<_>>();
+        let history = TableCommitHistoryIndex::new(
+            entry,
+            state
+                .commits
+                .iter()
+                .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
+                .map(|(_, commit_log)| commit_log),
+        );
         let mut commits = state
             .commits
             .iter()
@@ -725,12 +727,7 @@ where
                         .idempotency
                         .get(&Self::idempotency_key(&entry.table_bucket, &entry.table_id, idempotency_key))
                 });
-                table_commit_recovery_entry(
-                    entry,
-                    commit_log,
-                    idempotency_commit,
-                    table_commit_history_proves_committed(entry, commit_log, &commit_logs),
-                )
+                table_commit_recovery_entry(entry, commit_log, idempotency_commit, history.proves_committed(commit_log))
             })
             .collect::<Vec<_>>();
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
@@ -794,6 +791,13 @@ where
             .map(|idempotency_key| Self::idempotency_key(&request.table_bucket, &current.table_id, idempotency_key));
         let existing_idempotency_commit = idempotency_key.as_ref().and_then(|key| state.idempotency.get(key));
 
+        if let (Some(existing), Some(indexed)) = (existing_commit, existing_idempotency_commit)
+            && !commit_logs_share_recovery_payload(existing, indexed)
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "commit record and idempotency index contain different payloads".to_string(),
+            ));
+        }
         if let Some(existing) = existing_idempotency_commit
             && !commit_log_matches_request(existing, request, &current.table_id)
         {
@@ -824,15 +828,17 @@ where
                 && !table_matches_staged_base(&current, existing)
                 && !table_matches_committed_log(&current, existing)
             {
-                let commit_logs = state
-                    .commits
-                    .iter()
-                    .filter(|((table_bucket, table_id, _), _)| {
-                        table_bucket == &request.table_bucket && table_id == &current.table_id
-                    })
-                    .map(|(_, commit_log)| commit_log.clone())
-                    .collect::<Vec<_>>();
-                table_commit_history_proves_committed(&current, existing, &commit_logs)
+                TableCommitHistoryIndex::new(
+                    &current,
+                    state
+                        .commits
+                        .iter()
+                        .filter(|((table_bucket, table_id, _), _)| {
+                            table_bucket == &request.table_bucket && table_id == &current.table_id
+                        })
+                        .map(|(_, commit_log)| commit_log),
+                )
+                .proves_committed(existing)
             } else {
                 false
             };
@@ -878,13 +884,17 @@ where
             && !table_matches_staged_base(&current, &existing)
             && !table_matches_committed_log(&current, &existing)
         {
-            let commit_logs = state
-                .commits
-                .iter()
-                .filter(|((table_bucket, table_id, _), _)| table_bucket == &request.table_bucket && table_id == &current.table_id)
-                .map(|(_, commit_log)| commit_log.clone())
-                .collect::<Vec<_>>();
-            table_commit_history_proves_committed(&current, &existing, &commit_logs)
+            TableCommitHistoryIndex::new(
+                &current,
+                state
+                    .commits
+                    .iter()
+                    .filter(|((table_bucket, table_id, _), _)| {
+                        table_bucket == &request.table_bucket && table_id == &current.table_id
+                    })
+                    .map(|(_, commit_log)| commit_log),
+            )
+            .proves_committed(&existing)
         } else {
             false
         };
@@ -1260,12 +1270,26 @@ where
     }
 
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        self.register_table_with_publication(entry, &publication).await
+    }
+
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         validate_catalog_entry_version("table", entry.version)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         table_warehouse_object_prefix(&entry)?;
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
@@ -1386,12 +1410,26 @@ where
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        self.commit_table_with_publication(request, &publication).await
+    }
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let key = Self::table_key(&request.table_bucket, &namespace, &table);
 
         let committed_existing_result = {

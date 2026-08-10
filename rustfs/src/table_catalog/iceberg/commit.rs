@@ -41,42 +41,47 @@ pub(crate) fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitL
         && table.version_token == commit_log.expected_version_token
 }
 
-pub(crate) fn table_commit_history_proves_committed(
-    table: &TableEntry,
-    target: &CommitLogEntry,
-    commits: &[CommitLogEntry],
-) -> bool {
-    if table.table_id != target.table_id || matches!(target.status, CommitLogStatus::Failed) {
-        return false;
-    }
-    let target_state = (target.new_metadata_location.as_str(), target.new_version_token.as_str());
-    let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
-    if state == target_state {
-        return true;
-    }
+pub(crate) struct TableCommitHistoryIndex<'a> {
+    table_id: &'a str,
+    reachable_states: BTreeSet<(&'a str, &'a str)>,
+}
 
-    let mut by_new_state = BTreeMap::<(&str, &str), Option<&CommitLogEntry>>::new();
-    for commit in commits
-        .iter()
-        .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
-    {
-        let key = (commit.new_metadata_location.as_str(), commit.new_version_token.as_str());
-        by_new_state
-            .entry(key)
-            .and_modify(|candidate| *candidate = None)
-            .or_insert(Some(commit));
-    }
-    let mut visited = BTreeSet::new();
-    while visited.insert(state) {
-        let Some(Some(commit)) = by_new_state.get(&state) else {
-            return false;
-        };
-        state = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
-        if state == target_state {
-            return true;
+impl<'a> TableCommitHistoryIndex<'a> {
+    pub(crate) fn new(table: &'a TableEntry, commits: impl IntoIterator<Item = &'a CommitLogEntry>) -> Self {
+        let mut by_new_state = BTreeMap::<(&str, &str), Option<(&str, &str)>>::new();
+        for commit in commits
+            .into_iter()
+            .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
+        {
+            let key = (commit.new_metadata_location.as_str(), commit.new_version_token.as_str());
+            let previous = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
+            by_new_state
+                .entry(key)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(previous));
+        }
+
+        let mut reachable_states = BTreeSet::new();
+        let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
+        while reachable_states.insert(state) {
+            let Some(Some(previous)) = by_new_state.get(&state) else {
+                break;
+            };
+            state = *previous;
+        }
+        Self {
+            table_id: &table.table_id,
+            reachable_states,
         }
     }
-    false
+
+    pub(crate) fn proves_committed(&self, target: &CommitLogEntry) -> bool {
+        self.table_id == target.table_id.as_str()
+            && !matches!(target.status, CommitLogStatus::Failed)
+            && self
+                .reachable_states
+                .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
+    }
 }
 
 pub(crate) fn table_catalog_recovery_summary(
@@ -116,7 +121,7 @@ pub(crate) fn table_catalog_recovery_summary(
     (metadata_status.unwrap_or(TableCatalogRecoveryStatus::Healthy), actions)
 }
 
-fn commit_logs_share_recovery_payload(left: &CommitLogEntry, right: &CommitLogEntry) -> bool {
+pub(crate) fn commit_logs_share_recovery_payload(left: &CommitLogEntry, right: &CommitLogEntry) -> bool {
     left.version == right.version
         && left.commit_id == right.commit_id
         && left.idempotency_key == right.idempotency_key
