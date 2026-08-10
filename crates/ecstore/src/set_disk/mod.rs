@@ -837,10 +837,7 @@ mod prepared_get_object_metadata_tests {
                     .await
                     .expect("prepared metadata should resolve");
                 let prepared_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
-                assert_eq!(
-                    prepared_calls, 3,
-                    "default prepared GET metadata should stop after the 2+2 read/write quorum"
-                );
+                assert_eq!(prepared_calls, 4, "default prepared GET metadata should keep full data-read fanout");
 
                 let mut reader = set_disks
                     .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
@@ -864,7 +861,7 @@ mod prepared_get_object_metadata_tests {
         );
         assert_eq!(
             calls.total(disk_call_counters::KIND_READ_VERSION),
-            3,
+            4,
             "reader construction must consume prepared metadata instead of repeating the fanout"
         );
     }
