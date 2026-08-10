@@ -44,9 +44,9 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ScannerActivityRequest,
-    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
-    StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
+    ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse,
+    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
     TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
@@ -78,6 +78,7 @@ pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 /// reload signal transport.
 pub const KMS_SIGNAL_SUBSYSTEM: &str = "kms";
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const REPLACEMENT_RECOVERY_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
 const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
@@ -1077,6 +1078,38 @@ impl PeerRestClient {
                     ));
                 }
                 Ok(Some(response.bg_heal_state.to_vec()))
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn replacement_recovery_status(&self) -> Result<Option<Vec<u8>>> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(REPLACEMENT_RECOVERY_STATUS_MAX_MESSAGE_SIZE);
+                let response = match client
+                    .replacement_recovery_status(Request::new(ReplacementRecoveryStatusRequest::default()))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // RUSTFS_COMPAT_TODO(replacement-recovery-status-v1): old peers cannot prove replacement completion during rolling upgrades. Remove after the minimum supported RustFS peer version implements ReplacementRecoveryStatus.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                if !response.success {
+                    return Err(Error::other(
+                        response
+                            .error_info
+                            .unwrap_or_else(|| "peer replacement recovery status failed without an error".to_string()),
+                    ));
+                }
+                Ok(Some(response.recovery_status.to_vec()))
             }
             .await,
         )

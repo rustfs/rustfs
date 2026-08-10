@@ -22,7 +22,7 @@ use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
     HealControlCoordinator, NodeHealProgress, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
-    heal_control_coordinator, heal_topology_fingerprint,
+    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -40,7 +40,7 @@ use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
-const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 1;
+const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HealInitParams {
@@ -527,6 +527,204 @@ async fn read_cluster_heal_status(
     .await;
 
     merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes, topology_complete)
+}
+
+async fn query_peer_replacement_recovery_status<E>(
+    host: &str,
+    request: impl std::future::Future<Output = Result<Option<Vec<u8>>, E>>,
+    request_timeout: Duration,
+) -> Result<Option<rustfs_heal::ReplacementRecoverySnapshot>, String>
+where
+    E: std::fmt::Display,
+{
+    match timeout(request_timeout, request).await {
+        Ok(Ok(Some(status))) => decode_node_replacement_recovery_status(&status)
+            .map(|snapshot| Some(snapshot.snapshot))
+            .map_err(|err| format!("peer {host}: {err}")),
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(err)) => Err(format!("peer {host}: {err}")),
+        Err(_) => Err(format!("peer {host}: replacement recovery status timed out")),
+    }
+}
+
+fn canonical_replacement_records(
+    records: &[rustfs_heal::ReplacementRecoveryRecord],
+) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
+    let mut records = records.to_vec();
+    for record in &mut records {
+        record.target_slots.sort();
+    }
+    records.sort_by(|left, right| {
+        (
+            &left.task_id,
+            &left.generation,
+            &left.set_disk_id,
+            left.state,
+            &left.target_slots,
+            &left.verified_at,
+            &left.reason,
+        )
+            .cmp(&(
+                &right.task_id,
+                &right.generation,
+                &right.set_disk_id,
+                right.state,
+                &right.target_slots,
+                &right.verified_at,
+                &right.reason,
+            ))
+    });
+    records
+}
+
+fn merge_replacement_recovery_records(
+    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
+) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
+    let mut records = BTreeMap::<String, rustfs_heal::ReplacementRecoveryRecord>::new();
+    for snapshot in snapshots {
+        for record in canonical_replacement_records(&snapshot.records) {
+            match records.entry(record.task_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let task_id = entry.key().clone();
+                    entry.insert(rustfs_heal::ReplacementRecoveryRecord {
+                        task_id,
+                        state: rustfs_heal::ReplacementRecoveryState::Unknown,
+                        generation: None,
+                        set_disk_id: None,
+                        target_slots: Vec::new(),
+                        reason: Some("peer replacement recovery records disagree".to_string()),
+                        verified_at: None,
+                    });
+                }
+            }
+        }
+    }
+    records.into_values().collect()
+}
+
+fn aggregate_replacement_recovery_cluster_status(
+    mut snapshots: Vec<rustfs_heal::ReplacementRecoverySnapshot>,
+    peer_statuses: Vec<Result<Option<rustfs_heal::ReplacementRecoverySnapshot>, String>>,
+    expected_nodes: usize,
+    topology_complete: bool,
+) -> ReplacementRecoveryClusterStatus {
+    let mut reason = None::<&'static str>;
+    if !topology_complete {
+        reason = Some("peer_topology_incomplete");
+    }
+
+    for status in peer_statuses {
+        match status {
+            Ok(Some(snapshot)) => snapshots.push(snapshot),
+            Ok(None) => {
+                reason.get_or_insert("peer_replacement_recovery_status_unsupported");
+            }
+            Err(_) => {
+                reason.get_or_insert("peer_replacement_recovery_status_unavailable");
+            }
+        }
+    }
+
+    if snapshots.len() != expected_nodes {
+        reason.get_or_insert("peer_replacement_recovery_status_incomplete");
+    }
+    if snapshots.iter().any(|snapshot| !snapshot.definitive) {
+        reason.get_or_insert("peer_replacement_recovery_status_not_definitive");
+    }
+
+    let first_records = snapshots
+        .first()
+        .map(|snapshot| canonical_replacement_records(&snapshot.records));
+    if let Some(first_records) = &first_records
+        && snapshots
+            .iter()
+            .skip(1)
+            .any(|snapshot| canonical_replacement_records(&snapshot.records) != *first_records)
+    {
+        reason.get_or_insert("peer_replacement_recovery_status_conflict");
+    }
+
+    let records = merge_replacement_recovery_records(&snapshots);
+    if records
+        .iter()
+        .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
+    {
+        reason.get_or_insert("peer_replacement_recovery_status_conflict");
+    }
+
+    ReplacementRecoveryClusterStatus {
+        definitive: reason.is_none(),
+        reason: reason.map(str::to_string),
+        records,
+    }
+}
+
+async fn read_cluster_replacement_recovery_status(
+    local: rustfs_heal::ReplacementRecoverySnapshot,
+    notification_system: Option<&crate::admin::storage_api::runtime_sources::NotificationSys>,
+    expected_nodes: usize,
+) -> S3Result<ReplacementRecoveryClusterStatus> {
+    if expected_nodes == 1 {
+        return Ok(aggregate_replacement_recovery_cluster_status(
+            vec![local],
+            Vec::new(),
+            expected_nodes,
+            true,
+        ));
+    }
+    let Some(notification_system) = notification_system else {
+        return Ok(ReplacementRecoveryClusterStatus {
+            definitive: false,
+            reason: Some("notification_system_unavailable".to_string()),
+            records: local.records,
+        });
+    };
+    let topology_complete = peer_topology_complete(
+        expected_nodes,
+        notification_system.peer_clients.len(),
+        notification_system
+            .peer_clients
+            .iter()
+            .filter(|client| client.is_none())
+            .count(),
+        notification_system.all_peer_clients.len(),
+        notification_system
+            .all_peer_clients
+            .iter()
+            .filter(|client| client.is_some())
+            .count(),
+    );
+    if !topology_complete {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "replacement_recovery_status",
+            result = "degraded",
+            reason = "peer_topology_incomplete",
+            "cluster replacement recovery status will be partial"
+        );
+    }
+
+    let peer_statuses = join_all(notification_system.peer_clients.iter().map(|client| async move {
+        let Some(client) = client else {
+            return Err("configured peer is unavailable".to_string());
+        };
+        let host = client.host.to_string();
+        query_peer_replacement_recovery_status(&host, client.replacement_recovery_status(), PEER_HEAL_STATUS_TIMEOUT).await
+    }))
+    .await;
+
+    Ok(aggregate_replacement_recovery_cluster_status(
+        vec![local],
+        peer_statuses,
+        expected_nodes,
+        topology_complete,
+    ))
 }
 
 fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
@@ -1036,21 +1234,20 @@ pub(crate) struct ReplacementRecoveryStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReplacementRecoveryClusterStatus {
     pub definitive: bool,
-    pub reason: &'static str,
+    pub reason: Option<String>,
+    pub records: Vec<rustfs_heal::ReplacementRecoveryRecord>,
 }
 
 fn build_replacement_recovery_status_response(
     local: rustfs_heal::ReplacementRecoverySnapshot,
+    cluster: ReplacementRecoveryClusterStatus,
 ) -> ReplacementRecoveryStatusResponse {
     ReplacementRecoveryStatusResponse {
         contract_version: REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION,
         path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
-        scope: "local_survivor_disks",
+        scope: "cluster_survivor_disks",
         local,
-        cluster: ReplacementRecoveryClusterStatus {
-            definitive: false,
-            reason: "distributed replacement recovery status requires a peer capability RPC",
-        },
+        cluster,
     }
 }
 
@@ -1347,8 +1544,21 @@ impl Operation for ReplacementRecoveryStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_heal_admin_request(&req).await?;
 
+        let Some(context) = app_context_from_req(&req) else {
+            return Err(cluster_heal_status_unavailable("server_not_initialized"));
+        };
+        let Some(endpoints) = context.endpoints().handle() else {
+            return Err(cluster_heal_status_unavailable("endpoint_topology_unavailable"));
+        };
+        let expected_nodes = endpoints.get_nodes().len();
+        if expected_nodes == 0 {
+            return Err(cluster_heal_status_unavailable("endpoint_topology_empty"));
+        }
+        let notification_system = context.notification_system().handle();
         let local = rustfs_heal::current_replacement_recovery_snapshot().await;
-        let response = build_replacement_recovery_status_response(local);
+        let cluster =
+            read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
+        let response = build_replacement_recovery_status_response(local, cluster);
         let body = encode_replacement_recovery_status(&response)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1368,14 +1578,17 @@ mod tests {
     use super::extract_heal_init_params;
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
-        background_heal_runtime_state, build_heal_channel_request, build_replacement_recovery_status_response,
-        encode_background_heal_status, encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability,
-        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, json_response,
-        map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_start_success,
+        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
+        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status,
         reject_heal_admission, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
-    use crate::storage::rpc::node_service::heal::{NodeHealProgress, NodeHealStatusSnapshot};
+    use crate::storage::rpc::node_service::heal::{
+        NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
+    };
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
@@ -1393,6 +1606,26 @@ mod tests {
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;
+
+    fn replacement_record(task_id: &str) -> rustfs_heal::ReplacementRecoveryRecord {
+        rustfs_heal::ReplacementRecoveryRecord {
+            task_id: task_id.to_string(),
+            state: rustfs_heal::ReplacementRecoveryState::Completed,
+            generation: Some(task_id.to_string()),
+            set_disk_id: Some("pool_0_set_0".to_string()),
+            target_slots: vec!["http://node-a:9000/mnt/disk1".to_string()],
+            reason: None,
+            verified_at: Some(42),
+        }
+    }
+
+    fn replacement_snapshot(task_id: &str) -> rustfs_heal::ReplacementRecoverySnapshot {
+        rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![replacement_record(task_id)],
+            definitive: true,
+            reason: None,
+        }
+    }
 
     #[tokio::test]
     async fn cluster_capability_gate_runs_before_execution() {
@@ -1421,32 +1654,94 @@ mod tests {
     }
 
     #[test]
-    fn replacement_recovery_status_response_never_claims_cluster_completion() {
-        let response = build_replacement_recovery_status_response(rustfs_heal::ReplacementRecoverySnapshot {
-            records: vec![rustfs_heal::ReplacementRecoveryRecord {
-                task_id: "11111111-1111-4111-8111-111111111111".to_string(),
-                state: rustfs_heal::ReplacementRecoveryState::Completed,
-                generation: Some("11111111-1111-4111-8111-111111111111".to_string()),
-                set_disk_id: Some("pool_0_set_0".to_string()),
-                target_slots: vec!["http://node-a:9000/mnt/disk1".to_string()],
-                reason: None,
-                verified_at: Some(42),
-            }],
-            definitive: true,
-            reason: None,
-        });
+    fn replacement_recovery_status_response_reports_cluster_proof() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+        let response = build_replacement_recovery_status_response(local, cluster);
         let value = serde_json::to_value(response).expect("replacement status response should serialize");
 
-        assert_eq!(value["contractVersion"], 1);
+        assert_eq!(value["contractVersion"], 2);
         assert_eq!(value["path"], "/rustfs/admin/v4/heal/replacement-recovery");
-        assert_eq!(value["scope"], "local_survivor_disks");
+        assert_eq!(value["scope"], "cluster_survivor_disks");
         assert_eq!(value["local"]["definitive"], true);
         assert_eq!(value["local"]["records"][0]["state"], "completed");
-        assert_eq!(value["cluster"]["definitive"], false);
-        assert_eq!(
-            value["cluster"]["reason"],
-            "distributed replacement recovery status requires a peer capability RPC"
-        );
+        assert_eq!(value["cluster"]["definitive"], true);
+        assert!(value["cluster"]["reason"].is_null());
+        assert_eq!(value["cluster"]["records"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_requires_peer_capability() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(None)], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_unsupported"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_requires_matching_peer_records() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot("22222222-2222-4222-8222-222222222222");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 2);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_conflicting_records_inside_a_snapshot() {
+        let mut local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let mut conflicting = replacement_record("11111111-1111-4111-8111-111111111111");
+        conflicting.set_disk_id = Some("pool_0_set_1".to_string());
+        local.records.push(conflicting);
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], Vec::new(), 1, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_is_definitive_when_peers_match() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records.len(), 1);
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn peer_replacement_recovery_status_decodes_supported_peers() {
+        let payload = encode_node_replacement_recovery_status(&NodeReplacementRecoveryStatusSnapshot::new(replacement_snapshot(
+            "11111111-1111-4111-8111-111111111111",
+        )))
+        .expect("peer status should encode");
+        let decoded =
+            query_peer_replacement_recovery_status("node-a", async { Ok::<_, String>(Some(payload)) }, Duration::from_secs(1))
+                .await
+                .expect("peer query should succeed")
+                .expect("peer should support status");
+
+        assert_eq!(decoded.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn peer_replacement_recovery_status_treats_missing_rpc_as_unknown() {
+        let decoded = query_peer_replacement_recovery_status(
+            "node-a",
+            async { Ok::<Option<Vec<u8>>, String>(None) },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("missing rpc should not be a transport failure");
+
+        assert!(decoded.is_none());
     }
 
     #[test]
