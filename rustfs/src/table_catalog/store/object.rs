@@ -1052,6 +1052,17 @@ where
             .await?;
         let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
         let _table_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &table);
+        if self
+            .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), &view_path)
+            .await?
+            .is_some()
+        {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "catalog object already exists: view {}/{}/{}",
+                entry.table_bucket, entry.namespace, entry.table
+            )));
+        }
         // Preserve catalog -> publication -> object lock order across rolling upgrades.
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
@@ -1088,6 +1099,17 @@ where
             .await?;
         let view_path = self.paths.view_entry_path(&entry.table_bucket, &namespace, &view);
         let _view_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &view_path).await?;
+        let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &view);
+        if self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &table_path)
+            .await?
+            .is_some()
+        {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "catalog object already exists: table {}/{}/{}",
+                entry.table_bucket, entry.namespace, entry.view
+            )));
+        }
         self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
             .await
     }
@@ -3793,7 +3815,9 @@ where
             if !object.ends_with(TABLE_ENTRY_FILE) {
                 continue;
             }
-            if let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? {
+            if let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await?
+                && entry.state == TableCatalogEntryState::Active
+            {
                 entries.push(entry);
             }
         }
@@ -3834,7 +3858,7 @@ where
             TABLE_ENTRY_FILE,
             cursor,
             limit,
-            |_: &TableEntry| true,
+            |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
             |_, _: &TableEntry| Ok(()),
         )
         .await
@@ -3845,7 +3869,7 @@ where
         let table = parse_table_for_store(table)?;
         self.read_entry::<TableEntry>(self.catalog_bucket(), &self.paths.table_entry_path(table_bucket, &namespace, &table))
             .await
-            .map(|entry| entry.map(|(table, _)| table))
+            .map(|entry| entry.and_then(|(table, _)| (table.state == TableCatalogEntryState::Active).then_some(table)))
     }
 
     async fn resolve_table_data_plane_resource(
@@ -3927,6 +3951,20 @@ where
                 ))),
             );
         };
+        if current.state != TableCatalogEntryState::Active {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    request.table_bucket, request.namespace, request.table
+                ))),
+            );
+        }
 
         let commit_path = self
             .paths
@@ -4341,7 +4379,9 @@ where
             if !object.ends_with(VIEW_ENTRY_FILE) {
                 continue;
             }
-            if let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? {
+            if let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await?
+                && entry.state == TableCatalogEntryState::Active
+            {
                 entries.push(entry);
             }
         }
@@ -4362,7 +4402,7 @@ where
             VIEW_ENTRY_FILE,
             cursor,
             limit,
-            |_: &ViewEntry| true,
+            |entry: &ViewEntry| entry.state == TableCatalogEntryState::Active,
             |_, _: &ViewEntry| Ok(()),
         )
         .await
@@ -4373,7 +4413,7 @@ where
         let view = parse_table_for_store(view)?;
         self.read_entry::<ViewEntry>(self.catalog_bucket(), &self.paths.view_entry_path(table_bucket, &namespace, &view))
             .await
-            .map(|entry| entry.map(|(view, _)| view))
+            .map(|entry| entry.and_then(|(view, _)| (view.state == TableCatalogEntryState::Active).then_some(view)))
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
@@ -4396,6 +4436,12 @@ where
                 request.table_bucket, request.namespace, request.view
             )));
         };
+        if current.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "view {}/{}/{}",
+                request.table_bucket, request.namespace, request.view
+            )));
+        }
         if current.version_token != request.expected_version_token {
             return Err(TableCatalogStoreError::Conflict(
                 "current view version token does not match expected token".to_string(),

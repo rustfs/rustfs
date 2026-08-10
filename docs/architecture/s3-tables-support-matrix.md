@@ -119,6 +119,7 @@ catalog extension.
 | Strong backing state transfer | Supported | Object-backed table bucket, namespace, table, view, commit-log, and idempotency state can be materialized into the durable strong snapshot. The transfer is deterministic, ETag-CAS protected, idempotent after an interrupted finalization, and fails closed when a table or view has no owning namespace entry. |
 | Durable backing migration preflight | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, recovery blockers, warehouse prefix index readiness, persistent write-fence state, target snapshot agreement, and whether every table bucket is ready for cutover. |
 | Durable backing migration execution | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/migration` fences table-bucket registry changes, acquires a persistent per-bucket write fence, drains in-flight catalog mutations, materializes the target snapshot, and reports `ready_to_enable_durable_strong`. `DELETE` safely releases the bucket fence only while its target state has not advanced, and releases the registry fence after the last bucket is cancelled. Both mutations require `admin:MigrateTableCatalog`. |
+| Strong snapshot rolling compatibility | Supported | Durable strong mode reads snapshot versions 1 and 2, writes version 1 by default, and writes version 2 only after both the requested and fleet-confirmed gates are enabled. Once version 2 is observed, subsequent writes never downgrade the snapshot. |
 | Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal` generates an operator runbook covering catalog export, diagnostics, safe recovery repair, rollback/import, durable backing migration dry-run, post-recovery loadTable, and table data-plane policy probes. |
 | Scale and fault rehearsal | Manual/live harness | `failure_coverage.py --print-scale-fault-rehearsal` generates an opt-in runbook for concurrent writer stress, maintenance scheduler lease recovery, durable backing cutover preflight, recovery/rollback/import under load, and post-run evidence capture. |
 | Strong KV/WAL backing cutover | Preview / controlled | Operators can select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` only after every table bucket reports `SNAPSHOT_MATERIALIZED` and `ready_to_enable_durable_strong: true`. Object-only advanced operations fail closed in durable strong mode. |
@@ -153,6 +154,18 @@ warehouse:
    migration instead of restarting against the stale object-backed pointer.
 7. Preserve the object-backed catalog backup until durable strong backing has
    passed the operator's retention window.
+8. Keep strong snapshot writes on version 1 during a rolling binary upgrade.
+   After every catalog writer can read version 2, set both
+   `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2=true` and
+   `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED=true`, then restart
+   the catalog writers. Setting only one gate does not change the write format.
+9. After any version 2 snapshot is persisted, do not roll catalog writers back
+   to a binary that only reads version 1. Current binaries preserve version 2
+   even when the gates are later disabled, so recovery must restore a compatible
+   binary rather than rewriting the durable snapshot to an older version.
+10. A version 1 snapshot that contains the same identifier as both a table and
+    a view is loaded in cleanup-only quarantine. Ambiguous reads fail closed;
+    remove one resource before enabling version 2 writes.
 
 ## Production Failure Coverage
 

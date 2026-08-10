@@ -20,9 +20,9 @@ mod strong;
 
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
-#[cfg(test)]
-pub(super) use strong::StrongTableCatalogSnapshot;
 pub(crate) use strong::StrongTableCatalogStore;
+#[cfg(test)]
+pub(super) use strong::{StrongCommitSnapshotRecord, StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot};
 
 fn validate_namespace_entry_identity(entry: &NamespaceEntry) -> TableCatalogStoreResult<Namespace> {
     validate_catalog_entry_version("namespace", entry.version)?;
