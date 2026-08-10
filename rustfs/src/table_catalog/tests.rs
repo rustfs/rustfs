@@ -486,6 +486,93 @@ async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     assert_direct_commit_uses_publication_lock(&strong_store, &strong_backend).await;
 }
 
+#[tokio::test]
+async fn strong_catalog_blocked_publication_object_does_not_stall_unrelated_writes() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = Arc::new(StrongTableCatalogStore::new(backend.clone()));
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+        .await
+        .expect("table should be created");
+    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+
+    let blocked_object = "tables/table-id/data/late.parquet";
+    let blocker = backend
+        .acquire_write_lock(bucket, blocked_object)
+        .await
+        .expect("blocked object lock should be acquired");
+    let publication = Arc::new(BlockingObjectPublication::new(backend.clone(), blocked_object));
+    let commit_store = Arc::clone(&store);
+    let commit_publication = Arc::clone(&publication);
+    let commit = tokio::spawn(async move {
+        commit_store
+            .commit_table_with_publication(
+                TableCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: namespace.public_name(),
+                    table: table.as_str().to_string(),
+                    commit_id: "blocked-publication".to_string(),
+                    idempotency_key: None,
+                    operation: "append".to_string(),
+                    expected_version_token: "token-v1".to_string(),
+                    expected_metadata_location: current_metadata,
+                    new_metadata_location: new_metadata,
+                    requirements: Vec::new(),
+                    writer: Some("concurrency-test".to_string()),
+                },
+                commit_publication.as_ref(),
+            )
+            .await
+    });
+    publication.wait_started().await;
+
+    tokio::time::timeout(StdDuration::from_secs(5), store.put_table_bucket(test_bucket_entry("independent")))
+        .await
+        .expect("a blocked table publication must not hold the strong catalog write lock")
+        .expect("the unrelated table bucket write should succeed");
+
+    drop(blocker);
+    tokio::time::timeout(StdDuration::from_secs(5), commit)
+        .await
+        .expect("the blocked commit should finish after its object lock is released")
+        .expect("the commit task should join")
+        .expect("the commit should succeed");
+    assert!(
+        store
+            .get_table_bucket("independent")
+            .await
+            .expect("unrelated table bucket lookup should succeed")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist")
+            .metadata_location,
+        default_table_metadata_file_path(
+            &Namespace::parse("sales").expect("namespace should parse"),
+            &IdentifierSegment::parse("orders").expect("table should parse"),
+            "00002.metadata.json",
+        )
+    );
+}
+
 #[test]
 fn catalog_object_entry_paths_use_internal_root_and_hashed_untrusted_ids() {
     let paths = TableCatalogObjectPaths::default();
@@ -558,6 +645,43 @@ impl TestCatalogObjectPutPause {
 
     fn release(&self) {
         self.release.notify_one();
+    }
+}
+
+#[derive(Clone)]
+struct BlockingObjectPublication {
+    backend: TestCatalogObjectBackend,
+    object: String,
+    started: Arc<tokio::sync::Notify>,
+    guard: Arc<parking_lot::Mutex<Option<Box<dyn Send>>>>,
+}
+
+impl BlockingObjectPublication {
+    fn new(backend: TestCatalogObjectBackend, object: impl Into<String>) -> Self {
+        Self {
+            backend,
+            object: object.into(),
+            started: Arc::new(tokio::sync::Notify::new()),
+            guard: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl TableCommitPublication for BlockingObjectPublication {
+    async fn prepare(&self, table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
+        self.started.notify_one();
+        let guard = self.backend.acquire_read_lock(table_bucket, &self.object).await?;
+        *self.guard.lock() = Some(guard);
+        Ok(())
+    }
+
+    fn complete(&self) {
+        drop(self.guard.lock().take());
     }
 }
 

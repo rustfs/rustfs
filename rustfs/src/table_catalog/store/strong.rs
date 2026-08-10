@@ -1279,17 +1279,16 @@ where
         entry: TableEntry,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<()> {
-        let _write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
         validate_catalog_entry_version("table", entry.version)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         table_warehouse_object_prefix(&entry)?;
-        // Preserve catalog -> publication -> object lock order across rolling upgrades.
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
             .await?;
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
@@ -1419,17 +1418,16 @@ where
         request: TableCommitRequest,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<TableCommitResult> {
-        let _write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
-        // Preserve catalog -> publication -> object lock order across rolling upgrades.
         publication
             .prepare(&request.table_bucket, &request.namespace, &request.table)
             .await?;
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&request.table_bucket, &namespace, &table);
 
         let committed_existing_result = {
