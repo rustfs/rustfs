@@ -32,6 +32,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::error::Error;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tokio::time::{Duration, Instant, interval};
@@ -42,6 +43,7 @@ mod tests {
     const TARGET_NODE: usize = 1;
     const TARGET_DRIVE: usize = 0;
     const MOUNT_SIZE: &str = "size=128m,mode=0700";
+    const ABSENT_OBSERVATION_SECS: u64 = 20;
 
     #[derive(Debug)]
     struct BaselineVersion {
@@ -58,6 +60,7 @@ mod tests {
 
     impl MountNamespaceGuard {
         fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
+            verify_isolated_mount_namespace()?;
             run_command("mount", ["--make-rprivate", "/"])?;
             Ok(Self { mounts: Vec::new() })
         }
@@ -96,6 +99,34 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         )
         .into())
+    }
+
+    fn mount_namespace_link(proc_entry: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        Ok(fs::read_link(format!("/proc/{proc_entry}/ns/mnt"))?
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    fn parent_pid() -> Result<String, Box<dyn Error + Send + Sync>> {
+        let status = fs::read_to_string("/proc/self/status")?;
+        for line in status.lines() {
+            if let Some(ppid) = line.strip_prefix("PPid:") {
+                return Ok(ppid.trim().to_string());
+            }
+        }
+        Err("/proc/self/status does not contain PPid".into())
+    }
+
+    fn verify_isolated_mount_namespace() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let current = mount_namespace_link("self")?;
+        let parent = mount_namespace_link(&parent_pid()?)?;
+        if current == parent {
+            return Err(format!(
+                "privileged replacement E2E must run in a private mount namespace before mounting test drives; current namespace {current} still matches parent"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn mount_tmpfs(target: &Path, label: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -338,17 +369,58 @@ mod tests {
     }
 
     fn target_record_has_state(status: &serde_json::Value, target_disk: &Path, states: &[&str]) -> bool {
+        let present_states = target_record_states(status, target_disk);
+        states.iter().any(|state| present_states.contains(*state))
+    }
+
+    fn target_record_states(status: &serde_json::Value, target_disk: &Path) -> BTreeSet<String> {
         let target = target_disk.to_string_lossy();
-        status["cluster"]["records"].as_array().into_iter().flatten().any(|record| {
-            let state_matches = record["state"].as_str().is_some_and(|state| states.contains(&state));
-            let target_matches = record["targetSlots"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .any(|slot| slot.contains(target.as_ref()));
-            state_matches && target_matches
-        })
+        status["cluster"]["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|record| {
+                let state = record["state"].as_str()?;
+                let target_matches = record["targetSlots"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|slot| slot.contains(target.as_ref()));
+                target_matches.then(|| state.to_string())
+            })
+            .collect()
+    }
+
+    async fn assert_replacement_stays_waiting_while_absent(
+        cluster: &RustFSTestClusterEnvironment,
+        target_disk: &Path,
+        versions: &[BaselineVersion],
+        duration_secs: u64,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let deadline = Instant::now() + Duration::from_secs(duration_secs);
+        let mut tick = interval(Duration::from_secs(1));
+        loop {
+            let status = replacement_status(cluster).await?;
+            let states = target_record_states(&status, target_disk);
+            if states.len() != 1 || !states.contains("waiting_for_replacement") {
+                return Err(format!(
+                    "replacement target must stay waiting while absent; observed states {states:?} in status {status}"
+                )
+                .into());
+            }
+            let missing = incomplete_versions(target_disk, versions)?;
+            if missing.len() != versions.len() {
+                return Err(format!(
+                    "detached target unexpectedly exposed baseline shards while replacement was waiting: {missing:?}"
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            tick.tick().await;
+        }
     }
 
     async fn wait_for_replacement_state(
@@ -419,6 +491,7 @@ mod tests {
         if std::env::var_os(NAMESPACE_ENV).is_none() {
             return run_current_test_in_mount_namespace(test_name);
         }
+        verify_isolated_mount_namespace()?;
 
         let mut mount_ns = MountNamespaceGuard::new()?;
         let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(3, 4)).await?;
@@ -451,7 +524,8 @@ mod tests {
             versions.len(),
             "detached target path must not still expose baseline shards"
         );
-        wait_for_replacement_state(&cluster, &target_disk, &["waiting_for_replacement", "running"], 180).await?;
+        wait_for_replacement_state(&cluster, &target_disk, &["waiting_for_replacement"], 180).await?;
+        assert_replacement_stays_waiting_while_absent(&cluster, &target_disk, &versions, ABSENT_OBSERVATION_SECS).await?;
 
         cluster.stop_node(TARGET_NODE)?;
         mount_ns.mount_tmpfs(&target_disk, &format!("rustfs-e2e-p{parity}-replacement"))?;
