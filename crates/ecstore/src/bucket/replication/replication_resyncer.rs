@@ -1495,15 +1495,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
     let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object);
-    if requires_delayed_purge {
-        let bucket_clone = bucket.clone();
-        let dobj_clone = dobj.clone();
-        let dsc_clone = dsc.clone();
-        let storage_clone = storage.clone();
-        tokio::spawn(async move {
-            watch_and_purge_source_delete_marker(bucket_clone, dobj_clone, dsc_clone, storage_clone).await;
-        });
-    }
 
     let (replication_status, prev_status) = if !is_version_purge {
         (
@@ -1544,6 +1535,24 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     );
     if replication_status != prev_status {
         drs.replication_timestamp = Some(OffsetDateTime::now_utc());
+    }
+
+    if requires_delayed_purge {
+        // Hand the watcher the MERGED replication state: `drs` folds this
+        // round's per-target results into the previous state, including the
+        // version ids the targets assigned to the markers they just created.
+        // Spawning with the pre-merge `dobj` made the purge fall back to a
+        // source-derived id, which a target that mints its own ids answers
+        // with an idempotent 204 — the intent was then dropped while the
+        // real marker stayed behind.
+        let bucket_clone = bucket.clone();
+        let mut dobj_clone = dobj.clone();
+        dobj_clone.delete_object.replication_state = Some(drs.clone());
+        let dsc_clone = dsc.clone();
+        let storage_clone = storage.clone();
+        tokio::spawn(async move {
+            watch_and_purge_source_delete_marker(bucket_clone, dobj_clone, dsc_clone, storage_clone).await;
+        });
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
@@ -1712,22 +1721,12 @@ async fn replicate_delete_marker_purge_to_targets(
         {
             continue;
         }
-        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
-            warn!(
-                event = EVENT_DELETE_MARKER_PURGE_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket,
-                object = dobj.delete_object.object_name,
-                arn = tgt_entry.arn,
-                reason = "target_client_missing",
-                "Delete-marker purge attempt failed"
-            );
-            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "failed").increment(1);
-            failed_arns.push(tgt_entry.arn.clone());
-            continue;
-        };
-
+        // Decide the version first: refusing to guess is a per-target
+        // FAILURE, not a silent skip. Reporting it as success would let the
+        // watcher and the MRF replay drop the purge intent while the marker
+        // is still on the target — the leak stays visible instead (the
+        // entry is retained and keeps warning) until an operator repairs
+        // the metadata.
         let Some(purge_version_id) = delete_marker_purge_version_id(
             dobj.delete_object.replication_state.as_ref(),
             &tgt_entry.arn,
@@ -1741,8 +1740,26 @@ async fn replicate_delete_marker_purge_to_targets(
                 object = dobj.delete_object.object_name,
                 arn = tgt_entry.arn,
                 reason = "recorded_target_version_inconsistent",
-                "Skipping delete-marker purge: recorded target version metadata is inconsistent"
+                "Delete-marker purge refused: recorded target version metadata is inconsistent"
             );
+            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "refused").increment(1);
+            failed_arns.push(tgt_entry.arn.clone());
+            continue;
+        };
+
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
+            warn!(
+                event = EVENT_DELETE_MARKER_PURGE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket,
+                object = dobj.delete_object.object_name,
+                arn = tgt_entry.arn,
+                reason = "target_client_missing",
+                "Delete-marker purge attempt failed"
+            );
+            counter!(METRIC_DELETE_MARKER_PURGE_TOTAL, "state" => "failed").increment(1);
+            failed_arns.push(tgt_entry.arn.clone());
             continue;
         };
 
@@ -1789,6 +1806,16 @@ const DELETE_MARKER_PURGE_WATCH_ROUNDS: usize = 5;
 const DELETE_MARKER_PURGE_WATCH_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
 
 /// Watch the source delete marker for a short window after its replication.
+///
+/// KNOWN NON-DURABLE WINDOW: this task is detached, so a process exit inside
+/// the watch window loses an intent that has not been persisted yet. The
+/// window predates this code (the previous implementation had no durable
+/// channel at all, and no replay half either), so nothing regresses — closing
+/// it needs a write-ahead intent recorded before the parent delete is
+/// acknowledged, which is tracked as follow-up rather than done here: every
+/// delete-marker replication would pay a journal write for a purge that
+/// almost never happens.
+///
 /// If the marker disappears (deleted before or while the replica landed),
 /// purge the replicated marker from the targets, retrying failed targets on
 /// later rounds. When the window drains with targets still dirty, persist the
@@ -3458,6 +3485,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
     use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
     use s3s::dto::{
@@ -3840,6 +3868,45 @@ mod tests {
         assert!(!replicate_delete_outcome(1, 1, false, true, &ReplicationStatusType::Completed));
         assert!(!replicate_delete_outcome(1, 1, true, false, &ReplicationStatusType::Completed));
         assert!(!replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Failed));
+    }
+
+    /// P1-21 review follow-up: a target whose recorded marker version is
+    /// inconsistent must be reported as a per-target FAILURE. Treating the
+    /// refusal as success let the watcher and the MRF replay drop the purge
+    /// intent while the marker was still on the target.
+    #[tokio::test]
+    async fn test_delete_marker_purge_reports_corrupt_recorded_version_as_failure() {
+        let arn = format!("arn:rustfs:replication:us-east-1:corrupt:{}", Uuid::new_v4());
+        let mut dsc = ReplicateDecision::new();
+        dsc.set(ReplicateTargetDecision::new(arn.clone(), true, false));
+
+        let mut state = ReplicationState {
+            target_delete_marker_version_ids_corrupt: true,
+            ..Default::default()
+        };
+        state.targets.insert(arn.clone(), ReplicationStatusType::Completed);
+
+        let dobj = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                object_name: "doc.txt".to_string(),
+                delete_marker: true,
+                delete_marker_version_id: Some(Uuid::new_v4()),
+                replication_state: Some(state),
+                ..Default::default()
+            },
+            bucket: "bucket-a".to_string(),
+            ..Default::default()
+        };
+
+        // No target client is registered: the refusal must be decided from
+        // the recorded metadata alone, before any remote call is attempted.
+        let failed = replicate_delete_marker_purge_to_targets("bucket-a", &dobj, &dsc, None).await;
+
+        assert_eq!(
+            failed,
+            vec![arn],
+            "a refused purge must stay in the failed set so the intent is never acknowledged"
+        );
     }
 
     #[test]

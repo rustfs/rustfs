@@ -7578,12 +7578,14 @@ async fn replicate_delete_marker(
         .ok_or("source DELETE omitted the marker version ID")?
         .to_string();
 
+    // Wait for ANY delete marker: a target that mints its own version ids
+    // does not mirror the source one.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let replicated = target
             .stored_versions(target_bucket, DELAYED_PURGE_KEY)
             .iter()
-            .any(|(version_id, delete_marker)| *delete_marker && version_id == &marker_version);
+            .any(|(_, delete_marker)| *delete_marker);
         if replicated {
             return Ok(marker_version);
         }
@@ -7614,7 +7616,6 @@ fn delayed_purge_attempts(target: &FakeS3Target, marker_version: &str) -> Vec<Re
 async fn wait_for_target_marker_purged(
     target: &FakeS3Target,
     target_bucket: &str,
-    marker_version: &str,
     max_wait: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let deadline = tokio::time::Instant::now() + max_wait;
@@ -7622,14 +7623,14 @@ async fn wait_for_target_marker_purged(
         let marker_present = target
             .stored_versions(target_bucket, DELAYED_PURGE_KEY)
             .iter()
-            .any(|(version_id, delete_marker)| *delete_marker && version_id == marker_version);
+            .any(|(_, delete_marker)| *delete_marker);
         if !marker_present {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "target delete marker was never purged; purge attempts: {:?}",
-                delayed_purge_attempts(target, marker_version)
+                "target delete marker was never purged; target state: {:?}",
+                target.stored_versions(target_bucket, DELAYED_PURGE_KEY)
             )
             .into());
         }
@@ -7680,7 +7681,7 @@ async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure
     // Tight window on purpose: a fixed delayed purge retries on 1s rounds and
     // converges within ~5s, while any straggling backoff retry from the other
     // channels would land later and must not be what turns this test green.
-    wait_for_target_marker_purged(&target, target_bucket, &marker_version, Duration::from_secs(15)).await?;
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(15)).await?;
 
     let attempts = delayed_purge_attempts(&target, &marker_version);
     assert!(
@@ -7691,6 +7692,40 @@ async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure
         attempts.iter().any(|record| record.fault.is_none()),
         "expected a clean purge attempt after the fault script drained, got: {attempts:?}"
     );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-21 review follow-up: the watcher must purge the version the TARGET
+/// assigned to the replicated marker, not one derived from the source uuid.
+/// A target that mints its own version ids answers a source-derived purge
+/// with an idempotent 204, which used to look like success and strand the
+/// real marker on the target forever.
+#[tokio::test]
+#[serial]
+async fn test_delayed_delete_marker_purge_uses_target_assigned_version() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-mint-src";
+    let target_bucket = "delayed-purge-mint-dst";
+    let (target, _source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+    // The target ignores the forwarded source-version-id header and mints its
+    // own ids for both the object and the replicated delete marker.
+    target.assign_own_version_ids(true);
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // The replicated marker carries a target-minted version id, so nothing
+    // but the recorded mapping can address it.
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(25)).await?;
 
     target.shutdown().await;
     Ok(())
@@ -7753,7 +7788,7 @@ async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays
     let marker_survives_faults = target
         .stored_versions(target_bucket, DELAYED_PURGE_KEY)
         .iter()
-        .any(|(version_id, delete_marker)| *delete_marker && version_id == &marker_version);
+        .any(|(_, delete_marker)| *delete_marker);
     assert!(marker_survives_faults, "scripted faults must have blocked every in-process purge attempt");
 
     target.clear_faults();
@@ -7763,7 +7798,7 @@ async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays
     source_env
         .restart_server_preserving_data(vec![], &delayed_purge_process_env())
         .await?;
-    wait_for_target_marker_purged(&target, target_bucket, &marker_version, Duration::from_secs(30)).await?;
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(30)).await?;
     let attempts_after_replay = delayed_purge_attempts(&target, &marker_version).len();
     assert!(
         attempts_after_replay > attempts_before_restart,

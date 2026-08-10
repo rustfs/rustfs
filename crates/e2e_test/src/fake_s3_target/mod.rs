@@ -141,6 +141,7 @@ struct ControlState {
 
 #[derive(Default)]
 struct StoreState {
+    assign_own_version_ids: bool,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
     total_bytes: usize,
@@ -381,6 +382,12 @@ impl FakeS3Target {
             .and_then(|bucket| bucket.objects.get(key))
             .and_then(|versions| versions.last())
             .is_some_and(|version| !version.delete_marker)
+    }
+
+    /// Make the target mint its own version ids instead of mirroring the
+    /// forwarded source version id — models a generic S3 service.
+    pub fn assign_own_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_version_ids = enabled;
     }
 
     /// Queue `times` copies of a fault for one operation.
@@ -708,10 +715,17 @@ fn validate_retained_identifier(value: String, field: &str) -> S3Result<String> 
     }
 }
 
-fn new_version_id(headers: &HeaderMap) -> S3Result<String> {
+/// `assign_own` models a target that mints its own version ids (a generic S3
+/// service): the forwarded source-version-id header is validated but NOT
+/// mirrored into the stored version.
+fn new_version_id(headers: &HeaderMap, assign_own: bool) -> S3Result<String> {
     let Some(value) = header_value(headers, &SOURCE_VERSION_ID_HEADERS) else {
         return Ok(Uuid::new_v4().to_string());
     };
+    if assign_own {
+        validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
+        return Ok(Uuid::new_v4().to_string());
+    }
     let value = validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
     let version_id = Uuid::parse_str(&value).map_err(|_| s3s::s3_error!(InvalidArgument, "source version ID must be a UUID"))?;
     Ok(version_id.to_string())
@@ -1097,7 +1111,8 @@ impl S3 for FakeBackend {
         let input = req.input;
         let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control).await?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
-        let version_id = new_version_id(&headers)?;
+        let assign_own = lock(&self.store).assign_own_version_ids;
+        let version_id = new_version_id(&headers, assign_own)?;
         let e_tag = match source_etag(&headers)? {
             Some(value) => value,
             None => {
@@ -1231,7 +1246,9 @@ impl S3 for FakeBackend {
             ));
         }
 
-        let version_id = new_version_id(&headers)?;
+        // `state` is the live store guard: read the flag from it. Re-locking
+        // would self-deadlock (the store mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         upsert_version(
             &mut state,
             &input.bucket,
@@ -1271,12 +1288,15 @@ impl S3 for FakeBackend {
         ensure_upload_budget(&state)?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
         let upload_id = Uuid::new_v4().to_string();
+        // Read the flag before the mutable borrow of `state.uploads` below
+        // (and never re-lock the store: the mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         state.uploads.insert(
             upload_id.clone(),
             MultipartState {
                 bucket: input.bucket.clone(),
                 key: input.key.clone(),
-                version_id: new_version_id(&headers)?,
+                version_id,
                 content_type: input.content_type,
                 metadata: input.metadata,
                 parts: BTreeMap::new(),
