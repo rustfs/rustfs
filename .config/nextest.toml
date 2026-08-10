@@ -34,7 +34,8 @@ e2e-vault = { max-threads = 1 }
 
 # Reliability / fault-injection e2e tests each spawn a single-node 4-disk RustFS
 # server and manipulate its disk directories at runtime (crates/e2e_test:
-# reliability_disk_fault_test, degraded_read_eof_regression_test / dist-13). They
+# reliability_disk_fault_test, degraded_read_eof_regression_test / dist-13, and
+# replacement_privileged_e2e_test when explicitly run as root on Linux). They
 # are correct in isolation but resource-heavy; serialize them under nextest's
 # process boundary (serial_test's #[serial] does not cross it) so several 4-disk
 # servers never run at once. ci-7's nightly picks these up via the e2e suite;
@@ -90,7 +91,7 @@ test-group = 'ecstore-serial-flaky'
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
 [[profile.default.overrides]]
-filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression|replacement_privileged_e2e)_test::/)'
 test-group = 'e2e-reliability'
 
 [[profile.default.overrides]]
@@ -155,7 +156,7 @@ retries = 2
 # quarantine: no retries, just single-threaded so several 4-disk servers never
 # run concurrently when ci-7's nightly runs the full e2e suite.
 [[profile.ci.overrides]]
-filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression|replacement_privileged_e2e)_test::/)'
 test-group = 'e2e-reliability'
 
 # Serialize the multipart crash-consistency scenarios under the ci profile too
@@ -383,7 +384,7 @@ path = "junit.xml"
 # quarantine: no retries, just single-threaded so several 4-disk servers never
 # run concurrently.
 [[profile.e2e-full.overrides]]
-filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression|replacement_privileged_e2e)_test::/)'
 test-group = 'e2e-reliability'
 
 [[profile.e2e-full.overrides]]

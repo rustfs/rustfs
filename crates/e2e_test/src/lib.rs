@@ -39,6 +39,10 @@ pub mod fault_proxy;
 #[cfg(test)]
 mod reliability_disk_fault_test;
 
+// Privileged Linux-only 3x4 replacement rebuild proof for rustfs#5869/#1791.
+#[cfg(all(test, target_os = "linux"))]
+mod replacement_privileged_e2e_test;
+
 // dist-13 (backlog#1150/#1155): e2e regression net proving a large-object
 // degraded EC read never returns a silently truncated body (rustfs#4594/#4560/#4585).
 #[cfg(test)]
