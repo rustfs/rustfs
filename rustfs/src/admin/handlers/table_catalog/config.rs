@@ -33,8 +33,10 @@ impl Operation for EnableTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
-        let store = table_catalog_store()?;
-        let response = enable_table_bucket_response(&store, &warehouse).await?;
+        let backend = table_catalog_backend()?;
+        let store = table_catalog_store_from_backend(backend.clone())?;
+        let publication = TableCommitObjectBackend::preauthorized(backend);
+        let response = enable_table_bucket_response(&store, &publication, &warehouse).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

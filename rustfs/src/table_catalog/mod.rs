@@ -72,10 +72,10 @@ pub(crate) use error::{TableCatalogStoreError, TableCatalogStoreResult};
 pub(crate) use iceberg::*;
 pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use identifier::{
-    default_table_data_dir_path, default_table_delete_dir_path, default_table_metadata_dir_path,
-    default_table_metadata_file_path, default_table_publication_lock_path, default_view_metadata_file_path,
-    is_valid_table_metadata_location, is_valid_view_metadata_location, metadata_location_from_metadata_file_path,
-    validate_bucket_object_mutation,
+    default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
+    default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
+    default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_view_metadata_location,
+    metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
@@ -90,10 +90,13 @@ pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
+    "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
 pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
 pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";

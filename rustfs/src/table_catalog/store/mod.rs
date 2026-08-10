@@ -257,7 +257,13 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait TableCommitPublication: Send + Sync {
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()>;
+
     async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool;
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
     fn complete(&self);
 }
@@ -280,14 +286,21 @@ impl Drop for TableCommitPublicationCompletion<'_> {
 
 struct TableCommitLockPublication<'a, B> {
     backend: &'a B,
-    guard: parking_lot::Mutex<Option<Box<dyn Send>>>,
+    state: parking_lot::Mutex<TableCommitLockPublicationState>,
+}
+
+#[derive(Default)]
+struct TableCommitLockPublicationState {
+    table_bucket: Option<String>,
+    table: Option<(String, String, String)>,
+    guards: Vec<Box<dyn Send>>,
 }
 
 impl<'a, B> TableCommitLockPublication<'a, B> {
     fn new(backend: &'a B) -> Self {
         Self {
             backend,
-            guard: parking_lot::Mutex::new(None),
+            state: parking_lot::Mutex::new(TableCommitLockPublicationState::default()),
         }
     }
 }
@@ -297,23 +310,73 @@ impl<'a, B> TableCommitPublication for TableCommitLockPublication<'a, B>
 where
     B: TableCatalogObjectBackend,
 {
-    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let publication_lock = default_table_publication_lock_path(&namespace, &table);
-        let guard = self.backend.acquire_write_lock(table_bucket, &publication_lock).await?;
-        let mut current = self.guard.lock();
-        if current.is_some() {
-            return Err(TableCatalogStoreError::Internal(
-                "table commit publication lock is already held".to_string(),
-            ));
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        {
+            let mut state = self.state.lock();
+            if state.table_bucket.as_deref() == Some(table_bucket) {
+                return Ok(());
+            }
+            if state.table_bucket.is_some() || state.table.is_some() {
+                return Err(TableCatalogStoreError::Internal(
+                    "table-bucket publication lock is already held for another table bucket".to_string(),
+                ));
+            }
+            state.table_bucket = Some(table_bucket.to_string());
         }
-        *current = Some(guard);
+        let publication_lock = default_table_bucket_publication_lock_path();
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.state.lock().table_bucket = None;
+                return Err(err);
+            }
+        };
+        self.state.lock().guards.push(guard);
         Ok(())
     }
 
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_key = (table_bucket.to_string(), namespace.public_name(), table.as_str().to_string());
+        {
+            let mut state = self.state.lock();
+            if state.table.as_ref() == Some(&table_key) {
+                return Ok(());
+            }
+            if state.table.is_some() {
+                return Err(TableCatalogStoreError::Internal(
+                    "table publication lock is already held for another table".to_string(),
+                ));
+            }
+            state.table = Some(table_key);
+        }
+        let publication_lock = default_table_publication_lock_path(&namespace, &table);
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.state.lock().table = None;
+                return Err(err);
+            }
+        };
+        self.state.lock().guards.push(guard);
+        Ok(())
+    }
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool {
+        self.state.lock().table_bucket.as_deref() == Some(table_bucket)
+    }
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
+        self.state
+            .lock()
+            .table
+            .as_ref()
+            .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
+    }
+
     fn complete(&self) {
-        drop(self.guard.lock().take());
+        *self.state.lock() = TableCommitLockPublicationState::default();
     }
 }
 
@@ -463,6 +526,14 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
 
+    async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    fn table_bucket_commit_publication_is_held(&self, _table_bucket: &str) -> bool {
+        false
+    }
+
     async fn prepare_table_commit_publication(
         &self,
         _table_bucket: &str,
@@ -470,6 +541,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         _table: &str,
     ) -> TableCatalogStoreResult<()> {
         Ok(())
+    }
+
+    fn table_commit_publication_is_held(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
+        false
     }
 
     fn complete_table_commit_publication(&self) {}
@@ -480,8 +555,20 @@ impl<B> TableCommitPublication for B
 where
     B: TableCatalogObjectBackend,
 {
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.begin_table_bucket_commit_publication(table_bucket).await
+    }
+
     async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         self.prepare_table_commit_publication(table_bucket, namespace, table).await
+    }
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool {
+        self.table_bucket_commit_publication_is_held(table_bucket)
+    }
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
+        self.table_commit_publication_is_held(table_bucket, namespace, table)
     }
 
     fn complete(&self) {
@@ -692,6 +779,10 @@ impl TableCatalogObjectPaths {
             WAREHOUSE_INDEX_ROOT,
             WAREHOUSE_INDEX_STATE_FILE
         )
+    }
+
+    pub fn warehouse_index_entries_prefix(&self, table_bucket: &str) -> String {
+        format!("{}{}/", self.table_bucket_root_prefix(table_bucket), WAREHOUSE_INDEX_ROOT)
     }
 
     pub fn warehouse_index_entry_path(&self, table_bucket: &str, warehouse_object_prefix: &str) -> String {

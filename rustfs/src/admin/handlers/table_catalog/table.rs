@@ -43,8 +43,9 @@ impl Operation for RestCreateTableHandler {
         let metadata_backend = table_catalog_backend()?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let commit_backend = TableCommitObjectBackend::preauthorized(metadata_backend);
         let response =
-            create_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
+            create_table_response(&store, &commit_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

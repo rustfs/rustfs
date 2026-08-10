@@ -114,8 +114,15 @@ struct InternalObjectAuthorization;
 
 #[derive(Clone, Default)]
 struct TableDataPlanePublicationGuards {
-    keys: Arc<parking_lot::Mutex<BTreeSet<(String, String)>>>,
-    guards: Arc<parking_lot::Mutex<Vec<Box<dyn Send>>>>,
+    state: Arc<parking_lot::Mutex<TableDataPlanePublicationState>>,
+}
+
+#[derive(Default)]
+struct TableDataPlanePublicationState {
+    keys: BTreeSet<(String, String)>,
+    guards: Vec<Box<dyn Send>>,
+    resources: HashMap<(String, String), crate::table_catalog::TableDataPlaneResource>,
+    missing_resources: BTreeSet<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1290,7 +1297,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     .map_err(ApiError::from)?);
 
             if policy_allowed {
-                deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
+                deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
                 match get_public_access_block_config(bucket_name).await {
                     Ok((config, _)) => {
@@ -1427,58 +1434,119 @@ fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStor
 
 async fn retain_table_data_plane_publication_guard<T>(
     req: &mut S3Request<T>,
+    table_bucket: &str,
+    lock_object: &str,
+) -> S3Result<()> {
+    let key = (table_bucket.to_string(), lock_object.to_string());
+    let retained = req
+        .extensions
+        .get::<TableDataPlanePublicationGuards>()
+        .cloned()
+        .unwrap_or_default();
+    if retained.state.lock().keys.contains(&key) {
+        return Ok(());
+    }
+
+    let backend = table_catalog_backend_for_data_plane()?;
+    let guard = crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, table_bucket, lock_object)
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to acquire table publication guard: {}", err))?;
+    let mut state = retained.state.lock();
+    state.keys.insert(key);
+    state.guards.push(guard);
+    drop(state);
+    req.extensions.insert(retained);
+    Ok(())
+}
+
+async fn retain_table_bucket_publication_guard<T>(req: &mut S3Request<T>, table_bucket: &str) -> S3Result<()> {
+    retain_table_data_plane_publication_guard(
+        req,
+        table_bucket,
+        &crate::table_catalog::default_table_bucket_publication_lock_path(),
+    )
+    .await
+}
+
+async fn retain_table_publication_guard<T>(
+    req: &mut S3Request<T>,
     resource: &crate::table_catalog::TableDataPlaneResource,
 ) -> S3Result<()> {
     let namespace = crate::table_catalog::Namespace::parse(&resource.namespace)
         .map_err(|err| s3_error!(InternalError, "persisted table namespace is invalid: {}", err))?;
     let table = crate::table_catalog::IdentifierSegment::parse(resource.table.clone())
         .map_err(|err| s3_error!(InternalError, "persisted table name is invalid: {}", err))?;
-    let lock_object = crate::table_catalog::default_table_publication_lock_path(&namespace, &table);
-    let key = (resource.table_bucket.clone(), lock_object.clone());
+    retain_table_data_plane_publication_guard(
+        req,
+        &resource.table_bucket,
+        &crate::table_catalog::default_table_publication_lock_path(&namespace, &table),
+    )
+    .await?;
     let retained = req
         .extensions
         .get::<TableDataPlanePublicationGuards>()
         .cloned()
-        .unwrap_or_default();
-    if retained.keys.lock().contains(&key) {
-        return Ok(());
-    }
-
-    let backend = table_catalog_backend_for_data_plane()?;
-    let guard =
-        crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, &resource.table_bucket, &lock_object)
-            .await
-            .map_err(|err| s3_error!(InternalError, "failed to acquire table publication guard: {}", err))?;
-    retained.keys.lock().insert(key);
-    retained.guards.lock().push(guard);
-    req.extensions.insert(retained);
+        .ok_or_else(|| s3_error!(InternalError, "table publication guard state is missing"))?;
+    retained.state.lock().resources.insert(
+        (resource.table_bucket.clone(), resource.warehouse_object_prefix.clone()),
+        resource.clone(),
+    );
     Ok(())
 }
 
-async fn table_data_plane_resource_for_request(
-    bucket: &str,
-    object: &str,
-) -> S3Result<Option<crate::table_catalog::TableDataPlaneResource>> {
-    if bucket.is_empty() || object.is_empty() {
-        return Ok(None);
+async fn table_bucket_enabled_for_data_plane(bucket: &str) -> S3Result<bool> {
+    if bucket.is_empty() {
+        return Ok(false);
     }
 
     match get_bucket_metadata(bucket).await {
-        Ok(metadata) if metadata.table_bucket_enabled() => {}
-        Ok(_) | Err(StorageError::ConfigNotFound) => return Ok(None),
-        Err(err) if is_err_bucket_not_found(&err) => return Ok(None),
+        Ok(metadata) => Ok(metadata.table_bucket_enabled()),
+        Err(StorageError::ConfigNotFound) => Ok(false),
+        Err(err) if is_err_bucket_not_found(&err) => Ok(false),
         Err(err) => {
             tracing::warn!(
                 bucket = %bucket,
                 error = %err,
                 "failed to load bucket metadata while authorizing table data-plane access"
             );
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+            Err(s3_error!(AccessDenied, "Access Denied"))
+        }
+    }
+}
+
+async fn table_data_plane_resource_for_request<T>(
+    req: &mut S3Request<T>,
+    bucket: &str,
+    object: &str,
+    table_bucket_enabled: bool,
+) -> S3Result<Option<crate::table_catalog::TableDataPlaneResource>> {
+    if !table_bucket_enabled || bucket.is_empty() || object.is_empty() {
+        return Ok(None);
+    }
+
+    let key = (bucket.to_string(), object.to_string());
+    let retained = req
+        .extensions
+        .get::<TableDataPlanePublicationGuards>()
+        .cloned()
+        .unwrap_or_default();
+    {
+        let state = retained.state.lock();
+        if state.missing_resources.contains(&key) {
+            return Ok(None);
+        }
+        if let Some(resource) = state
+            .resources
+            .values()
+            .find(|resource| resource.table_bucket == bucket && object.starts_with(&resource.warehouse_object_prefix))
+            .cloned()
+        {
+            return Ok(Some(resource));
         }
     }
 
     let store = table_catalog_store_for_data_plane()?;
-    crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object)
+    let resource = crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object)
         .await
         .map_err(|err| {
             tracing::warn!(
@@ -1488,7 +1556,24 @@ async fn table_data_plane_resource_for_request(
                 "failed to resolve table data-plane resource"
             );
             s3_error!(AccessDenied, "Access Denied")
-        })
+        })?;
+    let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
+    let mut state = retained.state.lock();
+    if resource.is_none() && state.keys.contains(&bucket_fence_key) {
+        state.missing_resources.insert(key);
+        drop(state);
+        req.extensions.insert(retained);
+    }
+    Ok(resource)
+}
+
+async fn table_data_plane_resource_for_authorization<T>(
+    req: &mut S3Request<T>,
+    bucket: &str,
+    object: &str,
+    table_bucket_enabled: bool,
+) -> S3Result<Option<crate::table_catalog::TableDataPlaneResource>> {
+    table_data_plane_resource_for_request(req, bucket, object, table_bucket_enabled).await
 }
 
 async fn authorize_table_data_plane_if_needed<T>(
@@ -1504,7 +1589,11 @@ async fn authorize_table_data_plane_if_needed<T>(
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
     };
-    let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
+    if table_data_plane_content_mutation(action) {
+        retain_table_bucket_publication_guard(req, bucket).await?;
+    }
+    let table_bucket_enabled = table_bucket_enabled_for_data_plane(bucket).await?;
+    let Some(resource) = table_data_plane_resource_for_authorization(req, bucket, object, table_bucket_enabled).await? else {
         return Ok(());
     };
     let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
@@ -1527,7 +1616,7 @@ async fn authorize_table_data_plane_if_needed<T>(
         .await;
     if allowed {
         if table_data_plane_content_mutation(action) {
-            retain_table_data_plane_publication_guard(req, &resource).await?;
+            retain_table_publication_guard(req, &resource).await?;
         }
         return Ok(());
     }
@@ -1553,11 +1642,23 @@ pub(crate) async fn authorize_internal_object_request<T>(req: &mut S3Request<T>,
     result
 }
 
-async fn deny_anonymous_table_data_plane_if_needed(action: Action, bucket: &str, object: &str) -> S3Result<()> {
+async fn deny_anonymous_table_data_plane_if_needed<T>(
+    req: &mut S3Request<T>,
+    action: Action,
+    bucket: &str,
+    object: &str,
+) -> S3Result<()> {
     if table_data_plane_admin_action(action).is_none() {
         return Ok(());
     }
-    if table_data_plane_resource_for_request(bucket, object).await?.is_some() {
+    if table_data_plane_content_mutation(action) {
+        retain_table_bucket_publication_guard(req, bucket).await?;
+    }
+    let table_bucket_enabled = table_bucket_enabled_for_data_plane(bucket).await?;
+    if table_data_plane_resource_for_authorization(req, bucket, object, table_bucket_enabled)
+        .await?
+        .is_some()
+    {
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
     Ok(())
@@ -2837,7 +2938,7 @@ mod tests {
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
         BucketPolicyRawLoadErrorKind, DenialContext, FS, InternalObjectAuthorization, ObjectTagConditions,
-        PostObjectRequestMarker, ReqInfo, S3Access, StorageError, apply_bucket_generation_guard,
+        PostObjectRequestMarker, ReqInfo, S3Access, StorageError, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
         apply_copy_source_bucket_generation_guard, authorization_conditions, bucket_policy_needs_existing_object_tag_from_hint,
         bucket_website_config_authorize_action, classify_bucket_policy_raw_load_error,
         complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
@@ -2845,8 +2946,8 @@ mod tests {
         load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions,
         merge_request_object_tag_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
         put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
-        table_data_plane_admin_action, table_data_plane_content_mutation, validate_post_object_success_controls,
-        versioned_read_action,
+        table_data_plane_admin_action, table_data_plane_content_mutation, table_data_plane_resource_for_request,
+        validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -3006,6 +3107,119 @@ mod tests {
         ] {
             assert!(!table_data_plane_content_mutation(Action::S3Action(action)));
         }
+    }
+
+    #[test]
+    fn table_data_plane_mutations_fence_before_table_bucket_marker_lookup() {
+        let source = include_str!("access.rs");
+        for (function, end_marker) in [
+            ("async fn authorize_table_data_plane_if_needed", "/// Authorizes one exact object key"),
+            (
+                "async fn deny_anonymous_table_data_plane_if_needed",
+                "fn validate_post_object_success_controls",
+            ),
+        ] {
+            let start = source.find(function).expect("authorization helper should exist");
+            let end = source[start..]
+                .find(end_marker)
+                .map(|offset| start + offset)
+                .expect("authorization helper boundary should exist");
+            let block = &source[start..end];
+            let fence = block
+                .find("retain_table_bucket_publication_guard(req, bucket).await?;")
+                .expect("content mutation should retain the bucket publication fence");
+            let marker = block
+                .find("table_bucket_enabled_for_data_plane(bucket).await?")
+                .expect("authorization should load the table bucket marker");
+            assert!(fence < marker, "{function} must fence pre-enable writers before reading the marker");
+        }
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_request_reuses_table_resource_for_distinct_object_while_commit_waits() {
+        let resource = crate::table_catalog::TableDataPlaneResource {
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            warehouse_object_prefix: "tables/table-id/".to_string(),
+        };
+        let cached_key = ("warehouse".to_string(), "tables/table-id/".to_string());
+        let requested_key = ("warehouse".to_string(), "tables/table-id/data/part-00002.parquet".to_string());
+        let retained = TableDataPlanePublicationGuards::default();
+        retained.state.lock().resources.insert(cached_key, resource.clone());
+
+        let publication_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let request_publication_guard = Arc::clone(&publication_lock).lock_owned().await;
+        retained.state.lock().guards.push(Box::new(request_publication_guard));
+        let mut req = build_request((), Method::PUT);
+        req.extensions.insert(retained.clone());
+
+        let catalog_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let commit_started = Arc::new(tokio::sync::Notify::new());
+        let commit_catalog_lock = Arc::clone(&catalog_lock);
+        let commit_publication_lock = Arc::clone(&publication_lock);
+        let commit_started_signal = Arc::clone(&commit_started);
+        let commit = tokio::spawn(async move {
+            let _catalog_guard = commit_catalog_lock.lock().await;
+            commit_started_signal.notify_one();
+            let _publication_guard = commit_publication_lock.lock().await;
+        });
+        commit_started.notified().await;
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            table_data_plane_resource_for_request(&mut req, &requested_key.0, &requested_key.1, true),
+        )
+        .await
+        .expect("cached table resolution must not wait for the catalog lock")
+        .expect("cached table resolution should succeed");
+        assert_eq!(resolved, Some(resource));
+
+        retained.state.lock().guards.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit)
+            .await
+            .expect("commit should continue after the request releases its publication guard")
+            .expect("commit task should join");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_request_reuses_absence_while_bucket_publication_guard_is_held() {
+        let key = ("warehouse".to_string(), "tables/new-table/data/file.parquet".to_string());
+        let bucket_fence = (key.0.clone(), crate::table_catalog::default_table_bucket_publication_lock_path());
+        let retained = TableDataPlanePublicationGuards::default();
+        {
+            let mut state = retained.state.lock();
+            state.keys.insert(bucket_fence);
+            state.missing_resources.insert(key.clone());
+        }
+
+        let publication_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let request_publication_guard = Arc::clone(&publication_lock).lock_owned().await;
+        retained.state.lock().guards.push(Box::new(request_publication_guard));
+        let mut req = build_request((), Method::PUT);
+        req.extensions.insert(retained.clone());
+
+        let commit_publication_lock = Arc::clone(&publication_lock);
+        let commit = tokio::spawn(async move {
+            let _publication_guard = commit_publication_lock.lock().await;
+        });
+        tokio::task::yield_now().await;
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            table_data_plane_resource_for_request(&mut req, &key.0, &key.1, true),
+        )
+        .await
+        .expect("cached absence must not reread the catalog while publication waits")
+        .expect("cached absence should resolve successfully");
+        assert!(resolved.is_none());
+
+        retained.state.lock().guards.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit)
+            .await
+            .expect("publication should continue after the request releases its bucket guard")
+            .expect("publication task should join");
     }
 
     #[test]

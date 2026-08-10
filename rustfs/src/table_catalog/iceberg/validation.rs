@@ -237,6 +237,10 @@ pub(crate) fn warehouse_index_candidate_prefixes(object: &str) -> Vec<&str> {
     prefixes
 }
 
+pub(crate) fn warehouse_object_prefixes_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 pub(crate) fn table_data_plane_resource_from_entry(table: TableEntry, warehouse_object_prefix: String) -> TableDataPlaneResource {
     TableDataPlaneResource {
         table_bucket: table.table_bucket,

@@ -1215,6 +1215,8 @@ struct TableCommitObservedObject {
 #[derive(Default)]
 struct TableCommitPublicationState {
     phase: TableCommitPublicationPhase,
+    bucket_fence: Option<String>,
+    table_fence: Option<(String, String, String)>,
     observed_objects: BTreeMap<(String, String), TableCommitObservedObject>,
     guards: Vec<Box<dyn Send>>,
 }
@@ -1225,33 +1227,47 @@ struct TableCommitObjectBackend<B> {
     authorization: TableCommitObjectAuthorization,
     authorization_error: Arc<tokio::sync::Mutex<Option<S3Error>>>,
     publication: Arc<parking_lot::Mutex<TableCommitPublicationState>>,
+    publication_fence_fleet_confirmed: bool,
 }
 
 impl<B> TableCommitObjectBackend<B>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    fn for_request(backend: B, req: S3Request<Body>) -> Self {
+    fn new(backend: B, authorization: TableCommitObjectAuthorization, publication_fence_fleet_confirmed: bool) -> Self {
         Self {
             backend,
-            authorization: TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
+            authorization,
             authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
             publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
+            publication_fence_fleet_confirmed,
         }
     }
 
-    fn preauthorized(backend: B) -> Self {
-        Self {
+    fn for_request(backend: B, req: S3Request<Body>) -> Self {
+        Self::new(
             backend,
-            authorization: TableCommitObjectAuthorization::Preauthorized,
-            authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
-            publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
-        }
+            TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
+            rustfs_utils::get_env_bool(crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED, false),
+        )
+    }
+
+    fn preauthorized(backend: B) -> Self {
+        Self::new(
+            backend,
+            TableCommitObjectAuthorization::Preauthorized,
+            rustfs_utils::get_env_bool(crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED, false),
+        )
     }
 
     #[cfg(test)]
     fn trusted(backend: B) -> Self {
-        Self::preauthorized(backend)
+        Self::new(backend, TableCommitObjectAuthorization::Preauthorized, true)
+    }
+
+    #[cfg(test)]
+    fn rolling_upgrade(backend: B) -> Self {
+        Self::new(backend, TableCommitObjectAuthorization::Preauthorized, false)
     }
 
     #[cfg(test)]
@@ -1260,15 +1276,14 @@ where
         authorized_objects: Arc<tokio::sync::Mutex<Vec<(String, S3Action)>>>,
         denied_object: Option<String>,
     ) -> Self {
-        Self {
+        Self::new(
             backend,
-            authorization: TableCommitObjectAuthorization::Test {
+            TableCommitObjectAuthorization::Test {
                 authorized_objects,
                 denied_object,
             },
-            authorization_error: Arc::new(tokio::sync::Mutex::new(None)),
-            publication: Arc::new(parking_lot::Mutex::new(TableCommitPublicationState::default())),
-        }
+            true,
+        )
     }
 
     async fn authorize(&self, bucket: &str, object: &str, action: S3Action) -> crate::table_catalog::TableCatalogStoreResult<()> {
@@ -1385,6 +1400,36 @@ where
         })
     }
 
+    async fn begin_bucket_publication(&self, table_bucket: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        {
+            let mut publication = self.publication.lock();
+            if publication.phase != TableCommitPublicationPhase::Discovering {
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                    "table-bucket commit publication must begin before publication preparation".to_string(),
+                ));
+            }
+            if publication.bucket_fence.as_deref() == Some(table_bucket) {
+                return Ok(());
+            }
+            if publication.bucket_fence.is_some() {
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                    "table commit publication cannot span table buckets".to_string(),
+                ));
+            }
+            publication.bucket_fence = Some(table_bucket.to_string());
+        }
+        let publication_lock = crate::table_catalog::default_table_bucket_publication_lock_path();
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.publication.lock().bucket_fence = None;
+                return Err(err);
+            }
+        };
+        self.publication.lock().guards.push(guard);
+        Ok(())
+    }
+
     async fn prepare_publication(
         &self,
         table_bucket: &str,
@@ -1395,11 +1440,19 @@ where
             .map_err(|err| crate::table_catalog::TableCatalogStoreError::Invalid(format!("invalid namespace: {err}")))?;
         let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
             .map_err(|err| crate::table_catalog::TableCatalogStoreError::Invalid(format!("invalid table: {err}")))?;
+        let table_fence = (table_bucket.to_string(), namespace.public_name(), table.as_str().to_string());
         let publication_lock = crate::table_catalog::default_table_publication_lock_path(&namespace, &table);
         let expected = {
             let mut publication = self.publication.lock();
             match publication.phase {
-                TableCommitPublicationPhase::Prepared => return Ok(()),
+                TableCommitPublicationPhase::Prepared if publication.table_fence.as_ref() == Some(&table_fence) => {
+                    return Ok(());
+                }
+                TableCommitPublicationPhase::Prepared => {
+                    return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                        "table commit publication cannot span tables".to_string(),
+                    ));
+                }
                 TableCommitPublicationPhase::Discovering => {
                     publication.phase = TableCommitPublicationPhase::Preparing;
                     std::mem::take(&mut publication.observed_objects)
@@ -1418,14 +1471,22 @@ where
         };
 
         let prepared = async {
-            let content_object_count = expected
-                .values()
-                .filter(|object| matches!(&object.identity, TableCommitObjectIdentity::ContentSha256(_)))
-                .count();
-            let mut guards = Vec::with_capacity(content_object_count.saturating_add(1));
+            // RUSTFS_COMPAT_TODO(table-publication-fence-v1): Old nodes mutate table files without table publication
+            // fences. Remove exact live-file guards after the minimum supported release uses table and bucket fences.
+            let retain_legacy_object_guards = !self.publication_fence_fleet_confirmed;
+            let guarded_object_count = if retain_legacy_object_guards {
+                expected.len()
+            } else {
+                expected
+                    .values()
+                    .filter(|object| matches!(&object.identity, TableCommitObjectIdentity::ContentSha256(_)))
+                    .count()
+            };
+            let mut guards = Vec::with_capacity(guarded_object_count.saturating_add(1));
             guards.push(self.backend.acquire_write_lock(table_bucket, &publication_lock).await?);
             for ((bucket, object), expected_object) in &expected {
-                if matches!(&expected_object.identity, TableCommitObjectIdentity::ContentSha256(_)) {
+                if retain_legacy_object_guards || matches!(&expected_object.identity, TableCommitObjectIdentity::ContentSha256(_))
+                {
                     guards.push(self.backend.acquire_read_lock(bucket, object).await?);
                 }
             }
@@ -1455,7 +1516,12 @@ where
                     }),
             )
             .map(|(bucket, object, expected_identity)| async move {
-                let actual = Self::observed_metadata(&bucket, &object, self.backend.object_metadata(&bucket, &object).await?)?;
+                let metadata = if retain_legacy_object_guards {
+                    self.backend.object_metadata_unlocked(&bucket, &object).await?
+                } else {
+                    self.backend.object_metadata(&bucket, &object).await?
+                };
+                let actual = Self::observed_metadata(&bucket, &object, metadata)?;
                 if actual.identity != expected_identity {
                     return Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
                         "table commit object changed before catalog publication: {bucket}/{object}"
@@ -1473,7 +1539,8 @@ where
         let mut publication = self.publication.lock();
         match prepared {
             Ok(guards) if publication.phase == TableCommitPublicationPhase::Preparing => {
-                publication.guards = guards;
+                publication.guards.extend(guards);
+                publication.table_fence = Some(table_fence);
                 publication.phase = TableCommitPublicationPhase::Prepared;
                 Ok(())
             }
@@ -1494,6 +1561,8 @@ where
         let mut publication = self.publication.lock();
         publication.guards.clear();
         publication.observed_objects.clear();
+        publication.bucket_fence = None;
+        publication.table_fence = None;
         publication.phase = TableCommitPublicationPhase::Complete;
     }
 
@@ -1625,6 +1694,17 @@ where
         self.backend.acquire_write_lock(bucket, object).await
     }
 
+    async fn begin_table_bucket_commit_publication(
+        &self,
+        table_bucket: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.begin_bucket_publication(table_bucket).await
+    }
+
+    fn table_bucket_commit_publication_is_held(&self, table_bucket: &str) -> bool {
+        self.publication.lock().bucket_fence.as_deref() == Some(table_bucket)
+    }
+
     async fn prepare_table_commit_publication(
         &self,
         table_bucket: &str,
@@ -1632,6 +1712,14 @@ where
         table: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.prepare_publication(table_bucket, namespace, table).await
+    }
+
+    fn table_commit_publication_is_held(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
+        self.publication
+            .lock()
+            .table_fence
+            .as_ref()
+            .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
     }
 
     fn complete_table_commit_publication(&self) {
@@ -2067,10 +2155,21 @@ where
     })
 }
 
-async fn enable_table_bucket_response<S>(store: &S, bucket: &str) -> S3Result<TableBucketResponse>
+async fn enable_table_bucket_response<S>(
+    store: &S,
+    publication: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+) -> S3Result<TableBucketResponse>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    crate::table_catalog::TableCommitPublication::begin_table_bucket(publication, bucket)
+        .await
+        .map_err(catalog_store_error)?;
+    if !crate::table_catalog::TableCommitPublication::holds_table_bucket(publication, bucket) {
+        return Err(s3_error!(InternalError, "table bucket enablement requires a publication fence"));
+    }
+    let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
     enable_table_bucket_marker(bucket).await?;
     ensure_table_bucket_entry(store, bucket, true).await?;
     table_bucket_response(store, bucket, true).await
@@ -2482,6 +2581,13 @@ fn metadata_table_location(metadata: &serde_json::Value) -> S3Result<&str> {
 fn validate_metadata_table_location_in_bucket(bucket: &str, metadata: &serde_json::Value) -> S3Result<()> {
     let location = metadata_table_location(metadata)?;
     validate_table_location_in_bucket(bucket, location)
+}
+
+fn table_warehouse_location_changes(
+    current: &crate::table_catalog::TableEntry,
+    target_metadata: &serde_json::Value,
+) -> S3Result<bool> {
+    Ok(current.warehouse_location != metadata_table_location(target_metadata)?)
 }
 
 fn metadata_digest_requirement(metadata: &serde_json::Value) -> S3Result<serde_json::Value> {
@@ -4431,6 +4537,15 @@ where
 {
     let (entry, metadata) = table_entry_from_create_table_request(bucket, namespace, request)?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    crate::table_catalog::TableCommitPublication::begin_table_bucket(metadata_backend, bucket)
+        .await
+        .map_err(catalog_store_error)?;
+    if !crate::table_catalog::TableCommitPublication::holds_table_bucket(metadata_backend, bucket) {
+        return Err(catalog_store_error(crate::table_catalog::TableCatalogStoreError::Internal(
+            "table creation requires a table-bucket publication fence".to_string(),
+        )));
+    }
+    let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(metadata_backend);
     let metadata_data = serde_json::to_vec(&metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize initial table metadata: {}", err))?;
     metadata_backend
@@ -4782,11 +4897,21 @@ where
 async fn publish_table_commit<S>(
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    table_bucket_fence_required: bool,
     request: crate::table_catalog::TableCommitRequest,
 ) -> S3Result<crate::table_catalog::TableCommitResult>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let _bucket_publication_completion = if table_bucket_fence_required {
+        metadata_backend
+            .begin_table_bucket_commit_publication(&request.table_bucket)
+            .await
+            .map_err(catalog_store_error)?;
+        Some(crate::table_catalog::TableCommitPublicationCompletion::new(metadata_backend))
+    } else {
+        None
+    };
     store
         .commit_table_with_publication(request, metadata_backend)
         .await
@@ -4832,6 +4957,7 @@ where
     validate_metadata_table_location_in_bucket(bucket, &previous_metadata)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+    let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
     validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
     validate_table_metadata_snapshot_graph(
         metadata_backend,
@@ -4875,7 +5001,7 @@ where
             "commit retry does not match the original request",
         ));
     }
-    let result = publish_table_commit(store, metadata_backend, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
     Ok(table_metadata_location_response_from_entry(result.table))
 }
 
@@ -4918,6 +5044,7 @@ where
     validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.new_metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+    let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
     if let Some(existing_commit) = existing_commit {
         request.requirements = replay_commit_requirements(&existing_commit, &client_requirements, &target_metadata)?;
         if !crate::table_catalog::commit_log_matches_request(&existing_commit, &request, &current.table_id) {
@@ -4943,7 +5070,7 @@ where
         )
         .await?;
         let committed_metadata_location = request.new_metadata_location.clone();
-        let result = publish_table_commit(store, metadata_backend, request).await?;
+        let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
         return commit_table_replay_response(
             metadata_backend,
             bucket,
@@ -4967,7 +5094,7 @@ where
         &target_metadata,
     )
     .await?;
-    let result = publish_table_commit(store, metadata_backend, request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
     Ok(commit_table_response_from_result(result, target_metadata))
 }
 
@@ -5081,6 +5208,7 @@ where
         }
         Err(err) => return Err(catalog_store_error(err)),
     }
+    let table_bucket_fence_required = table_warehouse_location_changes(&current, &next_metadata)?;
 
     let commit_request = crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
@@ -5095,7 +5223,7 @@ where
         requirements: request.requirements,
         writer: request.writer,
     };
-    let result = publish_table_commit(store, metadata_backend, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
     Ok(commit_table_response_from_result(result, next_metadata))
 }
 
@@ -5286,9 +5414,11 @@ where
     }
     let requirements = replay_commit_requirements(&commit, &request.requirements, &target_metadata)?;
     let committed_metadata_location = commit.new_metadata_location.clone();
+    let table_bucket_fence_required = table_warehouse_location_changes(current, &target_metadata)?;
     let result = publish_table_commit(
         store,
         metadata_backend,
+        table_bucket_fence_required,
         crate::table_catalog::TableCommitRequest {
             table_bucket: bucket.to_string(),
             namespace: namespace.public_name(),
@@ -5378,6 +5508,7 @@ where
             Some(
                 store
                     .commit_table_compaction_with_publication(
+                        &publication_backend,
                         &publication_backend,
                         bucket,
                         &namespace.public_name(),
@@ -5545,6 +5676,7 @@ where
         )
         .await
         .map_err(catalog_store_error)?;
+    let table_bucket_fence_required = table_warehouse_location_changes(&current, &next_metadata)?;
 
     let commit_request = crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
@@ -5559,7 +5691,7 @@ where
         requirements: Vec::new(),
         writer: Some("rustfs-maintenance".to_string()),
     };
-    let result = publish_table_commit(store, metadata_backend, commit_request).await?;
+    let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
     report.expired_snapshot_ids = expired_snapshot_ids;
     report.committed_metadata_location = Some(result.table.metadata_location);
     Ok(report)
@@ -6048,9 +6180,11 @@ where
             &target_metadata,
         )
         .await?;
+        let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let result = publish_table_commit(
             store,
             metadata_backend,
+            table_bucket_fence_required,
             crate::table_catalog::TableCommitRequest {
                 table_bucket: bucket.to_string(),
                 namespace: namespace.public_name(),
@@ -6202,6 +6336,7 @@ where
             &target_metadata,
         )
         .await?;
+        let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let commit_request = crate::table_catalog::TableCommitRequest {
             table_bucket: bucket.to_string(),
             namespace: namespace.public_name(),
@@ -6215,7 +6350,7 @@ where
             requirements: Vec::new(),
             writer: Some("rustfs-catalog-rollback-api".to_string()),
         };
-        let result = publish_table_commit(store, metadata_backend, commit_request).await?;
+        let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, commit_request).await?;
         Ok(commit_table_response_from_result(result, target_metadata))
     }
     .await;

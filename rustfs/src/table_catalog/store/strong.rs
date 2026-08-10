@@ -443,16 +443,20 @@ where
                 continue;
             };
             let table_key = (table_bucket.clone(), namespace.clone(), table.clone());
-            if let Some(existing_key) = warehouse_index
-                .entry(table_bucket.clone())
-                .or_default()
-                .insert(warehouse_object_prefix.clone(), table_key.clone())
+            let bucket_index = warehouse_index.entry(table_bucket.clone()).or_default();
+            let predecessor = bucket_index.range(..=warehouse_object_prefix.clone()).next_back();
+            let successor = bucket_index.range(warehouse_object_prefix.clone()..).next();
+            if let Some((existing_prefix, existing_key)) = predecessor
+                .into_iter()
+                .chain(successor)
+                .find(|(existing_prefix, _)| warehouse_object_prefixes_overlap(existing_prefix, &warehouse_object_prefix))
             {
                 return Err(TableCatalogStoreError::Invalid(format!(
-                    "duplicate active table warehouse location in strong catalog snapshot: {warehouse_object_prefix} is owned by {}/{}/{} and {}/{}/{}",
+                    "overlapping active table warehouse location in strong catalog snapshot: {warehouse_object_prefix} overlaps {existing_prefix} owned by {}/{}/{} and {}/{}/{}",
                     existing_key.0, existing_key.1, existing_key.2, table_key.0, table_key.1, table_key.2
                 )));
             }
+            bucket_index.insert(warehouse_object_prefix, table_key);
         }
         state.warehouse_index = warehouse_index;
         Ok(())
@@ -696,9 +700,9 @@ where
             let Ok(existing_prefix) = table_warehouse_object_prefix(existing) else {
                 continue;
             };
-            if existing_prefix == candidate_prefix {
+            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
                 return Err(TableCatalogStoreError::Conflict(format!(
-                    "table warehouse location is already registered: {candidate_prefix}"
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
                 )));
             }
         }
@@ -1283,10 +1287,21 @@ where
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         table_warehouse_object_prefix(&entry)?;
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
             .await?;
-        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table publication fence".to_string(),
+            ));
+        }
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
@@ -1410,6 +1425,7 @@ where
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         let publication = TableCommitLockPublication::new(&self.object_backend);
+        publication.begin_table_bucket(&request.table_bucket).await?;
         self.commit_table_with_publication(request, &publication).await
     }
 
@@ -1425,6 +1441,11 @@ where
         publication
             .prepare(&request.table_bucket, &request.namespace, &request.table)
             .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table publication fence".to_string(),
+            ));
+        }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
@@ -1498,6 +1519,36 @@ where
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
+        let current_warehouse_location = {
+            let state = self.state.lock().await;
+            state
+                .tables
+                .get(&key)
+                .map(|entry| entry.warehouse_location.clone())
+                .ok_or_else(|| {
+                    TableCatalogStoreError::NotFound(format!(
+                        "table {}/{}/{}",
+                        request.table_bucket, request.namespace, request.table
+                    ))
+                })?
+        };
+        if next_warehouse_location
+            .as_ref()
+            .is_some_and(|warehouse_location| warehouse_location != &current_warehouse_location)
+            && !publication.holds_table_bucket(&request.table_bucket)
+        {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Internal(
+                    "table warehouse relocation requires a table-bucket publication fence".to_string(),
+                )),
+            );
+        }
 
         let cas_started = Instant::now();
         let prepared_result = {
@@ -1528,6 +1579,15 @@ where
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        publication.begin_table_bucket(table_bucket).await?;
+        publication.prepare(table_bucket, namespace, table).await?;
+        if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table drop requires table-bucket and table publication fences".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;

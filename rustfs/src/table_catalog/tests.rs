@@ -235,10 +235,21 @@ impl TableCatalogStore for NoopTableCatalogStore {
         entry: TableEntry,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<()> {
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
             .await?;
-        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table publication fence".to_string(),
+            ));
+        }
         self.register_table(entry).await
     }
 
@@ -306,6 +317,11 @@ impl TableCatalogStore for NoopTableCatalogStore {
         publication
             .prepare(&request.table_bucket, &request.namespace, &request.table)
             .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table publication fence".to_string(),
+            ));
+        }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
         self.commit_table(request).await
     }
@@ -484,6 +500,88 @@ async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     let strong_backend = TestCatalogObjectBackend::default();
     let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
     assert_direct_commit_uses_publication_lock(&strong_store, &strong_backend).await;
+}
+
+async fn assert_direct_drop_uses_publication_locks<S>(store: S, backend: &TestCatalogObjectBackend)
+where
+    S: TableCatalogStore + Clone + Send + Sync + 'static,
+{
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_table(test_table_entry(bucket, &namespace, &table, current_metadata))
+        .await
+        .expect("table should be created");
+
+    let bucket_lock = default_table_bucket_publication_lock_path();
+    let table_lock = default_table_publication_lock_path(&namespace, &table);
+    let bucket_guard = backend
+        .acquire_read_lock(bucket, &bucket_lock)
+        .await
+        .expect("bucket publication reader should be acquired");
+    let table_guard = backend
+        .acquire_read_lock(bucket, &table_lock)
+        .await
+        .expect("table publication reader should be acquired");
+    let bucket_attempts = backend.write_lock_acquisition_count(bucket, &bucket_lock).await;
+    let table_attempts = backend.write_lock_acquisition_count(bucket, &table_lock).await;
+
+    let drop_store = store.clone();
+    let drop_task = tokio::spawn(async move { drop_store.drop_table(bucket, "sales", "orders").await });
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while backend.write_lock_acquisition_count(bucket, &bucket_lock).await == bucket_attempts {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop should attempt the bucket publication fence");
+    assert!(!drop_task.is_finished(), "drop must wait for an in-flight bucket writer");
+
+    drop(bucket_guard);
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while backend.write_lock_acquisition_count(bucket, &table_lock).await == table_attempts {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop should attempt the table publication fence");
+    assert!(!drop_task.is_finished(), "drop must wait for an in-flight table writer");
+
+    drop(table_guard);
+    tokio::time::timeout(StdDuration::from_secs(1), drop_task)
+        .await
+        .expect("drop should continue after publication readers finish")
+        .expect("drop task should join")
+        .expect("drop should succeed");
+    assert!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .expect("table lookup should succeed")
+            .is_none(),
+        "table must become invisible before publication fences are released"
+    );
+}
+
+#[tokio::test]
+async fn catalog_backings_fence_direct_table_drop() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_direct_drop_uses_publication_locks(object_store, &object_backend).await;
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
+    assert_direct_drop_uses_publication_locks(strong_store, &strong_backend).await;
 }
 
 #[tokio::test]
@@ -673,11 +771,23 @@ impl BlockingObjectPublication {
 
 #[async_trait::async_trait]
 impl TableCommitPublication for BlockingObjectPublication {
+    async fn begin_table_bucket(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
     async fn prepare(&self, table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
         self.started.notify_one();
         let guard = self.backend.acquire_read_lock(table_bucket, &self.object).await?;
         *self.guard.lock() = Some(guard);
         Ok(())
+    }
+
+    fn holds_table_bucket(&self, _table_bucket: &str) -> bool {
+        true
+    }
+
+    fn holds_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
+        self.guard.lock().is_some()
     }
 
     fn complete(&self) {
@@ -2403,6 +2513,7 @@ async fn table_data_plane_resource_resolves_registered_warehouse_prefix() {
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend.reset_call_counts().await;
     assert_eq!(backend.list_call_count().await, 0);
 
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
@@ -2429,6 +2540,7 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend.reset_call_counts().await;
 
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id-other/data/part-00001.parquet")
         .await
@@ -2439,9 +2551,9 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
 }
 
 #[tokio::test]
-async fn table_data_plane_resource_prefers_longest_registered_warehouse_prefix() {
+async fn catalog_backings_reject_overlapping_registered_warehouse_prefixes() {
     let backend = TestCatalogObjectBackend::default();
-    let store = ObjectTableCatalogStore::new(backend.clone());
+    let store = ObjectTableCatalogStore::new(backend);
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").unwrap();
     let parent_table = IdentifierSegment::parse("orders").unwrap();
@@ -2452,18 +2564,78 @@ async fn table_data_plane_resource_prefers_longest_registered_warehouse_prefix()
     let mut child_entry = test_table_entry(bucket, &namespace, &child_table, current);
     child_entry.table_id = "table-id-child".to_string();
     child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
-    store.create_table(child_entry).await.unwrap();
+    assert_matches!(store.create_table(child_entry.clone()).await, Err(TableCatalogStoreError::Conflict(_)));
 
-    let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend);
+    strong_store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    strong_store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
         .await
-        .expect("data-plane resource lookup should succeed")
-        .expect("object should resolve to the child table");
+        .unwrap();
+    strong_store
+        .create_table(test_table_entry(
+            bucket,
+            &namespace,
+            &parent_table,
+            default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json"),
+        ))
+        .await
+        .unwrap();
+    assert_matches!(strong_store.create_table(child_entry).await, Err(TableCatalogStoreError::Conflict(_)));
+}
 
-    assert_eq!(resource.table, "orders_child");
-    assert_eq!(resource.table_id, "table-id-child");
-    assert_eq!(resource.warehouse_object_prefix, "tables/table-id/child/");
-    assert_eq!(resource.catalog_resource_object(), "namespaces/sales/tables/orders_child");
-    assert_eq!(backend.list_call_count().await, 0);
+#[tokio::test]
+async fn object_catalog_revalidates_legacy_warehouse_index_before_resolution() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let parent_table = IdentifierSegment::parse("orders").expect("parent table should parse");
+    let child_table = IdentifierSegment::parse("orders_child").expect("child table should parse");
+    let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current).await;
+    let mut child_entry = test_table_entry(
+        bucket,
+        &namespace,
+        &child_table,
+        default_table_metadata_file_path(&namespace, &child_table, "00001.metadata.json"),
+    );
+    child_entry.table_id = "table-id-child".to_string();
+    child_entry.table_uuid = "table-uuid-child".to_string();
+    child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
+    store
+        .write_entry(
+            store.catalog_bucket(),
+            &store.paths.table_entry_path(bucket, &namespace, &child_table),
+            &child_entry,
+            TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("legacy overlapping table entry should be seeded");
+    store
+        .write_entry(
+            store.catalog_bucket(),
+            &store.paths.warehouse_index_state_path(bucket),
+            &TableWarehouseIndexStateEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.to_string(),
+                state: TableCatalogEntryState::Active,
+            },
+            TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("legacy warehouse index state should be seeded");
+
+    let error = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
+        .await
+        .expect_err("legacy overlapping prefixes must fail closed during index rebuild");
+
+    assert!(matches!(
+        error,
+        TableCatalogStoreError::Conflict(message) if message.contains("warehouse locations overlap")
+    ));
 }
 
 #[tokio::test]
@@ -2495,6 +2667,7 @@ async fn table_data_plane_resource_skips_stale_deeper_index_and_matches_parent()
         )
         .await
         .unwrap();
+    backend.reset_call_counts().await;
 
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
         .await
@@ -8912,6 +9085,7 @@ async fn object_table_catalog_store_syncs_warehouse_location_from_committed_meta
         .unwrap();
 
     assert_eq!(result.table.warehouse_location, "s3://analytics/tables/relocated-table-id");
+    backend.reset_call_counts().await;
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/relocated-table-id/data/part-00001.parquet")
         .await
         .expect("data-plane resource lookup should succeed")
@@ -9940,6 +10114,13 @@ fn table_metadata_file_name_validation_rejects_unsafe_names() {
     assert!(!is_valid_table_metadata_file_name("nested%2f00001.json"));
     assert!(!is_valid_table_metadata_file_name("00001\\metadata.json"));
     assert!(!is_valid_table_metadata_file_name("00001\nmetadata.json"));
+}
+
+#[test]
+fn warehouse_prefix_overlap_distinguishes_nested_and_sibling_tables() {
+    assert!(warehouse_object_prefixes_overlap("tables/table-id/", "tables/table-id/child/"));
+    assert!(warehouse_object_prefixes_overlap("tables/table-id/child/", "tables/table-id/"));
+    assert!(!warehouse_object_prefixes_overlap("tables/table-id/", "tables/table-id-other/"));
 }
 
 #[test]
