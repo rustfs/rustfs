@@ -2997,6 +2997,147 @@ mod tests {
         assert!(!*storage.listed.lock().unwrap());
     }
 
+    #[tokio::test]
+    async fn cleanup_pending_recovery_removes_checkpoint_without_rebuild_work() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+        let identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![identity],
+        )
+        .await
+        .expect("terminal replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("terminal replacement proof should persist before cleanup");
+        resume_manager
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("failed cleanup must retain a cleanup-pending state");
+        CheckpointManager::new(anchor.clone(), task_id.clone())
+            .await
+            .expect("checkpoint fixture should persist");
+        assert!(
+            CheckpointManager::has_checkpoint(&anchor, &task_id).await,
+            "checkpoint fixture must exist before restart cleanup"
+        );
+
+        let storage = Arc::new(MockStorage {
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        HealTask::from_replacement_recovery_request(request, storage.clone(), Some(anchor.endpoint().to_string()))
+            .execute()
+            .await
+            .expect("cleanup-pending recovery must finish terminal cleanup");
+
+        assert!(
+            !CheckpointManager::has_checkpoint(&anchor, &task_id).await,
+            "terminal cleanup must remove the retained checkpoint"
+        );
+        assert!(
+            !ResumeManager::has_resume_state(&anchor, &task_id).await,
+            "terminal cleanup must remove the retained resume state"
+        );
+        assert_eq!(*storage.global_format_calls.lock().unwrap(), 0);
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "terminal checkpoint cleanup must not format replacement targets"
+        );
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+        assert!(!*storage.listed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn verified_recovery_keeps_state_when_marker_clear_fails() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+        let target = format!("replacement-marker-missing-{task_id}");
+        let identity = replacement_identity(&target, &target, &format!("identity-{target}"));
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec![target.clone()],
+            vec![identity],
+        )
+        .await
+        .expect("verified replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("verified state must persist proof before marker cleanup");
+
+        let storage = Arc::new(MockStorage {
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            replacement_targets_ready: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec![target];
+
+        let error = HealTask::from_replacement_recovery_request(request, storage.clone(), Some(anchor.endpoint().to_string()))
+            .execute()
+            .await
+            .expect_err("marker clear failure must keep the durable terminal state retryable");
+
+        assert!(error.to_string().contains("healing marker target is unavailable"));
+        let state = ResumeManager::load_replacement_intent(anchor.clone(), &task_id)
+            .await
+            .expect("verified state must remain for retry after marker clear failure")
+            .get_state()
+            .await;
+        assert!(state.completed);
+        assert_eq!(state.replacement_phase, ReplacementPhase::Verified);
+        assert_eq!(*storage.global_format_calls.lock().unwrap(), 0);
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "marker cleanup retry must not format replacement targets again"
+        );
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+        assert!(!*storage.listed.lock().unwrap());
+    }
+
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
