@@ -643,6 +643,48 @@ fn local_host_resolution_timeout_forced(host: &Host<&str>) -> bool {
         .contains(&host)
 }
 
+#[cfg(test)]
+static FORCED_KERNEL_HOSTNAME: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+struct KernelHostnameOverrideGuard;
+
+#[cfg(test)]
+impl Drop for KernelHostnameOverrideGuard {
+    fn drop(&mut self) {
+        *FORCED_KERNEL_HOSTNAME
+            .lock()
+            .expect("kernel-hostname test override mutex poisoned") = None;
+    }
+}
+
+/// Overrides the kernel hostname seen by Kubernetes endpoint-identity
+/// inference so tests stay deterministic on hosts whose kernel hostname is
+/// not a DNS name (e.g. macOS with a DHCP-assigned IP-literal hostname).
+#[cfg(test)]
+fn force_kernel_hostname_for_test(hostname: &str) -> KernelHostnameOverrideGuard {
+    *FORCED_KERNEL_HOSTNAME
+        .lock()
+        .expect("kernel-hostname test override mutex poisoned") = Some(hostname.to_string());
+    KernelHostnameOverrideGuard
+}
+
+fn kernel_hostname_for_endpoint_identity() -> Result<String> {
+    #[cfg(test)]
+    if let Some(hostname) = FORCED_KERNEL_HOSTNAME
+        .lock()
+        .expect("kernel-hostname test override mutex poisoned")
+        .clone()
+    {
+        return Ok(hostname);
+    }
+
+    hostname::get()
+        .map_err(|err| Error::other(format!("failed to read the kernel hostname for Kubernetes endpoint identity: {err}")))?
+        .into_string()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))
+}
+
 fn endpoint_is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<bool> {
     #[cfg(test)]
     if local_host_resolution_timeout_forced(&host) {
@@ -1268,12 +1310,7 @@ impl EndpointServerPools {
             && std::env::var_os(ENV_KUBERNETES_SERVICE_HOST).is_some()
             && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"));
         if infer_kubernetes_host {
-            let kernel_hostname = hostname::get()
-                .map_err(|err| {
-                    Error::other(format!("failed to read the kernel hostname for Kubernetes endpoint identity: {err}"))
-                })?
-                .into_string()
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))?;
+            let kernel_hostname = kernel_hostname_for_endpoint_identity()?;
             let local_port = check_local_server_addr(server_addr)?.port();
             match infer_kubernetes_local_endpoint_host(disks_layout, local_port, &kernel_hostname)? {
                 Some(inferred_host) => local_endpoint_host = Some(inferred_host),
@@ -2217,21 +2254,8 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn create_server_endpoints_infers_kubernetes_pod_host_without_peer_dns() {
-        let raw_hostname = hostname::get()
-            .expect("kernel hostname should be available")
-            .into_string()
-            .expect("kernel hostname should be UTF-8");
-        let Host::Domain(kernel_hostname) = Host::parse(raw_hostname.trim()).expect("kernel hostname should be a DNS name")
-        else {
-            panic!("kernel hostname should be a DNS name");
-        };
-        let kernel_hostname =
-            domain_without_optional_trailing_dot(&kernel_hostname).expect("kernel hostname should be canonical");
-        let local_host = if kernel_hostname.contains('.') {
-            kernel_hostname.to_string()
-        } else {
-            format!("{kernel_hostname}.rustfs-headless.ns.svc.cluster.local")
-        };
+        let _kernel_hostname = force_kernel_hostname_for_test("rustfs-0");
+        let local_host = "rustfs-0.rustfs-headless.ns.svc.cluster.local";
 
         async_with_vars(
             [
@@ -2287,6 +2311,7 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn create_server_endpoints_bounds_kubernetes_alias_dns_fallback() {
+        let _kernel_hostname = force_kernel_hostname_for_test("unmatched-test-node");
         let _resolution_timeout =
             force_local_host_resolution_timeout_for_test(&["unrelated-0.example.invalid", "unrelated-1.example.invalid"]);
 
@@ -2319,6 +2344,7 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn create_server_endpoints_preserves_resolvable_kubernetes_aliases() {
+        let _kernel_hostname = force_kernel_hostname_for_test("unmatched-test-node");
         async_with_vars(
             [
                 (ENV_LOCAL_ENDPOINT_HOST, None),

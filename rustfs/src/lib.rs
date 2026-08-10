@@ -84,6 +84,7 @@ pub mod diagnose;
 pub mod embedded;
 pub mod error;
 pub mod init;
+pub mod inspect;
 pub(crate) mod kms_deletion_gate;
 pub mod license;
 pub mod memory_observability;

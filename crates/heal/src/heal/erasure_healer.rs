@@ -14,7 +14,10 @@
 
 use crate::heal::{
     progress::HealProgress,
-    resume::{CheckpointManager, ResumeManager, ResumeUtils, compose_key},
+    resume::{
+        CheckpointManager, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
+        replacement_target_identities_match,
+    },
     storage::{HealStorageAPI, next_heal_listing_token},
     task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
 };
@@ -22,6 +25,7 @@ use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
 use metrics::gauge;
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -85,6 +89,16 @@ pub struct ErasureSetHealer {
     disk: DiskStore,
     heal_opts: HealOpts,
     source: HealRequestSource,
+    target_endpoints: Arc<[String]>,
+    replacement_task_id: Option<String>,
+    replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
+}
+
+pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
+    target_endpoints.iter().all(|endpoint| {
+        let mut drives = result.after.drives.iter().filter(|drive| drive.endpoint == *endpoint);
+        matches!(drives.next(), Some(drive) if drive.state == "ok") && drives.next().is_none()
+    })
 }
 
 impl ErasureSetHealer {
@@ -182,7 +196,44 @@ impl ErasureSetHealer {
             disk,
             heal_opts,
             source,
+            target_endpoints: Vec::new().into(),
+            replacement_task_id: None,
+            replacement_target_identities: None,
         }
+    }
+
+    pub(crate) fn with_replacement_targets(
+        mut self,
+        mut target_endpoints: Vec<String>,
+        replacement_task_id: Option<String>,
+    ) -> Self {
+        target_endpoints.sort_unstable();
+        target_endpoints.dedup();
+        self.target_endpoints = target_endpoints.into();
+        self.replacement_task_id = replacement_task_id;
+        self
+    }
+
+    pub(crate) fn with_replacement_identity_fence(
+        mut self,
+        replacement_target_identities: Option<Vec<ReplacementTargetIdentity>>,
+    ) -> Self {
+        self.replacement_target_identities = replacement_target_identities.map(Into::into);
+        self
+    }
+
+    async fn verify_replacement_identity_fence(&self, stage: &str) -> Result<()> {
+        let Some(expected_identities) = self.replacement_target_identities.as_ref() else {
+            return Ok(());
+        };
+        let actual_identities = self.storage.replacement_target_identities(&self.target_endpoints).await?;
+        if replacement_target_identities_match(expected_identities, &actual_identities) {
+            return Ok(());
+        }
+
+        Err(Error::TaskExecutionFailed {
+            message: format!("Replacement target changed during {stage}"),
+        })
     }
 
     /// execute erasure set heal with resume
@@ -212,9 +263,15 @@ impl ErasureSetHealer {
             .await;
 
         result?;
+        self.verify_replacement_identity_fence("completion").await?;
 
-        // The healing marker is cleared by the caller only after both cleanup
-        // operations succeed. Cleanup is idempotent, so a retry is safe.
+        if self.replacement_task_id.is_some() {
+            // A replacement marker must outlive the successful data scan. The
+            // task clears that owner marker before deleting these artifacts.
+            resume_manager.mark_replacement_completed_and_verified().await?;
+            return Ok(());
+        }
+
         checkpoint_manager.cleanup().await?;
         resume_manager.cleanup().await?;
         Ok(())
@@ -222,6 +279,21 @@ impl ErasureSetHealer {
 
     /// get or create task id
     async fn get_or_create_task_id(&self, set_disk_id: &str) -> Result<String> {
+        if let Some(task_id) = &self.replacement_task_id {
+            let manager = ResumeManager::load_replacement_intent(self.disk.clone(), task_id).await?;
+            let state = manager.get_state().await;
+            if !state.completed
+                && state.set_disk_id == set_disk_id
+                && state.replacement_targets.as_slice() == self.target_endpoints.as_ref()
+                && state.replacement_generation.as_deref() == Some(task_id.as_str())
+            {
+                return Ok(task_id.clone());
+            }
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Replacement resume intent does not match task {task_id}"),
+            });
+        }
+
         // check if there are resumable tasks
         let resumable_tasks = ResumeUtils::get_resumable_tasks(&self.disk).await?;
 
@@ -231,6 +303,7 @@ impl ErasureSetHealer {
                     let state = manager.get_state().await;
                     if !state.completed
                         && state.set_disk_id == set_disk_id
+                        && state.replacement_targets.as_slice() == self.target_endpoints.as_ref()
                         && ResumeUtils::can_resume_task(&self.disk, &task_id).await
                     {
                         debug!(
@@ -263,7 +336,7 @@ impl ErasureSetHealer {
         }
 
         // create new task id
-        let task_id = format!("{}_{}", set_disk_id, ResumeUtils::generate_task_id());
+        let task_id = ResumeUtils::generate_task_id();
         debug!(
             target: "rustfs::heal::erasure_healer",
             event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -285,7 +358,12 @@ impl ErasureSetHealer {
         buckets: &[String],
     ) -> Result<(ResumeManager, CheckpointManager)> {
         // check if resume state exists
-        if ResumeManager::has_resume_state(&self.disk, task_id).await {
+        let has_resume_state = if self.replacement_task_id.is_some() {
+            ResumeManager::has_replacement_intent(&self.disk, task_id).await
+        } else {
+            ResumeManager::has_resume_state(&self.disk, task_id).await
+        };
+        if has_resume_state {
             debug!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -297,7 +375,11 @@ impl ErasureSetHealer {
                 "Erasure set resume state loading"
             );
 
-            let resume_manager = ResumeManager::load_from_disk(self.disk.clone(), task_id).await?;
+            let resume_manager = if self.replacement_task_id.is_some() {
+                ResumeManager::load_replacement_intent(self.disk.clone(), task_id).await?
+            } else {
+                ResumeManager::load_from_disk(self.disk.clone(), task_id).await?
+            };
             let checkpoint_manager = if CheckpointManager::has_checkpoint(&self.disk, task_id).await {
                 CheckpointManager::load_from_disk(self.disk.clone(), task_id).await?
             } else {
@@ -340,6 +422,9 @@ impl ErasureSetHealer {
                 buckets.to_vec(),
             )
             .await?;
+            resume_manager
+                .set_replacement_targets(self.target_endpoints.as_ref().to_vec())
+                .await?;
 
             let checkpoint_manager = CheckpointManager::new(self.disk.clone(), task_id.to_string()).await?;
 
@@ -485,6 +570,12 @@ impl ErasureSetHealer {
         // later heal cycle via the same bounded-retry mechanism as failures —
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
+            if self.replacement_task_id.is_some() && resume_manager.schedule_retry().await? {
+                checkpoint_manager.reset_for_retry().await?;
+                return Err(Error::transient_skip(format!(
+                    "Replacement erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
+                )));
+            }
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
                 // rewinds the resume state (cursor + counters), and the
@@ -508,15 +599,15 @@ impl ErasureSetHealer {
                     state = "retry_scheduled",
                     "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
-                return Err(Error::other(format!(
+                return Err(Error::transient_skip(format!(
                     "Erasure set heal incomplete: {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped; retry scheduled"
                 )));
             }
 
-            // Retry budget exhausted: drop the resume/checkpoint state so this
-            // task does not loop, but keep the healing markers (return Err) so a
-            // later heal cycle / the background scanner starts a fresh attempt.
-            // Never silently claim a clean completion while objects are unhealed.
+            // Retry budget exhausted: keep the resume/checkpoint state while
+            // the replacement marker remains. A later repair must retain the
+            // durable evidence of the incomplete generation instead of
+            // starting from an indistinguishable blank state.
             error!(
                 target: "rustfs::heal::erasure_healer",
                 event = EVENT_HEAL_ERASURE_RESUME_STATE,
@@ -529,15 +620,16 @@ impl ErasureSetHealer {
                 state = "failed_after_retries",
                 "Erasure set heal exhausted retries with unrecovered versions"
             );
-            checkpoint_manager.cleanup().await?;
-            resume_manager.cleanup().await?;
             return Err(Error::other(format!(
                 "Erasure set heal exhausted retries with {failed_buckets} bucket(s) failed, {failed_objects} object(s) failed, {skipped_objects} object(s) skipped"
             )));
         }
 
-        // no failures — mark task completed
-        resume_manager.mark_completed().await?;
+        // No failures — ordinary heals are complete now. Replacement heals
+        // atomically transition to Verified after the terminal identity fence.
+        if self.replacement_task_id.is_none() {
+            resume_manager.mark_completed().await?;
+        }
 
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -628,6 +720,7 @@ impl ErasureSetHealer {
             matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
 
         loop {
+            self.verify_replacement_identity_fence("page scan").await?;
             // Get one page of object versions
             let (objects, next_token, is_truncated) = if use_disk_walk {
                 self.storage
@@ -672,6 +765,8 @@ impl ErasureSetHealer {
                 let set_label = set_disk_id.to_string();
                 let heal_opts = self.heal_opts;
                 let semaphore = semaphore.clone();
+                let target_endpoints = self.target_endpoints.clone();
+                let replacement_commit_evidence_required = self.replacement_task_id.is_some();
 
                 page_tasks.push(async move {
                     let permit = semaphore
@@ -699,6 +794,35 @@ impl ErasureSetHealer {
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
                             .await
                         {
+                            Ok((result, None))
+                                if target_outcomes_complete(&result, &target_endpoints) =>
+                            {
+                                if !replacement_commit_evidence_required {
+                                    Ok(true)
+                                } else {
+                                    match storage
+                                        .replacement_targets_have_version(
+                                            &bucket_name,
+                                            &object_name,
+                                            version_id.as_deref(),
+                                            &heal_opts,
+                                            &target_endpoints,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => Ok(true),
+                                        Ok(false) => Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
+                                        ))),
+                                        Err(err) => Err(Error::transient_skip(format!(
+                                            "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
+                                        ))),
+                                    }
+                                }
+                            }
+                            Ok((_result, None)) if !target_endpoints.is_empty() => Err(Error::transient_skip(format!(
+                                "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
+                            ))),
                             Ok((_result, None)) => Ok(true),
                             Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
                             Ok((_, Some(err))) | Err(err) => match Self::classify_heal_object_error(&err) {
@@ -1011,9 +1135,12 @@ mod resume_loop_tests {
     //! that emits programmable multi-version pages. These exercise the real loop
     //! logic (cursor seeding, per-version dedup, anti-loop guard, absence
     //! handling) — not merely a mock's own output.
-    use super::ErasureSetHealer;
+    use super::{ErasureSetHealer, target_outcomes_complete};
     use crate::heal::progress::HealProgress;
-    use crate::heal::resume::{CheckpointManager, RESUME_CHECKPOINT_FILE, ResumeDeleteFailure, ResumeManager, compose_key};
+    use crate::heal::resume::{
+        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
+        compose_key,
+    };
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
@@ -1021,8 +1148,8 @@ mod resume_loop_tests {
     };
     use crate::{Error, Result};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
-    use rustfs_madmin::heal_commands::HealResultItem;
-    use std::collections::HashMap;
+    use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1035,6 +1162,53 @@ mod resume_loop_tests {
             version_id: version.map(str::to_string),
             is_delete_marker: delete_marker,
         }
+    }
+
+    #[test]
+    fn target_outcomes_require_each_requested_endpoint_once_and_ok() {
+        let result = HealResultItem {
+            after: Infos {
+                drives: vec![
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    },
+                    HealDriveInfo {
+                        endpoint: "replacement-b".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+
+        assert!(target_outcomes_complete(&result, &["replacement-a".to_string()]));
+        assert!(!target_outcomes_complete(
+            &result,
+            &["replacement-a".to_string(), "replacement-b".to_string()]
+        ));
+        assert!(!target_outcomes_complete(&result, &["replacement-c".to_string()]));
+
+        let duplicate = HealResultItem {
+            after: Infos {
+                drives: vec![
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    },
+                    HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        assert!(!target_outcomes_complete(&duplicate, &["replacement-a".to_string()]));
     }
 
     #[derive(Clone)]
@@ -1061,8 +1235,14 @@ mod resume_loop_tests {
         pages: Mutex<HashMap<Option<String>, Page>>,
         /// per-`compose_key` heal outcome; default is `Ok`
         outcomes: Mutex<HashMap<String, HealOutcome>>,
+        /// successful low-level result per `compose_key`; default has no drive outcomes.
+        results: Mutex<HashMap<String, HealResultItem>>,
+        /// Target-specific physical readback evidence per `compose_key`; the
+        /// fake models a healthy backend unless a test explicitly revokes it.
+        replacement_commit_evidence: Mutex<HashMap<String, bool>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
+        replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         fail_listing: AtomicBool,
     }
 
@@ -1072,6 +1252,15 @@ mod resume_loop_tests {
         }
         fn set_outcome(&self, name: &str, version: Option<&str>, outcome: HealOutcome) {
             self.outcomes.lock().unwrap().insert(compose_key(name, version), outcome);
+        }
+        fn set_result(&self, name: &str, version: Option<&str>, result: HealResultItem) {
+            self.results.lock().unwrap().insert(compose_key(name, version), result);
+        }
+        fn set_replacement_commit_evidence(&self, name: &str, version: Option<&str>, committed: bool) {
+            self.replacement_commit_evidence
+                .lock()
+                .unwrap()
+                .insert(compose_key(name, version), committed);
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
@@ -1143,7 +1332,7 @@ mod resume_loop_tests {
             let key = compose_key(object, version_id);
             let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
             match outcome {
-                HealOutcome::Ok => Ok((HealResultItem::default(), None)),
+                HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -1156,6 +1345,21 @@ mod resume_loop_tests {
         }
         async fn heal_format(&self, _dry: bool) -> Result<(HealResultItem, Option<Error>)> {
             Ok((HealResultItem::default(), None))
+        }
+        async fn replacement_targets_have_version(
+            &self,
+            _bucket: &str,
+            object: &str,
+            version_id: Option<&str>,
+            _opts: &HealOpts,
+            _targets: &[String],
+        ) -> Result<bool> {
+            Ok(*self
+                .replacement_commit_evidence
+                .lock()
+                .unwrap()
+                .get(&compose_key(object, version_id))
+                .unwrap_or(&true))
         }
         async fn list_objects_for_heal(&self, _b: &str, _p: &str) -> Result<Vec<HealListItem>> {
             Ok(Vec::new())
@@ -1178,6 +1382,13 @@ mod resume_loop_tests {
         }
         async fn get_disk_for_resume(&self, _id: &str) -> Result<DiskStore> {
             Err(Error::other("not implemented in tests"))
+        }
+        async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+            self.replacement_target_identity_sequences
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| Error::other("replacement identity sequence exhausted"))
         }
     }
 
@@ -1204,13 +1415,19 @@ mod resume_loop_tests {
         storage: Arc<FakeStorage>,
         resume: ResumeManager,
         checkpoint: CheckpointManager,
+        task_id: String,
         _temp: TempDir,
     }
 
     async fn make_env() -> Env {
+        make_env_with_targets(Vec::new()).await
+    }
+
+    async fn make_env_with_targets(target_endpoints: Vec<String>) -> Env {
         let temp = TempDir::new().unwrap();
         let disk = make_disk(&temp).await;
         let storage = Arc::new(FakeStorage::default());
+        let task_id = ResumeUtils::generate_task_id();
         let healer = ErasureSetHealer::new(
             storage.clone(),
             Arc::new(RwLock::new(HealProgress::new())),
@@ -1218,22 +1435,24 @@ mod resume_loop_tests {
             disk.clone(),
             HealOpts::default(),
             HealRequestSource::Internal,
-        );
+        )
+        .with_replacement_targets(target_endpoints, None);
         let resume = ResumeManager::new(
             disk.clone(),
-            "task".to_string(),
+            task_id.clone(),
             "erasure_set".to_string(),
             "pool_0_set_0".to_string(),
             vec!["b".to_string()],
         )
         .await
         .unwrap();
-        let checkpoint = CheckpointManager::new(disk, "task".to_string()).await.unwrap();
+        let checkpoint = CheckpointManager::new(disk, task_id.clone()).await.unwrap();
         Env {
             healer,
             storage,
             resume,
             checkpoint,
+            task_id,
             _temp: temp,
         }
     }
@@ -1275,6 +1494,112 @@ mod resume_loop_tests {
         assert_eq!(skipped, 0);
         assert!(env.storage.calls().is_empty());
         assert_eq!(env.resume.resume_cursor().await, None);
+    }
+
+    #[tokio::test]
+    async fn replacement_targets_use_a_canonical_order() {
+        let env = make_env_with_targets(vec![
+            "replacement-b".to_string(),
+            "replacement-a".to_string(),
+            "replacement-b".to_string(),
+        ])
+        .await;
+
+        assert_eq!(env.healer.target_endpoints.as_ref(), ["replacement-a", "replacement-b"]);
+    }
+
+    #[tokio::test]
+    async fn replacement_identity_fence_rejects_a_remount_before_page_scan() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let expected_identity = ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "filesystem-a".to_string(),
+        };
+        let remounted_identity = ReplacementTargetIdentity {
+            physical_device_ids: vec!["device-b".to_string()],
+            filesystem_identity: "filesystem-b".to_string(),
+            ..expected_identity.clone()
+        };
+        env.storage
+            .replacement_target_identity_sequences
+            .lock()
+            .unwrap()
+            .push_back(vec![remounted_identity]);
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()))
+        .with_replacement_identity_fence(Some(vec![expected_identity]));
+        let mut current_object_index = 0;
+        let mut processed = 0;
+        let mut successful = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+
+        let error = healer
+            .heal_bucket_with_resume(
+                "b",
+                "pool_0_set_0",
+                0,
+                &mut current_object_index,
+                &mut processed,
+                &mut successful,
+                &mut failed,
+                &mut skipped,
+                &env.resume,
+                &env.checkpoint,
+            )
+            .await
+            .expect_err("a remounted target must not begin a new page scan");
+
+        assert!(error.to_string().contains("page scan"));
+        assert!(env.storage.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_generation_never_reuses_another_disk_cursor() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            ResumeUtils::generate_task_id(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("first replacement intent should persist");
+
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(ResumeUtils::generate_task_id()));
+
+        let error = healer
+            .get_or_create_task_id("pool_0_set_0")
+            .await
+            .expect_err("a second replacement must not reuse the first replacement cursor");
+        assert!(
+            !error.to_string().contains("generation-a"),
+            "the previous replacement generation must not be selected"
+        );
     }
 
     #[tokio::test]
@@ -1330,13 +1655,14 @@ mod resume_loop_tests {
             .await
             .expect("new heal should allocate a task id");
 
-        assert_ne!(task_id, "task", "a completed resume state must not suppress a new heal");
+        assert_ne!(task_id, env.task_id, "a completed resume state must not suppress a new heal");
+        assert!(uuid::Uuid::parse_str(&task_id).is_ok(), "new resume task ids must be UUIDs");
     }
 
     #[tokio::test]
     async fn cleanup_failure_keeps_erasure_set_heal_incomplete() {
         let env = make_env().await;
-        let checkpoint_path = format!("{BUCKET_META_PREFIX}/task_{RESUME_CHECKPOINT_FILE}");
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{}_{RESUME_CHECKPOINT_FILE}", env.task_id);
         let _failure = ResumeDeleteFailure::install(checkpoint_path, crate::heal::DiskError::DiskAccessDenied);
 
         let error = env
@@ -1346,12 +1672,90 @@ mod resume_loop_tests {
             .expect_err("checkpoint cleanup failure must fail the erasure-set heal");
 
         assert!(matches!(error, Error::Disk(crate::heal::DiskError::DiskAccessDenied)));
-        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), "task")
+        let state = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
             .await
             .expect("completed state must remain discoverable after cleanup failure")
             .get_state()
             .await;
         assert!(state.completed, "successful data heal must be persisted before cleanup is attempted");
+    }
+
+    #[tokio::test]
+    async fn replacement_completion_keeps_resume_artifacts_until_marker_cleanup() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let replacement_task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        let checkpoint = CheckpointManager::new(env.healer.disk.clone(), replacement_task_id.clone())
+            .await
+            .expect("replacement checkpoint should persist");
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+
+        healer
+            .heal_erasure_set(&["b".to_string()], "pool_0_set_0")
+            .await
+            .expect("replacement data scan should complete");
+
+        let state = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("verified replacement state must remain after data scan")
+            .get_state()
+            .await;
+        assert!(state.completed, "the verified state must record a completed data scan");
+        assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+        assert!(
+            CheckpointManager::has_checkpoint(&env.healer.disk, &replacement_task_id).await,
+            "the checkpoint must survive until the caller clears the healing marker"
+        );
+        drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_keeps_resume_artifacts_for_recovery() {
+        let env = make_env().await;
+        for _ in 0..3 {
+            assert!(env.resume.schedule_retry().await.expect("retry state should persist"));
+            env.checkpoint
+                .reset_for_retry()
+                .await
+                .expect("checkpoint reset should persist");
+        }
+        env.storage.fail_listing();
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("exhausted retry state must report the incomplete heal");
+
+        assert!(
+            ResumeManager::has_resume_state(&env.healer.disk, &env.task_id).await,
+            "retry exhaustion must not delete the resumable state while a marker may remain"
+        );
+        assert!(
+            CheckpointManager::has_checkpoint(&env.healer.disk, &env.task_id).await,
+            "retry exhaustion must retain the checkpoint with the resumable state"
+        );
     }
 
     #[tokio::test]
@@ -1385,7 +1789,7 @@ mod resume_loop_tests {
 
         let (_, checkpoint) = env
             .healer
-            .initialize_resume_state("task", "pool_0_set_0", &["b".to_string()])
+            .initialize_resume_state(&env.task_id, "pool_0_set_0", &["b".to_string()])
             .await
             .expect("resume initialization should repair a stale checkpoint");
         let checkpoint = checkpoint.get_checkpoint().await;
@@ -1652,5 +2056,133 @@ mod resume_loop_tests {
             checkpoint.skipped_objects.is_empty(),
             "the skipped set must be cleared so the retry re-heals the version"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_target_missing_from_success_result_retries_the_full_pass() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "missing".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = env
+            .healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        result.expect_err("a missing replacement target must not report completion");
+        let state = env.resume.get_state().await;
+        assert!(!state.completed);
+        assert_eq!(state.retry_count, 1);
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_target_readback_evidence_must_confirm_the_healed_version() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()));
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+        env.storage.set_replacement_commit_evidence("object", Some("v1"), false);
+
+        let result = healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        result.expect_err("a success result without target readback evidence must retry");
+        assert_eq!(env.resume.get_state().await.retry_count, 1);
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_targeted_heal_keeps_existing_best_effort_result_semantics() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::Admin,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], None);
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+        env.storage.set_replacement_commit_evidence("object", Some("v1"), false);
+
+        healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("manual targeted healing must retain its existing success semantics");
+
+        assert_eq!(env.resume.get_state().await.retry_count, 0);
     }
 }

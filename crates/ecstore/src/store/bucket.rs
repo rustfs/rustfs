@@ -52,7 +52,10 @@ fn validate_table_bucket_delete_allowed(
 async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
     let local_disks = runtime_sources::local_disks_in(ctx).await;
     for disk in local_disks.iter() {
-        let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
+        let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+            continue;
+        };
+        let catalog_path = bucket_path?.join(BUCKET_TABLE_RESERVED_PREFIX);
         if has_xlmeta_files(&catalog_path).await? {
             return Ok(true);
         }
@@ -727,7 +730,10 @@ impl ECStore {
             if !opts.force {
                 let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
                 for disk in local_disks.iter() {
-                    let bucket_path = disk.path().join(bucket);
+                    let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+                        continue;
+                    };
+                    let bucket_path = bucket_path?;
                     if has_xlmeta_files(&bucket_path).await? {
                         return Err(StorageError::BucketNotEmpty(bucket.to_string()));
                     }
