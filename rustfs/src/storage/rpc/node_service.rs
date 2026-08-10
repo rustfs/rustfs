@@ -1934,6 +1934,32 @@ impl Node for NodeService {
         }
     }
 
+    async fn replacement_recovery_status(
+        &self,
+        _request: Request<ReplacementRecoveryStatusRequest>,
+    ) -> Result<Response<ReplacementRecoveryStatusResponse>, Status> {
+        if self.resolve_object_store().is_none() {
+            return Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: false,
+                recovery_status: Bytes::new(),
+                error_info: Some("storage layer not initialized".to_string()),
+            }));
+        }
+        let snapshot = heal::capture_node_replacement_recovery_status().await;
+        match heal::encode_node_replacement_recovery_status(&snapshot) {
+            Ok(recovery_status) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: true,
+                recovery_status: recovery_status.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                success: false,
+                recovery_status: Bytes::new(),
+                error_info: Some(err),
+            })),
+        }
+    }
+
     async fn get_metacache_listing(
         &self,
         _request: Request<GetMetacacheListingRequest>,
