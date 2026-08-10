@@ -28,7 +28,7 @@ const REPLICATION_RUNTIME_NOT_INITIALIZED: &str = "replication runtime not initi
 const REPLICATION_QUEUE_BACKLOG_PRESENT: &str = "replication queue has pending work";
 const REPLICATION_QUEUE_STATS_UNAVAILABLE: &str = "replication queue stats unavailable";
 const SCANNER_ADMISSION_SATURATED: &str = "scanner active work reached configured set-scan limit";
-const SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED: &str = "scanner activity idle or not initialized";
+const SCANNER_RUNTIME_NOT_INITIALIZED: &str = "scanner runtime not initialized";
 const STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_READ: &str =
     "storage concurrency provider did not expose foreground read admission";
 const STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_WRITE: &str =
@@ -107,19 +107,24 @@ fn metadata_workload_admission_snapshot_from_initialized(runtime_initialized: bo
 pub fn scanner_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
     let runtime_config = rustfs_scanner::scanner_runtime_config_status();
     scanner_workload_admission_snapshot_from_activity(
+        rustfs_scanner::scanner_runtime_initialized(),
         rustfs_scanner::current_scanner_activity(),
         runtime_config.max_concurrent_set_scans.value,
     )
 }
 
-fn scanner_workload_admission_snapshot_from_activity(active: u64, limit: usize) -> WorkloadAdmissionSnapshot {
+fn scanner_workload_admission_snapshot_from_activity(
+    runtime_initialized: bool,
+    active: u64,
+    limit: usize,
+) -> WorkloadAdmissionSnapshot {
     let effective_limit = if limit == 0 { None } else { Some(limit) };
-    let state = if effective_limit.is_some_and(|limit| usize::try_from(active).ok().is_some_and(|active| active >= limit)) {
-        AdmissionState::Saturated
-    } else if active > 0 {
-        AdmissionState::Open
-    } else {
+    let state = if !runtime_initialized {
         AdmissionState::Unknown
+    } else if effective_limit.is_some_and(|limit| usize::try_from(active).ok().is_some_and(|active| active >= limit)) {
+        AdmissionState::Saturated
+    } else {
+        AdmissionState::Open
     };
 
     let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::Scanner, state).with_counts(
@@ -130,7 +135,7 @@ fn scanner_workload_admission_snapshot_from_activity(active: u64, limit: usize) 
 
     match state {
         AdmissionState::Saturated => snapshot.with_reason(SCANNER_ADMISSION_SATURATED),
-        AdmissionState::Unknown => snapshot.with_reason(SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED),
+        AdmissionState::Unknown => snapshot.with_reason(SCANNER_RUNTIME_NOT_INITIALIZED),
         _ => snapshot,
     }
 }
@@ -277,7 +282,7 @@ mod tests {
 
     #[test]
     fn scanner_snapshot_reports_active_work_units() {
-        let snapshot = scanner_workload_admission_snapshot_from_activity(5, 8);
+        let snapshot = scanner_workload_admission_snapshot_from_activity(true, 5, 8);
 
         assert_eq!(snapshot.class, WorkloadClass::Scanner);
         assert_eq!(snapshot.state, AdmissionState::Open);
@@ -288,29 +293,40 @@ mod tests {
     }
 
     #[test]
-    fn scanner_snapshot_is_unknown_when_idle_or_uninitialized() {
-        let snapshot = scanner_workload_admission_snapshot_from_activity(0, 8);
+    fn scanner_snapshot_is_open_when_initialized_and_idle() {
+        let snapshot = scanner_workload_admission_snapshot_from_activity(true, 0, 8);
+
+        assert_eq!(snapshot.class, WorkloadClass::Scanner);
+        assert_eq!(snapshot.state, AdmissionState::Open);
+        assert_eq!(snapshot.active, Some(0));
+        assert_eq!(snapshot.limit, Some(8));
+        assert_eq!(snapshot.reason, None);
+    }
+
+    #[test]
+    fn scanner_snapshot_is_unknown_before_runtime_initialization() {
+        let snapshot = scanner_workload_admission_snapshot_from_activity(false, 0, 8);
 
         assert_eq!(snapshot.class, WorkloadClass::Scanner);
         assert_eq!(snapshot.state, AdmissionState::Unknown);
         assert_eq!(snapshot.active, Some(0));
         assert_eq!(snapshot.limit, Some(8));
-        assert_eq!(snapshot.reason.as_deref(), Some(SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED));
+        assert_eq!(snapshot.reason.as_deref(), Some(SCANNER_RUNTIME_NOT_INITIALIZED));
     }
 
     #[test]
     fn scanner_snapshot_treats_zero_set_scan_limit_as_topology_derived() {
-        let snapshot = scanner_workload_admission_snapshot_from_activity(0, 0);
+        let snapshot = scanner_workload_admission_snapshot_from_activity(true, 0, 0);
 
         assert_eq!(snapshot.class, WorkloadClass::Scanner);
-        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.state, AdmissionState::Open);
         assert_eq!(snapshot.limit, None);
-        assert_eq!(snapshot.reason.as_deref(), Some(SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED));
+        assert_eq!(snapshot.reason, None);
     }
 
     #[test]
     fn scanner_snapshot_with_topology_derived_limit_reports_active_work_open() {
-        let snapshot = scanner_workload_admission_snapshot_from_activity(4, 0);
+        let snapshot = scanner_workload_admission_snapshot_from_activity(true, 4, 0);
 
         assert_eq!(snapshot.class, WorkloadClass::Scanner);
         assert_eq!(snapshot.state, AdmissionState::Open);
@@ -321,7 +337,7 @@ mod tests {
 
     #[test]
     fn scanner_snapshot_reports_saturation_when_active_work_reaches_limit() {
-        let snapshot = scanner_workload_admission_snapshot_from_activity(4, 4);
+        let snapshot = scanner_workload_admission_snapshot_from_activity(true, 4, 4);
 
         assert_eq!(snapshot.class, WorkloadClass::Scanner);
         assert_eq!(snapshot.state, AdmissionState::Saturated);

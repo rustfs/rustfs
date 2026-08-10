@@ -1,6 +1,6 @@
 ---
 name: adversarial-validation
-description: Execute the Adversarial Validation policy from the root AGENTS.md — run the seven reviewer roles (correctness, simplicity, security, concurrency/durability, compatibility, performance, test coverage) with RustFS-specific attack probes. Use on every behavior-affecting code change, bug fix, or design proposal before declaring it done.
+description: Execute the Adversarial Validation policy from the root AGENTS.md — run the applicable reviewer roles with RustFS-specific attack probes. Use on every behavior-affecting code change, bug fix, design proposal, or agent-instruction change that alters execution before declaring it done.
 ---
 
 # Adversarial Validation Playbooks
@@ -61,14 +61,15 @@ Null report example: "Attacked quorum-1 error reduction, exact max-keys listing 
 
 ### Simplicity adversary
 
-- Smaller-diff attack: rewrite the diff's change mentally (or actually, in scratch) as the minimal in-place edit and compare. Flag as findings: a helper function with exactly one caller introduced by this diff; a file rewrite where a 3-line edit inside the existing control flow suffices; reshaped control flow in init/locking/metadata/quorum paths beyond what the fix requires; new string literals duplicating existing constants (grep the token first); #[path] module inclusion. If the smaller diff achieves identical behavior, report it with the concrete replacement.
+- Smaller-diff attack: inspect production growth separately from tests, fixtures, generated code, and documentation; test additions have no growth budget. Rewrite the production diff mentally (or in scratch) as the minimal equivalent edit. Report a finding only with a concrete smaller design that preserves correctness, compatibility, readability, and real boundaries; fewer lines alone are not evidence.
   - Where: Any diff; extra scrutiny for crates/ecstore, crates/lock, rustfs/src/storage where 'preserve the existing control-flow shape' is an explicit rule
-  - Evidence: AGENTS.md 'Change Style for Existing Logic' (one-off helper ban, preserve control-flow shape in distributed/locking/metadata paths, no #[path]) and 'Reuse Before You Write' (constants clause); the Adversarial Validation roles list charters the simplicity adversary with exactly this attack.
-- Reuse-and-necessity attack: for each new helper the diff introduces, run `ls crates/utils/src crates/common/src` and `rg -i 'fn \w*<term>'` over those dirs plus the touched crate (snake_case signatures — a full-text single-word grep drowns, a multi-word phrase returns nothing). A reimplementation of an existing workspace utility, or of plain std/tokio behavior no wrapper refines, is a finding — but so is forced reuse with mismatched semantics (normalization such as `clean` resolving `.`/`..` against raw S3 keys, error type, backoff, durability gating). For each new defensive branch, demand the nameable trigger and flag re-validation of what a validated upstream layer on the SAME path already guarantees — excluding the Cross-Cutting Domain Invariant patterns (nil/empty/absent UUID, dual metadata keys, unversioned-tier versionId) and re-checks before destructive actions, which are load-bearing even when redundant on the happy path. For each new test, flag near-duplicates pinning the same code path AND poison-value class as an existing test — boundary companions (n==max vs max+1, absent vs empty vs nil UUID, MetaObject vs MetaDeleteMarker) are never near-duplicates; the test-coverage skeptic playbook below mandates them.
-  - Where: Any diff adding helpers, branches on decoded/peer data, or tests; helper checks against crates/utils, crates/common, and the touched crate
+  - Evidence: AGENTS.md 'Change Style for Existing Logic' (conditional extraction rule, preserve sensitive control flow, canonical modules) and 'Reuse Before You Write'; the Adversarial Validation roles list charters this attack.
+- Reuse-and-necessity attack: for each new helper, search `crates/utils`, `crates/common`, the touched crate, the likely domain owner, and relevant direct dependencies. A reimplementation is a finding, but forced reuse with mismatched normalization, error, backoff, or durability semantics is also a finding. Demand a nameable trigger for new defensive branches. Tests remain subject to validity and near-duplicate coverage review, never a size limit.
+  - Where: Any diff adding helpers, branches on decoded/peer data, or tests
   - Evidence: AGENTS.md 'Reuse Before You Write' and 'Necessary Code Only'; GHSA-f4vq-9ffr-m8m3 (normalization-asymmetry traversal — why forced reuse of normalizing helpers on raw keys is itself an attack); docs/operations/tier-ilm-debugging.md nil-versionId incident (why boundary re-checks are load-bearing).
+- Replacement-and-comment attack: when the diff introduces a replacement path or representation, trace all callers and flag a superseded in-scope path left behind without a compatibility requirement. Keep one canonical core behind compatibility adapters. Comments must state non-obvious invariants completely without narration or change history. Never demand unrelated deletion or trade away correctness, compatibility, or readability to reduce the diff.
 
-Null report example: "Rewrote the diff as an in-place edit (no smaller equivalent exists), grepped both new helpers against crates/utils, crates/common, and the touched crate (no existing equivalent; call-site semantics checked), verified the two new defensive branches name concrete corrupt-input triggers, and checked the added tests against the existing suite (each pins a distinct poison-value class) — no break found."
+Null report example: "Separated production growth from tests/docs, tested a smaller equivalent, checked helper reuse and superseded paths, and found no break."
 
 ### Security reviewer
 
@@ -195,9 +196,9 @@ Null report example: "Attacked dual-key metadata writes/removals against MinIO-o
 
 ### Performance reviewer
 
-- For every `.clone()` the diff adds or moves onto a per-request/per-object path, open the cloned type and count heap fields (String, Vec, HashMap, Bytes). If >5 heap fields or it contains an EC block buffer, construct the cost: N concurrent PUTs x M objects -> N*M deep copies per second. Demand Arc-wrapping of heavy fields or pass-by-reference; also flag new `String` allocations in header/path/signature parsing where `&str`/`Cow<str>` suffices.
+- For each `.clone()` or allocation added to a per-request/per-object path, identify the copied data and execution frequency. Report a finding only for a concrete repeated cost or benchmark regression. Recommend borrowing, moving, `Bytes`/`Arc`, `Cow`, or capacity reservation only when it reduces that cost without obscuring ownership or APIs.
   - Where: crates/ecstore/src/set_disk/**, crates/ecstore/src/store*.rs, rustfs/src/storage/, crates/filemeta/, request handlers in rustfs/src/
-  - Evidence: crates/ecstore/AGENTS.md 'Allocation Discipline in Hot Paths' (no Clone on >5-heap-field structs, Arc for large buffers, &str/Cow for temporary computations); .agents/skills/rust-code-quality/SKILL.md ranks 'unnecessary clone in hot path' as P1 must-fix
+  - Evidence: crates/ecstore/AGENTS.md 'Allocation Discipline in Hot Paths'; .agents/skills/rust-code-quality/SKILL.md requires a concrete hot-path cost rather than a proxy metric
 - For every new sync_all/sync_data/fdatasync/flush/File::sync call in the diff, trace the call chain to DurabilityMode / RUSTFS_DRIVE_SYNC_ENABLE resolution (crates/ecstore/src/disk/local.rs:291 DurabilityMode, :347 resolve_durability_mode) and to per-bucket durability overrides. Construct the run where the operator sets mode=none (or legacy RUSTFS_DRIVE_SYNC_ENABLE=false) and the new fsync still fires — that is an ungated durability cost and a regression on 4KiB writes.
   - Where: crates/ecstore/src/disk/local.rs, crates/ecstore/src/bucket/durability.rs, crates/ecstore/src/set_disk/** (rename_data/commit paths), any crate doing tokio::fs or std::fs writes
   - Evidence: #4221 fsync work caused a measured -10% 4KiB write regression (#814 investigation), later gated; durability modes added in eaff17cad (#4397), per-bucket tier overrides in 13e48d93a (#4407); 2df315baf (#4493) shows even ancestor-dir fsyncs are routed through the gate
@@ -230,12 +231,12 @@ Null report example: "Attacked the new rename_data commit-section work, durabili
 
 ### Test-coverage skeptic
 
-- For every behavior claim in the PR description, revert that hunk (git stash / manual undo of the changed lines) and name the exact test (`cargo test -p <crate> <test_name>`) that fails. If no test fails on revert, the behavior is untested — file a finding, not a note. Especially verify the test exercises the REAL production call path, not a lookalike helper.
+- For every testable behavior claim in the PR description, revert that hunk and name the focused test or executable check that detects the revert. If no reasonable check exists, require the reason and residual risk from the validation floor. Especially verify the check exercises the real production path, not a lookalike helper.
   - Where: All crates; highest value in crates/ecstore, rustfs/src/storage, crates/heal
-  - Evidence: AGENTS.md exit criterion 'Every behavior change has a test that fails without it'. Real bug: PR #4220 (ghost-directory cleanup) merged with green tests but its fix never executed on the real delete path — required follow-up rustfs#4307, backlog#798 stayed OPEN. The tests exercised a path the production flow never took.
+  - Evidence: AGENTS.md testable-behavior exit criterion. Real bug: PR #4220 (ghost-directory cleanup) merged with green tests but its fix never executed on the real delete path — required follow-up rustfs#4307, backlog#798 stayed OPEN. The tests exercised a path the production flow never took.
 - Read each added/modified test and confirm it asserts the real outcome (returned value, stored bytes, error variant), not merely 'call succeeded' or 'no panic'. Flag any test whose only observable is that the function returned, and any `assert!(result.is_err())` that never checks WHICH error. Then check: does the test prove the exploit/failure form is denied, or only that the intended form still works?
   - Where: crates/e2e_test (security_boundary_test.rs pattern), and every #[cfg(test)] module in the diff
-  - Evidence: Commit dee8e4e63 (#4466) had to rewrite 277 lines of crates/e2e_test/src/security_boundary_test.rs because 'security boundary tests' passed without asserting real outcomes. .agents/skills/rust-code-quality/SKILL.md checklist: 'Every test function has at least one assert!'; .agents/skills/security-advisory-lessons/SKILL.md: 'Does the test prove the exploit form is denied, or only that the intended form still works?'
+  - Evidence: Commit dee8e4e63 (#4466) had to rewrite 277 lines of crates/e2e_test/src/security_boundary_test.rs because 'security boundary tests' passed without asserting real outcomes. .agents/skills/rust-code-quality/SKILL.md requires an observable failure criterion; .agents/skills/security-advisory-lessons/SKILL.md asks whether the exploit form is denied.
 - When the diff adds a boolean/mode parameter or config flag, find the test that fails if the flag's effect is INVERTED inside the changed function. Tests that were mechanically updated to pass `false`/default at every call site assert nothing about the new behavior. Execute the check: flip the flag's branch in the source and confirm at least one test goes red for each branch.
   - Where: crates/ecstore/src/set_disk/ (e.g. build_codec_streaming_part_reader), any function gaining a parameter
   - Evidence: Commit 05890d6e2 (#4573): PR #4560 added a 15th param allow_inplace_legacy_fallback; the arity tests were fixed by passing `false` everywhere — they assert Err outcomes independent of the flag, so the fallback behavior itself has no revert-detecting test at those sites.
@@ -260,7 +261,7 @@ Null report example: "Attacked the new rename_data commit-section work, durabili
 - For any pagination/limit/truncation change, construct the exact-boundary test: result count == max (page exactly full), max+1, and a delimiter re-fold that lands precisely on the page boundary — assert both the item count AND the is_truncated/continuation marker. Off-by-one at the page boundary is a recurring shipped bug here.
   - Where: crates/ecstore listing paths (list_objects, ListMultipartUploads, metacache), S3 handlers in rustfs/src/storage
   - Evidence: Two shipped boundary bugs: fefa70b31 (#4447) ListMultipartUploads returned one upload past max-uploads; d91f4d455 (#4538) delimiter re-fold of a full page lost the truncation flag. Both survived existing tests because no test pinned n == max exactly.
-- Green `cargo test -p <crate>` on the touched crate is not a coverage verdict for the diff's test code itself: run `cargo clippy --all-targets -p <crate>` and a workspace-wide test BUILD (`cargo check --workspace --all-targets` at minimum) before accepting the tests as evidence. Test-only code that doesn't compile workspace-wide or fails clippy has repeatedly broken main and masked whether tests ran at all.
+- A green focused test is evidence only for the targets it builds. Follow the `AGENTS.md` validation tier: add package-scoped Clippy or broader test-target compilation only when changed targets, features, or dependents remain uncovered; do not require a workspace-wide build by default.
   - Where: All crates; especially concurrent-branch merges into crates/ecstore
   - Evidence: #4322 broke main because only cargo test ran (field_reassign_with_default is clippy-only). b06f3df6b (#4441) and 05890d6e2 (#4573): test code broke the workspace test build (E0061) on main after textually-clean merges, failing CI for every open PR.
 
@@ -271,7 +272,6 @@ Null report example: "Attacked revert-detection for all 3 claimed behaviors (eac
 Probes are distilled from shipped bugs in git history (commit/PR references
 above), GitHub security advisories (see the security-advisory-lessons
 skill), scoped `AGENTS.md` rules, and invariants under `docs/architecture/`
-and `docs/operations/`. Line numbers drift; when a cited location no longer
-matches, trust the invariant and re-locate the code. When a new bug class
-ships, add a probe with its evidence here rather than growing the policy
-section in `AGENTS.md`.
+and `docs/operations/`. Line numbers drift; re-locate the invariant. Merge
+new incidents into an existing probe when they share a failure class; add a
+new probe only for a distinct attack, rather than growing the root policy.

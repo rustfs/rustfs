@@ -24,9 +24,10 @@ use crate::startup_runtime_sources;
 use rustfs_common::MtlsIdentityPem;
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
-    DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_SERVER_MTLS_ENABLE,
-    ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_SYSTEM_CA,
-    RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_TLS_CERT,
+    DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_RUSTFS_EXTRA_CA_CERT,
+    ENV_SERVER_MTLS_ENABLE, ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA,
+    ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME,
+    RUSTFS_TLS_CERT,
 };
 use rustfs_tls_runtime::{
     ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource, WebPkiClientVerifierOptions,
@@ -34,6 +35,7 @@ use rustfs_tls_runtime::{
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -265,6 +267,60 @@ fn map_runtime_tls_error(err: rustfs_tls_runtime::TlsRuntimeError) -> TlsMateria
         }
         _ => TlsMaterialError::Io(err.to_string()),
     }
+}
+
+pub(crate) async fn validate_configured_oidc_extra_ca_cert() -> Result<(), TlsMaterialError> {
+    if let Some(path) = configured_oidc_extra_ca_cert_path() {
+        let _ = load_configured_oidc_extra_ca_cert().await?;
+        info!(
+            component = LOG_COMPONENT_TLS,
+            subsystem = LOG_SUBSYSTEM_TLS,
+            event = "oidc_extra_ca_validated",
+            source = "oidc_extra_ca_bundle",
+            env_var = ENV_RUSTFS_EXTRA_CA_CERT,
+            path = ?path,
+            "OIDC extra root CA bundle validated"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn load_configured_oidc_extra_ca_cert() -> Result<Option<Vec<u8>>, TlsMaterialError> {
+    let Some(path) = configured_oidc_extra_ca_cert_path() else {
+        return Ok(None);
+    };
+
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|e| TlsMaterialError::Io(format!("read extra CA bundle {path:?}: {e}")))?;
+    validate_cert_bundle(&data, &path)?;
+    Ok(Some(data))
+}
+
+fn configured_oidc_extra_ca_cert_path() -> Option<PathBuf> {
+    let path = get_env_opt_str(ENV_RUSTFS_EXTRA_CA_CERT)?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn validate_cert_bundle(data: &[u8], path: &Path) -> Result<(), TlsMaterialError> {
+    let mut reader = Cursor::new(data);
+    let mut found = false;
+    let mut store = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(&mut reader) {
+        let cert = cert.map_err(|e| TlsMaterialError::Parse(format!("invalid extra CA bundle {path:?}: {e}")))?;
+        store
+            .add(cert)
+            .map_err(|e| TlsMaterialError::Parse(format!("invalid extra CA bundle {path:?}: {e}")))?;
+        found = true;
+    }
+    if !found {
+        return Err(TlsMaterialError::Parse(format!("no certificate found in extra CA bundle {path:?}")));
+    }
+    Ok(())
 }
 
 /// Load a single certificate file and append PEM data.
@@ -679,6 +735,86 @@ mod tests {
         let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![subject.to_string()]).unwrap();
         fs::write(dir.join(RUSTFS_TLS_CERT), cert.pem()).unwrap();
         fs::write(dir.join(rustfs_config::RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn oidc_extra_ca_cert_loads_configured_bundle() {
+        let CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["extra-ca.example".to_string()]).expect("generate extra CA cert");
+        let temp_file = tempfile::NamedTempFile::new().expect("create extra CA file");
+        fs::write(temp_file.path(), cert.pem()).expect("write extra CA file");
+        let path = temp_file.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([(ENV_RUSTFS_EXTRA_CA_CERT, Some(path.as_str()))], async {
+            let extra_ca = load_configured_oidc_extra_ca_cert()
+                .await
+                .expect("OIDC extra CA should load")
+                .expect("configured OIDC extra CA should be present");
+
+            assert!(extra_ca.starts_with(cert.pem().as_bytes()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn oidc_extra_ca_cert_rejects_invalid_pem() {
+        let temp_file = tempfile::NamedTempFile::new().expect("create invalid extra CA file");
+        fs::write(temp_file.path(), b"not a certificate").expect("write invalid extra CA file");
+        let path = temp_file.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([(ENV_RUSTFS_EXTRA_CA_CERT, Some(path.as_str()))], async {
+            let err = load_configured_oidc_extra_ca_cert()
+                .await
+                .expect_err("invalid extra CA should fail");
+
+            assert!(err.to_string().contains("no certificate found in extra CA bundle"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn oidc_extra_ca_cert_rejects_malformed_der_certificate() {
+        let temp_file = tempfile::NamedTempFile::new().expect("create malformed extra CA file");
+        fs::write(
+            temp_file.path(),
+            b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydA==\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write malformed extra CA file");
+        let path = temp_file.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([(ENV_RUSTFS_EXTRA_CA_CERT, Some(path.as_str()))], async {
+            let err = load_configured_oidc_extra_ca_cert()
+                .await
+                .expect_err("malformed DER in PEM framing should fail");
+
+            assert!(err.to_string().contains("invalid extra CA bundle"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn load_tls_material_does_not_append_oidc_extra_ca_cert() {
+        let temp_dir = TempDir::new().expect("create TLS material dir");
+        write_test_cert_pair(temp_dir.path(), "server.example");
+        let CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["extra-ca.example".to_string()]).expect("generate extra CA cert");
+        let temp_file = tempfile::NamedTempFile::new().expect("create extra CA file");
+        fs::write(temp_file.path(), cert.pem()).expect("write extra CA file");
+        let path = temp_file.path().to_string_lossy().to_string();
+
+        temp_env::async_with_vars([(ENV_RUSTFS_EXTRA_CA_CERT, Some(path.as_str()))], async {
+            let snapshot = load_tls_material(temp_dir.path().to_str().expect("TLS material dir should be utf-8"))
+                .await
+                .expect("TLS material should load");
+
+            assert!(snapshot.outbound.root_ca_pem.is_empty());
+            assert!(snapshot.server.is_some());
+        })
+        .await;
     }
 
     #[tokio::test]

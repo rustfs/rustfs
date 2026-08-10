@@ -851,6 +851,14 @@ message BackgroundHealStatusResponse {
   optional string error_info = 3;
 }
 
+message ReplacementRecoveryStatusRequest {}
+
+message ReplacementRecoveryStatusResponse {
+  bool success = 1;
+  bytes recovery_status = 2;
+  optional string error_info = 3;
+}
+
 message HealControlRequest {
   uint32 version = 1;
   string topology_fingerprint = 2;
@@ -1084,6 +1092,7 @@ service NodeService {
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {}; // auth-policy: body-bound
   rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
+  rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {}; // auth-policy: body-bound

@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use manager::IamCache;
-use oidc::OidcSys;
+use oidc::{OidcExtraRootCaProvider, OidcSys};
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -284,6 +284,23 @@ pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
 
 /// Initialize the global OIDC system. Non-fatal if no OIDC providers are configured.
 pub async fn init_oidc_sys() -> Result<()> {
+    init_oidc_sys_with_extra_root_ca(None).await
+}
+
+/// Initialize the global OIDC system with an additional outbound root CA bundle.
+pub async fn init_oidc_sys_with_extra_root_ca(root_ca_pem: Option<&[u8]>) -> Result<()> {
+    init_oidc_sys_with_extra_root_ca_provider_inner(None, root_ca_pem).await
+}
+
+/// Initialize the global OIDC system with a reload-aware outbound root CA provider.
+pub async fn init_oidc_sys_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<()> {
+    init_oidc_sys_with_extra_root_ca_provider_inner(Some(extra_root_ca_provider), None).await
+}
+
+async fn init_oidc_sys_with_extra_root_ca_provider_inner(
+    extra_root_ca_provider: Option<OidcExtraRootCaProvider>,
+    root_ca_pem: Option<&[u8]>,
+) -> Result<()> {
     if OIDC_SYS.get().is_some() {
         debug!(
             event = EVENT_OIDC_STATE,
@@ -303,7 +320,11 @@ pub async fn init_oidc_sys() -> Result<()> {
         "OIDC runtime starting"
     );
 
-    let oidc_sys = match OidcSys::new().await {
+    let oidc_sys_result = match extra_root_ca_provider {
+        Some(provider) => OidcSys::new_with_extra_root_ca_provider(provider).await,
+        None => OidcSys::new_with_extra_root_ca(root_ca_pem).await,
+    };
+    let oidc_sys = match oidc_sys_result {
         Ok(sys) => {
             if sys.has_providers() {
                 debug!(

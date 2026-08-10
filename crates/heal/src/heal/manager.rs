@@ -65,6 +65,18 @@ fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bo
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
 
+fn unblock_replacement_recovery_sets_after_validation(
+    blocked_sets: &mut HashSet<String>,
+    retry_succeeded: HashSet<String>,
+    retry_failed: &HashSet<String>,
+) {
+    for set_disk_id in retry_succeeded {
+        if !retry_failed.contains(&set_disk_id) {
+            blocked_sets.remove(&set_disk_id);
+        }
+    }
+}
+
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
 // recovery loops submit those per object, so a full queue or a retry storm
@@ -2532,11 +2544,7 @@ impl HealManager {
                             let mut blocked = replacement_recovery_blocked_sets
                                 .lock()
                                 .expect("replacement recovery blocked set lock poisoned");
-                            for set_disk_id in retry_succeeded {
-                                if !retry_failed.contains(&set_disk_id) {
-                                    blocked.remove(&set_disk_id);
-                                }
-                            }
+                            unblock_replacement_recovery_sets_after_validation(&mut blocked, retry_succeeded, &retry_failed);
                         }
                         for disk in &local_disks {
                             let endpoint = disk.endpoint();
@@ -3491,11 +3499,13 @@ fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String,
 mod tests {
     use super::*;
     use crate::heal::EcstoreError;
+    use crate::heal::resume::{CheckpointManager, ReplacementTargetIdentity};
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use crate::heal::task::{BatchHealFailure, HealOptions, HealPriority, HealRequest, HealTask, HealType};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_concurrency::{WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot};
     use rustfs_madmin::heal_commands::HealResultItem;
+    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
     use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -3616,6 +3626,9 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+            if let Some(hook) = manager_recovery_test_hook() {
+                *hook.listed.lock().expect("manager recovery listed lock should not poison") = true;
+            }
             Ok(Vec::new())
         }
 
@@ -3638,6 +3651,12 @@ mod tests {
             _version_id: Option<&str>,
             _opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
+            if let Some(hook) = manager_recovery_test_hook() {
+                *hook
+                    .heal_object_calls
+                    .lock()
+                    .expect("manager recovery object call lock should not poison") += 1;
+            }
             if bucket == "retry-transition" {
                 return Ok((
                     HealResultItem::default(),
@@ -3651,10 +3670,38 @@ mod tests {
         }
 
         async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            if let Some(hook) = manager_recovery_test_hook() {
+                *hook
+                    .bucket_heal_calls
+                    .lock()
+                    .expect("manager recovery bucket call lock should not poison") += 1;
+            }
             Ok(HealResultItem::default())
         }
 
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+            if let Some(hook) = manager_recovery_test_hook() {
+                *hook
+                    .global_format_calls
+                    .lock()
+                    .expect("manager recovery global format call lock should not poison") += 1;
+            }
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn heal_replacement_format(
+            &self,
+            _dry_run: bool,
+            _pool_index: usize,
+            _set_index: usize,
+            _targets: &[String],
+        ) -> Result<(HealResultItem, Option<Error>)> {
+            if let Some(hook) = manager_recovery_test_hook() {
+                *hook
+                    .replacement_format_calls
+                    .lock()
+                    .expect("manager recovery replacement format call lock should not poison") += 1;
+            }
             Ok((HealResultItem::default(), None))
         }
 
@@ -3674,6 +3721,89 @@ mod tests {
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
             Err(Error::other("not implemented in tests"))
         }
+
+        async fn get_replacement_resume_disk(
+            &self,
+            _set_disk_id: &str,
+            _task_id: &str,
+            _excluded_targets: &[String],
+        ) -> Result<crate::heal::storage::ReplacementResumeDisk> {
+            let Some(hook) = manager_recovery_test_hook() else {
+                return Err(Error::other("not implemented in tests"));
+            };
+            Ok(crate::heal::storage::ReplacementResumeDisk::Existing(
+                hook.replacement_resume_disk.clone(),
+            ))
+        }
+    }
+
+    struct ManagerRecoveryTestHook {
+        replacement_resume_disk: DiskStore,
+        listed: StdMutex<bool>,
+        global_format_calls: StdMutex<u32>,
+        replacement_format_calls: StdMutex<u32>,
+        bucket_heal_calls: StdMutex<u32>,
+        heal_object_calls: StdMutex<u32>,
+    }
+
+    static MANAGER_RECOVERY_TEST_HOOK: LazyLock<StdMutex<Option<Arc<ManagerRecoveryTestHook>>>> =
+        LazyLock::new(|| StdMutex::new(None));
+
+    struct ManagerRecoveryTestHookGuard;
+
+    impl ManagerRecoveryTestHook {
+        fn install(replacement_resume_disk: DiskStore) -> (Arc<Self>, ManagerRecoveryTestHookGuard) {
+            let hook = Arc::new(Self {
+                replacement_resume_disk,
+                listed: StdMutex::new(false),
+                global_format_calls: StdMutex::new(0),
+                replacement_format_calls: StdMutex::new(0),
+                bucket_heal_calls: StdMutex::new(0),
+                heal_object_calls: StdMutex::new(0),
+            });
+            let previous = MANAGER_RECOVERY_TEST_HOOK
+                .lock()
+                .expect("manager recovery hook lock should not poison")
+                .replace(hook.clone());
+            assert!(previous.is_none(), "manager recovery hook already installed");
+            (hook, ManagerRecoveryTestHookGuard)
+        }
+    }
+
+    impl Drop for ManagerRecoveryTestHookGuard {
+        fn drop(&mut self) {
+            *MANAGER_RECOVERY_TEST_HOOK
+                .lock()
+                .expect("manager recovery hook lock should not poison") = None;
+        }
+    }
+
+    fn manager_recovery_test_hook() -> Option<Arc<ManagerRecoveryTestHook>> {
+        MANAGER_RECOVERY_TEST_HOOK
+            .lock()
+            .expect("manager recovery hook lock should not poison")
+            .clone()
+    }
+
+    async fn make_manager_resume_disk(temp: &TempDir, name: &str) -> DiskStore {
+        let disk_path = temp.path().join(name);
+        std::fs::create_dir_all(&disk_path).expect("manager recovery disk directory should be created");
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).expect("manager recovery endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("manager recovery disk should initialize");
+        let metadata_volume = disk.make_volume(super::super::RUSTFS_META_BUCKET).await;
+        assert!(
+            matches!(metadata_volume, Ok(()) | Err(DiskError::VolumeExists)),
+            "manager recovery metadata volume should exist: {metadata_volume:?}"
+        );
+        disk
     }
 
     fn bucket_request(bucket: &str, priority: HealPriority, source: HealRequestSource) -> HealRequest {
@@ -4523,6 +4653,143 @@ mod tests {
                 message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
             }
         ));
+    }
+
+    #[test]
+    fn replacement_recovery_retry_barrier_requires_all_set_records_to_validate() {
+        let mut blocked = HashSet::from(["pool_0_set_0".to_string(), "pool_0_set_1".to_string()]);
+        let retry_succeeded = HashSet::from(["pool_0_set_0".to_string(), "pool_0_set_1".to_string()]);
+        let retry_failed = HashSet::from(["pool_0_set_0".to_string()]);
+
+        unblock_replacement_recovery_sets_after_validation(&mut blocked, retry_succeeded, &retry_failed);
+
+        assert!(
+            blocked.contains("pool_0_set_0"),
+            "one failed disk record must keep the whole replacement set blocked"
+        );
+        assert!(
+            !blocked.contains("pool_0_set_1"),
+            "a blocked set may resume only after every retried record validates"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_completes_cleanup_pending_recovery_from_manager_anchor() {
+        let temp = TempDir::new().expect("temporary manager recovery directory should be created");
+        let anchor = make_manager_resume_disk(&temp, "anchor").await;
+        let task_id = ResumeUtils::generate_task_id();
+        let target = "replacement-a".to_string();
+        let identity = ReplacementTargetIdentity {
+            endpoint: target.clone(),
+            canonical_path: "/replacement/replacement-a".to_string(),
+            physical_device_ids: vec!["replacement-a".to_string()],
+            filesystem_identity: "identity-replacement-a".to_string(),
+        };
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec![target.clone()],
+            vec![identity],
+        )
+        .await
+        .expect("cleanup-pending replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("completion proof should persist before cleanup");
+        resume_manager
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("cleanup-pending state should persist before restart");
+        CheckpointManager::new(anchor.clone(), task_id.clone())
+            .await
+            .expect("checkpoint fixture should persist");
+
+        let (hook, _hook_guard) = ManagerRecoveryTestHook::install(anchor.clone());
+        let storage = Arc::new(MockStorage);
+        let manager = HealManager::new(storage.clone(), None);
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec![target];
+        assert_eq!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("durable recovery request should be admitted"),
+            HealAdmissionResult::Accepted
+        );
+        manager
+            .replacement_recovery_anchors
+            .lock()
+            .expect("replacement recovery anchor lock should not poison")
+            .insert(task_id.clone(), anchor.endpoint().to_string());
+
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let resume_removed = !ResumeManager::has_resume_state(&anchor, &task_id).await;
+                let checkpoint_removed = !CheckpointManager::has_checkpoint(&anchor, &task_id).await;
+                let anchor_removed = !manager
+                    .replacement_recovery_anchors
+                    .lock()
+                    .expect("replacement recovery anchor lock should not poison")
+                    .contains_key(&task_id);
+                if resume_removed && checkpoint_removed && anchor_removed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup-pending recovery should finish through the manager scheduler");
+
+        assert!(
+            !*hook.listed.lock().expect("manager recovery listed lock should not poison"),
+            "cleanup-pending recovery must not list buckets or restart object healing"
+        );
+        assert_eq!(
+            *hook
+                .global_format_calls
+                .lock()
+                .expect("manager recovery global format call lock should not poison"),
+            0
+        );
+        assert_eq!(
+            *hook
+                .replacement_format_calls
+                .lock()
+                .expect("manager recovery replacement format call lock should not poison"),
+            0,
+            "manager-resumed terminal cleanup must not format replacement targets"
+        );
+        assert_eq!(
+            *hook
+                .bucket_heal_calls
+                .lock()
+                .expect("manager recovery bucket call lock should not poison"),
+            0
+        );
+        assert_eq!(
+            *hook
+                .heal_object_calls
+                .lock()
+                .expect("manager recovery object call lock should not poison"),
+            0
+        );
     }
 
     #[test]
