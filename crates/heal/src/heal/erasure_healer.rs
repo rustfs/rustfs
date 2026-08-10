@@ -1229,6 +1229,12 @@ mod resume_loop_tests {
         Timeout,
     }
 
+    #[derive(Clone)]
+    enum ReplacementCommitEvidence {
+        Confirmed(bool),
+        Error(String),
+    }
+
     #[derive(Default)]
     struct FakeStorage {
         /// page keyed by the *incoming* continuation token
@@ -1239,7 +1245,7 @@ mod resume_loop_tests {
         results: Mutex<HashMap<String, HealResultItem>>,
         /// Target-specific physical readback evidence per `compose_key`; the
         /// fake models a healthy backend unless a test explicitly revokes it.
-        replacement_commit_evidence: Mutex<HashMap<String, bool>>,
+        replacement_commit_evidence: Mutex<HashMap<String, ReplacementCommitEvidence>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
@@ -1260,7 +1266,13 @@ mod resume_loop_tests {
             self.replacement_commit_evidence
                 .lock()
                 .unwrap()
-                .insert(compose_key(name, version), committed);
+                .insert(compose_key(name, version), ReplacementCommitEvidence::Confirmed(committed));
+        }
+        fn set_replacement_commit_evidence_error(&self, name: &str, version: Option<&str>, message: &str) {
+            self.replacement_commit_evidence
+                .lock()
+                .unwrap()
+                .insert(compose_key(name, version), ReplacementCommitEvidence::Error(message.to_string()));
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
@@ -1354,12 +1366,17 @@ mod resume_loop_tests {
             _opts: &HealOpts,
             _targets: &[String],
         ) -> Result<bool> {
-            Ok(*self
+            match self
                 .replacement_commit_evidence
                 .lock()
                 .unwrap()
                 .get(&compose_key(object, version_id))
-                .unwrap_or(&true))
+                .cloned()
+                .unwrap_or(ReplacementCommitEvidence::Confirmed(true))
+            {
+                ReplacementCommitEvidence::Confirmed(committed) => Ok(committed),
+                ReplacementCommitEvidence::Error(message) => Err(Error::other(message)),
+            }
         }
         async fn list_objects_for_heal(&self, _b: &str, _p: &str) -> Result<Vec<HealListItem>> {
             Ok(Vec::new())
@@ -2140,6 +2157,58 @@ mod resume_loop_tests {
         result.expect_err("a success result without target readback evidence must retry");
         assert_eq!(env.resume.get_state().await.retry_count, 1);
         assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_delete_marker_readback_error_keeps_auto_heal_resumable() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()));
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("dm-v1"), true)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "object",
+            Some("dm-v1"),
+            HealResultItem {
+                after: Infos {
+                    drives: vec![HealDriveInfo {
+                        endpoint: "replacement-a".to_string(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        );
+        env.storage
+            .set_replacement_commit_evidence_error("object", Some("dm-v1"), "injected target readback failure");
+
+        let result = healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        let error = result.expect_err("a target readback error must not complete automatic replacement");
+        let error = error.to_string();
+        assert!(error.contains("Transient heal skip"), "unexpected error: {error}");
+        assert!(error.contains("retry scheduled"), "unexpected error: {error}");
+        let state = env.resume.get_state().await;
+        assert!(!state.completed, "readback errors must leave the replacement task incomplete");
+        assert_eq!(state.retry_count, 1, "readback errors must arm the bounded retry path");
+        assert!(env.checkpoint.get_checkpoint().await.processed_objects.is_empty());
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("dm-v1".to_string()))]);
     }
 
     #[tokio::test]
