@@ -784,7 +784,11 @@ impl PeerS3Client for LocalPeerS3Client {
 
         if opts.force_if_empty && !opts.force {
             for disk in local_disks.iter() {
-                if has_xlmeta_files(&disk.path().join(bucket)).await.map_err(Error::Io)? {
+                let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+                    continue;
+                };
+                let bucket_path = bucket_path?;
+                if has_xlmeta_files(&bucket_path).await.map_err(Error::Io)? {
                     return Err(Error::VolumeNotEmpty);
                 }
             }

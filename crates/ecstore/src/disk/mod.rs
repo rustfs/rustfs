@@ -115,6 +115,15 @@ pub enum PartTransactionAction {
     Rollback,
 }
 
+/// Result of an owner-aware file mutation. The disk applies the mutation only
+/// while the current contents match the supplied expected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalFileUpdate {
+    Updated,
+    Missing,
+    Mismatch,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MmapCopyStageMetrics {
     pub(crate) path: &'static str,
@@ -557,6 +566,26 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        match self {
+            Disk::Local(local_disk) => local_disk.compare_and_update_file(volume, path, expected, replacement).await,
+            Disk::Remote(remote_disk) => remote_disk.compare_and_update_file(volume, path, expected, replacement).await,
+        }
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.has_replacement_mount_lease(),
+            Disk::Remote(remote_disk) => remote_disk.has_replacement_mount_lease(),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
@@ -692,6 +721,34 @@ impl Disk {
     pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
         match self {
             Disk::Local(w) => Some(w.get_object_path_if_local(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) fn get_object_path_for_io_if_local(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_for_io(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) fn get_bucket_path_for_io_if_local(&self, volume: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_bucket_path_for_io(volume)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    /// Return the descriptor-rooted mount path admitted for automatic
+    /// replacement, or `None` when the configured endpoint no longer names
+    /// that held mount instance.
+    pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
+        match self {
+            Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
         }
     }
@@ -860,6 +917,24 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
+    /// Atomically replace or remove a small control file only when its current
+    /// contents match `expected`. Implementations that cannot provide this
+    /// cross-process guarantee must fail closed instead of emulating it with a
+    /// read-then-write sequence.
+    async fn compare_and_update_file(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    /// Whether local I/O is rooted at a held mount descriptor. Auto-replacement
+    /// refuses destructive work when this is false.
+    fn has_replacement_mount_lease(&self) -> bool {
+        false
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
 }
@@ -1612,6 +1687,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let expected_object_path = local_disk.root.join("test-bucket/test-object");
         let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
@@ -1626,6 +1702,19 @@ mod tests {
         // Test path method
         let path = disk.path();
         assert!(path.exists());
+        let object_path = disk
+            .get_object_path_if_local("test-bucket", "test-object")
+            .expect("local disk should expose an object path")
+            .expect("object path should resolve");
+        assert_eq!(object_path, expected_object_path);
+        assert!(!object_path.starts_with("/proc/self/fd/"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            disk.get_object_path_for_io_if_local("test-bucket", "test-object")
+                .expect("local disk should expose an I/O object path")
+                .expect("I/O object path should resolve")
+                .starts_with("/proc/self/fd/")
+        );
 
         // Test disk location
         let location = disk.get_disk_location();

@@ -97,6 +97,56 @@ impl ECStore {
         Ok((r, None))
     }
 
+    #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
+    pub async fn heal_replacement_format(
+        &self,
+        dry_run: bool,
+        pool_index: usize,
+        set_index: usize,
+        targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let set = pool.disk_set.get(set_index).cloned().ok_or_else(|| {
+            StorageError::InvalidArgument(
+                "heal".to_string(),
+                "set".to_string(),
+                format!("invalid heal set index {set_index} for pool {pool_index}"),
+            )
+        })?;
+
+        set.heal_replacement_format(dry_run, targets).await
+    }
+
+    #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
+    pub async fn replacement_targets_have_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        pool_index: usize,
+        set_index: usize,
+        targets: &[String],
+    ) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let set = pool.disk_set.get(set_index).cloned().ok_or_else(|| {
+            StorageError::InvalidArgument(
+                "heal".to_string(),
+                "set".to_string(),
+                format!("invalid heal set index {set_index} for pool {pool_index}"),
+            )
+        })?;
+
+        set.replacement_targets_have_version(bucket, object, version_id, targets)
+            .await
+            .map_err(Into::into)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         let res = self.peer_sys.heal_bucket(bucket, opts).await?;

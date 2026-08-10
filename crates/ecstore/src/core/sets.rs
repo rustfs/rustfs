@@ -1058,17 +1058,23 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             for (i, set) in new_format_sets.iter().enumerate() {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
-                        res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after.drives[i * self.set_drive_count + j].state = DriveState::Ok.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
             // Save new formats `format.json` on unformatted disks.
-            for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() && save_format_file(disk, fm).await.is_err() {
-                    let _ = disk.as_ref().unwrap().close().await;
-                    *fm = None;
+            for (index, (fm, disk)) in tmp_new_formats.iter_mut().zip(disks.iter()).enumerate() {
+                if fm.is_some() && disk.is_some() {
+                    if let Err(err) = save_format_file(disk, fm).await {
+                        if let Some(disk) = disk.as_ref() {
+                            let _ = disk.close().await;
+                        }
+                        return Ok((res, Some(err.into())));
+                    }
+                    if let Some(saved_format) = fm.as_ref() {
+                        res.after.drives[index].uuid = saved_format.erasure.this.to_string();
+                        res.after.drives[index].state = DriveState::Ok.to_string();
+                    }
                 }
             }
 
@@ -2203,6 +2209,39 @@ mod tests {
             res.before.drives[2].state,
             DriveState::Missing.to_string(),
             "unformatted disk must be Missing on its real index, not on a placeholder"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_format_only_writes_the_requested_slot() {
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(1, false).await;
+        let target = sets.endpoints.endpoints.as_ref()[1].to_string();
+        let untouched = sets.endpoints.endpoints.as_ref()[2].to_string();
+        let set = set_level_heal_view(&sets).await;
+
+        let (result, error) = set
+            .heal_replacement_format(false, std::slice::from_ref(&target))
+            .await
+            .expect("target-scoped replacement format should run");
+
+        assert!(error.is_none(), "target format must not report an error: {error:?}");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == target && drive.state == DriveState::Ok.to_string()),
+            "requested replacement slot must be formatted"
+        );
+        let untouched_format = std::path::Path::new(&sets.endpoints.endpoints.as_ref()[2].get_file_path())
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(crate::disk::FORMAT_CONFIG_FILE);
+        assert!(
+            !tokio::fs::try_exists(untouched_format)
+                .await
+                .expect("untouched replacement format path should be inspectable"),
+            "unrequested slot {untouched} must remain unformatted"
         );
     }
 

@@ -152,6 +152,7 @@ const DISK_OPERATION_NAMES: &[&str] = &[
     "read_parts",
     "read_multiple",
     "write_all",
+    "compare_and_update_file",
     "read_all",
 ];
 
@@ -1092,6 +1093,18 @@ impl LocalDiskWrapper {
         self.disk.get_object_path(volume, path)
     }
 
+    pub(crate) fn get_object_path_for_io(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
+        self.disk.get_object_path_for_io(volume, path)
+    }
+
+    pub(crate) fn get_bucket_path_for_io(&self, volume: &str) -> crate::disk::error::Result<std::path::PathBuf> {
+        self.disk.get_bucket_path_for_io(volume)
+    }
+
+    pub fn replacement_mount_lease_root(&self) -> Option<std::path::PathBuf> {
+        self.disk.replacement_mount_lease_root()
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
     }
@@ -1639,6 +1652,10 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    fn has_replacement_mount_lease(&self) -> bool {
+        self.disk.has_replacement_mount_lease()
+    }
+
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         self.track_disk_health_with_op_and_timeout_action(
             "read_metadata",
@@ -2135,6 +2152,22 @@ impl DiskAPI for LocalDiskWrapper {
             "write_all",
             DiskMetricMutation::Write,
             || async { self.disk.write_all(volume, path, data).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<crate::disk::ConditionalFileUpdate> {
+        self.track_disk_health_mutation(
+            "compare_and_update_file",
+            DiskMetricMutation::Write,
+            || async { self.disk.compare_and_update_file(volume, path, expected, replacement).await },
             get_max_timeout_duration(),
         )
         .await

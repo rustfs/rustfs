@@ -22,15 +22,16 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{DiskFaultHarness, signed_admin_post};
+    use crate::chaos::{DiskFaultHarness, VersionShardCensus, signed_admin_post};
     use crate::common::init_logging;
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
-    use tokio::time::{Duration, sleep, timeout};
+    use std::error::Error;
+    use tokio::time::{Duration, Instant, interval, timeout};
     use tracing::info;
 
     const GET_TIMEOUT: Duration = Duration::from_secs(60);
@@ -271,12 +272,17 @@ mod tests {
         put_and_record(&client, bucket, "heal/nested/large.bin", payload(2 * 1024 * 1024, 34), &mut manifest).await?;
 
         verify_manifest(&client, bucket, &manifest, "baseline before disk replacement").await?;
-        for (key, _) in &manifest {
-            assert!(
-                harness.object_metadata_exists_on_disk(0, bucket, key),
-                "disk0 should hold xl.meta for {key} before replacement"
-            );
-        }
+        let manifest_keys = manifest.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let target_manifest: Vec<(String, VersionShardCensus)> = manifest_keys
+            .iter()
+            .map(|key| {
+                let census = harness.census_object_version(0, bucket, key, None)?;
+                if !census.is_complete() {
+                    return Err(format!("disk 0 has incomplete physical census for {key}: {census:?}").into());
+                }
+                Ok((key.clone(), census))
+            })
+            .collect::<Result<_, Box<dyn Error + Send + Sync>>>()?;
 
         harness.kill_server();
         harness.replace_disk_with_empty(0)?;
@@ -287,21 +293,112 @@ mod tests {
         signed_admin_post(&heal_url, Some(heal_body), &harness.env.access_key, &harness.env.secret_key).await?;
 
         let client = harness.env.create_s3_client();
-        let mut remaining: HashSet<String> = manifest.iter().map(|(key, _)| key.clone()).collect();
+        let mut remaining: HashSet<String> = manifest_keys.iter().cloned().collect();
         let heal_timeout_secs = std::env::var("RUSTFS_RELIABILITY_HEAL_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(120);
+        let deadline = Instant::now() + Duration::from_secs(heal_timeout_secs);
+        let mut retry = interval(Duration::from_secs(1));
 
-        for _ in 0..heal_timeout_secs {
-            remaining.retain(|key| !harness.object_metadata_exists_on_disk(0, bucket, key));
+        loop {
+            remaining.retain(|key| {
+                let expected = target_manifest
+                    .iter()
+                    .find(|(manifest_key, _)| manifest_key == key)
+                    .map(|(_, manifest)| manifest)
+                    .expect("every key has a physical manifest");
+                harness
+                    .census_object_version(0, bucket, key, None)
+                    .map(|census| !census.matches_manifest(expected))
+                    .unwrap_or(true)
+            });
             if remaining.is_empty() {
                 verify_manifest(&client, bucket, &manifest, "after fresh-disk heal completed").await?;
                 return Ok(());
             }
-            sleep(Duration::from_secs(1)).await;
+            if Instant::now() >= deadline {
+                break;
+            }
+            retry.tick().await;
         }
 
         Err(format!("fresh-disk heal did not rebuild {remaining:?} on the replaced disk within {heal_timeout_secs}s").into())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_versioned_shard_census_selects_each_version_data_dir() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        info!("Reliability: physical shard census selects the requested object version");
+
+        let mut harness = DiskFaultHarness::new(4).await?;
+        harness.start_server().await?;
+        let client = harness.env.create_s3_client();
+        let bucket = "reliability-versioned-census";
+        let key = "versions/large.bin";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await?;
+
+        let first = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(payload(256 * 1024, 41)))
+            .send()
+            .await?;
+        let first_version = first.version_id().ok_or("first PUT did not return a version ID")?;
+        let second = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(payload(256 * 1024, 42)))
+            .send()
+            .await?;
+        let second_version = second.version_id().ok_or("second PUT did not return a version ID")?;
+        let delete = client.delete_object().bucket(bucket).key(key).send().await?;
+        let delete_version = delete.version_id().ok_or("delete marker did not return a version ID")?;
+
+        let first_census = harness.census_object_version(0, bucket, key, Some(first_version))?;
+        let second_census = harness.census_object_version(0, bucket, key, Some(second_version))?;
+        let delete_census = harness.census_object_version(0, bucket, key, Some(delete_version))?;
+        assert!(
+            first_census.is_complete(),
+            "first version physical census is incomplete: {first_census:?}"
+        );
+        assert!(
+            second_census.is_complete(),
+            "second version physical census is incomplete: {second_census:?}"
+        );
+        assert_ne!(
+            first_census.data_dir, second_census.data_dir,
+            "distinct object versions must select distinct physical data directories"
+        );
+        assert_eq!(
+            first_census.expected_part_numbers, second_census.expected_part_numbers,
+            "same single-part shape should expose the same part numbers"
+        );
+        assert!(
+            delete_census.is_complete(),
+            "delete marker physical census is incomplete: {delete_census:?}"
+        );
+        assert!(
+            delete_census.expected_part_numbers.is_empty(),
+            "delete marker must not declare object shards: {delete_census:?}"
+        );
+        assert!(
+            delete_census.present_part_numbers.is_empty(),
+            "delete marker must not select stale object shards: {delete_census:?}"
+        );
+        Ok(())
     }
 }

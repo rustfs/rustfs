@@ -57,7 +57,7 @@ fn build_part_path(file_path: &Path) -> PathBuf {
 
 async fn open_download_part_file(file_part_path: &Path) -> io::Result<tokio::fs::File> {
     let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
+    options.create(true).truncate(false).read(true).write(true);
 
     #[cfg(not(windows))]
     options.mode(0o600);

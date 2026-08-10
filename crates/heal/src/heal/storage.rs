@@ -26,7 +26,7 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, Endpoint, StorageError};
+use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -36,6 +36,11 @@ const EVENT_HEAL_STORAGE_OBJECT_READ_LIMIT: &str = "heal_storage_object_read_lim
 const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
+
+pub enum ReplacementResumeDisk {
+    Fresh,
+    Existing(DiskStore),
+}
 
 pub(crate) fn next_heal_listing_token(
     bucket: &str,
@@ -354,6 +359,42 @@ pub trait HealStorageAPI: Send + Sync {
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
 
+    /// Heal only the explicitly admitted replacement targets in one erasure set.
+    ///
+    /// The default is deliberately fail-closed so alternate storage
+    /// implementations cannot accidentally fall back to the global format path.
+    async fn heal_replacement_format(
+        &self,
+        _dry_run: bool,
+        _pool_index: usize,
+        _set_index: usize,
+        _targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        Err(Error::other("target-scoped replacement format is unsupported"))
+    }
+
+    /// Recheck admitted replacement targets immediately before destructive work.
+    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Read target-specific physical evidence for one replacement version.
+    ///
+    /// This is only used by automatic replacement healing after the normal
+    /// transaction returns success. The conservative default prevents an
+    /// alternate backend from turning an unverified replacement into a
+    /// completed generation.
+    async fn replacement_targets_have_version(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _opts: &HealOpts,
+        _targets: &[String],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// List object versions for healing (returns all versions, may use significant memory for large buckets)
     ///
     /// WARNING: This method loads all object versions into memory at once. For buckets with many
@@ -390,8 +431,30 @@ pub trait HealStorageAPI: Send + Sync {
         self.list_objects_for_heal_page(bucket, prefix, continuation_token).await
     }
 
-    /// Get disk for resume functionality
+    /// Get disk for resume functionality.
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
+
+    /// Get a healthy non-target disk for durable replacement state.
+    async fn get_disk_for_resume_excluding(&self, _set_disk_id: &str, _excluded_targets: &[String]) -> Result<DiskStore> {
+        Err(Error::other("target-excluding resume disk selection is unsupported"))
+    }
+
+    /// Reopen the exact surviving disk that owns an existing replacement
+    /// intent. Falling back to another disk would create a second copy of the
+    /// same generation and split its progress.
+    async fn get_replacement_resume_disk(
+        &self,
+        _set_disk_id: &str,
+        _task_id: &str,
+        _excluded_targets: &[String],
+    ) -> Result<ReplacementResumeDisk> {
+        Err(Error::other("durable replacement resume selection is unsupported"))
+    }
+
+    /// Capture the mounted replacement instance before it is formatted.
+    async fn replacement_target_identities(&self, _targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+        Err(Error::other("replacement target identity collection is unsupported"))
+    }
 }
 
 /// ECStore Heal storage layer implementation
@@ -1306,6 +1369,44 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
+    async fn heal_replacement_format(
+        &self,
+        dry_run: bool,
+        pool_index: usize,
+        set_index: usize,
+        targets: &[String],
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.ecstore
+            .heal_replacement_format(dry_run, pool_index, set_index, targets)
+            .await
+            .map(|(result, error)| (result, error.map(Error::Storage)))
+            .map_err(Error::Storage)
+    }
+
+    async fn replacement_targets_ready(&self, targets: &[String]) -> Result<bool> {
+        Ok(super::replacement_readiness::auto_replacement_targets_ready(targets).await)
+    }
+
+    async fn replacement_targets_have_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<bool> {
+        let pool_index = opts
+            .pool
+            .ok_or_else(|| Error::other("replacement target readback is missing pool scope"))?;
+        let set_index = opts
+            .set
+            .ok_or_else(|| Error::other("replacement target readback is missing set scope"))?;
+        self.ecstore
+            .replacement_targets_have_version(bucket, object, version_id.unwrap_or(""), pool_index, set_index, targets)
+            .await
+            .map_err(Error::Storage)
+    }
+
     async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1543,6 +1644,10 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
+        self.get_disk_for_resume_excluding(set_disk_id, &[]).await
+    }
+
+    async fn get_disk_for_resume_excluding(&self, set_disk_id: &str, excluded_targets: &[String]) -> Result<DiskStore> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1564,8 +1669,18 @@ impl HealStorageAPI for ECStoreHealStorage {
                 message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
             })?;
 
-        // Find the first available disk
-        if let Some(disk_store) = disks.into_iter().flatten().next() {
+        // The replacement target is unformatted before repair and must never
+        // host the intent that authorizes its own formatting.
+        for disk_store in disks.into_iter().flatten() {
+            if !disk_store.endpoint().is_local {
+                continue;
+            }
+            if excluded_targets.contains(&disk_store.endpoint().to_string()) {
+                continue;
+            }
+            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                continue;
+            }
             debug!(
                 target: "rustfs::heal::storage",
                 event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1583,6 +1698,43 @@ impl HealStorageAPI for ECStoreHealStorage {
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+
+    async fn get_replacement_resume_disk(
+        &self,
+        set_disk_id: &str,
+        task_id: &str,
+        excluded_targets: &[String],
+    ) -> Result<ReplacementResumeDisk> {
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
+            })?;
+        let mut existing = None;
+        for disk_store in disks.into_iter().flatten() {
+            if !disk_store.endpoint().is_local || excluded_targets.contains(&disk_store.endpoint().to_string()) {
+                continue;
+            }
+            if !matches!(disk_store.get_disk_id().await, Ok(Some(id)) if !id.is_nil()) {
+                continue;
+            }
+            if super::resume::ResumeManager::has_replacement_intent(&disk_store, task_id).await
+                && existing.replace(disk_store).is_some()
+            {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Replacement resume intent is duplicated for set_disk_id: {set_disk_id}"),
+                });
+            }
+        }
+        Ok(existing.map_or(ReplacementResumeDisk::Fresh, ReplacementResumeDisk::Existing))
+    }
+
+    async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
+        super::replacement_readiness::auto_replacement_target_identities(targets)
+            .await
+            .ok_or_else(|| Error::other("replacement target is not a stable mounted disk"))
     }
 }
 
