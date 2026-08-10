@@ -28,6 +28,14 @@ pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
 pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
+pub const INTERNODE_OPERATION_GRPC_READ_VERSION: &str = "grpc_read_version";
+pub const INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION: &str = "grpc_batch_read_version";
+pub const INTERNODE_OPERATION_GRPC_LOCK: &str = "grpc_lock";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK: &str = "grpc_unlock";
+pub const INTERNODE_OPERATION_GRPC_LOCK_BATCH: &str = "grpc_lock_batch";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK_BATCH: &str = "grpc_unlock_batch";
+pub const INTERNODE_OPERATION_GRPC_REFRESH: &str = "grpc_refresh";
+pub const INTERNODE_OPERATION_GRPC_FORCE_UNLOCK: &str = "grpc_force_unlock";
 pub const INTERNODE_OPERATION_GRPC_OTHER: &str = "grpc_other";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
@@ -78,6 +86,7 @@ const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
     "rustfs_system_network_internode_replay_cache_overflow_by_operation_total";
+const INTERNODE_REPLAY_CACHE_RECORDS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_records_total";
 const INTERNODE_REPLAY_CACHE_ENTRIES: &str = "rustfs_system_network_internode_replay_cache_entries";
 const INTERNODE_REPLAY_CACHE_CAPACITY: &str = "rustfs_system_network_internode_replay_cache_capacity";
 const INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_evictions_total";
@@ -155,6 +164,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
         labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
     },
     InternodeOperationMetricDescriptor {
@@ -619,6 +632,22 @@ impl InternodeMetrics {
         .increment(1);
     }
 
+    pub fn record_replay_cache_record_for_operation_and_backend_path(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        rpc_path: &str,
+    ) {
+        counter!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            RPC_PATH_LABEL => rpc_path.to_owned()
+        )
+        .increment(1);
+    }
+
     pub fn record_replay_cache_state(&self, entries: usize, capacity: usize) {
         let entries = usize_to_u64_saturating(entries);
         let capacity = usize_to_u64_saturating(capacity);
@@ -964,7 +993,7 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 20);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 21);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -986,14 +1015,18 @@ mod tests {
             INTERNODE_OPERATION_METRICS[13].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
         );
-        for metric in &INTERNODE_OPERATION_METRICS[14..16] {
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[14].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[15..17] {
             assert_eq!(metric.labels, &[SERVER_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[16].labels, &[SERVER_LABEL, REASON_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[17].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[17].labels, &[SERVER_LABEL, REASON_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
         // Payload histogram + large-payload counter carry operation+backend labels.
-        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -1004,6 +1037,14 @@ mod tests {
         assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
         assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_VERSION, "grpc_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, "grpc_batch_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK, "grpc_lock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK, "grpc_unlock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK_BATCH, "grpc_lock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, "grpc_unlock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_REFRESH, "grpc_refresh");
+        assert_eq!(INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, "grpc_force_unlock");
         assert_eq!(INTERNODE_OPERATION_GRPC_OTHER, "grpc_other");
 
         assert_eq!(INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, "tcp-http");
@@ -1048,26 +1089,30 @@ mod tests {
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[14].name,
-            "rustfs_system_network_internode_replay_cache_entries"
+            "rustfs_system_network_internode_replay_cache_records_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[15].name,
-            "rustfs_system_network_internode_replay_cache_capacity"
+            "rustfs_system_network_internode_replay_cache_entries"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[16].name,
-            "rustfs_system_network_internode_replay_cache_evictions_total"
+            "rustfs_system_network_internode_replay_cache_capacity"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[17].name,
-            "rustfs_system_storage_erasure_write_quorum_failures_total"
+            "rustfs_system_network_internode_replay_cache_evictions_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[18].name,
-            "rustfs_system_network_internode_operation_payload_bytes"
+            "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[19].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[20].name,
             "rustfs_system_network_internode_operation_large_payloads_total"
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
@@ -1090,6 +1135,10 @@ mod tests {
         assert_eq!(
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"
+        );
+        assert_eq!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+            "rustfs_system_network_internode_replay_cache_records_total"
         );
         assert_eq!(FAILURE_REASON_LABEL, "failure_reason");
         assert_eq!(RPC_PATH_LABEL, "rpc_path");
@@ -1144,6 +1193,11 @@ mod tests {
                 INTERNODE_TRANSPORT_BACKEND_GRPC,
                 "/node_service.NodeService/ReadAll",
             );
+            metrics.record_replay_cache_record_for_operation_and_backend_path(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "/node_service.NodeService/ReadVersion",
+            );
         });
 
         let snapshot = metrics.snapshot();
@@ -1178,6 +1232,28 @@ mod tests {
         assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
         assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
         assert_eq!(labels.get(RPC_PATH_LABEL).map(String::as_str), Some("/node_service.NodeService/ReadAll"));
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+
+        let records: Vec<_> = entries
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_RECORDS_TOTAL)
+            .collect();
+        assert_eq!(records.len(), 1);
+        let labels: HashMap<_, _> = records[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(RPC_PATH_LABEL).map(String::as_str),
+            Some("/node_service.NodeService/ReadVersion")
+        );
         assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
     }
 
