@@ -604,7 +604,7 @@ mod tests {
         let mut mount_ns = MountNamespaceGuard::new()?;
         let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(3, 4)).await?;
         let target_log_path = PathBuf::from(&cluster.temp_dir).join(format!("replacement-node{TARGET_NODE}.log"));
-        cluster.nodes[TARGET_NODE].capture_log_path = Some(target_log_path.to_string_lossy().into_owned());
+        cluster.set_node_capture_log_path(TARGET_NODE, target_log_path.to_string_lossy())?;
         // Each drive below is an independent tmpfs mount, so this privileged
         // path must exercise the production distinct-device/readiness fences.
         cluster.extra_env.retain(|(key, _)| key != "RUSTFS_UNSAFE_BYPASS_DISK_CHECK");
