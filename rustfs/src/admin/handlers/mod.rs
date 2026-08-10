@@ -119,6 +119,7 @@ mod tests {
         let _tls_status_handler = tls_debug::TlsStatusHandler {};
         let _heal_handler = heal::HealHandler {};
         let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
+        let _replacement_recovery_status_handler = heal::ReplacementRecoveryStatusHandler {};
         let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
