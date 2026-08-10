@@ -4671,6 +4671,11 @@ mod tests {
             Url::parse(&format!("https://object-lambda.test:{}/transform", address.port())).expect("object lambda TLS endpoint");
         let mut config = object_lambda_test_config(endpoint.clone());
         config.client_ca = ca_path.to_string_lossy().into_owned();
+        // This is the only object-lambda test that performs a real TLS
+        // handshake; under a full-suite nextest run the CPU contention from
+        // neighboring tests pushes it past the helper's tight 2s request
+        // deadline. SNI preservation, not latency, is under test here.
+        config.response_header_timeout = Some(Duration::from_secs(30));
 
         let response = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
             .expect("object lambda TLS client should build")
