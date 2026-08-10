@@ -3881,7 +3881,7 @@ impl ScannerIODisk for Disk {
         Ok(size_summary)
     }
 
-    #[tracing::instrument(skip(self, budget, updates, cache))]
+    #[tracing::instrument(skip(self, budget, updates, cache, set_disks))]
     async fn nsscanner_disk(
         self: Arc<Self>,
         ctx: CancellationToken,
