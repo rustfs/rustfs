@@ -673,9 +673,9 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
 // requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
-// reads without version_id / healing / free-version needs) and still requires
-// a full read-quorum agreement before stopping. Set the env var to `false` to
-// fall back to full-wait metadata fanout.
+// reads by default, without version_id / healing / free-version needs) and
+// still requires a full read-quorum agreement before stopping. Set the env var
+// to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
@@ -683,6 +683,12 @@ const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
+
+const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = false;
+
+const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
 
 // --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
 
@@ -1189,6 +1195,46 @@ fn is_version_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+fn is_get_metadata_data_read_early_stop_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+                DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+fn is_get_metadata_early_stop_bounded_fanout_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+                DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
             )
         })
     }
