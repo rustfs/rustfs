@@ -122,6 +122,34 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
+/// Return whether `path` is an exact Linux mount point.
+///
+/// Device numbers alone are insufficient here: bind mounts may deliberately
+/// share a device number with their source. Auto-format callers use this to
+/// refuse an unmounted mountpoint directory rather than writing into its
+/// parent filesystem.
+pub fn is_mount_point(path: &Path) -> std::io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    let canonical_path = fs::canonicalize(path)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let canonical_path = canonical_path.to_string_lossy().replace(' ', "\\040");
+    Ok(mountinfo
+        .lines()
+        .any(|line| mountinfo_path(line) == Some(canonical_path.as_ref())))
+}
+
+fn mountinfo_path(line: &str) -> Option<&str> {
+    let mut fields = line.split_whitespace();
+    for _ in 0..4 {
+        fields.next()?;
+    }
+    fields.next()
+}
+
 /// Resolve the leaf physical device identities backing a local filesystem path.
 ///
 /// Linux block stacks such as partitions, `dm-*`, or software RAID can all
@@ -413,6 +441,13 @@ mod tests {
 
         let paths = parse_mount_paths(mounts);
         assert_eq!(paths, vec!["/data/my disk".to_string()]);
+    }
+
+    #[test]
+    fn mountinfo_path_extracts_the_mountpoint() {
+        let line = "42 31 8:1 / /data/replacement rw,relatime - ext4 /dev/sda1 rw";
+
+        assert_eq!(mountinfo_path(line), Some("/data/replacement"));
     }
 
     #[test]

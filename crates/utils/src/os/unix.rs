@@ -93,6 +93,20 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
+/// Return whether `path` is mounted separately from its parent directory.
+///
+/// This is intentionally conservative on non-Linux Unix platforms. Linux
+/// uses mountinfo to recognize bind mounts; elsewhere a shared device number
+/// cannot distinguish a bind mount from a normal directory safely.
+pub fn is_mount_point(path: &Path) -> std::io::Result<bool> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let parent = path.parent().ok_or_else(|| Error::other("mount point has no parent"))?;
+    Ok(rustix::fs::stat(path)?.st_dev != rustix::fs::stat(parent)?.st_dev)
+}
+
 pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
     let stat = rustix::fs::stat(disk)?;
     let major = rustix::fs::major(stat.st_dev);

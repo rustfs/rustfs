@@ -1439,7 +1439,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
         if let Some(disk) = disk_op.as_ref() {
             let data_dir = files[idx].data_dir.unwrap_or_default();
             let path_str = format!("{object}/{data_dir}/part.{part_number}");
-            match disk.get_object_path_if_local(bucket, &path_str) {
+            match disk.get_object_path_for_io_if_local(bucket, &path_str) {
                 Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
                 _ => return None,
             }

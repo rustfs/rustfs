@@ -326,8 +326,8 @@ pub mod disk {
     pub use crate::disk::local::ScanGuard;
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
+        CheckPartsResp, ConditionalFileUpdate, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+        DiskStore, FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
         PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
         STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
         validate_batch_read_version_item_count,
@@ -452,6 +452,11 @@ pub mod rpc {
 
 pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
+
+    /// Return the canonical object-metadata identity used for read-quorum grouping.
+    pub fn file_info_quorum_hash(meta: &rustfs_filemeta::FileInfo) -> [u8; 32] {
+        crate::set_disk::SetDisks::file_info_quorum_hash(meta)
+    }
 
     #[cfg(feature = "test-util")]
     pub mod test_util {

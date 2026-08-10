@@ -16,7 +16,7 @@
 //!
 //! This module contains the command-line interface definitions including:
 //! - `Cli`: Main CLI parser
-//! - `Commands`: Subcommands (Server, Info, Tls)
+//! - `Commands`: Top-level server and diagnostic subcommands
 //! - `ServerOpts`: Server subcommand options
 //! - `InfoOpts`: Info subcommand options
 //! - `TlsOpts`: TLS diagnostic subcommand options
@@ -56,7 +56,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -116,6 +116,48 @@ pub enum Commands {
     Tls(TlsOpts),
     /// Analyze RustFS log files and report probable failure causes
     Diagnose(DiagnoseOpts),
+    /// Offline, read-only inspection of on-disk data (no server required)
+    Inspect(InspectOpts),
+}
+
+/// Offline inspection subcommand options
+#[derive(Args, Clone)]
+pub struct InspectOpts {
+    #[command(subcommand)]
+    pub command: InspectCommands,
+}
+
+/// Offline inspection subcommands
+#[derive(Subcommand, Clone)]
+pub enum InspectCommands {
+    /// Export a bucket's persisted configuration bytes straight from drive roots
+    /// (works even when the config XML no longer parses)
+    BucketMeta(InspectBucketMetaOpts),
+}
+
+/// `inspect bucket-meta` options
+#[derive(Args, Clone)]
+#[command(
+    after_help = "IMPORTANT: Mount every source drive read-only for forensic use. Read-only application calls cannot prevent filesystem atime updates or path replacement races on writable mounts."
+)]
+pub struct InspectBucketMetaOpts {
+    /// Drive root path(s). Repeat for multi-drive nodes: erasure-coded metadata
+    /// needs enough drives for write quorum. Source media must be mounted
+    /// read-only for strict forensic use.
+    #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
+    pub paths: Vec<String>,
+
+    /// Bucket whose metadata to inspect
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub bucket: String,
+
+    /// Write the raw `.metadata.bin` blob and each stored config's exact bytes to --out
+    #[arg(long)]
+    pub raw: bool,
+
+    /// New output directory for --raw (default: ./bucket-meta-<bucket>)
+    #[arg(long, requires = "raw")]
+    pub out: Option<std::path::PathBuf>,
 }
 
 /// Diagnose report output format
@@ -368,6 +410,8 @@ pub enum CommandResult {
     Tls(TlsOpts),
     /// Diagnose command with options
     Diagnose(DiagnoseOpts),
+    /// Inspect command with options
+    Inspect(InspectOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -407,7 +451,7 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, preprocess_args_for_legacy};
+    use super::{Cli, Commands, InspectCommands, preprocess_args_for_legacy};
     use clap::Parser;
     use clap::error::ErrorKind;
 
@@ -422,5 +466,53 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn inspect_bucket_meta_parses_repeated_drive_paths() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--path",
+            "/data/drive-2",
+            "--bucket",
+            "example-bucket",
+            "--raw",
+            "--out",
+            "/tmp/export",
+        ])
+        .expect("inspect arguments should parse");
+
+        let Some(Commands::Inspect(inspect)) = cli.command else {
+            panic!("inspect command expected");
+        };
+        let InspectCommands::BucketMeta(opts) = inspect.command;
+        assert_eq!(opts.paths, ["/data/drive-1", "/data/drive-2"]);
+        assert_eq!(opts.bucket, "example-bucket");
+        assert!(opts.raw);
+        assert_eq!(opts.out.as_deref(), Some(std::path::Path::new("/tmp/export")));
+    }
+
+    #[test]
+    fn inspect_bucket_meta_rejects_out_without_raw() {
+        let err = match Cli::try_parse_from([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+            "--out",
+            "/tmp/export",
+        ]) {
+            Ok(_) => panic!("--out without --raw must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

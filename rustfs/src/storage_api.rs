@@ -23,6 +23,16 @@ pub(crate) mod capacity {
     }
 }
 
+/// Offline bucket-metadata inspection (`rustfs inspect bucket-meta`,
+/// backlog#1733): read-only shard verification and reconstruction without a
+/// running store.
+pub(crate) mod inspect {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata as bucket_metadata;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
+    pub(crate) use crate::storage::storage_api::ecstore_erasure::{BitrotReader, Erasure};
+    pub(crate) use crate::storage::storage_api::ecstore_set_disk::file_info_quorum_hash;
+}
+
 pub(crate) mod cluster {
     pub(crate) mod contract {
         pub(crate) mod capability {
