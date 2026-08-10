@@ -122,7 +122,7 @@ fn attach_mutation_body_digest<T>(
     op: &'static str,
 ) -> Result<()> {
     let canonical_body = canonical_body.map_err(|_| Error::other(format!("{op} request length cannot be represented")))?;
-    crate::cluster::rpc::set_tonic_rolling_mutation_body_digest(request, &canonical_body).map_err(Error::other)
+    crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
 }
 
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {

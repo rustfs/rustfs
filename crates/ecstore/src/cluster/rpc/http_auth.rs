@@ -964,26 +964,41 @@ fn verify_tonic_boot_epoch_response_with_secret(
     Ok(boot_epoch)
 }
 
-pub(crate) fn verify_tonic_replay_cache_capability_response(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPeerReplayCapabilities {
+    pub(crate) boot_epoch: Uuid,
+    pub(crate) dynamic_replay_cache: bool,
+}
+
+pub(crate) fn verify_tonic_peer_replay_capabilities_response(
     audience: &str,
     challenge: Uuid,
     headers: &HeaderMap,
-) -> std::io::Result<Uuid> {
+) -> std::io::Result<AuthenticatedPeerReplayCapabilities> {
     let secret = get_shared_secret()?;
     let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
-    let capability = headers
-        .get(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
+    let capability = headers.get(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
+    let proof = headers.get(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
+    if capability.is_none() && proof.is_none() {
+        return Ok(AuthenticatedPeerReplayCapabilities {
+            boot_epoch,
+            dynamic_replay_cache: false,
+        });
+    }
+    let capability = capability
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability"))?;
     if capability != RPC_REPLAY_CACHE_CAPABILITY_V1 {
         return Err(std::io::Error::other("Unsupported RPC replay cache capability"));
     }
-    let proof = headers
-        .get(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)
+    let proof = proof
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability proof"))?;
     verify_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch, proof)?;
-    Ok(boot_epoch)
+    Ok(AuthenticatedPeerReplayCapabilities {
+        boot_epoch,
+        dynamic_replay_cache: true,
+    })
 }
 
 fn valid_content_sha256(value: &str) -> bool {
@@ -1193,10 +1208,18 @@ pub fn set_tonic_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
         .get_ref()
         .canonical_body()
         .map_err(|_| std::io::Error::other("RPC mutation body length cannot be represented"))?;
-    set_tonic_rolling_mutation_body_digest(request, &canonical_body)
+    set_tonic_canonical_body_digest(request, &canonical_body)
 }
 
-pub fn set_tonic_rolling_mutation_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+pub fn set_tonic_rolling_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
+    request: &mut tonic::Request<T>,
+) -> std::io::Result<()> {
+    set_tonic_mutation_body_digest(request)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+pub fn set_tonic_rolling_canonical_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     set_tonic_canonical_body_digest(request, canonical_body)?;
     request.extensions_mut().insert(RollingMutationBodyDigest);
     Ok(())
@@ -2299,15 +2322,16 @@ mod tests {
         ensure_test_rpc_secret();
         let challenge = Uuid::new_v4();
         let headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("capability headers should build");
-        let epoch = verify_tonic_replay_cache_capability_response("node-a:9000", challenge, &headers)
+        let capabilities = verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &headers)
             .expect("matching capability proof should verify");
-        assert_eq!(epoch, tonic_rpc_boot_epoch());
-        assert!(verify_tonic_replay_cache_capability_response("node-b:9000", challenge, &headers).is_err());
-        assert!(verify_tonic_replay_cache_capability_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+        assert_eq!(capabilities.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(capabilities.dynamic_replay_cache);
+        assert!(verify_tonic_peer_replay_capabilities_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
 
         let mut changed_capability = headers;
         changed_capability.insert(RPC_REPLAY_CACHE_CAPABILITY_HEADER, HeaderValue::from_static("dynamic-replay-cache-v2"));
-        assert!(verify_tonic_replay_cache_capability_response("node-a:9000", challenge, &changed_capability).is_err());
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
     }
 
     #[test]
