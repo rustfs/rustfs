@@ -23,7 +23,7 @@ use datafusion::sql::{
     },
 };
 use rustfs_s3select_api::{
-    QueryError, QueryResult, S3SelectPolicyError,
+    QueryError, QueryResult, SelectError,
     query::{
         ast::ExtStatement,
         logical_planner::{LogicalPlanner, Plan, QueryPlan},
@@ -76,7 +76,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
 
                 Ok(plan)
             }
-            _ => Err(QueryError::NotImplemented { err: stmt.to_string() }),
+            _ => Err(unsupported_structure("only SELECT queries are supported")),
         }
     }
 }
@@ -191,7 +191,7 @@ fn validate_select(select: &Select) -> QueryResult<()> {
     let ([ObjectNamePart::Identifier(table_name)] | [ObjectNamePart::Identifier(table_name), ObjectNamePart::Identifier(_)]) =
         name.0.as_slice()
     else {
-        return Err(unsupported_structure("the source must be S3Object"));
+        return Err(SelectError::DataSourcePathUnsupported.into());
     };
     let is_s3_object = if table_name.quote_style.is_some() {
         table_name.value == "S3Object"
@@ -199,14 +199,14 @@ fn validate_select(select: &Select) -> QueryResult<()> {
         table_name.value.eq_ignore_ascii_case("S3Object")
     };
     if !is_s3_object {
-        return Err(unsupported_structure("the source must be S3Object"));
+        return Err(SelectError::DataSourcePathUnsupported.into());
     }
 
     Ok(())
 }
 
 fn unsupported_structure(message: &str) -> QueryError {
-    S3SelectPolicyError::UnsupportedSqlStructure {
+    SelectError::UnsupportedSqlStructure {
         message: message.to_string(),
     }
     .into()
@@ -234,7 +234,7 @@ mod tests {
     use super::validate_s3_select_statement;
     use crate::sql::parser::ExtParser;
     use datafusion::sql::sqlparser::ast::Statement;
-    use rustfs_s3select_api::{S3SelectPolicyError, query::ast::ExtStatement};
+    use rustfs_s3select_api::{SelectError, query::ast::ExtStatement};
 
     fn parse_statement(sql: &str) -> Statement {
         let mut statements = ExtParser::parse_sql(sql).expect("SQL should parse");
@@ -271,7 +271,7 @@ mod tests {
             validate_s3_select_statement(&statement),
             Err(ref err) if matches!(
                 err.s3_select_policy_error(),
-                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "JOIN is not supported"
+                Some(SelectError::UnsupportedSqlStructure { message }) if message == "JOIN is not supported"
             )
         ));
     }
@@ -284,7 +284,7 @@ mod tests {
             validate_s3_select_statement(&statement),
             Err(ref err) if matches!(
                 err.s3_select_policy_error(),
-                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+                Some(SelectError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
             )
         ));
     }
@@ -297,7 +297,7 @@ mod tests {
             validate_s3_select_statement(&statement),
             Err(ref err) if matches!(
                 err.s3_select_policy_error(),
-                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+                Some(SelectError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
             )
         ));
     }
@@ -310,7 +310,7 @@ mod tests {
             validate_s3_select_statement(&statement),
             Err(ref err) if matches!(
                 err.s3_select_policy_error(),
-                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "the source must be S3Object"
+                Some(SelectError::DataSourcePathUnsupported)
             )
         ));
     }
@@ -326,7 +326,7 @@ mod tests {
             assert!(
                 matches!(
                     validate_s3_select_statement(&statement),
-                    Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::UnsupportedSqlStructure { .. }))
+                    Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::UnsupportedSqlStructure { .. }))
                 ),
                 "query should be rejected: {sql}"
             );
