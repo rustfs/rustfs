@@ -4643,7 +4643,7 @@ mod tests {
         );
         run_blocking_namespace_file_sync_operation(lease, &admission, || Ok(()))
             .await
-            .expect("later barrier should reuse admission without requeueing");
+            .expect("later barrier should reuse admission without requeuing");
 
         drop(admission);
         tokio::time::timeout(Duration::from_secs(30), waiting)
