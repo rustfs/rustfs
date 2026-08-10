@@ -40,8 +40,11 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, INTERNODE_OPERATION_GRPC_LOCK,
+    INTERNODE_OPERATION_GRPC_LOCK_BATCH, INTERNODE_OPERATION_GRPC_OTHER, INTERNODE_OPERATION_GRPC_READ_ALL,
+    INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_REFRESH,
+    INTERNODE_OPERATION_GRPC_UNLOCK, INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
 use rustfs_utils::get_env_bool;
@@ -340,6 +343,7 @@ struct RpcNonceCacheMetrics<'a> {
     expired: usize,
     entries: usize,
     capacity: usize,
+    record_scope: Option<RpcReplayCacheMetricScope<'a>>,
     overflow_scope: Option<RpcReplayCacheMetricScope<'a>>,
 }
 
@@ -350,6 +354,13 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
     let internode_metrics = global_internode_metrics();
     internode_metrics.record_replay_cache_evictions("expired", metrics.expired);
     internode_metrics.record_replay_cache_state(metrics.entries, metrics.capacity);
+    if let Some(scope) = metrics.record_scope {
+        internode_metrics.record_replay_cache_record_for_operation_and_backend_path(
+            scope.operation,
+            scope.backend,
+            scope.rpc_path,
+        );
+    }
     if let Some(scope) = metrics.overflow_scope {
         internode_metrics.record_replay_cache_overflow_for_operation_and_backend_path(
             scope.operation,
@@ -385,6 +396,7 @@ impl RpcNonceCache {
             expired,
             entries: self.nonces.len(),
             capacity: record.capacity,
+            record_scope: None,
             overflow_scope: None,
         };
         if self.nonces.contains(&record.nonce) {
@@ -409,6 +421,7 @@ impl RpcNonceCache {
             Ok(()),
             Some(RpcNonceCacheMetrics {
                 entries: self.nonces.len(),
+                record_scope: Some(record.metric_scope),
                 ..metrics
             }),
         )
@@ -913,7 +926,15 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
     match parse_tonic_rpc_path(path).ok().map(|(_, rpc_method)| rpc_method) {
         Some("ReadAll") => INTERNODE_OPERATION_GRPC_READ_ALL,
         Some("ReadMultiple") => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
+        Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
         Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
+        Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
+        Some("LockBatch") => INTERNODE_OPERATION_GRPC_LOCK_BATCH,
+        Some("UnLockBatch") => INTERNODE_OPERATION_GRPC_UNLOCK_BATCH,
+        Some("Refresh") => INTERNODE_OPERATION_GRPC_REFRESH,
+        Some("ForceUnLock") => INTERNODE_OPERATION_GRPC_FORCE_UNLOCK,
         _ => INTERNODE_OPERATION_GRPC_OTHER,
     }
 }
@@ -2458,8 +2479,40 @@ mod tests {
             INTERNODE_OPERATION_GRPC_READ_MULTIPLE
         );
         assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/ReadVersion"),
+            INTERNODE_OPERATION_GRPC_READ_VERSION
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/BatchReadVersion"),
+            INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+        );
+        assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/WriteAll"),
             INTERNODE_OPERATION_GRPC_WRITE_ALL
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/Lock"),
+            INTERNODE_OPERATION_GRPC_LOCK
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/UnLock"),
+            INTERNODE_OPERATION_GRPC_UNLOCK
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/LockBatch"),
+            INTERNODE_OPERATION_GRPC_LOCK_BATCH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/UnLockBatch"),
+            INTERNODE_OPERATION_GRPC_UNLOCK_BATCH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/Refresh"),
+            INTERNODE_OPERATION_GRPC_REFRESH
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/ForceUnLock"),
+            INTERNODE_OPERATION_GRPC_FORCE_UNLOCK
         );
         assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/SignalService"),
@@ -2554,6 +2607,13 @@ mod tests {
         result
     }
 
+    fn check_test_nonce_record_with_metrics<'a>(
+        cache: &mut RpcNonceCache,
+        record: RpcNonceRecord<'a>,
+    ) -> (std::io::Result<()>, Option<RpcNonceCacheMetrics<'a>>) {
+        cache.check_and_record(record)
+    }
+
     fn test_nonce_record(
         nonce: Uuid,
         signed_at: i64,
@@ -2595,6 +2655,48 @@ mod tests {
             .expect("expired nonce should release capacity");
         assert!(!cache.nonces.contains(&nonce_a));
         assert!(cache.nonces.contains(&nonce_b));
+    }
+
+    #[test]
+    fn nonce_cache_metrics_mark_successful_records_only() {
+        let now = Instant::now();
+        let expiry = now.checked_add(REPLAY_CACHE_RETENTION).expect("test expiry should fit");
+        let nonce_a = Uuid::new_v4();
+        let nonce_b = Uuid::new_v4();
+        let mut cache = RpcNonceCache::default();
+
+        let (recorded, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_a, 100, now, 100, expiry, 1));
+        recorded.expect("first nonce should be recorded");
+        let metrics = metrics.expect("successful nonce should publish metrics");
+        let record_scope = metrics.record_scope.expect("successful nonce should carry record scope");
+        assert_eq!(record_scope.operation, INTERNODE_OPERATION_GRPC_READ_ALL);
+        assert_eq!(record_scope.backend, INTERNODE_TRANSPORT_BACKEND_GRPC);
+        assert_eq!(record_scope.rpc_path, "/node_service.NodeService/ReadAll");
+        assert!(metrics.overflow_scope.is_none());
+
+        let (replay, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_a, 100, now, 100, expiry, 1));
+        assert_eq!(
+            replay.expect_err("duplicate nonce must fail closed").to_string(),
+            "RPC request replay detected"
+        );
+        let metrics = metrics.expect("replay rejection should still publish cache state");
+        assert!(metrics.record_scope.is_none());
+        assert!(metrics.overflow_scope.is_none());
+
+        let (overflow, metrics) =
+            check_test_nonce_record_with_metrics(&mut cache, test_nonce_record(nonce_b, 100, now, 100, expiry, 1));
+        assert_eq!(
+            overflow.expect_err("full cache must fail closed").to_string(),
+            "RPC replay cache capacity exceeded"
+        );
+        let metrics = metrics.expect("overflow should publish cache state");
+        assert!(metrics.record_scope.is_none());
+        let overflow_scope = metrics.overflow_scope.expect("overflow should keep diagnostic scope");
+        assert_eq!(overflow_scope.operation, INTERNODE_OPERATION_GRPC_READ_ALL);
+        assert_eq!(overflow_scope.backend, INTERNODE_TRANSPORT_BACKEND_GRPC);
+        assert_eq!(overflow_scope.rpc_path, "/node_service.NodeService/ReadAll");
     }
 
     // The `rpc_body_digest_fallback_counter` serial group covers every test that drives (or

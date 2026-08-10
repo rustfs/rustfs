@@ -24,21 +24,14 @@ const EVENT_TLS_OUTBOUND_INITIALIZATION_FAILED: &str = "tls_outbound_initializat
 const TLS_STARTUP_GENERATION_CONSUMER: &str = "rustfs_server_startup";
 
 pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
+    crate::server::tls_material::validate_configured_oidc_extra_ca_cert()
+        .await
+        .map_err(|err| Error::other(err.to_string()))?;
+
     if let Some(tls_path) = normalized_tls_path(config.tls_path.as_deref()) {
         match crate::server::tls_material::load_tls_material(tls_path).await {
             Ok(snapshot) => {
-                let generation = next_tls_generation(startup_runtime_sources::current_outbound_tls_generation());
-                startup_runtime_sources::publish_outbound_tls_state(generation, &snapshot.outbound).await;
-                startup_runtime_sources::record_tls_generation(TLS_STARTUP_GENERATION_CONSUMER, generation.0);
-                info!(
-                    target: "rustfs::main",
-                    event = EVENT_TLS_OUTBOUND_INITIALIZED,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    tls_path,
-                    generation = generation.0,
-                    "Initialized TLS outbound material"
-                );
+                publish_outbound_tls_material(&snapshot.outbound, Some(tls_path)).await;
             }
             Err(err) => {
                 error!(
@@ -59,6 +52,24 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn publish_outbound_tls_material(outbound: &rustfs_tls_runtime::OutboundTlsMaterial, tls_path: Option<&str>) {
+    let generation = next_tls_generation(startup_runtime_sources::current_outbound_tls_generation());
+    startup_runtime_sources::publish_outbound_tls_state(generation, outbound).await;
+    startup_runtime_sources::record_tls_generation(TLS_STARTUP_GENERATION_CONSUMER, generation.0);
+    info!(
+        target: "rustfs::main",
+        event = EVENT_TLS_OUTBOUND_INITIALIZED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "initialized",
+        tls_path = tls_path.unwrap_or(""),
+        generation = generation.0,
+        has_root_ca = !outbound.root_ca_pem.is_empty(),
+        has_mtls_identity = outbound.mtls_identity.is_some(),
+        "Initialized TLS outbound material"
+    );
 }
 
 fn normalized_tls_path(path: Option<&str>) -> Option<&str> {
