@@ -236,6 +236,40 @@ where
         Ok(false)
     }
 
+    async fn has_namespace_resource_entry(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
+        let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
+        for (prefix, entry_file) in [
+            (self.paths.table_entries_prefix(table_bucket, namespace), TABLE_ENTRY_FILE),
+            (self.paths.view_entries_prefix(table_bucket, namespace), VIEW_ENTRY_FILE),
+        ] {
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .backend
+                    .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), scan_limit)
+                    .await?;
+                let last_scanned = page.objects.last().cloned();
+                if page.objects.iter().any(|object| object.ends_with(entry_file)) {
+                    return Ok(true);
+                }
+                if !page.is_truncated {
+                    break;
+                }
+                let next = last_scanned.ok_or_else(|| {
+                    TableCatalogStoreError::Internal("catalog namespace resource scan made no progress".to_string())
+                })?;
+                if cursor.as_deref().is_some_and(|cursor| next.as_str() <= cursor) {
+                    return Err(TableCatalogStoreError::Internal(
+                        "catalog namespace resource scan did not advance".to_string(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+        }
+        Ok(false)
+    }
+
     async fn has_active_namespace_descendant(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
         let parent = namespace.public_name();
         let descendant_prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), namespace.storage_id());
@@ -3583,13 +3617,7 @@ where
     }
 
     async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
-        validate_catalog_entry_version("table bucket", entry.version)?;
-        if entry.table_bucket.is_empty() {
-            return Err(TableCatalogStoreError::Invalid("table bucket name cannot be empty".to_string()));
-        }
-        if entry.catalog_type != TABLE_BUCKET_CATALOG_TYPE {
-            return Err(TableCatalogStoreError::Invalid("unsupported table bucket catalog type".to_string()));
-        }
+        validate_table_bucket_entry(&entry)?;
         let _registry_guard = self.acquire_table_bucket_registry_write_permit().await?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
         let object = self.paths.table_bucket_entry_path(&entry.table_bucket);
@@ -3744,7 +3772,7 @@ where
                 namespace.public_name()
             )));
         }
-        if self.has_active_namespace_object(table_bucket, &namespace).await? {
+        if self.has_namespace_resource_entry(table_bucket, &namespace).await? {
             return Err(TableCatalogStoreError::Conflict(format!(
                 "namespace {table_bucket}/{} is not empty",
                 namespace.public_name()
@@ -3764,20 +3792,6 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
-                table_bucket,
-                namespace.public_name()
-            )));
-        }
-        if !self.list_tables(table_bucket, &namespace.public_name()).await?.is_empty() {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "namespace {}/{} is not empty",
-                table_bucket,
-                namespace.public_name()
-            )));
-        }
-        if !self.list_views(table_bucket, &namespace.public_name()).await?.is_empty() {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "namespace {}/{} is not empty",
                 table_bucket,
                 namespace.public_name()
             )));

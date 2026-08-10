@@ -22,7 +22,21 @@ use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 pub(crate) use strong::StrongTableCatalogStore;
 #[cfg(test)]
-pub(super) use strong::{StrongCommitSnapshotRecord, StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot};
+pub(super) use strong::{
+    STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, StrongCommitSnapshotRecord, StrongTableCatalogBucketSnapshot,
+    StrongTableCatalogSnapshot,
+};
+
+fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("table bucket", entry.version)?;
+    if entry.table_bucket.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("table bucket name cannot be empty".to_string()));
+    }
+    if entry.catalog_type != TABLE_BUCKET_CATALOG_TYPE {
+        return Err(TableCatalogStoreError::Invalid("unsupported table bucket catalog type".to_string()));
+    }
+    Ok(())
+}
 
 fn validate_namespace_entry_identity(entry: &NamespaceEntry) -> TableCatalogStoreResult<Namespace> {
     validate_catalog_entry_version("namespace", entry.version)?;
