@@ -51,26 +51,25 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 
 ## Change Style for Existing Logic
 
-- Prefer direct, local code over extracting one-off helpers.
-- Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
+- Start with the smallest direct, local edit. Add production files, types, traits, helpers, wrappers, or abstraction layers only when current behavior requires them. Extraction must remove present duplication, enforce a real boundary, or materially clarify a non-trivial flow; anticipated reuse is not enough.
 - Use Rust's default module file layout (`mod foo;` with `foo.rs` or `foo/mod.rs`/`foo/*.rs`).
   Avoid `#[path = "..."]` for module inclusion; move files into the canonical module tree instead.
   If an unavoidable generated-code, FFI, or test-fixture exception remains, keep it local and document why the canonical layout cannot work.
 - Solve only the requested problem; do not add speculative features, configurability, or adjacent improvements.
 - Prefer editing existing code over rewriting files or reshaping unrelated logic.
-- Modify only what is required and remove only artifacts introduced by your own changes.
+- Modify only what is required. Remove any in-scope path or representation superseded by the change. If compatibility or rollback requires retention, adapt at the boundary to one canonical core and follow the repository's `RUSTFS_COMPAT_TODO` removal policy; never delete unrelated code merely to improve addition/deletion statistics.
 - Preserve the existing control-flow and logic shape when fixing bugs or addressing review comments, especially in init, distributed coordination, locking, metadata, and concurrency paths.
 - Do not refactor existing code only to make it easier to unit test.
 - Keep fixes narrowly aligned with the requested behavior; avoid semantic-adjacent rewrites while touching sensitive paths.
-- Keep code elegant, concise, and direct. Prefer minimal, readable implementations over over-engineering and excessive abstraction. Use comments to clarify non-obvious intent and invariants, not to compensate for unclear code.
-- Do not write comments that narrate what the next line does, restate a signature, or describe the change you just made — that commentary belongs in the PR description, not the code. Required invariant comments — lock ordering, `SAFETY`, unwrap justification, `#[allow(dead_code)]` rationale, `RUSTFS_COMPAT_TODO` — are never narration.
+- Keep code elegant, concise, and direct. Prefer the smallest readable design and existing abstractions over parallel managers, factories, adapters, or wrappers added only to make the design look extensible.
+- Comments state non-obvious reasons, assumptions, and invariants in the shortest complete form. Their length follows the invariant's complexity: `SAFETY`, lock ordering, durability, and compatibility contracts may need a short list of conditions. Never narrate the next line, restate a signature, or record change history; move durable design rationale to architecture or operations documentation.
 - Mention unrelated issues when useful, but do not fix them as part of a narrow task.
 
 ## Reuse Before You Write
 
 Search for an existing implementation before writing a new one; extend what exists instead of duplicating it:
 
-- **Helpers and utilities** (path/string handling, hashing, retry, env parsing, IO wrappers): check `ls crates/utils/src` first — file names map to operations (`retry.rs`, `envs.rs`, `hash.rs`, `path.rs`, `string.rs`, `io.rs`) — plus `crates/common` (shared structures/globals), then `rg -i 'fn \w*<term>' crates/utils/src crates/common/src <touched-crate>/src` for signatures. Helpers are snake_case: a full-text single-word grep over a large crate drowns you and a multi-word phrase returns nothing. Reimplementing an existing workspace helper — or hand-rolling what `std`, `tokio`, or an existing workspace dependency already provides — is a review finding, not a style preference.
+- **Helpers and utilities** (path/string handling, hashing, retry, env parsing, IO wrappers): check `crates/utils`, `crates/common`, the touched crate, the likely domain-owning crate, and relevant direct workspace dependencies from `Cargo.toml`. Search snake_case signatures with a focused term. Reimplementing an existing workspace helper — or hand-rolling what `std`, `tokio`, or an existing dependency already provides — is a review finding, not a style preference.
 - **Reuse requires matching semantics, not a matching name**: before adopting a helper, check its normalization (`clean` resolves `.`/`..` — never apply it to raw S3 object keys), error type, backoff/deadline behavior, and durability gating against the call site. When semantics differ, a new narrowly-named helper with a comment naming the rejected lookalike is the correct outcome. The inverse also holds: workspace wrappers exist because raw `std`/`tokio` semantics were insufficient (durability gates, retries) — prefer the wrapper over the raw call.
 - **Constants and fixed tokens** (protocol labels, error identifiers, header keys, event names, metric names, command tags): search for existing constants/enums that already represent the same semantic value and reuse them. If a value is truly new, define one local constant near related logic; never scatter the literal across sites. When changing existing behavior, align naming and format with the established constants.
 - **Test scaffolding**: reuse existing test utilities and fixtures (the touched crate's own `test_util` module and `tests/fixtures`, or `crates/test-utils`) instead of writing new setup code — run `rg -l '<fn-under-test>' <crate>/src <crate>/tests` before writing a test. A new test must pin a failure mode no existing test covers. Near-duplicate means same code path AND same poison-value class: this repo's boundary companions (n==max vs max+1, absent vs empty vs nil UUID bytes, MetaObject vs MetaDeleteMarker) are distinct by definition and must all be written.
@@ -79,6 +78,7 @@ Search for an existing implementation before writing a new one; extend what exis
 
 Net-new code — files, types, branches, comments — is cost to justify, not progress:
 
+- Inspect production-code additions separately. Tests, fixtures, generated code, and documentation do not count as production-code growth. Line counts are signals, not quotas: new production structures must map to a current requirement, and a blocker requires a concrete smaller design that preserves correctness, compatibility, readability, and real boundaries.
 - Validate at the trust boundary — untrusted client input, bytes read from disk, RPC payloads, config (see Serde Safety and Cross-Cutting Domain Invariants) — then trust the type: do not re-check what the type system or a validated upstream layer already guarantees, and cite the establishing check (`file:line`) when the guarantee is not obvious.
 - The exception is load-bearing: a value that crossed a persistence, RPC, or version boundary is never guaranteed by the code on the other side — a peer may be older or buggy, disk bytes may be corrupt — so the Cross-Cutting Domain Invariant patterns apply at every consumer, and re-checks immediately before a destructive action (delete, overwrite, quorum decision) stay. Deleting an existing guard is a behavior change requiring adversarial review, not cleanup.
 - Every new branch needs a nameable trigger: a concrete input, state, or failure that reaches it — for boundary-crossing values, corrupt or stale persisted/peer data is always nameable. If you cannot name one, do not write the branch. If the case is truly unreachable, encode the invariant in the type; where that is impossible, return a typed internal error (fail closed). `debug_assert!` is acceptable only for pure internal arithmetic on values that never crossed a disk/RPC/config boundary — never as the sole guard on decoded or peer-supplied data.
@@ -218,9 +218,10 @@ not to bless it.
 
 Pick the tier from the riskiest file touched; when in doubt, pick the higher.
 
-- **Exempt:** docs/comments/instruction-only changes, formatting, typos with
-  no runtime surface. Skip this section.
-- **Mechanical:** pure renames, file moves, test-only or tooling changes —
+- **Exempt:** docs/comments, formatting, and typos that cannot affect runtime,
+  builds, tests, or agent execution. Skip this section.
+- **Mechanical:** pure renames, file moves, test-only or tooling changes, and
+  agent-instruction changes that alter execution —
   correctness and simplicity adversaries only.
 - **Standard (the default):** any change that affects behavior.
 - **High risk:** touches locking, erasure coding, quorum/heal, replication,
@@ -242,7 +243,7 @@ encode this repo's shipped bugs.
 - **Correctness adversary** — construct a concrete input/state/interleaving
   that yields wrong output, data loss, or a crash. Probe error paths and edge
   values (empty, nil UUID, zero-length, quorum−1, missing version).
-- **Simplicity adversary** — same behavior, less code. Hunt the materially smaller or more idiomatic diff (see Change Style for Existing Logic, Reuse Before You Write, and Necessary Code Only): reimplemented workspace helpers, one-caller extractions, rewrites where an in-place edit suffices, defensive branches with no nameable trigger, redundant error wrapping, near-duplicate tests, narration comments. A smaller diff achieving identical behavior is a finding, reported with the concrete replacement; forced reuse of a helper with mismatched semantics is equally a finding.
+- **Simplicity adversary** — same behavior, less code. Hunt reimplemented helpers, rewrites where an in-place edit suffices, speculative abstractions, defensive branches with no nameable trigger, redundant error wrapping, near-duplicate tests, and narration comments. A one-caller helper is a finding only when it merely forwards or splits a short linear flow without adding domain naming, boundary isolation, an invariant, or useful error context. Report a concrete smaller replacement; fewer lines alone are not evidence.
 - **Security reviewer** — authn/authz bypass, injection, secret leakage,
   untrusted deserialization (see Serde Safety), path traversal, timing leaks.
 - **Concurrency/durability reviewer** — lock ordering, races, cancellation,
@@ -253,10 +254,11 @@ encode this repo's shipped bugs.
   time across IO, sync or CPU-heavy work on async runtime threads, added
   fsync/flush outside the durability gate, hot-path logging noise. A
   measurable regression on a per-request or per-object path is a finding.
-- **Test-coverage skeptic** — for each claimed behavior, name the test that
-  fails if the change is reverted; then name a changed line that could be
-  wrong while all tests stay green — if one exists, coverage is insufficient.
-  A missing test is a finding, not a note.
+- **Test-coverage skeptic** — for each testable behavior claim, name the test
+  or executable check that detects a revert; then name a changed line that
+  could be wrong while all checks stay green. If a focused check is not
+  reasonable, require the reason and residual risk from the validation floor.
+  Test additions have no line-count or growth budget.
 
 Standard tier: correctness adversary + simplicity adversary + test-coverage
 skeptic, plus every role whose domain the diff touches (async or
@@ -282,7 +284,9 @@ High risk: all seven roles.
 
 - Every applicable role has run; every finding is fixed or rebutted with
   evidence.
-- Every behavior change has a test that fails without it.
+- Every testable behavior change has a focused regression check. Exceptions
+  follow the validation floor and state why a check is impractical and what
+  risk remains.
 - The Verification Before PR gates pass — adversarial review supplements
   those gates, never replaces them.
 - High risk only: record a one-line verdict per role in the PR description.

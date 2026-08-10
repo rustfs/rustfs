@@ -24,15 +24,17 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 
 2. Inspect change scope
 - Review the diff and summarize what changed.
+- Inspect `git diff --stat` and `git diff --numstat`; assess production-code growth separately. Tests, fixtures, generated code, and documentation have no growth budget. Treat line counts as signals, not quotas.
 - Call out unrelated edits, generated artifacts, logs, or secrets as blockers.
 - Mark risky areas explicitly: auth, storage, config, network, migrations, breaking changes.
+- Use the simplicity-adversary verdict instead of producing a per-symbol inventory. Block growth only when the review identifies duplication or gives a concrete smaller design that preserves correctness, compatibility, readability, and real boundaries.
+- Confirm replacement implementations remove the superseded in-scope path or adapt compatibility at the boundary to one canonical core.
 - Scan the diff for newly added string literals and confirm whether they duplicate values already defined as constants/enums/typed wrappers in the same module or shared modules.
 - Treat introducing a new hardcoded literal where a project constant already exists as a likely regression risk; require either a refactor to reuse the constant or an explicit exception explanation in the PR body.
 
 3. Verify readiness requirements
-- Require `make pre-commit` before marking PRs ready when the diff changes Rust code, product behavior, CI behavior, runtime configuration, security-sensitive logic, migrations, storage, auth, networking, or other high-risk paths.
-- For documentation-only, agent-instruction-only, or local developer-tooling-only changes, allow focused verification instead of `make pre-commit` when it directly validates the changed surface.
-- For focused verification, explain why the full gate was not run and list the scope-specific commands in the PR body.
+- Select checks from `AGENTS.md` "Verification Before PR" based on the final diff's risk tier. Do not replace a focused behavioral test with `make pre-commit`, or a required high-risk `make pre-pr` with a narrower gate.
+- For focused verification, state why the selected tier is sufficient and list the scope-specific commands in the PR body.
 - If `make` is unavailable, use the equivalent commands from `.config/make/`.
 - Add scope-specific verification commands when the changed area needs more than the baseline.
 - If required checks fail, stop and return `BLOCKED`.
@@ -81,13 +83,14 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 
 ## Blocker rules
 
-- Return `BLOCKED` if a code, behavior, CI, runtime configuration, security-sensitive, migration, storage, auth, networking, or other high-risk change has not passed `make pre-commit`.
+- Return `BLOCKED` if the checks required by the `AGENTS.md` validation tier have not passed.
 - Return `BLOCKED` if a documentation-only, agent-instruction-only, or local developer-tooling-only change lacks focused verification for the changed surface.
 - Return `BLOCKED` if the diff contains unrelated changes that are not acknowledged.
 - Return `BLOCKED` if required template sections are missing.
 - Return `BLOCKED` if the title/body is not in English.
 - Return `BLOCKED` if the title does not follow the repository's Conventional Commit rule.
 - Return `BLOCKED` if the diff introduces string literals that should use existing constants but did not.
+- Return `BLOCKED` for production-code growth only when the review identifies a duplicated or superseded implementation, or supplies a concrete smaller design with equivalent semantics. Fewer lines alone are not evidence.
 
 ## Reference
 
