@@ -2559,6 +2559,96 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn replacement_target_readback_checks_the_requested_historical_version() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "replacement-target-readback-versioned";
+        let object = "object.bin";
+        set.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("versioned bucket should be created");
+
+        let mut old_reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
+        let old_info = set
+            .put_object(
+                bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old object version should be written");
+        let old_version = old_info
+            .version_id
+            .expect("versioned put should return the old version id")
+            .to_string();
+        let mut latest_reader = PutObjReader::from_vec(vec![0x33; 1024 * 1024]);
+        let latest_info = set
+            .put_object(
+                bucket,
+                object,
+                &mut latest_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("latest object version should be written");
+        let latest_version = latest_info
+            .version_id
+            .expect("versioned put should return the latest version id")
+            .to_string();
+        let old_source = disks[2]
+            .read_version("", bucket, object, &old_version, &ReadOptions::default())
+            .await
+            .expect("old version metadata should be readable");
+        let old_data_dir = old_source.data_dir.expect("old version should have a data directory");
+        let targets = vec![set.set_endpoints[0].to_string(), set.set_endpoints[1].to_string()];
+
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &old_version, &targets)
+                .await
+                .expect("healthy historical target shards should be readable")
+        );
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &latest_version, &targets)
+                .await
+                .expect("healthy latest target shards should be readable")
+        );
+
+        tokio::fs::remove_file(
+            temp_dirs[1]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(old_data_dir.to_string())
+                .join("part.1"),
+        )
+        .await
+        .expect("old target shard should be removed after the initial commit");
+
+        assert!(
+            !set.replacement_targets_have_version(bucket, object, &old_version, &targets)
+                .await
+                .expect("missing old target shard should be observable")
+        );
+        assert!(
+            set.replacement_targets_have_version(bucket, object, &latest_version, &targets)
+                .await
+                .expect("latest target evidence should remain independent")
+        );
+    }
+
+    #[tokio::test]
     async fn format_heal_cached_layout_rejects_a_disk_from_another_slot() {
         let mut _temp_dirs = Vec::new();
         let mut endpoints = Vec::new();
