@@ -91,6 +91,19 @@ where
     Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
 {
     let _process_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    with_site_replication_state_object_lock(store, operation).await
+}
+
+/// The distributed half of the boundary on its own: the state-object write
+/// lock, without the process mutex. This is the only thing that serializes
+/// writers in *different* processes (the mutex cannot), so it is also what
+/// the separate-nodes regression test drives.
+pub(crate) async fn with_site_replication_state_object_lock<T, F, Fut>(store: Arc<ECStore>, operation: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
+{
     with_config_object_write_lock(store, SITE_REPLICATION_STATE_PATH.to_string(), operation)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication state failed: {e}")))?

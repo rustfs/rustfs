@@ -111,6 +111,8 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
+#[cfg(test)]
+use crate::admin::site_replication_state::with_site_replication_state_object_lock;
 use crate::admin::site_replication_state::{
     SITE_REPLICATION_STATE_PATH, site_replication_state_process_guard, with_site_replication_state_lock,
 };
@@ -1095,6 +1097,28 @@ async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, mut state: 
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))
     }
+}
+
+/// A second node's view of the same transaction: identical production code
+/// path minus the process mutex, which is per process and therefore cannot
+/// serialize anything across nodes. Used by the separate-nodes regression
+/// test so that removing the distributed lock breaks it.
+#[cfg(test)]
+async fn update_site_replication_state_as_separate_node<T, F>(update: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
+{
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    let lock_store = store.clone();
+    with_site_replication_state_object_lock(lock_store, move || async move {
+        let mut state = load_site_replication_state_no_lock(store.clone()).await?;
+        let result = update(&mut state)?;
+        persist_site_replication_state_no_lock(store, state).await?;
+        Ok(result)
+    })
+    .await
 }
 
 /// The site-replication state RMW transaction: load, mutate, persist — all
@@ -8277,12 +8301,12 @@ impl Operation for SiteReplicationAddHandler {
 
         mark_unknown_peer_sync_enabled(&mut state.peers);
         persist_site_replication_state(&state).await?;
-        // The state RMW is committed; release the state lock before the peer
-        // fan-out — the retry-event bookkeeping inside the transport helpers
-        // re-enters the state transaction (P1-15) and must not nest inside
-        // this guard.
-        drop(_state_guard);
 
+        // The finalize fan-out below delivers peer-edit payloads, so it stays
+        // under the state guard: ordering against a concurrent edit matters
+        // and the peer edit handler has no generation fence. It uses the
+        // plain transport (no retry-event bookkeeping), so nothing re-enters
+        // the state transaction while the guard is held.
         for target in state.peers.values() {
             if target.deployment_id == local_peer.deployment_id || same_identity_endpoint(&target.endpoint, &local_peer.endpoint)
             {
@@ -8311,6 +8335,12 @@ impl Operation for SiteReplicationAddHandler {
                 }
             }
         }
+
+        // Bootstrap and back-fill send bucket-ops, not peer edits, so their
+        // ordering is not state-sensitive — and their transports do record
+        // retry events, which re-enter the state transaction. Release the
+        // guard before them.
+        drop(_state_guard);
 
         initial_sync_errors.extend(bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await);
 
@@ -9021,24 +9051,47 @@ impl Operation for SiteReplicationEditHandler {
                 // handlers): a failed notification is recorded as a retry
                 // event and converges from the committed local state —
                 // fanning out first meant the retry event pointed at a state
-                // the local site had not saved. Releasing the guard is also
-                // required: the transport helpers' retry-event bookkeeping
-                // re-enters the state transaction (P1-15).
+                // the local site had not saved.
                 save_site_replication_state(&state).await?;
-                drop(state_guard.take());
-                for target in remote_targets {
+
+                // The fan-out stays UNDER the state guard: releasing it here
+                // would let a concurrent edit commit and reach a peer first
+                // while this one stalls, and the peer edit handler applies
+                // whatever arrives last (it has no generation fence), so the
+                // sites would silently diverge. The retry-event bookkeeping
+                // is what cannot run under the guard — it re-enters the state
+                // transaction (P1-15) — so deliver with the plain transport
+                // here and settle the retry queue after the guard is
+                // released, preserving both ordering and the bookkeeping.
+                let mut delivered: Vec<PeerInfo> = Vec::new();
+                let mut failure: Option<(PeerInfo, S3Error)> = None;
+                'fanout: for target in remote_targets {
                     let transport = PeerTransport::for_runtime_peer(target).await?;
                     for peer in &peers_to_send {
-                        send_peer_admin_request_with_retry_event_transport(
-                            target,
-                            &transport,
+                        if let Err(err) = send_peer_admin_request_with_client(
+                            &transport.client,
+                            &transport.connection,
                             SITE_REPLICATION_PEER_EDIT_PATH,
                             &current_state.service_account_access_key,
                             &service_account_secret_key,
                             peer,
                         )
-                        .await?;
+                        .await
+                        {
+                            failure = Some((target.clone(), err));
+                            break 'fanout;
+                        }
                     }
+                    delivered.push(target.clone());
+                }
+                drop(state_guard.take());
+
+                for target in &delivered {
+                    dequeue_site_replication_retry_event(target, SITE_REPLICATION_PEER_EDIT_PATH).await;
+                }
+                if let Some((target, err)) = failure {
+                    enqueue_site_replication_retry_event(&target, SITE_REPLICATION_PEER_EDIT_PATH, &err).await;
+                    return Err(err);
                 }
             }
         }
@@ -14839,6 +14892,119 @@ mod tests {
         let mut newer = status;
         newer.generation += 1;
         assert!(parse_site_resync_page(&query, &newer).is_err());
+    }
+
+    /// P1-15 review follow-up: isolates the PROCESS guard. One writer uses
+    /// the legacy shape that the not-yet-migrated call sites still use (take
+    /// the process mutex, then load / mutate / save through the plain
+    /// helpers, which take their own per-IO object locks); the other runs the
+    /// full transaction. They only stay serialized because the transaction
+    /// also takes the process mutex — drop it there and this test loses one
+    /// of the two updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_transaction_serializes_against_a_process_only_legacy_writer() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-legacy".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            let legacy_id = format!("legacy-{round}");
+            let legacy = tokio::spawn(async move {
+                // Exactly what an unmigrated call site does today.
+                let _guard = site_replication_state_process_guard().await;
+                let mut state = load_site_replication_state().await.expect("legacy load");
+                if let Some(pending) = state.pending_rotation.as_mut() {
+                    pending.secret_candidates.push(legacy_id);
+                }
+                save_site_replication_state(&state).await.expect("legacy save");
+            });
+            let ack_id = format!("ack-{round}");
+            let migrated = tokio::spawn(async move {
+                mark_pending_rotation_peer_acked("rot-legacy", &ack_id)
+                    .await
+                    .expect("transaction writer");
+            });
+            legacy.await.expect("legacy task");
+            migrated.await.expect("transaction task");
+        }
+
+        let final_state = load_site_replication_state().await.expect("reload");
+        let pending = final_state.pending_rotation.expect("pending rotation survives");
+        for round in 0..ROUNDS {
+            assert!(
+                pending.secret_candidates.contains(&format!("legacy-{round}")),
+                "legacy writer update {round} was lost; candidates: {:?}",
+                pending.secret_candidates
+            );
+            assert!(
+                pending.acked_deployment_ids.contains(&format!("ack-{round}")),
+                "transaction writer update {round} was lost; acks: {:?}",
+                pending.acked_deployment_ids
+            );
+        }
+    }
+
+    /// P1-15 review follow-up: isolates the DISTRIBUTED guard. Both writers
+    /// bypass the process mutex, which is what two separate nodes do — the
+    /// mutex is per process and cannot serialize them. Only the state-object
+    /// write lock keeps their read-modify-write sequences apart; drop it and
+    /// this test loses an update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_state_object_lock_serializes_writers_from_separate_nodes() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-nodes".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        // Each "node" runs the production transaction minus the process
+        // mutex — the distributed state-object lock is the only thing left
+        // to keep them apart.
+        fn node_local_update(candidate: String) -> impl std::future::Future<Output = S3Result<()>> {
+            update_site_replication_state_as_separate_node(move |state| {
+                if let Some(pending) = state.pending_rotation.as_mut() {
+                    pending.secret_candidates.push(candidate);
+                }
+                Ok(())
+            })
+        }
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            let node_a = tokio::spawn(node_local_update(format!("node-a-{round}")));
+            let node_b = tokio::spawn(node_local_update(format!("node-b-{round}")));
+            node_a.await.expect("node a task").expect("node a update");
+            node_b.await.expect("node b task").expect("node b update");
+        }
+
+        let final_state = load_site_replication_state().await.expect("reload");
+        let pending = final_state.pending_rotation.expect("pending rotation survives");
+        for round in 0..ROUNDS {
+            for node in ["node-a", "node-b"] {
+                assert!(
+                    pending.secret_candidates.contains(&format!("{node}-{round}")),
+                    "{node} update {round} was lost across nodes; candidates: {:?}",
+                    pending.secret_candidates
+                );
+            }
+        }
     }
 
     /// P1-15 (rustfs/backlog#1675 B2): every state RMW — including the
