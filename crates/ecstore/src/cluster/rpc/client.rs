@@ -15,12 +15,11 @@
 #[cfg(test)]
 use crate::cluster::rpc::http_auth::RPC_REPLAY_SCOPE_VERSION_HEADER;
 use crate::cluster::rpc::http_auth::{
-    RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2, RPC_BOOT_EPOCH_CHALLENGE_HEADER, RPC_BOOT_EPOCH_HEADER,
-    RPC_BOOT_EPOCH_PROOF_HEADER, RPC_CONTENT_SHA256_HEADER, TIMESTAMP_HEADER,
+    RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2, RPC_BOOT_EPOCH_CHALLENGE_HEADER, RPC_CONTENT_SHA256_HEADER,
+    RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER, RollingMutationBodyDigest, TIMESTAMP_HEADER,
+    internode_rpc_body_digest_strict, verify_tonic_replay_cache_capability_response,
 };
-use crate::cluster::rpc::{
-    gen_tonic_replay_scope_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience, verify_tonic_boot_epoch_response,
-};
+use crate::cluster::rpc::{gen_tonic_replay_scope_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience};
 #[cfg(test)]
 use crate::cluster::rpc::{tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers};
 use crate::disk::error::{DiskError, Error as DiskErrorType, RpcStatusError};
@@ -233,7 +232,17 @@ pub struct ReplayScopeChannel<S> {
 /// The channel type used by internode clients after v2 authentication and replay-scope handling.
 pub type AuthenticatedChannel = ReplayScopeChannel<Channel>;
 
-static PEER_BOOT_EPOCHS: LazyLock<Mutex<HashMap<String, Uuid>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerReplayCapability {
+    Capable { boot_epoch: Uuid },
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerReplayCapabilitySnapshot(Option<PeerReplayCapability>);
+
+static PEER_REPLAY_CAPABILITIES: LazyLock<Mutex<HashMap<String, PeerReplayCapability>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl<S> ReplayScopeChannel<S> {
     fn new(inner: S, audience: Option<String>) -> Self {
@@ -241,13 +250,54 @@ impl<S> ReplayScopeChannel<S> {
     }
 }
 
-fn cached_peer_boot_epoch(audience: &str) -> Option<Uuid> {
-    PEER_BOOT_EPOCHS.lock().ok().and_then(|epochs| epochs.get(audience).copied())
+fn peer_replay_capability(audience: &str) -> Option<PeerReplayCapability> {
+    PEER_REPLAY_CAPABILITIES
+        .lock()
+        .ok()
+        .and_then(|capabilities| capabilities.get(audience).copied())
 }
 
-fn remember_peer_boot_epoch(audience: String, epoch: Uuid) {
-    if let Ok(mut epochs) = PEER_BOOT_EPOCHS.lock() {
-        epochs.insert(audience, epoch);
+fn apply_peer_replay_capability_response(
+    audience: String,
+    sent_capability: Option<PeerReplayCapability>,
+    response_capability: std::io::Result<Uuid>,
+) {
+    if let Ok(mut capabilities) = PEER_REPLAY_CAPABILITIES.lock() {
+        let current_capability = capabilities.get(&audience).copied();
+        match (sent_capability, current_capability, response_capability) {
+            (None, None, Ok(boot_epoch))
+            | (Some(PeerReplayCapability::Revoked), Some(PeerReplayCapability::Revoked), Ok(boot_epoch)) => {
+                capabilities.insert(audience, PeerReplayCapability::Capable { boot_epoch });
+            }
+            (
+                Some(PeerReplayCapability::Capable {
+                    boot_epoch: sent_boot_epoch,
+                }),
+                Some(PeerReplayCapability::Capable {
+                    boot_epoch: current_boot_epoch,
+                }),
+                Ok(response_boot_epoch),
+            ) if sent_boot_epoch == current_boot_epoch => {
+                capabilities.insert(
+                    audience,
+                    PeerReplayCapability::Capable {
+                        boot_epoch: response_boot_epoch,
+                    },
+                );
+            }
+            (
+                Some(PeerReplayCapability::Capable {
+                    boot_epoch: sent_boot_epoch,
+                }),
+                Some(PeerReplayCapability::Capable {
+                    boot_epoch: current_boot_epoch,
+                }),
+                Err(_),
+            ) if sent_boot_epoch == current_boot_epoch => {
+                capabilities.insert(audience, PeerReplayCapability::Revoked);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -276,6 +326,10 @@ where
                 == Some(RPC_AUTH_VERSION_V2)
         });
         let challenge = authenticated.then(Uuid::new_v4);
+        let sent_capability = request
+            .extensions()
+            .get::<PeerReplayCapabilitySnapshot>()
+            .and_then(|snapshot| snapshot.0);
         if let (Some(audience), Some(challenge)) = (self.audience.as_deref(), challenge) {
             // The challenge is independently HMAC-authenticated by the response proof. It is not
             // part of v2 so old peers ignore it, while a new peer can safely advertise its epoch.
@@ -283,8 +337,8 @@ where
                 RPC_BOOT_EPOCH_CHALLENGE_HEADER,
                 challenge.to_string().parse().expect("UUID must be a valid header value"),
             );
-            if let (Some(boot_epoch), Some(timestamp), Some(content_sha256)) = (
-                cached_peer_boot_epoch(audience),
+            if let (Some(PeerReplayCapability::Capable { boot_epoch }), Some(timestamp), Some(content_sha256)) = (
+                sent_capability,
                 request.headers().get(TIMESTAMP_HEADER).and_then(|value| value.to_str().ok()),
                 request
                     .headers()
@@ -303,16 +357,21 @@ where
         Box::pin(async move {
             let response = future.await?;
             if let (Some(audience), Some(challenge)) = (audience, challenge) {
-                match verify_tonic_boot_epoch_response(&audience, challenge, response.headers()) {
-                    Ok(epoch) => remember_peer_boot_epoch(audience, epoch),
-                    Err(error)
-                        if response.headers().contains_key(RPC_BOOT_EPOCH_HEADER)
-                            || response.headers().contains_key(RPC_BOOT_EPOCH_PROOF_HEADER) =>
-                    {
-                        debug!(error = %error, "peer boot epoch response proof was rejected")
-                    }
-                    Err(_) => {}
+                let response_capability = verify_tonic_replay_cache_capability_response(&audience, challenge, response.headers());
+                if let Err(error) = &response_capability
+                    && (response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
+                        || response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER))
+                {
+                    debug!(
+                        event = "internode_rpc_capability_proof_rejected",
+                        component = "ecstore",
+                        subsystem = "rpc_client",
+                        result = "rejected",
+                        error = %error,
+                        "internode RPC capability proof rejected"
+                    )
                 }
+                apply_peer_replay_capability_response(audience, sent_capability, response_capability);
             }
             Ok(response)
         })
@@ -321,6 +380,7 @@ where
 
 pub struct TonicSignatureInterceptor {
     audience: Option<String>,
+    body_digest_strict: bool,
 }
 
 impl tonic::service::Interceptor for TonicSignatureInterceptor {
@@ -337,9 +397,33 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
             .metadata()
             .get(RPC_CONTENT_SHA256_HEADER)
             .and_then(|value| value.to_str().ok());
+        // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): use cache-free v2 for fixed-cache peers. Remove after every supported peer advertises the authenticated dynamic replay-cache capability and body-digest strict mode is the default.
+        // beta.11 verifies v2 body digests but stores their nonces in a fixed-size cache.
+        let rolling_mutation = req.extensions().get::<RollingMutationBodyDigest>().is_some();
+        let peer_capability = PEER_REPLAY_CAPABILITIES
+            .lock()
+            .map_err(|_| tonic::Status::unauthenticated("RPC peer capability state unavailable"))?
+            .get(audience)
+            .copied();
+        let content_sha256 = if content_sha256.is_some() {
+            if peer_capability == Some(PeerReplayCapability::Revoked) {
+                return Err(tonic::Status::unauthenticated("RPC peer replay capability changed"));
+            }
+            if rolling_mutation
+                && !self.body_digest_strict
+                && !matches!(peer_capability, Some(PeerReplayCapability::Capable { .. }))
+            {
+                None
+            } else {
+                content_sha256
+            }
+        } else {
+            content_sha256
+        };
         let headers = gen_tonic_signature_headers(audience, method.service(), method.method(), content_sha256)
             .map_err(|_| tonic::Status::unauthenticated("No valid auth token"))?;
         req.metadata_mut().as_mut().extend(headers);
+        req.extensions_mut().insert(PeerReplayCapabilitySnapshot(peer_capability));
         inject_trace_context_into_metadata(req.metadata_mut());
         inject_request_id_into_metadata(req.metadata_mut());
         Ok(req)
@@ -347,7 +431,10 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
 }
 
 pub fn gen_tonic_signature_interceptor() -> TonicSignatureInterceptor {
-    TonicSignatureInterceptor { audience: None }
+    TonicSignatureInterceptor {
+        audience: None,
+        body_digest_strict: internode_rpc_body_digest_strict(),
+    }
 }
 
 pub struct NoOpInterceptor;
@@ -409,6 +496,7 @@ mod tests {
     #[derive(Clone)]
     struct EpochProofService {
         audience: String,
+        include_capability: bool,
         seen_headers: std::sync::Arc<Mutex<Vec<http::HeaderMap>>>,
     }
 
@@ -430,11 +518,31 @@ mod tests {
                 .expect("client challenge must be syntactically valid")
                 .expect("authenticated client request must carry a boot epoch challenge");
             let mut response = HttpResponse::new(());
-            response.headers_mut().extend(
-                tonic_boot_epoch_response_headers(&self.audience, challenge)
-                    .expect("test server must be able to sign an epoch proof"),
-            );
+            let mut headers = tonic_boot_epoch_response_headers(&self.audience, challenge)
+                .expect("test server must be able to sign an epoch proof");
+            if !self.include_capability {
+                headers.remove(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
+                headers.remove(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
+            }
+            response.headers_mut().extend(headers);
             std::future::ready(Ok(response))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MissingProofService;
+
+    impl Service<HttpRequest<()>> for MissingProofService {
+        type Response = HttpResponse<()>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: HttpRequest<()>) -> Self::Future {
+            std::future::ready(Ok(HttpResponse::new(())))
         }
     }
 
@@ -443,17 +551,58 @@ mod tests {
     }
 
     fn test_request() -> tonic::Request<()> {
+        test_request_for("Ping")
+    }
+
+    fn test_request_for(method: &'static str) -> tonic::Request<()> {
         let mut request = tonic::Request::new(());
         request
             .extensions_mut()
-            .insert(tonic::GrpcMethod::new("node_service.NodeService", "Ping"));
+            .insert(tonic::GrpcMethod::new("node_service.NodeService", method));
         request
     }
 
     fn test_interceptor() -> TonicSignatureInterceptor {
+        test_interceptor_for("node-a:9000", false)
+    }
+
+    fn test_interceptor_for(audience: &str, body_digest_strict: bool) -> TonicSignatureInterceptor {
         TonicSignatureInterceptor {
-            audience: Some("node-a:9000".to_string()),
+            audience: Some(audience.to_string()),
+            body_digest_strict,
         }
+    }
+
+    fn clear_peer_capability(audience: &str) {
+        PEER_REPLAY_CAPABILITIES
+            .lock()
+            .expect("peer capability cache lock must not be poisoned")
+            .remove(audience);
+    }
+
+    fn rolling_mutation_request(method: &'static str) -> tonic::Request<()> {
+        let mut request = tonic::Request::new(rustfs_protos::proto_gen::node_service::GenerallyLockRequest {
+            args: "canonical mutation request".to_string(),
+        });
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("node_service.NodeService", method));
+        crate::cluster::rpc::set_tonic_mutation_body_digest(&mut request).expect("test mutation digest must be attached");
+        request.map(|_| ())
+    }
+
+    fn replay_scope_request(audience: &str, method: &'static str) -> HttpRequest<()> {
+        let mut request = HttpRequest::builder()
+            .uri(format!("/node_service.NodeService/{method}"))
+            .body(())
+            .expect("test RPC request must build");
+        request.headers_mut().extend(
+            gen_tonic_signature_headers(audience, "node_service.NodeService", method, None).expect("v2 test headers must mint"),
+        );
+        request
+            .extensions_mut()
+            .insert(PeerReplayCapabilitySnapshot(peer_replay_capability(audience)));
+        request
     }
 
     fn with_trace_parent<F>(trace_id_hex: &str, f: F)
@@ -568,6 +717,307 @@ mod tests {
     }
 
     #[test]
+    fn unknown_peer_mutations_use_cache_free_unsigned_v2() {
+        ensure_test_rpc_secret();
+        let audience = "legacy-body-digest-client-test:9000";
+        clear_peer_capability(audience);
+        let mut interceptor = test_interceptor_for(audience, false);
+        for method in ["Lock", "WriteAll"] {
+            let request = interceptor
+                .call(rolling_mutation_request(method))
+                .expect("interceptor call should succeed");
+
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("x-rustfs-content-sha256")
+                    .and_then(|value| value.to_str().ok()),
+                Some("UNSIGNED-PAYLOAD")
+            );
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("x-rustfs-rpc-nonce")
+                    .and_then(|value| value.to_str().ok()),
+                Some("unsigned")
+            );
+            assert!(
+                crate::cluster::rpc::verify_tonic_rpc_signature(
+                    audience,
+                    &format!("/node_service.NodeService/{method}"),
+                    request.metadata().as_ref(),
+                )
+                .is_ok(),
+                "the cache-free request must retain valid audience- and method-bound v2 authentication"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_peer_exact_body_contract_remains_body_bound() {
+        ensure_test_rpc_secret();
+        let audience = "exact-body-contract-client-test:9000";
+        clear_peer_capability(audience);
+        let mut interceptor = test_interceptor_for(audience, false);
+        let mut request = test_request_for("ScannerActivity");
+        crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, b"exact scanner activity body")
+            .expect("test exact body digest must be attached");
+        let expected_digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .expect("test request must carry its digest")
+            .to_string();
+
+        let request = interceptor.call(request).expect("interceptor call should succeed");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_digest.as_str())
+        );
+        assert!(
+            crate::cluster::rpc::verify_tonic_rpc_signature(
+                audience,
+                "/node_service.NodeService/ScannerActivity",
+                request.metadata().as_ref(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn authenticated_replay_cache_capability_enables_body_binding() {
+        ensure_test_rpc_secret();
+        let audience = "body-digest-capable-client-test:9000";
+        clear_peer_capability(audience);
+        let seen_headers = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let service = EpochProofService {
+            audience: audience.to_string(),
+            include_capability: true,
+            seen_headers,
+        };
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
+            .expect("authenticated capability probe must complete");
+
+        let mut interceptor = test_interceptor_for(audience, false);
+        let request = rolling_mutation_request("Lock");
+        let expected_digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .expect("test mutation must carry its digest")
+            .to_string();
+
+        let request = interceptor.call(request).expect("interceptor call should succeed");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_digest.as_str())
+        );
+        let nonce = request
+            .metadata()
+            .get("x-rustfs-rpc-nonce")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("capable peer body-bound mutation must carry a UUID nonce");
+        assert!(!nonce.is_nil());
+        assert!(
+            crate::cluster::rpc::verify_tonic_rpc_signature(
+                audience,
+                "/node_service.NodeService/Lock",
+                request.metadata().as_ref(),
+            )
+            .is_ok(),
+            "the body-bound request must retain valid audience- and method-bound v2 authentication"
+        );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn invalid_capability_proof_does_not_enable_body_binding() {
+        ensure_test_rpc_secret();
+        let audience = "invalid-capability-client-test:9000";
+        clear_peer_capability(audience);
+        let service = EpochProofService {
+            audience: "wrong-capability-audience:9000".to_string(),
+            include_capability: true,
+            seen_headers: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
+            .expect("invalid capability response must still complete");
+
+        let mut interceptor = test_interceptor_for(audience, false);
+        let request = interceptor
+            .call(rolling_mutation_request("Lock"))
+            .expect("legacy-compatible mutation must still be signed");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some("UNSIGNED-PAYLOAD")
+        );
+    }
+
+    #[test]
+    fn legacy_boot_proof_without_capability_stays_cache_free() {
+        ensure_test_rpc_secret();
+        let audience = "legacy-boot-proof-client-test:9000";
+        clear_peer_capability(audience);
+        let service = EpochProofService {
+            audience: audience.to_string(),
+            include_capability: false,
+            seen_headers: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
+            .expect("legacy boot proof response must complete");
+
+        assert_eq!(peer_replay_capability(audience), None);
+    }
+
+    #[test]
+    fn reordered_capability_responses_cannot_undo_newer_state() {
+        let audience = "reordered-capability-client-test:9000";
+        let epoch_one = Uuid::new_v4();
+        let epoch_two = Uuid::new_v4();
+        clear_peer_capability(audience);
+
+        apply_peer_replay_capability_response(audience.to_string(), None, Ok(epoch_one));
+        apply_peer_replay_capability_response(audience.to_string(), None, Err(std::io::Error::other("delayed legacy response")));
+        assert_eq!(
+            peer_replay_capability(audience),
+            Some(PeerReplayCapability::Capable { boot_epoch: epoch_one })
+        );
+
+        let sent_epoch_one = Some(PeerReplayCapability::Capable { boot_epoch: epoch_one });
+        apply_peer_replay_capability_response(
+            audience.to_string(),
+            sent_epoch_one,
+            Err(std::io::Error::other("rollback response")),
+        );
+        apply_peer_replay_capability_response(audience.to_string(), sent_epoch_one, Ok(epoch_one));
+        assert_eq!(peer_replay_capability(audience), Some(PeerReplayCapability::Revoked));
+
+        apply_peer_replay_capability_response(audience.to_string(), Some(PeerReplayCapability::Revoked), Ok(epoch_one));
+        apply_peer_replay_capability_response(audience.to_string(), sent_epoch_one, Ok(epoch_two));
+        apply_peer_replay_capability_response(audience.to_string(), sent_epoch_one, Ok(epoch_one));
+        assert_eq!(
+            peer_replay_capability(audience),
+            Some(PeerReplayCapability::Capable { boot_epoch: epoch_two })
+        );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn interceptor_snapshot_prevents_delayed_legacy_response_from_revoking_capability() {
+        ensure_test_rpc_secret();
+        let audience = "capability-snapshot-client-test:9000";
+        clear_peer_capability(audience);
+        let boot_epoch = Uuid::new_v4();
+        let mut interceptor = test_interceptor_for(audience, false);
+        let request = interceptor
+            .call(rolling_mutation_request("Lock"))
+            .expect("legacy-compatible request must pass the interceptor");
+        assert_eq!(
+            request
+                .extensions()
+                .get::<PeerReplayCapabilitySnapshot>()
+                .map(|snapshot| snapshot.0),
+            Some(None),
+            "interceptor must preserve its unknown-state admission snapshot"
+        );
+
+        PEER_REPLAY_CAPABILITIES
+            .lock()
+            .expect("peer capability cache lock must not be poisoned")
+            .insert(audience.to_string(), PeerReplayCapability::Capable { boot_epoch });
+        let (metadata, extensions, body) = request.into_parts();
+        let mut request = HttpRequest::new(body);
+        *request.uri_mut() = "/node_service.NodeService/Lock".parse().expect("test RPC URI must parse");
+        *request.headers_mut() = metadata.into_headers();
+        *request.extensions_mut() = extensions;
+        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()));
+
+        futures::executor::block_on(channel.call(request)).expect("in-flight request response must complete");
+
+        assert_eq!(peer_replay_capability(audience), Some(PeerReplayCapability::Capable { boot_epoch }));
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn strict_mode_keeps_unknown_peer_mutations_body_bound() {
+        ensure_test_rpc_secret();
+        let audience = "strict-body-digest-client-test:9000";
+        clear_peer_capability(audience);
+        let mut interceptor = test_interceptor_for(audience, true);
+        let request = rolling_mutation_request("WriteAll");
+        let expected_digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .expect("test mutation must carry its digest")
+            .to_string();
+
+        let request = interceptor.call(request).expect("interceptor call should succeed");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_digest.as_str())
+        );
+        let nonce = request
+            .metadata()
+            .get("x-rustfs-rpc-nonce")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("strict body-bound mutation must carry a UUID nonce");
+        assert!(!nonce.is_nil());
+        assert!(
+            crate::cluster::rpc::verify_tonic_rpc_signature(
+                audience,
+                "/node_service.NodeService/WriteAll",
+                request.metadata().as_ref(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_capability_after_pin_fails_closed() {
+        ensure_test_rpc_secret();
+        let audience = "revoked-capability-client-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        PEER_REPLAY_CAPABILITIES
+            .lock()
+            .expect("peer capability cache lock must not be poisoned")
+            .insert(audience.to_string(), PeerReplayCapability::Capable { boot_epoch });
+        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()));
+        futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
+            .expect("legacy response must complete before capability rejection");
+
+        let mut interceptor = test_interceptor_for(audience, false);
+        let error = interceptor
+            .call(rolling_mutation_request("Lock"))
+            .expect_err("a peer that loses its pinned capability must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "RPC peer replay capability changed");
+        clear_peer_capability(audience);
+    }
+
+    #[test]
     fn test_signature_interceptor_binds_audience_from_peer_uri() {
         let interceptor = TonicInterceptor::Signature(gen_tonic_signature_interceptor())
             .with_rpc_audience("http://node-a:9000")
@@ -583,27 +1033,15 @@ mod tests {
     fn replay_scope_channel_uses_epoch_proof_before_sending_v3() {
         ensure_test_rpc_secret();
         let audience = "replay-scope-client-test:9000";
-        PEER_BOOT_EPOCHS
-            .lock()
-            .expect("peer epoch cache lock must not be poisoned")
-            .remove(audience);
+        clear_peer_capability(audience);
         let seen_headers = std::sync::Arc::new(Mutex::new(Vec::new()));
         let service = EpochProofService {
             audience: audience.to_string(),
+            include_capability: true,
             seen_headers: seen_headers.clone(),
         };
         let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
-        let make_request = || {
-            let mut request = HttpRequest::builder()
-                .uri("/node_service.NodeService/Ping")
-                .body(())
-                .expect("test RPC request must build");
-            request.headers_mut().extend(
-                gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
-                    .expect("v2 test headers must mint"),
-            );
-            request
-        };
+        let make_request = || replay_scope_request(audience, "Ping");
 
         futures::executor::block_on(channel.call(make_request())).expect("first request must complete");
         futures::executor::block_on(channel.call(make_request())).expect("second request must complete");
@@ -619,10 +1057,7 @@ mod tests {
             headers[1].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "the second request must carry the replay-scoped v3 signature"
         );
-        PEER_BOOT_EPOCHS
-            .lock()
-            .expect("peer epoch cache lock must not be poisoned")
-            .remove(audience);
+        clear_peer_capability(audience);
     }
 
     #[test]

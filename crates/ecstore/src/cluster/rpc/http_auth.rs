@@ -73,10 +73,14 @@ pub const RPC_REPLAY_SCOPE_NONCE_HEADER: &str = "x-rustfs-rpc-replay-nonce";
 pub const RPC_BOOT_EPOCH_HEADER: &str = "x-rustfs-rpc-boot-epoch";
 pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-challenge";
 pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay-cache-capability";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_V1: &str = "dynamic-replay-cache-v1";
 const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
 const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -102,6 +106,10 @@ static INTERNODE_RPC_BODY_DIGEST_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
     )
 });
+
+pub(crate) fn internode_rpc_body_digest_strict() -> bool {
+    *INTERNODE_RPC_BODY_DIGEST_STRICT
+}
 static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
@@ -789,6 +797,50 @@ fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_e
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC boot epoch proof"))
 }
 
+fn update_replay_cache_capability_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN);
+    for part in [
+        audience.as_bytes(),
+        b"|",
+        challenge.as_bytes(),
+        b"|",
+        boot_epoch.as_bytes(),
+        b"|",
+        RPC_REPLAY_CACHE_CAPABILITY_V1.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    proof: &str,
+) -> std::io::Result<()> {
+    let proof = general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC replay cache capability proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC replay cache capability proof"))
+}
+
 fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
     let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
     (!value.is_nil())
@@ -871,15 +923,34 @@ pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option
 /// Build the authenticated response headers for a client boot-epoch challenge.
 pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
     let boot_epoch = tonic_rpc_boot_epoch();
-    let proof = generate_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch)?;
+    let secret = get_shared_secret()?;
+    let proof = generate_boot_epoch_proof(&secret, audience, challenge, boot_epoch)?;
+    let capability_proof = generate_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch)?;
     let mut headers = HeaderMap::new();
     headers.insert(RPC_BOOT_EPOCH_HEADER, header_value(&boot_epoch.to_string(), RPC_BOOT_EPOCH_HEADER)?);
     headers.insert(RPC_BOOT_EPOCH_PROOF_HEADER, header_value(&proof, RPC_BOOT_EPOCH_PROOF_HEADER)?);
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_HEADER,
+        HeaderValue::from_static(RPC_REPLAY_CACHE_CAPABILITY_V1),
+    );
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+        header_value(&capability_proof, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)?,
+    );
     Ok(headers)
 }
 
 /// Verify the server boot-epoch response for a challenge generated by this client.
 pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers: &HeaderMap) -> std::io::Result<Uuid> {
+    verify_tonic_boot_epoch_response_with_secret(&get_shared_secret()?, audience, challenge, headers)
+}
+
+fn verify_tonic_boot_epoch_response_with_secret(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<Uuid> {
     let boot_epoch = headers
         .get(RPC_BOOT_EPOCH_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -889,7 +960,29 @@ pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers
         .get(RPC_BOOT_EPOCH_PROOF_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch proof"))?;
-    verify_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch, proof)?;
+    verify_boot_epoch_proof(secret, audience, challenge, boot_epoch, proof)?;
+    Ok(boot_epoch)
+}
+
+pub(crate) fn verify_tonic_replay_cache_capability_response(
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<Uuid> {
+    let secret = get_shared_secret()?;
+    let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
+    let capability = headers
+        .get(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability"))?;
+    if capability != RPC_REPLAY_CACHE_CAPABILITY_V1 {
+        return Err(std::io::Error::other("Unsupported RPC replay cache capability"));
+    }
+    let proof = headers
+        .get(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability proof"))?;
+    verify_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch, proof)?;
     Ok(boot_epoch)
 }
 
@@ -1100,8 +1193,17 @@ pub fn set_tonic_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
         .get_ref()
         .canonical_body()
         .map_err(|_| std::io::Error::other("RPC mutation body length cannot be represented"))?;
-    set_tonic_canonical_body_digest(request, &canonical_body)
+    set_tonic_rolling_mutation_body_digest(request, &canonical_body)
 }
+
+pub fn set_tonic_rolling_mutation_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    set_tonic_canonical_body_digest(request, canonical_body)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RollingMutationBodyDigest;
 
 pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     let version = request
@@ -1139,7 +1241,7 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
 /// including v1-downgraded ones. It converges independently of the signature-strict switch
 /// (<https://github.com/rustfs/backlog/issues/1327>).
 pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
-    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, *INTERNODE_RPC_BODY_DIGEST_STRICT)
+    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, internode_rpc_body_digest_strict())
 }
 
 /// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
@@ -2190,6 +2292,22 @@ mod tests {
         assert_eq!(epoch, tonic_rpc_boot_epoch());
         assert!(verify_tonic_boot_epoch_response("node-b:9000", challenge, &headers).is_err());
         assert!(verify_tonic_boot_epoch_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+    }
+
+    #[test]
+    fn replay_cache_capability_proof_binds_audience_challenge_epoch_and_value() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("capability headers should build");
+        let epoch = verify_tonic_replay_cache_capability_response("node-a:9000", challenge, &headers)
+            .expect("matching capability proof should verify");
+        assert_eq!(epoch, tonic_rpc_boot_epoch());
+        assert!(verify_tonic_replay_cache_capability_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_replay_cache_capability_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+
+        let mut changed_capability = headers;
+        changed_capability.insert(RPC_REPLAY_CACHE_CAPABILITY_HEADER, HeaderValue::from_static("dynamic-replay-cache-v2"));
+        assert!(verify_tonic_replay_cache_capability_response("node-a:9000", challenge, &changed_capability).is_err());
     }
 
     #[test]
