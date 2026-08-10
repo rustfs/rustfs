@@ -42,6 +42,7 @@ use crate::server::{
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::HeaderValue;
@@ -2077,9 +2078,14 @@ struct ReplicationProbePutOutcome {
 #[async_trait::async_trait]
 trait ReplicationProbeOperations {
     async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
+    /// Multipart decides the target version at initiate time and only reports
+    /// it on completion, so the identity contract has to be probed separately
+    /// there: a target can adopt PutObject version ids and still mint its own
+    /// for CreateMultipartUpload.
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
     async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String>;
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String>;
 }
 
 struct RemoteReplicationProbeOperations<'a> {
@@ -2093,6 +2099,10 @@ struct RemoteReplicationProbeOperations<'a> {
 impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
     async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
         put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+        multipart_put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
@@ -2118,13 +2128,27 @@ impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
         .map(|_| ())
     }
 
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String> {
         cleanup_replication_probe(self.client, self.bucket, self.key, known_version_ids).await
     }
 }
 
+/// `None` when the target adopted the source version id on this path.
+fn version_fidelity_error(api: &str, outcome: &ReplicationProbePutOutcome) -> Option<String> {
+    if outcome.response_version_id.as_deref() == Some(outcome.sent_version_id.as_str()) {
+        return None;
+    }
+    Some(format!(
+        "target assigned version id {} instead of adopting the source version id {} on {api}; \
+         version-addressed replication (version deletes, heal) cannot converge on this target",
+        outcome.response_version_id.as_deref().unwrap_or("<none>"),
+        outcome.sent_version_id,
+    ))
+}
+
 async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, operations: &mut impl ReplicationProbeOperations) {
     let mut probe_version_id = None;
+    let mut multipart_probe_version_id = None;
     let mut delete_marker_version_id = None;
     let mut cleanup_required = true;
 
@@ -2137,18 +2161,13 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
             // from the probe PUT's own response; on mismatch the later
             // mutation phases are pointless (they address by version id), but
             // cleanup still runs against whatever id the target assigned.
-            if outcome.response_version_id.as_deref() == Some(outcome.sent_version_id.as_str()) {
-                result.phases.version_fidelity = ReplicationCheckPhaseStatus::passed();
-            } else {
-                let error = format!(
-                    "target assigned version id {} instead of adopting the source version id {}; \
-                     version-addressed replication (version deletes, heal) cannot converge on this target",
-                    outcome.response_version_id.as_deref().unwrap_or("<none>"),
-                    outcome.sent_version_id,
-                );
-                result.phases.version_fidelity =
-                    ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
-                fail_replication_check_target(result, error);
+            match version_fidelity_error("PutObject", &outcome) {
+                None => result.phases.version_fidelity = ReplicationCheckPhaseStatus::passed(),
+                Some(error) => {
+                    result.phases.version_fidelity =
+                        ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
+                    fail_replication_check_target(result, error);
+                }
             }
             probe_version_id = outcome.response_version_id;
         }
@@ -2159,6 +2178,27 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
             // The conditional PUT cannot have created an artifact when the
             // target reports a collision with a concurrently-created key.
             cleanup_required = err.code.as_deref() != Some("PreconditionFailed");
+        }
+    }
+
+    // The multipart path fixes the target version at initiate and only
+    // reports it on completion, so a target can adopt PutObject ids and still
+    // mint its own here — probe it before declaring the contract met.
+    if result.phases.version_fidelity.status == "OK" {
+        match operations.multipart_put().await {
+            Ok(outcome) => {
+                multipart_probe_version_id = outcome.response_version_id.clone();
+                if let Some(error) = version_fidelity_error("CreateMultipartUpload", &outcome) {
+                    result.phases.version_fidelity =
+                        ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
+                    fail_replication_check_target(result, error);
+                }
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+                result.phases.version_fidelity = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+            }
         }
     }
 
@@ -2187,7 +2227,11 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
 
     if cleanup_required {
         match operations
-            .cleanup([probe_version_id.as_deref(), delete_marker_version_id.as_deref()])
+            .cleanup([
+                probe_version_id.as_deref(),
+                multipart_probe_version_id.as_deref(),
+                delete_marker_version_id.as_deref(),
+            ])
             .await
         {
             Ok(()) => result.phases.cleanup = ReplicationCheckPhaseStatus::passed(),
@@ -2272,14 +2316,7 @@ fn build_replication_probe_remove_options(now: OffsetDateTime, replication_delet
     }
 }
 
-async fn put_replication_probe_object(
-    target_client: &TargetClient,
-    target_bucket: &str,
-    probe_key: &str,
-    now: OffsetDateTime,
-) -> Result<ReplicationProbePutOutcome, S3ClientError> {
-    let options = build_replication_probe_put_options(now);
-    let sent_version_id = options.internal.source_version_id.clone();
+fn build_replication_probe_headers(options: &PutObjectOptions) -> HeaderMap {
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
     insert_header(
@@ -2293,6 +2330,101 @@ async fn put_replication_probe_object(
         HeaderName::from_static("x-amz-replication-status"),
         HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
     );
+    headers
+}
+
+/// Probe the identity contract on the multipart path: initiate carrying the
+/// source version as `?versionId=` (where the target fixes the version),
+/// upload one small part, and read the version the completion reports.
+async fn multipart_put_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let headers = build_replication_probe_headers(&options);
+
+    let initiate_headers = headers.clone();
+    let initiate_version_id = sent_version_id.clone();
+    let created = target_client
+        .client
+        .create_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in initiate_headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            let uri = append_version_id_query(req.uri(), &initiate_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map_err(S3ClientError::from)?;
+    let upload_id = created
+        .upload_id()
+        .ok_or_else(|| S3ClientError::new("target multipart initiate returned no upload id"))?
+        .to_string();
+
+    let uploaded = target_client
+        .client
+        .upload_part()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .send()
+        .await
+        .map_err(S3ClientError::from)?;
+
+    let completed_part = CompletedPart::builder()
+        .part_number(1)
+        .set_e_tag(uploaded.e_tag().map(ToOwned::to_owned))
+        .build();
+    let complete_headers = headers.clone();
+    let completed = target_client
+        .client
+        .complete_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![completed_part]))
+                .build(),
+        )
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in complete_headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map_err(S3ClientError::from)?;
+
+    Ok(ReplicationProbePutOutcome {
+        sent_version_id,
+        response_version_id: completed.version_id().map(ToOwned::to_owned),
+    })
+}
+
+async fn put_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let headers = build_replication_probe_headers(&options);
 
     // Carry the source version as `?versionId=` exactly like a live
     // replication PUT (P0-5 shape): the probe must exercise the query the
@@ -3494,6 +3626,9 @@ mod tests {
         /// Version id the scripted target answers with on PUT; None models a
         /// mirroring target that echoes the sent source version id.
         minted_version_id: Option<&'static str>,
+        /// Same, for the multipart leg: a target may mirror PutObject ids and
+        /// still mint its own at CreateMultipartUpload.
+        minted_multipart_version_id: Option<&'static str>,
         delete_marker_error: Option<&'static str>,
         version_delete_error: Option<&'static str>,
         cleanup_error: Option<&'static str>,
@@ -3523,6 +3658,14 @@ mod tests {
             }
         }
 
+        async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+            self.calls.push("multipart-put");
+            Ok(ReplicationProbePutOutcome {
+                sent_version_id: "multipart-version".to_string(),
+                response_version_id: Some(self.minted_multipart_version_id.unwrap_or("multipart-version").to_string()),
+            })
+        }
+
         async fn create_delete_marker(&mut self, _version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
             self.calls.push("delete-marker");
             match self.delete_marker_error {
@@ -3539,7 +3682,7 @@ mod tests {
             }
         }
 
-        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String> {
             self.calls.push("cleanup");
             self.cleanup_ids = known_version_ids
                 .into_iter()
@@ -3575,7 +3718,7 @@ mod tests {
         assert_eq!(result.phases.delete_marker.status, "SKIPPED");
         assert_eq!(result.phases.version_delete.status, "SKIPPED");
         assert_eq!(result.phases.cleanup.status, "OK");
-        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None]);
+        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None, None]);
     }
 
     #[tokio::test]
@@ -3618,8 +3761,15 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
-        assert_eq!(operations.cleanup_ids, [Some("object-version".to_string()), None]);
+        assert_eq!(operations.calls, ["put", "multipart-put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.cleanup_ids,
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                None
+            ]
+        );
         assert_eq!(result.phases.delete_marker.status, "FAILED");
         assert_eq!(result.phases.version_delete.status, "OK");
         assert_eq!(result.phases.cleanup.status, "OK");
@@ -3636,10 +3786,14 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(operations.calls, ["put", "multipart-put", "delete-marker", "version-delete", "cleanup"]);
         assert_eq!(
             operations.cleanup_ids,
-            [Some("object-version".to_string()), Some("marker-version".to_string())]
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                Some("marker-version".to_string())
+            ]
         );
         assert_eq!(result.phases.version_delete.status, "FAILED");
         assert_eq!(result.phases.cleanup.status, "FAILED");

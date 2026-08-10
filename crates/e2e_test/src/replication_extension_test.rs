@@ -7492,6 +7492,83 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     Ok(())
 }
 
+/// P1-19 review follow-up: multipart fixes the target version at initiate
+/// and only reports it on completion, so a target can adopt PutObject
+/// version ids and still mint its own there — the check must not report OK
+/// while multipart deletes and heals would silently miss.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_multipart_only_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-fidelity-dst";
+    target.create_bucket(target_bucket);
+    // PutObject mirrors the source version id; CreateMultipartUpload does not.
+    target.assign_own_multipart_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(payload["Status"], "FAILED", "multipart drift must fail the check: {payload}");
+    let target_report = &payload["Targets"][0];
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "{payload}");
+    assert_eq!(fidelity["Code"], "BucketRemoteTargetVersionMismatch", "{payload}");
+    assert!(
+        fidelity["Error"]
+            .as_str()
+            .is_some_and(|error| error.contains("CreateMultipartUpload")),
+        "the failure must name the multipart path: {payload}"
+    );
+    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    let probe_key = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .and_then(|record| record.key)
+        .ok_or("the probe PUT never reached the fake target")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "both probe versions must be cleaned up on the mismatching target"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
 /// P1-19 (backlog#1675): the supported replication contract is targets that
 /// adopt the source version id (RustFS/MinIO semantics). A target that mints
 /// its own version ids silently breaks every version-addressed operation that

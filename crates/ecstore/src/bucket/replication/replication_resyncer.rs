@@ -3536,15 +3536,27 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
     let actual_size = replication_multipart_complete_actual_size(&object_info.user_defined);
 
-    cli.complete_multipart_upload(
-        dst_bucket,
-        object,
-        &upload_id,
-        uploaded_parts,
-        &replication_complete_multipart_options(actual_size, object_info.etag.clone().unwrap_or_default(), object_info.mod_time),
-    )
-    .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let completed = cli
+        .complete_multipart_upload(
+            dst_bucket,
+            object,
+            &upload_id,
+            uploaded_parts,
+            &replication_complete_multipart_options(
+                actual_size,
+                object_info.etag.clone().unwrap_or_default(),
+                object_info.mod_time,
+            ),
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Multipart decides the target version at initiate time and only reveals
+    // it on completion, so this is where the identity contract is observable
+    // for this path. A target can mirror PutObject version ids and still mint
+    // its own here, which would leave multipart deletes and heals addressing
+    // a version that never existed.
+    audit_target_version_identity(&cli, &put_opts.internal.source_version_id, completed.version_id());
 
     Ok(())
 }
