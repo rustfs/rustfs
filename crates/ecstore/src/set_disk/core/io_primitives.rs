@@ -538,7 +538,7 @@ impl MetadataQuorumAccumulator {
     }
 
     pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
-        if self.default_parity_count == 0 {
+        if self.default_parity_count == 0 || self.default_parity_count >= self.total_disks {
             return self.total_disks;
         }
         let data_blocks = self.total_disks.saturating_sub(self.default_parity_count);
@@ -550,7 +550,7 @@ impl MetadataQuorumAccumulator {
     }
 
     pub(in crate::set_disk) fn missing_response_quorum(&self) -> usize {
-        if self.default_parity_count == 0 {
+        if self.default_parity_count == 0 || self.default_parity_count >= self.total_disks {
             self.total_disks
         } else {
             self.total_disks / 2
@@ -5376,7 +5376,7 @@ mod tests {
         temp_env::async_with_vars(
             [
                 ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("false")),
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
@@ -5389,7 +5389,7 @@ mod tests {
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "control path should keep the default data-read full fanout"
+                    "control path should keep full fanout when data-read early stop is explicitly disabled"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
             },
@@ -5426,6 +5426,42 @@ mod tests {
                 );
                 assert_eq!(diagnostics.total_responses(), 3);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == treatment_object).count(), 3);
+                assert!(errs.iter().all(Option::is_none));
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test]
+    async fn bounded_metadata_early_stop_defaults_keep_data_get_full_fanout() {
+        const DISKS: usize = 4;
+        let bucket = "bounded-data-get-default-bucket";
+        let object = "bounded-data-get-default-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
+            ],
+            async {
+                let calls = disk_call_counters::observe(object);
+                let (parts_metadata, errs, diagnostics) =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2)
+                        .await
+                        .expect("default data-read metadata should resolve");
+
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    DISKS as u64,
+                    "default GET data-read metadata must keep full fanout for read-failure tolerance"
+                );
+                assert_eq!(diagnostics.total_responses(), DISKS);
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
                 assert!(errs.iter().all(Option::is_none));
             },
         )
@@ -6007,6 +6043,16 @@ mod tests {
         let mut impossible_parity = candidate;
         impossible_parity.erasure.parity_blocks = 4;
         assert_eq!(accumulator.candidate_latest_quorum(&impossible_parity), None);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_treats_invalid_default_parity_as_full_fanout() {
+        let accumulator = MetadataQuorumAccumulator::new(2, 2, true);
+
+        assert_eq!(accumulator.default_write_quorum(), 2);
+        assert_eq!(accumulator.missing_response_quorum(), 2);
+        assert!(accumulator.can_still_reach_early_stop_with_pending(2));
+        assert!(!accumulator.can_still_reach_early_stop_with_pending(1));
     }
 
     #[test]
