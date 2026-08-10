@@ -36,6 +36,11 @@ pub const ENV_TRUST_SYSTEM_CA: &str = "RUSTFS_TRUST_SYSTEM_CA";
 /// To change this behavior, set the environment variable RUSTFS_TRUST_SYSTEM_CA=1
 pub const DEFAULT_TRUST_SYSTEM_CA: bool = false;
 
+/// Environment variable for an extra outbound root CA certificate bundle.
+/// Use this to trust an internal CA for outbound HTTPS clients without replacing
+/// the default operating-system/web PKI roots via SSL_CERT_FILE.
+pub const ENV_RUSTFS_EXTRA_CA_CERT: &str = "RUSTFS_EXTRA_CA_CERT";
+
 /// Environment variable to trust leaf certificates as CA
 /// When set to "1", RustFS will treat leaf certificates as CA certificates for trust validation.
 /// By default, this is disabled.

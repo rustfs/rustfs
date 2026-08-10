@@ -107,7 +107,10 @@ url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
+rcgen.workspace = true
 rustfs-test-utils = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls-pki-types.workspace = true
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
