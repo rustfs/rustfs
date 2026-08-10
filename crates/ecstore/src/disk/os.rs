@@ -82,24 +82,39 @@ pub(crate) mod fsync_dir_recorder {
     use std::sync::Mutex;
 
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    pub(crate) fn record(dir: &Path) {
-        let mut recorded = RECORDED.lock().expect("fsync dir recorder poisoned");
-        recorded.push(dir.to_path_buf());
-        if let Ok(canonical) = dir.canonicalize()
-            && canonical != dir
+    fn record_path(paths: &Mutex<Vec<PathBuf>>, path: &Path, description: &str) {
+        let mut paths = paths.lock().expect(description);
+        paths.push(path.to_path_buf());
+        if let Ok(canonical) = path.canonicalize()
+            && canonical != path
         {
-            recorded.push(canonical);
+            paths.push(canonical);
         }
     }
 
-    pub(crate) fn was_fsynced(dir: &Path) -> bool {
-        let canonical = dir.canonicalize().ok();
-        RECORDED
-            .lock()
-            .expect("fsync dir recorder poisoned")
+    fn contains_path(paths: &[PathBuf], path: &Path) -> bool {
+        let canonical = path.canonicalize().ok();
+        paths
             .iter()
-            .any(|p| p == dir || canonical.as_ref().is_some_and(|canonical| p == canonical))
+            .any(|recorded| recorded == path || canonical.as_ref().is_some_and(|canonical| recorded == canonical))
+    }
+
+    pub(crate) fn record(dir: &Path) {
+        record_path(&RECORDED, dir, "fsync dir recorder");
+    }
+
+    pub(crate) fn was_fsynced(dir: &Path) -> bool {
+        contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
+    }
+
+    pub(crate) fn record_limited(dir: &Path) {
+        record_path(&LIMITED, dir, "limited fsync dir recorder");
+    }
+
+    pub(crate) fn was_limited(dir: &Path) -> bool {
+        contains_path(&LIMITED.lock().expect("limited fsync dir recorder poisoned"), dir)
     }
 }
 
@@ -1118,6 +1133,61 @@ pub(crate) async fn run_blocking_namespace_operation<T: Send + 'static>(
     })
     .await
     .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+}
+
+/// Admit one strict inline commit under the disk sync limit. The caller already
+/// owns the namespace lease, establishing namespace -> disk ordering. Holding
+/// admission across adjacent durability barriers prevents one transaction from
+/// repeatedly joining the disk semaphore tail.
+pub(crate) struct FileSyncAdmission {
+    disk_permit: Arc<OwnedSemaphorePermit>,
+}
+
+pub(crate) async fn acquire_file_sync_admission(disk_permits: Arc<Semaphore>) -> io::Result<FileSyncAdmission> {
+    let disk_permit = disk_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| io::Error::other("disk file sync concurrency limiter closed"))?;
+    Ok(FileSyncAdmission {
+        disk_permit: Arc::new(disk_permit),
+    })
+}
+
+/// Keep the disk admission and namespace lease with the blocking syscall if
+/// the async waiter is cancelled. The process-wide admission remains with the
+/// waiter so cancellation cannot starve healthy disks.
+pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let global_permit = FILE_SYNC_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
+    let disk_permit = admission.disk_permit.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let _disk_permit = disk_permit;
+        operation()
+    })
+    .await;
+    drop(global_permit);
+    result.map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?
+}
+
+pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
+    dir: impl AsRef<Path>,
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+) -> io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    run_blocking_namespace_file_sync_operation(lease, admission, move || {
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(&dir);
+        fsync_dir_std(dir)
+    })
+    .await
 }
 
 struct RenamePreparation {
@@ -2784,6 +2854,7 @@ pub fn is_dir_not_empty_error(err: &io::Error) -> bool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
     use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -4551,6 +4622,83 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
 
         fsync_dir(temp_dir.path()).await.expect("fsync dir must succeed");
+    }
+
+    #[tokio::test]
+    async fn file_sync_admission_is_reused_across_commit_barriers() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let limiter = Arc::new(Semaphore::new(1));
+        let lease = acquire_namespace_mutation_lease(temp_dir.path()).await;
+        let admission = acquire_file_sync_admission(limiter.clone())
+            .await
+            .expect("first commit should acquire admission");
+
+        run_blocking_namespace_file_sync_operation(lease.clone(), &admission, || Ok(()))
+            .await
+            .expect("first barrier should complete under the admission");
+        let mut waiting = Box::pin(acquire_file_sync_admission(limiter));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "another commit must remain queued between durability barriers"
+        );
+        run_blocking_namespace_file_sync_operation(lease, &admission, || Ok(()))
+            .await
+            .expect("later barrier should reuse admission without requeueing");
+
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(30), waiting)
+            .await
+            .expect("queued commit should acquire admission after release")
+            .expect("queued commit should acquire admission");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
+    async fn cancelled_file_sync_waiter_keeps_disk_admission_until_blocking_work_finishes() {
+        use std::sync::mpsc;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let limiter = Arc::new(Semaphore::new(1));
+        let global_reservation = FILE_SYNC_PERMITS
+            .acquire_many((TEST_GLOBAL_FILE_SYNCS - 1) as u32)
+            .await
+            .expect("global file sync limiter should remain open");
+        let lease = acquire_namespace_mutation_lease(temp_dir.path()).await;
+        let admission = acquire_file_sync_admission(limiter.clone())
+            .await
+            .expect("file sync admission should be acquired");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            run_blocking_namespace_file_sync_operation(lease, &admission, move || {
+                entered_tx.send(()).expect("signal blocking work");
+                release_rx.recv().expect("wait for blocking work release");
+                Ok(())
+            })
+            .await
+        });
+
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("blocking work waiter should run")
+            .expect("blocking work should start");
+        waiter.abort();
+        assert!(waiter.await.expect_err("waiter should be cancelled").is_cancelled());
+        let returned_global_permit = FILE_SYNC_PERMITS
+            .try_acquire()
+            .expect("cancelled waiter must return global capacity for healthy disks");
+        assert!(
+            limiter.clone().try_acquire_owned().is_err(),
+            "cancelled waiter must not return disk capacity while blocking work is active"
+        );
+
+        release_tx.send(()).expect("release blocking work");
+        let _returned_permit = tokio::time::timeout(Duration::from_secs(30), limiter.acquire_owned())
+            .await
+            .expect("disk capacity should return after blocking work finishes")
+            .expect("disk limiter should remain open");
+        drop(returned_global_permit);
+        drop(global_reservation);
     }
 
     #[tokio::test]
