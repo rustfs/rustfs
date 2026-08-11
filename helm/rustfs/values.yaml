@@ -115,7 +115,7 @@ pools:
   #       dataStorageSize: 10Gi
 
 secret:
-  existingSecret: "hello-test"
+  existingSecret: ""
   # SECURITY: rendering fails by default unless one of the following is true:
   #   1. `secret.existingSecret` names a Kubernetes Secret you control, or
   #   2. `secret.rustfs.access_key` and `secret.rustfs.secret_key` are both
