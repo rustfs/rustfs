@@ -89,8 +89,9 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const REPLAY_CACHE_RETENTION_SECS: usize = 601;
 const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
-const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 8;
-const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 2048;
+// Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
+const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
+const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
 const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
@@ -2694,21 +2695,27 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 10_737_418);
-        assert_eq!(decision.cpu_based_capacity, 9_846_784);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.memory_based_capacity, 17_448_304);
+        assert_eq!(decision.cpu_based_capacity, 19_693_568);
+        assert_eq!(decision.capacity, 17_448_304);
     }
 
     #[test]
-    fn replay_cache_capacity_auto_uses_resource_model_on_larger_nodes() {
+    fn replay_cache_capacity_auto_uses_32m_on_field_sized_nodes() {
         let gib = 1024_u64 * 1024 * 1024;
         let decision =
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 21_474_836);
-        assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 19_693_568);
+        assert_eq!(decision.memory_based_capacity, 34_896_609);
+        assert_eq!(decision.cpu_based_capacity, 39_387_136);
+        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
+
+        let observed_field_node =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
+        assert_eq!(observed_field_node.memory_based_capacity, 33_806_090);
+        assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
+        assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
 
     #[test]
@@ -2740,7 +2747,7 @@ mod tests {
         let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.capacity, 19_693_568);
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
