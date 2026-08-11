@@ -2742,7 +2742,7 @@ async fn object_table_catalog_store_rejects_duplicate_warehouse_prefix() {
 
     assert!(matches!(
         error,
-        TableCatalogStoreError::Conflict(message) if message.contains("warehouse location is already registered")
+        TableCatalogStoreError::Conflict(message) if message.contains("warehouse location overlaps an active table")
     ));
 }
 
@@ -8497,7 +8497,7 @@ async fn strong_catalog_backing_rejects_duplicate_snapshot_warehouse_index_entri
         .await
         .expect_err("duplicate warehouse prefix should fail snapshot hydration");
 
-    assert_matches!(err, TableCatalogStoreError::Invalid(message) if message.contains("duplicate active table warehouse location"));
+    assert_matches!(err, TableCatalogStoreError::Invalid(message) if message.contains("overlapping active table warehouse location"));
 }
 
 #[tokio::test]

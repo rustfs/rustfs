@@ -409,6 +409,8 @@ fn table_pointer_write_handlers_install_commit_publication_guard() {
     let src = table_catalog_handler_source();
     for handler in [
         "RestRegisterTableHandler",
+        "RestCommitTableHandler",
+        "UpdateTableMetadataLocationHandler",
         "ImportTableCatalogHandler",
         "PutTableRefHandler",
         "DeleteTableRefHandler",
@@ -1969,9 +1971,16 @@ async fn create_table_response_recreates_dropped_identifier_without_overwriting_
         ]
     }))
     .expect("standard commit request should parse");
-    standard_commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("first table metadata commit should succeed");
+    standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("first table metadata commit should succeed");
     let first_committed_entry = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -2203,9 +2212,16 @@ async fn standard_commit_applies_updates_and_writes_next_metadata() {
     }))
     .expect("standard commit table request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("standard commit should succeed");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("standard commit should succeed");
 
     let metadata_file_prefix =
         "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
@@ -2260,9 +2276,16 @@ async fn standard_commit_uses_client_uuid_commit_id_in_metadata_file_name() {
         ]
     }))
     .expect("standard commit table request should parse");
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("standard commit should succeed");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("standard commit should succeed");
 
     assert_eq!(commit.commit_id, commit_id);
     assert_eq!(
@@ -2301,9 +2324,16 @@ async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_m
         ]
     }))
     .expect("standard commit table request should parse");
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("standard commit should succeed");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("standard commit should succeed");
 
     let metadata_file_prefix =
         "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
@@ -2335,9 +2365,16 @@ async fn commit_publication_uses_idempotency_key_as_retry_identity() {
     }))
     .expect("standard commit request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", request)
-        .await
-        .expect("standard commit should succeed");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect("standard commit should succeed");
 
     assert_eq!(commit.commit_id, idempotency_key);
     assert!(commit.metadata_location.contains(&idempotency_key));
@@ -2365,7 +2402,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         });
         let first = standard_commit_table_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -2400,7 +2437,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
         let second = standard_commit_table_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -2425,7 +2462,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
 
         let replay = standard_commit_table_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -2451,7 +2488,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         mutated_request["updates"][0]["updates"]["owner"] = serde_json::Value::String("mutated".to_string());
         let error = standard_commit_table_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -3477,9 +3514,16 @@ async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
         ]
     }))
     .expect("standard commit table request should parse");
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("standard commit should not collide with generation-only orphan");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("standard commit should not collide with generation-only orphan");
 
     assert_eq!(
         commit.metadata_location,
@@ -3528,9 +3572,11 @@ async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointe
     }))
     .expect("second standard commit table request should parse");
 
+    let first_backend = trusted_table_commit_backend(&metadata_backend);
+    let second_backend = trusted_table_commit_backend(&metadata_backend);
     let (first, second) = tokio::join!(
-        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_request),
-        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_request)
+        commit_table_response(&store, &first_backend, "warehouse", &namespace, "events", first_request),
+        commit_table_response(&store, &second_backend, "warehouse", &namespace, "events", second_request)
     );
     let success_count = [first.is_ok(), second.is_ok()].into_iter().filter(|ok| *ok).count();
 
@@ -3609,9 +3655,16 @@ async fn standard_commit_accepts_legacy_catalog_uuid_when_current_metadata_match
         ]
     }))
     .expect("standard commit table request should parse");
-    let committed = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
-        .await
-        .expect("legacy catalog uuid should not block standard commit");
+    let committed = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        commit_request,
+    )
+    .await
+    .expect("legacy catalog uuid should not block standard commit");
 
     assert_eq!(committed.metadata["table-uuid"], "metadata-table-uuid");
     assert_eq!(committed.metadata["properties"]["owner"], "lakehouse");
@@ -3667,7 +3720,7 @@ async fn metadata_location_api_accepts_legacy_catalog_uuid_when_target_matches_c
 
     let updated = update_table_metadata_location_response(
         &store,
-        &metadata_backend,
+        &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &namespace,
         "events",
@@ -4877,9 +4930,16 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append commit should succeed");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append commit should succeed");
 
     let overwrite_manifest_list = format!("{table_location}/metadata/snap-11.avro");
     let replacement_data_file = format!("{table_location}/data/part-11.parquet");
@@ -4924,9 +4984,16 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
     let stale_overwrite_request: RestCommitTableRequest =
         serde_json::from_value(overwrite_request_json.clone()).expect("stale overwrite request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", stale_overwrite_request)
-        .await
-        .expect_err("deleted file sequence must not change");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        stale_overwrite_request,
+    )
+    .await
+    .expect_err("deleted file sequence must not change");
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
 
     seed_test_snapshot_manifest(
@@ -4941,9 +5008,16 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
     let overwrite_request: RestCommitTableRequest =
         serde_json::from_value(overwrite_request_json).expect("overwrite request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
-        .await
-        .expect("overwrite commit should pass manifest conflict validation");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        overwrite_request,
+    )
+    .await
+    .expect("overwrite commit should pass manifest conflict validation");
 
     assert_eq!(commit.metadata["current-snapshot-id"], 11);
     assert_eq!(commit.metadata["last-sequence-number"], 2);
@@ -4987,9 +5061,16 @@ async fn row_level_conflict_allows_v1_manifest_snapshot() {
     }))
     .expect("append request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("v1 manifests snapshot should commit");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("v1 manifests snapshot should commit");
 
     assert_eq!(commit.metadata["current-snapshot-id"], 10);
     assert_eq!(commit.metadata["last-sequence-number"], 1);
@@ -5037,9 +5118,16 @@ async fn row_level_conflict_allows_v1_manifest_snapshot() {
     }))
     .expect("second append request should parse");
 
-    let upgraded = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
-        .await
-        .expect("manifest-list snapshot should inherit a legacy manifest with unknown provenance");
+    let upgraded = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        second_append,
+    )
+    .await
+    .expect("manifest-list snapshot should inherit a legacy manifest with unknown provenance");
 
     assert_eq!(upgraded.metadata["current-snapshot-id"], 11);
     assert_eq!(upgraded.metadata["last-sequence-number"], 2);
@@ -5083,9 +5171,16 @@ async fn row_level_conflict_inherits_manifest_list_sequence_numbers() {
     }))
     .expect("append request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("manifest entry should inherit sequence numbers from manifest list");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("manifest entry should inherit sequence numbers from manifest list");
 
     assert_eq!(commit.metadata["current-snapshot-id"], 10);
     assert_eq!(commit.metadata["last-sequence-number"], 1);
@@ -5128,9 +5223,16 @@ async fn row_level_conflict_allows_inherited_manifests_on_append() {
         ]
     }))
     .expect("first append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_append)
-        .await
-        .expect("first append should commit");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        first_append,
+    )
+    .await
+    .expect("first append should commit");
 
     let second_manifest_list = format!("{table_location}/metadata/snap-11.avro");
     let second_manifest = format!("{table_location}/metadata/manifest-11.avro");
@@ -5175,9 +5277,16 @@ async fn row_level_conflict_allows_inherited_manifests_on_append() {
     }))
     .expect("second append request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
-        .await
-        .expect("append should preserve inherited manifests");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        second_append,
+    )
+    .await
+    .expect("append should preserve inherited manifests");
 
     assert_eq!(commit.metadata["current-snapshot-id"], 11);
     assert_eq!(commit.metadata["last-sequence-number"], 2);
@@ -5220,9 +5329,16 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
         ]
     }))
     .expect("first append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_append)
-        .await
-        .expect("first append should commit");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        first_append,
+    )
+    .await
+    .expect("first append should commit");
     let current = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -5256,9 +5372,16 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     }))
     .expect("second append request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
-        .await
-        .expect_err("inherited manifest identity must not change");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        second_append,
+    )
+    .await
+    .expect_err("inherited manifest identity must not change");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5308,9 +5431,16 @@ async fn row_level_conflict_rejects_stale_new_manifest_sequence() {
     }))
     .expect("append request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect_err("new manifest sequence must match the committed snapshot");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect_err("new manifest sequence must match the committed snapshot");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5360,9 +5490,16 @@ async fn row_level_conflict_rejects_stale_added_entry_sequence() {
     }))
     .expect("append request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect_err("added file sequence must match the new manifest");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect_err("added file sequence must match the new manifest");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5412,9 +5549,16 @@ async fn row_level_conflict_rejects_historical_change_in_new_manifest() {
     }))
     .expect("append request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect_err("new manifest must not claim a historical changed entry");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect_err("new manifest must not claim a historical changed entry");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5470,9 +5614,16 @@ async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append commit should succeed");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append commit should succeed");
 
     let overwrite_manifest_list = format!("{table_location}/metadata/snap-11.avro");
     let added_data_file = format!("{table_location}/data/part-11.parquet");
@@ -5516,9 +5667,16 @@ async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
     }))
     .expect("overwrite request should parse");
 
-    let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
-        .await
-        .expect("add-only overwrite should pass conflict validation");
+    let commit = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        overwrite_request,
+    )
+    .await
+    .expect("add-only overwrite should pass conflict validation");
 
     assert_eq!(commit.metadata["current-snapshot-id"], 11);
     assert_eq!(commit.metadata["last-sequence-number"], 2);
@@ -5567,9 +5725,16 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append commit should succeed");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append commit should succeed");
     let committed = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -5614,9 +5779,16 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
     }))
     .expect("overwrite request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
-        .await
-        .expect_err("stale row-level delete should conflict");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        overwrite_request,
+    )
+    .await
+    .expect_err("stale row-level delete should conflict");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
     let unchanged = store
@@ -5664,9 +5836,16 @@ async fn row_level_conflict_rejects_append_with_delete_files() {
     }))
     .expect("append request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect_err("append must not add delete files");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect_err("append must not add delete files");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5722,9 +5901,16 @@ async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append commit should succeed");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append commit should succeed");
     let committed = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -5756,9 +5942,16 @@ async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
     }))
     .expect("overwrite request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
-        .await
-        .expect_err("missing manifest-list should fail before pointer update");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        overwrite_request,
+    )
+    .await
+    .expect_err("missing manifest-list should fail before pointer update");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -5814,9 +6007,16 @@ async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append commit should succeed");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append commit should succeed");
     let committed = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -5848,9 +6048,16 @@ async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
     }))
     .expect("overwrite request should parse");
 
-    let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
-        .await
-        .expect_err("outside manifest-list should fail before pointer update");
+    let error = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        overwrite_request,
+    )
+    .await
+    .expect_err("outside manifest-list should fail before pointer update");
 
     assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
     let unchanged = store
@@ -6190,9 +6397,16 @@ async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
         ]
     }))
     .expect("append request should parse");
-    commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
-        .await
-        .expect("append should commit");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        append_request,
+    )
+    .await
+    .expect("append should commit");
 
     let ref_request_json = serde_json::json!({
         "snapshot-id": 10,
@@ -8018,7 +8232,7 @@ async fn table_helpers_call_catalog_store() {
     })];
     let commit = commit_table_response(
         &store,
-        &metadata_backend,
+        &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &namespace,
         "events",
@@ -8459,7 +8673,7 @@ async fn metadata_location_api_loads_and_updates_current_pointer() {
 
     let updated = update_table_metadata_location_response(
         &store,
-        &metadata_backend,
+        &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &namespace,
         "events",
@@ -8497,7 +8711,7 @@ async fn metadata_location_api_accepts_gzip_table_metadata() {
 
     let updated = update_table_metadata_location_response(
         &store,
-        &metadata_backend,
+        &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &namespace,
         "events",
@@ -8553,9 +8767,16 @@ async fn metadata_location_api_validates_snapshot_graph_before_commit() {
         idempotency_key: Some("graph-replay".to_string()),
     };
 
-    let error = update_table_metadata_location_response(&store, &metadata_backend, "warehouse", &namespace, "events", request())
-        .await
-        .expect_err("missing manifest-list must fail before pointer publication");
+    let error = update_table_metadata_location_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request(),
+    )
+    .await
+    .expect_err("missing manifest-list must fail before pointer publication");
     assert_eq!(error.message(), Some("snapshot manifest-list object is missing"));
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
@@ -8565,9 +8786,16 @@ async fn metadata_location_api_validates_snapshot_graph_before_commit() {
     assert_eq!(unchanged.metadata_location, current.metadata_location);
 
     seed_test_snapshot_manifest(&metadata_backend, "warehouse", &manifest_list, 10, 1, &[(&data_file, 0, 1, 10, 1)]).await;
-    update_table_metadata_location_response(&store, &metadata_backend, "warehouse", &namespace, "events", request())
-        .await
-        .expect("complete snapshot graph should commit");
+    update_table_metadata_location_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request(),
+    )
+    .await
+    .expect("complete snapshot graph should commit");
 }
 
 #[tokio::test]
@@ -8606,7 +8834,7 @@ async fn metadata_location_api_validates_relocated_snapshot_graph_under_target_w
 
     update_table_metadata_location_response(
         &store,
-        &metadata_backend,
+        &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &namespace,
         "events",
@@ -8682,7 +8910,7 @@ async fn metadata_location_api_rejects_invalid_target_metadata_before_commit() {
     assert!(
         update_table_metadata_location_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -8762,7 +8990,7 @@ async fn metadata_location_api_rejects_mismatched_table_uuid_before_commit() {
     assert!(
         update_table_metadata_location_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
@@ -8863,7 +9091,7 @@ async fn catalog_import_and_rollback_use_register_and_commit_paths() {
     backend.put_json(bucket, &rollback_location, rollback_metadata).await;
     let rollback = rollback_table_response(
         &store,
-        &backend,
+        &trusted_table_commit_backend(&backend),
         bucket,
         &namespace,
         "events",
@@ -9008,7 +9236,7 @@ async fn rollback_rejects_invalid_target_metadata_before_commit() {
     assert!(
         rollback_table_response(
             &store,
-            &backend,
+            &trusted_table_commit_backend(&backend),
             bucket,
             &namespace,
             "events",
@@ -9093,7 +9321,7 @@ async fn rollback_rejects_mismatched_table_uuid_before_commit() {
     assert!(
         rollback_table_response(
             &store,
-            &backend,
+            &trusted_table_commit_backend(&backend),
             bucket,
             &namespace,
             "events",
@@ -9174,7 +9402,7 @@ async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
     assert!(
         commit_table_response(
             &store,
-            &metadata_backend,
+            &trusted_table_commit_backend(&metadata_backend),
             "warehouse",
             &namespace,
             "events",
