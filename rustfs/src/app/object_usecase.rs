@@ -708,6 +708,8 @@ const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
 const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
+const MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = 512 * 1024;
+const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
@@ -761,6 +763,12 @@ fn tune_reader_stream_buffer_size(
         && response_content_length >= LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES
     {
         return selected_size.max(LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
+    }
+
+    if stream_strategy == GetObjectStreamStrategy::Standard
+        && response_content_length >= MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES
+    {
+        return selected_size.max(MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
     }
 
     selected_size
@@ -14938,7 +14946,11 @@ mod tests {
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, MI_B as i64, GetObjectStreamStrategy::Standard),
-            128 * 1024
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(256 * 1024, 2 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::LargeSequentialReadahead),

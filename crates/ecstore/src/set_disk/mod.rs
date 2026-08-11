@@ -584,10 +584,14 @@ fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
 ///
 /// **Deprecated**: Use `adaptive_duplex_buffer_size()` for object-size-aware sizing.
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
-        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
-    )
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+            rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+        )
+        .max(1)
+    })
 }
 
 /// Get adaptive duplex buffer size based on object size.
@@ -597,12 +601,15 @@ pub fn get_duplex_buffer_size() -> usize {
 fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
     const KB: usize = 1024;
     const MB: usize = 1024 * 1024;
-    match object_size {
-        0..=1_048_576 => 64 * KB,           // <= 1MB: 64KB
+    let target = match object_size {
+        0..=131_072 => 64 * KB,             // <= 128KB: 64KB
+        131_073..=1_048_576 => 512 * KB,    // <= 1MB: reduce duplex backpressure without a 1MB pipe per request
         1_048_577..=16_777_216 => MB,       // <= 16MB: 1MB
         16_777_217..=268_435_456 => 4 * MB, // <= 256MB: 4MB
         _ => 8 * MB,                        // > 256MB: 8MB
-    }
+    };
+    let object_cap = usize::try_from(object_size).ok().filter(|size| *size > 0).unwrap_or(target);
+    target.min(object_cap.max(64 * KB)).min(get_duplex_buffer_size())
 }
 
 // ============================================================================
@@ -11128,5 +11135,14 @@ mod tests {
                 "offline (None) disk slot must map to DiskNotFound in-place, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_duplex_buffer_size_raises_mid_sized_gets_without_penalizing_tiny_objects() {
+        assert_eq!(adaptive_duplex_buffer_size(64 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(128 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(256 * 1024), 256 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(1024 * 1024), 512 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(2 * 1024 * 1024), 1024 * 1024);
     }
 }
