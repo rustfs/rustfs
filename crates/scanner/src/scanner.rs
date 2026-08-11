@@ -34,7 +34,7 @@ use crate::scanner_io::{
     scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
-use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
+use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO, ScannerObjectOptions};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -1312,7 +1312,9 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let replication_active = startup_features.replication;
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
+    let runtime_guard = ScannerRuntimeGuard::new();
     tokio::spawn(async move {
+        let _runtime_guard = runtime_guard;
         let (usage_cache_is_cold, has_buckets) = initial_scanner_startup_usage_state(&storeapi_clone).await;
         let sleep_time = initial_scanner_delay_for_startup(
             scanner_start_delay().map(|duration| duration.as_secs()),
