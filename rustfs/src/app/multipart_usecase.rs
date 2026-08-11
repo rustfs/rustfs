@@ -2058,7 +2058,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn compressed_complete_records_logical_quota_usage_and_overwrite_delta() {
-        use crate::admin::storage_api::quota::BucketQuota;
+        use crate::app::storage_api::multipart_usecase::bucket::quota::BucketQuota;
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
         use crate::app::storage_api::test::data_usage::seed_bucket_usage_memory_for_test;
 
