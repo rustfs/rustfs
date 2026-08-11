@@ -151,6 +151,11 @@ const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
 const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
+/// Peer-edit fencing token, carried as query parameters so a peer that predates
+/// the fence simply ignores them (unknown query keys are dropped) and keeps the
+/// previous last-writer-wins behaviour.
+const SITE_REPLICATION_EDIT_ORIGIN_QUERY: &str = "editOrigin";
+const SITE_REPLICATION_EDIT_GENERATION_QUERY: &str = "editGeneration";
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
@@ -462,6 +467,20 @@ struct SiteReplicationState {
     retry_queue: Vec<SiteReplicationRetryEvent>,
     #[serde(default)]
     sync_state_initialized: bool,
+    /// Fencing token for peer-edit delivery, allocated inside the state
+    /// transaction (process mutex + distributed state-object lock). Two nodes
+    /// of THIS site that accept admin edits concurrently therefore get
+    /// strictly ordered generations even though the process mutex cannot
+    /// serialize them, and a delivery that stalls can be recognised as stale
+    /// by the receiving site.
+    #[serde(default)]
+    edit_generation: u64,
+    /// Per-origin high-water mark of the peer edits already applied here,
+    /// keyed by the origin site's deployment id. A delivery whose generation
+    /// is not above the mark arrived out of order and must not overwrite the
+    /// newer edit that already landed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    applied_edit_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -600,6 +619,12 @@ struct SiteReplicationRetryEvent {
     last_error: String,
     #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
     updated_at: Option<OffsetDateTime>,
+    /// Peer-edit generation whose delivery failed, when the failing send
+    /// carried one. Settling a *later* success for the same (peer, path) must
+    /// not erase a failure recorded for a NEWER generation — see
+    /// [`settle_site_replication_retry_events`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edit_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1045,6 +1070,14 @@ fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
     let mut state: SiteReplicationState = serde_json::from_slice(data)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
     state.peers = normalize_peer_map_by_identity(state.peers);
+    // A peer-edit high-water mark only fences a CURRENT peer. A site that
+    // leaves drops below two peers, which clears its own state object and
+    // restarts its generation counter at zero — a mark left over from the
+    // previous membership would then reject every edit it sends after it
+    // rejoins. Dropping departed origins on load also keeps the map bounded.
+    state
+        .applied_edit_generations
+        .retain(|origin, _| state.peers.contains_key(origin));
     if !state.sync_state_initialized {
         if state.enabled() {
             mark_unknown_peer_sync_enabled(&mut state.peers);
@@ -3901,6 +3934,7 @@ async fn persist_site_replication_repair_task(
                 .first()
                 .map(String::as_str)
                 .unwrap_or("remote-operation-failed"),
+            None,
         );
     } else {
         dequeue_site_replication_retry_events(&mut latest.retry_queue, peer, path);
@@ -5294,6 +5328,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         failed: false,
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
+        edit_generation: None,
     });
     state.pending_endpoint_refresh = Some(pending);
     Ok(())
@@ -5862,17 +5897,99 @@ fn summarize_peer_error_detail(detail: &str) -> String {
     summary
 }
 
+/// Allocate the next peer-edit generation. Called inside the state
+/// transaction, so the counter is handed out under the distributed
+/// state-object lock and two nodes of this site can never take the same one.
+fn next_peer_edit_generation(state: &mut SiteReplicationState) -> u64 {
+    state.edit_generation = state.edit_generation.saturating_add(1);
+    state.edit_generation
+}
+
+/// Build the peer-edit request path carrying the fencing token. The bare
+/// constant stays the retry-queue key: the query only fences the wire
+/// delivery, and a per-generation key would make every retry event unique.
+/// Without a local deployment id there is nothing to fence against, so the
+/// unstamped path is sent and the receiver keeps its pre-fence behaviour.
+fn peer_edit_path_with_fence(origin: Option<&str>, generation: u64) -> String {
+    let Some(origin) = origin.filter(|origin| !origin.is_empty()) else {
+        return SITE_REPLICATION_PEER_EDIT_PATH.to_string();
+    };
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair(SITE_REPLICATION_EDIT_ORIGIN_QUERY, origin)
+        .append_pair(SITE_REPLICATION_EDIT_GENERATION_QUERY, &generation.to_string())
+        .finish();
+    format!("{SITE_REPLICATION_PEER_EDIT_PATH}?{query}")
+}
+
+/// The (origin site, generation) fence an incoming peer edit carries, when the
+/// sender stamped one. An unstamped edit (older peer) has no fence and is
+/// applied as before.
+fn peer_edit_fence(queries: &HashMap<String, String>) -> Option<(String, u64)> {
+    let origin = queries
+        .get(SITE_REPLICATION_EDIT_ORIGIN_QUERY)
+        .filter(|origin| !origin.is_empty())?;
+    let generation = queries.get(SITE_REPLICATION_EDIT_GENERATION_QUERY)?.parse::<u64>().ok()?;
+    Some((origin.clone(), generation))
+}
+
+/// True when a newer edit from the same origin site already landed here. The
+/// process mutex on the sending node cannot order deliveries issued by two
+/// nodes of that site, so ordering is decided here, on the generation the
+/// sender allocated under the distributed lock.
+fn peer_edit_delivery_is_stale(state: &SiteReplicationState, origin: &str, generation: u64) -> bool {
+    state
+        .applied_edit_generations
+        .get(origin)
+        .is_some_and(|applied| *applied >= generation)
+}
+
+fn record_applied_peer_edit_generation(state: &mut SiteReplicationState, origin: &str, generation: u64) {
+    let applied = state.applied_edit_generations.entry(origin.to_string()).or_default();
+    *applied = (*applied).max(generation);
+}
+
 fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
 }
 
 fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
+    settle_site_replication_retry_events(queue, peer, path, None)
+}
+
+/// Remove the retry events for (peer, path) that `generation` is entitled to
+/// settle. A successful delivery only proves the peer reached the state the
+/// delivery carried: while it was in flight another edit can commit, fail its
+/// own delivery, and enqueue for the same (peer, path). Erasing that event
+/// would leave the peer on the older edit with no retry left, so an event
+/// stamped with a NEWER generation survives. `None` settles unconditionally —
+/// the broadcast paths that carry no generation, whose retry events live under
+/// their own paths and never collide with peer-edit deliveries.
+fn settle_site_replication_retry_events(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    generation: Option<u64>,
+) -> usize {
     let before = queue.len();
-    queue.retain(|event| !retry_event_matches(event, peer, path));
+    queue.retain(|event| {
+        if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        match (generation, event.edit_generation) {
+            (Some(settled), Some(failed)) => failed > settled,
+            _ => false,
+        }
+    });
     before.saturating_sub(queue.len())
 }
 
-fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str, error: &str) {
+fn upsert_site_replication_retry_event(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    error: &str,
+    generation: Option<u64>,
+) {
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
@@ -5880,6 +5997,9 @@ fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent
         event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
         event.last_error = detail;
         event.updated_at = Some(now);
+        // Keep the newest generation: an older delivery that fails afterwards
+        // must not lower the fence and let its own success settle the event.
+        event.edit_generation = event.edit_generation.max(generation);
         return;
     }
 
@@ -5892,6 +6012,7 @@ fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent
         failed: false,
         last_error: detail,
         updated_at: Some(now),
+        edit_generation: generation,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
         let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
@@ -5918,11 +6039,20 @@ fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
 }
 
 async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
+    enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
+}
+
+async fn enqueue_site_replication_retry_event_for_generation(
+    peer: &PeerInfo,
+    path: &str,
+    error: &S3Error,
+    generation: Option<u64>,
+) {
     let peer_owned = peer.clone();
     let path_owned = path.to_string();
     let error_text = error.to_string();
     let result = update_site_replication_state(move |state| {
-        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text);
+        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
         Ok(())
     })
     .await;
@@ -5960,18 +6090,22 @@ fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool 
 /// This is a no-op (load + no-op persist skipped) when no matching entry exists,
 /// avoiding unnecessary I/O on the common path.
 async fn dequeue_site_replication_retry_event(peer: &PeerInfo, path: &str) {
+    dequeue_site_replication_retry_event_for_generation(peer, path, None).await
+}
+
+async fn dequeue_site_replication_retry_event_for_generation(peer: &PeerInfo, path: &str, generation: Option<u64>) {
     let result = async {
         // Fast path: this sits on every successful hook broadcast, so probe
         // with a plain read first and only enter the locked RMW on a hit
         // (the transaction re-checks under the lock).
         let mut probe = load_site_replication_state().await?;
-        if dequeue_site_replication_retry_events(&mut probe.retry_queue, peer, path) == 0 {
+        if settle_site_replication_retry_events(&mut probe.retry_queue, peer, path, generation) == 0 {
             return Ok(());
         }
         let peer_owned = peer.clone();
         let path_owned = path.to_string();
         update_site_replication_state(move |state| {
-            dequeue_site_replication_retry_events(&mut state.retry_queue, &peer_owned, &path_owned);
+            settle_site_replication_retry_events(&mut state.retry_queue, &peer_owned, &path_owned, generation);
             Ok(())
         })
         .await?;
@@ -9051,18 +9185,23 @@ impl Operation for SiteReplicationEditHandler {
                 // handlers): a failed notification is recorded as a retry
                 // event and converges from the committed local state —
                 // fanning out first meant the retry event pointed at a state
-                // the local site had not saved.
+                // the local site had not saved. The generation is allocated in
+                // the same commit, i.e. under the state-object lock, so it
+                // orders this edit against one another node accepts
+                // concurrently — the process guard below cannot.
+                let edit_generation = next_peer_edit_generation(&mut state);
                 save_site_replication_state(&state).await?;
+                let edit_path = peer_edit_path_with_fence(local_deployment_id.as_deref(), edit_generation);
+                let delivery_fence = local_deployment_id.is_some().then_some(edit_generation);
 
-                // The fan-out stays UNDER the state guard: releasing it here
-                // would let a concurrent edit commit and reach a peer first
-                // while this one stalls, and the peer edit handler applies
-                // whatever arrives last (it has no generation fence), so the
-                // sites would silently diverge. The retry-event bookkeeping
-                // is what cannot run under the guard — it re-enters the state
-                // transaction (P1-15) — so deliver with the plain transport
-                // here and settle the retry queue after the guard is
-                // released, preserving both ordering and the bookkeeping.
+                // The fan-out stays UNDER the state guard so deliveries issued
+                // by THIS node keep their commit order; the generation fence
+                // above is what covers the cross-node case, where the peer
+                // rejects a delivery an older edit is still trying to make.
+                // The retry-event bookkeeping is what cannot run under the
+                // guard — it re-enters the state transaction (P1-15) — so
+                // deliver with the plain transport here and settle the retry
+                // queue after the guard is released.
                 let mut delivered: Vec<PeerInfo> = Vec::new();
                 let mut failure: Option<(PeerInfo, S3Error)> = None;
                 'fanout: for target in remote_targets {
@@ -9071,7 +9210,7 @@ impl Operation for SiteReplicationEditHandler {
                         if let Err(err) = send_peer_admin_request_with_client(
                             &transport.client,
                             &transport.connection,
-                            SITE_REPLICATION_PEER_EDIT_PATH,
+                            &edit_path,
                             &current_state.service_account_access_key,
                             &service_account_secret_key,
                             peer,
@@ -9086,11 +9225,21 @@ impl Operation for SiteReplicationEditHandler {
                 }
                 drop(state_guard.take());
 
+                // Settle only what this generation is entitled to: a newer
+                // edit that committed and failed its own delivery while this
+                // fan-out was in flight left a retry event that must survive.
                 for target in &delivered {
-                    dequeue_site_replication_retry_event(target, SITE_REPLICATION_PEER_EDIT_PATH).await;
+                    dequeue_site_replication_retry_event_for_generation(target, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence)
+                        .await;
                 }
                 if let Some((target, err)) = failure {
-                    enqueue_site_replication_retry_event(&target, SITE_REPLICATION_PEER_EDIT_PATH, &err).await;
+                    enqueue_site_replication_retry_event_for_generation(
+                        &target,
+                        SITE_REPLICATION_PEER_EDIT_PATH,
+                        &err,
+                        delivery_fence,
+                    )
+                    .await;
                     return Err(err);
                 }
             }
@@ -9131,8 +9280,24 @@ impl Operation for SRPeerEditHandler {
         let queries = query_pairs(&req.uri);
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
+        let delivery_fence = peer_edit_fence(&queries);
         let state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
+        // Ordering fence: the sending site allocates the generation under its
+        // state-object lock, so a delivery that lost the race carries a
+        // generation this site has already passed. Applying it would roll the
+        // peer back to the older edit. Ack it — the newer edit already landed,
+        // so the sender has nothing to retry.
+        if let Some((origin, generation)) = delivery_fence.as_ref()
+            && peer_edit_delivery_is_stale(&state, origin, *generation)
+        {
+            return json_response(&ReplicateEditStatus {
+                success: true,
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
+        }
         if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
             return json_response(&ReplicateEditStatus {
                 success: false,
@@ -9200,6 +9365,12 @@ impl Operation for SRPeerEditHandler {
                     acked_deployment_ids: BTreeSet::new(),
                 },
             )?;
+        }
+        // Raise the origin's high-water mark in the same commit as the edit it
+        // fences: a crash between the two would let the superseded delivery
+        // apply on the next attempt.
+        if let Some((origin, generation)) = delivery_fence.as_ref() {
+            record_applied_peer_edit_generation(&mut state, origin, *generation);
         }
         save_site_replication_state(&state).await?;
         if endpoint_refresh_requested {
@@ -11447,6 +11618,28 @@ mod tests {
                 .contains("validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;"),
             "SRPeerEditHandler must not require SiteReplicationAddAction for internal peer edits"
         );
+        // P1-15 review follow-up: the ordering fence is only worth anything if
+        // the handler both rejects a superseded delivery and raises the mark it
+        // rejects against — dropping either half silently restores
+        // last-writer-wins between two nodes of the sending site.
+        assert!(
+            handler_block.contains("peer_edit_delivery_is_stale(&state, origin, *generation)"),
+            "SRPeerEditHandler must reject peer edits a newer generation already superseded"
+        );
+        assert!(
+            handler_block.contains("record_applied_peer_edit_generation(&mut state, origin, *generation);"),
+            "SRPeerEditHandler must record the applied generation so later stale deliveries are recognised"
+        );
+
+        let sender_block = src
+            .split("impl Operation for SiteReplicationEditHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SRPeerEditCapabilitiesHandler").next())
+            .expect("SiteReplicationEditHandler block should exist");
+        assert!(
+            sender_block.contains("let edit_generation = next_peer_edit_generation(&mut state);"),
+            "the edit handler must allocate the generation inside the committed state, not outside the lock"
+        );
     }
 
     #[test]
@@ -12518,14 +12711,128 @@ mod tests {
         };
         let mut queue = Vec::new();
 
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first");
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second");
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third");
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
         assert!(queue[0].failed);
         assert_eq!(queue[0].last_error, "third");
+    }
+
+    /// P1-15 review follow-up: a successful peer-edit delivery only proves the
+    /// peer reached the state THAT delivery carried. Settling it must not
+    /// erase a retry event a newer edit left behind, or the local site sits on
+    /// edit B, the peer on edit A, and nothing is queued to converge them.
+    #[test]
+    fn retry_settlement_must_not_erase_a_newer_generation_failure() {
+        let peer = PeerInfo {
+            deployment_id: "remote-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let mut queue = Vec::new();
+
+        // Edit A (generation 5) delivered successfully and is stalled before
+        // settling. Edit B (generation 6) commits meanwhile, fails delivery to
+        // the same peer, and enqueues.
+        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6));
+
+        // A resumes: its own settlement must leave B's retry alone.
+        assert_eq!(
+            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(5)),
+            0
+        );
+        assert_eq!(queue.len(), 1, "the newer edit's retry event was erased by an older success");
+        assert_eq!(queue[0].edit_generation, Some(6));
+
+        // An even older delivery failing afterwards must not lower the fence.
+        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4));
+        assert_eq!(queue[0].edit_generation, Some(6));
+
+        // B's own delivery succeeding is what clears it.
+        assert_eq!(
+            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(6)),
+            1
+        );
+        assert!(queue.is_empty());
+
+        // Broadcast paths carry no generation and keep settling unconditionally
+        // — their retry events live under their own path and never collide
+        // with a peer-edit delivery.
+        let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 1);
+    }
+
+    /// P1-15 review follow-up: the receiving side of the ordering fence. The
+    /// sender's process mutex is per node, so two nodes of the same site can
+    /// fan out in the opposite order to their commits; the receiver decides
+    /// ordering from the generation the sender allocated under the distributed
+    /// state lock.
+    #[test]
+    fn peer_edit_fence_rejects_a_delivery_the_newer_edit_already_passed() {
+        let mut state = SiteReplicationState::default();
+        let path = peer_edit_path_with_fence(Some("origin-site"), 7);
+        let queries = query_pairs(&path.parse::<Uri>().expect("the fenced path must be a valid request uri"));
+        let (origin, generation) = peer_edit_fence(&queries).expect("the fence must round-trip through the request path");
+        assert_eq!((origin.as_str(), generation), ("origin-site", 7));
+
+        assert!(!peer_edit_delivery_is_stale(&state, &origin, generation));
+        record_applied_peer_edit_generation(&mut state, &origin, generation);
+
+        // The delivery that lost the race carries the older generation.
+        assert!(peer_edit_delivery_is_stale(&state, "origin-site", 6));
+        // A replay of the generation already applied is stale too.
+        assert!(peer_edit_delivery_is_stale(&state, "origin-site", 7));
+        // The next edit from that origin still applies...
+        assert!(!peer_edit_delivery_is_stale(&state, "origin-site", 8));
+        // ...and another origin site is ordered independently.
+        assert!(!peer_edit_delivery_is_stale(&state, "other-site", 1));
+
+        // A sender with no deployment id has nothing to fence against, and a
+        // peer that predates the fence sends no query: both keep the previous
+        // last-writer-wins behaviour rather than being rejected.
+        assert_eq!(peer_edit_path_with_fence(None, 9), SITE_REPLICATION_PEER_EDIT_PATH);
+        assert_eq!(peer_edit_path_with_fence(Some(""), 9), SITE_REPLICATION_PEER_EDIT_PATH);
+        assert!(peer_edit_fence(&HashMap::new()).is_none());
+    }
+
+    /// P1-15 review follow-up: a site that leaves the mesh drops below two
+    /// peers, which clears its state object and restarts its generation
+    /// counter at zero. A mark left over from its previous membership would
+    /// make every edit it sends after rejoining look stale — i.e. the fence
+    /// would silently swallow that site's edits forever.
+    #[test]
+    fn peer_edit_marks_do_not_outlive_the_peer_that_earned_them() {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            "origin-site".to_string(),
+            PeerInfo {
+                deployment_id: "origin-site".to_string(),
+                ..peer("origin", "https://origin.example:9000")
+            },
+        );
+        record_applied_peer_edit_generation(&mut state, "origin-site", 12);
+        let retained = serde_json::to_vec(&state).expect("serialize state with a live peer");
+        assert_eq!(
+            parse_site_replication_state(&retained)
+                .expect("reload")
+                .applied_edit_generations
+                .get("origin-site"),
+            Some(&12),
+            "the mark for a current peer must survive a reload"
+        );
+
+        state.peers.remove("origin-site");
+        let departed = serde_json::to_vec(&state).expect("serialize state after the peer left");
+        let reloaded = parse_site_replication_state(&departed).expect("reload");
+        assert!(
+            reloaded.applied_edit_generations.is_empty(),
+            "a departed peer's mark must not fence its edits after it rejoins: {:?}",
+            reloaded.applied_edit_generations
+        );
+        assert!(!peer_edit_delivery_is_stale(&reloaded, "origin-site", 1));
     }
 
     #[test]
@@ -15005,6 +15312,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// P1-15 review follow-up: the sending side of the peer-edit ordering
+    /// fence, driven by two separate nodes. Both bypass the process mutex —
+    /// which is exactly what two nodes of one site do — so the generation is
+    /// only unique because it is allocated inside the state transaction, under
+    /// the distributed state-object lock. Two nodes sharing a generation would
+    /// leave the receiver unable to tell which edit is newer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_edit_generations_are_unique_across_nodes() {
+        publish_ready_iam_context().await;
+        // A configured site: `persist_site_replication_state_no_lock` clears
+        // the object once a site drops below two peers, and a cleared object
+        // would reset the counter between allocations.
+        let seed = SiteReplicationState {
+            peers: ["site-a", "site-b"]
+                .into_iter()
+                .map(|name| (name.to_string(), peer(name, &format!("https://{name}.example:9000"))))
+                .collect(),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        fn node_local_allocate() -> impl std::future::Future<Output = S3Result<u64>> {
+            update_site_replication_state_as_separate_node(|state| Ok(next_peer_edit_generation(state)))
+        }
+
+        const ROUNDS: usize = 8;
+        let mut generations = Vec::new();
+        for _ in 0..ROUNDS {
+            let node_a = tokio::spawn(node_local_allocate());
+            let node_b = tokio::spawn(node_local_allocate());
+            generations.push(node_a.await.expect("node a task").expect("node a allocation"));
+            generations.push(node_b.await.expect("node b task").expect("node b allocation"));
+        }
+
+        let unique: BTreeSet<u64> = generations.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            generations.len(),
+            "two nodes took the same edit generation, so their deliveries cannot be ordered: {generations:?}"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").edit_generation,
+            generations.len() as u64,
+            "the persisted counter must account for every allocation"
+        );
     }
 
     /// P1-15 (rustfs/backlog#1675 B2): every state RMW — including the
