@@ -2907,23 +2907,58 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
 /// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
 /// mmap-copy / direct-read-copy positioned read, moved verbatim from the
 /// former `DiskAPI` method bodies on `LocalDisk`.
-#[derive(Debug)]
 pub(crate) struct StdBackend {
     root: PathBuf,
     #[cfg(target_os = "linux")]
     direct_io: Arc<DirectIoReadState>,
     #[cfg(target_os = "linux")]
     direct_io_write: Arc<DirectIoWriteState>,
+    /// Per-disk descriptor cache for buffered reads (rustfs/backlog#1801).
+    /// `None` when disabled by env, blocked by a low `RLIMIT_NOFILE`, or on
+    /// non-Linux (where the cache type is unavailable). Like the io_uring
+    /// cache, only the buffered read path populates it; O_DIRECT reads keep
+    /// opening their own aligned descriptors.
+    #[cfg(target_os = "linux")]
+    fd_cache: Option<FdCache>,
+}
+
+// Manual `Debug` mirrors `UringBackend`: the fd cache (and the Linux-only
+// direct-IO state) hold types that do not implement `Debug`, so a derive would
+// force `FdCache: Debug`. `finish_non_exhaustive` skips them.
+impl std::fmt::Debug for StdBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdBackend").field("root", &self.root).finish_non_exhaustive()
+    }
 }
 
 impl StdBackend {
     pub(crate) fn new(root: PathBuf) -> Self {
+        // Gate the fd cache on RLIMIT_NOFILE headroom (rustfs/backlog#1178):
+        // 512 fds/disk with a low soft limit and several disks would hit EMFILE.
+        // Fall back to open-per-read when the limit is too small.
+        #[cfg(target_os = "linux")]
+        let fd_cache = if is_local_fd_cache_enabled() {
+            if rlimit_allows_fd_cache() {
+                Some(FdCache::new())
+            } else {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    "std fd cache disabled: RLIMIT_NOFILE soft limit too low for 512 fds/disk; using open-per-read"
+                );
+                None
+            }
+        } else {
+            None
+        };
         Self {
             root,
             #[cfg(target_os = "linux")]
             direct_io: Arc::new(DirectIoReadState::new()),
             #[cfg(target_os = "linux")]
             direct_io_write: Arc::new(DirectIoWriteState::new()),
+            #[cfg(target_os = "linux")]
+            fd_cache,
         }
     }
 
@@ -3001,6 +3036,9 @@ impl LocalIoBackend for StdBackend {
                 direct_read_copy_fault_delta: MmapPageFaultDelta,
                 blocking_task_duration: StdDuration,
                 used_direct_io: bool,
+                /// The descriptor opened by THIS call (None on a cache hit), handed
+                /// back so the async caller can index it in the fd cache.
+                opened_fd: Option<Arc<std::fs::File>>,
             }
 
             enum MmapCopyReadError {
@@ -3028,28 +3066,72 @@ impl LocalIoBackend for StdBackend {
             let direct_io_state = self.direct_io.clone();
             let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
             let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+
+            // Descriptor cache (rustfs/backlog#1801): on a hit the read reuses an
+            // already-open descriptor (via dup below) and skips `access` +
+            // `File::open`. Linux-only — on other Unix `cached_fd` is None and the
+            // read opens per call exactly as before. `fd_lookup` snapshots the
+            // invalidation generation BEFORE the open so a heal/delete that lands
+            // while the blocking open is in flight prevents the now-stale descriptor
+            // from being inserted (rustfs/backlog#1176).
+            #[cfg(target_os = "linux")]
+            let fd_lookup = self.fd_cache.as_ref().map(|cache| {
+                let key = FdKey {
+                    volume: volume.to_owned(),
+                    path: path.to_owned(),
+                    direct: false,
+                };
+                let gen_at_open = cache.generation();
+                (cache, key, gen_at_open)
+            });
+            #[cfg(target_os = "linux")]
+            let cached_fd: Option<Arc<std::fs::File>> = match &fd_lookup {
+                Some((cache, key, _)) => cache.get(key).await,
+                None => None,
+            };
+            #[cfg(not(target_os = "linux"))]
+            let cached_fd: Option<Arc<std::fs::File>> = None;
+
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
             let read_result = tokio::task::spawn_blocking(move || {
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
 
-                let access_check_start = metrics_enabled.then(StdInstant::now);
-                let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
-                if !skip_access_checks(&volume_owned) {
-                    crate::disk::fs::access_std(&volume_dir)
-                        .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
-                }
-                let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
+                // Resolve the part path unconditionally: the O_DIRECT branch (large
+                // reads) opens its own aligned descriptor by path even on a cache hit.
                 let path_resolve_start = metrics_enabled.then(StdInstant::now);
                 let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 let file_open_start = metrics_enabled.then(StdInstant::now);
-                let mut file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                // Acquire the read handle (rustfs/backlog#1801). On a descriptor-cache
+                // hit this reuses the cached descriptor via `dup` (one syscall, no path
+                // resolution or permission re-check) and skips the volume access probe;
+                // on a miss it resolves the volume, access-checks, and opens the file.
+                // `File::try_clone` shares the cached descriptor's open-file offset, so
+                // the read below is positioned (mmap offset argument / `read_exact_at`)
+                // and never depends on the descriptor's current offset. `cached_fd` being
+                // None also marks this call as a miss for the cache-insert side-channel.
+                let (file, access_check_duration) = if let Some(cached) = cached_fd.as_ref() {
+                    (cached.as_ref().try_clone().map_err(DiskError::from)?, StdDuration::ZERO)
+                } else {
+                    // Measure the volume access probe only — the part-path resolution
+                    // above is accounted in `path_resolve_duration` (rustfs/backlog#1801).
+                    let access_check_start = metrics_enabled.then(StdInstant::now);
+                    let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+                    if !skip_access_checks(&volume_owned) {
+                        crate::disk::fs::access_std(&volume_dir)
+                            .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                    }
+                    let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                    (std::fs::File::open(&file_path).map_err(DiskError::from)?, access_check_duration)
+                };
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
+                // On a cache hit this fstats the cached descriptor — the inode it was
+                // opened against, which invalidation keeps current for live entries. EC
+                // shards are fixed-length, so a still-cached pre-heal length is benign.
                 let meta = file.metadata().map_err(DiskError::from)?;
                 let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
@@ -3160,13 +3242,15 @@ impl LocalIoBackend for StdBackend {
                             bytes
                         }
                         LocalReadCopyMethod::DirectReadCopy => {
-                            use std::io::{Read as _, Seek as _};
+                            use std::os::unix::fs::FileExt;
 
                             let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
                             let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                            file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
                             let mut buffer = vec![0; length];
-                            file.read_exact(&mut buffer).map_err(DiskError::from)?;
+                            // Positioned read: a cache hit reads through a `dup`'d handle
+                            // that shares the cached descriptor's offset, so this must not
+                            // touch the descriptor offset (rustfs/backlog#1801).
+                            file.read_exact_at(&mut buffer, offset_u64).map_err(DiskError::from)?;
                             let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
                             direct_read_copy_duration =
                                 direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
@@ -3193,6 +3277,16 @@ impl LocalIoBackend for StdBackend {
 
                 let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
+                // Hand the freshly opened descriptor back so the async caller can index
+                // the cache — None on a hit (the cache already holds it). mmap/reclaim
+                // above only borrowed `file`, so it is still owned here and moves into the
+                // Arc; `cached_fd.is_none()` is true exactly when this call did the open.
+                // Non-Linux has no fd cache, so skip the Arc allocation there.
+                #[cfg(target_os = "linux")]
+                let opened_fd: Option<Arc<std::fs::File>> = cached_fd.is_none().then(|| Arc::new(file));
+                #[cfg(not(target_os = "linux"))]
+                let opened_fd: Option<Arc<std::fs::File>> = None;
+
                 Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
                     bytes,
                     access_check_duration,
@@ -3208,6 +3302,7 @@ impl LocalIoBackend for StdBackend {
                     direct_read_copy_fault_delta,
                     blocking_task_duration,
                     used_direct_io,
+                    opened_fd,
                 })
             })
             .await
@@ -3312,6 +3407,16 @@ impl LocalIoBackend for StdBackend {
                         }
                     }
                 }
+            }
+            // Index the freshly opened descriptor for future cache hits
+            // (rustfs/backlog#1801). `insert_if_fresh` refuses to cache if an
+            // invalidation (heal/delete/rename) bumped the generation between the
+            // open snapshot and now, so a stale pre-mutation inode is never served
+            // (rustfs/backlog#1176). On a cache hit `opened_fd` is None; on non-Linux
+            // there is no fd cache, so this is gated out entirely.
+            #[cfg(target_os = "linux")]
+            if let (Some((cache, key, gen_at_open)), Some(opened)) = (fd_lookup, read_result.opened_fd) {
+                cache.insert_if_fresh(key, opened, gen_at_open).await;
             }
             let bytes = read_result.bytes;
 
@@ -3516,6 +3621,39 @@ impl LocalIoBackend for StdBackend {
             }
         }
     }
+
+    // Descriptor-cache invalidation for StdBackend (rustfs/backlog#1801). On
+    // non-Linux `fd_cache` does not exist, so these overrides are absent and the
+    // trait's default no-op impls apply. On Linux they mirror UringBackend so
+    // the existing LocalDisk mutation hooks (rename_data/rename_file/delete/
+    // delete_volume/close) drop stale descriptors on every inode swap.
+    #[cfg(target_os = "linux")]
+    async fn invalidate_cached_fd(&self, volume: &str, path: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_exact(volume, path).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_under(volume, path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn invalidate_cached_fds_for_volume(&self, volume: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_volume(volume);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn clear_cached_fds(&self) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.clear();
+        }
+    }
 }
 
 /// Enable the per-disk descriptor cache for io_uring reads (backlog#1145).
@@ -3539,6 +3677,20 @@ const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
+}
+
+/// Enable the per-disk descriptor cache for the default `StdBackend` reads
+/// (rustfs/backlog#1801). Independent of the io_uring switch so each backend is
+/// separately controllable; both share the same `rlimit_allows_fd_cache` guard
+/// because each may hold up to `FD_CACHE_CAPACITY` (512) descriptors per disk.
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_LOCAL_FD_CACHE: &str = "RUSTFS_LOCAL_FD_CACHE";
+#[cfg(target_os = "linux")]
+const DEFAULT_RUSTFS_LOCAL_FD_CACHE: bool = true;
+
+#[cfg(target_os = "linux")]
+fn is_local_fd_cache_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_LOCAL_FD_CACHE, DEFAULT_RUSTFS_LOCAL_FD_CACHE)
 }
 
 /// Whether the soft `RLIMIT_NOFILE` has enough headroom to run the fd cache
@@ -19392,6 +19544,116 @@ mod test {
             Bytes::from_static(b"healed--shard"),
             "after invalidation the healed shard must be visible"
         );
+    }
+
+    /// Same heal hazard as the io_uring test, but exercised through the default
+    /// `StdBackend` read path (rustfs/backlog#1801): a cached descriptor keeps
+    /// serving the pre-heal inode until `invalidate_cached_fds_under` drops it.
+    /// `StdBackend` reads via mmap/`try_clone`, so this proves the dup-based hit
+    /// path also defers to invalidation rather than masking a healed shard.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn std_fd_cache_hides_a_healed_shard_until_invalidated() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let backend = temp_env::with_vars([(ENV_RUSTFS_LOCAL_FD_CACHE, Some("true"))], || StdBackend::new(root.clone()));
+        if backend.fd_cache.is_none() {
+            // RLIMIT_NOFILE too low for 512 fds/disk (rustfs/backlog#1178): the
+            // cache is off, so there is nothing to exercise. Do not vacuously pass.
+            eprintln!(
+                "std_fd_cache_hides_a_healed_shard_until_invalidated: skipped \
+                 (RLIMIT_NOFILE too low for the std fd cache)"
+            );
+            return;
+        }
+
+        let volume = "bucket";
+        let object = "obj/0d1e2f/part.1";
+        let dir = root.join(volume).join("obj/0d1e2f");
+        std::fs::create_dir_all(&dir).expect("operation should succeed");
+        let part = root.join(volume).join(object);
+        std::fs::write(&part, b"corrupt-shard").expect("operation should succeed");
+
+        let before = backend
+            .pread_bytes(volume, object, 0, b"corrupt-shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(before, Bytes::from_static(b"corrupt-shard"));
+
+        // Heal: rename rebuilt content onto the same part path — inode swap, path
+        // unchanged. A cached descriptor would keep reading the old inode.
+        let rebuilt = dir.join("part.1.rebuilt");
+        std::fs::write(&rebuilt, b"healed--shard").expect("operation should succeed");
+        std::fs::rename(&rebuilt, &part).expect("operation should succeed");
+
+        let stale = backend
+            .pread_bytes(volume, object, 0, b"healed--shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(
+            stale,
+            Bytes::from_static(b"corrupt-shard"),
+            "a cached descriptor is expected to still see the pre-heal inode — this is the \
+             hazard invalidate_cached_fds exists to close, and the assertion proves the cache is live"
+        );
+
+        backend.invalidate_cached_fds_under(volume, "obj/0d1e2f");
+        let healed = backend
+            .pread_bytes(volume, object, 0, b"healed--shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(healed, Bytes::from_static(b"healed--shard"));
+    }
+
+    /// A repeated read of the same shard must (a) return correct bytes both times
+    /// and (b) actually populate the descriptor cache, so the second read can skip
+    /// `File::open` (rustfs/backlog#1801).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn std_fd_cache_serves_repeated_reads_and_caches_descriptor() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let backend = temp_env::with_vars([(ENV_RUSTFS_LOCAL_FD_CACHE, Some("true"))], || StdBackend::new(root.clone()));
+        let cache = match backend.fd_cache.as_ref() {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "std_fd_cache_serves_repeated_reads_and_caches_descriptor: skipped \
+                     (RLIMIT_NOFILE too low for the std fd cache)"
+                );
+                return;
+            }
+        };
+
+        let volume = "bucket";
+        let object = "obj/abc/part.1";
+        std::fs::create_dir_all(root.join(volume).join("obj/abc")).expect("operation should succeed");
+        let payload = b"hello-small-shard-payload";
+        std::fs::write(root.join(volume).join(object), payload).expect("operation should succeed");
+
+        let first = backend
+            .pread_bytes(volume, object, 0, payload.len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(first, Bytes::from_static(payload));
+
+        // After the first miss the freshly opened descriptor is indexed; a second
+        // read of the same path is a cache hit.
+        assert_eq!(cache.entry_count().await, 1, "the first read should have cached exactly one descriptor");
+
+        let second = backend
+            .pread_bytes(volume, object, 0, payload.len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(second, Bytes::from_static(payload));
+
+        // Invalidating by the object prefix drops the cached descriptor.
+        backend.invalidate_cached_fds_under(volume, "obj/abc");
+        assert_eq!(cache.entry_count().await, 0, "prefix invalidation must drop the cached descriptor");
     }
 
     /// The mutation paths on `LocalDisk` must actually call
