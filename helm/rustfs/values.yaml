@@ -115,7 +115,7 @@ pools:
   #       dataStorageSize: 10Gi
 
 secret:
-  existingSecret: ""
+  existingSecret: "hello-test"
   # SECURITY: rendering fails by default unless one of the following is true:
   #   1. `secret.existingSecret` names a Kubernetes Secret you control, or
   #   2. `secret.rustfs.access_key` and `secret.rustfs.secret_key` are both
@@ -370,6 +370,7 @@ gatewayApi:
       name: websecure
       port: 8443
   hostname: example.rustfs.com
+  httpToHttpsRedirect: true
   existingGateway:
     name: ""
     namespace: ""
