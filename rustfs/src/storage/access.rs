@@ -642,10 +642,13 @@ fn request_object_store<T>(req: &S3Request<T>) -> S3Result<Arc<ECStore>> {
     match req.extensions.get::<Arc<ServerContextSlot>>() {
         Some(server_ctx) => server_ctx
             .installed_object_store()
-            .ok_or_else(|| s3_error!(InternalError, "object store is not initialized")),
-        None => runtime_sources::current_object_store_handle()
-            .ok_or_else(|| s3_error!(InternalError, "object store is not initialized")),
+            .ok_or_else(object_store_not_initialized_error),
+        None => runtime_sources::current_object_store_handle().ok_or_else(object_store_not_initialized_error),
     }
+}
+
+fn object_store_not_initialized_error() -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized")
 }
 
 fn request_iam_store<T>(req: &S3Request<T>) -> S3Result<Arc<IamSys<ObjectStore>>> {

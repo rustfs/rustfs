@@ -35,7 +35,7 @@ impl Operation for EnableTableBucketHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
         let backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let object_store = runtime_sources::object_store_from_req(&req)
-            .ok_or_else(|| s3_error!(InternalError, "request object store is not initialized"))?;
+            .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
         let publication = TableCommitObjectBackend::preauthorized(backend);
         let response = enable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;

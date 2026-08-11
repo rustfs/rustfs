@@ -78,6 +78,10 @@ const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
 const NAMESPACE_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const PREFIX_PROPERTY: &str = "prefix";
+
+fn table_catalog_internal_error(message: &'static str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, message)
+}
 const NAMESPACE_SEPARATOR_PROPERTY: &str = "namespace-separator";
 const ICEBERG_ERROR_ALREADY_EXISTS: &str = "AlreadyExistsException";
 const ICEBERG_ERROR_BAD_REQUEST: &str = "BadRequestException";
@@ -791,10 +795,10 @@ struct IamTableCredentialIssuer {
 impl IamTableCredentialIssuer {
     fn from_request(req: &S3Request<Body>) -> S3Result<Self> {
         let context = runtime_sources::app_context_from_req(req)
-            .ok_or_else(|| s3_error!(InternalError, "request application context is not initialized"))?;
+            .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
         let iam = context.iam();
         if !iam.is_ready() {
-            return Err(s3_error!(InternalError, "iam not init"));
+            return Err(table_catalog_internal_error("iam not init"));
         }
         let token_signing_key = context.action_credentials().get().map(|credentials| credentials.secret_key);
         Ok(Self {
@@ -857,7 +861,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
         let secret = self
             .token_signing_key
             .as_deref()
-            .ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+            .ok_or_else(|| table_catalog_internal_error("token signing key not initialized"))?;
         let mut credential = get_new_credentials_with_metadata(&claims, secret)
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);
@@ -1183,7 +1187,7 @@ async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<Tabl
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
     let context = runtime_sources::app_context_from_req(req)
-        .ok_or_else(|| s3_error!(InternalError, "request application context is not initialized"))?;
+        .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
     let (credentials, owner) = check_key_valid_with_context(
         get_session_token(&req.uri, &req.headers).unwrap_or_default(),
         &input_cred.access_key,
@@ -1192,7 +1196,7 @@ async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<Tabl
     .await?;
     let iam = context.iam();
     if !iam.is_ready() {
-        return Err(s3_error!(InternalError, "iam not init"));
+        return Err(table_catalog_internal_error("iam not init"));
     }
     Ok(TableCatalogRequestPrincipal {
         credentials,
@@ -2064,7 +2068,7 @@ fn table_catalog_backend_from_extensions(
     extensions: &http::Extensions,
 ) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
     let store = runtime_sources::object_store_from_extensions(extensions)
-        .ok_or_else(|| s3_error!(InternalError, "request object store is not initialized"))?;
+        .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
     Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
 }
 
@@ -2098,7 +2102,7 @@ fn table_catalog_object_store_from_extensions(extensions: &http::Extensions) -> 
 
 async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<bool> {
     let store = runtime_sources::object_store_from_extensions(extensions)
-        .ok_or_else(|| s3_error!(InternalError, "request object store is not initialized"))?;
+        .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
     let metadata = store
         .get_bucket_metadata(bucket)
         .await
