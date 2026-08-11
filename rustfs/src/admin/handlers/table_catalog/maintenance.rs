@@ -24,10 +24,10 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
-        let store = table_catalog_object_store()?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let response =
             table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -44,8 +44,8 @@ impl Operation for GetTableMaintenanceConfigHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
             .await
@@ -64,9 +64,9 @@ impl Operation for PutTableMaintenanceConfigHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<crate::table_catalog::TableMaintenanceConfig>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .put_table_maintenance_config(&warehouse, &namespace.public_name(), &table, request)
             .await
@@ -86,8 +86,8 @@ impl Operation for GetTableMaintenanceJobHandler {
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let Some(response) = store
             .get_table_metadata_maintenance_report(&warehouse, &namespace.public_name(), &table, &job)
             .await
@@ -109,8 +109,8 @@ impl Operation for GetTableMaintenanceSchedulerHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .get_table_maintenance_scheduler_report(&warehouse, &namespace.public_name(), &table)
             .await
@@ -129,9 +129,9 @@ impl Operation for RunTableMaintenanceSchedulerHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body_or_default::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .run_table_maintenance_scheduler_once(
                 &warehouse,
@@ -155,9 +155,9 @@ impl Operation for RunTableMaintenanceWorkerHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .run_table_metadata_maintenance_worker_once(
                 &warehouse,
@@ -182,9 +182,9 @@ impl Operation for HeartbeatTableMaintenanceJobHandler {
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .heartbeat_table_metadata_maintenance_job(
                 &warehouse,
@@ -211,9 +211,9 @@ impl Operation for TableMaintenanceQuarantineHandler {
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<crate::table_catalog::TableMaintenanceQuarantineOperationRequest>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = store
             .apply_table_maintenance_quarantine_operation(&warehouse, &namespace.public_name(), &table, &job, request)
             .await

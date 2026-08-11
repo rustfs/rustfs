@@ -33,10 +33,12 @@ impl Operation for EnableTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
-        let backend = table_catalog_backend()?;
+        let backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let object_store = runtime_sources::object_store_from_req(&req)
+            .ok_or_else(|| s3_error!(InternalError, "request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
         let publication = TableCommitObjectBackend::preauthorized(backend);
-        let response = enable_table_bucket_response(&store, &publication, &warehouse).await?;
+        let response = enable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -49,8 +51,8 @@ impl Operation for GetTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableBucketAction).await?;
-        let store = table_catalog_store()?;
-        let enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let response = table_bucket_response(&store, &warehouse, enabled).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -64,8 +66,8 @@ impl Operation for GetTableCatalogMigrationHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCatalogAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_object_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
             .plan_durable_strong_backing_migration(&warehouse)
@@ -84,8 +86,8 @@ impl Operation for MaterializeTableCatalogMigrationHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_object_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
             .materialize_durable_strong_backing_migration(&warehouse)
@@ -104,8 +106,8 @@ impl Operation for CancelTableCatalogMigrationHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_object_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
             .cancel_durable_strong_backing_migration(&warehouse)
@@ -127,8 +129,8 @@ impl Operation for ExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_object_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let response = external_catalog_bridge_response(&store, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -144,9 +146,9 @@ impl Operation for PutExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<ExternalCatalogBridgeRequest>(req.input).await?;
-        let store = table_catalog_object_store()?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let response = put_external_catalog_bridge_response(&store, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -163,9 +165,9 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal =
             authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let metadata_backend = table_catalog_backend()?;
-        let store = table_catalog_object_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         if store
             .load_table(&warehouse, &namespace.public_name(), &table)
             .await
@@ -176,7 +178,7 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         }
         install_table_catalog_s3_request_info(&mut req, &principal)?;
         let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(std::mem::take(&mut req.input)).await?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = sync_external_catalog_bridge_response(
             &store,

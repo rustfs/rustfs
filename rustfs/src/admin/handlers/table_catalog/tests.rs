@@ -1,4 +1,5 @@
 use super::*;
+use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
 use datafusion::{
     arrow::{
@@ -9,6 +10,118 @@ use datafusion::{
     parquet::arrow::ArrowWriter,
 };
 use std::sync::Arc;
+
+use rustfs_iam::store::{Store as _, UserType};
+use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+
+struct RequestIam {
+    handle: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
+}
+
+impl IamInterface for RequestIam {
+    fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+        self.handle.clone()
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+struct RequestKms;
+
+impl KmsInterface for RequestKms {
+    fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+        Arc::new(rustfs_kms::KmsServiceManager::new())
+    }
+}
+
+#[tokio::test]
+async fn table_catalog_authentication_and_credentials_use_the_request_context() {
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    rustfs_iam::store::object::ObjectStore::new(store.clone())
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("request IAM format should be seeded");
+    let iam = rustfs_iam::build_iam_sys(store.clone())
+        .await
+        .expect("request IAM should initialize");
+    let user_access_key = "request-table-user";
+    let user_secret_key = "request-table-user-secret-key";
+    let policy_name = "request-table-get";
+    iam.create_user(
+        user_access_key,
+        &AddOrUpdateUserReq {
+            secret_key: user_secret_key.to_string(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .expect("request IAM user should be created");
+    iam.set_policy(
+        policy_name,
+        Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:GetTable"]}]}"#)
+            .expect("request table policy should parse"),
+    )
+    .await
+    .expect("request table policy should be stored");
+    iam.policy_db_set(user_access_key, UserType::Reg, false, policy_name)
+        .await
+        .expect("request table policy should be attached");
+    let context = Arc::new(AppContext::new(
+        store.clone(),
+        Arc::new(RequestIam { handle: iam.clone() }),
+        Arc::new(RequestKms),
+    ));
+    let credentials = rustfs_credentials::Credentials {
+        access_key: "request-root-access-key".to_string(),
+        secret_key: "request-root-secret-key".to_string(),
+        status: "on".to_string(),
+        ..Default::default()
+    };
+    assert!(context.publish_action_credentials(credentials.clone()));
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context));
+    let mut extensions = http::Extensions::new();
+    extensions.insert(slot);
+    let request = S3Request {
+        input: Body::empty(),
+        method: Method::GET,
+        uri: "/table-context".parse().expect("test URI"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: Some(s3s::auth::Credentials {
+            access_key: user_access_key.to_string(),
+            secret_key: s3s::auth::SecretKey::from(user_secret_key.to_string()),
+        }),
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+
+    let principal = table_catalog_request_principal(&request)
+        .await
+        .expect("request IAM credentials should authenticate");
+    assert!(!principal.owner);
+    assert!(Arc::ptr_eq(&principal.iam_store, &iam));
+    authorize_table_catalog_request(&request, AdminAction::GetTableAction)
+        .await
+        .expect("unscoped authorization should use the request IAM");
+    let resource = TableCatalogResource::warehouse("request-warehouse");
+    authorize_table_catalog_resource_request(&request, &resource, AdminAction::GetTableAction)
+        .await
+        .expect("resource authorization should use the request IAM");
+    let issuer = IamTableCredentialIssuer::from_request(&request).expect("credential issuer should use the request context");
+    assert!(Arc::ptr_eq(&issuer.iam_store, &iam));
+    assert_eq!(issuer.token_signing_key.as_deref(), Some("request-root-secret-key"));
+    let resolved_store =
+        runtime_sources::object_store_from_extensions(&request.extensions).expect("request object store should resolve");
+    assert!(Arc::ptr_eq(&resolved_store, &store));
+}
 
 #[test]
 #[serial_test::serial]
@@ -236,7 +349,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
             .contains("authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;")
     );
     assert!(
-        src.contains("validate_admin_request_with_bucket_object("),
+        src.contains("validate_admin_action_with_bucket_object_for_iam("),
         "catalog resource auth should pass namespace/table scope into IAM object matching"
     );
 
@@ -368,6 +481,18 @@ fn table_catalog_handlers_require_table_admin_actions() {
 }
 
 #[test]
+fn table_bucket_handlers_resolve_state_from_the_request_context() {
+    let src = table_catalog_handler_source();
+    let enable = operation_block(&src, "EnableTableBucketHandler");
+    assert!(enable.contains("table_catalog_backend_from_extensions(&req.extensions)?;"));
+    assert!(enable.contains("runtime_sources::object_store_from_req(&req)"));
+
+    let get = operation_block(&src, "GetTableBucketHandler");
+    assert!(get.contains("table_catalog_store_from_extensions(&req.extensions)?;"));
+    assert!(get.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"));
+}
+
+#[test]
 fn table_catalog_list_handlers_parse_standard_pagination() {
     let src = table_catalog_handler_source();
     for (handler, helper_call) in [
@@ -486,8 +611,8 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains("ensure_table_bucket_enabled(&warehouse).await?;")
-                || block.contains("table_bucket_enabled_from_metadata(&warehouse).await?;"),
+            block.contains("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
+                || block.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"),
             "{handler} should require the table bucket metadata marker before catalog state access"
         );
     }
@@ -501,7 +626,7 @@ fn enable_table_bucket_response_fences_before_marker_and_catalog_entry() {
         .find("TableCommitPublication::begin_table_bucket(publication, bucket)")
         .expect("enable should acquire the table-bucket publication fence");
     let marker_write = block
-        .find("enable_table_bucket_marker(bucket).await?;")
+        .find("enable_table_bucket_marker(object_store, bucket).await?;")
         .expect("enable should write the metadata marker");
     let catalog_entry_write = block
         .find("ensure_table_bucket_entry(store, bucket, true).await?;")

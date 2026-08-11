@@ -1444,10 +1444,6 @@ pub(crate) async fn get_bucket_accelerate_config(
     ecstore_bucket::metadata_sys::get_accelerate_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_bucket_policy_raw(bucket).await
-}
-
 pub(crate) async fn get_bucket_cors_config(bucket: &str) -> Result<(s3s::dto::CORSConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_cors_config(bucket).await
 }
@@ -1460,12 +1456,6 @@ pub(crate) async fn get_bucket_object_lock_config(
     bucket: &str,
 ) -> Result<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
-}
-
-pub(crate) async fn get_public_access_block_config(
-    bucket: &str,
-) -> Result<(s3s::dto::PublicAccessBlockConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_public_access_block_config(bucket).await
 }
 
 pub(crate) async fn get_bucket_replication_config(
