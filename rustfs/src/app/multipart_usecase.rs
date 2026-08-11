@@ -58,7 +58,9 @@ use super::storage_api::multipart_usecase::sse::{
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, mark_encrypted_multipart_metadata,
     sse_decryption, sse_prepare_encryption,
 };
-use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use super::storage_api::multipart_usecase::{
+    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+};
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
@@ -221,6 +223,18 @@ fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
     opts.http_preconditions = None;
     opts
+}
+
+fn logical_object_size(info: &ObjectInfo) -> Result<u64, StorageError> {
+    u64::try_from(info.get_actual_size()?).map_err(|_| StorageError::PartMissingOrCorrupt)
+}
+
+fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
+    match logical_object_size(info) {
+        Ok(size) => Ok(size),
+        Err(err) if fail_closed => Err(ApiError::from(err).into()),
+        Err(_) => Ok(info.size.max(0) as u64),
+    }
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -488,10 +502,16 @@ impl DefaultMultipartUsecase {
                 .await
                 .map_err(ApiError::from)?,
         );
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info, &current_opts)?;
-                Some(existing_obj_info.size.max(0) as u64)
+                let physical_size = existing_obj_info.size.max(0) as u64;
+                let logical_size = if opts.replication_request {
+                    Ok(physical_size)
+                } else {
+                    logical_object_size(&existing_obj_info)
+                };
+                Some((physical_size, logical_size))
             }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
@@ -541,8 +561,32 @@ impl DefaultMultipartUsecase {
         let quota_metadata_sys = self.bucket_metadata_sys();
         if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
-            map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+            let check_result =
+                map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+            // Ciphertext-passthrough replication parts use a different size basis and retain
+            // the existing post-commit accounting path until they carry a trusted logical-size proof.
+            if !opts.replication_request
+                && let Some(quota_limit) = check_result.quota_limit
+            {
+                let installed = check_result
+                    .current_usage
+                    .is_some_and(|current_usage| opts.set_quota_admission(current_usage, quota_limit));
+                if !installed {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ServiceUnavailable,
+                        "Bucket quota check temporarily unavailable, please retry".to_string(),
+                    ));
+                }
+            }
         }
+
+        let previous_current_size = match previous_current_sizes {
+            Some((physical_size, _)) if opts.replication_request => Some(physical_size),
+            Some((_, Ok(logical_size))) => Some(logical_size),
+            Some((_, Err(err))) if opts.quota_admission.is_some() => return Err(ApiError::from(err).into()),
+            Some((physical_size, Err(_))) => Some(physical_size),
+            None => None,
+        };
 
         let obj_info = store
             .clone()
@@ -552,18 +596,14 @@ impl DefaultMultipartUsecase {
         let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
-        if let Some(metadata_sys) = quota_metadata_sys {
-            let quota_checker = QuotaChecker::new(metadata_sys);
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size.max(0) as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        // Preserve the established compensation behavior for
-                        // a known over-quota result. Unknown usage is rejected
-                        // by the preflight check before the upload is committed.
+        if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
+            if opts.replication_request {
+                let quota_checker = QuotaChecker::new(metadata_sys.clone());
+                match quota_checker
+                    .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size.max(0) as u64)
+                    .await
+                {
+                    Ok(check_result) if !check_result.allowed => {
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
                         let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
@@ -575,16 +615,22 @@ impl DefaultMultipartUsecase {
                             ),
                         ));
                     }
-                }
-                Err(err) => {
-                    warn!("Quota check failed for bucket {} after multipart completion: {}", bucket, err);
+                    Err(err) => {
+                        warn!("Quota check failed for bucket {} after multipart completion: {}", bucket, err);
+                    }
+                    Ok(_) => {}
                 }
             }
 
-            if versioned {
-                record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+            let committed_size = if opts.replication_request {
+                obj_info.size.max(0) as u64
             } else {
-                record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                quota_accounting_object_size(&obj_info, opts.quota_admission.is_some())?
+            };
+            if versioned {
+                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+            } else {
+                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
             }
         }
 
@@ -1592,6 +1638,37 @@ mod tests {
     }
 
     #[test]
+    fn quota_accounting_uses_logical_size_when_available() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "8192".to_string());
+        let info = ObjectInfo {
+            size: 128,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        assert_eq!(quota_accounting_object_size(&info, true).expect("logical size should resolve"), 8192);
+        assert_eq!(quota_accounting_object_size(&info, false).expect("logical size should resolve"), 8192);
+    }
+
+    #[test]
+    fn quota_accounting_fails_closed_only_when_quota_is_configured() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "-1".to_string());
+        let info = ObjectInfo {
+            size: 128,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let err = quota_accounting_object_size(&info, true).expect_err("invalid logical size must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(quota_accounting_object_size(&info, false).expect("physical fallback should resolve"), 128);
+    }
+
+    #[test]
     fn test_build_complete_multipart_location_uses_forwarded_proto_and_encodes_key() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::HOST, HeaderValue::from_static("storage.example.com:9000"));
@@ -1976,6 +2053,77 @@ mod tests {
             .await
             .expect_err("missing parts list must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn compressed_complete_records_logical_quota_usage_and_overwrite_delta() {
+        use crate::app::storage_api::multipart_usecase::bucket::quota::BucketQuota;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::data_usage::seed_bucket_usage_memory_for_test;
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+
+        let bucket = format!("compressed-complete-quota-{}", Uuid::new_v4());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create compressed quota bucket");
+        seed_bucket_usage_memory_for_test(&bucket, 0).await;
+
+        let usecase = DefaultMultipartUsecase::from_global();
+        let metadata_sys = usecase
+            .bucket_metadata_sys()
+            .expect("test app context should expose bucket metadata");
+        let mut quota_checker = QuotaChecker::new(metadata_sys);
+        quota_checker
+            .set_quota_config(&bucket, BucketQuota::new(Some(16_384)))
+            .await
+            .expect("configure bucket quota");
+
+        for (actual_size, payload_byte) in [(8192_i64, 0x61), (4096_i64, 0x62)] {
+            let mut create_opts = ObjectOptions::default();
+            insert_str(&mut create_opts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+            let upload = store
+                .new_multipart_upload(&bucket, object, &create_opts)
+                .await
+                .expect("create compressed multipart upload");
+            let payload = vec![payload_byte; 128];
+            let mut part_reader = PutObjReader::new(
+                HashReader::from_stream(Cursor::new(payload), 128, actual_size, None, None, false)
+                    .expect("construct compressed part reader"),
+            );
+            let staged_part = store
+                .put_object_part(&bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+                .await
+                .expect("write compressed multipart part");
+            let staged_etag = staged_part.etag.expect("staged compressed part should have an ETag");
+            let input = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .upload_id(upload.upload_id)
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(to_s3s_etag(&staged_etag)),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("complete multipart input should build");
+            usecase
+                .execute_complete_multipart_upload(build_request(input, Method::POST))
+                .await
+                .expect("compressed multipart completion should succeed");
+
+            let quota = quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, 0)
+                .await
+                .expect("read live quota usage");
+            assert_eq!(quota.current_usage, Some(actual_size as u64));
+        }
     }
 
     #[tokio::test]

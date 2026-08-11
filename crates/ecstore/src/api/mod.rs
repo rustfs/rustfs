@@ -308,6 +308,8 @@ pub mod config {
 }
 
 pub mod data_usage {
+    #[cfg(feature = "test-util")]
+    pub use crate::data_usage::seed_bucket_usage_memory_for_test;
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
@@ -409,10 +411,10 @@ pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
-        ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader,
-        ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
+        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,

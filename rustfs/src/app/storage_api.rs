@@ -67,7 +67,7 @@ pub(crate) mod data_usage {
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, store_data_usage_in_backend,
+        compute_bucket_usage, live_bucket_usage_computations, seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
@@ -597,6 +597,8 @@ pub(crate) mod bucket {
             pub(crate) type QuotaChecker = crate::storage::storage_api::ecstore_bucket::quota::checker::QuotaChecker;
         }
 
+        #[cfg(test)]
+        pub(crate) type BucketQuota = crate::storage::storage_api::ecstore_bucket::quota::BucketQuota;
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
         pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
         pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
@@ -1149,7 +1151,7 @@ pub(crate) mod multipart_usecase {
     }
 
     pub(crate) use super::{access, bucket, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse};
-    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectOptions, StoragePutObjReader};
+    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
 }
 
 pub(crate) mod select_object {
