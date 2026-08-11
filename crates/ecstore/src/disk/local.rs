@@ -11573,10 +11573,13 @@ mod test {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_rename_part_commits_realistic_windows_multipart_path() {
         use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
         use tempfile::tempdir;
 
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        assert_eq!(effective_durability(RUSTFS_META_MULTIPART_BUCKET), DurabilityMode::Strict);
         let dir = tempdir().expect("temp dir should be created");
         let root = dir.path().join("realistic-windows-multipart-root");
         fs::create_dir_all(&root).await.expect("disk root should be created");
