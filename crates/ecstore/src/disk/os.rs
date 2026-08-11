@@ -78,11 +78,16 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
 /// their own unique tempdir to stay robust against parallel test execution.
 #[cfg(test)]
 pub(crate) mod fsync_dir_recorder {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    type Hook = Box<dyn FnOnce() + Send>;
+
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static BEFORE_LIMITED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
     fn record_path(paths: &Mutex<Vec<PathBuf>>, path: &Path, description: &str) {
         let mut paths = paths.lock().expect(description);
@@ -111,10 +116,21 @@ pub(crate) mod fsync_dir_recorder {
 
     pub(crate) fn record_limited(dir: &Path) {
         record_path(&LIMITED, dir, "limited fsync dir recorder");
+        let hook = BEFORE_LIMITED.lock().expect("limited fsync hook poisoned").remove(dir);
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(crate) fn was_limited(dir: &Path) -> bool {
         contains_path(&LIMITED.lock().expect("limited fsync dir recorder poisoned"), dir)
+    }
+
+    pub(crate) fn set_before_limited(dir: &Path, hook: impl FnOnce() + Send + 'static) {
+        BEFORE_LIMITED
+            .lock()
+            .expect("limited fsync hook poisoned")
+            .insert(dir.to_path_buf(), Box::new(hook));
     }
 }
 
@@ -1161,7 +1177,16 @@ pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static
     admission: &FileSyncAdmission,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    let global_permit = FILE_SYNC_PERMITS
+    run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+}
+
+async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    global_permits: &Semaphore,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let global_permit = global_permits
         .acquire()
         .await
         .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
@@ -1181,13 +1206,22 @@ pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
 ) -> io::Result<()> {
-    let dir = dir.as_ref().to_path_buf();
-    run_blocking_namespace_file_sync_operation(lease, admission, move || {
-        #[cfg(test)]
-        fsync_dir_recorder::record_limited(&dir);
+    #[cfg(unix)]
+    {
+        let dir = dir.as_ref().to_path_buf();
+        run_blocking_namespace_file_sync_operation(lease, admission, move || {
+            #[cfg(test)]
+            fsync_dir_recorder::record_limited(&dir);
+            fsync_dir_std(dir)
+        })
+        .await
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (lease, admission);
         fsync_dir_std(dir)
-    })
-    .await
+    }
 }
 
 struct RenamePreparation {
@@ -4653,24 +4687,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(file_sync_probe)]
     async fn cancelled_file_sync_waiter_keeps_disk_admission_until_blocking_work_finishes() {
         use std::sync::mpsc;
 
         let temp_dir = tempdir().expect("create temp dir");
         let limiter = Arc::new(Semaphore::new(1));
-        let global_reservation = FILE_SYNC_PERMITS
-            .acquire_many((TEST_GLOBAL_FILE_SYNCS - 1) as u32)
-            .await
-            .expect("global file sync limiter should remain open");
+        let global_permits = Arc::new(Semaphore::new(1));
         let lease = acquire_namespace_mutation_lease(temp_dir.path()).await;
         let admission = acquire_file_sync_admission(limiter.clone())
             .await
             .expect("file sync admission should be acquired");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let waiter_global_permits = global_permits.clone();
         let waiter = tokio::spawn(async move {
-            run_blocking_namespace_file_sync_operation(lease, &admission, move || {
+            run_blocking_namespace_file_sync_operation_with_global(lease, &admission, waiter_global_permits.as_ref(), move || {
                 entered_tx.send(()).expect("signal blocking work");
                 release_rx.recv().expect("wait for blocking work release");
                 Ok(())
@@ -4684,7 +4715,7 @@ mod tests {
             .expect("blocking work should start");
         waiter.abort();
         assert!(waiter.await.expect_err("waiter should be cancelled").is_cancelled());
-        let returned_global_permit = FILE_SYNC_PERMITS
+        let returned_global_permit = global_permits
             .try_acquire()
             .expect("cancelled waiter must return global capacity for healthy disks");
         assert!(
@@ -4698,7 +4729,6 @@ mod tests {
             .expect("disk capacity should return after blocking work finishes")
             .expect("disk limiter should remain open");
         drop(returned_global_permit);
-        drop(global_reservation);
     }
 
     #[tokio::test]

@@ -2027,6 +2027,9 @@ type InlinePreparationHook = Box<dyn FnOnce() + Send>;
 static INLINE_PREPARATION_BEFORE_BACKUP: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
+static INLINE_BEFORE_FILE_SYNC_ADMISSION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
 static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
@@ -2088,6 +2091,14 @@ fn set_inline_preparation_before_backup(dst_path: &str, hook: impl FnOnce() + Se
     INLINE_PREPARATION_BEFORE_BACKUP
         .lock()
         .expect("test preparation hook lock should not be poisoned")
+        .insert(dst_path.to_string(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn set_inline_before_file_sync_admission(dst_path: &str, hook: impl FnOnce() + Send + 'static) {
+    INLINE_BEFORE_FILE_SYNC_ADMISSION
+        .lock()
+        .expect("test admission hook lock should not be poisoned")
         .insert(dst_path.to_string(), Box::new(hook));
 }
 
@@ -2230,6 +2241,17 @@ fn run_inline_preparation_before_backup(dst_path: &str) {
     let hook = INLINE_PREPARATION_BEFORE_BACKUP
         .lock()
         .expect("test preparation hook lock should not be poisoned")
+        .remove(dst_path);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn run_inline_before_file_sync_admission(dst_path: &str) {
+    let hook = INLINE_BEFORE_FILE_SYNC_ADMISSION
+        .lock()
+        .expect("test admission hook lock should not be poisoned")
         .remove(dst_path);
     if let Some(hook) = hook {
         hook();
@@ -9017,6 +9039,8 @@ impl DiskAPI for LocalDisk {
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = rename_commit_guard.clone();
             let sync = durability.syncs_commit_metadata();
+            #[cfg(test)]
+            run_inline_before_file_sync_admission(dst_path);
             let mut file_sync_admission = if sync {
                 Some(
                     os::acquire_file_sync_admission(self.file_sync_permits.clone())
@@ -12325,7 +12349,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
+    async fn windows_and_unix_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
         // The inline commit path (fi.data present) has the same mkdir gap as the
         // non-inline path: a first PUT under a new prefix must fsync the newly
         // created prefix and bucket dirs.
@@ -12354,17 +12378,121 @@ mod test {
             os::fsync_dir_recorder::was_fsynced(&prefix_dir),
             "the newly created prefix dir must be fsynced on an inline first PUT"
         );
-        assert!(
+        assert_eq!(
             os::fsync_dir_recorder::was_limited(&prefix_dir),
-            "inline prefix fsync must use the disk file-sync limit"
+            cfg!(unix),
+            "only Unix inline prefix fsyncs should use the disk file-sync limit"
         );
         assert!(
             os::fsync_dir_recorder::was_fsynced(&bucket_dir),
             "the bucket dir must be fsynced on an inline first PUT"
         );
-        assert!(
+        assert_eq!(
             os::fsync_dir_recorder::was_limited(&bucket_dir),
-            "inline bucket fsync must use the disk file-sync limit"
+            cfg!(unix),
+            "only Unix inline bucket fsyncs should use the disk file-sync limit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn strict_inline_rename_retains_admission_until_commit_fsync() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::mpsc;
+        use tempfile::tempdir;
+        use tokio::sync::oneshot;
+
+        const FIRST_BARRIER: u8 = 1;
+        const SECOND_PREPARATION: u8 = 2;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let mut disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.file_sync_permits = Arc::new(Semaphore::new(1));
+        let disk = Arc::new(disk);
+        let bucket = "inline-admission-order";
+        let first_object = "first-object";
+        let second_object = "second-object";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let (first_prepared_tx, first_prepared_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        set_inline_preparation_before_backup(first_object, move || {
+            first_prepared_tx.send(()).expect("signal first preparation");
+            release_first_rx.recv().expect("wait for queued rename");
+        });
+        let first_disk = disk.clone();
+        let first = tokio::spawn(async move {
+            first_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    "first-stage",
+                    test_file_info(first_object, Uuid::new_v4(), None, Some(Bytes::from_static(b"first"))),
+                    bucket,
+                    first_object,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || first_prepared_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("first preparation waiter should run")
+            .expect("first rename should hold the only disk admission");
+
+        let first_event = Arc::new(AtomicU8::new(0));
+        let first_barrier_event = first_event.clone();
+        let first_object_dir = disk
+            .get_object_path(bucket, first_object)
+            .expect("first object path should resolve");
+        os::fsync_dir_recorder::set_before_limited(&first_object_dir, move || {
+            let _ = first_barrier_event.compare_exchange(0, FIRST_BARRIER, Ordering::SeqCst, Ordering::SeqCst);
+        });
+
+        let second_preparation_event = first_event.clone();
+        set_inline_preparation_before_backup(second_object, move || {
+            second_preparation_event.fetch_or(SECOND_PREPARATION, Ordering::SeqCst);
+        });
+        let (second_admission_tx, second_admission_rx) = oneshot::channel();
+        set_inline_before_file_sync_admission(second_object, move || {
+            second_admission_tx.send(()).expect("signal second admission attempt");
+        });
+        let second_disk = disk.clone();
+        let mut second = Box::pin(async move {
+            second_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    "second-stage",
+                    test_file_info(second_object, Uuid::new_v4(), None, Some(Bytes::from_static(b"second"))),
+                    bucket,
+                    second_object,
+                )
+                .await
+        });
+        let mut second_admission_rx = Box::pin(second_admission_rx);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = &mut second => panic!("second rename must wait for disk admission"),
+                signal = &mut second_admission_rx => signal.expect("second admission hook should run"),
+            }
+        })
+        .await
+        .expect("second rename should reach the admission queue");
+
+        release_first_tx.send(()).expect("release first preparation");
+        let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(first, second) })
+            .await
+            .expect("both inline renames should complete");
+        first_result
+            .expect("first rename task should join")
+            .expect("first inline rename should commit");
+        second_result.expect("second inline rename should commit");
+
+        assert_eq!(
+            first_event.load(Ordering::SeqCst),
+            FIRST_BARRIER | SECOND_PREPARATION,
+            "the queued rename must not overtake the admitted rename before its commit fsync"
         );
     }
 
@@ -13683,17 +13811,19 @@ mod test {
             os::fsync_dir_recorder::was_fsynced(backup_path.parent().expect("backup must have a parent")),
             "strict inline overwrite must persist the rollback backup directory entry"
         );
-        assert!(
+        assert_eq!(
             os::fsync_dir_recorder::was_limited(backup_path.parent().expect("backup must have a parent")),
-            "strict inline rollback backup fsync must use the disk file-sync limit"
+            cfg!(unix),
+            "only Unix rollback backup fsyncs should use the disk file-sync limit"
         );
         assert!(
             os::fsync_dir_recorder::was_fsynced(&dst_object_dir),
             "strict inline overwrite must persist the committed xl.meta directory entry"
         );
-        assert!(
+        assert_eq!(
             os::fsync_dir_recorder::was_limited(&dst_object_dir),
-            "strict inline commit fsync must use the disk file-sync limit"
+            cfg!(unix),
+            "only Unix inline commit fsyncs should use the disk file-sync limit"
         );
         // The rollback backup must contain the previous metadata bytes verbatim so
         // that undo_write can restore the prior committed object; guards the inline
