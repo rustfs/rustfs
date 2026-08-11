@@ -1080,17 +1080,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         if iam_allowed {
             if !internal_object_authorization {
-                authorize_table_data_plane_if_needed(
-                    req,
-                    action,
-                    bucket.as_str(),
-                    object.as_str(),
-                    cred,
-                    is_owner,
-                    &conditions,
-                    claims,
-                )
-                .await?;
+                authorize_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions)
+                    .await?;
             }
             return Ok(());
         }
@@ -1114,17 +1105,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         if policy_allowed_fallback {
             if !internal_object_authorization {
-                authorize_table_data_plane_if_needed(
-                    req,
-                    action,
-                    bucket.as_str(),
-                    object.as_str(),
-                    cred,
-                    is_owner,
-                    &conditions,
-                    claims,
-                )
-                .await?;
+                authorize_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions)
+                    .await?;
             }
             return Ok(());
         }
@@ -1584,7 +1566,6 @@ async fn authorize_table_data_plane_if_needed<T>(
     cred: &rustfs_credentials::Credentials,
     is_owner: bool,
     conditions: &HashMap<String, Vec<String>>,
-    claims: &HashMap<String, serde_json::Value>,
 ) -> S3Result<()> {
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
@@ -1599,6 +1580,8 @@ async fn authorize_table_data_plane_if_needed<T>(
     let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
+    let default_claims = HashMap::new();
+    let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
     let resource_object = resource.catalog_resource_object();
     let allowed = iam_store

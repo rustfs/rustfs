@@ -5084,7 +5084,7 @@ mod tests {
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
-        jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
+        get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
         manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
@@ -5141,7 +5141,6 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::WarmBackend as _;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
-    #[cfg(feature = "test-util")]
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
