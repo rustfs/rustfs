@@ -7890,6 +7890,11 @@ impl DiskAPI for LocalDisk {
                 std::io::Write::write_all(&mut new_meta, &meta)?;
                 if durability.syncs_commit_metadata() {
                     new_meta.sync_data()?;
+                }
+                // Windows rejects renaming a directory while one of its children is
+                // still open, even when the child handle shares delete access.
+                drop(new_meta);
+                if durability.syncs_commit_metadata() {
                     os::fsync_dir_std(&staging_path)?;
                 }
                 std::fs::rename(&staging_path, &transaction_path)?;
@@ -8096,7 +8101,7 @@ impl DiskAPI for LocalDisk {
         let durability = effective_durability(dst_volume);
         if durability.syncs_data_shards() && !src_is_dir {
             let src = src_file_path.clone();
-            tokio::task::spawn_blocking(move || std::fs::File::open(&src)?.sync_data())
+            tokio::task::spawn_blocking(move || os::sync_file(&src))
                 .await
                 .map_err(DiskError::from)?
                 .map_err(to_file_error)?;
@@ -11564,6 +11569,116 @@ mod test {
                 .expect("legacy destination metadata should be readable"),
             legacy_meta
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_part_commits_realistic_windows_multipart_path() {
+        use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        assert_eq!(effective_durability(RUSTFS_META_MULTIPART_BUCKET), DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let root = dir.path().join("realistic-windows-multipart-root");
+        fs::create_dir_all(&root).await.expect("disk root should be created");
+        let endpoint = Endpoint::try_from(root.to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+
+        let src_path = "upload/part.1";
+        let dst_path = concat!(
+            "6f897928dfe04a87a269ccd9f5a5897d9cbbdf6b55e4d903ef3cbc1125c0cb8f/",
+            "8f897819-2604-4f3d-b843-c32a45d198b2x1786372838834745500/",
+            "58ba822c-06e4-4332-81cc-be2c9d921900/part.1"
+        );
+        let transaction_path = disk
+            .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(dst_path))
+            .expect("transaction path should resolve");
+        let deepest_marker = transaction_path
+            .parent()
+            .expect("transaction path should have a parent")
+            .join(".part-txn-00000000-0000-0000-0000-000000000000")
+            .join(PART_TRANSACTION_OLD_DATA_ABSENT);
+        assert!(
+            deepest_marker.as_os_str().len() > 260,
+            "regression path must cross the traditional Windows MAX_PATH boundary: {deepest_marker:?}"
+        );
+        let payload = Bytes::from_static(b"part payload");
+        let meta = Bytes::from_static(b"part metadata");
+        disk.write_all(RUSTFS_META_TMP_BUCKET, src_path, payload.clone())
+            .await
+            .expect("source part should be written");
+
+        disk.prepare_part_transaction(RUSTFS_META_TMP_BUCKET, src_path, RUSTFS_META_MULTIPART_BUCKET, dst_path, meta.clone())
+            .await
+            .expect("realistic Windows part transaction should be prepared");
+        disk.rename_part(RUSTFS_META_TMP_BUCKET, src_path, RUSTFS_META_MULTIPART_BUCKET, dst_path, meta.clone())
+            .await
+            .expect("realistic Windows part should be committed");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_path, PartTransactionAction::Commit)
+            .await
+            .expect("realistic Windows part transaction should be settled");
+
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, dst_path)
+                .await
+                .expect("destination part should be readable"),
+            payload
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &format!("{dst_path}.meta"))
+                .await
+                .expect("destination metadata should be readable"),
+            meta
+        );
+
+        let replacement_payload = Bytes::from_static(b"replacement part payload");
+        let replacement_meta = Bytes::from_static(b"replacement part metadata");
+        disk.write_all(RUSTFS_META_TMP_BUCKET, src_path, replacement_payload.clone())
+            .await
+            .expect("replacement source part should be written");
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            src_path,
+            RUSTFS_META_MULTIPART_BUCKET,
+            dst_path,
+            replacement_meta.clone(),
+        )
+        .await
+        .expect("replacement Windows part transaction should be prepared");
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            src_path,
+            RUSTFS_META_MULTIPART_BUCKET,
+            dst_path,
+            replacement_meta.clone(),
+        )
+        .await
+        .expect("replacement Windows part should be committed");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_path, PartTransactionAction::Commit)
+            .await
+            .expect("replacement Windows part transaction should be settled");
+
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, dst_path)
+                .await
+                .expect("replacement destination part should be readable"),
+            replacement_payload
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &format!("{dst_path}.meta"))
+                .await
+                .expect("replacement destination metadata should be readable"),
+            replacement_meta
+        );
+        assert!(
+            matches!(disk.read_all(RUSTFS_META_TMP_BUCKET, src_path).await, Err(DiskError::FileNotFound)),
+            "successful replacement must remove its source part"
+        );
+        assert!(!transaction_path.exists(), "settled replacement must remove its transaction directory");
     }
 
     #[tokio::test]

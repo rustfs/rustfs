@@ -32,7 +32,7 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            TargetClient,
+            TargetClient, append_version_id_query,
         };
     }
 
@@ -281,7 +281,7 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config,
+            ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config, delete_config_no_lock,
             is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
             read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
             read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_server_config,

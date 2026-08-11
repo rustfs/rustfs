@@ -97,6 +97,14 @@ Current guidance:
   - enables minimal payload mode for GET health responses (`status`, `ready` only).
 - `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS`
   - TTL for readiness cache evaluation.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_ENABLE`
+  - withdraws readiness when bounded object read/write stages stop completing while requests remain active.
+  - default is `true`.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS`
+  - maximum time without completion in a bounded object stage before readiness is withdrawn.
+  - default is `30000`; `0` uses the default.
+  - the effective value is at least 5 seconds longer than `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT`.
+  - this readiness SLO is independent of disk read/write failure deadlines and may withdraw traffic before those deadlines expire.
 - `RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE`
   - enables busy protection behavior for health probes.
   - default is `false`.

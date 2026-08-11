@@ -1450,7 +1450,7 @@ fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
 /// member, so the query is spliced in via `map_request`, which runs at
 /// `modify_before_signing`: the parameter becomes part of the SigV4 canonical
 /// request.
-fn append_version_id_query(uri: &str, version_id: &str) -> String {
+pub fn append_version_id_query(uri: &str, version_id: &str) -> String {
     let separator = if uri.contains('?') { '&' } else { '?' };
     format!("{uri}{separator}versionId={}", urlencoding::encode(version_id))
 }
@@ -1861,6 +1861,9 @@ impl TargetClient {
         }
     }
 
+    /// On success returns the version id the target assigned (from
+    /// `x-amz-version-id`), letting callers audit the version-identity
+    /// contract — a target that adopts the source version echoes it back.
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -1868,7 +1871,7 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<(), S3ClientError> {
+    ) -> Result<Option<String>, S3ClientError> {
         let mut headers = opts.header();
 
         let builder = self.client.put_object();
@@ -1903,7 +1906,7 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(output) => Ok(output.version_id().map(ToOwned::to_owned)),
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();

@@ -497,7 +497,7 @@ pub(crate) mod file_sync_probe {
     }
 }
 
-fn sync_file(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     let _probe = file_sync_probe::enter(path);
     #[cfg(test)]

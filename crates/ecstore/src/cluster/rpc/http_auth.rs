@@ -73,10 +73,14 @@ pub const RPC_REPLAY_SCOPE_NONCE_HEADER: &str = "x-rustfs-rpc-replay-nonce";
 pub const RPC_BOOT_EPOCH_HEADER: &str = "x-rustfs-rpc-boot-epoch";
 pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-challenge";
 pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay-cache-capability";
+pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
+const RPC_REPLAY_CACHE_CAPABILITY_V1: &str = "dynamic-replay-cache-v1";
 const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
 const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -85,8 +89,9 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const REPLAY_CACHE_RETENTION_SECS: usize = 601;
 const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
-const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 8;
-const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 2048;
+// Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
+const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
+const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
 const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
@@ -102,6 +107,10 @@ static INTERNODE_RPC_BODY_DIGEST_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
     )
 });
+
+pub(crate) fn internode_rpc_body_digest_strict() -> bool {
+    *INTERNODE_RPC_BODY_DIGEST_STRICT
+}
 static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
@@ -789,6 +798,50 @@ fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_e
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC boot epoch proof"))
 }
 
+fn update_replay_cache_capability_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN);
+    for part in [
+        audience.as_bytes(),
+        b"|",
+        challenge.as_bytes(),
+        b"|",
+        boot_epoch.as_bytes(),
+        b"|",
+        RPC_REPLAY_CACHE_CAPABILITY_V1.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_replay_cache_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    proof: &str,
+) -> std::io::Result<()> {
+    let proof = general_purpose::STANDARD
+        .decode(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC replay cache capability proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC replay cache capability proof"))
+}
+
 fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
     let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
     (!value.is_nil())
@@ -871,15 +924,34 @@ pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option
 /// Build the authenticated response headers for a client boot-epoch challenge.
 pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
     let boot_epoch = tonic_rpc_boot_epoch();
-    let proof = generate_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch)?;
+    let secret = get_shared_secret()?;
+    let proof = generate_boot_epoch_proof(&secret, audience, challenge, boot_epoch)?;
+    let capability_proof = generate_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch)?;
     let mut headers = HeaderMap::new();
     headers.insert(RPC_BOOT_EPOCH_HEADER, header_value(&boot_epoch.to_string(), RPC_BOOT_EPOCH_HEADER)?);
     headers.insert(RPC_BOOT_EPOCH_PROOF_HEADER, header_value(&proof, RPC_BOOT_EPOCH_PROOF_HEADER)?);
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_HEADER,
+        HeaderValue::from_static(RPC_REPLAY_CACHE_CAPABILITY_V1),
+    );
+    headers.insert(
+        RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+        header_value(&capability_proof, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)?,
+    );
     Ok(headers)
 }
 
 /// Verify the server boot-epoch response for a challenge generated by this client.
 pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers: &HeaderMap) -> std::io::Result<Uuid> {
+    verify_tonic_boot_epoch_response_with_secret(&get_shared_secret()?, audience, challenge, headers)
+}
+
+fn verify_tonic_boot_epoch_response_with_secret(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<Uuid> {
     let boot_epoch = headers
         .get(RPC_BOOT_EPOCH_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -889,8 +961,45 @@ pub fn verify_tonic_boot_epoch_response(audience: &str, challenge: Uuid, headers
         .get(RPC_BOOT_EPOCH_PROOF_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| std::io::Error::other("Missing RPC boot epoch proof"))?;
-    verify_boot_epoch_proof(&get_shared_secret()?, audience, challenge, boot_epoch, proof)?;
+    verify_boot_epoch_proof(secret, audience, challenge, boot_epoch, proof)?;
     Ok(boot_epoch)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPeerReplayCapabilities {
+    pub(crate) boot_epoch: Uuid,
+    pub(crate) dynamic_replay_cache: bool,
+}
+
+pub(crate) fn verify_tonic_peer_replay_capabilities_response(
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerReplayCapabilities> {
+    let secret = get_shared_secret()?;
+    let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
+    let capability = headers.get(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
+    let proof = headers.get(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
+    if capability.is_none() && proof.is_none() {
+        return Ok(AuthenticatedPeerReplayCapabilities {
+            boot_epoch,
+            dynamic_replay_cache: false,
+        });
+    }
+    let capability = capability
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability"))?;
+    if capability != RPC_REPLAY_CACHE_CAPABILITY_V1 {
+        return Err(std::io::Error::other("Unsupported RPC replay cache capability"));
+    }
+    let proof = proof
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC replay cache capability proof"))?;
+    verify_replay_cache_capability_proof(&secret, audience, challenge, boot_epoch, proof)?;
+    Ok(AuthenticatedPeerReplayCapabilities {
+        boot_epoch,
+        dynamic_replay_cache: true,
+    })
 }
 
 fn valid_content_sha256(value: &str) -> bool {
@@ -1103,6 +1212,23 @@ pub fn set_tonic_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
     set_tonic_canonical_body_digest(request, &canonical_body)
 }
 
+pub fn set_tonic_rolling_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(
+    request: &mut tonic::Request<T>,
+) -> std::io::Result<()> {
+    set_tonic_mutation_body_digest(request)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+pub fn set_tonic_rolling_canonical_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    set_tonic_canonical_body_digest(request, canonical_body)?;
+    request.extensions_mut().insert(RollingMutationBodyDigest);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RollingMutationBodyDigest;
+
 pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     let version = request
         .metadata()
@@ -1139,7 +1265,7 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
 /// including v1-downgraded ones. It converges independently of the signature-strict switch
 /// (<https://github.com/rustfs/backlog/issues/1327>).
 pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
-    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, *INTERNODE_RPC_BODY_DIGEST_STRICT)
+    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, internode_rpc_body_digest_strict())
 }
 
 /// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
@@ -2193,6 +2319,23 @@ mod tests {
     }
 
     #[test]
+    fn replay_cache_capability_proof_binds_audience_challenge_epoch_and_value() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("capability headers should build");
+        let capabilities = verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &headers)
+            .expect("matching capability proof should verify");
+        assert_eq!(capabilities.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(capabilities.dynamic_replay_cache);
+        assert!(verify_tonic_peer_replay_capabilities_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+
+        let mut changed_capability = headers;
+        changed_capability.insert(RPC_REPLAY_CACHE_CAPABILITY_HEADER, HeaderValue::from_static("dynamic-replay-cache-v2"));
+        assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
+    }
+
+    #[test]
     fn tonic_rpc_auth_failure_reason_maps_security_relevant_errors() {
         for (message, reason) in [
             ("Invalid RPC v2 signature", "invalid_v2_signature"),
@@ -2552,21 +2695,27 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 10_737_418);
-        assert_eq!(decision.cpu_based_capacity, 9_846_784);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.memory_based_capacity, 17_448_304);
+        assert_eq!(decision.cpu_based_capacity, 19_693_568);
+        assert_eq!(decision.capacity, 17_448_304);
     }
 
     #[test]
-    fn replay_cache_capacity_auto_uses_resource_model_on_larger_nodes() {
+    fn replay_cache_capacity_auto_uses_32m_on_field_sized_nodes() {
         let gib = 1024_u64 * 1024 * 1024;
         let decision =
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 21_474_836);
-        assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 19_693_568);
+        assert_eq!(decision.memory_based_capacity, 34_896_609);
+        assert_eq!(decision.cpu_based_capacity, 39_387_136);
+        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
+
+        let observed_field_node =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
+        assert_eq!(observed_field_node.memory_based_capacity, 33_806_090);
+        assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
+        assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
 
     #[test]
@@ -2598,7 +2747,7 @@ mod tests {
         let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
-        assert_eq!(decision.capacity, 9_846_784);
+        assert_eq!(decision.capacity, 19_693_568);
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
