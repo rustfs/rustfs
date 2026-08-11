@@ -443,16 +443,20 @@ where
                 continue;
             };
             let table_key = (table_bucket.clone(), namespace.clone(), table.clone());
-            if let Some(existing_key) = warehouse_index
-                .entry(table_bucket.clone())
-                .or_default()
-                .insert(warehouse_object_prefix.clone(), table_key.clone())
+            let bucket_index = warehouse_index.entry(table_bucket.clone()).or_default();
+            let predecessor = bucket_index.range(..=warehouse_object_prefix.clone()).next_back();
+            let successor = bucket_index.range(warehouse_object_prefix.clone()..).next();
+            if let Some((existing_prefix, existing_key)) = predecessor
+                .into_iter()
+                .chain(successor)
+                .find(|(existing_prefix, _)| warehouse_object_prefixes_overlap(existing_prefix, &warehouse_object_prefix))
             {
                 return Err(TableCatalogStoreError::Invalid(format!(
-                    "duplicate active table warehouse location in strong catalog snapshot: {warehouse_object_prefix} is owned by {}/{}/{} and {}/{}/{}",
+                    "overlapping active table warehouse location in strong catalog snapshot: {warehouse_object_prefix} overlaps {existing_prefix} owned by {}/{}/{} and {}/{}/{}",
                     existing_key.0, existing_key.1, existing_key.2, table_key.0, table_key.1, table_key.2
                 )));
             }
+            bucket_index.insert(warehouse_object_prefix, table_key);
         }
         state.warehouse_index = warehouse_index;
         Ok(())
@@ -696,9 +700,9 @@ where
             let Ok(existing_prefix) = table_warehouse_object_prefix(existing) else {
                 continue;
             };
-            if existing_prefix == candidate_prefix {
+            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
                 return Err(TableCatalogStoreError::Conflict(format!(
-                    "table warehouse location is already registered: {candidate_prefix}"
+                    "table warehouse location overlaps an active table: {candidate_prefix}"
                 )));
             }
         }
@@ -709,6 +713,14 @@ where
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
+        let history = TableCommitHistoryIndex::new(
+            entry,
+            state
+                .commits
+                .iter()
+                .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
+                .map(|(_, commit_log)| commit_log),
+        );
         let mut commits = state
             .commits
             .iter()
@@ -719,7 +731,7 @@ where
                         .idempotency
                         .get(&Self::idempotency_key(&entry.table_bucket, &entry.table_id, idempotency_key))
                 });
-                table_commit_recovery_entry(entry, commit_log, idempotency_commit)
+                table_commit_recovery_entry(entry, commit_log, idempotency_commit, history.proves_committed(commit_log))
             })
             .collect::<Vec<_>>();
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
@@ -783,18 +795,11 @@ where
             .map(|idempotency_key| Self::idempotency_key(&request.table_bucket, &current.table_id, idempotency_key));
         let existing_idempotency_commit = idempotency_key.as_ref().and_then(|key| state.idempotency.get(key));
 
-        if let Some(existing) = existing_commit {
-            if !commit_log_matches_request(existing, request, &current.table_id) {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "commit id already exists: {}",
-                    request.commit_id
-                )));
-            }
-            if matches!(existing.status, CommitLogStatus::Committed) || table_matches_committed_log(&current, existing) {
-                return Ok(current);
-            }
+        if let (Some(existing), Some(indexed)) = (existing_commit, existing_idempotency_commit)
+            && !commit_logs_share_recovery_payload(existing, indexed)
+        {
             return Err(TableCatalogStoreError::Conflict(
-                "existing commit record does not match current table state".to_string(),
+                "commit record and idempotency index contain different payloads".to_string(),
             ));
         }
         if let Some(existing) = existing_idempotency_commit
@@ -802,9 +807,53 @@ where
         {
             return Err(TableCatalogStoreError::Conflict("idempotency key already exists".to_string()));
         }
-        if existing_idempotency_commit.is_some() {
+        if existing_commit.is_none() && existing_idempotency_commit.is_some() {
             return Err(TableCatalogStoreError::Conflict(
                 "idempotency key exists without a recoverable commit record".to_string(),
+            ));
+        }
+
+        if let Some(existing) = existing_commit {
+            if !commit_log_matches_request(existing, request, &current.table_id) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "commit id already exists: {}",
+                    request.commit_id
+                )));
+            }
+            if matches!(existing.status, CommitLogStatus::Failed) {
+                return Err(TableCatalogStoreError::Conflict("failed commit record cannot be replayed".to_string()));
+            }
+            if matches!(existing.status, CommitLogStatus::Committed) && table_matches_staged_base(&current, existing) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "committed record still matches the pre-commit table state".to_string(),
+                ));
+            }
+            let historically_committed = if matches!(existing.status, CommitLogStatus::Staged)
+                && !table_matches_staged_base(&current, existing)
+                && !table_matches_committed_log(&current, existing)
+            {
+                TableCommitHistoryIndex::new(
+                    &current,
+                    state
+                        .commits
+                        .iter()
+                        .filter(|((table_bucket, table_id, _), _)| {
+                            table_bucket == &request.table_bucket && table_id == &current.table_id
+                        })
+                        .map(|(_, commit_log)| commit_log),
+                )
+                .proves_committed(existing)
+            } else {
+                false
+            };
+            if matches!(existing.status, CommitLogStatus::Committed)
+                || (matches!(existing.status, CommitLogStatus::Staged)
+                    && (table_matches_committed_log(&current, existing) || historically_committed))
+            {
+                return Ok(current);
+            }
+            return Err(TableCatalogStoreError::Conflict(
+                "existing commit record does not match current table state".to_string(),
             ));
         }
         if current.version_token != request.expected_version_token {
@@ -831,15 +880,38 @@ where
         current: TableEntry,
     ) -> Option<TableCommitResult> {
         let commit_key = Self::commit_key(&request.table_bucket, &current.table_id, &request.commit_id);
-        let existing = state.commits.get(&commit_key)?;
-        if !commit_log_matches_request(existing, request, &current.table_id) {
+        let existing = state.commits.get(&commit_key)?.clone();
+        if !commit_log_matches_request(&existing, request, &current.table_id) {
             return None;
         }
-        if !matches!(existing.status, CommitLogStatus::Committed) && !table_matches_committed_log(&current, existing) {
+        let historically_committed = if matches!(existing.status, CommitLogStatus::Staged)
+            && !table_matches_staged_base(&current, &existing)
+            && !table_matches_committed_log(&current, &existing)
+        {
+            TableCommitHistoryIndex::new(
+                &current,
+                state
+                    .commits
+                    .iter()
+                    .filter(|((table_bucket, table_id, _), _)| {
+                        table_bucket == &request.table_bucket && table_id == &current.table_id
+                    })
+                    .map(|(_, commit_log)| commit_log),
+            )
+            .proves_committed(&existing)
+        } else {
+            false
+        };
+        if matches!(existing.status, CommitLogStatus::Failed)
+            || (matches!(existing.status, CommitLogStatus::Committed) && table_matches_staged_base(&current, &existing))
+            || (!matches!(existing.status, CommitLogStatus::Committed)
+                && !table_matches_committed_log(&current, &existing)
+                && !historically_committed)
+        {
             return None;
         }
 
-        let mut committed = existing.clone();
+        let mut committed = existing;
         committed.status = CommitLogStatus::Committed;
         state.commits.insert(commit_key, committed.clone());
         if let Some(idempotency_key) = committed.idempotency_key.as_deref() {
@@ -1202,12 +1274,36 @@ where
     }
 
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
-        let _write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        self.register_table_with_publication(entry, &publication).await
+    }
+
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
         validate_catalog_entry_version("table", entry.version)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         table_warehouse_object_prefix(&entry)?;
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
+            .await?;
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration requires a table publication fence".to_string(),
+            ));
+        }
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
         let (snapshot, precondition) = {
             let state = self.state.lock().await;
@@ -1328,12 +1424,31 @@ where
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
-        let _write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        publication.begin_table_bucket(&request.table_bucket).await?;
+        self.commit_table_with_publication(request, &publication).await
+    }
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&request.table_bucket, &namespace, &table);
 
         let committed_existing_result = {
@@ -1396,6 +1511,7 @@ where
                 ))),
             );
         };
+        validate_commit_metadata_digest(&request, &new_metadata_object)?;
         let table_bucket = request.table_bucket.clone();
         let metadata_location = request.new_metadata_location.clone();
         let next_warehouse_location = tokio::task::spawn_blocking(move || {
@@ -1403,6 +1519,36 @@ where
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
+        let current_warehouse_location = {
+            let state = self.state.lock().await;
+            state
+                .tables
+                .get(&key)
+                .map(|entry| entry.warehouse_location.clone())
+                .ok_or_else(|| {
+                    TableCatalogStoreError::NotFound(format!(
+                        "table {}/{}/{}",
+                        request.table_bucket, request.namespace, request.table
+                    ))
+                })?
+        };
+        if next_warehouse_location
+            .as_ref()
+            .is_some_and(|warehouse_location| warehouse_location != &current_warehouse_location)
+            && !publication.holds_table_bucket(&request.table_bucket)
+        {
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Internal(
+                    "table warehouse relocation requires a table-bucket publication fence".to_string(),
+                )),
+            );
+        }
 
         let cas_started = Instant::now();
         let prepared_result = {
@@ -1433,6 +1579,15 @@ where
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        publication.begin_table_bucket(table_bucket).await?;
+        publication.prepare(table_bucket, namespace, table).await?;
+        if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table drop requires table-bucket and table publication fences".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;

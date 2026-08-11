@@ -188,6 +188,25 @@ pub async fn validate_admin_request_with_bucket_object(
     evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
 }
 
+pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<S: Store>(
+    iam_store: Arc<IamSys<S>>,
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    action: Action,
+    remote_addr: Option<std::net::SocketAddr>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<()> {
+    let ctx = AuthContext {
+        headers,
+        cred,
+        is_owner,
+        deny_only: false,
+        remote_addr,
+    };
+    evaluate_admin_actions(iam_store, &ctx, &[action], resource.bucket, resource.object).await
+}
+
 /// Admin gate for KMS endpoints that act on one key.
 ///
 /// `key_id` is the identifier as requested (before any alias resolution), so a

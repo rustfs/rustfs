@@ -23,6 +23,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
+use rustfs_policy::policy::BucketPolicy;
 use std::collections::BTreeMap;
 use std::future::Future;
 
@@ -153,6 +154,31 @@ where
 }
 
 impl ECStore {
+    pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get(bucket).await
+    }
+
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get_bucket_policy(bucket).await
+    }
+
+    pub async fn get_bucket_policy_raw(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        sys.read().await.get_bucket_policy_raw(bucket).await
+    }
+
+    pub async fn restricts_public_bucket_access(&self, bucket: &str) -> Result<bool> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let (config, _) = sys.read().await.get_public_access_block_config(bucket).await?;
+        Ok(config.restrict_public_buckets.unwrap_or(false))
+    }
+
+    pub async fn update_bucket_metadata_config(&self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+        metadata_sys::update_in(&self.ctx, bucket, config_file, data).await
+    }
+
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
         metadata_sys::get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
@@ -1075,6 +1101,26 @@ mod tests {
         }
 
         (temp_dir, ecstore)
+    }
+
+    #[tokio::test]
+    async fn request_metadata_methods_fail_closed_before_instance_initialization() {
+        let (_temp_dir, store) = setup_multi_pool_scanner_listing_test_env().await;
+
+        let expected = "bucket metadata sys not initialized for this instance";
+        let errors = [
+            store.get_bucket_metadata("bucket").await.unwrap_err(),
+            store.get_bucket_policy("bucket").await.unwrap_err(),
+            store.get_bucket_policy_raw("bucket").await.unwrap_err(),
+            store.restricts_public_bucket_access("bucket").await.unwrap_err(),
+            store
+                .update_bucket_metadata_config("bucket", crate::bucket::metadata::BUCKET_POLICY_CONFIG, Vec::new())
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.to_string(), format!("Io error: {expected}"));
+        }
     }
 
     async fn create_bucket_with_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str) {

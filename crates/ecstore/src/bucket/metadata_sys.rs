@@ -288,6 +288,13 @@ pub(crate) fn bucket_metadata_sys_of(ctx: &crate::runtime::instance::InstanceCon
     get_bucket_metadata_sys()
 }
 
+pub(crate) fn require_bucket_metadata_sys_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+) -> Result<Arc<RwLock<BucketMetadataSys>>> {
+    ctx.bucket_metadata_sys()
+        .ok_or_else(|| Error::other("bucket metadata sys not initialized for this instance"))
+}
+
 pub(crate) async fn object_store_in(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<ECStore>> {
     let sys = bucket_metadata_sys_of(ctx)?;
     Ok(sys.read().await.api.clone())
@@ -374,6 +381,15 @@ pub(crate) async fn inject_object_lock_disk_read_error_in(
 /// write — not just the replication-targets one — has to hold that lock.
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
     Box::pin(update_with_sys(get_bucket_metadata_sys()?, bucket, config_file, data)).await
+}
+
+pub(crate) async fn update_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+) -> Result<OffsetDateTime> {
+    Box::pin(update_with_sys(require_bucket_metadata_sys_in(ctx)?, bucket, config_file, data)).await
 }
 
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {

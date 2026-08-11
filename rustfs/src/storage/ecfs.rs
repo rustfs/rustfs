@@ -34,7 +34,7 @@ use crate::storage::storage_api::ecfs_consumer::contract::{
 use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
-use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
@@ -128,6 +128,15 @@ impl FS {
         let Some(store) = self.server_ctx.object_store() else {
             return Ok(std::collections::HashMap::new());
         };
+        Self::get_object_tag_conditions_for_policy_from_store(store.as_ref(), bucket, object, version_id).await
+    }
+
+    pub(crate) async fn get_object_tag_conditions_for_policy_from_store(
+        store: &ECStore,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
         let opts = ObjectOptions {
             version_id: version_id.map(String::from),
             ..Default::default()
