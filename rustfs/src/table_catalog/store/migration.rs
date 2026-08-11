@@ -390,6 +390,23 @@ where
                 "migration snapshot contains duplicate idempotency lookup keys".to_string(),
             ));
         }
+        let mut commit_logs_by_table = BTreeMap::<&str, Vec<&CommitLogEntry>>::new();
+        for record in &snapshot.commits {
+            commit_logs_by_table
+                .entry(record.table_id.as_str())
+                .or_default()
+                .push(&record.commit);
+        }
+        let history_by_table = tables_by_id
+            .iter()
+            .map(|(table_id, table)| {
+                let commits = commit_logs_by_table
+                    .get(table_id)
+                    .into_iter()
+                    .flat_map(|commits| commits.iter().copied());
+                (*table_id, TableCommitHistoryIndex::new(table, commits))
+            })
+            .collect::<BTreeMap<_, _>>();
         for record in &snapshot.commits {
             let table = tables_by_id.get(record.table_id.as_str()).ok_or_else(|| {
                 TableCatalogStoreError::Invalid(format!("commit {} has no table in migration snapshot", record.commit.commit_id))
@@ -408,7 +425,14 @@ where
                 .idempotency_key
                 .as_deref()
                 .and_then(|idempotency_key| idempotency_by_key.get(&(record.table_id.as_str(), idempotency_key)).copied());
-            let recovery = table_commit_recovery_entry(table, &record.commit, indexed);
+            let recovery = table_commit_recovery_entry(
+                table,
+                &record.commit,
+                indexed,
+                history_by_table
+                    .get(record.table_id.as_str())
+                    .is_some_and(|history| history.proves_committed(&record.commit)),
+            );
             if recovery.recovery_state != TableCommitRecoveryState::Committed {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "commit {} requires catalog recovery before durable strong migration",

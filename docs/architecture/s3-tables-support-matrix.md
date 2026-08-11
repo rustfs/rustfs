@@ -92,6 +92,7 @@ catalog extension.
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the table pointer. |
 | Metadata cleanup delete | Supported | Deletes only candidates that pass the safety window and current-pointer checks. |
+| Ordinary bucket lifecycle expiry | Disabled for table buckets | Table bucket objects are excluded from ordinary lifecycle expiration, including already queued expiry work. Snapshot expiration and orphan cleanup remain catalog maintenance operations so referenced Iceberg files cannot be deleted outside publication fencing. |
 | Snapshot expiration planning | Supported | Produces expiration plans with retained and candidate snapshots. |
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
@@ -112,6 +113,7 @@ catalog extension.
 |---|---|---|
 | Single-table CAS | Supported | The table pointer advances only through expected-token and expected-metadata-location validation. |
 | Idempotent retry | Supported | Repeated commit IDs can return the already finalized result or surface recoverable finalization gaps. |
+| Commit publication fencing | Supported with rolling-upgrade gate | Existing deployments retain exact object guards so older writers cannot mutate referenced files during publication. Set `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` only after every serving node supports table and table-bucket publication fences. In scalable mode, active table warehouse prefixes must not overlap, ordinary lifecycle expiry remains disabled for table buckets, and first enablement, first publication, drop, and warehouse relocation are serialized by the table-bucket fence. |
 | Post-CAS finalization recovery | Supported | Diagnostics and recovery can repair stale or missing idempotency indexes without changing the current table pointer. |
 | Catalog export | Supported | Exposes table state, commit recovery state, and backing migration information for operator inspection. |
 | Strong backing state transfer | Supported | Object-backed table bucket, namespace, table, view, commit-log, and idempotency state can be materialized into the durable strong snapshot. The transfer is deterministic, ETag-CAS protected, idempotent after an interrupted finalization, and fails closed when a table or view has no owning namespace entry. |
