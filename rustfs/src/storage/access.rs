@@ -1438,8 +1438,15 @@ fn table_data_plane_content_mutation(action: Action) -> bool {
 fn table_catalog_backend_for_data_plane<T>(
     req: &S3Request<T>,
 ) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let store = request_object_store(req)?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
+    let context = match req.extensions.get::<Arc<ServerContextSlot>>() {
+        Some(server_ctx) => server_ctx.installed_app_context(),
+        None => runtime_sources::current_app_context(),
+    }
+    .ok_or_else(object_store_not_initialized_error)?;
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        context.object_store(),
+        context.table_catalog_strong_runtime(),
+    ))
 }
 
 fn table_catalog_store_for_data_plane<T>(

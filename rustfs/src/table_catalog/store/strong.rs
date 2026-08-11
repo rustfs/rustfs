@@ -19,11 +19,37 @@ type StrongResourceKey = (String, String, String);
 type StrongCommitKey = (String, String, String);
 type StrongNamespaceChildKey = (String, String, String);
 type StrongWarehouseIndex = BTreeMap<String, BTreeMap<String, StrongResourceKey>>;
+#[derive(Clone, PartialEq, Eq)]
+struct StrongSnapshotObservation {
+    hydrated: bool,
+    snapshot_required: bool,
+    etag: Option<String>,
+    version: Option<u16>,
+}
 pub(in crate::table_catalog) const STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS: usize = 3;
+pub(in crate::table_catalog) const STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE: usize = 64 * 1024 * 1024;
+
+pub(in crate::table_catalog) fn strong_snapshot_write_version(version_two_requested: bool, fleet_confirmed: bool) -> u16 {
+    if version_two_requested && fleet_confirmed {
+        STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
+    } else {
+        STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StrongTableCatalogRuntime {
+    state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    reload_lock_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[derive(Clone, Default)]
 pub(in crate::table_catalog) struct StrongTableCatalogState {
     pub(super) hydrated: bool,
+    snapshot_required: bool,
     pub(in crate::table_catalog) snapshot_etag: Option<String>,
     snapshot_version: Option<u16>,
     pub(in crate::table_catalog) table_buckets: BTreeMap<String, TableBucketEntry>,
@@ -86,6 +112,111 @@ pub(in crate::table_catalog) struct StrongTableCatalogBucketSnapshot {
     pub(super) idempotency: Vec<StrongCommitSnapshotRecord>,
 }
 
+#[derive(Clone)]
+enum StrongSnapshotWritePostcondition {
+    TableBucketPresent(TableBucketEntry),
+    TableBucketAbsent(String),
+    NamespacePresent(NamespaceEntry),
+    NamespaceAbsent(StrongNamespaceKey),
+    TablePresent(TableEntry),
+    TableAbsent {
+        key: StrongResourceKey,
+        table_id: String,
+    },
+    ViewPresent(ViewEntry),
+    ViewAbsent {
+        key: StrongResourceKey,
+        view_id: String,
+    },
+    CommitPresent {
+        table_bucket: String,
+        table_id: String,
+        commit: CommitLogEntry,
+    },
+    BucketSnapshotPresent(StrongTableCatalogBucketSnapshot),
+}
+
+impl StrongSnapshotWritePostcondition {
+    fn is_satisfied_by<B>(&self, state: &StrongTableCatalogState) -> bool
+    where
+        B: TableCatalogObjectBackend,
+    {
+        match self {
+            Self::TableBucketPresent(expected) => state.table_buckets.get(&expected.table_bucket) == Some(expected),
+            Self::TableBucketAbsent(table_bucket) => !state.table_buckets.contains_key(table_bucket),
+            Self::NamespacePresent(expected) => {
+                let Ok(namespace) = parse_namespace_for_store(&expected.namespace) else {
+                    return false;
+                };
+                state
+                    .namespaces
+                    .get(&StrongTableCatalogStore::<B>::namespace_key(&expected.table_bucket, &namespace))
+                    == Some(expected)
+            }
+            Self::NamespaceAbsent(key) => !state.namespaces.contains_key(key),
+            Self::TablePresent(expected) => {
+                let (Ok(namespace), Ok(table)) =
+                    (parse_namespace_for_store(&expected.namespace), parse_table_for_store(&expected.table))
+                else {
+                    return false;
+                };
+                state
+                    .tables
+                    .get(&StrongTableCatalogStore::<B>::table_key(&expected.table_bucket, &namespace, &table))
+                    == Some(expected)
+            }
+            Self::TableAbsent { key, table_id } => state.tables.get(key).is_none_or(|current| current.table_id != *table_id),
+            Self::ViewPresent(expected) => {
+                let (Ok(namespace), Ok(view)) =
+                    (parse_namespace_for_store(&expected.namespace), parse_table_for_store(&expected.view))
+                else {
+                    return false;
+                };
+                state
+                    .views
+                    .get(&StrongTableCatalogStore::<B>::table_key(&expected.table_bucket, &namespace, &view))
+                    == Some(expected)
+            }
+            Self::ViewAbsent { key, view_id } => state.views.get(key).is_none_or(|current| current.view_id != *view_id),
+            Self::CommitPresent {
+                table_bucket,
+                table_id,
+                commit,
+            } => {
+                let commit_key = StrongTableCatalogStore::<B>::commit_key(table_bucket, table_id, &commit.commit_id);
+                if state.commits.get(&commit_key) != Some(commit) {
+                    return false;
+                }
+                if !commit.idempotency_key.as_deref().is_none_or(|idempotency_key| {
+                    state
+                        .idempotency
+                        .get(&StrongTableCatalogStore::<B>::idempotency_key(table_bucket, table_id, idempotency_key))
+                        == Some(commit)
+                }) {
+                    return false;
+                }
+                let Some(table) = state.tables.values().find(|table| {
+                    table.table_bucket == *table_bucket
+                        && table.table_id == *table_id
+                        && table.state == TableCatalogEntryState::Active
+                }) else {
+                    return false;
+                };
+                TableCommitHistoryIndex::new(
+                    table,
+                    StrongTableCatalogStore::<B>::table_commits_locked(state, table_bucket, table_id),
+                )
+                .proves_committed(commit)
+            }
+            Self::BucketSnapshotPresent(expected) => {
+                StrongTableCatalogStore::<B>::bucket_snapshot_from_state_locked(state, &expected.table_bucket.table_bucket)
+                    .as_ref()
+                    == Some(expected)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 impl StrongTableCatalogBucketSnapshot {
     pub(in crate::table_catalog) fn new_for_test(table_bucket: TableBucketEntry) -> Self {
@@ -111,6 +242,13 @@ pub(super) enum TableCatalogBackingMigrationFenceStatus {
     Materialized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TableCatalogBackingMigrationTargetSnapshotState {
+    Unknown,
+    Absent,
+    Present,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TableCatalogBackingMigrationGlobalFence {
@@ -130,7 +268,7 @@ pub(super) struct TableCatalogBackingMigrationFence {
     pub(super) target_snapshot_etag: Option<String>,
 }
 
-pub(super) fn table_catalog_bucket_snapshot_fingerprint(
+pub(in crate::table_catalog) fn table_catalog_bucket_snapshot_fingerprint(
     snapshot: &StrongTableCatalogBucketSnapshot,
 ) -> TableCatalogStoreResult<String> {
     let data = serde_json::to_vec(snapshot)
@@ -142,6 +280,7 @@ pub(super) fn table_catalog_bucket_snapshot_fingerprint(
 pub(crate) struct StrongTableCatalogStore<B> {
     object_backend: B,
     snapshot_write_version: u16,
+    snapshot_required_on_start: bool,
     // Single mutex protecting all catalog state (table_buckets, namespaces, tables, views, commits, idempotency).
     // This is intentional: many operations require atomic read-modify-write across multiple fields.
     // Splitting into per-field locks would introduce deadlock risk and complexity.
@@ -152,6 +291,10 @@ pub(crate) struct StrongTableCatalogStore<B> {
     pub(in crate::table_catalog) state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    // Coalesces reloads for clones of one store so only one task reads and decodes a changed snapshot.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    reload_lock_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<B> StrongTableCatalogStore<B>
@@ -159,33 +302,61 @@ where
     B: TableCatalogObjectBackend,
 {
     pub fn new(object_backend: B) -> Self {
-        let snapshot_v2_enabled = rustfs_utils::get_env_bool(ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2, false)
-            && rustfs_utils::get_env_bool(ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED, false);
+        Self::new_with_snapshot_requirement(object_backend, false)
+    }
+
+    pub(in crate::table_catalog) fn new_requiring_snapshot(object_backend: B) -> Self {
+        Self::new_with_snapshot_requirement(object_backend, true)
+    }
+
+    #[cfg(test)]
+    pub(in crate::table_catalog) async fn is_hydrated_for_test(&self) -> bool {
+        self.state.lock().await.hydrated
+    }
+
+    #[cfg(test)]
+    pub(in crate::table_catalog) fn reload_lock_attempts_for_test(&self) -> usize {
+        self.reload_lock_attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn new_with_snapshot_requirement(object_backend: B, snapshot_required_on_start: bool) -> Self {
+        let snapshot_write_version = strong_snapshot_write_version(
+            rustfs_utils::get_env_bool(ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2, false),
+            rustfs_utils::get_env_bool(ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED, false),
+        );
+        // RUSTFS_COMPAT_TODO(table-catalog-strong-snapshot-v1): Keep version 1 writes during mixed-version rollout. Remove after all supported releases read version 2 and every retained snapshot is upgraded.
+        // Remove after the minimum supported release reads version 2 and operators no longer need collision cleanup.
+        let runtime = object_backend.strong_catalog_runtime().unwrap_or_default();
+        Self::new_with_runtime_and_snapshot_write_version(
+            object_backend,
+            runtime,
+            snapshot_write_version,
+            snapshot_required_on_start,
+        )
+    }
+
+    fn new_with_runtime_and_snapshot_write_version(
+        object_backend: B,
+        runtime: StrongTableCatalogRuntime,
+        snapshot_write_version: u16,
+        snapshot_required_on_start: bool,
+    ) -> Self {
         Self {
             object_backend,
-            snapshot_write_version: if snapshot_v2_enabled {
-                STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
-            } else {
-                STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION
-            },
-            state: Arc::new(tokio::sync::Mutex::new(StrongTableCatalogState::default())),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_write_version,
+            snapshot_required_on_start,
+            state: runtime.state,
+            write_lock: runtime.write_lock,
+            reload_lock: runtime.reload_lock,
+            #[cfg(test)]
+            reload_lock_attempts: runtime.reload_lock_attempts,
         }
     }
 
     #[cfg(test)]
     pub(in crate::table_catalog) fn new_with_snapshot_write_version(object_backend: B, snapshot_write_version: u16) -> Self {
-        Self {
-            object_backend,
-            snapshot_write_version,
-            state: Arc::new(tokio::sync::Mutex::new(StrongTableCatalogState::default())),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::table_catalog) fn configured_snapshot_write_version(&self) -> u16 {
-        self.snapshot_write_version
+        let runtime = object_backend.strong_catalog_runtime().unwrap_or_default();
+        Self::new_with_runtime_and_snapshot_write_version(object_backend, runtime, snapshot_write_version, false)
     }
 
     pub(in crate::table_catalog) fn namespace_key(table_bucket: &str, namespace: &Namespace) -> StrongNamespaceKey {
@@ -336,8 +507,37 @@ where
         (table_bucket.to_string(), table_id.to_string(), idempotency_key.to_string())
     }
 
+    fn table_commits_locked<'a>(
+        state: &'a StrongTableCatalogState,
+        table_bucket: &str,
+        table_id: &str,
+    ) -> impl Iterator<Item = &'a CommitLogEntry> + 'a {
+        let owner = (table_bucket.to_string(), table_id.to_string());
+        let start = (owner.0.clone(), owner.1.clone(), String::new());
+        state
+            .commits
+            .range(start..)
+            .take_while(move |((entry_bucket, entry_table_id, _), _)| entry_bucket == &owner.0 && entry_table_id == &owner.1)
+            .map(|(_, commit)| commit)
+    }
+
+    fn commit_write_postcondition(table_bucket: &str, commit: &CommitLogEntry) -> StrongSnapshotWritePostcondition {
+        StrongSnapshotWritePostcondition::CommitPresent {
+            table_bucket: table_bucket.to_string(),
+            table_id: commit.table_id.clone(),
+            commit: commit.clone(),
+        }
+    }
+
     pub(in crate::table_catalog) fn snapshot_object_path() -> String {
         format!("{INTERNAL_CATALOG_ROOT}/{STRONG_TABLE_CATALOG_BACKING_ROOT}/{STRONG_TABLE_CATALOG_SNAPSHOT_FILE}")
+    }
+
+    // Ordinary mutations hold the global migration read lock before the local write lock; migration takes the
+    // write side before invoking its dedicated snapshot mutation methods.
+    async fn acquire_snapshot_write_permit(&self) -> TableCatalogStoreResult<Box<dyn Send>> {
+        let lock_path = TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path();
+        self.object_backend.acquire_read_lock(RUSTFS_META_BUCKET, &lock_path).await
     }
 
     fn effective_snapshot_write_version(state: &StrongTableCatalogState, configured_write_version: u16) -> u16 {
@@ -452,9 +652,16 @@ where
         state: &mut StrongTableCatalogState,
         snapshot: StrongTableCatalogBucketSnapshot,
     ) -> TableCatalogStoreResult<()> {
-        validate_table_bucket_entry(&snapshot.table_bucket)?;
+        let expected_counts = (
+            1,
+            snapshot.namespaces.len(),
+            snapshot.tables.len(),
+            snapshot.views.len(),
+            snapshot.commits.len(),
+            snapshot.idempotency.len(),
+        );
         let table_bucket = snapshot.table_bucket.table_bucket.clone();
-        for owner in snapshot
+        let unexpected_owner = snapshot
             .namespaces
             .iter()
             .map(|entry| entry.table_bucket.as_str())
@@ -462,96 +669,24 @@ where
             .chain(snapshot.views.iter().map(|entry| entry.table_bucket.as_str()))
             .chain(snapshot.commits.iter().map(|record| record.table_bucket.as_str()))
             .chain(snapshot.idempotency.iter().map(|record| record.table_bucket.as_str()))
-        {
-            if owner != table_bucket.as_str() {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "durable strong bucket snapshot for {table_bucket} contains state owned by {owner}"
-                )));
-            }
+            .find(|owner| *owner != table_bucket);
+        if let Some(owner) = unexpected_owner {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "durable strong bucket snapshot for {table_bucket} contains state owned by {owner}"
+            )));
         }
-        Self::remove_bucket_from_state_locked(state, &table_bucket);
-        state.table_buckets.insert(table_bucket.clone(), snapshot.table_bucket);
-        for entry in snapshot.namespaces {
-            let namespace = validate_namespace_entry_identity(&entry)?;
-            if state
-                .namespaces
-                .insert(Self::namespace_key(&table_bucket, &namespace), entry)
-                .is_some()
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable strong bucket snapshot contains duplicate namespace identifiers".to_string(),
-                ));
-            }
-        }
-        for entry in snapshot.tables {
-            let namespace = parse_namespace_for_store(&entry.namespace)?;
-            let table = parse_table_for_store(&entry.table)?;
-            if state
-                .tables
-                .insert(Self::table_key(&table_bucket, &namespace, &table), entry)
-                .is_some()
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable strong bucket snapshot contains duplicate table identifiers".to_string(),
-                ));
-            }
-        }
-        for entry in snapshot.views {
-            let namespace = parse_namespace_for_store(&entry.namespace)?;
-            let view = parse_table_for_store(&entry.view)?;
-            if state
-                .views
-                .insert(Self::table_key(&table_bucket, &namespace, &view), entry)
-                .is_some()
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable strong bucket snapshot contains duplicate view identifiers".to_string(),
-                ));
-            }
-        }
-        for record in snapshot.commits {
-            if state
-                .commits
-                .insert(
-                    Self::commit_key(&record.table_bucket, &record.table_id, &record.lookup_key),
-                    record.commit,
-                )
-                .is_some()
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable strong bucket snapshot contains duplicate commit lookup keys".to_string(),
-                ));
-            }
-        }
-        for record in snapshot.idempotency {
-            if state
-                .idempotency
-                .insert(
-                    Self::idempotency_key(&record.table_bucket, &record.table_id, &record.lookup_key),
-                    record.commit,
-                )
-                .is_some()
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "durable strong bucket snapshot contains duplicate idempotency lookup keys".to_string(),
-                ));
-            }
-        }
-        let expected_counts = (
-            state.table_buckets.len(),
-            state.namespaces.len(),
-            state.tables.len(),
-            state.views.len(),
-            state.commits.len(),
-            state.idempotency.len(),
-        );
-        let snapshot_version = state
-            .snapshot_version
-            .unwrap_or(STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION);
-        let snapshot_etag = state.snapshot_etag.clone();
-        let hydrated = state.hydrated;
-        let snapshot = Self::snapshot_from_state_locked(state, snapshot_version);
-        let mut validated = Self::state_from_snapshot(snapshot, snapshot_etag)?;
+        let validated = Self::state_from_snapshot(
+            StrongTableCatalogSnapshot {
+                version: STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION,
+                table_buckets: vec![snapshot.table_bucket],
+                namespaces: snapshot.namespaces,
+                tables: snapshot.tables,
+                views: snapshot.views,
+                commits: snapshot.commits,
+                idempotency: snapshot.idempotency,
+            },
+            None,
+        )?;
         let validated_counts = (
             validated.table_buckets.len(),
             validated.namespaces.len(),
@@ -565,8 +700,15 @@ where
                 "durable strong bucket snapshot contains state without a valid owner".to_string(),
             ));
         }
-        validated.hydrated = hydrated;
-        *state = validated;
+        Self::remove_bucket_from_state_locked(state, &table_bucket);
+        state.table_buckets.extend(validated.table_buckets);
+        state.namespaces.extend(validated.namespaces);
+        state.tables.extend(validated.tables);
+        state.views.extend(validated.views);
+        state.commits.extend(validated.commits);
+        state.idempotency.extend(validated.idempotency);
+        Self::rebuild_namespace_indexes_locked(state)?;
+        Self::rebuild_warehouse_index_locked(state)?;
         Ok(())
     }
 
@@ -667,6 +809,9 @@ where
                     "strong catalog table {table_bucket}/{namespace}/{table} has no table bucket"
                 )));
             }
+            if entry.state != TableCatalogEntryState::Active {
+                continue;
+            }
             let namespace_identity = parse_namespace_for_store(namespace)?;
             let table_identity = parse_table_for_store(table)?;
             validate_table_warehouse_location(table_bucket, &entry.warehouse_location)?;
@@ -679,9 +824,6 @@ where
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "table {table_bucket}/{namespace}/{table} has no active namespace"
                 )));
-            }
-            if entry.state != TableCatalogEntryState::Active {
-                continue;
             }
             if !state
                 .table_buckets
@@ -722,6 +864,9 @@ where
                     "strong catalog view {table_bucket}/{namespace}/{view} has no table bucket"
                 )));
             }
+            if entry.state != TableCatalogEntryState::Active {
+                continue;
+            }
             let namespace_identity = parse_namespace_for_store(namespace)?;
             let view_identity = parse_table_for_store(view)?;
             validate_view_warehouse_location(table_bucket, &entry.warehouse_location)?;
@@ -734,9 +879,6 @@ where
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "view {table_bucket}/{namespace}/{view} has no active namespace"
                 )));
-            }
-            if entry.state != TableCatalogEntryState::Active {
-                continue;
             }
             if !state
                 .table_buckets
@@ -761,6 +903,46 @@ where
         Ok(())
     }
 
+    fn validate_inactive_resource_locations_locked(state: &StrongTableCatalogState) -> TableCatalogStoreResult<()> {
+        for ((table_bucket, namespace, table), entry) in &state.tables {
+            if entry.state == TableCatalogEntryState::Active {
+                continue;
+            }
+            let namespace_identity = parse_namespace_for_store(namespace)?;
+            let table_identity = parse_table_for_store(table)?;
+            validate_table_warehouse_location(table_bucket, &entry.warehouse_location)?;
+            if !is_valid_table_metadata_location(&namespace_identity, &table_identity, &entry.metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "strong catalog table {table_bucket}/{namespace}/{table} has an invalid metadata location"
+                )));
+            }
+            if !Self::namespace_exists_locked(state, table_bucket, &namespace_identity) {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "table {table_bucket}/{namespace}/{table} has no active namespace"
+                )));
+            }
+        }
+        for ((table_bucket, namespace, view), entry) in &state.views {
+            if entry.state == TableCatalogEntryState::Active {
+                continue;
+            }
+            let namespace_identity = parse_namespace_for_store(namespace)?;
+            let view_identity = parse_table_for_store(view)?;
+            validate_view_warehouse_location(table_bucket, &entry.warehouse_location)?;
+            if !is_valid_view_metadata_location(&namespace_identity, &view_identity, &entry.metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "strong catalog view {table_bucket}/{namespace}/{view} has an invalid metadata location"
+                )));
+            }
+            if !Self::namespace_exists_locked(state, table_bucket, &namespace_identity) {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "view {table_bucket}/{namespace}/{view} has no active namespace"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn snapshot_from_mutated_state_locked(
         state: &mut StrongTableCatalogState,
         configured_write_version: u16,
@@ -780,6 +962,8 @@ where
         let collision_cleanup_progress = !previous_identifier_collisions.is_empty()
             && state.identifier_collisions.is_subset(&previous_identifier_collisions)
             && state.identifier_collisions.len() < previous_identifier_collisions.len();
+        // RUSTFS_COMPAT_TODO(table-catalog-strong-snapshot-v1): Version 1 collision quarantine permits cleanup-only writes. Remove after all supported releases read version 2 and every retained snapshot is collision-free.
+        // Remove with version 1 snapshot write support after every supported deployment writes collision-free version 2 snapshots.
         if !state.identifier_collisions.is_empty() && !collision_cleanup_progress {
             return Err(TableCatalogStoreError::Conflict(
                 "legacy table/view identifier collision permits only collision cleanup".to_string(),
@@ -790,7 +974,11 @@ where
         } else {
             STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION
         };
+        if snapshot_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION {
+            Self::validate_inactive_resource_locations_locked(state)?;
+        }
         let snapshot = Self::snapshot_from_state_locked(state, snapshot_version);
+        Self::state_from_snapshot(snapshot.clone(), None)?;
         state.snapshot_version = Some(state.snapshot_version.unwrap_or(snapshot.version).max(snapshot.version));
         Ok(snapshot)
     }
@@ -809,6 +997,7 @@ where
         let snapshot_version = snapshot.version;
         let mut state = StrongTableCatalogState {
             hydrated: true,
+            snapshot_required: true,
             snapshot_etag,
             snapshot_version: Some(snapshot_version),
             ..StrongTableCatalogState::default()
@@ -846,7 +1035,7 @@ where
         }
         let mut table_ids = BTreeSet::new();
         for entry in snapshot.tables {
-            validate_catalog_entry_version("table", entry.version)?;
+            validate_table_entry_version_and_id(&entry)?;
             let namespace = parse_namespace_for_store(&entry.namespace)?;
             let table = parse_table_for_store(&entry.table)?;
             if !state.table_buckets.contains_key(&entry.table_bucket) {
@@ -855,9 +1044,9 @@ where
                     entry.table_bucket, entry.namespace, entry.table
                 )));
             }
-            if entry.table_id.is_empty() || !table_ids.insert((entry.table_bucket.clone(), entry.table_id.clone())) {
+            if !table_ids.insert((entry.table_bucket.clone(), entry.table_id.clone())) {
                 return Err(TableCatalogStoreError::Invalid(
-                    "strong catalog snapshot contains duplicate or empty table ids".to_string(),
+                    "strong catalog snapshot contains duplicate table ids".to_string(),
                 ));
             }
             let key = Self::table_key(&entry.table_bucket, &namespace, &table);
@@ -868,7 +1057,7 @@ where
             }
         }
         for entry in snapshot.views {
-            validate_catalog_entry_version("view", entry.version)?;
+            validate_view_entry_version_and_id(&entry)?;
             let namespace = parse_namespace_for_store(&entry.namespace)?;
             let view = parse_table_for_store(&entry.view)?;
             if !state.table_buckets.contains_key(&entry.table_bucket) {
@@ -909,6 +1098,7 @@ where
             }
         }
         for record in snapshot.idempotency {
+            validate_catalog_entry_version("commit idempotency", record.commit.version)?;
             if record.commit.table_id != record.table_id
                 || record.commit.idempotency_key.as_deref() != Some(record.lookup_key.as_str())
             {
@@ -952,8 +1142,24 @@ where
                 )));
             }
         }
+        for table in state.tables.values() {
+            let table_commits = Self::table_commits_locked(&state, &table.table_bucket, &table.table_id).collect::<Vec<_>>();
+            let history = TableCommitHistoryIndex::new(table, table_commits.iter().copied());
+            if let Some(commit) = table_commits
+                .into_iter()
+                .find(|commit| matches!(commit.status, CommitLogStatus::Failed) || !history.proves_committed(commit))
+            {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "strong catalog commit {} is not recoverable in the current table history",
+                    commit.commit_id
+                )));
+            }
+        }
         Self::rebuild_namespace_indexes_locked(&mut state)?;
         Self::rebuild_warehouse_index_locked(&mut state)?;
+        if snapshot_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION {
+            Self::validate_inactive_resource_locations_locked(&state)?;
+        }
         if snapshot_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION && !state.identifier_collisions.is_empty() {
             return Err(TableCatalogStoreError::Invalid(
                 "strong catalog snapshot contains a table/view identifier collision".to_string(),
@@ -975,11 +1181,41 @@ where
         (Self::snapshot_write_precondition_locked(state), state.clone())
     }
 
+    fn snapshot_observation_locked(state: &StrongTableCatalogState) -> StrongSnapshotObservation {
+        StrongSnapshotObservation {
+            hydrated: state.hydrated,
+            snapshot_required: state.snapshot_required,
+            etag: state.snapshot_etag.clone(),
+            version: state.snapshot_version,
+        }
+    }
+
+    fn snapshot_etag(etag: Option<String>) -> TableCatalogStoreResult<String> {
+        etag.filter(|etag| !etag.is_empty())
+            .ok_or_else(|| TableCatalogStoreError::Internal("durable strong catalog snapshot has no etag".to_string()))
+    }
+
+    fn state_from_snapshot_object(snapshot_object: TableCatalogObject) -> TableCatalogStoreResult<StrongTableCatalogState> {
+        let snapshot_etag = Self::snapshot_etag(snapshot_object.etag)?;
+        let snapshot = serde_json::from_slice::<StrongTableCatalogSnapshot>(&snapshot_object.data)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to decode strong catalog snapshot: {err}")))?;
+        Self::state_from_snapshot(snapshot, Some(snapshot_etag))
+    }
+
+    async fn mark_snapshot_reload_failed(&self, err: &TableCatalogStoreError, phase: &'static str) {
+        self.state.lock().await.hydrated = false;
+        tracing::warn!(
+            error = %err,
+            phase,
+            "durable strong catalog state reload failed after a snapshot write outcome"
+        );
+    }
+
     async fn hydrate_state(&self) -> TableCatalogStoreResult<()> {
-        let Some(current_snapshot_etag) = ({
+        let Some((current_snapshot_etag, current_snapshot_required)) = ({
             let state = self.state.lock().await;
             if state.hydrated {
-                Some(state.snapshot_etag.clone())
+                Some((state.snapshot_etag.clone(), state.snapshot_required))
             } else {
                 None
             }
@@ -992,38 +1228,67 @@ where
             .object_metadata(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
             .await?;
         match (snapshot_metadata, current_snapshot_etag.as_deref()) {
-            (None, None) => Ok(()),
+            (None, None) if !self.snapshot_required_on_start && !current_snapshot_required => Ok(()),
             (Some(metadata), Some(current_etag)) if metadata.etag.as_deref() == Some(current_etag) => Ok(()),
             _ => self.reload_state_from_durable().await,
         }
     }
 
     pub(in crate::table_catalog) async fn reload_state_from_durable(&self) -> TableCatalogStoreResult<()> {
+        let initial_observation = {
+            let state = self.state.lock().await;
+            Self::snapshot_observation_locked(&state)
+        };
+        #[cfg(test)]
+        self.reload_lock_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _reload_guard = self.reload_lock.lock().await;
+        {
+            let state = self.state.lock().await;
+            if state.hydrated
+                && (!self.snapshot_required_on_start || state.snapshot_required)
+                && Self::snapshot_observation_locked(&state) != initial_observation
+            {
+                return Ok(());
+            }
+        }
+
         for _ in 0..STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS {
             let observed_state = {
                 let state = self.state.lock().await;
-                (state.hydrated, state.snapshot_etag.clone(), state.snapshot_version)
+                Self::snapshot_observation_locked(&state)
             };
             let snapshot_object = self
                 .object_backend
-                .read_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
+                .read_object_limited(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE)
                 .await?;
-            let loaded_state = snapshot_object
-                .map(|snapshot_object| {
-                    let snapshot =
-                        serde_json::from_slice::<StrongTableCatalogSnapshot>(&snapshot_object.data).map_err(|err| {
-                            TableCatalogStoreError::Internal(format!("failed to decode strong catalog snapshot: {err}"))
-                        })?;
-                    Self::state_from_snapshot(snapshot, snapshot_object.etag)
-                })
-                .transpose()?;
+            let snapshot_metadata = self
+                .object_backend
+                .object_metadata(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
+                .await?;
+            let loaded_state = match (snapshot_object, snapshot_metadata) {
+                (Some(snapshot_object), Some(snapshot_metadata)) => {
+                    let object_etag = Self::snapshot_etag(snapshot_object.etag.clone())?;
+                    let metadata_etag = Self::snapshot_etag(snapshot_metadata.etag)?;
+                    if object_etag != metadata_etag {
+                        continue;
+                    }
+                    Some(Self::state_from_snapshot_object(snapshot_object)?)
+                }
+                (Some(_), None) => {
+                    return Err(TableCatalogStoreError::Internal(
+                        "durable strong catalog snapshot disappeared while it was being loaded".to_string(),
+                    ));
+                }
+                (None, Some(_)) => continue,
+                (None, None) => None,
+            };
             let mut state = self.state.lock().await;
-            if (state.hydrated, state.snapshot_etag.clone(), state.snapshot_version) != observed_state {
+            if Self::snapshot_observation_locked(&state) != observed_state {
                 continue;
             }
-            let mut loaded_state = match loaded_state {
+            let loaded_state = match loaded_state {
                 Some(loaded_state) => loaded_state,
-                None if observed_state.1.is_some() => {
+                None if observed_state.snapshot_required || self.snapshot_required_on_start => {
                     return Err(TableCatalogStoreError::Internal(
                         "durable strong catalog snapshot disappeared after it was observed".to_string(),
                     ));
@@ -1033,16 +1298,13 @@ where
                     ..StrongTableCatalogState::default()
                 },
             };
-            if observed_state
-                .2
-                .is_some_and(|version| version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
-                && !loaded_state.identifier_collisions.is_empty()
+            if let (Some(observed), Some(loaded)) = (observed_state.version, loaded_state.snapshot_version)
+                && loaded < observed
             {
-                return Err(TableCatalogStoreError::Invalid(
-                    "version 1 collision snapshot cannot replace an observed version 2 snapshot".to_string(),
-                ));
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "durable strong catalog snapshot version {loaded} cannot replace process high-water version {observed}"
+                )));
             }
-            loaded_state.snapshot_version = loaded_state.snapshot_version.max(observed_state.2);
             *state = loaded_state;
             return Ok(());
         }
@@ -1055,48 +1317,49 @@ where
         &self,
         snapshot: StrongTableCatalogSnapshot,
         precondition: TableCatalogPutPrecondition,
+        postcondition: StrongSnapshotWritePostcondition,
     ) -> TableCatalogStoreResult<()> {
         let data = serde_json::to_vec(&snapshot)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to encode strong catalog snapshot: {err}")))?;
+        if data.len() > STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "durable strong catalog snapshot exceeds the maximum encoded size of {STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE} bytes"
+            )));
+        }
         match self
             .object_backend
             .put_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), data, precondition)
             .await
         {
             Ok(()) => {
+                self.state.lock().await.snapshot_required = true;
                 if let Err(err) = self.reload_state_from_durable().await {
-                    self.state.lock().await.hydrated = false;
-                    tracing::warn!(
-                        error = %err,
-                        "durable strong catalog snapshot committed but local state reload failed"
-                    );
+                    self.mark_snapshot_reload_failed(&err, "confirmed-write").await;
                 }
                 Ok(())
             }
+            Err(err @ TableCatalogStoreError::Conflict(_)) => {
+                self.state.lock().await.snapshot_required = true;
+                if let Err(reload_err) = self.reload_state_from_durable().await {
+                    self.mark_snapshot_reload_failed(&reload_err, "write-conflict").await;
+                }
+                Err(err)
+            }
             Err(err) => {
-                let committed = match self
-                    .object_backend
-                    .read_object(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
-                    .await
-                {
-                    Ok(Some(snapshot_object)) => {
-                        let persisted = serde_json::from_slice::<StrongTableCatalogSnapshot>(&snapshot_object.data).ok();
-                        persisted.as_ref() == Some(&snapshot)
+                self.state.lock().await.snapshot_required = true;
+                match self.reload_state_from_durable().await {
+                    Ok(()) => {
+                        let state = self.state.lock().await;
+                        if postcondition.is_satisfied_by::<B>(&state) {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
                     }
-                    Ok(None) | Err(_) => false,
-                };
-                if committed {
-                    if let Err(reload_err) = self.reload_state_from_durable().await {
-                        self.state.lock().await.hydrated = false;
-                        tracing::warn!(
-                            error = %reload_err,
-                            "durable strong catalog snapshot committed but local state recovery failed"
-                        );
+                    Err(reload_err) => {
+                        self.mark_snapshot_reload_failed(&reload_err, "ambiguous-write").await;
+                        Err(err)
                     }
-                    Ok(())
-                } else {
-                    let _ = self.reload_state_from_durable().await;
-                    Err(err)
                 }
             }
         }
@@ -1109,7 +1372,7 @@ where
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let table_bucket = source.table_bucket.table_bucket.clone();
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             if let Some(current) = Self::bucket_snapshot_from_state_locked(&state, &table_bucket) {
                 if current != source {
@@ -1124,13 +1387,15 @@ where
                 return Ok((snapshot_etag, false));
             }
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+            let postcondition = StrongSnapshotWritePostcondition::BucketSnapshotPresent(source.clone());
             Self::insert_bucket_snapshot_locked(&mut draft_state, source)?;
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                postcondition,
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await?;
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
         self.hydrate_state().await?;
         let state = self.state.lock().await;
         let snapshot_etag = state
@@ -1140,14 +1405,14 @@ where
         Ok((snapshot_etag, true))
     }
 
-    pub(super) async fn remove_bucket_snapshot_if_unchanged(
+    pub(in crate::table_catalog) async fn remove_bucket_snapshot_if_unchanged(
         &self,
         table_bucket: &str,
         expected_fingerprint: &str,
     ) -> TableCatalogStoreResult<()> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             let Some(current) = Self::bucket_snapshot_from_state_locked(&state, table_bucket) else {
                 return Ok(());
@@ -1162,18 +1427,80 @@ where
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::TableBucketAbsent(table_bucket.to_string()),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+    }
+
+    pub(super) async fn restore_absent_migration_snapshot_baseline(&self) -> TableCatalogStoreResult<()> {
+        let _write_guard = self.write_lock.lock().await;
+        let _reload_guard = self.reload_lock.lock().await;
+        let snapshot_object = self
+            .object_backend
+            .read_object_limited(RUSTFS_META_BUCKET, &Self::snapshot_object_path(), STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE)
+            .await?;
+        let snapshot_metadata = self
+            .object_backend
+            .object_metadata(RUSTFS_META_BUCKET, &Self::snapshot_object_path())
+            .await?;
+        match (snapshot_object, snapshot_metadata) {
+            (None, None) => {}
+            (Some(_), Some(_)) => return Ok(()),
+            _ => {
+                return Err(TableCatalogStoreError::Internal(
+                    "durable strong catalog snapshot changed while restoring an absent migration baseline".to_string(),
+                ));
+            }
+        }
+
+        let mut state = self.state.lock().await;
+        if state.snapshot_etag.is_some()
+            || state.snapshot_version.is_some()
+            || !state.table_buckets.is_empty()
+            || !state.namespaces.is_empty()
+            || !state.namespace_children.is_empty()
+            || !state.namespace_objects.is_empty()
+            || !state.tables.is_empty()
+            || !state.views.is_empty()
+            || !state.commits.is_empty()
+            || !state.idempotency.is_empty()
+            || !state.warehouse_index.is_empty()
+            || !state.identifier_collisions.is_empty()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "cannot restore an absent migration baseline after durable strong catalog state was observed".to_string(),
+            ));
+        }
+        *state = StrongTableCatalogState {
+            hydrated: true,
+            ..StrongTableCatalogState::default()
+        };
+        Ok(())
+    }
+
+    pub(super) async fn bucket_snapshot_observation(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<(Option<String>, Option<String>)> {
+        self.hydrate_state().await?;
+        let state = self.state.lock().await;
+        let fingerprint = Self::bucket_snapshot_from_state_locked(&state, table_bucket)
+            .as_ref()
+            .map(table_catalog_bucket_snapshot_fingerprint)
+            .transpose()?;
+        Ok((fingerprint, state.snapshot_etag.clone()))
     }
 
     pub(super) async fn bucket_snapshot_fingerprint(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<String>> {
+        self.bucket_snapshot_observation(table_bucket)
+            .await
+            .map(|(fingerprint, _)| fingerprint)
+    }
+
+    pub(super) async fn table_bucket_names(&self) -> TableCatalogStoreResult<BTreeSet<String>> {
         self.hydrate_state().await?;
-        let state = self.state.lock().await;
-        Self::bucket_snapshot_from_state_locked(&state, table_bucket)
-            .as_ref()
-            .map(table_catalog_bucket_snapshot_fingerprint)
-            .transpose()
+        Ok(self.state.lock().await.table_buckets.keys().cloned().collect())
     }
 
     fn require_table_bucket_in_state(state: &StrongTableCatalogState, table_bucket: &str) -> TableCatalogStoreResult<()> {
@@ -1196,19 +1523,26 @@ where
             return Ok(());
         }
         let candidate_prefix = table_warehouse_object_prefix(candidate)?;
-        for (existing_key, existing) in &state.tables {
-            if existing_key == candidate_key
-                || existing.table_bucket != candidate.table_bucket
-                || existing.state != TableCatalogEntryState::Active
-            {
-                continue;
-            }
-            let existing_prefix = table_warehouse_object_prefix(existing)?;
-            if warehouse_object_prefixes_overlap(&existing_prefix, &candidate_prefix) {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "table warehouse location overlaps an active table: {candidate_prefix}"
-                )));
-            }
+        let Some(bucket_index) = state.warehouse_index.get(&candidate.table_bucket) else {
+            return Ok(());
+        };
+        let predecessor = bucket_index
+            .range(..=candidate_prefix.clone())
+            .rev()
+            .find(|(_, existing_key)| *existing_key != candidate_key)
+            .map(|(prefix, existing_key)| (prefix.as_str(), existing_key));
+        let successor = bucket_index
+            .range(candidate_prefix.clone()..)
+            .find(|(_, existing_key)| *existing_key != candidate_key)
+            .map(|(prefix, existing_key)| (prefix.as_str(), existing_key));
+        if predecessor
+            .into_iter()
+            .chain(successor)
+            .any(|(existing_prefix, _)| warehouse_object_prefixes_overlap(existing_prefix, &candidate_prefix))
+        {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "table warehouse location overlaps an active table: {candidate_prefix}"
+            )));
         }
         Ok(())
     }
@@ -1217,19 +1551,10 @@ where
         state: &StrongTableCatalogState,
         entry: &TableEntry,
     ) -> TableCommitRecoveryReport {
-        let history = TableCommitHistoryIndex::new(
-            entry,
-            state
-                .commits
-                .iter()
-                .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
-                .map(|(_, commit_log)| commit_log),
-        );
-        let mut commits = state
-            .commits
-            .iter()
-            .filter(|((table_bucket, table_id, _), _)| table_bucket == &entry.table_bucket && table_id == &entry.table_id)
-            .map(|((_, _, _), commit_log)| {
+        let history =
+            TableCommitHistoryIndex::new(entry, Self::table_commits_locked(state, &entry.table_bucket, &entry.table_id));
+        let mut commits = Self::table_commits_locked(state, &entry.table_bucket, &entry.table_id)
+            .map(|commit_log| {
                 let idempotency_commit = commit_log.idempotency_key.as_deref().and_then(|idempotency_key| {
                     state
                         .idempotency
@@ -1345,13 +1670,7 @@ where
             {
                 TableCommitHistoryIndex::new(
                     &current,
-                    state
-                        .commits
-                        .iter()
-                        .filter(|((table_bucket, table_id, _), _)| {
-                            table_bucket == &request.table_bucket && table_id == &current.table_id
-                        })
-                        .map(|(_, commit_log)| commit_log),
+                    Self::table_commits_locked(state, &request.table_bucket, &current.table_id),
                 )
                 .proves_committed(existing)
             } else {
@@ -1399,17 +1718,8 @@ where
             && !table_matches_staged_base(&current, &existing)
             && !table_matches_committed_log(&current, &existing)
         {
-            TableCommitHistoryIndex::new(
-                &current,
-                state
-                    .commits
-                    .iter()
-                    .filter(|((table_bucket, table_id, _), _)| {
-                        table_bucket == &request.table_bucket && table_id == &current.table_id
-                    })
-                    .map(|(_, commit_log)| commit_log),
-            )
-            .proves_committed(&existing)
+            TableCommitHistoryIndex::new(&current, Self::table_commits_locked(state, &request.table_bucket, &current.table_id))
+                .proves_committed(&existing)
         } else {
             false
         };
@@ -1532,29 +1842,32 @@ where
     }
 
     async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         validate_table_bucket_entry(&entry)?;
 
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.table_buckets.insert(entry.table_bucket.clone(), entry);
+            draft_state.table_buckets.insert(entry.table_bucket.clone(), entry.clone());
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::TableBucketPresent(entry),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = validate_namespace_entry_identity(&entry)?;
         validate_namespace_properties(&entry.properties)?;
         let key = Self::namespace_key(&entry.table_bucket, &namespace);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
             let existing = state.namespaces.get(&key);
@@ -1567,13 +1880,14 @@ where
                 )));
             }
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.namespaces.insert(key, entry);
+            draft_state.namespaces.insert(key, entry.clone());
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::NamespacePresent(entry),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
@@ -1700,11 +2014,12 @@ where
         namespace: &str,
         update: NamespacePropertiesUpdate,
     ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let key = Self::namespace_key(table_bucket, &namespace);
-        let (snapshot, precondition, result) = {
+        let (snapshot, precondition, result, postcondition) = {
             let state = self.state.lock().await;
             let current = state
                 .namespaces
@@ -1730,23 +2045,25 @@ where
                 return Ok(result);
             }
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.namespaces.insert(key, next);
+            draft_state.namespaces.insert(key, next.clone());
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
                 result,
+                StrongSnapshotWritePostcondition::NamespacePresent(next),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await?;
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
         Ok(result)
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let key = Self::namespace_key(table_bucket, &namespace);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             let parent = namespace.public_name();
             if Self::has_active_namespace_descendant_locked(&state, table_bucket, &parent) {
@@ -1790,9 +2107,10 @@ where
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::NamespaceAbsent(key),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
@@ -1809,10 +2127,15 @@ where
         entry: TableEntry,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<()> {
-        validate_catalog_entry_version("table", entry.version)?;
+        validate_table_entry_version_and_id(&entry)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
         table_warehouse_object_prefix(&entry)?;
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "table metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
         publication.begin_table_bucket(&entry.table_bucket).await?;
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Internal(
@@ -1820,6 +2143,7 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         publication
             .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
             .await?;
@@ -1831,7 +2155,7 @@ where
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
             Self::require_active_namespace_locked(&state, &entry.table_bucket, &namespace)?;
@@ -1852,13 +2176,14 @@ where
             }
             Self::ensure_table_warehouse_prefix_available_locked(&state, &entry, &key)?;
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.tables.insert(key, entry);
+            draft_state.tables.insert(key, entry.clone());
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::TablePresent(entry),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
@@ -1951,10 +2276,23 @@ where
         self.hydrate_state().await?;
         let state = self.state.lock().await;
         let Some(bucket_entry) = state.table_buckets.get(table_bucket) else {
-            return Ok(None);
+            return Err(TableCatalogStoreError::Internal(format!(
+                "durable strong catalog has no entry for table-enabled bucket {table_bucket}"
+            )));
         };
         if bucket_entry.state != TableCatalogEntryState::Active {
-            return Ok(None);
+            return Err(TableCatalogStoreError::Internal(format!(
+                "table-enabled bucket {table_bucket} has an inactive durable strong catalog entry"
+            )));
+        }
+        if self.snapshot_write_version >= STRONG_TABLE_CATALOG_SNAPSHOT_VERSION
+            && state
+                .snapshot_version
+                .is_none_or(|version| version < STRONG_TABLE_CATALOG_SNAPSHOT_VERSION)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "durable strong catalog data-plane access requires a version 2 snapshot after fleet confirmation".to_string(),
+            ));
         }
 
         let Some(bucket_index) = state.warehouse_index.get(table_bucket) else {
@@ -1987,6 +2325,7 @@ where
         request: TableCommitRequest,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<TableCommitResult> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let commit_started = Instant::now();
         record_table_commit_attempt(&request.operation);
         let namespace = parse_namespace_for_store(&request.namespace)?;
@@ -2000,7 +2339,7 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        let _write_guard = self.write_lock.lock().await;
+        let write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let key = Self::table_key(&request.table_bucket, &namespace, &table);
 
@@ -2035,7 +2374,10 @@ where
         if let Some(prepared_result) = committed_existing_result {
             let result = match prepared_result {
                 Ok((result, Some((snapshot, precondition)))) => {
-                    self.finalize_snapshot_write(snapshot, precondition).await.map(|_| result)
+                    let postcondition = Self::commit_write_postcondition(&request.table_bucket, &result.commit_log);
+                    self.finalize_snapshot_write(snapshot, precondition, postcondition)
+                        .await
+                        .map(|_| result)
                 }
                 Ok((result, None)) => Ok(result),
                 Err(err) => Err(err),
@@ -2050,6 +2392,7 @@ where
                 result,
             );
         }
+        drop(write_guard);
 
         let Some(new_metadata_object) = self
             .object_backend
@@ -2077,6 +2420,8 @@ where
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let current_warehouse_location = {
             let state = self.state.lock().await;
             state
@@ -2119,22 +2464,25 @@ where
             }
         };
         let result = match prepared_result {
-            Ok((result, snapshot, precondition)) => match self.finalize_snapshot_write(snapshot, precondition).await {
-                Ok(()) => Ok(result),
-                Err(err) => {
-                    let replay = {
-                        let state = self.state.lock().await;
-                        let mut replay_state = state.clone();
-                        state
-                            .tables
-                            .get(&key)
-                            .cloned()
-                            .and_then(|current| Self::committed_existing_result_locked(&mut replay_state, &request, current))
-                            .and_then(|(result, state_changed)| (!state_changed).then_some(result))
-                    };
-                    replay.ok_or(err)
+            Ok((result, snapshot, precondition)) => {
+                let postcondition = Self::commit_write_postcondition(&request.table_bucket, &result.commit_log);
+                match self.finalize_snapshot_write(snapshot, precondition, postcondition).await {
+                    Ok(()) => Ok(result),
+                    Err(err) => {
+                        let replay = {
+                            let state = self.state.lock().await;
+                            let mut replay_state = state.clone();
+                            state
+                                .tables
+                                .get(&key)
+                                .cloned()
+                                .and_then(|current| Self::committed_existing_result_locked(&mut replay_state, &request, current))
+                                .and_then(|(result, state_changed)| (!state_changed).then_some(result))
+                        };
+                        replay.ok_or(err)
+                    }
                 }
-            },
+            }
             Err(err) => Err(err),
         };
         let cas_result = result.as_ref().map(|_| ()).map_err(Clone::clone);
@@ -2153,6 +2501,7 @@ where
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         let publication = TableCommitLockPublication::new(&self.object_backend);
         publication.begin_table_bucket(table_bucket).await?;
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         publication.prepare(table_bucket, namespace, table).await?;
         if !publication.holds_table_bucket(table_bucket) || !publication.holds_table(table_bucket, namespace, table) {
             return Err(TableCatalogStoreError::Internal(
@@ -2165,7 +2514,7 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let key = Self::table_key(table_bucket, &namespace, &table);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             if !state.tables.contains_key(&key) {
                 return Err(TableCatalogStoreError::NotFound(format!(
@@ -2188,20 +2537,30 @@ where
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::TableAbsent {
+                    key,
+                    table_id: removed.table_id,
+                },
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
-        validate_catalog_entry_version("view", entry.version)?;
+        validate_view_entry_version_and_id(&entry)?;
         validate_view_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let view = parse_table_for_store(&entry.view)?;
+        if !is_valid_view_metadata_location(&namespace, &view, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "view metadata location must be inside the view metadata directory".to_string(),
+            ));
+        }
         let key = Self::table_key(&entry.table_bucket, &namespace, &view);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
             Self::require_active_namespace_locked(&state, &entry.table_bucket, &namespace)?;
@@ -2212,13 +2571,14 @@ where
                 )));
             }
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.views.insert(key, entry);
+            draft_state.views.insert(key, entry.clone());
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::ViewPresent(entry),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
@@ -2287,25 +2647,28 @@ where
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
-        let _write_guard = self.write_lock.lock().await;
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
         let key = Self::table_key(&request.table_bucket, &namespace, &view);
-        {
+        let expected_view_id = {
             let state = self.state.lock().await;
             Self::ensure_identifier_is_unambiguous_locked(&state, &key)?;
-            if !state
+            let Some(current) = state
                 .views
                 .get(&key)
-                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
-            {
+                .filter(|entry| entry.state == TableCatalogEntryState::Active)
+            else {
                 return Err(TableCatalogStoreError::NotFound(format!(
                     "view {}/{}/{}",
                     request.table_bucket, request.namespace, request.view
                 )));
-            }
-        }
+            };
+            current.view_id.clone()
+        };
+        drop(write_guard);
         if !is_valid_view_metadata_location(&namespace, &view, &request.new_metadata_location) {
             return Err(TableCatalogStoreError::Invalid(
                 "new metadata location must be inside the view metadata directory".to_string(),
@@ -2329,7 +2692,9 @@ where
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("view metadata parser task failed: {err}")))??;
 
-        let (snapshot, precondition, next) = {
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
+        let (snapshot, precondition, next, postcondition) = {
             let state = self.state.lock().await;
             Self::ensure_identifier_is_unambiguous_locked(&state, &key)?;
             let Some(current) = state.views.get(&key).cloned() else {
@@ -2343,6 +2708,11 @@ where
                     "view {}/{}/{}",
                     request.table_bucket, request.namespace, request.view
                 )));
+            }
+            if current.view_id != expected_view_id {
+                return Err(TableCatalogStoreError::Conflict(
+                    "current view identity changed while metadata was being validated".to_string(),
+                ));
             }
             if current.version_token != request.expected_version_token {
                 return Err(TableCatalogStoreError::Conflict(
@@ -2367,20 +2737,22 @@ where
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
-                next,
+                next.clone(),
+                StrongSnapshotWritePostcondition::ViewPresent(next),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await?;
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
         Ok(ViewCommitResult { view: next })
     }
 
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()> {
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let view = parse_table_for_store(view)?;
         let key = Self::table_key(table_bucket, &namespace, &view);
-        let (snapshot, precondition) = {
+        let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             if !state.views.contains_key(&key) {
                 return Err(TableCatalogStoreError::NotFound(format!(
@@ -2391,13 +2763,19 @@ where
                 )));
             }
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            draft_state.views.remove(&key);
+            let removed = draft_state.views.remove(&key).ok_or_else(|| {
+                TableCatalogStoreError::Internal("view disappeared while preparing the strong catalog snapshot".to_string())
+            })?;
             (
                 Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
                 precondition,
+                StrongSnapshotWritePostcondition::ViewAbsent {
+                    key,
+                    view_id: removed.view_id,
+                },
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition).await
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn get_commit_by_id(

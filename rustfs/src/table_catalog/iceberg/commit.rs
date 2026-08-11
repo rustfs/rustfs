@@ -44,11 +44,14 @@ pub(crate) fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitL
 pub(crate) struct TableCommitHistoryIndex<'a> {
     table_id: &'a str,
     reachable_states: BTreeSet<(&'a str, &'a str)>,
+    ambiguous_states: BTreeSet<(&'a str, &'a str)>,
+    cycle_detected: bool,
 }
 
 impl<'a> TableCommitHistoryIndex<'a> {
     pub(crate) fn new(table: &'a TableEntry, commits: impl IntoIterator<Item = &'a CommitLogEntry>) -> Self {
         let mut by_new_state = BTreeMap::<(&str, &str), Option<(&str, &str)>>::new();
+        let mut ambiguous_states = BTreeSet::new();
         for commit in commits
             .into_iter()
             .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
@@ -57,27 +60,39 @@ impl<'a> TableCommitHistoryIndex<'a> {
             let previous = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
             by_new_state
                 .entry(key)
-                .and_modify(|candidate| *candidate = None)
+                .and_modify(|candidate| {
+                    *candidate = None;
+                    ambiguous_states.insert(key);
+                })
                 .or_insert(Some(previous));
         }
 
         let mut reachable_states = BTreeSet::new();
         let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
-        while reachable_states.insert(state) {
+        let cycle_detected = loop {
+            if !reachable_states.insert(state) {
+                break true;
+            }
             let Some(Some(previous)) = by_new_state.get(&state) else {
-                break;
+                break false;
             };
             state = *previous;
-        }
+        };
         Self {
             table_id: &table.table_id,
             reachable_states,
+            ambiguous_states,
+            cycle_detected,
         }
     }
 
     pub(crate) fn proves_committed(&self, target: &CommitLogEntry) -> bool {
-        self.table_id == target.table_id.as_str()
+        !self.cycle_detected
+            && self.table_id == target.table_id.as_str()
             && !matches!(target.status, CommitLogStatus::Failed)
+            && !self
+                .ambiguous_states
+                .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
             && self
                 .reachable_states
                 .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
@@ -202,7 +217,7 @@ pub(crate) fn table_commit_recovery_entry(
             TableCommitRecoveryState::FinalizationRequired,
             "a later committed pointer proves this staged commit is part of table history".to_string(),
         )
-    } else if matches!(commit_log.status, CommitLogStatus::Committed) {
+    } else if matches!(commit_log.status, CommitLogStatus::Committed) && historically_committed {
         if idempotency_index_repair_required {
             (
                 TableCommitRecoveryState::IdempotencyIndexRepairRequired,
@@ -214,6 +229,11 @@ pub(crate) fn table_commit_recovery_entry(
                 "commit is finalized and may be older than the current table pointer".to_string(),
             )
         }
+    } else if matches!(commit_log.status, CommitLogStatus::Committed) {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "committed log is not reachable from the current table pointer".to_string(),
+        )
     } else if table_matches_staged_base(table, commit_log) {
         (
             TableCommitRecoveryState::StagedBeforeTableUpdate,
