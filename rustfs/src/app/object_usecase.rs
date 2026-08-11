@@ -5550,8 +5550,8 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let use_small_eager_put_path =
-            should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_empty_or_small_eager_put_path = size == 0
+            || should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let zero_copy_eager_put_path_status =
             zero_copy_eager_put_path_status(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
@@ -5563,7 +5563,7 @@ impl DefaultObjectUsecase {
             "stream_compressed"
         } else if use_zero_copy_eager_put_path {
             "zero_copy_eager"
-        } else if use_small_eager_put_path {
+        } else if use_empty_or_small_eager_put_path {
             "small_eager"
         } else {
             "streaming"
@@ -5777,7 +5777,7 @@ impl DefaultObjectUsecase {
                 let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
                 rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
-            } else if use_small_eager_put_path {
+            } else if use_empty_or_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -5931,7 +5931,7 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let object_traffic_health = if use_small_eager_put_path {
+        let object_traffic_health = if use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path {
             self.object_traffic_health()
         } else {
             None
@@ -11353,6 +11353,147 @@ mod tests {
         let recovered = object_traffic_health.snapshot();
         assert!(!recovered.read_stalled);
         assert!(!recovered.write_stalled);
+    }
+
+    #[tokio::test]
+    async fn object_progress_tracks_zero_byte_and_zero_copy_put_lock_waits() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let context =
+            crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+        let store = context.object_store();
+        let bucket = format!("progress-buffered-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("buffered PUT progress bucket must be created");
+
+        let extra_body_object = "zero-byte-extra.bin";
+        let extra_body_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(extra_body_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"x")))))
+            .content_length(Some(88))
+            .build()
+            .expect("zero-byte extra-body PUT input must build");
+        let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut extra_body_request = build_request(extra_body_input, Method::PUT);
+        extra_body_request.headers = streaming_headers(Some("0"));
+        let extra_body_err = extra_body_usecase
+            .execute_put_object(&FS::new(), extra_body_request)
+            .await
+            .expect_err("decoded zero-byte PUT with body data must fail");
+        assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        let lookup_err = store
+            .get_object_info(&bucket, extra_body_object, &ObjectOptions::default())
+            .await
+            .expect_err("rejected zero-byte PUT must not create an object");
+        assert!(is_err_object_not_found(&lookup_err));
+
+        let zero_object = "zero-byte.bin";
+        let zero_write_lock = store
+            .new_ns_lock(&bucket, zero_object)
+            .await
+            .expect("zero-byte PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-byte PUT namespace lock must be held");
+        let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+        let (body_release_tx, body_release_rx) = tokio::sync::oneshot::channel();
+        let pending_zero_body = StreamingBlob::wrap(futures::stream::once(async move {
+            body_polled_tx.send(()).expect("zero-byte body poll signal must be received");
+            body_release_rx.await.expect("zero-byte body EOF must be released");
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let zero_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(zero_object.to_string())
+            .body(Some(pending_zero_body))
+            .content_length(Some(87))
+            .build()
+            .expect("zero-byte PUT input must build");
+        let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut zero_request = build_request(zero_input, Method::PUT);
+        zero_request.headers = streaming_headers(Some("0"));
+        let zero_put = tokio::spawn(async move { zero_usecase.execute_put_object(&FS::new(), zero_request).await });
+
+        tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
+            .await
+            .expect("zero-byte PUT body must be polled for EOF")
+            .expect("zero-byte PUT body poll signal must be sent");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for request EOF");
+
+        body_release_tx.send(()).expect("zero-byte PUT body EOF must be released");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fully received zero-byte PUT must publish a storage stall");
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for the held namespace lock");
+
+        drop(zero_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_put)
+            .await
+            .expect("zero-byte PUT must finish after releasing the lock")
+            .expect("zero-byte PUT task must join")
+            .expect("zero-byte PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+
+        let zero_copy_object = "zero-copy-eager.jpg";
+        let zero_copy_payload = Bytes::from(vec![b'z'; 1024 * 1024 + 1]);
+        let zero_copy_size = i64::try_from(zero_copy_payload.len()).expect("zero-copy payload length must fit i64");
+        let zero_copy_headers = HeaderMap::new();
+        assert!(!is_disk_compressible(&zero_copy_headers, zero_copy_object));
+        assert_eq!(
+            zero_copy_eager_put_path_status(zero_copy_size, &zero_copy_headers, false, false, false),
+            PUT_EAGER_STATUS_ELIGIBLE,
+            "test payload must exercise the production zero-copy eager path",
+        );
+        let zero_copy_write_lock = store
+            .new_ns_lock(&bucket, zero_copy_object)
+            .await
+            .expect("zero-copy PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-copy PUT namespace lock must be held");
+        let zero_copy_input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key(zero_copy_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(zero_copy_payload))))
+            .content_length(Some(zero_copy_size))
+            .build()
+            .expect("zero-copy PUT input must build");
+        let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
+        let zero_copy_put = tokio::spawn(async move {
+            zero_copy_usecase
+                .execute_put_object(&FS::new(), build_request(zero_copy_input, Method::PUT))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked zero-copy eager PUT must publish a storage stall");
+        assert!(
+            !zero_copy_put.is_finished(),
+            "zero-copy PUT must still be waiting for the held namespace lock"
+        );
+
+        drop(zero_copy_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_copy_put)
+            .await
+            .expect("zero-copy PUT must finish after releasing the lock")
+            .expect("zero-copy PUT task must join")
+            .expect("zero-copy PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
