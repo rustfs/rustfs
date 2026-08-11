@@ -2075,6 +2075,7 @@ impl ResumeUtils {
         match disk.list_dir("", RUSTFS_META_BUCKET, recovery_dir, -1).await {
             Ok(entries) => Ok(entries),
             Err(DiskError::FileNotFound) => Ok(Vec::new()),
+            Err(error @ DiskError::UnformattedDisk) => Err(error.into()),
             Err(error) => Err(Error::TaskExecutionFailed {
                 message: format!("Failed to list replacement recovery records: {error}"),
             }),
