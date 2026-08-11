@@ -40,7 +40,8 @@ use http::header::{CONTENT_TYPE, HOST};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -59,8 +60,16 @@ pub(crate) struct VersionShardCensus {
     pub version_id: Option<String>,
     pub has_xl_meta: bool,
     pub data_dir: Option<String>,
+    pub erasure_index: Option<usize>,
     pub expected_part_numbers: BTreeSet<usize>,
     pub present_part_numbers: BTreeSet<usize>,
+    pub present_part_fingerprints: BTreeMap<usize, PartShardFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PartShardFingerprint {
+    pub size: u64,
+    pub sha256: String,
 }
 
 impl VersionShardCensus {
@@ -73,8 +82,15 @@ impl VersionShardCensus {
             && self.is_complete()
             && manifest.is_complete()
             && self.data_dir == manifest.data_dir
+            && self.erasure_index == manifest.erasure_index
             && self.expected_part_numbers == manifest.expected_part_numbers
+            && self.present_part_fingerprints == manifest.present_part_fingerprints
     }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Single-node RustFS server with `disk_count` local volume directories that
@@ -283,8 +299,10 @@ pub(crate) fn census_object_version_on_disk(
             version_id,
             has_xl_meta: false,
             data_dir: None,
+            erasure_index: None,
             expected_part_numbers: BTreeSet::new(),
             present_part_numbers: BTreeSet::new(),
+            present_part_fingerprints: BTreeMap::new(),
         });
     }
 
@@ -296,20 +314,38 @@ pub(crate) fn census_object_version_on_disk(
         file_info.parts.iter().map(|part| part.number).collect()
     };
     let data_dir = file_info.data_dir.map(|id| id.to_string());
+    let erasure_index = Some(file_info.erasure.index);
     let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
-    let present_part_numbers = match std::fs::read_dir(&part_dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(|kind| kind.is_file())
-                    .and_then(|_| entry.file_name().to_str().map(str::to_owned))
-            })
-            .filter_map(|name| name.strip_prefix("part.").and_then(|number| number.parse::<usize>().ok()))
-            .collect(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+    let (present_part_numbers, present_part_fingerprints) = match std::fs::read_dir(&part_dir) {
+        Ok(entries) => {
+            let mut numbers = BTreeSet::new();
+            let mut fingerprints = BTreeMap::new();
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(part_number) = file_name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("part."))
+                    .and_then(|number| number.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                numbers.insert(part_number);
+                let data = std::fs::read(entry.path())?;
+                fingerprints.insert(
+                    part_number,
+                    PartShardFingerprint {
+                        size: u64::try_from(data.len())?,
+                        sha256: sha256_hex(&data),
+                    },
+                );
+            }
+            (numbers, fingerprints)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (BTreeSet::new(), BTreeMap::new()),
         Err(error) => return Err(error.into()),
     };
 
@@ -317,8 +353,10 @@ pub(crate) fn census_object_version_on_disk(
         version_id,
         has_xl_meta: true,
         data_dir,
+        erasure_index,
         expected_part_numbers,
         present_part_numbers,
+        present_part_fingerprints,
     })
 }
 

@@ -67,6 +67,16 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
 }
 
+fn capture_command_logs(command: &mut Command, log_path: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(log_path) = log_path else {
+        return Ok(());
+    };
+    let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+    let stderr_file = file.try_clone()?;
+    command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
+    Ok(())
+}
+
 pub(crate) fn build_test_s3_config(
     endpoint_url: &str,
     access_key: &str,
@@ -557,13 +567,7 @@ impl RustFSTestEnvironment {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        // Optionally capture the child's stdout+stderr to a file so the test can
-        // grep server logs (e.g. to confirm which GET reader path was taken).
-        if let Some(log_path) = &self.capture_log_path {
-            let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
-            let stderr_file = file.try_clone()?;
-            command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
-        }
+        capture_command_logs(&mut command, self.capture_log_path.as_deref())?;
         let process = command.args(&args).spawn()?;
 
         self.process = Some(process);
@@ -1051,6 +1055,7 @@ pub struct RustFSTestClusterEnvironment {
     pub secret_key: String,
     pub extra_env: Vec<(String, String)>,
     pub node_extra_env: Vec<Vec<(String, String)>>,
+    pub node_capture_log_paths: Vec<Option<String>>,
     pub topology: ClusterTopology,
 }
 
@@ -1150,6 +1155,7 @@ impl RustFSTestClusterEnvironment {
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         })
     }
@@ -1176,6 +1182,20 @@ impl RustFSTestClusterEnvironment {
     {
         self.ensure_node_index(node_idx)?;
         self.node_extra_env[node_idx].push((key.into(), value.into()));
+        Ok(())
+    }
+
+    /// Capture stdout+stderr for a single cluster node process.
+    pub fn set_node_capture_log_path<P>(
+        &mut self,
+        node_idx: usize,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: Into<String>,
+    {
+        self.ensure_node_index(node_idx)?;
+        self.node_capture_log_paths[node_idx] = Some(path.into());
         Ok(())
     }
 
@@ -1268,6 +1288,7 @@ impl RustFSTestClusterEnvironment {
             for (key, value) in &self.node_extra_env[i] {
                 command.env(key, value);
             }
+            capture_command_logs(&mut command, self.node_capture_log_paths[i].as_deref())?;
 
             let process = command.current_dir(&node.data_dir).spawn()?;
 
@@ -1294,6 +1315,7 @@ impl RustFSTestClusterEnvironment {
 
         let binary_path = rustfs_binary_path();
         let volumes_arg = self.build_volumes_arg();
+        let log_path = self.node_capture_log_paths[node_idx].clone();
         let node = &mut self.nodes[node_idx];
         info!("Starting cluster node {} on {}", node_idx, node.address);
 
@@ -1312,6 +1334,7 @@ impl RustFSTestClusterEnvironment {
         for (key, value) in &self.node_extra_env[node_idx] {
             command.env(key, value);
         }
+        capture_command_logs(&mut command, log_path.as_deref())?;
 
         let process = command.current_dir(&node.data_dir).spawn()?;
         node.process = Some(process);
@@ -1563,6 +1586,7 @@ mod tests {
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         }
     }
@@ -1656,6 +1680,16 @@ mod tests {
             env.node_extra_env[2].as_slice(),
             [("RUSTFS_INTERNODE_RPC_MSGPACK_ONLY".to_string(), "true".to_string())]
         );
+    }
+
+    #[test]
+    fn cluster_node_log_capture_supports_per_node_paths() {
+        let mut env = fake_cluster(ClusterTopology::single_pool(3));
+        env.set_node_capture_log_path(1, "/tmp/node1.log").unwrap();
+        assert_eq!(env.node_capture_log_paths[0], None);
+        assert_eq!(env.node_capture_log_paths[1], Some("/tmp/node1.log".to_string()));
+        assert_eq!(env.node_capture_log_paths[2], None);
+        assert!(env.set_node_capture_log_path(3, "/tmp/invalid.log").is_err());
     }
 
     #[test]
