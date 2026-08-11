@@ -1034,6 +1034,10 @@ pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec
     ecstore_config::com::save_config_no_lock(api, file, data).await
 }
 
+pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<()> {
+    ecstore_config::com::delete_config_no_lock(api, file).await
+}
+
 pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send + 'static,
