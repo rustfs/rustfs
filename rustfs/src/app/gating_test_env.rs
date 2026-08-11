@@ -25,6 +25,7 @@
 use super::storage_api::test::bucket::metadata_sys;
 use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions};
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use super::{context::AppContext, object_traffic_health::ObjectTrafficHealth};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
@@ -32,6 +33,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 static SHARED_GATING_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
+static SHARED_GATING_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Return a shared 4-disk `ECStore` with bucket metadata initialized.
 ///
@@ -39,6 +41,10 @@ static SHARED_GATING_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = Once
 /// subsequent callers get the same `Arc<ECStore>`. Safe to call from
 /// `#[serial]` tests that share the process bootstrap context.
 pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
+    if let Some((_paths, store, _)) = SHARED_GATING_ENV.get() {
+        return store.clone();
+    }
+    let _init_guard = SHARED_GATING_INIT.lock().await;
     if let Some((_paths, store, _)) = SHARED_GATING_ENV.get() {
         return store.clone();
     }
@@ -99,6 +105,28 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
 
     let _ = SHARED_GATING_ENV.set((disk_paths, ecstore.clone(), temp_dir));
     ecstore
+}
+
+pub(crate) async fn shared_gating_ambient() -> Arc<AppContext> {
+    let store = shared_gating_ecstore().await;
+    if let Some(ambient) = crate::runtime_sources::current_app_context() {
+        return ambient;
+    }
+
+    let _init_guard = SHARED_GATING_INIT.lock().await;
+    if crate::runtime_sources::current_app_context().is_none() {
+        super::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+    }
+    crate::runtime_sources::current_app_context().expect("object traffic test context must be installed")
+}
+
+pub(crate) fn app_context_from_current_environment(ambient: &AppContext) -> AppContext {
+    AppContext::new(ambient.object_store(), ambient.iam(), ambient.kms())
+}
+
+pub(crate) async fn app_context_with_object_traffic_health(object_traffic_health: Arc<ObjectTrafficHealth>) -> Arc<AppContext> {
+    let ambient = shared_gating_ambient().await;
+    Arc::new(app_context_from_current_environment(&ambient).with_test_object_traffic_health(object_traffic_health))
 }
 
 /// Like [`shared_gating_ecstore`], but also returns the backing disk paths so

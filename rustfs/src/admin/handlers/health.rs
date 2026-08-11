@@ -14,6 +14,7 @@
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::app_context_from_req;
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, build_health_response_parts,
     collect_probe_readiness, probe_from_path,
@@ -51,6 +52,7 @@ pub struct HealthCheckHandler {}
 #[async_trait::async_trait]
 impl Operation for HealthCheckHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let object_traffic_health = app_context_from_req(&req).map(|context| context.object_traffic_health());
         // Extract the original HTTP Method (encapsulated by s3s into S3Request)
         let method = req.method;
 
@@ -66,7 +68,7 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let readiness_report = collect_probe_readiness(probe).await;
+        let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
 
         let response_parts =
             build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-endpoint", None, None);

@@ -59,11 +59,51 @@ use s3s::dto::VersioningConfiguration;
 #[cfg(test)]
 pub(crate) static VERSIONING_CONFIG_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+type VersioningConfigTestHook = (String, std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+
+#[cfg(test)]
+static VERSIONING_CONFIG_TEST_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<VersioningConfigTestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_versioning_config_test_hook(
+    bucket: String,
+    entered: std::sync::Arc<tokio::sync::Barrier>,
+    resume: std::sync::Arc<tokio::sync::Barrier>,
+) {
+    *VERSIONING_CONFIG_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("versioning config test hook lock should not be poisoned") = Some((bucket, entered, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_versioning_config_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = VERSIONING_CONFIG_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioning config test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, entered, resume)) = hook {
+        entered.wait().await;
+        resume.wait().await;
+    }
+}
+
 /// Fetch the bucket's versioning configuration once so callers can derive
 /// enabled/suspended state without repeated metadata-sys lookups per request.
 pub(crate) async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
     #[cfg(test)]
     VERSIONING_CONFIG_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    wait_for_versioning_config_test_hook(bucket).await;
     match BucketVersioningSys::get(bucket).await {
         Ok(cfg) => cfg,
         Err(err) => {
