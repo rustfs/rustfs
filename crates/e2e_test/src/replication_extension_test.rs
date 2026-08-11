@@ -630,6 +630,17 @@ async fn put_bucket_replication_with_delete_statuses(
     delete_marker_status: &str,
     version_delete_status: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    put_bucket_replication_with_statuses(env, bucket, target_arn, delete_marker_status, version_delete_status, "Enabled").await
+}
+
+async fn put_bucket_replication_with_statuses(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arn: &str,
+    delete_marker_status: &str,
+    version_delete_status: Option<&str>,
+    existing_object_status: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let delete_replication = version_delete_status
         .map(|status| format!("<DeleteReplication><Status>{status}</Status></DeleteReplication>"))
         .unwrap_or_default();
@@ -645,7 +656,7 @@ async fn put_bucket_replication_with_delete_statuses(
     </DeleteMarkerReplication>
     {delete_replication}
     <ExistingObjectReplication>
-      <Status>Enabled</Status>
+      <Status>{existing_object_status}</Status>
     </ExistingObjectReplication>
     <Destination>
       <Bucket>{target_arn}</Bucket>
@@ -8149,5 +8160,239 @@ async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays
     );
 
     target.shutdown().await;
+
+    Ok(())
+}
+
+// --- P1-20 (backlog#1675): scanner existing-object compensation matrix ---
+//
+// Every case below inverts the order used by the rest of this file: objects
+// are written FIRST and the replication rule arrives afterwards, so the only
+// channel that can move the pre-existing objects is the data scanner's
+// existing-object resync pass. Negative cells ("never compensated") are
+// contracts and are asserted over multiple scanner cycles, always next to a
+// replicated control key that proves the scanner and the live path are
+// running — an absent key on a dead scanner proves nothing.
+
+/// Envs + buckets only: versioning, the remote target, and the rule variant
+/// are wired by each test (the null-version case must PUT before the source
+/// bucket becomes versioned). The source runs with FAST_SCANNER_ENV so
+/// existing keys are rescanned within seconds instead of 16 dir cycles.
+async fn build_scanner_compensation_pair(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment), Box<dyn Error + Send + Sync>> {
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    source_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await?;
+    target_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(target_bucket)
+        .send()
+        .await?;
+
+    Ok((source_env, target_env))
+}
+
+/// P1-20: objects that already exist when a rule with
+/// ExistingObjectReplication=Enabled arrives are compensated by the scanner's
+/// existing-object resync pass, whatever wrote them — plain PUT, CopyObject,
+/// or Snowball auto-extract. The pinned exception is a null-version object
+/// (written before the bucket became versioned): the scanner heal gate skips
+/// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
+/// must NEVER be compensated.
+#[tokio::test]
+#[serial]
+async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-comp-src";
+    let target_bucket = "scanner-comp-dst";
+    let (source_env, target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    // Null-version cell: PUT before versioning; the object keeps the nil
+    // version id forever.
+    let null_key = "pre-versioning-null.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(null_key)
+        .body(ByteStream::from_static(b"null version payload"))
+        .send()
+        .await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    // Pre-existing objects from three write paths, all before any replication
+    // config exists (their replication status stays Empty).
+    let plain_key = "existing-plain.txt";
+    let plain_payload = "existing plain payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(plain_key)
+        .body(ByteStream::from_static(plain_payload.as_bytes()))
+        .send()
+        .await?;
+
+    let copy_key = "existing-copy.txt";
+    source_client
+        .copy_object()
+        .bucket(source_bucket)
+        .key(copy_key)
+        .copy_source(format!("{source_bucket}/{plain_key}"))
+        .send()
+        .await?;
+
+    let member_key = "snowball/existing-member.txt";
+    let member_payload: &[u8] = b"existing snowball member payload";
+    let mut builder = tokio_tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    let mut header = tokio_tar::Header::new_gnu();
+    header.set_size(member_payload.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, member_key, std::io::Cursor::new(member_payload))
+        .await?;
+    let archive = builder.into_inner().await?.into_inner();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("existing-members.tar")
+        .metadata("Snowball-Auto-Extract", "true")
+        .body(ByteStream::from(archive))
+        .send()
+        .await?;
+    // The extracted member must exist locally before the rule arrives, or it
+    // would replicate through the live path instead of the scanner.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if source_client
+            .head_object()
+            .bucket(source_bucket)
+            .key(member_key)
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("snowball member was never extracted on the source".into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Only now wire the remote target and the Enabled rule.
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    // Control key written after the rule replicates through the live path.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner compensation for each pre-existing write path.
+    wait_for_replicated_object(&target_client, target_bucket, plain_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
+
+    // Null-version contract: with every sibling compensated (scanner proven
+    // live), the nil-version object must stay absent across further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, null_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-20: ExistingObjectReplication=Disabled is a contract, not a delay — the
+/// scanner must NEVER compensate objects that predate the rule, while objects
+/// written after the rule replicate normally (the setting only gates the
+/// existing-object resync path).
+#[tokio::test]
+#[serial]
+async fn test_scanner_never_compensates_when_existing_object_replication_disabled() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-disabled-src";
+    let target_bucket = "scanner-disabled-dst";
+    let (source_env, mut target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let existing_key = "existing-disabled.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(existing_key)
+        .body(ByteStream::from_static(b"existing disabled payload"))
+        .send()
+        .await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_statuses(&source_env, source_bucket, &target_arn, "Enabled", None, "Disabled").await?;
+
+    // The live path is unaffected by the Disabled existing-object setting.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner-only witness. A live-path control key alone would let this test
+    // pass while the existing-object scanner is disabled or wedged, so make
+    // the scanner itself observable: an object whose replication FAILED while
+    // the target was down can only be re-driven by the data scanner's
+    // replication heal pass (see FAST_SCANNER_ENV), and that pass is NOT
+    // gated by ExistingObjectReplication. The witness lives in the same
+    // bucket and prefix as the pre-existing key, so a heal pass that reached
+    // it necessarily walked the pre-existing key in the same scan.
+    let witness_key = "scanner-witness.txt";
+    let witness_payload = "scanner witness payload";
+    target_env.stop_server();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(witness_key)
+        .body(ByteStream::from_static(witness_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, source_bucket, witness_key, "FAILED", false).await?;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+    let target_client = target_env.create_s3_client();
+    wait_for_replicated_object(&target_client, target_bucket, witness_key, witness_payload).await?;
+
+    // The scanner demonstrably swept this bucket; the pre-existing key must
+    // still be absent, and stay absent over further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, existing_key, Duration::from_secs(6)).await?;
+
     Ok(())
 }

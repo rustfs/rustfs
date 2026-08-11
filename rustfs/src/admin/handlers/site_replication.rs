@@ -46,7 +46,7 @@ use crate::config::get_config_snapshot;
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::storage::storage_api::{
-    lock_bucket_targets_metadata, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
+    delete_config_no_lock, lock_bucket_targets_metadata, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
     with_config_object_write_lock,
 };
 use base64::Engine;
@@ -111,7 +111,11 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
-const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
+#[cfg(test)]
+use crate::admin::site_replication_state::with_site_replication_state_object_lock;
+use crate::admin::site_replication_state::{
+    SITE_REPLICATION_STATE_PATH, site_replication_state_process_guard, with_site_replication_state_lock,
+};
 const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
 const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
@@ -147,6 +151,11 @@ const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
 const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
+/// Peer-edit fencing token, carried as query parameters so a peer that predates
+/// the fence simply ignores them (unknown query keys are dropped) and keeps the
+/// previous last-writer-wins behaviour.
+const SITE_REPLICATION_EDIT_ORIGIN_QUERY: &str = "editOrigin";
+const SITE_REPLICATION_EDIT_GENERATION_QUERY: &str = "editGeneration";
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
@@ -344,7 +353,8 @@ impl TryFrom<&PeerSite> for PeerConnection {
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
 // Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
-static SITE_REPLICATION_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+// The state mutex lives in crate::admin::site_replication_state and is
+// taken through site_replication_state_process_guard (P1-15).
 static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
@@ -457,6 +467,20 @@ struct SiteReplicationState {
     retry_queue: Vec<SiteReplicationRetryEvent>,
     #[serde(default)]
     sync_state_initialized: bool,
+    /// Fencing token for peer-edit delivery, allocated inside the state
+    /// transaction (process mutex + distributed state-object lock). Two nodes
+    /// of THIS site that accept admin edits concurrently therefore get
+    /// strictly ordered generations even though the process mutex cannot
+    /// serialize them, and a delivery that stalls can be recognised as stale
+    /// by the receiving site.
+    #[serde(default)]
+    edit_generation: u64,
+    /// Per-origin high-water mark of the peer edits already applied here,
+    /// keyed by the origin site's deployment id. A delivery whose generation
+    /// is not above the mark arrived out of order and must not overwrite the
+    /// newer edit that already landed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    applied_edit_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -595,6 +619,12 @@ struct SiteReplicationRetryEvent {
     last_error: String,
     #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
     updated_at: Option<OffsetDateTime>,
+    /// Peer-edit generation whose delivery failed, when the failing send
+    /// carried one. Settling a *later* success for the same (peer, path) must
+    /// not erase a failure recorded for a NEWER generation — see
+    /// [`settle_site_replication_retry_events`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edit_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1036,30 +1066,112 @@ fn parse_public_peer_edit(body: &[u8]) -> S3Result<(PeerInfo, PeerTlsFieldPresen
     Ok((parse_site_replication_json(body)?, parse_site_replication_json(body)?))
 }
 
+fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
+    let mut state: SiteReplicationState = serde_json::from_slice(data)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
+    state.peers = normalize_peer_map_by_identity(state.peers);
+    // A peer-edit high-water mark only fences a CURRENT peer. A site that
+    // leaves drops below two peers, which clears its own state object and
+    // restarts its generation counter at zero — a mark left over from the
+    // previous membership would then reject every edit it sends after it
+    // rejoins. Dropping departed origins on load also keeps the map bounded.
+    state
+        .applied_edit_generations
+        .retain(|origin, _| state.peers.contains_key(origin));
+    if !state.sync_state_initialized {
+        if state.enabled() {
+            mark_unknown_peer_sync_enabled(&mut state.peers);
+        }
+        state.sync_state_initialized = true;
+    }
+    Ok(state)
+}
+
 async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
     match read_admin_config(store, SITE_REPLICATION_STATE_PATH).await {
-        Ok(data) => {
-            let mut state: SiteReplicationState = serde_json::from_slice(&data)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
-            state.peers = normalize_peer_map_by_identity(state.peers);
-            if !state.sync_state_initialized {
-                if state.enabled() {
-                    mark_unknown_peer_sync_enabled(&mut state.peers);
-                }
-                state.sync_state_initialized = true;
-            }
-            Ok(state)
-        }
+        Ok(data) => parse_site_replication_state(&data),
         Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
         Err(err) => Err(S3Error::with_message(
             S3ErrorCode::InternalError,
             format!("failed to load site replication state: {err}"),
         )),
     }
+}
+
+async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
+    match read_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
+        Ok(data) => parse_site_replication_state(&data),
+        Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
+        Err(err) => Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to load site replication state: {err}"),
+        )),
+    }
+}
+
+/// Persist-or-clear under an already-held state object lock. Normalizes the
+/// peer map exactly once (the historical persist path normalized twice with
+/// two full clones — P2-22).
+async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, mut state: SiteReplicationState) -> S3Result<()> {
+    state.peers = normalize_peer_map_by_identity(state.peers);
+    if state.peers.len() <= 1 && state.pending_rotation.is_none() && state.pending_remove.is_none() {
+        match delete_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
+            Ok(()) | Err(StorageError::ConfigNotFound) => Ok(()),
+            Err(err) => Err(S3Error::with_message(S3ErrorCode::InternalError, format!("clear state failed: {err}"))),
+        }
+    } else {
+        let data = serde_json::to_vec(&state)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
+        save_config_no_lock(store, SITE_REPLICATION_STATE_PATH, data)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))
+    }
+}
+
+/// A second node's view of the same transaction: identical production code
+/// path minus the process mutex, which is per process and therefore cannot
+/// serialize anything across nodes. Used by the separate-nodes regression
+/// test so that removing the distributed lock breaks it.
+#[cfg(test)]
+async fn update_site_replication_state_as_separate_node<T, F>(update: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
+{
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    let lock_store = store.clone();
+    with_site_replication_state_object_lock(lock_store, move || async move {
+        let mut state = load_site_replication_state_no_lock(store.clone()).await?;
+        let result = update(&mut state)?;
+        persist_site_replication_state_no_lock(store, state).await?;
+        Ok(result)
+    })
+    .await
+}
+
+/// The site-replication state RMW transaction: load, mutate, persist — all
+/// under the process mutex plus the distributed state-object write lock
+/// (see crate::admin::site_replication_state). No peer network calls and no
+/// other config locks inside `update`.
+async fn update_site_replication_state<T, F>(update: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
+{
+    with_site_replication_state_lock(move || async move {
+        let store = current_object_store_handle()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+        let mut state = load_site_replication_state_no_lock(store.clone()).await?;
+        let result = update(&mut state)?;
+        persist_site_replication_state_no_lock(store, state).await?;
+        Ok(result)
+    })
+    .await
 }
 
 async fn load_site_replication_repair_state_from_store(store: Arc<ECStore>) -> S3Result<SiteReplicationRepairState> {
@@ -2633,7 +2745,7 @@ fn is_missing_service_account_error(err: &rustfs_iam::error::Error) -> bool {
 /// disables every control-plane push while `replicate info` still reports the site enabled.
 /// Both used to require deleting and recreating the account by hand.
 async fn reconcile_site_replicator_service_account() -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let state = load_site_replication_state().await?;
     if !state.enabled() || state.service_account_access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
         return Ok(());
@@ -3805,7 +3917,7 @@ async fn persist_site_replication_repair_task(
 ) -> S3Result<()> {
     persist_site_replication_repair_operation(operation).await?;
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut latest = load_site_replication_state().await?;
     let family_status = operation
         .sites
@@ -3822,6 +3934,7 @@ async fn persist_site_replication_repair_task(
                 .first()
                 .map(String::as_str)
                 .unwrap_or("remote-operation-failed"),
+            None,
         );
     } else {
         dequeue_site_replication_retry_events(&mut latest.retry_queue, peer, path);
@@ -3883,7 +3996,7 @@ async fn execute_site_replication_repair_locked(
     request: SiteReplicationRepairExecutionRequest,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let state = {
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
         if !state.enabled() || state.service_account_access_key.is_empty() {
             return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -4006,7 +4119,7 @@ async fn execute_site_replication_repair_locked(
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
     let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
     let runtime = {
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let Some(runtime) = runtime_site_replication_targets().await? else {
             return Ok(());
         };
@@ -5215,6 +5328,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         failed: false,
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
+        edit_generation: None,
     });
     state.pending_endpoint_refresh = Some(pending);
     Ok(())
@@ -5783,17 +5897,99 @@ fn summarize_peer_error_detail(detail: &str) -> String {
     summary
 }
 
+/// Allocate the next peer-edit generation. Called inside the state
+/// transaction, so the counter is handed out under the distributed
+/// state-object lock and two nodes of this site can never take the same one.
+fn next_peer_edit_generation(state: &mut SiteReplicationState) -> u64 {
+    state.edit_generation = state.edit_generation.saturating_add(1);
+    state.edit_generation
+}
+
+/// Build the peer-edit request path carrying the fencing token. The bare
+/// constant stays the retry-queue key: the query only fences the wire
+/// delivery, and a per-generation key would make every retry event unique.
+/// Without a local deployment id there is nothing to fence against, so the
+/// unstamped path is sent and the receiver keeps its pre-fence behaviour.
+fn peer_edit_path_with_fence(origin: Option<&str>, generation: u64) -> String {
+    let Some(origin) = origin.filter(|origin| !origin.is_empty()) else {
+        return SITE_REPLICATION_PEER_EDIT_PATH.to_string();
+    };
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair(SITE_REPLICATION_EDIT_ORIGIN_QUERY, origin)
+        .append_pair(SITE_REPLICATION_EDIT_GENERATION_QUERY, &generation.to_string())
+        .finish();
+    format!("{SITE_REPLICATION_PEER_EDIT_PATH}?{query}")
+}
+
+/// The (origin site, generation) fence an incoming peer edit carries, when the
+/// sender stamped one. An unstamped edit (older peer) has no fence and is
+/// applied as before.
+fn peer_edit_fence(queries: &HashMap<String, String>) -> Option<(String, u64)> {
+    let origin = queries
+        .get(SITE_REPLICATION_EDIT_ORIGIN_QUERY)
+        .filter(|origin| !origin.is_empty())?;
+    let generation = queries.get(SITE_REPLICATION_EDIT_GENERATION_QUERY)?.parse::<u64>().ok()?;
+    Some((origin.clone(), generation))
+}
+
+/// True when a newer edit from the same origin site already landed here. The
+/// process mutex on the sending node cannot order deliveries issued by two
+/// nodes of that site, so ordering is decided here, on the generation the
+/// sender allocated under the distributed lock.
+fn peer_edit_delivery_is_stale(state: &SiteReplicationState, origin: &str, generation: u64) -> bool {
+    state
+        .applied_edit_generations
+        .get(origin)
+        .is_some_and(|applied| *applied >= generation)
+}
+
+fn record_applied_peer_edit_generation(state: &mut SiteReplicationState, origin: &str, generation: u64) {
+    let applied = state.applied_edit_generations.entry(origin.to_string()).or_default();
+    *applied = (*applied).max(generation);
+}
+
 fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
 }
 
 fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
+    settle_site_replication_retry_events(queue, peer, path, None)
+}
+
+/// Remove the retry events for (peer, path) that `generation` is entitled to
+/// settle. A successful delivery only proves the peer reached the state the
+/// delivery carried: while it was in flight another edit can commit, fail its
+/// own delivery, and enqueue for the same (peer, path). Erasing that event
+/// would leave the peer on the older edit with no retry left, so an event
+/// stamped with a NEWER generation survives. `None` settles unconditionally —
+/// the broadcast paths that carry no generation, whose retry events live under
+/// their own paths and never collide with peer-edit deliveries.
+fn settle_site_replication_retry_events(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    generation: Option<u64>,
+) -> usize {
     let before = queue.len();
-    queue.retain(|event| !retry_event_matches(event, peer, path));
+    queue.retain(|event| {
+        if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        match (generation, event.edit_generation) {
+            (Some(settled), Some(failed)) => failed > settled,
+            _ => false,
+        }
+    });
     before.saturating_sub(queue.len())
 }
 
-fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str, error: &str) {
+fn upsert_site_replication_retry_event(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    error: &str,
+    generation: Option<u64>,
+) {
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
@@ -5801,6 +5997,9 @@ fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent
         event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
         event.last_error = detail;
         event.updated_at = Some(now);
+        // Keep the newest generation: an older delivery that fails afterwards
+        // must not lower the fence and let its own success settle the event.
+        event.edit_generation = event.edit_generation.max(generation);
         return;
     }
 
@@ -5813,6 +6012,7 @@ fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent
         failed: false,
         last_error: detail,
         updated_at: Some(now),
+        edit_generation: generation,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
         let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
@@ -5839,11 +6039,22 @@ fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
 }
 
 async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
-    let result = async {
-        let mut state = load_site_replication_state().await?;
-        upsert_site_replication_retry_event(&mut state.retry_queue, peer, path, &error.to_string());
-        persist_site_replication_state(&state).await
-    }
+    enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
+}
+
+async fn enqueue_site_replication_retry_event_for_generation(
+    peer: &PeerInfo,
+    path: &str,
+    error: &S3Error,
+    generation: Option<u64>,
+) {
+    let peer_owned = peer.clone();
+    let path_owned = path.to_string();
+    let error_text = error.to_string();
+    let result = update_site_replication_state(move |state| {
+        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        Ok(())
+    })
     .await;
 
     if let Err(err) = result {
@@ -5879,11 +6090,25 @@ fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool 
 /// This is a no-op (load + no-op persist skipped) when no matching entry exists,
 /// avoiding unnecessary I/O on the common path.
 async fn dequeue_site_replication_retry_event(peer: &PeerInfo, path: &str) {
+    dequeue_site_replication_retry_event_for_generation(peer, path, None).await
+}
+
+async fn dequeue_site_replication_retry_event_for_generation(peer: &PeerInfo, path: &str, generation: Option<u64>) {
     let result = async {
-        let mut state = load_site_replication_state().await?;
-        if dequeue_site_replication_retry_events(&mut state.retry_queue, peer, path) > 0 {
-            persist_site_replication_state(&state).await?;
+        // Fast path: this sits on every successful hook broadcast, so probe
+        // with a plain read first and only enter the locked RMW on a hit
+        // (the transaction re-checks under the lock).
+        let mut probe = load_site_replication_state().await?;
+        if settle_site_replication_retry_events(&mut probe.retry_queue, peer, path, generation) == 0 {
+            return Ok(());
         }
+        let peer_owned = peer.clone();
+        let path_owned = path.to_string();
+        update_site_replication_state(move |state| {
+            settle_site_replication_retry_events(&mut state.retry_queue, &peer_owned, &path_owned, generation);
+            Ok(())
+        })
+        .await?;
         Ok::<_, S3Error>(())
     }
     .await;
@@ -5987,7 +6212,7 @@ async fn record_pending_rotation_secret_candidate(rotation_id: &str, secret: Str
         return Ok(());
     }
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if let Some(pending) = state.pending_rotation.as_mut()
         && pending.id == rotation_id
@@ -6003,7 +6228,7 @@ async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String)
         return Ok(());
     }
 
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if let Some(pending) = state.pending_remove.as_mut()
         && pending.id == remove_id
@@ -6015,31 +6240,35 @@ async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String)
 }
 
 async fn mark_pending_rotation_peer_acked(rotation_id: &str, deployment_id: &str) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-    let mut state = load_site_replication_state().await?;
-    if let Some(pending) = state.pending_rotation.as_mut()
-        && pending.id == rotation_id
-    {
-        pending.acked_deployment_ids.insert(deployment_id.to_string());
-        save_site_replication_state(&state).await?;
-    }
-    Ok(())
+    let rotation_id = rotation_id.to_string();
+    let deployment_id = deployment_id.to_string();
+    update_site_replication_state(move |state| {
+        if let Some(pending) = state.pending_rotation.as_mut()
+            && pending.id == rotation_id
+        {
+            pending.acked_deployment_ids.insert(deployment_id);
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn mark_pending_remove_peer_acked(remove_id: &str, deployment_id: &str) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-    let mut state = load_site_replication_state().await?;
-    if let Some(pending) = state.pending_remove.as_mut()
-        && pending.id == remove_id
-    {
-        pending.acked_deployment_ids.insert(deployment_id.to_string());
-        save_site_replication_state(&state).await?;
-    }
-    Ok(())
+    let remove_id = remove_id.to_string();
+    let deployment_id = deployment_id.to_string();
+    update_site_replication_state(move |state| {
+        if let Some(pending) = state.pending_remove.as_mut()
+            && pending.id == remove_id
+        {
+            pending.acked_deployment_ids.insert(deployment_id);
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     let Some(pending) = state.pending_rotation.as_ref() else {
         return Ok(true);
@@ -6057,7 +6286,7 @@ async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &P
 }
 
 async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let state = load_site_replication_state().await?;
     let Some(pending) = state.pending_remove.as_ref() else {
         return Ok(None);
@@ -6073,7 +6302,7 @@ async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo
 }
 
 async fn clear_pending_remove(remove_id: &str) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state
         .pending_remove
@@ -7152,7 +7381,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
             .await
             .map_err(ApiError::from)?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -7473,7 +7702,7 @@ async fn refresh_site_resync_status(mut status: SRResyncOpStatus, peer: &PeerInf
 }
 
 async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state
         .resync_status
@@ -7487,7 +7716,7 @@ async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) ->
 }
 
 async fn persist_new_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let _state_guard = site_replication_state_process_guard().await;
     let mut state = load_site_replication_state().await?;
     if state.resync_status.get(peer_id).is_some_and(site_resync_is_active) {
         return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
@@ -8103,7 +8332,7 @@ impl Operation for SiteReplicationAddHandler {
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
-        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let state_guard = site_replication_state_process_guard().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -8126,7 +8355,7 @@ impl Operation for SiteReplicationAddHandler {
         let expected_updated_at = current_state.updated_at;
         drop(state_guard);
         require_add_peer_tls_capability(&sites, &local_peer).await?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let latest_state = load_site_replication_state().await?;
         if latest_state.updated_at != expected_updated_at || pending_endpoint_refresh(&latest_state).is_some() {
             return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
@@ -8207,6 +8436,11 @@ impl Operation for SiteReplicationAddHandler {
         mark_unknown_peer_sync_enabled(&mut state.peers);
         persist_site_replication_state(&state).await?;
 
+        // The finalize fan-out below delivers peer-edit payloads, so it stays
+        // under the state guard: ordering against a concurrent edit matters
+        // and the peer edit handler has no generation fence. It uses the
+        // plain transport (no retry-event bookkeeping), so nothing re-enters
+        // the state transaction while the guard is held.
         for target in state.peers.values() {
             if target.deployment_id == local_peer.deployment_id || same_identity_endpoint(&target.endpoint, &local_peer.endpoint)
             {
@@ -8236,6 +8470,12 @@ impl Operation for SiteReplicationAddHandler {
             }
         }
 
+        // Bootstrap and back-fill send bucket-ops, not peer edits, so their
+        // ordering is not state-sensitive — and their transports do record
+        // retry events, which re-enter the state transaction. Release the
+        // guard before them.
+        drop(_state_guard);
+
         initial_sync_errors.extend(bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await);
 
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
@@ -8263,7 +8503,7 @@ impl Operation for SiteReplicationRemoveHandler {
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let current_state = load_site_replication_state().await?;
             if pending_endpoint_refresh(&current_state).is_some() {
                 return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -8469,7 +8709,7 @@ impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
@@ -8556,6 +8796,10 @@ impl Operation for SRPeerJoinHandler {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| local_peer.name.clone());
         persist_site_replication_state(&state).await?;
+        // Committed; release the state lock before the reverse-reachability
+        // probe and bucket back-fill — their transport helpers' retry-event
+        // bookkeeping re-enters the state transaction (P1-15).
+        drop(_state_guard);
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
         // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
@@ -8741,7 +8985,7 @@ impl Operation for SiteReplicationEditHandler {
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let body = read_site_replication_body(req, &cred.secret_key, true).await?;
         let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
-        let mut state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+        let mut state_guard = Some(site_replication_state_process_guard().await);
         let current_state = load_site_replication_state().await?;
         apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
@@ -8788,7 +9032,7 @@ impl Operation for SiteReplicationEditHandler {
             if tls_transport_probe_required {
                 probe_proposed_peer_tls_transport(&incoming, &current_state.service_account_access_key, &secret).await?;
             }
-            state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+            state_guard = Some(site_replication_state_process_guard().await);
             let latest_state = load_site_replication_state().await?;
             if latest_state.updated_at != expected_updated_at
                 || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
@@ -8860,7 +9104,7 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+                state_guard = Some(site_replication_state_process_guard().await);
                 let latest_state = load_site_replication_state().await?;
                 if latest_state.updated_at != expected_updated_at
                     || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
@@ -8913,7 +9157,7 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+                let _state_guard = site_replication_state_process_guard().await;
                 let mut state = load_site_replication_state().await?;
                 let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -8928,7 +9172,7 @@ impl Operation for SiteReplicationEditHandler {
                     site_replicator_service_account_secret(&state.service_account_access_key).await?;
                 drop(_state_guard);
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-                let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+                let _state_guard = site_replication_state_process_guard().await;
                 let mut state = load_site_replication_state().await?;
                 let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -8937,21 +9181,67 @@ impl Operation for SiteReplicationEditHandler {
                 clear_pending_endpoint_refresh(&mut state);
                 save_site_replication_state(&state).await?;
             } else {
-                for target in remote_targets {
+                // Commit before the peer fan-out (mirrors the add/join
+                // handlers): a failed notification is recorded as a retry
+                // event and converges from the committed local state —
+                // fanning out first meant the retry event pointed at a state
+                // the local site had not saved. The generation is allocated in
+                // the same commit, i.e. under the state-object lock, so it
+                // orders this edit against one another node accepts
+                // concurrently — the process guard below cannot.
+                let edit_generation = next_peer_edit_generation(&mut state);
+                save_site_replication_state(&state).await?;
+                let edit_path = peer_edit_path_with_fence(local_deployment_id.as_deref(), edit_generation);
+                let delivery_fence = local_deployment_id.is_some().then_some(edit_generation);
+
+                // The fan-out stays UNDER the state guard so deliveries issued
+                // by THIS node keep their commit order; the generation fence
+                // above is what covers the cross-node case, where the peer
+                // rejects a delivery an older edit is still trying to make.
+                // The retry-event bookkeeping is what cannot run under the
+                // guard — it re-enters the state transaction (P1-15) — so
+                // deliver with the plain transport here and settle the retry
+                // queue after the guard is released.
+                let mut delivered: Vec<PeerInfo> = Vec::new();
+                let mut failure: Option<(PeerInfo, S3Error)> = None;
+                'fanout: for target in remote_targets {
                     let transport = PeerTransport::for_runtime_peer(target).await?;
                     for peer in &peers_to_send {
-                        send_peer_admin_request_with_retry_event_transport(
-                            target,
-                            &transport,
-                            SITE_REPLICATION_PEER_EDIT_PATH,
+                        if let Err(err) = send_peer_admin_request_with_client(
+                            &transport.client,
+                            &transport.connection,
+                            &edit_path,
                             &current_state.service_account_access_key,
                             &service_account_secret_key,
                             peer,
                         )
-                        .await?;
+                        .await
+                        {
+                            failure = Some((target.clone(), err));
+                            break 'fanout;
+                        }
                     }
+                    delivered.push(target.clone());
                 }
-                save_site_replication_state(&state).await?;
+                drop(state_guard.take());
+
+                // Settle only what this generation is entitled to: a newer
+                // edit that committed and failed its own delivery while this
+                // fan-out was in flight left a retry event that must survive.
+                for target in &delivered {
+                    dequeue_site_replication_retry_event_for_generation(target, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence)
+                        .await;
+                }
+                if let Some((target, err)) = failure {
+                    enqueue_site_replication_retry_event_for_generation(
+                        &target,
+                        SITE_REPLICATION_PEER_EDIT_PATH,
+                        &err,
+                        delivery_fence,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
         }
 
@@ -8990,8 +9280,24 @@ impl Operation for SRPeerEditHandler {
         let queries = query_pairs(&req.uri);
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
-        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let delivery_fence = peer_edit_fence(&queries);
+        let state_guard = site_replication_state_process_guard().await;
         let state = load_site_replication_state().await?;
+        // Ordering fence: the sending site allocates the generation under its
+        // state-object lock, so a delivery that lost the race carries a
+        // generation this site has already passed. Applying it would roll the
+        // peer back to the older edit. Ack it — the newer edit already landed,
+        // so the sender has nothing to retry.
+        if let Some((origin, generation)) = delivery_fence.as_ref()
+            && peer_edit_delivery_is_stale(&state, origin, *generation)
+        {
+            return json_response(&ReplicateEditStatus {
+                success: true,
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
+        }
         if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
             return json_response(&ReplicateEditStatus {
                 success: false,
@@ -9060,6 +9366,12 @@ impl Operation for SRPeerEditHandler {
                 },
             )?;
         }
+        // Raise the origin's high-water mark in the same commit as the edit it
+        // fences: a crash between the two would let the superseded delivery
+        // apply on the next attempt.
+        if let Some((origin, generation)) = delivery_fence.as_ref() {
+            record_applied_peer_edit_generation(&mut state, origin, *generation);
+        }
         save_site_replication_state(&state).await?;
         if endpoint_refresh_requested {
             if state.service_account_access_key.is_empty() {
@@ -9074,7 +9386,7 @@ impl Operation for SRPeerEditHandler {
             let pending_id = refresh_id.unwrap_or_default();
             drop(state_guard);
             refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let mut state = load_site_replication_state().await?;
             let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                 return json_response(&ReplicateEditStatus {
@@ -9107,7 +9419,7 @@ impl Operation for SRPeerRemoveHandler {
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -9151,7 +9463,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (peer, existing_status) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let state = load_site_replication_state().await?;
             let local_peer = current_local_runtime_peer(&state);
             let requested_peer = normalize_peer_info(requested_peer);
@@ -9312,7 +9624,7 @@ impl Operation for SRStateEditHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let _state_guard = site_replication_state_process_guard().await;
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
@@ -9327,7 +9639,7 @@ impl Operation for SiteReplicationRepairHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let (state, local_peer) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let state = load_site_replication_state().await?;
             if !state.enabled() || state.service_account_access_key.is_empty() {
                 return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -9438,7 +9750,7 @@ impl Operation for SRRotateServiceAccountHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let (pending_rotation, local_peer, previous_access_key) = {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state_guard = site_replication_state_process_guard().await;
             let mut state = load_site_replication_state().await?;
             if !state.enabled() {
                 return Err(s3_error!(InvalidRequest, "site replication is not configured"));
@@ -11306,6 +11618,28 @@ mod tests {
                 .contains("validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;"),
             "SRPeerEditHandler must not require SiteReplicationAddAction for internal peer edits"
         );
+        // P1-15 review follow-up: the ordering fence is only worth anything if
+        // the handler both rejects a superseded delivery and raises the mark it
+        // rejects against — dropping either half silently restores
+        // last-writer-wins between two nodes of the sending site.
+        assert!(
+            handler_block.contains("peer_edit_delivery_is_stale(&state, origin, *generation)"),
+            "SRPeerEditHandler must reject peer edits a newer generation already superseded"
+        );
+        assert!(
+            handler_block.contains("record_applied_peer_edit_generation(&mut state, origin, *generation);"),
+            "SRPeerEditHandler must record the applied generation so later stale deliveries are recognised"
+        );
+
+        let sender_block = src
+            .split("impl Operation for SiteReplicationEditHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SRPeerEditCapabilitiesHandler").next())
+            .expect("SiteReplicationEditHandler block should exist");
+        assert!(
+            sender_block.contains("let edit_generation = next_peer_edit_generation(&mut state);"),
+            "the edit handler must allocate the generation inside the committed state, not outside the lock"
+        );
     }
 
     #[test]
@@ -11582,14 +11916,14 @@ mod tests {
         let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
         let add_guard =
             SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
-        let add_state = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let add_state = site_replication_state_process_guard().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
         let remove = tokio::spawn(async move {
             let _ = started_tx.send(());
             let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
             let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _state = site_replication_state_process_guard().await;
             let _ = entered_tx.send(());
         });
         started_rx.await.expect("remove task started");
@@ -12377,14 +12711,128 @@ mod tests {
         };
         let mut queue = Vec::new();
 
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first");
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second");
-        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third");
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
         assert!(queue[0].failed);
         assert_eq!(queue[0].last_error, "third");
+    }
+
+    /// P1-15 review follow-up: a successful peer-edit delivery only proves the
+    /// peer reached the state THAT delivery carried. Settling it must not
+    /// erase a retry event a newer edit left behind, or the local site sits on
+    /// edit B, the peer on edit A, and nothing is queued to converge them.
+    #[test]
+    fn retry_settlement_must_not_erase_a_newer_generation_failure() {
+        let peer = PeerInfo {
+            deployment_id: "remote-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let mut queue = Vec::new();
+
+        // Edit A (generation 5) delivered successfully and is stalled before
+        // settling. Edit B (generation 6) commits meanwhile, fails delivery to
+        // the same peer, and enqueues.
+        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6));
+
+        // A resumes: its own settlement must leave B's retry alone.
+        assert_eq!(
+            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(5)),
+            0
+        );
+        assert_eq!(queue.len(), 1, "the newer edit's retry event was erased by an older success");
+        assert_eq!(queue[0].edit_generation, Some(6));
+
+        // An even older delivery failing afterwards must not lower the fence.
+        upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4));
+        assert_eq!(queue[0].edit_generation, Some(6));
+
+        // B's own delivery succeeding is what clears it.
+        assert_eq!(
+            settle_site_replication_retry_events(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, Some(6)),
+            1
+        );
+        assert!(queue.is_empty());
+
+        // Broadcast paths carry no generation and keep settling unconditionally
+        // — their retry events live under their own path and never collide
+        // with a peer-edit delivery.
+        let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 1);
+    }
+
+    /// P1-15 review follow-up: the receiving side of the ordering fence. The
+    /// sender's process mutex is per node, so two nodes of the same site can
+    /// fan out in the opposite order to their commits; the receiver decides
+    /// ordering from the generation the sender allocated under the distributed
+    /// state lock.
+    #[test]
+    fn peer_edit_fence_rejects_a_delivery_the_newer_edit_already_passed() {
+        let mut state = SiteReplicationState::default();
+        let path = peer_edit_path_with_fence(Some("origin-site"), 7);
+        let queries = query_pairs(&path.parse::<Uri>().expect("the fenced path must be a valid request uri"));
+        let (origin, generation) = peer_edit_fence(&queries).expect("the fence must round-trip through the request path");
+        assert_eq!((origin.as_str(), generation), ("origin-site", 7));
+
+        assert!(!peer_edit_delivery_is_stale(&state, &origin, generation));
+        record_applied_peer_edit_generation(&mut state, &origin, generation);
+
+        // The delivery that lost the race carries the older generation.
+        assert!(peer_edit_delivery_is_stale(&state, "origin-site", 6));
+        // A replay of the generation already applied is stale too.
+        assert!(peer_edit_delivery_is_stale(&state, "origin-site", 7));
+        // The next edit from that origin still applies...
+        assert!(!peer_edit_delivery_is_stale(&state, "origin-site", 8));
+        // ...and another origin site is ordered independently.
+        assert!(!peer_edit_delivery_is_stale(&state, "other-site", 1));
+
+        // A sender with no deployment id has nothing to fence against, and a
+        // peer that predates the fence sends no query: both keep the previous
+        // last-writer-wins behaviour rather than being rejected.
+        assert_eq!(peer_edit_path_with_fence(None, 9), SITE_REPLICATION_PEER_EDIT_PATH);
+        assert_eq!(peer_edit_path_with_fence(Some(""), 9), SITE_REPLICATION_PEER_EDIT_PATH);
+        assert!(peer_edit_fence(&HashMap::new()).is_none());
+    }
+
+    /// P1-15 review follow-up: a site that leaves the mesh drops below two
+    /// peers, which clears its state object and restarts its generation
+    /// counter at zero. A mark left over from its previous membership would
+    /// make every edit it sends after rejoining look stale — i.e. the fence
+    /// would silently swallow that site's edits forever.
+    #[test]
+    fn peer_edit_marks_do_not_outlive_the_peer_that_earned_them() {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            "origin-site".to_string(),
+            PeerInfo {
+                deployment_id: "origin-site".to_string(),
+                ..peer("origin", "https://origin.example:9000")
+            },
+        );
+        record_applied_peer_edit_generation(&mut state, "origin-site", 12);
+        let retained = serde_json::to_vec(&state).expect("serialize state with a live peer");
+        assert_eq!(
+            parse_site_replication_state(&retained)
+                .expect("reload")
+                .applied_edit_generations
+                .get("origin-site"),
+            Some(&12),
+            "the mark for a current peer must survive a reload"
+        );
+
+        state.peers.remove("origin-site");
+        let departed = serde_json::to_vec(&state).expect("serialize state after the peer left");
+        let reloaded = parse_site_replication_state(&departed).expect("reload");
+        assert!(
+            reloaded.applied_edit_generations.is_empty(),
+            "a departed peer's mark must not fence its edits after it rejoins: {:?}",
+            reloaded.applied_edit_generations
+        );
+        assert!(!peer_edit_delivery_is_stale(&reloaded, "origin-site", 1));
     }
 
     #[test]
@@ -14751,5 +15199,228 @@ mod tests {
         let mut newer = status;
         newer.generation += 1;
         assert!(parse_site_resync_page(&query, &newer).is_err());
+    }
+
+    /// P1-15 review follow-up: isolates the PROCESS guard. One writer uses
+    /// the legacy shape that the not-yet-migrated call sites still use (take
+    /// the process mutex, then load / mutate / save through the plain
+    /// helpers, which take their own per-IO object locks); the other runs the
+    /// full transaction. They only stay serialized because the transaction
+    /// also takes the process mutex — drop it there and this test loses one
+    /// of the two updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_transaction_serializes_against_a_process_only_legacy_writer() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-legacy".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            let legacy_id = format!("legacy-{round}");
+            let legacy = tokio::spawn(async move {
+                // Exactly what an unmigrated call site does today.
+                let _guard = site_replication_state_process_guard().await;
+                let mut state = load_site_replication_state().await.expect("legacy load");
+                if let Some(pending) = state.pending_rotation.as_mut() {
+                    pending.secret_candidates.push(legacy_id);
+                }
+                save_site_replication_state(&state).await.expect("legacy save");
+            });
+            let ack_id = format!("ack-{round}");
+            let migrated = tokio::spawn(async move {
+                mark_pending_rotation_peer_acked("rot-legacy", &ack_id)
+                    .await
+                    .expect("transaction writer");
+            });
+            legacy.await.expect("legacy task");
+            migrated.await.expect("transaction task");
+        }
+
+        let final_state = load_site_replication_state().await.expect("reload");
+        let pending = final_state.pending_rotation.expect("pending rotation survives");
+        for round in 0..ROUNDS {
+            assert!(
+                pending.secret_candidates.contains(&format!("legacy-{round}")),
+                "legacy writer update {round} was lost; candidates: {:?}",
+                pending.secret_candidates
+            );
+            assert!(
+                pending.acked_deployment_ids.contains(&format!("ack-{round}")),
+                "transaction writer update {round} was lost; acks: {:?}",
+                pending.acked_deployment_ids
+            );
+        }
+    }
+
+    /// P1-15 review follow-up: isolates the DISTRIBUTED guard. Both writers
+    /// bypass the process mutex, which is what two separate nodes do — the
+    /// mutex is per process and cannot serialize them. Only the state-object
+    /// write lock keeps their read-modify-write sequences apart; drop it and
+    /// this test loses an update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_state_object_lock_serializes_writers_from_separate_nodes() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-nodes".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        // Each "node" runs the production transaction minus the process
+        // mutex — the distributed state-object lock is the only thing left
+        // to keep them apart.
+        fn node_local_update(candidate: String) -> impl std::future::Future<Output = S3Result<()>> {
+            update_site_replication_state_as_separate_node(move |state| {
+                if let Some(pending) = state.pending_rotation.as_mut() {
+                    pending.secret_candidates.push(candidate);
+                }
+                Ok(())
+            })
+        }
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            let node_a = tokio::spawn(node_local_update(format!("node-a-{round}")));
+            let node_b = tokio::spawn(node_local_update(format!("node-b-{round}")));
+            node_a.await.expect("node a task").expect("node a update");
+            node_b.await.expect("node b task").expect("node b update");
+        }
+
+        let final_state = load_site_replication_state().await.expect("reload");
+        let pending = final_state.pending_rotation.expect("pending rotation survives");
+        for round in 0..ROUNDS {
+            for node in ["node-a", "node-b"] {
+                assert!(
+                    pending.secret_candidates.contains(&format!("{node}-{round}")),
+                    "{node} update {round} was lost across nodes; candidates: {:?}",
+                    pending.secret_candidates
+                );
+            }
+        }
+    }
+
+    /// P1-15 review follow-up: the sending side of the peer-edit ordering
+    /// fence, driven by two separate nodes. Both bypass the process mutex —
+    /// which is exactly what two nodes of one site do — so the generation is
+    /// only unique because it is allocated inside the state transaction, under
+    /// the distributed state-object lock. Two nodes sharing a generation would
+    /// leave the receiver unable to tell which edit is newer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_edit_generations_are_unique_across_nodes() {
+        publish_ready_iam_context().await;
+        // A configured site: `persist_site_replication_state_no_lock` clears
+        // the object once a site drops below two peers, and a cleared object
+        // would reset the counter between allocations.
+        let seed = SiteReplicationState {
+            peers: ["site-a", "site-b"]
+                .into_iter()
+                .map(|name| (name.to_string(), peer(name, &format!("https://{name}.example:9000"))))
+                .collect(),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        fn node_local_allocate() -> impl std::future::Future<Output = S3Result<u64>> {
+            update_site_replication_state_as_separate_node(|state| Ok(next_peer_edit_generation(state)))
+        }
+
+        const ROUNDS: usize = 8;
+        let mut generations = Vec::new();
+        for _ in 0..ROUNDS {
+            let node_a = tokio::spawn(node_local_allocate());
+            let node_b = tokio::spawn(node_local_allocate());
+            generations.push(node_a.await.expect("node a task").expect("node a allocation"));
+            generations.push(node_b.await.expect("node b task").expect("node b allocation"));
+        }
+
+        let unique: BTreeSet<u64> = generations.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            generations.len(),
+            "two nodes took the same edit generation, so their deliveries cannot be ordered: {generations:?}"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").edit_generation,
+            generations.len() as u64,
+            "the persisted counter must account for every allocation"
+        );
+    }
+
+    /// P1-15 (rustfs/backlog#1675 B2): every state RMW — including the
+    /// retry-event writers that hang off the hook broadcast paths — now runs
+    /// through `update_site_replication_state`, which holds the process
+    /// mutex plus the distributed state-object write lock for the whole
+    /// load -> mutate -> persist. Before the fix the retry writers took no
+    /// lock at all: this concurrent mix deterministically lost one side
+    /// (the red-light commit pinned the exact interleaving).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
+        publish_ready_iam_context().await;
+
+        let seed = SiteReplicationState {
+            pending_rotation: Some(PendingRotation {
+                id: "rot-1".to_string(),
+                access_key: "svc-account".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        const ROUNDS: usize = 8;
+        for round in 0..ROUNDS {
+            let peer = PeerInfo {
+                endpoint: format!("https://peer-{round}.example:9000"),
+                deployment_id: format!("peer-{round}-deployment"),
+                ..Default::default()
+            };
+            let enqueue = tokio::spawn(async move {
+                let error = S3Error::with_message(S3ErrorCode::InternalError, "peer offline".to_string());
+                enqueue_site_replication_retry_event(&peer, "bucket-meta", &error).await;
+            });
+            let ack_id = format!("ack-{round}-deployment");
+            let ack = tokio::spawn(async move {
+                mark_pending_rotation_peer_acked("rot-1", &ack_id)
+                    .await
+                    .expect("locked writer must succeed");
+            });
+            enqueue.await.expect("enqueue task");
+            ack.await.expect("ack task");
+        }
+
+        let final_state = load_site_replication_state().await.expect("reload final state");
+        assert_eq!(
+            final_state.retry_queue.len(),
+            ROUNDS,
+            "every concurrently-enqueued retry event must survive"
+        );
+        let acked = &final_state
+            .pending_rotation
+            .as_ref()
+            .expect("pending rotation must survive")
+            .acked_deployment_ids;
+        for round in 0..ROUNDS {
+            assert!(
+                acked.contains(&format!("ack-{round}-deployment")),
+                "rotation ack {round} must survive the concurrent retry-event writers; acked: {acked:?}"
+            );
+        }
     }
 }
