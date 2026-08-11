@@ -1471,8 +1471,7 @@ where
         };
 
         let prepared = async {
-            // RUSTFS_COMPAT_TODO(table-publication-fence-v1): Old nodes mutate table files without table publication
-            // fences. Remove exact live-file guards after the minimum supported release uses table and bucket fences.
+            // RUSTFS_COMPAT_TODO(table-publication-fence-v1): Retain exact live-file guards for old nodes. Remove after the minimum supported release uses table and bucket publication fences.
             let retain_legacy_object_guards = !self.publication_fence_fleet_confirmed;
             let guarded_object_count = if retain_legacy_object_guards {
                 expected.len()
