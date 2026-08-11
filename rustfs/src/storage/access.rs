@@ -3411,7 +3411,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_required_existing_object_tags_are_merged_into_authorization_conditions() {
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(store, Arc::new(UnreadyIam), Arc::new(TestKms),))));
         let mut request = build_request((), Method::GET);
+        request.extensions.insert(server_ctx);
         request.extensions.insert(ObjectTagConditions::new(
             "bucket",
             "tagged-object",
