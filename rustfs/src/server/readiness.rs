@@ -88,6 +88,8 @@ pub enum ReadinessDegradedReason {
     IamNotReady,
     LockQuorumUnavailable,
     KmsNotReady,
+    ObjectReadStalled,
+    ObjectWriteStalled,
     ClusterHealthTimeout,
     PeerHealthUnavailable,
     StorageAndIamUnavailable,
@@ -103,6 +105,8 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::IamNotReady => "iam_not_ready",
             ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
             ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
+            ReadinessDegradedReason::ObjectReadStalled => "object_read_stalled",
+            ReadinessDegradedReason::ObjectWriteStalled => "object_write_stalled",
             ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
             ReadinessDegradedReason::PeerHealthUnavailable => "peer_health_unavailable",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
@@ -712,6 +716,11 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
     for reason in &report.degraded_reasons {
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
     }
+}
+
+pub(crate) fn record_readiness_overlay_reason(reason: ReadinessDegradedReason) {
+    gauge!(METRIC_RUNTIME_READINESS_READY).set(0.0);
+    counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
 fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {

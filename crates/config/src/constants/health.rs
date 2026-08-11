@@ -22,6 +22,19 @@ pub const DEFAULT_HEALTH_ENDPOINT_ENABLE: bool = true;
 pub const ENV_HEALTH_READINESS_CACHE_TTL_MS: &str = "RUSTFS_HEALTH_READINESS_CACHE_TTL_MS";
 pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
 
+/// Enable readiness withdrawal when bounded object read/write stages stop
+/// completing while requests remain active.
+pub const ENV_HEALTH_OBJECT_PROGRESS_ENABLE: &str = "RUSTFS_HEALTH_OBJECT_PROGRESS_ENABLE";
+pub const DEFAULT_HEALTH_OBJECT_PROGRESS_ENABLE: bool = true;
+
+/// Requested time without completion in a bounded object stage before local
+/// readiness is withdrawn (milliseconds). A value of `0` uses the default;
+/// runtime adds a safety floor based on the object-lock acquisition timeout.
+pub const ENV_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS: &str = "RUSTFS_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS: u64 = 30_000;
+/// Additional time beyond the configured object-lock acquisition deadline.
+pub const HEALTH_OBJECT_PROGRESS_LOCK_MARGIN_MS: u64 = 5_000;
+
 /// Timeout for cluster health readiness collectors (milliseconds).
 /// This bounds expensive storage and lock quorum checks used by cluster probes.
 pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
