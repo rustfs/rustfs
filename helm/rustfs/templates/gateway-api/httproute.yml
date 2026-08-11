@@ -37,7 +37,7 @@ spec:
         - name: {{ include "rustfs.fullname" $ }}-svc
           port: {{ .Values.service.console.port }}
         {{- end }}
-
+{{- if .Values.gatewayApi.httpToHttpsRedirect }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -62,4 +62,5 @@ spec:
           requestRedirect:
             scheme: https
             statusCode: 301
+  {{- end }}
 {{- end }}
