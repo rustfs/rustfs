@@ -435,7 +435,8 @@ pub(crate) mod ecstore_data_usage {
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached, store_data_usage_in_backend,
+        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached,
+        seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 }
 

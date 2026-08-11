@@ -901,6 +901,10 @@ pub(crate) mod runtime {
     pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
 }
 
+pub(crate) mod s3 {
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
+}
+
 pub(crate) mod tier {
     pub(crate) use super::{
         AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,

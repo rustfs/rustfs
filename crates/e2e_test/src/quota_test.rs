@@ -252,6 +252,7 @@ impl QuotaTestEnv {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
 
     #[tokio::test]
     #[serial]
@@ -963,8 +964,26 @@ mod integration_tests {
             .send()
             .await;
 
-        assert!(complete_result.is_err());
+        let complete_error = complete_result.expect_err("multipart completion above quota must be rejected");
+        assert_eq!(complete_error.as_service_error().and_then(|error| error.code()), Some("InvalidRequest"));
         assert!(!env.object_exists("over_quota.txt").await?);
+
+        let staged_parts = env
+            .client
+            .list_parts()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .upload_id(upload_id2)
+            .send()
+            .await?;
+        assert_eq!(staged_parts.parts().len(), 2, "quota rejection must preserve the multipart upload");
+        env.client
+            .abort_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .upload_id(upload_id2)
+            .send()
+            .await?;
 
         env.cleanup_bucket().await?;
 

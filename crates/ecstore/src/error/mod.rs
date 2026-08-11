@@ -204,6 +204,8 @@ pub enum StorageError {
         required: usize,
         achieved: usize,
     },
+    #[error("Bucket quota exceeded. Current usage: {current} bytes, limit: {limit} bytes")]
+    QuotaExceeded { current: u64, limit: u64 },
 
     // ── Generic ──────────────────────────────────────────────────────
     #[error("Unexpected error")]
@@ -540,6 +542,10 @@ impl Clone for StorageError {
                 required: *required,
                 achieved: *achieved,
             },
+            StorageError::QuotaExceeded { current, limit } => StorageError::QuotaExceeded {
+                current: *current,
+                limit: *limit,
+            },
         }
     }
 }
@@ -627,6 +633,7 @@ impl StorageError {
             StorageError::NotModified => StorageErrorCode::NotModified,
             StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
             StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
+            StorageError::QuotaExceeded { .. } => StorageErrorCode::QuotaExceeded,
         }
     }
 
@@ -751,6 +758,10 @@ impl StorageError {
                 object: Default::default(),
                 required: Default::default(),
                 achieved: Default::default(),
+            }),
+            StorageErrorCode::QuotaExceeded => Some(StorageError::QuotaExceeded {
+                current: Default::default(),
+                limit: Default::default(),
             }),
         }
     }
@@ -1301,6 +1312,7 @@ mod tests {
             .to_u32(),
             0x42
         );
+        assert_eq!(StorageError::QuotaExceeded { current: 1, limit: 2 }.to_u32(), 0x53);
     }
 
     #[test]
@@ -1318,6 +1330,10 @@ mod tests {
         assert!(matches!(
             StorageError::from_u32(0x42),
             Some(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+        assert!(matches!(
+            StorageError::from_u32(0x53),
+            Some(StorageError::QuotaExceeded { current: 0, limit: 0 })
         ));
 
         // Test invalid code returns None
@@ -1549,6 +1565,7 @@ mod tests {
             StorageError::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning,
             StorageError::OperationCanceled,
+            StorageError::QuotaExceeded { current: 1, limit: 2 },
         ];
 
         for original_error in test_errors {

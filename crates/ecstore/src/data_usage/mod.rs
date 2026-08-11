@@ -1638,7 +1638,7 @@ fn preserve_unknown_dirty_usage(
     Some(preserved)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn replace_bucket_usage_memory_from_authoritative(bucket: &str, usage: BucketUsageInfo, refresh_started_at: SystemTime) {
     let mut cache = memory_cache().write().await;
     if let Some(existing) = cache.get(bucket)
@@ -1648,6 +1648,19 @@ async fn replace_bucket_usage_memory_from_authoritative(bucket: &str, usage: Buc
     }
 
     cache.insert(bucket.to_string(), cached_bucket_usage_from_backend(usage, refresh_started_at, true));
+}
+
+#[cfg(feature = "test-util")]
+pub async fn seed_bucket_usage_memory_for_test(bucket: &str, size: u64) {
+    replace_bucket_usage_memory_from_authoritative(
+        bucket,
+        BucketUsageInfo {
+            size,
+            ..Default::default()
+        },
+        SystemTime::now(),
+    )
+    .await;
 }
 
 /// Fast in-memory update for immediate quota and admin usage consistency.

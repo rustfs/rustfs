@@ -42,8 +42,8 @@
 //! mutex, then state object lock) -> per-bucket metadata.
 
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
 use crate::storage::storage_api::with_config_object_write_lock;
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::sync::Arc;
 
 use super::runtime_sources::current_object_store_handle;
