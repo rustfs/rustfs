@@ -2595,6 +2595,9 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
     assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["Targets"][0]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
+    // A RustFS target adopts the source version id, so the P1-19
+    // version-identity probe passes.
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
@@ -7485,6 +7488,334 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     // With B's outbound proven, the inbound replica must stay put across
     // multiple fast-scanner cycles.
     assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-19 review follow-up: multipart fixes the target version at initiate
+/// and only reports it on completion, so a target can adopt PutObject
+/// version ids and still mint its own there — the check must not report OK
+/// while multipart deletes and heals would silently miss.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_multipart_only_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-fidelity-dst";
+    target.create_bucket(target_bucket);
+    // PutObject mirrors the source version id; CreateMultipartUpload does not.
+    target.assign_own_multipart_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(payload["Status"], "FAILED", "multipart drift must fail the check: {payload}");
+    let target_report = &payload["Targets"][0];
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "{payload}");
+    assert_eq!(fidelity["Code"], "BucketRemoteTargetVersionMismatch", "{payload}");
+    assert!(
+        fidelity["Error"]
+            .as_str()
+            .is_some_and(|error| error.contains("CreateMultipartUpload")),
+        "the failure must name the multipart path: {payload}"
+    );
+    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    let probe_key = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .and_then(|record| record.key)
+        .ok_or("the probe PUT never reached the fake target")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "both probe versions must be cleaned up on the mismatching target"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-cleanup-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-cleanup-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for failed_operation in [FakeTargetOperation::UploadPart, FakeTargetOperation::CompleteMultipartUpload] {
+        target.clear_faults();
+        target.take_requests();
+        target.inject(failed_operation, FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE), 16);
+
+        let response = run_replication_check(&source_env, source_bucket).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await?;
+        assert_eq!(
+            payload["Status"], "FAILED",
+            "the injected multipart failure must fail the check: {payload}"
+        );
+
+        let requests = target.requests();
+        assert!(
+            requests.iter().any(|request| {
+                request.operation == failed_operation
+                    && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+            }),
+            "the check must reach the injected {failed_operation:?} failure: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+            "the failed {failed_operation:?} probe must be aborted: {requests:?}"
+        );
+        assert_eq!(
+            target.active_multipart_upload_count(),
+            0,
+            "the failed {failed_operation:?} probe must not leave multipart state"
+        );
+        assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+    }
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::CompleteMultipartUpload, FakeTargetFault::DisconnectAfterResponse, 16);
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "OK",
+        "NoSuchUpload after an ambiguous complete means the multipart artifact is gone: {payload}"
+    );
+    let requests = target.requests();
+    let completed_key = requests
+        .iter()
+        .find(|request| {
+            request.operation == FakeTargetOperation::CompleteMultipartUpload
+                && request.fault == Some(FakeTargetFault::DisconnectAfterResponse)
+        })
+        .and_then(|request| request.key.as_deref())
+        .expect("the scripted complete response disconnect must be observed");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+        "the ambiguous complete must still attempt abort: {requests:?}"
+    );
+    assert_eq!(target.active_multipart_upload_count(), 0);
+    assert!(
+        target.stored_versions(target_bucket, completed_key).is_empty(),
+        "outer cleanup must remove the object committed before the response disconnect"
+    );
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::UploadPart, FakeTargetFault::Status(StatusCode::FORBIDDEN), 16);
+    target.inject(
+        FakeTargetOperation::AbortMultipartUpload,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        16,
+    );
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "FAILED",
+        "an unremoved multipart probe must be reported as a cleanup failure: {payload}"
+    );
+    assert_eq!(
+        target_report["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "the primary multipart error must remain the target error: {payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["VersionFidelity"]["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "{payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Error"], "failed to abort multipart replication probe",
+        "{payload}"
+    );
+    assert!(
+        target.requests().iter().any(|request| {
+            request.operation == FakeTargetOperation::AbortMultipartUpload
+                && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+        }),
+        "the abort failure must be observed"
+    );
+    assert_eq!(
+        target.active_multipart_upload_count(),
+        1,
+        "the report must match the retained multipart state"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-19 (backlog#1675): the supported replication contract is targets that
+/// adopt the source version id (RustFS/MinIO semantics). A target that mints
+/// its own version ids silently breaks every version-addressed operation that
+/// follows — version deletes and heal re-drives never match, diverging the
+/// two sides. replication-check must surface this explicitly: a
+/// VersionFidelity phase that compares the probe PUT's response version id
+/// against the sent source version id and fails with
+/// BucketRemoteTargetVersionMismatch — while still cleaning up the probe
+/// object via the version id the target actually assigned.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "version-fidelity-dst";
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "version-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "FAILED",
+        "a version-minting target must fail the replication check: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "target must be FAILED: {payload}");
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "VersionFidelity phase must fail: {payload}");
+    assert_eq!(
+        fidelity["Code"], "BucketRemoteTargetVersionMismatch",
+        "the failure must carry a machine-readable code: {payload}"
+    );
+    // The probe PUT itself succeeded (fidelity is judged from its response);
+    // the later mutation phases are pointless against a drifting target and
+    // must be skipped, but cleanup still runs.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // The probe PUT must carry the source version as `?versionId=` — the
+    // exact shape live replication uses (P0-5), and the only shape MinIO
+    // consumes. The journal records the query value.
+    let probe_put = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .ok_or("the probe PUT never reached the fake target")?;
+    let probe_query_version = probe_put
+        .version_id
+        .as_deref()
+        .ok_or("the probe PUT must carry a versionId query")?;
+    assert!(
+        uuid::Uuid::parse_str(probe_query_version).is_ok(),
+        "the probe versionId query must be the source uuid, got {probe_query_version}"
+    );
+
+    // No probe residue: cleanup must address the version id the target
+    // actually assigned, not the source id (which never matched anything).
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "the probe object must be cleaned up on the mismatching target"
+    );
 
     Ok(())
 }

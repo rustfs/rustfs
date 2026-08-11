@@ -74,10 +74,10 @@ use rustfs_utils::http::{
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
@@ -105,6 +105,7 @@ const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_ch
 const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_failed";
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
+const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
 const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
     "dispatch failure",
     "timeouterror",
@@ -184,6 +185,57 @@ fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
         .unwrap_or((false, None));
     let raw_status = err.raw_response().map(|resp| resp.status().as_u16());
     should_count_head_proxy_failure(is_not_found, code, raw_status)
+}
+
+const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_identity_drift_total";
+
+/// Targets that already produced a version-identity-drift warning this
+/// process lifetime, by ARN. Deduping is advisory only (the metric still
+/// counts every drifting PUT), so a reconfigured target re-warning only
+/// after a restart is acceptable.
+static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+/// Runtime half of the P1-19 version-identity contract (the explicit probe
+/// lives in replication-check's VersionFidelity phase): every replication PUT
+/// response reveals whether the target adopted the source version id. A
+/// target minting its own ids silently breaks version-addressed deletes and
+/// heal, so surface it — once per target — instead of letting the divergence
+/// accumulate unseen.
+/// Pure drift judgment: the contract only applies when the source addressed a
+/// real (non-nil) version uuid, and drift means the target answered with
+/// anything else — including nothing at all.
+fn version_identity_drifted(source_version_id: &str, assigned_version_id: Option<&str>) -> bool {
+    if source_version_id.is_empty() {
+        return false;
+    }
+    // A nil source uuid travels as the literal "null" (unversioned-source
+    // semantics); no identity contract applies to it.
+    if Uuid::parse_str(source_version_id).map(|uuid| uuid.is_nil()).unwrap_or(true) {
+        return false;
+    }
+    assigned_version_id != Some(source_version_id)
+}
+
+fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
+    if !version_identity_drifted(source_version_id, assigned_version_id) {
+        return;
+    }
+    counter!(METRIC_VERSION_IDENTITY_DRIFT_TOTAL).increment(1);
+    let mut warned = VERSION_IDENTITY_WARNED_ARNS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(tgt_client.arn.clone()) {
+        warn!(
+            event = EVENT_REPLICATION_VERSION_IDENTITY_DRIFT,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            arn = %tgt_client.arn,
+            endpoint = %tgt_client.endpoint,
+            sent_version_id = %source_version_id,
+            assigned_version_id = assigned_version_id.unwrap_or("<none>"),
+            "Replication target does not adopt source version ids; version-addressed replication cannot converge (run ?replication-check for details)"
+        );
+    }
 }
 
 async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
@@ -2872,6 +2924,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
+                .map(|assigned_version_id| {
+                    audit_target_version_identity(
+                        &tgt_client,
+                        &put_opts.internal.source_version_id,
+                        assigned_version_id.as_deref(),
+                    )
+                })
                 .map_err(|e| std::io::Error::other(e.to_string()));
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
             if has_tagging_replication {
@@ -3279,6 +3338,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
+                .map(|assigned_version_id| {
+                    audit_target_version_identity(
+                        &tgt_client,
+                        &put_opts.internal.source_version_id,
+                        assigned_version_id.as_deref(),
+                    )
+                })
                 .map_err(|e| std::io::Error::other(e.to_string()));
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
             if has_tagging_replication {
@@ -3470,15 +3536,27 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
     let actual_size = replication_multipart_complete_actual_size(&object_info.user_defined);
 
-    cli.complete_multipart_upload(
-        dst_bucket,
-        object,
-        &upload_id,
-        uploaded_parts,
-        &replication_complete_multipart_options(actual_size, object_info.etag.clone().unwrap_or_default(), object_info.mod_time),
-    )
-    .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let completed = cli
+        .complete_multipart_upload(
+            dst_bucket,
+            object,
+            &upload_id,
+            uploaded_parts,
+            &replication_complete_multipart_options(
+                actual_size,
+                object_info.etag.clone().unwrap_or_default(),
+                object_info.mod_time,
+            ),
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Multipart decides the target version at initiate time and only reveals
+    // it on completion, so this is where the identity contract is observable
+    // for this path. A target can mirror PutObject version ids and still mint
+    // its own here, which would leave multipart deletes and heals addressing
+    // a version that never existed.
+    audit_target_version_identity(&cli, &put_opts.internal.source_version_id, completed.version_id());
 
     Ok(())
 }
@@ -3523,6 +3601,27 @@ mod tests {
 
     async fn register_test_target(target: &Arc<TargetClient>) {
         ReplicationTargetStore::register_test_target(target).await;
+    }
+
+    /// P1-19 runtime spot-check exemption matrix: drift only applies when the
+    /// source addressed a real version uuid.
+    #[test]
+    fn test_version_identity_drift_judgment() {
+        let source = "6fa459ea-ee8a-3ca4-894e-db77e160355e";
+        for (sent, got, expected) in [
+            (source, Some(source), false),
+            (source, Some("0e304ce5-33e9-4b8a-9b12-9e40a53e6ded"), true),
+            (source, None, true),
+            ("", None, false),
+            ("null", Some("anything"), false),
+            ("00000000-0000-0000-0000-000000000000", Some("anything"), false),
+        ] {
+            assert_eq!(
+                version_identity_drifted(sent, got),
+                expected,
+                "sent {sent:?} got {got:?} must judge drift = {expected}"
+            );
+        }
     }
 
     #[test]
