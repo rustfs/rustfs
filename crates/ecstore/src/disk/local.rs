@@ -12444,7 +12444,7 @@ mod test {
         let first_event = Arc::new(AtomicU8::new(0));
         let first_barrier_event = first_event.clone();
         let first_object_dir = disk
-            .get_object_path(bucket, first_object)
+            .get_object_path_for_io(bucket, first_object)
             .expect("first object path should resolve");
         os::fsync_dir_recorder::set_before_limited(&first_object_dir, move || {
             let _ = first_barrier_event.compare_exchange(0, FIRST_BARRIER, Ordering::SeqCst, Ordering::SeqCst);
