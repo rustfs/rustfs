@@ -68,7 +68,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
         match stmt {
             Statement::Query(_) => {
                 validate_s3_select_statement(&stmt)?;
-                let df_plan = self.df_planner.sql_statement_to_plan(stmt)?;
+                let df_plan = self.df_planner.sql_statement_to_plan(stmt).map_err(classify_planner_error)?;
                 let plan = Plan::Query(QueryPlan {
                     df_plan,
                     is_tag_scan: false,
@@ -79,6 +79,20 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
             _ => Err(unsupported_structure("only SELECT queries are supported")),
         }
     }
+}
+
+fn classify_planner_error(error: datafusion::common::DataFusionError) -> QueryError {
+    if matches!(
+        &error,
+        datafusion::common::DataFusionError::Plan(message)
+            if message.starts_with("Failed to coerce arguments to satisfy a call to")
+                || (message.starts_with("Internal error: Function '")
+                    && message.contains("' failed to match any signature, errors:"))
+    ) {
+        return SelectError::IncorrectSqlFunctionArgumentType.into();
+    }
+
+    error.into()
 }
 
 fn validate_s3_select_statement(statement: &Statement) -> QueryResult<()> {

@@ -128,6 +128,53 @@ mod error_handling_tests {
     }
 
     #[tokio::test]
+    async fn test_function_argument_coercion_failure_is_typed() {
+        for sql in ["SELECT ROUND(3.14, 1.1) FROM S3Object", "SELECT SQRT(1, 2) FROM S3Object"] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let error = match db.execute(&query).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid function arguments must fail during planning: {sql}"),
+            };
+
+            assert_eq!(
+                error.select_error(),
+                SelectError::IncorrectSqlFunctionArgumentType,
+                "unexpected planner error for {sql}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_other_planner_failures_remain_invalid_query() {
+        for sql in [
+            "SELECT DEFINITELY_UNKNOWN_FUNCTION(1) FROM S3Object",
+            "SELECT 1 + 'text' FROM S3Object",
+        ] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let error = match db.execute(&query).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid query must fail during planning: {sql}"),
+            };
+
+            assert_eq!(
+                error.select_error(),
+                SelectError::InvalidQuery,
+                "unexpected planner error for {sql}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_invalid_column_references() {
         let invalid_column_sqls = vec![
             "SELECT nonexistent_column FROM S3Object",
