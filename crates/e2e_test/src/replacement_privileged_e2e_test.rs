@@ -59,6 +59,13 @@ mod tests {
         expected: VersionShardCensus,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum CompletionSample {
+        Pending,
+        Ready,
+        CompletedWithIncomplete(BTreeSet<String>),
+    }
+
     struct MountNamespaceGuard {
         mounts: Vec<PathBuf>,
     }
@@ -75,7 +82,7 @@ mod tests {
     impl MountNamespaceGuard {
         fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
             verify_isolated_mount_namespace()?;
-            run_command("mount", ["--make-rprivate", "/"])?;
+            run_command("mount", &["--make-rprivate", "/"])?;
             Ok(Self { mounts: Vec::new() })
         }
 
@@ -108,15 +115,15 @@ mod tests {
                 return Err("losetup --find --show returned an empty loop device".into());
             }
 
-            run_command_dynamic("mkfs.ext4", &["-F", &loop_device])?;
+            run_command("mkfs.ext4", &["-F", &loop_device])?;
             let sectors = run_command_stdout("blockdev", &["--getsz", &loop_device])?;
             let dm_name = format!("rustfs_e2e_{label}_{}", std::process::id());
             let table = format!("0 {sectors} linear {loop_device} 0");
             let mapper = format!("/dev/mapper/{dm_name}");
-            run_command_dynamic("dmsetup", &["create", &dm_name, "--table", &table])?;
+            run_command("dmsetup", &["create", &dm_name, "--table", &table])?;
 
             let target_arg = path_to_string(target, "faultable mount target")?;
-            run_command_dynamic("mount", &[&mapper, &target_arg])?;
+            run_command("mount", &[&mapper, &target_arg])?;
 
             Ok(Self {
                 target: target.to_path_buf(),
@@ -131,17 +138,17 @@ mod tests {
         fn make_unavailable(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
             let sectors = run_command_stdout("blockdev", &["--getsz", &self.loop_device])?;
             let error_table = format!("0 {sectors} error");
-            run_command_dynamic("dmsetup", &["suspend", &self.dm_name])?;
-            run_command_dynamic("dmsetup", &["load", &self.dm_name, "--table", &error_table])?;
-            run_command_dynamic("dmsetup", &["resume", &self.dm_name])
+            run_command("dmsetup", &["suspend", &self.dm_name])?;
+            run_command("dmsetup", &["load", &self.dm_name, "--table", &error_table])?;
+            run_command("dmsetup", &["resume", &self.dm_name])
         }
 
         fn restore_available(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
             let sectors = run_command_stdout("blockdev", &["--getsz", &self.loop_device])?;
             let linear_table = format!("0 {sectors} linear {} 0", self.loop_device);
-            run_command_dynamic("dmsetup", &["suspend", &self.dm_name])?;
-            run_command_dynamic("dmsetup", &["load", &self.dm_name, "--table", &linear_table])?;
-            run_command_dynamic("dmsetup", &["resume", &self.dm_name])
+            run_command("dmsetup", &["suspend", &self.dm_name])?;
+            run_command("dmsetup", &["load", &self.dm_name, "--table", &linear_table])?;
+            run_command("dmsetup", &["resume", &self.dm_name])
         }
 
         fn cleanup(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -157,14 +164,14 @@ mod tests {
                 }
             }
             if self.dm_created {
-                if let Err(error) = run_command_dynamic("dmsetup", &["remove", "-f", &self.dm_name]) {
+                if let Err(error) = run_command("dmsetup", &["remove", "-f", &self.dm_name]) {
                     first_error.get_or_insert(error);
                 } else {
                     self.dm_created = false;
                 }
             }
             if !self.loop_device.is_empty() {
-                if let Err(error) = run_command_dynamic("losetup", &["-d", &self.loop_device]) {
+                if let Err(error) = run_command("losetup", &["-d", &self.loop_device]) {
                     first_error.get_or_insert(error);
                 } else {
                     self.loop_device.clear();
@@ -188,14 +195,10 @@ mod tests {
         }
     }
 
-    fn run_command<const N: usize>(program: &str, args: [&str; N]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        run_command_dynamic(program, &args)
-    }
-
-    fn run_command_dynamic(program: &str, args: &[&str]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn checked_command_output(program: &str, args: &[&str]) -> Result<std::process::Output, Box<dyn Error + Send + Sync>> {
         let output = Command::new(program).args(args).output()?;
         if output.status.success() {
-            return Ok(());
+            return Ok(output);
         }
         Err(format!(
             "{program} {} failed with status {}: stdout={} stderr={}",
@@ -205,21 +208,16 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         )
         .into())
+    }
+
+    fn run_command(program: &str, args: &[&str]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        checked_command_output(program, args).map(drop)
     }
 
     fn run_command_stdout(program: &str, args: &[&str]) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let output = Command::new(program).args(args).output()?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        }
-        Err(format!(
-            "{program} {} failed with status {}: stdout={} stderr={}",
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into())
+        Ok(String::from_utf8(checked_command_output(program, args)?.stdout)?
+            .trim()
+            .to_string())
     }
 
     fn path_to_string(path: &Path, label: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -260,14 +258,14 @@ mod tests {
         let target = target
             .to_str()
             .ok_or_else(|| format!("tmpfs target path is not UTF-8: {target:?}"))?;
-        run_command("mount", ["-t", "tmpfs", "-o", MOUNT_SIZE, label, target])
+        run_command("mount", &["-t", "tmpfs", "-o", MOUNT_SIZE, label, target])
     }
 
     fn detach_mount(target: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
         let target = target
             .to_str()
             .ok_or_else(|| format!("umount target path is not UTF-8: {target:?}"))?;
-        run_command("umount", [target])
+        run_command("umount", &[target])
     }
 
     fn privileged_run_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -423,6 +421,10 @@ mod tests {
             .await?;
         versions.push((versioned_bucket, "history/object.bin", deleted.version_id().map(str::to_owned), None));
 
+        let (version_id, body_sha256) =
+            put_object_version(client, versioned_bucket, "history/inline.bin", payload(8 * 1024, 9)).await?;
+        versions.push((versioned_bucket, "history/inline.bin", version_id, Some(body_sha256)));
+
         let (version_id, body_sha256) = put_multipart_version(
             client,
             versioned_bucket,
@@ -436,7 +438,7 @@ mod tests {
             put_object_version(client, null_bucket, "null/current.bin", payload(512 * 1024, 8)).await?;
         versions.push((null_bucket, "null/current.bin", version_id, Some(body_sha256)));
 
-        versions
+        let versions = versions
             .into_iter()
             .map(|(bucket, key, version_id, body_sha256)| {
                 let expected = census_object_version_on_disk(target_disk, bucket, key, version_id.as_deref())?;
@@ -451,7 +453,15 @@ mod tests {
                     expected,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
+        let inline = versions
+            .iter()
+            .find(|version| version.key == "history/inline.bin")
+            .ok_or("inline replacement baseline was not recorded")?;
+        if inline.expected.inline_data_fingerprint.is_none() || !inline.expected.present_part_fingerprints.is_empty() {
+            return Err(format!("inline replacement baseline lacks xl.meta payload evidence: {:?}", inline.expected).into());
+        }
+        Ok(versions)
     }
 
     async fn verify_bodies(client: &Client, versions: &[BaselineVersion]) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -597,6 +607,32 @@ mod tests {
         Ok(String::from_utf8_lossy(&log[start..]).into_owned())
     }
 
+    fn live_disk_loss_scan_completed(log: &str, target_disk: &Path) -> bool {
+        let target = target_disk.to_string_lossy();
+        let mut saw_live_loss = false;
+        for line in log.lines() {
+            if line.contains("Heal auto-scan disk inspection failed")
+                && line.contains("check_failed")
+                && line.contains(target.as_ref())
+            {
+                saw_live_loss = true;
+                continue;
+            }
+            if saw_live_loss && line.contains("Heal auto-scan cycle completed") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn live_disk_loss_scan_completed_from_path(
+        log_path: &Path,
+        start_offset: u64,
+        target_disk: &Path,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        Ok(live_disk_loss_scan_completed(&log_from_offset(log_path, start_offset)?, target_disk))
+    }
+
     async fn wait_for_live_disk_loss_observation(
         log_path: &Path,
         target_disk: &Path,
@@ -605,20 +641,12 @@ mod tests {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut tick = interval(Duration::from_secs(1));
-        let target = target_disk.to_string_lossy();
         loop {
-            let log = log_from_offset(log_path, start_offset)?;
-            let mut saw_live_loss = false;
-            for line in log.lines() {
-                if line.contains("check_failed") && line.contains(target.as_ref()) {
-                    saw_live_loss = true;
-                    continue;
-                }
-                if saw_live_loss && line.contains("Heal auto disk scanner idle") {
-                    return Ok(());
-                }
+            if live_disk_loss_scan_completed_from_path(log_path, start_offset, target_disk)? {
+                return Ok(());
             }
             if Instant::now() >= deadline {
+                let log = log_from_offset(log_path, start_offset)?;
                 return Err(format!(
                     "scanner did not finish a live target-loss scan for {target_disk:?} within {timeout_secs}s; log tail:\n{}",
                     log_tail(&log)
@@ -629,14 +657,10 @@ mod tests {
         }
     }
 
-    fn require_definitive_replacement_status(
-        status: &serde_json::Value,
-        context: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if status["cluster"]["definitive"].as_bool().unwrap_or(false) {
-            return Ok(());
-        }
-        Err(format!("{context} requires a definitive cluster replacement status: {status}").into())
+    fn cluster_status_is_definitive(status: &serde_json::Value) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        status["cluster"]["definitive"]
+            .as_bool()
+            .ok_or_else(|| format!("replacement recovery status omitted cluster.definitive: {status}").into())
     }
 
     async fn assert_no_replacement_status_records(
@@ -644,8 +668,17 @@ mod tests {
         target_disk: &Path,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let status = replacement_status(cluster).await?;
-        require_definitive_replacement_status(&status, "live missing replacement status check")?;
-        let states = target_record_states(&status, target_disk);
+        assert_no_replacement_status_records_in_status(&status, target_disk)
+    }
+
+    fn assert_no_replacement_status_records_in_status(
+        status: &serde_json::Value,
+        target_disk: &Path,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !cluster_status_is_definitive(status)? {
+            return Err(format!("live missing replacement status check requires a definitive cluster status: {status}").into());
+        }
+        let states = target_record_states(status, target_disk);
         if states.is_empty() {
             return Ok(());
         }
@@ -653,11 +686,6 @@ mod tests {
             "live missing replacement target must not have durable recovery records; observed states {states:?} in status {status}"
         )
         .into())
-    }
-
-    fn target_record_has_state(status: &serde_json::Value, target_disk: &Path, states: &[&str]) -> bool {
-        let present_states = target_record_states(status, target_disk);
-        states.iter().any(|state| present_states.contains(*state))
     }
 
     fn target_record_states(status: &serde_json::Value, target_disk: &Path) -> BTreeSet<String> {
@@ -694,6 +722,55 @@ mod tests {
         Ok(missing)
     }
 
+    fn replacement_completion_state(
+        status: &serde_json::Value,
+        target_disk: &Path,
+        missing: BTreeSet<String>,
+    ) -> Result<CompletionSample, Box<dyn Error + Send + Sync>> {
+        if !cluster_status_is_definitive(status)? {
+            return Ok(CompletionSample::Pending);
+        }
+        if !target_record_states(status, target_disk).contains("completed") {
+            return Ok(CompletionSample::Pending);
+        }
+        if missing.is_empty() {
+            return Ok(CompletionSample::Ready);
+        }
+        Ok(CompletionSample::CompletedWithIncomplete(missing))
+    }
+
+    async fn sample_replacement_completion<C, S, F>(
+        target_disk: &Path,
+        census: C,
+        status: S,
+    ) -> Result<CompletionSample, Box<dyn Error + Send + Sync>>
+    where
+        C: FnOnce() -> Result<BTreeSet<String>, Box<dyn Error + Send + Sync>>,
+        S: FnOnce() -> F,
+        F: std::future::Future<Output = Result<serde_json::Value, Box<dyn Error + Send + Sync>>>,
+    {
+        let missing = census()?;
+        let status = status().await?;
+        replacement_completion_state(&status, target_disk, missing)
+    }
+
+    async fn confirm_replacement_completion<C, S, F>(
+        target_disk: &Path,
+        mut census: C,
+        mut status: S,
+    ) -> Result<CompletionSample, Box<dyn Error + Send + Sync>>
+    where
+        C: FnMut() -> Result<BTreeSet<String>, Box<dyn Error + Send + Sync>>,
+        S: FnMut() -> F,
+        F: std::future::Future<Output = Result<serde_json::Value, Box<dyn Error + Send + Sync>>>,
+    {
+        let first = sample_replacement_completion(target_disk, &mut census, &mut status).await?;
+        if matches!(first, CompletionSample::CompletedWithIncomplete(_)) {
+            return sample_replacement_completion(target_disk, census, status).await;
+        }
+        Ok(first)
+    }
+
     async fn wait_for_completed_replacement_with_census(
         cluster: &RustFSTestClusterEnvironment,
         target_disk: &Path,
@@ -703,28 +780,25 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut tick = interval(Duration::from_secs(1));
         loop {
-            let status = replacement_status(cluster).await?;
-            let missing = incomplete_versions(target_disk, versions)?;
-            if require_definitive_replacement_status(&status, "replacement completion poll").is_err() {
-                if Instant::now() >= deadline {
+            match confirm_replacement_completion(
+                target_disk,
+                || incomplete_versions(target_disk, versions),
+                || replacement_status(cluster),
+            )
+            .await?
+            {
+                CompletionSample::Ready => return Ok(()),
+                CompletionSample::CompletedWithIncomplete(confirmed_missing) => {
                     return Err(format!(
-	                        "replacement recovery status never became definitive within {timeout_secs}s while waiting for physical census; latest status: {status}; missing: {missing:?}"
-	                    )
-	                    .into());
+                        "replacement status remained completed across two incomplete physical censuses: {confirmed_missing:?}"
+                    )
+                    .into());
                 }
-                tick.tick().await;
-                continue;
-            }
-            if target_record_has_state(&status, target_disk, &["completed"]) {
-                if !missing.is_empty() {
-                    return Err(format!(
-	                        "replacement status reached completed before target physical census matched baseline: {missing:?}; status: {status}"
-	                    )
-	                    .into());
-                }
-                return Ok(());
+                CompletionSample::Pending => {}
             }
             if Instant::now() >= deadline {
+                let missing = incomplete_versions(target_disk, versions)?;
+                let status = replacement_status(cluster).await?;
                 return Err(format!(
 	                    "replacement target did not reach completed with matching physical census within {timeout_secs}s: missing={missing:?}; status={status}"
 	                )
@@ -810,6 +884,155 @@ mod tests {
         verify_bodies(&clients[0], &versions).await?;
 
         Ok(())
+    }
+
+    #[test]
+    fn live_loss_barrier_requires_scanner_failure_after_log_offset() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let target = Path::new("/mnt/target");
+        assert!(live_disk_loss_scan_completed(
+            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed",
+            target
+        ));
+        assert!(!live_disk_loss_scan_completed(
+            "Heal auto-scan cycle completed\nHeal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed",
+            target
+        ));
+        assert!(!live_disk_loss_scan_completed(
+            "event=disk_health_check_failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed",
+            target
+        ));
+        assert!(!live_disk_loss_scan_completed(
+            "Heal auto-scan disk inspection failed endpoint=/mnt/other disk_state=check_failed\nHeal auto-scan cycle completed",
+            target
+        ));
+        let path = std::env::temp_dir().join(format!("rustfs-replacement-scan-{}.log", std::process::id()));
+        let stale = "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed\n";
+        fs::write(&path, stale)?;
+        let offset = log_len(&path)?;
+        assert!(!live_disk_loss_scan_completed_from_path(&path, offset, target)?);
+        let fresh = "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed\n";
+        fs::write(&path, format!("{stale}{fresh}"))?;
+        assert!(live_disk_loss_scan_completed_from_path(&path, offset, target)?);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completion_requires_definitive_status_and_prior_census_match() {
+        let target = Path::new("/mnt/target");
+        let non_definitive = serde_json::json!({
+            "cluster": {"definitive": false, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+        });
+        assert_eq!(
+            replacement_completion_state(&non_definitive, target, BTreeSet::new()).unwrap(),
+            CompletionSample::Pending
+        );
+
+        let omitted = serde_json::json!({
+            "cluster": {"records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+        });
+        assert!(replacement_completion_state(&omitted, target, BTreeSet::new()).is_err());
+
+        let definitive = serde_json::json!({
+            "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+        });
+        assert_eq!(
+            replacement_completion_state(&definitive, target, BTreeSet::from(["missing".to_string()])).unwrap(),
+            CompletionSample::CompletedWithIncomplete(BTreeSet::from(["missing".to_string()]))
+        );
+        assert_eq!(
+            replacement_completion_state(&definitive, target, BTreeSet::new()).unwrap(),
+            CompletionSample::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_poll_samples_census_before_status() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let census_order = order.clone();
+        let status_order = order.clone();
+        let sample = sample_replacement_completion(
+            Path::new("/mnt/target"),
+            move || {
+                census_order.borrow_mut().push("census");
+                Ok::<_, Box<dyn Error + Send + Sync>>(BTreeSet::new())
+            },
+            move || async move {
+                status_order.borrow_mut().push("status");
+                Ok::<_, Box<dyn Error + Send + Sync>>(serde_json::json!({
+                    "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sample, CompletionSample::Ready);
+        assert_eq!(*order.borrow(), ["census", "status"]);
+    }
+
+    #[tokio::test]
+    async fn completed_status_confirms_a_stale_incomplete_census() {
+        let samples = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::from([
+            BTreeSet::from(["missing".to_string()]),
+            BTreeSet::new(),
+        ])));
+        let census_samples = samples.clone();
+        let result = confirm_replacement_completion(
+            Path::new("/mnt/target"),
+            move || {
+                census_samples
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| "missing census sample".into())
+            },
+            || async {
+                Ok(serde_json::json!({
+                    "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, CompletionSample::Ready);
+        assert!(samples.borrow().is_empty());
+
+        let persistent = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::from([
+            BTreeSet::from(["missing".to_string()]),
+            BTreeSet::from(["still-missing".to_string()]),
+        ])));
+        let census_samples = persistent.clone();
+        let result = confirm_replacement_completion(
+            Path::new("/mnt/target"),
+            move || {
+                census_samples
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| "missing census sample".into())
+            },
+            || async {
+                Ok(serde_json::json!({
+                    "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            CompletionSample::CompletedWithIncomplete(BTreeSet::from(["still-missing".to_string()]))
+        );
+        assert!(persistent.borrow().is_empty());
+    }
+
+    #[test]
+    fn absent_status_requires_definitive_empty_records() {
+        let target = Path::new("/mnt/target");
+        let non_definitive = serde_json::json!({"cluster": {"definitive": false, "records": []}});
+        assert!(assert_no_replacement_status_records_in_status(&non_definitive, target).is_err());
+        let omitted = serde_json::json!({"cluster": {"records": []}});
+        assert!(assert_no_replacement_status_records_in_status(&omitted, target).is_err());
+        let definitive = serde_json::json!({"cluster": {"definitive": true, "records": []}});
+        assert!(assert_no_replacement_status_records_in_status(&definitive, target).is_ok());
     }
 
     /// Linux mount namespaces are per-thread; keep mount setup and process
