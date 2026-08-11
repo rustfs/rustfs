@@ -16,7 +16,6 @@ use crate::cluster::rpc::client::{
     AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
     node_service_time_out_client, node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
-use crate::cluster::rpc::http_auth::set_tonic_canonical_body_digest;
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
     WriteStreamRequest,
@@ -123,7 +122,7 @@ fn attach_mutation_body_digest<T>(
     op: &'static str,
 ) -> Result<()> {
     let canonical_body = canonical_body.map_err(|_| Error::other(format!("{op} request length cannot be represented")))?;
-    set_tonic_canonical_body_digest(request, &canonical_body).map_err(Error::other)
+    crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
 }
 
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
@@ -3028,6 +3027,22 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[test]
+    fn disk_mutation_digest_marks_rolling_compatibility() {
+        let mut request = Request::new(());
+
+        attach_mutation_body_digest(&mut request, Ok(b"canonical disk mutation".to_vec()), "WriteAll")
+            .expect("disk mutation digest must be attached");
+
+        assert!(
+            request
+                .extensions()
+                .get::<crate::cluster::rpc::http_auth::RollingMutationBodyDigest>()
+                .is_some(),
+            "remote-disk mutations must reach the cache-free compatibility gate"
+        );
+    }
 
     // `#[serial(internode_metrics)]` marks every test that observes
     // `global_internode_metrics()`. Those counters are a process-wide singleton:
