@@ -921,9 +921,11 @@ pub(crate) fn compacted_manifest_list_avro_bytes(summary: CompactionManifestList
         "#,
     )
     .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction manifest list schema: {err}")))?;
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).map_err(|err| {
+        TableCatalogStoreError::Internal(format!("failed to initialize compaction manifest list writer: {err}"))
+    })?;
     writer
-        .append(apache_avro::types::Value::Record(vec![
+        .append_value(apache_avro::types::Value::Record(vec![
             (
                 "manifest_path".to_string(),
                 apache_avro::types::Value::String(summary.manifest_path.to_string()),
@@ -1095,14 +1097,15 @@ fn compaction_partition_field_schema(value: &apache_avro::types::Value) -> Optio
 
 pub(crate) fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<Vec<u8>> {
     let schema = compacted_manifest_avro_schema(data_files)?;
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new())
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to initialize compaction manifest writer: {err}")))?;
     for data_file in data_files {
         let sort_order_id = match data_file.sort_order_id {
             Some(sort_order_id) => apache_avro::types::Value::Union(1, Box::new(apache_avro::types::Value::Int(sort_order_id))),
             None => apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
         };
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(data_file.status)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(data_file.snapshot_id)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(data_file.sequence_number)),
