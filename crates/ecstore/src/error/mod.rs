@@ -358,6 +358,13 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeNotFound => DiskError::VolumeNotFound,
             StorageError::VolumeExists => DiskError::VolumeExists,
             StorageError::FileNameTooLong => DiskError::FileNameTooLong,
+            StorageError::FaultyRemoteDisk => DiskError::FaultyRemoteDisk,
+            StorageError::DiskAccessDenied => DiskError::DiskAccessDenied,
+            StorageError::DriveIsRoot => DiskError::DriveIsRoot,
+            StorageError::IsNotRegular => DiskError::IsNotRegular,
+            StorageError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
+            StorageError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
+            StorageError::FileAccessDenied => DiskError::FileAccessDenied,
             _ => DiskError::other(val),
         }
     }
@@ -1489,6 +1496,49 @@ mod tests {
                 StorageError::from_u32(code).unwrap_or_else(|| panic!("failed to recover error from code: {code:#x}"));
 
             assert_eq!(std::mem::discriminant(&original_error), std::mem::discriminant(&recovered_error));
+        }
+    }
+
+    // Every DiskError variant must survive DiskError -> StorageError -> DiskError
+    // unchanged. A variant that degrades to `DiskError::Io` on the way back loses
+    // its identity for quorum aggregation (`reduce_errs` classifies by variant
+    // equality), so ignore-list entries such as FaultyRemoteDisk and
+    // DiskAccessDenied would silently stop matching.
+    #[test]
+    fn test_disk_error_storage_error_round_trip_identity_all_variants() {
+        // DiskError codes are contiguous from 0x01, so enumerating via from_u32
+        // covers every variant and picks up newly appended ones automatically.
+        let all_variants: Vec<DiskError> = (1u32..).map_while(DiskError::from_u32).collect();
+        assert!(
+            all_variants.len() >= 42,
+            "DiskError variant enumeration shrank: got {}, expected at least 42",
+            all_variants.len()
+        );
+
+        for original in all_variants {
+            let storage_error: StorageError = original.clone().into();
+            let round_tripped: DiskError = storage_error.into();
+
+            assert_eq!(
+                std::mem::discriminant(&original),
+                std::mem::discriminant(&round_tripped),
+                "round trip changed variant: {original:?} -> {round_tripped:?}"
+            );
+            assert_eq!(original, round_tripped, "round trip not identical for {original:?}");
+        }
+
+        // Io is the only payload-carrying variant: a representative kind and
+        // message must both survive the round trip.
+        let io_original = DiskError::Io(IoError::new(ErrorKind::PermissionDenied, "denied"));
+        let storage_error: StorageError = io_original.clone().into();
+        let io_round_tripped: DiskError = storage_error.into();
+        assert_eq!(io_original, io_round_tripped);
+        match io_round_tripped {
+            DiskError::Io(inner) => {
+                assert_eq!(inner.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(inner.to_string(), "denied");
+            }
+            other => panic!("expected DiskError::Io, got {other:?}"),
         }
     }
 

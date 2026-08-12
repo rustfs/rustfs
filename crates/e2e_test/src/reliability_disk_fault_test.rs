@@ -349,11 +349,32 @@ mod tests {
             .send()
             .await?;
 
+        let first_inline = client
+            .put_object()
+            .bucket(bucket)
+            .key("versions/inline.bin")
+            .body(ByteStream::from(payload(8 * 1024, 40)))
+            .send()
+            .await?;
+        let first_inline_version = first_inline
+            .version_id()
+            .ok_or("first inline PUT did not return a version ID")?;
+        let second_inline = client
+            .put_object()
+            .bucket(bucket)
+            .key("versions/inline.bin")
+            .body(ByteStream::from(payload(8 * 1024, 41)))
+            .send()
+            .await?;
+        let second_inline_version = second_inline
+            .version_id()
+            .ok_or("second inline PUT did not return a version ID")?;
+
         let first = client
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(payload(256 * 1024, 41)))
+            .body(ByteStream::from(payload(128 * 1024, 41)))
             .send()
             .await?;
         let first_version = first.version_id().ok_or("first PUT did not return a version ID")?;
@@ -361,16 +382,36 @@ mod tests {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(payload(256 * 1024, 42)))
+            .body(ByteStream::from(payload(3 * 1024 * 1024, 42)))
             .send()
             .await?;
         let second_version = second.version_id().ok_or("second PUT did not return a version ID")?;
         let delete = client.delete_object().bucket(bucket).key(key).send().await?;
         let delete_version = delete.version_id().ok_or("delete marker did not return a version ID")?;
 
+        let first_inline_census = harness.census_object_version(0, bucket, "versions/inline.bin", Some(first_inline_version))?;
+        let second_inline_census =
+            harness.census_object_version(0, bucket, "versions/inline.bin", Some(second_inline_version))?;
         let first_census = harness.census_object_version(0, bucket, key, Some(first_version))?;
+        let first_other_disk_census = harness.census_object_version(1, bucket, key, Some(first_version))?;
         let second_census = harness.census_object_version(0, bucket, key, Some(second_version))?;
         let delete_census = harness.census_object_version(0, bucket, key, Some(delete_version))?;
+        assert!(
+            first_inline_census.is_complete() && second_inline_census.is_complete(),
+            "inline version physical census is incomplete: first={first_inline_census:?} second={second_inline_census:?}"
+        );
+        assert!(
+            first_inline_census.present_part_fingerprints.is_empty() && second_inline_census.present_part_fingerprints.is_empty(),
+            "inline versions must not select external shard files: first={first_inline_census:?} second={second_inline_census:?}"
+        );
+        assert!(
+            first_inline_census.inline_data_fingerprint.is_some() && second_inline_census.inline_data_fingerprint.is_some(),
+            "inline versions must fingerprint payload bytes stored in xl.meta"
+        );
+        assert_ne!(
+            first_inline_census.inline_data_fingerprint, second_inline_census.inline_data_fingerprint,
+            "same-size inline versions with different payloads must retain distinct xl.meta fingerprints"
+        );
         assert!(
             first_census.is_complete(),
             "first version physical census is incomplete: {first_census:?}"
@@ -379,6 +420,14 @@ mod tests {
             second_census.is_complete(),
             "second version physical census is incomplete: {second_census:?}"
         );
+        assert!(
+            first_other_disk_census.is_complete(),
+            "first version physical census on the second disk is incomplete: {first_other_disk_census:?}"
+        );
+        assert_ne!(
+            first_census.erasure_index, first_other_disk_census.erasure_index,
+            "physical census must preserve each disk's erasure index"
+        );
         assert_ne!(
             first_census.data_dir, second_census.data_dir,
             "distinct object versions must select distinct physical data directories"
@@ -386,6 +435,24 @@ mod tests {
         assert_eq!(
             first_census.expected_part_numbers, second_census.expected_part_numbers,
             "same single-part shape should expose the same part numbers"
+        );
+        let first_part = first_census
+            .present_part_fingerprints
+            .values()
+            .next()
+            .ok_or("first version did not expose a physical part fingerprint")?;
+        let second_part = second_census
+            .present_part_fingerprints
+            .values()
+            .next()
+            .ok_or("second version did not expose a physical part fingerprint")?;
+        assert_ne!(
+            first_part.size, second_part.size,
+            "different shard lengths must retain their physical sizes"
+        );
+        assert_ne!(
+            first_part.sha256, second_part.sha256,
+            "different shard contents must retain their physical hashes"
         );
         assert!(
             delete_census.is_complete(),
@@ -396,7 +463,7 @@ mod tests {
             "delete marker must not declare object shards: {delete_census:?}"
         );
         assert!(
-            delete_census.present_part_numbers.is_empty(),
+            delete_census.present_part_fingerprints.is_empty(),
             "delete marker must not select stale object shards: {delete_census:?}"
         );
         Ok(())

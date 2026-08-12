@@ -10,9 +10,27 @@ and rollback steps.
 | Area | Current owner | Size | Split status |
 |---|---|---:|---|
 | Bucket lifecycle | `crates/lifecycle/` + `crates/ecstore/src/bucket/lifecycle/` | core contracts + ECStore runtime | Core contract extracted |
-| Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Contracts extracted; runtime move pending |
+| Bucket replication | `crates/ecstore/src/bucket/replication/` | 15,619 lines | Contracts extracted; runtime move pending |
 | Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
 | Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
+
+Measured 2026-08-12: the whole crate is 265 files / ~288K lines (roughly half
+is inline `#[cfg(test)]` code). The largest single files are `disk/local.rs`
+(21,063 lines), `bucket/lifecycle/bucket_lifecycle_ops.rs` (11,961 lines), and
+`set_disk/mod.rs` (11,151 lines). Reproduce with:
+
+```bash
+find crates/ecstore/src -name '*.rs' | xargs wc -l | sort -rn | head
+find crates/ecstore/src/bucket/replication -name '*.rs' | xargs wc -l | tail -1
+```
+
+No split step has landed since the contract-extraction PRs of 2026-07-04,
+while the `bucket/replication` runtime grew from 8,730 to 15,619 lines (+79%)
+through feature work (e.g. SSE-C ciphertext passthrough replication #5898,
+delete-marker purge retry/replay #5864). To keep the gap from widening: in
+domains that already have a contract crate, new replication runtime logic that
+does not need ECStore runtime state must land in `rustfs-replication`, not in
+`crates/ecstore/src/bucket/replication/`.
 
 The file split inside `set_disk/` is already operation-oriented: read, write,
 list, multipart, lock, heal, and replication code live in separate modules.

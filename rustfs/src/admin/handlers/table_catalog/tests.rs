@@ -2512,7 +2512,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         crate::table_catalog::TableCatalogBackingMode::DurableStrong,
     ] {
         let metadata_backend = TestTableCatalogObjectBackend::default();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         create_standard_events_table(&store, &metadata_backend, &namespace).await;
         let first_request = serde_json::json!({
@@ -2559,7 +2559,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
             }
         }
 
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
         let second = standard_commit_table_response(
             &store,
             &trusted_table_commit_backend(&metadata_backend),
@@ -7313,10 +7313,10 @@ fn test_manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, i32,
             "#,
     )
     .expect("manifest list avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
     for (manifest_path, partition_spec_id, sequence_number, snapshot_id) in manifests {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 (
                     "manifest_path".to_string(),
                     apache_avro::types::Value::String((*manifest_path).to_string()),
@@ -7368,10 +7368,10 @@ fn test_manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u8> {
             "#,
     )
     .expect("manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
     for (file_path, content, status, snapshot_id, sequence_number) in files {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(*status)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
@@ -7427,10 +7427,10 @@ fn test_manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i32, i6
             "#,
     )
     .expect("manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
     for (file_path, content, status, snapshot_id, sequence_number) in files {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(*status)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
                 ("sequence_number".to_string(), test_nullable_long(*sequence_number)),

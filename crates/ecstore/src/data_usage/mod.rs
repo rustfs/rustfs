@@ -2150,30 +2150,6 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
     Ok(d)
 }
 
-#[instrument(skip(cache))]
-pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate::error::Result<()> {
-    use crate::config::com::save_config;
-    use crate::disk::BUCKET_META_PREFIX;
-    use std::path::Path;
-
-    let Some(store) = runtime_sources::object_store_handle() else {
-        return Err(Error::other("errServerNotInitialized"));
-    };
-    let buf = cache.marshal_msg().map_err(Error::other)?;
-    let buf_clone = buf.clone();
-
-    let store_clone = store.clone();
-
-    let name = Path::new(BUCKET_META_PREFIX).join(name).to_string_lossy().to_string();
-
-    let name_clone = name.clone();
-    tokio::spawn(async move {
-        let _ = save_config(store_clone, &format!("{}{}", name_clone, ".bkp"), buf_clone).await;
-    });
-    save_config(store, &name, buf).await?;
-    Ok(())
-}
-
 /// Persist the current in-memory compression total to the backend.
 /// Resets the debounce counter so the next auto-persist won't fire
 /// immediately after this manual flush (intended for shutdown paths).

@@ -2067,9 +2067,12 @@ fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 fn table_catalog_backend_from_extensions(
     extensions: &http::Extensions,
 ) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let store = runtime_sources::object_store_from_extensions(extensions)
-        .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
+    let context = runtime_sources::app_context_from_extensions(extensions)
+        .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+        context.object_store(),
+        context.table_catalog_strong_runtime(),
+    ))
 }
 
 type EcStoreObjectTableCatalogStore =

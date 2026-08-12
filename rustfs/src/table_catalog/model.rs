@@ -1067,7 +1067,9 @@ pub(crate) struct TableCatalogBackingProfile {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogBackingKind {
     ObjectBacked,
-    StrongKvWal,
+    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
+    #[serde(rename = "STRONG_KV_WAL")]
+    DurableStrongSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1203,7 +1205,9 @@ pub(crate) enum TableCatalogBackingMigrationStep {
     ReplayCommitLog,
     VerifyCurrentPointer,
     EnableSingleWriterFencing,
-    CutOverLinearizableReads,
+    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
+    #[serde(rename = "CUT_OVER_LINEARIZABLE_READS")]
+    CutOverDurableSnapshotReads,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1213,6 +1217,8 @@ pub(crate) enum TableCatalogBackingMigrationBlocker {
     CommitManualReviewRequired,
     WarehouseIndexBackfillRequired,
     DuplicateWarehousePrefix,
+    DuplicateTableIdentity,
+    TableViewIdentifierCollision,
     DurableStrongSnapshotChanged,
 }
 
@@ -1222,6 +1228,8 @@ pub(crate) enum TableCatalogBackingMigrationAction {
     RunCatalogRecovery,
     BackfillWarehouseIndex,
     ReviewDuplicateWarehousePrefixes,
+    ReviewDuplicateTableIdentities,
+    ReviewTableViewIdentifierCollisions,
     SnapshotObjectBackedCatalog,
     EnableDurableStrongBacking,
     VerifyDurableStrongSnapshot,

@@ -9180,6 +9180,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_memory_versioned_bucket_uses_inline_data_shards_for_latest() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let payload = vec![b'v'; 64 * 1024];
+        let payload_size = i64::try_from(payload.len()).expect("test payload size should fit i64");
+        let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
+        let mut fi = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
+        fi.size = payload_size;
+        fi.data = files[0].data.clone();
+        fi.add_object_part(1, String::new(), payload.len(), None, payload_size, None, None);
+
+        let mut object_info = ObjectInfo {
+            size: payload_size,
+            actual_size: payload_size,
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                actual_size: payload_size,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        object_info.inlined = true;
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Use {
+                object_size: payload.len()
+            }
+        );
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            "bucket",
+            "object",
+            &fi,
+            &files,
+            &vec![Some(disk); erasure.total_shard_count()],
+            true,
+            GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+            metrics_size_bucket,
+        )
+        .await
+        .expect("versioned latest direct-memory read should not fail")
+        .expect("versioned latest should use inline data shards");
+
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
     async fn direct_memory_data_shards_direct_read_reassembles_single_block_payload() {
         use uuid::Uuid;
 

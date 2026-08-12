@@ -2955,11 +2955,31 @@ impl std::fmt::Debug for StdBackend {
 
 impl StdBackend {
     pub(crate) fn new(root: PathBuf) -> Self {
+        Self::build(root, true)
+    }
+
+    /// Construct without the descriptor cache.
+    ///
+    /// `UringBackend` wraps a `StdBackend` and runs its own `FdCache` over the
+    /// same positioned reads. If the inner `StdBackend` also built a cache, a
+    /// fallback read (`UringBackend::pread_bytes` delegates to the inner backend
+    /// on latch-off / O_DIRECT / buffered errors) would populate a *second*
+    /// cache that `UringBackend`'s invalidation never touches — re-opening the
+    /// stale-inode hazard `FdCache` exists to close (rustfs/backlog#1176/#1801).
+    /// The wrapper therefore owns the only cache for the disk; the inner backend
+    /// opens per read. This also avoids double-counting `FD_CACHE_CAPACITY`
+    /// against `RLIMIT_NOFILE` (rustfs/backlog#1178).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_without_fd_cache(root: PathBuf) -> Self {
+        Self::build(root, false)
+    }
+
+    fn build(root: PathBuf, build_fd_cache: bool) -> Self {
         // Gate the fd cache on RLIMIT_NOFILE headroom (rustfs/backlog#1178):
         // 512 fds/disk with a low soft limit and several disks would hit EMFILE.
         // Fall back to open-per-read when the limit is too small.
         #[cfg(target_os = "linux")]
-        let fd_cache = if is_local_fd_cache_enabled() {
+        let fd_cache = if build_fd_cache && is_local_fd_cache_enabled() {
             if rlimit_allows_fd_cache() {
                 Some(FdCache::new())
             } else {
@@ -2973,6 +2993,10 @@ impl StdBackend {
         } else {
             None
         };
+        // `build_fd_cache` is only consulted on Linux (for the fd cache); on
+        // other platforms it has no effect and would trip the unused-variable lint.
+        #[cfg(not(target_os = "linux"))]
+        let _ = build_fd_cache;
         Self {
             root,
             #[cfg(target_os = "linux")]
@@ -4120,7 +4144,7 @@ impl UringBackend {
                 // struct (rustfs/backlog#1185).
                 let root_label = root.display().to_string();
                 Some(Self {
-                    inner: StdBackend::new(root.clone()),
+                    inner: StdBackend::new_without_fd_cache(root.clone()),
                     root,
                     root_label,
                     driver: std::mem::ManuallyDrop::new(driver),
@@ -19917,6 +19941,23 @@ mod test {
         // Invalidating by the object prefix drops the cached descriptor.
         backend.invalidate_cached_fds_under(volume, "obj/abc");
         assert_eq!(cache.entry_count().await, 0, "prefix invalidation must drop the cached descriptor");
+    }
+
+    /// `StdBackend::new_without_fd_cache` must not build a descriptor cache.
+    /// `UringBackend` wraps a `StdBackend` and owns the only cache for the disk,
+    /// so an inner cache would be populated by fallback reads
+    /// (`UringBackend::pread_bytes` delegates inward) yet never invalidated —
+    /// the stale-inode hazard `FdCache` exists to close (backlog#1176/#1801).
+    /// This pins the contract so a future constructor change cannot regress it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_without_fd_cache_builds_no_descriptor_cache() {
+        let root_dir = tempfile::tempdir().expect("operation should succeed");
+        let backend = StdBackend::new_without_fd_cache(root_dir.path().to_path_buf());
+        assert!(
+            backend.fd_cache.is_none(),
+            "new_without_fd_cache must not build a descriptor cache — UringBackend owns the only cache for the disk"
+        );
     }
 
     /// The mutation paths on `LocalDisk` must actually call

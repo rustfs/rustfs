@@ -62,8 +62,8 @@ pub(crate) struct VersionShardCensus {
     pub data_dir: Option<String>,
     pub erasure_index: Option<usize>,
     pub expected_part_numbers: BTreeSet<usize>,
-    pub present_part_numbers: BTreeSet<usize>,
     pub present_part_fingerprints: BTreeMap<usize, PartShardFingerprint>,
+    pub inline_data_fingerprint: Option<PartShardFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,7 +74,12 @@ pub(crate) struct PartShardFingerprint {
 
 impl VersionShardCensus {
     pub(crate) fn is_complete(&self) -> bool {
-        self.has_xl_meta && self.expected_part_numbers == self.present_part_numbers
+        self.has_xl_meta
+            && self.expected_part_numbers.len() == self.present_part_fingerprints.len()
+            && self
+                .expected_part_numbers
+                .iter()
+                .all(|part_number| self.present_part_fingerprints.contains_key(part_number))
     }
 
     pub(crate) fn matches_manifest(&self, manifest: &Self) -> bool {
@@ -85,12 +90,20 @@ impl VersionShardCensus {
             && self.erasure_index == manifest.erasure_index
             && self.expected_part_numbers == manifest.expected_part_numbers
             && self.present_part_fingerprints == manifest.present_part_fingerprints
+            && self.inline_data_fingerprint == manifest.inline_data_fingerprint
     }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn shard_fingerprint(data: &[u8]) -> ChaosResult<PartShardFingerprint> {
+    Ok(PartShardFingerprint {
+        size: u64::try_from(data.len())?,
+        sha256: sha256_hex(data),
+    })
 }
 
 /// Single-node RustFS server with `disk_count` local volume directories that
@@ -301,8 +314,8 @@ pub(crate) fn census_object_version_on_disk(
             data_dir: None,
             erasure_index: None,
             expected_part_numbers: BTreeSet::new(),
-            present_part_numbers: BTreeSet::new(),
             present_part_fingerprints: BTreeMap::new(),
+            inline_data_fingerprint: None,
         });
     }
 
@@ -315,10 +328,10 @@ pub(crate) fn census_object_version_on_disk(
     };
     let data_dir = file_info.data_dir.map(|id| id.to_string());
     let erasure_index = Some(file_info.erasure.index);
+    let inline_data_fingerprint = file_info.data.as_deref().map(shard_fingerprint).transpose()?;
     let part_dir = data_dir.as_ref().map_or_else(|| object_dir.clone(), |id| object_dir.join(id));
-    let (present_part_numbers, present_part_fingerprints) = match std::fs::read_dir(&part_dir) {
+    let present_part_fingerprints = match std::fs::read_dir(&part_dir) {
         Ok(entries) => {
-            let mut numbers = BTreeSet::new();
             let mut fingerprints = BTreeMap::new();
             for entry in entries {
                 let entry = entry?;
@@ -333,19 +346,12 @@ pub(crate) fn census_object_version_on_disk(
                 else {
                     continue;
                 };
-                numbers.insert(part_number);
                 let data = std::fs::read(entry.path())?;
-                fingerprints.insert(
-                    part_number,
-                    PartShardFingerprint {
-                        size: u64::try_from(data.len())?,
-                        sha256: sha256_hex(&data),
-                    },
-                );
+                fingerprints.insert(part_number, shard_fingerprint(&data)?);
             }
-            (numbers, fingerprints)
+            fingerprints
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (BTreeSet::new(), BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(error) => return Err(error.into()),
     };
 
@@ -355,8 +361,8 @@ pub(crate) fn census_object_version_on_disk(
         data_dir,
         erasure_index,
         expected_part_numbers,
-        present_part_numbers,
         present_part_fingerprints,
+        inline_data_fingerprint,
     })
 }
 
@@ -395,4 +401,44 @@ pub async fn signed_admin_post(url: &str, body: Option<&str>, access_key: &str, 
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_census() -> VersionShardCensus {
+        VersionShardCensus {
+            version_id: Some("version".to_string()),
+            has_xl_meta: true,
+            data_dir: Some("data-dir".to_string()),
+            erasure_index: Some(3),
+            expected_part_numbers: BTreeSet::from([1]),
+            present_part_fingerprints: BTreeMap::from([(1, shard_fingerprint(b"part").unwrap())]),
+            inline_data_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn shard_fingerprint_uses_physical_length_and_sha256() {
+        assert_eq!(
+            shard_fingerprint(b"abc").unwrap(),
+            PartShardFingerprint {
+                size: 3,
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_requires_matching_inline_payload() {
+        let mut expected = complete_census();
+        expected.expected_part_numbers.clear();
+        expected.present_part_fingerprints.clear();
+        expected.inline_data_fingerprint = Some(shard_fingerprint(b"expected").unwrap());
+        let mut changed = expected.clone();
+        changed.inline_data_fingerprint = Some(shard_fingerprint(b"changed").unwrap());
+        assert!(expected.matches_manifest(&expected));
+        assert!(!changed.matches_manifest(&expected));
+    }
 }
