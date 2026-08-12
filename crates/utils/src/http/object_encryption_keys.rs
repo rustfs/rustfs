@@ -30,6 +30,13 @@ use super::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
 pub const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 pub const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
 pub const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
+/// Carries the AEAD algorithm the object was sealed with.
+///
+/// The S3 `x-amz-server-side-encryption` header records the *SSE mode*
+/// (`AES256` / `aws:kms`), not the cipher, so it cannot round-trip
+/// `ChaCha20Poly1305`. Without this header a ChaCha-sealed object comes back
+/// from the projection claiming `aws:kms` and is then opened with the wrong
+/// cipher.
 pub const INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "x-rustfs-encryption-algorithm";
 pub const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
 pub const INTERNAL_ENCRYPTION_CONTEXT_HEADER: &str = "x-rustfs-encryption-context";
@@ -44,6 +51,15 @@ pub const MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER: &str = "X-Minio-Inter
 pub const MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
 pub const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key";
 pub const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
+
+/// Reserved RustFS-branded twin of the MinIO-internal SSE key family.
+///
+/// No RustFS writer emits these keys today — the SSE writer persists the
+/// MinIO-branded `X-Minio-Internal-Server-Side-Encryption-*` keys verbatim for
+/// interoperability — but redaction (`rustfs_filemeta`) and replication
+/// stripping treat the family as sensitive so that a future or third-party
+/// writer cannot leak sealed material through the reserved names.
+pub const RUSTFS_INTERNAL_ENCRYPTION_PREFIX: &str = "x-rustfs-internal-server-side-encryption-";
 
 pub const REPLICATION_SSEC_ALGORITHM_HEADER: &str = "X-Rustfs-Replication-Ssec-Algorithm";
 pub const REPLICATION_SSEC_KEY_MD5_HEADER: &str = "X-Rustfs-Replication-Ssec-Key-Md5";
@@ -125,13 +141,14 @@ pub fn ssec_replication_transport_header(stored_key: &str) -> Option<&'static st
 /// SSE-C material. SSE-C passthrough re-adds its keys through the transport
 /// mapping instead.
 pub fn is_replication_stripped_encryption_key(key: &str) -> bool {
-    // The dual-key invariant writes an x-rustfs-internal- twin next to every
-    // x-minio-internal- SSE key; cover it here so this predicate is safe to
-    // use standalone, without an is_internal_key backstop.
+    // The x-rustfs-internal- SSE prefix is a reserved name family with no
+    // writer today (see RUSTFS_INTERNAL_ENCRYPTION_PREFIX); cover it here so
+    // this predicate is safe to use standalone, without an is_internal_key
+    // backstop.
     super::is_encryption_metadata_key(key)
         || super::is_sse_header(key)
         || key.eq_ignore_ascii_case(SSEC_ORIGINAL_SIZE_HEADER)
-        || super::starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+        || super::starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
 }
 
 #[cfg(test)]

@@ -277,9 +277,10 @@ pub struct FileInfo {
 /// Values of these keys must never reach logs at any level.
 fn is_sensitive_metadata_key(key: &str) -> bool {
     // `is_encryption_metadata_key` covers the x-minio-internal- SSE prefix but not
-    // its x-rustfs-internal- twin, which the dual-key invariant writes alongside it.
+    // its reserved x-rustfs-internal- twin, which has no writer today but must
+    // stay redacted in case one appears.
     is_encryption_metadata_key(key)
-        || starts_with_ignore_ascii_case(key, "x-rustfs-internal-server-side-encryption-")
+        || starts_with_ignore_ascii_case(key, rustfs_utils::http::RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
         || rustfs_utils::http::REPLICATION_SSE_TRANSPORT_PREFIXES
             .iter()
             .any(|prefix| starts_with_ignore_ascii_case(key, prefix))
