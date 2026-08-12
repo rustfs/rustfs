@@ -17,9 +17,11 @@
 # =============================================================================
 #
 # Metric source: the KMS operation-policy choke point in
-# crates/kms/src/policy.rs. All label values are bounded static strings
-# (operation, op_class, outcome, error_class, backend, scope); key identifiers,
-# key material, and tokens never appear in labels.
+# crates/kms/src/policy.rs, except KmsKeyRotationOverdue, which reads the
+# label-less key-lifecycle gauge published by the deletion worker's sweep
+# (crates/kms/src/deletion_worker.rs). All label values are bounded static
+# strings (operation, op_class, outcome, error_class, backend, scope); key
+# identifiers, key material, and tokens never appear in labels.
 #
 # Response procedures: docs/operations/kms-observability-runbook.md
 #
@@ -212,3 +214,38 @@ groups:
             circuit_open until the half-open probe succeeds or returns
             a non-retryable failure.
           runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmsbackendcircuitopen"
+
+      # ------------------------------------------------------------------
+      # 7. KmsKeyRotationOverdue
+      #    The least recently rotated usable key has gone more than 400
+      #    days without a rotation (measured from creation for keys with
+      #    no recorded rotation). Direct gauge state published by the
+      #    deletion worker's sweep, so no traffic guard applies; the
+      #    one-hour hold only bridges scrape gaps. The worker runs only
+      #    on backends with the schedule_deletion capability, so on the
+      #    Static backend the series never exists and this alert cannot
+      #    fire — that backend cannot rotate either; see the rotation
+      #    driver matrix in docs/operations/kms-backend-security.md.
+      #    Threshold: 400 days — conservative default sitting above a
+      #    one-year rotation policy. Align it with the rotation period
+      #    your compliance policy requires, and with
+      #    RUSTFS_KMS_ROTATION_MAX_AGE_SECS so the per-key rotation_due
+      #    verdict and this aggregate alert agree.
+      # ------------------------------------------------------------------
+      - alert: KmsKeyRotationOverdue
+        expr: |
+          rustfs_kms_oldest_key_rotation_age_seconds > (400 * 86400)
+        for: 1h
+        labels:
+          severity: warning
+          component: kms
+        annotations:
+          summary: "Oldest KMS key unrotated for more than 400 days"
+          description: >-
+            The least recently rotated usable KMS key was last rotated
+            {{ $value | humanizeDuration }} ago (measured from creation
+            for keys with no recorded rotation). List keys through the
+            admin API and read rotation_due / rotation_due_reason for
+            the per-key verdict; an "unsupported" reason means the
+            backend cannot rotate at all.
+          runbook_url: "https://github.com/rustfs/rustfs/blob/main/docs/operations/kms-observability-runbook.md#kmskeyrotationoverdue"
