@@ -78,6 +78,34 @@ Notes:
 
 Rotation support differs per backend. Local and Static advertise no `rotate` capability — `capabilities.rotate` is false in the `kms/status` response — and reject rotation with `UnsupportedCapability`; their single key material is never overwritten. Vault Transit delegates rotation to the Transit engine's own key versioning (ciphertext is version-prefixed, e.g. `vault:v1:...`). Vault KV2 rotates by retaining every historical version, as described below. Rotation is reachable through the admin API as `POST /rustfs/admin/v3/kms/keys/rotate`, which the route policy classifies as high risk and gates behind `kms:RotateKey`; it is not exposed through the S3 surface. The upgrade ordering constraint below therefore applies to an operator action, not only to a call from inside the process.
 
+### Rotation drivers and scheduling, per backend
+
+The rotate endpoint is one API over three very different mechanisms, and which component actually performs the rotation decides how periodic rotation must be scheduled — on two backends it cannot be scheduled at all.
+
+| Backend | Can rotate | Who performs the rotation | How to schedule periodic rotation |
+| --- | --- | --- | --- |
+| Local | No | Nobody — the backend advertises no `rotate` capability and the rotate endpoint is refused with `UnsupportedCapability` | Cannot be scheduled. Migrating to a rotating backend is the only path to rotation |
+| Static | No | Nobody — same refusal as Local; the material is supplied out-of-band and read-only | Cannot be scheduled. Migrate to a rotating backend |
+| Vault KV2 | Yes | **RustFS** owns the whole rotation protocol: freeze the outgoing material as an immutable version record, persist the new version's material, then move the current pointer with a check-and-set write | An **external scheduler** (cron, Kubernetes CronJob, your automation platform) calling `POST /rustfs/admin/v3/kms/keys/rotate`. RustFS deliberately ships no built-in rotation timer — see below |
+| Vault Transit | Yes | **Vault's Transit engine** — RustFS only forwards the call to Transit's rotate endpoint and records the version bump in its own metadata | Vault's native `auto_rotate_period` on the Transit key. Do **not** additionally point an external scheduler at the RustFS rotate endpoint — see below |
+| AWS KMS | Yes | **AWS** — the RustFS rotate endpoint maps to `RotateKeyOnDemand` | AWS's native automatic rotation, configured on the AWS side. Do **not** drive periodic rotation through the RustFS endpoint — see below |
+
+**Local and Static: the wrap ceiling is unmitigable.** These backends wrap every DEK with AES-256-GCM under their single master key using a random 96-bit nonce, and NIST SP 800-38D caps AES-GCM at 2^32 invocations per key when nonces are chosen at random. Each encrypted object write wraps a DEK, so the invocation count tracks the number of encrypted-object writes over the deployment's lifetime. On a rotating backend that count restarts whenever new master key material takes over; on Local and Static it can never restart, because there is no rotation to restart it. The only mitigation is migrating to a backend that rotates. The same 2^32 bound applies to the KV2 backend's wrapping — RustFS wraps DEKs locally there too — but there each rotation mints fresh master key material and resets the count, which is one more reason to actually schedule KV2 rotation rather than merely support it.
+
+**Vault KV2: bring your own scheduler, deliberately.** RustFS performs the rotation but does not decide when: there is no built-in rotation worker, by design rather than omission. A timer inside the server cannot verify the [cluster-upgrade precondition](#upgrade-before-first-rotation-hard-constraint) before firing, and rotation is not idempotent — without leader election, N nodes running the same schedule would perform N rotations per period, advancing the key version N times. Run exactly one external scheduler, point it at the admin rotate endpoint with credentials scoped to `kms:RotateKey`, and use the [rotation readiness fields](#rotation-readiness-reported-never-acted-on) plus the `KmsKeyRotationOverdue` alert in the [KMS observability runbook](kms-observability-runbook.md#kmskeyrotationoverdue) to verify the schedule is actually keeping up.
+
+**Vault Transit: exactly one owner of the version cadence.** Configure `auto_rotate_period` on the Transit key and let Vault own the schedule. Layering an external scheduler that calls the RustFS rotate endpoint on top of `auto_rotate_period` creates two competing owners of the key's version cadence, and the effective rotation period stops being the one either owner was configured with. The data path is indifferent to who rotates — Transit ciphertext self-describes the version that wrapped it, so envelopes never pin a version RustFS tracked — but the key version RustFS reports only advances when rotation goes through RustFS, so on an auto-rotating key treat the reported version as a floor, not the truth.
+
+**AWS KMS: native automatic rotation for cadence, `RotateKeyOnDemand` for incidents.** The RustFS rotate endpoint maps to AWS `RotateKeyOnDemand`, and AWS enforces a lifetime limit on the number of on-demand rotations a key may receive (see the AWS KMS documentation) — a periodic scheduler driving the RustFS endpoint will exhaust that quota and then fail forever. Configure AWS's automatic rotation for periodic cadence and keep the RustFS endpoint for what on-demand rotation is for: incident response and one-off rotations. Note that RustFS neither enables nor observes AWS automatic rotation, and it records no rotation timestamp for AWS keys, so the readiness fields and the rotation-age gauge measure key age on this backend — verify the actual cadence in AWS, not through RustFS.
+
+**Pre-rotation checklist** (before the first rotation of any key, and before enabling any schedule):
+
+1. Every node in the cluster runs a build that understands the `master_key_version` envelope field — the [hard upgrade-ordering constraint](#upgrade-before-first-rotation-hard-constraint) below. A timer cannot check this; you must.
+2. No rolling upgrade is in progress — see [Do not do these during a mixed-version window](#do-not-do-these-during-a-mixed-version-window).
+3. The [retention and destruction preconditions](#retention-and-destruction-preconditions) are understood: every version record a stored DEK envelope references must remain readable forever, and no retention tooling prunes the version subtree.
+4. For KV2, exactly one scheduler exists, so no two callers race the same rotation period.
+5. `RUSTFS_KMS_ROTATION_MAX_AGE_SECS` is set to the rotation period your policy requires, so the per-key `rotation_due` verdict and the rotation-age alert verify the schedule instead of assuming it.
+
 ### Rotation readiness: reported, never acted on
 
 RustFS does not rotate keys on a schedule. There is no built-in rotation worker, deliberately: rotation is a policy decision with a per-backend cost and a hard upgrade-ordering constraint (see below), and a server that rotated on its own would make that decision on an operator's behalf at a moment it did not choose. What the server does instead is tell you which keys have outlived a period you configure.
@@ -93,7 +121,7 @@ The verdict is advisory in the strongest sense: nothing consults it before encry
 
 `GET /rustfs/admin/v3/kms/keys/{key_id}` does **not** carry these fields. Its response type records a creation date but no rotation timestamp, so a verdict computed there could not tell a key rotated last week from one never rotated at all, and reporting `never_rotated` for a key that was in fact rotated would be worse than reporting nothing. Read the verdict from the listing.
 
-Driving the rotation itself remains external: call `POST /rustfs/admin/v3/kms/keys/rotate` from your own scheduler, having first satisfied the upgrade-ordering constraint below.
+Driving the rotation itself remains external: call `POST /rustfs/admin/v3/kms/keys/rotate` from your own scheduler, having first satisfied the upgrade-ordering constraint below — and only on the backend where that is the right scheduling model; see [Rotation drivers and scheduling, per backend](#rotation-drivers-and-scheduling-per-backend).
 
 ### Vault KV2 versioned retention model
 
