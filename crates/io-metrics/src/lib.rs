@@ -795,8 +795,12 @@ pub fn record_get_object_metadata_cache_decision(path: &'static str, decision: &
 }
 
 /// Record aggregate metadata fanout shape for one GetObject metadata read.
+///
+/// The legacy `metadata_fanout_error_responses` series records every non-valid
+/// response, including not-found and ignored outcomes. Use
+/// `metadata_response_total` outcome labels for failure attribution.
 #[inline(always)]
-pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
+pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, non_valid: usize) {
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -807,7 +811,7 @@ pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize,
     histogram!("rustfs_io_get_object_metadata_fanout_ignored_responses", "path" => path)
         .record(metadata_fanout_count_to_f64(ignored));
     histogram!("rustfs_io_get_object_metadata_fanout_error_responses", "path" => path)
-        .record(metadata_fanout_count_to_f64(errors));
+        .record(metadata_fanout_count_to_f64(non_valid));
 }
 
 /// Record a guarded metadata early-stop hit for GetObject.

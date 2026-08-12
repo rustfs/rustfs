@@ -5553,7 +5553,7 @@ mod get_object_downstream_close_accounting_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (decode_failures, emit_failures) = metrics::with_local_recorder(&recorder, || {
+        let (decode_failures, emit_failures, legacy_fanout, internal_fanout) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
                 let bucket = "get-downstream-close-accounting";
@@ -5621,6 +5621,14 @@ mod get_object_downstream_close_accounting_tests {
                             ("reason", GetObjectFailureReason::DownstreamClosed.as_str()),
                         ],
                     ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_total_responses",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_total_responses",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
                 )
             })
         });
@@ -5628,6 +5636,11 @@ mod get_object_downstream_close_accounting_tests {
 
         assert!(decode_failures > 0, "the producer must expose the downstream close at decode");
         assert_eq!(emit_failures, 0, "downstream closure must not be counted as an emit failure");
+        assert_eq!(legacy_fanout, vec![4.0], "ordinary object fanout must retain the legacy_duplex path");
+        assert!(
+            internal_fanout.is_empty(),
+            "ordinary object fanout must not be attributed to internal_meta"
+        );
     }
 
     #[test]
@@ -5641,7 +5654,7 @@ mod get_object_downstream_close_accounting_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (internal_missing, legacy_unknown) = metrics::with_local_recorder(&recorder, || {
+        let (internal_missing, legacy_unknown, internal_fanout, legacy_fanout) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
                 let options = ObjectOptions {
@@ -5677,6 +5690,14 @@ mod get_object_downstream_close_accounting_tests {
                             ("reason", GetObjectFailureReason::Unknown.as_str()),
                         ],
                     ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_error_responses",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_error_responses",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
                 )
             })
         });
@@ -5687,6 +5708,8 @@ mod get_object_downstream_close_accounting_tests {
             legacy_unknown, 0,
             "internal metadata miss must not be attributed to legacy_duplex/unknown"
         );
+        assert_eq!(internal_fanout, vec![4.0], "internal metadata fanout must retain its path label");
+        assert!(legacy_fanout.is_empty(), "internal metadata fanout must not leak into legacy_duplex");
     }
 }
 
