@@ -438,6 +438,12 @@ impl LazyBuf {
 /// The returned path ends in a slash only if it represents a root directory, such as `/` on Unix or `C:/` on Windows.
 ///
 /// If the result of this process is an empty string, `clean` returns the string `.`.
+///
+/// Note: `crates/policy/src/policy/utils/path.rs` deliberately keeps its own
+/// slash-only Go `path.Clean` port instead of using this function — S3
+/// ARN/resource matching must not treat backslashes as separators, and this
+/// Windows-aware version would change policy evaluation semantics on Windows.
+/// Do not consolidate the two (backlog#1833).
 pub fn clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
