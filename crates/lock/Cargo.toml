@@ -57,7 +57,7 @@ thiserror.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 smallvec = { workspace = true, features = ["serde"] }
-smartstring.workspace = true
+compact_str.workspace = true
 crossbeam-queue = { workspace = true }
 
 [dev-dependencies]

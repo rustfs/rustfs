@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::fast_lock::guard::FastLockGuard;
+use compact_str::CompactString;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use smartstring::SmartString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -143,15 +143,15 @@ impl ObjectKey {
     }
 }
 
-/// Optimized object key using smart strings for better performance
+/// Optimized object key using compact strings for better performance
 #[derive(Debug, Clone)]
 pub struct OptimizedObjectKey {
     /// Bucket name - uses inline storage for small strings
-    pub bucket: SmartString<smartstring::LazyCompact>,
+    pub bucket: CompactString,
     /// Object name - uses inline storage for small strings
-    pub object: SmartString<smartstring::LazyCompact>,
+    pub object: CompactString,
     /// Version - optional for latest version semantics
-    pub version: Option<SmartString<smartstring::LazyCompact>>,
+    pub version: Option<CompactString>,
     /// Cached hash to avoid recomputation
     hash_cache: OnceLock<u64>,
 }
@@ -189,10 +189,7 @@ impl Ord for OptimizedObjectKey {
 }
 
 impl OptimizedObjectKey {
-    pub fn new(
-        bucket: impl Into<SmartString<smartstring::LazyCompact>>,
-        object: impl Into<SmartString<smartstring::LazyCompact>>,
-    ) -> Self {
+    pub fn new(bucket: impl Into<CompactString>, object: impl Into<CompactString>) -> Self {
         Self {
             bucket: bucket.into(),
             object: object.into(),
@@ -202,9 +199,9 @@ impl OptimizedObjectKey {
     }
 
     pub fn with_version(
-        bucket: impl Into<SmartString<smartstring::LazyCompact>>,
-        object: impl Into<SmartString<smartstring::LazyCompact>>,
-        version: impl Into<SmartString<smartstring::LazyCompact>>,
+        bucket: impl Into<CompactString>,
+        object: impl Into<CompactString>,
+        version: impl Into<CompactString>,
     ) -> Self {
         Self {
             bucket: bucket.into(),
@@ -232,9 +229,9 @@ impl OptimizedObjectKey {
     /// Convert from regular ObjectKey
     pub fn from_object_key(key: &ObjectKey) -> Self {
         Self {
-            bucket: SmartString::from(key.bucket.as_ref()),
-            object: SmartString::from(key.object.as_ref()),
-            version: key.version.as_ref().map(|v| SmartString::from(v.as_ref())),
+            bucket: CompactString::from(key.bucket.as_ref()),
+            object: CompactString::from(key.object.as_ref()),
+            version: key.version.as_ref().map(|v| CompactString::from(v.as_ref())),
             hash_cache: OnceLock::new(),
         }
     }
