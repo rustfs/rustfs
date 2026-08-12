@@ -76,6 +76,8 @@ const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
 const NAMESPACE_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const RENAME_TABLE_BODY_MAX_SIZE: usize = 16 * 1024;
+const RENAME_TABLE_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const PREFIX_PROPERTY: &str = "prefix";
 
@@ -204,7 +206,10 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &["POST /v1/{prefix}/namespaces/{namespace}/properties"];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[
+    "POST /v1/{prefix}/namespaces/{namespace}/properties",
+    "POST /v1/{prefix}/tables/rename",
+];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
@@ -229,6 +234,7 @@ static TABLE_EXISTS_HANDLER: RestTableExistsHandler = RestTableExistsHandler {};
 static LOAD_CREDENTIALS_HANDLER: RestLoadCredentialsHandler = RestLoadCredentialsHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
+static RENAME_TABLE_HANDLER: RestRenameTableHandler = RestRenameTableHandler {};
 static LOAD_VIEW_HANDLER: RestLoadViewHandler = RestLoadViewHandler {};
 static VIEW_EXISTS_HANDLER: RestViewExistsHandler = RestViewExistsHandler {};
 static REPLACE_VIEW_HANDLER: RestReplaceViewHandler = RestReplaceViewHandler {};
@@ -660,10 +666,18 @@ struct RestListNamespacesResponse {
     next_page_token: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RestTableIdentifier {
     namespace: Vec<String>,
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameTableRequest {
+    source: RestTableIdentifier,
+    destination: RestTableIdentifier,
 }
 
 #[derive(Debug, Serialize)]
@@ -1115,6 +1129,16 @@ async fn authorize_table_catalog_resource_request(
 ) -> S3Result<TableCatalogRequestPrincipal> {
     let principal = table_catalog_request_principal(req).await?;
 
+    authorize_table_catalog_resource_for_principal(req, &principal, resource, action).await?;
+    Ok(principal)
+}
+
+async fn authorize_table_catalog_resource_for_principal(
+    req: &S3Request<Body>,
+    principal: &TableCatalogRequestPrincipal,
+    resource: &TableCatalogResource<'_>,
+    action: AdminAction,
+) -> S3Result<()> {
     let object_path = resource.object_path();
     validate_admin_action_with_bucket_object_for_iam(
         principal.iam_store.clone(),
@@ -1125,8 +1149,7 @@ async fn authorize_table_catalog_resource_request(
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         AdminResourceScope::bucket_object(resource.warehouse, object_path.as_deref().unwrap_or("")),
     )
-    .await?;
-    Ok(principal)
+    .await
 }
 
 struct TableCatalogRequestPrincipal {
@@ -3699,8 +3722,6 @@ struct SnapshotFileIdentity {
 async fn validate_table_snapshot_commit_conflicts<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     current_metadata: &serde_json::Value,
     updates: &[serde_json::Value],
@@ -3725,13 +3746,10 @@ where
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| s3_error!(InvalidRequest, "snapshot summary.operation is required"))?;
 
-    let current_live_files =
-        load_current_snapshot_live_files(metadata_backend, bucket, namespace, table, entry, current_metadata).await?;
+    let current_live_files = load_current_snapshot_live_files(metadata_backend, bucket, entry, current_metadata).await?;
     let changes = load_snapshot_file_changes(
         metadata_backend,
         bucket,
-        namespace,
-        table,
         entry,
         snapshot,
         SnapshotChangeContext {
@@ -3808,8 +3826,6 @@ fn added_snapshot_update(updates: &[serde_json::Value]) -> S3Result<Option<&serd
 async fn load_current_snapshot_live_files<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     current_metadata: &serde_json::Value,
 ) -> S3Result<SnapshotLiveFiles>
@@ -3833,7 +3849,7 @@ where
         .ok_or_else(|| s3_error!(InvalidRequest, "current snapshot metadata is missing"))?;
 
     let mut live_files = SnapshotLiveFiles::default();
-    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, entry, snapshot).await? {
         let SnapshotManifestLocation {
             manifest_path,
             sequence_number,
@@ -3877,8 +3893,6 @@ where
 async fn load_snapshot_file_changes<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
     context: SnapshotChangeContext<'_>,
@@ -3887,7 +3901,7 @@ where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let mut changes = SnapshotFileChanges::default();
-    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, entry, snapshot).await? {
         let inherited_identity = context
             .current_live_files
             .manifest_files
@@ -3987,21 +4001,17 @@ struct SnapshotManifestReferences {
 async fn read_snapshot_manifest_references<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
 ) -> S3Result<Vec<SnapshotManifestReferences>>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, namespace, table, entry, snapshot).await?;
+    let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, entry, snapshot).await?;
     let mut manifests = Vec::new();
     for manifest_location in manifest_locations {
         let manifest_key = table_commit_object_key(
             bucket,
-            namespace,
-            table,
             entry,
             &manifest_location.manifest_path,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestFile,
@@ -4026,7 +4036,7 @@ where
             if reference.file_sequence_number.is_none() {
                 reference.file_sequence_number = manifest_location.sequence_number;
             }
-            validate_manifest_data_file_reference(metadata_backend, bucket, namespace, table, entry, &reference).await?;
+            validate_manifest_data_file_reference(metadata_backend, bucket, entry, &reference).await?;
             references.push(reference);
         }
         manifests.push(SnapshotManifestReferences {
@@ -4047,8 +4057,6 @@ struct SnapshotManifestLocation {
 async fn snapshot_manifest_locations<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
 ) -> S3Result<Vec<SnapshotManifestLocation>>
@@ -4058,8 +4066,6 @@ where
     if let Some(manifest_list_location) = snapshot.get("manifest-list").and_then(serde_json::Value::as_str) {
         let manifest_list_key = table_commit_object_key(
             bucket,
-            namespace,
-            table,
             entry,
             manifest_list_location,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestList,
@@ -4105,15 +4111,13 @@ where
 async fn validate_manifest_data_file_reference<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     reference: &crate::table_catalog::ManifestDataFileReference,
 ) -> S3Result<()>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    table_commit_object_key(bucket, namespace, table, entry, &reference.location, reference.object_kind.clone())?;
+    table_commit_object_key(bucket, entry, &reference.location, reference.object_kind.clone())?;
     let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, &reference.location)
         .ok_or_else(|| s3_error!(InvalidRequest, "manifest data file location is invalid"))?;
     if !metadata_backend
@@ -4128,8 +4132,6 @@ where
 
 fn table_commit_object_key(
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     location: &str,
     expected_kind: crate::table_catalog::TableMetadataMaintenanceObjectKind,
@@ -4138,7 +4140,7 @@ fn table_commit_object_key(
         .ok_or_else(|| s3_error!(InvalidRequest, "snapshot object location is invalid"))?;
     let warehouse_object_prefix = crate::table_catalog::table_warehouse_object_prefix(entry).map_err(catalog_store_error)?;
     let object_kind =
-        crate::table_catalog::table_maintenance_object_kind(namespace, table, Some(&warehouse_object_prefix), &object_key)
+        crate::table_catalog::table_maintenance_object_kind_for_entry(entry, Some(&warehouse_object_prefix), &object_key)
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot object is outside the table warehouse"))?;
     if !crate::table_catalog::table_maintenance_object_kind_matches_reference(&object_kind, &expected_kind) {
         return Err(s3_error!(InvalidRequest, "snapshot object kind does not match manifest metadata"));
@@ -4339,6 +4341,15 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
             iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_RESOURCE, StatusCode::NOT_FOUND, message)
         }
+        crate::table_catalog::TableCatalogStoreError::NamespaceNotFound(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_NAMESPACE, StatusCode::NOT_FOUND, message)
+        }
+        crate::table_catalog::TableCatalogStoreError::TableNotFound(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, message)
+        }
+        crate::table_catalog::TableCatalogStoreError::AlreadyExists(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_ALREADY_EXISTS, StatusCode::CONFLICT, message)
+        }
         crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
             iceberg_rest_error(ICEBERG_ERROR_COMMIT_FAILED, StatusCode::CONFLICT, message)
         }
@@ -4352,6 +4363,15 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
             iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
         }
     }
+}
+
+fn table_identifier_from_request(
+    identifier: RestTableIdentifier,
+) -> S3Result<(crate::table_catalog::Namespace, crate::table_catalog::IdentifierSegment)> {
+    let namespace = namespace_from_segments(&identifier.namespace)?;
+    let table = crate::table_catalog::IdentifierSegment::parse(identifier.name)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    Ok((namespace, table))
 }
 
 fn catalog_store_conflict_error(err: crate::table_catalog::TableCatalogStoreError, conflict_type: &'static str) -> S3Error {
@@ -4547,12 +4567,10 @@ where
 {
     let mut entry = table_entry_from_register_request(bucket, namespace, request)?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
-    let table = crate::table_catalog::IdentifierSegment::parse(entry.table.clone())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
-    validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table, &entry, None, &metadata).await?;
+    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
     store
         .register_table_with_publication(entry.clone(), metadata_backend)
         .await
@@ -4648,8 +4666,6 @@ async fn read_table_metadata_json(
 async fn validate_table_metadata_snapshot_graph<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     current_metadata: Option<&serde_json::Value>,
     metadata: &serde_json::Value,
@@ -4657,7 +4673,7 @@ async fn validate_table_metadata_snapshot_graph<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    validate_table_metadata_snapshot_graph_result(metadata_backend, bucket, namespace, table, entry, current_metadata, metadata)
+    validate_table_metadata_snapshot_graph_result(metadata_backend, bucket, entry, current_metadata, metadata)
         .await
         .map_err(catalog_store_error)
 }
@@ -4665,8 +4681,6 @@ where
 async fn validate_table_metadata_snapshot_graph_result<B>(
     metadata_backend: &B,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     current_metadata: Option<&serde_json::Value>,
     metadata: &serde_json::Value,
@@ -4676,8 +4690,7 @@ where
 {
     let mut target_entry = entry.clone();
     target_entry.warehouse_location = crate::table_catalog::table_metadata_location(metadata)?.to_string();
-    let context =
-        crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, namespace, table, &target_entry);
+    let context = crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, &target_entry);
     crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata).await
 }
 
@@ -4965,8 +4978,6 @@ async fn update_table_metadata_location_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -4975,7 +4986,7 @@ where
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
+    if !crate::table_catalog::is_valid_table_metadata_location_for_entry(&current, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
     let existing_commit = table_commit_for_retry_ids(
@@ -4995,16 +5006,8 @@ where
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
     validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
-    validate_table_metadata_snapshot_graph(
-        metadata_backend,
-        bucket,
-        namespace,
-        &table_name,
-        &current,
-        Some(&previous_metadata),
-        &target_metadata,
-    )
-    .await?;
+    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&previous_metadata), &target_metadata)
+        .await?;
     let requirements = match existing_commit.as_ref() {
         Some(existing_commit) => replay_commit_requirements(existing_commit, &[], &target_metadata)?,
         None => Vec::new(),
@@ -5056,8 +5059,6 @@ where
         return standard_commit_table_response(store, metadata_backend, bucket, namespace, table, request).await;
     }
 
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -5073,7 +5074,7 @@ where
     }
     let client_requirements = request.requirements.clone();
     let mut request = table_commit_request_from_rest_request(bucket, namespace, table, request)?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.new_metadata_location) {
+    if !crate::table_catalog::is_valid_table_metadata_location_for_entry(&current, &request.new_metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
@@ -5095,41 +5096,16 @@ where
         validate_metadata_table_location_in_bucket(bucket, &previous_metadata)?;
         validate_table_commit_requirements(&previous_metadata, &client_requirements)?;
         validate_metadata_matches_current_metadata(&previous_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(
-            metadata_backend,
-            bucket,
-            namespace,
-            &table_name,
-            &current,
-            Some(&previous_metadata),
-            &target_metadata,
-        )
-        .await?;
+        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&previous_metadata), &target_metadata)
+            .await?;
         let committed_metadata_location = request.new_metadata_location.clone();
         let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
-        return commit_table_replay_response(
-            metadata_backend,
-            bucket,
-            namespace,
-            table,
-            result,
-            &committed_metadata_location,
-            target_metadata,
-        )
-        .await;
+        return commit_table_replay_response(metadata_backend, bucket, result, &committed_metadata_location, target_metadata)
+            .await;
     }
     validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
     validate_table_commit_requirements(&current_metadata, &client_requirements)?;
-    validate_table_metadata_snapshot_graph(
-        metadata_backend,
-        bucket,
-        namespace,
-        &table_name,
-        &current,
-        Some(&current_metadata),
-        &target_metadata,
-    )
-    .await?;
+    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &target_metadata).await?;
     let result = publish_table_commit(store, metadata_backend, table_bucket_fence_required, request).await?;
     Ok(commit_table_response_from_result(result, target_metadata))
 }
@@ -5145,8 +5121,6 @@ async fn standard_commit_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -5168,38 +5142,21 @@ where
         apply_table_commit_updates_at(current_metadata, &request.updates, &previous_metadata_location, commit_timestamp_ms)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     validate_metadata_identity_matches_current_metadata(&expected_metadata, &next_metadata)?;
-    validate_table_metadata_snapshot_graph_result(
-        metadata_backend,
-        bucket,
-        namespace,
-        &table_name,
-        &current,
-        Some(&expected_metadata),
-        &next_metadata,
-    )
-    .await
-    .map_err(|err| match err {
-        crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
-        err => catalog_store_error(err),
-    })?;
-    validate_table_snapshot_commit_conflicts(
-        metadata_backend,
-        bucket,
-        namespace,
-        &table_name,
-        &current,
-        &expected_metadata,
-        &request.updates,
-    )
-    .await?;
+    validate_table_metadata_snapshot_graph_result(metadata_backend, bucket, &current, Some(&expected_metadata), &next_metadata)
+        .await
+        .map_err(|err| match err {
+            crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
+            err => catalog_store_error(err),
+        })?;
+    validate_table_snapshot_commit_conflicts(metadata_backend, bucket, &current, &expected_metadata, &request.updates).await?;
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id.or_else(|| request.idempotency_key.clone()));
     let next_generation = current.generation.saturating_add(1);
-    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
-        namespace,
-        &table_name,
+    let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
+        &current,
         &next_metadata_file_name(next_generation, &metadata_file_token),
-    );
+    )
+    .map_err(catalog_store_error)?;
     let next_metadata_data = serde_json::to_vec(&next_metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
     let put_result = metadata_backend
@@ -5334,8 +5291,6 @@ fn replay_commit_requirements(
 async fn commit_table_replay_response(
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
-    namespace: &crate::table_catalog::Namespace,
-    table: &str,
     result: crate::table_catalog::TableCommitResult,
     committed_metadata_location: &str,
     committed_metadata: serde_json::Value,
@@ -5343,9 +5298,7 @@ async fn commit_table_replay_response(
     let metadata = if result.table.metadata_location == committed_metadata_location {
         committed_metadata
     } else {
-        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &result.table.metadata_location) {
+        if !crate::table_catalog::is_valid_table_metadata_location_for_entry(&result.table, &result.table.metadata_location) {
             return Err(iceberg_rest_error(
                 ICEBERG_ERROR_REST,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5421,13 +5374,9 @@ where
         ));
     }
     if crate::table_catalog::table_matches_staged_base(current, &commit) {
-        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
         validate_table_metadata_snapshot_graph_result(
             metadata_backend,
             bucket,
-            namespace,
-            &table_name,
             current,
             Some(&previous_metadata),
             &target_metadata,
@@ -5437,16 +5386,7 @@ where
             crate::table_catalog::TableCatalogStoreError::Invalid(message) => s3_error!(InvalidRequest, "{}", message),
             err => catalog_store_error(err),
         })?;
-        validate_table_snapshot_commit_conflicts(
-            metadata_backend,
-            bucket,
-            namespace,
-            &table_name,
-            current,
-            &previous_metadata,
-            &request.updates,
-        )
-        .await?;
+        validate_table_snapshot_commit_conflicts(metadata_backend, bucket, current, &previous_metadata, &request.updates).await?;
     }
     let requirements = replay_commit_requirements(&commit, &request.requirements, &target_metadata)?;
     let committed_metadata_location = commit.new_metadata_location.clone();
@@ -5471,16 +5411,7 @@ where
     )
     .await?;
     Ok(Some(
-        commit_table_replay_response(
-            metadata_backend,
-            bucket,
-            namespace,
-            table,
-            result,
-            &committed_metadata_location,
-            target_metadata,
-        )
-        .await?,
+        commit_table_replay_response(metadata_backend, bucket, result, &committed_metadata_location, target_metadata).await?,
     ))
 }
 
@@ -5682,25 +5613,14 @@ where
     let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &previous_metadata_location)?;
     validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    validate_table_metadata_snapshot_graph(
-        metadata_backend,
-        bucket,
-        namespace,
-        &table_name,
-        &current,
-        Some(&current_metadata),
-        &next_metadata,
-    )
-    .await?;
+    validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &next_metadata).await?;
     let (commit_id, metadata_file_token) = standard_commit_ids(None);
     let next_generation = current.generation.saturating_add(1);
-    let next_metadata_location = crate::table_catalog::default_table_metadata_file_path(
-        namespace,
-        &table_name,
+    let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
+        &current,
         &next_metadata_file_name(next_generation, &metadata_file_token),
-    );
+    )
+    .map_err(catalog_store_error)?;
     let next_metadata_data = serde_json::to_vec(&next_metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize snapshot expiration metadata: {}", err))?;
     metadata_backend
@@ -6187,9 +6107,6 @@ where
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let external_table_uuid = validate_external_catalog_metadata_uuid(request.external_table_uuid.as_deref(), &target_metadata)?;
-    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-
     let (action, table_response) = if let Some(current) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -6206,16 +6123,8 @@ where
         let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(
-            metadata_backend,
-            bucket,
-            namespace,
-            &table_name,
-            &current,
-            Some(&current_metadata),
-            &target_metadata,
-        )
-        .await?;
+        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, Some(&current_metadata), &target_metadata)
+            .await?;
         let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let result = publish_table_commit(
             store,
@@ -6257,8 +6166,7 @@ where
             },
         )?;
         adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table_name, &entry, None, &target_metadata)
-            .await?;
+        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &target_metadata).await?;
         store
             .register_table_with_publication(entry.clone(), metadata_backend)
             .await
@@ -6298,12 +6206,10 @@ where
     let result = async {
         ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
         let mut entry = table_entry_from_import_request(bucket, namespace, table, request)?;
-        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
         let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &metadata)?;
         adopt_registered_metadata_identity(&mut entry, &metadata)?;
-        validate_table_metadata_snapshot_graph(metadata_backend, bucket, namespace, &table_name, &entry, None, &metadata).await?;
+        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
         if let Some(existing) = store
             .load_table(bucket, &namespace.public_name(), table)
             .await
@@ -6351,10 +6257,8 @@ where
         else {
             return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
         };
-        let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
-            .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
         let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
-        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
+        if !crate::table_catalog::is_valid_table_metadata_location_for_entry(&current, &metadata_location) {
             return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
         }
         let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
@@ -6362,16 +6266,7 @@ where
         let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
-        validate_table_metadata_snapshot_graph(
-            metadata_backend,
-            bucket,
-            namespace,
-            &table_name,
-            &current,
-            None,
-            &target_metadata,
-        )
-        .await?;
+        validate_table_metadata_snapshot_graph(metadata_backend, bucket, &current, None, &target_metadata).await?;
         let table_bucket_fence_required = table_warehouse_location_changes(&current, &target_metadata)?;
         let commit_request = crate::table_catalog::TableCommitRequest {
             table_bucket: bucket.to_string(),

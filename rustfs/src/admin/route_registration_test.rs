@@ -405,6 +405,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/{warehouse}/namespaces/{namespace}/register",
             "/analytics/namespaces/sales/register",
         ),
+        table_route_sample(Method::POST, "/{warehouse}/tables/rename", "/analytics/tables/rename"),
         table_route_sample(
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/views",
@@ -601,6 +602,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/{warehouse}/namespaces/{namespace}/register",
             "/analytics/namespaces/sales/register",
         ),
+        compat_table_route_sample(Method::POST, "/{warehouse}/tables/rename", "/analytics/tables/rename"),
         compat_table_route_sample(
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/views",
@@ -909,6 +911,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/tables/rename"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/views"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/views"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
@@ -1059,6 +1062,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/tables"));
     assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/tables/rename"));
     assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales/views"));
     assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/views"));
     assert_route(

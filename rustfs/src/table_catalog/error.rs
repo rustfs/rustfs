@@ -58,6 +58,9 @@ impl std::error::Error for TableObjectMutationError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableCatalogStoreError {
     NotFound(String),
+    NamespaceNotFound(String),
+    TableNotFound(String),
+    AlreadyExists(String),
     Conflict(String),
     Invalid(String),
     Unsupported(String),
@@ -68,6 +71,9 @@ impl fmt::Display for TableCatalogStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(message) => write!(f, "table catalog entry not found: {message}"),
+            Self::NamespaceNotFound(message) => write!(f, "table catalog namespace not found: {message}"),
+            Self::TableNotFound(message) => write!(f, "table catalog table not found: {message}"),
+            Self::AlreadyExists(message) => write!(f, "table catalog entry already exists: {message}"),
             Self::Conflict(message) => write!(f, "table catalog conflict: {message}"),
             Self::Invalid(message) => write!(f, "invalid table catalog entry: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported table catalog operation: {message}"),

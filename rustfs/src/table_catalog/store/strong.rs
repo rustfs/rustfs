@@ -123,6 +123,11 @@ enum StrongSnapshotWritePostcondition {
         key: StrongResourceKey,
         table_id: String,
     },
+    TableRenamed {
+        source_key: StrongResourceKey,
+        destination_key: StrongResourceKey,
+        table_id: String,
+    },
     ViewPresent(ViewEntry),
     ViewAbsent {
         key: StrongResourceKey,
@@ -166,6 +171,20 @@ impl StrongSnapshotWritePostcondition {
                     == Some(expected)
             }
             Self::TableAbsent { key, table_id } => state.tables.get(key).is_none_or(|current| current.table_id != *table_id),
+            Self::TableRenamed {
+                source_key,
+                destination_key,
+                table_id,
+            } => {
+                state
+                    .tables
+                    .get(source_key)
+                    .is_none_or(|current| current.table_id != *table_id)
+                    && state
+                        .tables
+                        .get(destination_key)
+                        .is_some_and(|current| current.table_id == *table_id)
+            }
             Self::ViewPresent(expected) => {
                 let (Ok(namespace), Ok(view)) =
                     (parse_namespace_for_store(&expected.namespace), parse_table_for_store(&expected.view))
@@ -813,9 +832,8 @@ where
                 continue;
             }
             let namespace_identity = parse_namespace_for_store(namespace)?;
-            let table_identity = parse_table_for_store(table)?;
             validate_table_warehouse_location(table_bucket, &entry.warehouse_location)?;
-            if !is_valid_table_metadata_location(&namespace_identity, &table_identity, &entry.metadata_location) {
+            if !is_valid_table_metadata_location_for_entry(entry, &entry.metadata_location) {
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "strong catalog table {table_bucket}/{namespace}/{table} has an invalid metadata location"
                 )));
@@ -909,9 +927,8 @@ where
                 continue;
             }
             let namespace_identity = parse_namespace_for_store(namespace)?;
-            let table_identity = parse_table_for_store(table)?;
             validate_table_warehouse_location(table_bucket, &entry.warehouse_location)?;
-            if !is_valid_table_metadata_location(&namespace_identity, &table_identity, &entry.metadata_location) {
+            if !is_valid_table_metadata_location_for_entry(entry, &entry.metadata_location) {
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "strong catalog table {table_bucket}/{namespace}/{table} has an invalid metadata location"
                 )));
@@ -1607,8 +1624,6 @@ where
         state: &StrongTableCatalogState,
         key: &StrongResourceKey,
         request: &TableCommitRequest,
-        namespace: &Namespace,
-        table: &IdentifierSegment,
     ) -> TableCatalogStoreResult<TableEntry> {
         Self::ensure_identifier_is_unambiguous_locked(state, key)?;
         let Some(current) = state.tables.get(key).cloned() else {
@@ -1696,7 +1711,7 @@ where
                 "current table metadata location does not match expected location".to_string(),
             ));
         }
-        if !is_valid_table_metadata_location(namespace, table, &request.new_metadata_location) {
+        if !is_valid_table_metadata_location_for_entry(&current, &request.new_metadata_location) {
             return Err(TableCatalogStoreError::Invalid(
                 "new metadata location must be inside the table metadata directory".to_string(),
             ));
@@ -1763,7 +1778,7 @@ where
         next_warehouse_location: Option<String>,
     ) -> TableCatalogStoreResult<TableCommitResult> {
         let key = Self::table_key(&request.table_bucket, namespace, table);
-        let current = Self::validate_new_table_commit_locked(state, &key, request, namespace, table)?;
+        let current = Self::validate_new_table_commit_locked(state, &key, request)?;
         if let Some((result, _)) = Self::committed_existing_result_locked(state, request, current.clone()) {
             return Ok(result);
         }
@@ -2264,6 +2279,95 @@ where
             .cloned())
     }
 
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        publication.begin_table_bucket(table_bucket).await?;
+        if !publication.holds_table_bucket(table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table rename requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
+
+        let source_namespace = parse_namespace_for_store(source_namespace)?;
+        let source_table = parse_table_for_store(source_table)?;
+        let destination_namespace = parse_namespace_for_store(destination_namespace)?;
+        let destination_table = parse_table_for_store(destination_table)?;
+        let source_key = Self::table_key(table_bucket, &source_namespace, &source_table);
+        let destination_key = Self::table_key(table_bucket, &destination_namespace, &destination_table);
+
+        let (snapshot, precondition, postcondition) = {
+            let state = self.state.lock().await;
+            Self::require_table_bucket_in_state(&state, table_bucket)?;
+            Self::ensure_identifier_is_unambiguous_locked(&state, &source_key)?;
+            Self::ensure_identifier_is_unambiguous_locked(&state, &destination_key)?;
+            let source = state
+                .tables
+                .get(&source_key)
+                .filter(|entry| entry.state == TableCatalogEntryState::Active)
+                .cloned()
+                .ok_or_else(|| {
+                    TableCatalogStoreError::TableNotFound(format!(
+                        "{table_bucket}/{}/{}",
+                        source_namespace.public_name(),
+                        source_table.as_str()
+                    ))
+                })?;
+            if !Self::namespace_exists_locked(&state, table_bucket, &source_namespace) {
+                return Err(TableCatalogStoreError::TableNotFound(format!(
+                    "{table_bucket}/{}/{}",
+                    source_namespace.public_name(),
+                    source_table.as_str()
+                )));
+            }
+            if !Self::namespace_exists_locked(&state, table_bucket, &destination_namespace) {
+                return Err(TableCatalogStoreError::NamespaceNotFound(format!(
+                    "{table_bucket}/{}",
+                    destination_namespace.public_name()
+                )));
+            }
+            if state.tables.contains_key(&destination_key) || state.views.contains_key(&destination_key) {
+                return Err(TableCatalogStoreError::AlreadyExists(format!(
+                    "destination table already exists: {table_bucket}/{}/{}",
+                    destination_namespace.public_name(),
+                    destination_table.as_str()
+                )));
+            }
+            if !is_valid_table_metadata_location_for_entry(&source, &source.metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "current metadata location must be inside the table metadata directory".to_string(),
+                ));
+            }
+
+            let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
+            draft_state.tables.remove(&source_key);
+            let mut destination = source;
+            destination.namespace = destination_namespace.public_name();
+            destination.table = destination_table.as_str().to_string();
+            draft_state.tables.insert(destination_key.clone(), destination.clone());
+            (
+                Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)?,
+                precondition,
+                StrongSnapshotWritePostcondition::TableRenamed {
+                    source_key,
+                    destination_key,
+                    table_id: destination.table_id,
+                },
+            )
+        };
+        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+    }
+
     async fn resolve_table_data_plane_resource(
         &self,
         table_bucket: &str,
@@ -2345,7 +2449,7 @@ where
 
         let committed_existing_result = {
             let state = self.state.lock().await;
-            let current = Self::validate_new_table_commit_locked(&state, &key, &request, &namespace, &table);
+            let current = Self::validate_new_table_commit_locked(&state, &key, &request);
             match current {
                 Ok(current) => {
                     let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);

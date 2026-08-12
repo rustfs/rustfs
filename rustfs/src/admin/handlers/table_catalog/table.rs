@@ -30,6 +30,46 @@ impl Operation for RestListTablesHandler {
     }
 }
 
+pub struct RestRenameTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestRenameTableHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let principal = table_catalog_request_principal(&req).await?;
+        let request = read_bounded_json_body::<RenameTableRequest>(
+            &req.headers,
+            std::mem::take(&mut req.input),
+            RENAME_TABLE_BODY_MAX_SIZE,
+            RENAME_TABLE_BODY_TIMEOUT,
+            "rename table",
+        )
+        .await?;
+        let (source_namespace, source_table) = table_identifier_from_request(request.source)?;
+        let (destination_namespace, destination_table) = table_identifier_from_request(request.destination)?;
+
+        let source_resource = TableCatalogResource::table(&warehouse, &source_namespace, source_table.as_str());
+        authorize_table_catalog_resource_for_principal(&req, &principal, &source_resource, AdminAction::SetTableAction).await?;
+        let destination_resource = TableCatalogResource::table(&warehouse, &destination_namespace, destination_table.as_str());
+        authorize_table_catalog_resource_for_principal(&req, &principal, &destination_resource, AdminAction::SetTableAction)
+            .await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        store
+            .rename_table(
+                &warehouse,
+                &source_namespace.public_name(),
+                source_table.as_str(),
+                &destination_namespace.public_name(),
+                destination_table.as_str(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
 pub struct RestCreateTableHandler {}
 
 #[async_trait::async_trait]

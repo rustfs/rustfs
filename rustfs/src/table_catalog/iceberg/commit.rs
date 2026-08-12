@@ -269,9 +269,13 @@ pub(crate) fn record_table_commit_attempt(operation: &str) {
 fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &'static str {
     match result {
         Ok(_) => "success",
-        Err(TableCatalogStoreError::Conflict(_)) => "conflict",
+        Err(TableCatalogStoreError::Conflict(_) | TableCatalogStoreError::AlreadyExists(_)) => "conflict",
         Err(TableCatalogStoreError::Invalid(_)) => "invalid",
-        Err(TableCatalogStoreError::NotFound(_)) => "not_found",
+        Err(
+            TableCatalogStoreError::NotFound(_)
+            | TableCatalogStoreError::NamespaceNotFound(_)
+            | TableCatalogStoreError::TableNotFound(_),
+        ) => "not_found",
         Err(TableCatalogStoreError::Unsupported(_)) => "unsupported",
         Err(TableCatalogStoreError::Internal(_)) => "failure",
     }
