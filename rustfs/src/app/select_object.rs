@@ -57,12 +57,13 @@ const BUSY_MESSAGE: &str = "The service is unavailable. Try again later.";
 const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
 const SLOW_DOWN_MESSAGE: &str = "Reduce your request rate.";
 const UNSUPPORTED_SQL_STRUCTURE_MESSAGE: &str = "We encountered an unsupported SQL structure. Check the SQL Reference.";
-const SELECT_MINIO_SSEC_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
-const SELECT_MINIO_S3_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key";
-const SELECT_MINIO_KMS_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key";
-const SELECT_MINIO_KMS_KEY_ID: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
-const SELECT_MINIO_KMS_CONTEXT: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
-const SELECT_RUSTFS_KMS_KEY_ID: &str = "x-rustfs-encryption-key-id";
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+};
+
+// No canonical owner exists for the KMS key ARN prefix; keep it local.
 const SELECT_KMS_ARN_PREFIX: &str = "arn:aws:kms:";
 
 #[derive(Clone, Debug)]
@@ -190,8 +191,8 @@ fn select_metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) 
 fn select_snapshot_kms_key_id(metadata: &HashMap<String, String>) -> S3Result<Option<&str>> {
     let values = [
         select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?,
-        select_metadata_value(metadata, SELECT_RUSTFS_KMS_KEY_ID)?,
-        select_metadata_value(metadata, SELECT_MINIO_KMS_KEY_ID)?,
+        select_metadata_value(metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER)?,
+        select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)?,
     ];
     let mut resolved = None;
     for value in values.into_iter().flatten() {
@@ -206,9 +207,9 @@ fn select_snapshot_kms_key_id(metadata: &HashMap<String, String>) -> S3Result<Op
 fn select_snapshot_sse_mode(metadata: &HashMap<String, String>) -> S3Result<Option<SelectSnapshotSseMode>> {
     let public_mode = select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION)?;
     let customer_algorithm = select_metadata_value(metadata, SSEC_ALGORITHM_HEADER)?;
-    let has_ssec_marker = select_metadata_value(metadata, SELECT_MINIO_SSEC_SEALED_KEY)?.is_some();
-    let has_s3_marker = select_metadata_value(metadata, SELECT_MINIO_S3_SEALED_KEY)?.is_some();
-    let has_kms_marker = select_metadata_value(metadata, SELECT_MINIO_KMS_SEALED_KEY)?.is_some();
+    let has_ssec_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)?.is_some();
+    let has_s3_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)?.is_some();
+    let has_kms_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)?.is_some();
 
     let public_mode = match public_mode {
         Some(AMZ_ENCRYPTION_AES) => Some(SelectSnapshotSseMode::S3),
@@ -269,7 +270,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
     match mode {
         SelectSnapshotSseMode::S3 => {
             if select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?.is_some()
-                || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some()
+                || select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)?.is_some()
                 || select_metadata_value(metadata, SSEC_KEY_MD5_HEADER)?.is_some()
             {
                 return Err(invalid_select_snapshot_sse_metadata());
@@ -293,7 +294,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
                     &format!("{SELECT_KMS_ARN_PREFIX}{key_id}"),
                 )?;
             }
-            if let Some(context) = select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)? {
+            if let Some(context) = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)? {
                 let context = HeaderValue::from_str(context).map_err(|_| invalid_select_snapshot_sse_metadata())?;
                 let mut validation_headers = HeaderMap::with_capacity(1);
                 validation_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT, context.clone());
@@ -303,7 +304,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
             }
         }
         SelectSnapshotSseMode::Customer => {
-            if kms_key_id.is_some() || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some() {
+            if kms_key_id.is_some() || select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)?.is_some() {
                 return Err(invalid_select_snapshot_sse_metadata());
             }
             let algorithm = request_headers
@@ -1047,8 +1048,8 @@ mod tests {
     fn select_snapshot_sse_s3_headers_are_whitelisted() {
         let metadata = HashMap::from([
             (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_AES.to_string()),
-            (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "default".to_string()),
-            (SELECT_MINIO_KMS_KEY_ID.to_string(), "default".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "default".to_string()),
+            (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
             ("x-amz-meta-private".to_string(), "private-value".to_string()),
         ]);
 
@@ -1067,9 +1068,9 @@ mod tests {
             let metadata = HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), key_id.to_string()),
-                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), key_id.to_string()),
-                (SELECT_MINIO_KMS_KEY_ID.to_string(), key_id.to_string()),
-                (SELECT_MINIO_KMS_CONTEXT.to_string(), context.to_string()),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), key_id.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), key_id.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), context.to_string()),
             ]);
 
             let headers = select_snapshot_sse_response_headers(&metadata, &HeaderMap::new())
@@ -1143,16 +1144,16 @@ mod tests {
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
             ]),
-            HashMap::from([(SELECT_MINIO_KMS_SEALED_KEY.to_string(), "sealed".to_string())]),
+            HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), "sealed".to_string())]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
-                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "key-2".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "key-2".to_string()),
             ]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
-                (SELECT_MINIO_KMS_CONTEXT.to_string(), invalid_context.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), invalid_context.to_string()),
             ]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_KMS.to_string()),
