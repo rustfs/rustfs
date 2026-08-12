@@ -344,7 +344,7 @@ pub mod disk {
     }
 
     pub mod error {
-        pub use crate::disk::error::{BitrotErrorType, DiskError, Error, FileAccessDeniedWithContext, Result};
+        pub use crate::disk::error::{DiskError, Error, FileAccessDeniedWithContext, Result};
     }
 
     pub mod error_reduce {
