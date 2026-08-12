@@ -1585,7 +1585,7 @@ impl ECStore {
     ) -> Result<GetObjectReader> {
         check_get_obj_args(bucket, object)?;
 
-        let object = encode_dir_object(object);
+        let object = rustfs_utils::path::encode_dir_object_ref(object);
         let mut opts = opts.clone();
         let read_lock_guard = self
             .acquire_object_read_lock_if_needed("get_object", bucket, &object, &mut opts)
@@ -1593,14 +1593,14 @@ impl ECStore {
 
         let reader = if self.single_pool() {
             self.pools[0]
-                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         } else {
             let (_, idx) = self
                 .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
                 .await?;
             self.pools[idx]
-                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         };
 
