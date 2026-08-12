@@ -113,7 +113,7 @@ pub struct ScannerStats {
     pub current_cycle_usage_saves: u64,
     /// Current scanner mode: 0 unknown or idle, 1 normal, 2 deep bitrot scan
     pub current_scan_mode: u64,
-    /// Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded
+    /// Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded, 5 deferred
     pub last_cycle_result: u64,
     /// Last scanner partial cycle reason: 0 unknown, 1 runtime, 2 objects, 3 directories
     pub last_cycle_partial_reason: u64,

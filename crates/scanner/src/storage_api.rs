@@ -83,6 +83,11 @@ pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
 };
 #[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rebalance::{
+    RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
+    RebalanceStats as EcstoreRebalanceStats,
+};
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
@@ -122,8 +127,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreInstanceContext, EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys,
-        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreInstanceContext, EcstorePoolEndpoints, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta,
+        EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx,
+        ecstore_new_disk,
     };
 }
 
