@@ -179,7 +179,6 @@ pub mod backpressure_metrics;
 pub mod cache_config;
 pub mod capacity_metrics;
 pub mod collector;
-pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
@@ -264,13 +263,6 @@ pub use system_path_metrics::record_system_path_failure;
 pub use timeout_metrics::{
     TimeoutMetricsSummary, record_dynamic_timeout, record_operation_completion, record_operation_duration,
     record_operation_progress, record_stalled_operation, record_timeout_event,
-};
-
-// Config exports
-pub use config::{
-    BackpressureSettings, CacheSettings, DEFAULT_BASE_BUFFER_SIZE, DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_CACHE_MAX_MEMORY,
-    DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_CONCURRENT_READS, DEFAULT_MIN_BUFFER_SIZE,
-    DeadlockDetectionSettings, IoConfig, IoSchedulerSettings, TimeoutSettings,
 };
 
 // Re-exports for convenience

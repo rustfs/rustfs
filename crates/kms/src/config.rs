@@ -1129,6 +1129,53 @@ pub fn allow_immediate_deletion_from_env() -> bool {
     get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, false)
 }
 
+impl crate::persisted_observability::UnknownFieldSummary {
+    fn record_for_kms_config(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("kms-config") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "persisted KMS configuration contains unknown fields"
+            );
+        }
+    }
+}
+
+/// Deserialize a persisted KMS configuration, observing ignored fields.
+///
+/// The persisted configuration deliberately tolerates unknown fields — a
+/// rolling upgrade writes fields the previous build does not know, and
+/// rejecting them would turn every upgrade into a hard stop (see the
+/// regression test pinning that tolerance). Tolerated must not mean
+/// invisible: this loader wraps the deserializer with `serde_ignored`, so
+/// every field the configuration silently dropped is counted and sampled
+/// into a warning, per the repository rule that formats too
+/// compatibility-bound for `deny_unknown_fields` must at least log unknown
+/// fields. Only field paths are recorded, never values — a mistyped field
+/// name can sit next to a secret.
+pub fn kms_config_from_persisted_json(data: &[u8]) -> serde_json::Result<KmsConfig> {
+    use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
+
+    let mut deserializer = serde_json::Deserializer::from_slice(data);
+    let mut unknown_fields = UnknownFieldSummary::default();
+    let config: KmsConfig = serde_ignored::deserialize(&mut deserializer, |path| {
+        unknown_fields.observe(BoundedUnknownFieldName::new(&path.to_string()));
+    })?;
+    deserializer.end()?;
+    unknown_fields.record_for_kms_config();
+    Ok(config)
+}
+
 fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
     skip_tls_verify.then_some(TlsConfig {
         ca_cert_path: None,
@@ -1977,6 +2024,58 @@ mod tests {
         with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, None::<&str>)], || {
             assert!(!allow_immediate_deletion_from_env());
         });
+    }
+
+    #[test]
+    fn persisted_config_unknown_fields_remain_readable_and_are_observed() {
+        // Unknown fields in a persisted config are deliberately tolerated (a
+        // rolling upgrade writes fields the previous build does not know), but
+        // tolerated must not mean invisible (rustfs/backlog#1641): the
+        // observing loader counts and warns, naming only the field path —
+        // never the value, which can sit next to a secret. Coverage includes a
+        // field nested inside the backend variant, which the externally tagged
+        // enum exposes to the observer.
+        let mut value = serde_json::to_value(KmsConfig::default()).expect("serialize config");
+        value.as_object_mut().expect("config serializes to an object").insert(
+            "top_level_field_from_the_future".to_string(),
+            serde_json::json!("top-level value must not be logged"),
+        );
+        value
+            .pointer_mut("/backend_config/Local")
+            .expect("default config has a Local backend section")
+            .as_object_mut()
+            .expect("Local backend section is an object")
+            .insert(
+                "nested_field_from_the_future".to_string(),
+                serde_json::json!("nested value must not be logged"),
+            );
+        let data = serde_json::to_vec(&value).expect("encode config");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let config = metrics::with_local_recorder(&recorder, || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                kms_config_from_persisted_json(&data).expect("unknown fields must remain readable")
+            })
+        });
+        assert!(matches!(config.backend_config, BackendConfig::Local(_)));
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "kms-config"), 2);
+
+        let output = logs.output();
+        assert!(output.contains("persisted KMS configuration contains unknown fields"), "got: {output}");
+        assert!(!output.contains("must not be logged"));
+
+        // A clean config observes nothing and logs nothing.
+        let clean = serde_json::to_vec(&KmsConfig::default()).expect("encode clean config");
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || kms_config_from_persisted_json(&clean).expect("clean config must parse"));
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "kms-config"), 0);
     }
 
     #[test]
