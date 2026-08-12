@@ -27,6 +27,7 @@ use super::storage_api::multipart_usecase::bucket::{
     replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
+use super::storage_api::multipart_usecase::compression::is_disk_compressible;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
@@ -39,7 +40,7 @@ use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_n
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
@@ -208,6 +209,21 @@ fn create_multipart_upload_metadata(
     }
 
     metadata
+}
+
+/// A multipart session advertises disk compression only when the object key/headers
+/// qualify AND the session is not an SSE-C ciphertext-passthrough replication session,
+/// which must preserve source bytes verbatim.
+///
+/// Each part is compressed as an independent stream; the GET path decodes across part
+/// boundaries (see `ReadTransform::Compressed`), so the session may advertise
+/// object-level compression again.
+///
+/// Unlike single PUT there is no `MIN_DISK_COMPRESSIBLE_SIZE` floor here: the total
+/// object size is unknown at CreateMultipartUpload time, so tiny multipart objects pay
+/// the (harmless) framing overhead. This is a deliberate trade-off, not a bug.
+fn should_advertise_session_compression(ciphertext_passthrough: bool, disk_compressible: bool) -> bool {
+    !ciphertext_passthrough && disk_compressible
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -837,8 +853,13 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        // Multipart parts are independent physical streams. Advertising object-level
-        // compression here would make GET decode the completed object as one stream.
+        if should_advertise_session_compression(ciphertext_passthrough, is_disk_compressible(&req.headers, &key)) {
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_COMPRESSION,
+                compression_metadata_value(CompressionAlgorithm::default()),
+            );
+        }
 
         let mt2 = metadata.clone();
         let mut opts: ObjectOptions =
@@ -1630,6 +1651,25 @@ mod tests {
 
     fn make_usecase() -> DefaultMultipartUsecase {
         DefaultMultipartUsecase::without_context()
+    }
+
+    #[test]
+    fn session_compression_is_advertised_only_for_non_passthrough_compressible_uploads() {
+        // (ciphertext_passthrough, disk_compressible, expected)
+        let cases = [
+            (false, false, false),
+            (false, true, true),
+            (true, false, false),
+            (true, true, false),
+        ];
+
+        for (ciphertext_passthrough, disk_compressible, expected) in cases {
+            assert_eq!(
+                should_advertise_session_compression(ciphertext_passthrough, disk_compressible),
+                expected,
+                "ciphertext_passthrough={ciphertext_passthrough} disk_compressible={disk_compressible}"
+            );
+        }
     }
 
     #[test]

@@ -51,7 +51,14 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                     e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
                     part_number: p.part_num.try_into().ok(),
-                    size: p.size.try_into().ok(),
+                    // Compressed parts store fewer bytes than the client sent; S3
+                    // semantics report the uploaded (logical) size, matching
+                    // GetObjectAttributes ObjectParts.
+                    size: if p.actual_size > 0 {
+                        Some(p.actual_size)
+                    } else {
+                        p.size.try_into().ok()
+                    },
                     ..Default::default()
                 })
                 .collect(),
@@ -245,6 +252,63 @@ mod tests {
         assert_eq!(parts[0].e_tag, Some(to_s3s_etag("etag-1")));
         assert_eq!(output.owner, Some(rustfs_owner()));
         assert_eq!(output.initiator, Some(rustfs_initiator()));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_logical_size_for_compressed_parts() {
+        let input = ListPartsInfo {
+            bucket: "bucket-a".to_string(),
+            object: "obj-a".to_string(),
+            upload_id: "upload-a".to_string(),
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Stored (compressed) bytes on disk vs. the logical size the client uploaded.
+                size: 1_024,
+                actual_size: 8_388_608,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].size,
+            Some(8_388_608),
+            "compressed parts must report the uploaded logical size, not the stored size"
+        );
+    }
+
+    #[test]
+    fn test_list_parts_output_falls_back_to_stored_size_when_actual_size_unknown() {
+        let input = ListPartsInfo {
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 1_024,
+                    // Uncompressed parts leave actual_size unset.
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 1_024,
+                    // Legacy/unknown sentinel must not leak a negative size to clients.
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].size, Some(1024));
+        assert_eq!(parts[1].size, Some(1024));
     }
 
     #[test]
