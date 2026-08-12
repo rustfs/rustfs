@@ -2899,7 +2899,7 @@ where
         table.warehouse_location = format!("s3://{bucket}/tables/table-{name}");
         store.create_table(table).await.expect("table should be created");
 
-        let view_identifier = IdentifierSegment::parse(&format!("view_{name}")).expect("view name should parse");
+        let view_identifier = IdentifierSegment::parse(format!("view_{name}")).expect("view name should parse");
         let view_metadata_location = default_view_metadata_file_path(namespace, &view_identifier, "00001.metadata.json");
         let mut view = test_view_entry(bucket, namespace, &view_identifier, view_metadata_location);
         view.view_id = format!("view-{name}");
