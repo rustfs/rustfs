@@ -457,7 +457,13 @@ impl ECStore {
             None
         };
 
-        let mut meta = existing_metadata.unwrap_or_else(|| BucketMetadata::new(bucket));
+        let mut meta = existing_metadata.unwrap_or_else(|| {
+            if confirmed_missing && !is_meta_bucketname(bucket) {
+                BucketMetadata::new_with_default_durability(bucket)
+            } else {
+                BucketMetadata::new(bucket)
+            }
+        });
         let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
         if confirmed_missing || is_meta_bucketname(bucket) {
             meta.set_created(opts.created_at);
@@ -1554,6 +1560,76 @@ mod tests {
         assert!(
             !meta.versioning_config_xml.is_empty(),
             "Object Lock requires versioning, so that must be persisted too"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn make_bucket_seeds_new_bucket_durability_override() {
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
+            let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+            let bucket = format!("bucket-default-durability-{}", Uuid::new_v4().simple());
+
+            ecstore
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("new bucket should be created");
+
+            let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
+                .await
+                .expect("metadata should load for the new bucket");
+            assert_eq!(
+                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn force_create_existing_bucket_keeps_durability_override() {
+        let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-force-durability-{}", Uuid::new_v4().simple());
+
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, Some("inherit"))], async {
+            ecstore
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("plain bucket should be created without a durability override");
+        })
+        .await;
+        assert!(
+            metadata_sys::get_in(&ecstore.ctx, &bucket)
+                .await
+                .expect("metadata should load after initial create")
+                .durability_config()
+                .is_none(),
+            "test setup: the existing bucket must start without an override"
+        );
+
+        temp_env::async_with_vars([(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, None::<&str>)], async {
+            ecstore
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        force_create: true,
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("force create should update existing bucket metadata");
+        })
+        .await;
+
+        let metadata = metadata_sys::get_in(&ecstore.ctx, &bucket)
+            .await
+            .expect("metadata should load after force create");
+        assert!(metadata.lock_enabled, "force create sanity check: Object Lock should be enabled");
+        assert!(
+            metadata.durability_config().is_none(),
+            "force create must not apply the new-bucket default to existing bucket metadata"
         );
     }
 
