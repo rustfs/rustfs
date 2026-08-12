@@ -81,16 +81,14 @@ fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<Stri
     enc_context
 }
 
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
-
-/// Carries the AEAD algorithm the object was sealed with.
-///
-/// The S3 `x-amz-server-side-encryption` header records the *SSE mode*
-/// (`AES256` / `aws:kms`), not the cipher, so it cannot round-trip
-/// `ChaCha20Poly1305`. Without this header a ChaCha-sealed object comes back
-/// from the projection claiming `aws:kms` and is then opened with the wrong
-/// cipher.
-const INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "x-rustfs-encryption-algorithm";
+// Canonical owners of the internal encryption header names. Note on
+// INTERNAL_ENCRYPTION_ALGORITHM_HEADER: it carries the AEAD algorithm the
+// object was sealed with. The S3 `x-amz-server-side-encryption` header records
+// the *SSE mode* (`AES256` / `aws:kms`), not the cipher, so it cannot
+// round-trip `ChaCha20Poly1305`. Without this header a ChaCha-sealed object
+// comes back from the projection claiming `aws:kms` and is then opened with
+// the wrong cipher.
+use rustfs_utils::http::object_encryption_keys::{INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER};
 
 /// Result of object encryption
 #[derive(Debug, Clone)]
