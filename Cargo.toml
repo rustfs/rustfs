@@ -171,7 +171,7 @@ tower = { version = "0.5.3" }
 tower-http = { version = "0.7.0" }
 
 # Serialization and Data Formats
-apache-avro = "0.22.0"
+apache-avro = "0.21.0"
 bytes = { version = "1.12.1" }
 bytesize = "2.7.0"
 byteorder = "1.5.0"
@@ -294,7 +294,7 @@ serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
 smallvec = { version = "1.15.2" }
-smartstring = "1.0.1"
+compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.2.2" }
 strum = { version = "0.28.0" }
