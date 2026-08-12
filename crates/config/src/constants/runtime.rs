@@ -81,6 +81,8 @@ pub const ENV_TEST_IAM_FAIL_INIT_ATTEMPTS: &str = "RUSTFS_TEST_IAM_FAIL_INIT_ATT
 pub const ENV_TEST_IAM_RETRY_INTERVAL_MS: &str = "RUSTFS_TEST_IAM_RETRY_INTERVAL_MS";
 /// Runtime env var controlling the transition worker count.
 pub const ENV_TRANSITION_WORKERS: &str = "RUSTFS_MAX_TRANSITION_WORKERS";
+/// Runtime env var controlling the expiry worker count.
+pub const ENV_MAX_EXPIRY_WORKERS: &str = "RUSTFS_MAX_EXPIRY_WORKERS";
 /// Runtime env var controlling the absolute maximum transition workers.
 pub const ENV_TRANSITION_WORKERS_ABSOLUTE_MAX: &str = "RUSTFS_ABSOLUTE_MAX_WORKERS";
 /// Runtime env var controlling the transition queue capacity.

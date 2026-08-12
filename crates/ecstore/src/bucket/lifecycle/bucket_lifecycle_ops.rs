@@ -78,8 +78,8 @@ use rustfs_common::metrics::{
 };
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
-    ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
+    ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
@@ -159,6 +159,8 @@ const TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL: StdDuration = StdDuration::f
 const TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT: u64 = 10;
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
+/// Maximum expiry workers used as a local fallback when runtime env is unset.
+const DEFAULT_EXPIRY_WORKERS_CAP: usize = 16;
 const DEFAULT_MANUAL_TRANSITION_JOB_RECOVERY_LIMIT: usize = 100;
 
 // Phase 5 (backlog#939): lifecycle expiry/transition state moved into the
@@ -202,6 +204,15 @@ fn resolve_transition_queue_send_timeout() -> StdDuration {
     StdDuration::from_millis(
         get_env_usize(ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64,
     )
+}
+
+fn resolve_expiry_worker_count() -> usize {
+    let fallback = std::cmp::min(num_cpus::get(), DEFAULT_EXPIRY_WORKERS_CAP);
+    env::var(ENV_MAX_EXPIRY_WORKERS)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
 }
 
 fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
@@ -2017,17 +2028,7 @@ fn is_slow_down(err: &Error) -> bool {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
-    //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS")
-        && let Ok(num_expirations) = env_expiration_workers.parse::<usize>()
-    {
-        workers = num_expirations;
-    }
-
-    if workers == 0 {
-        workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
-    }
+    let workers = resolve_expiry_worker_count();
 
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
@@ -5075,13 +5076,13 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
-        EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState, ExpiryTask, FreeVersionTask, ManualTransitionJobRecoveryOutcome,
-        ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, StaleMultipartUploadCandidate,
-        TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE,
-        TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
-        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_EXPIRY_WORKERS_CAP, DEFAULT_TRANSITION_QUEUE_CAPACITY,
+        DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED,
+        EVENT_LIFECYCLE_EXPIRED_DETECTED, EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState, ExpiryTask, FreeVersionTask,
+        ManualTransitionJobRecoveryOutcome, ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
+        StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
+        TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
+        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
         get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
@@ -5090,11 +5091,12 @@ mod tests {
         manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
         persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
-        recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
-        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
-        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        recover_manual_transition_jobs, resolve_expiry_worker_count, resolve_tier_free_version_recovery_enabled,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
+        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -5155,7 +5157,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
-    use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
+    use rustfs_config::{ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX};
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
     use s3s::dto::{
@@ -7404,6 +7406,76 @@ mod tests {
             assert_eq!(configured, fallback);
             assert_eq!(absolute_max, 32);
             assert_eq!(effective, fallback);
+        });
+    }
+
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    fn with_expiry_worker_env<F>(value: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original = env::var_os(ENV_MAX_EXPIRY_WORKERS);
+
+        match value {
+            Some(value) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original {
+            Some(value) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_expiry_worker_count_uses_fallback_when_env_missing() {
+        with_expiry_worker_env(None, || {
+            let fallback = std::cmp::min(num_cpus::get(), DEFAULT_EXPIRY_WORKERS_CAP);
+            assert_eq!(resolve_expiry_worker_count(), fallback);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_expiry_worker_count_honors_positive_env_value() {
+        with_expiry_worker_env(Some("6"), || {
+            assert_eq!(resolve_expiry_worker_count(), 6);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_expiry_worker_count_falls_back_for_zero_value() {
+        with_expiry_worker_env(Some("0"), || {
+            let fallback = std::cmp::min(num_cpus::get(), DEFAULT_EXPIRY_WORKERS_CAP);
+            assert_eq!(resolve_expiry_worker_count(), fallback);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_expiry_worker_count_falls_back_for_invalid_value() {
+        with_expiry_worker_env(Some("not-a-number"), || {
+            let fallback = std::cmp::min(num_cpus::get(), DEFAULT_EXPIRY_WORKERS_CAP);
+            assert_eq!(resolve_expiry_worker_count(), fallback);
         });
     }
 
