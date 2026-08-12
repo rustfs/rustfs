@@ -1919,7 +1919,7 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -1964,7 +1964,7 @@ async fn iceberg_snapshot_graph_allows_missing_deleted_files() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -1992,7 +1992,7 @@ async fn iceberg_snapshot_graph_accepts_empty_manifest_lists() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -2036,7 +2036,7 @@ async fn iceberg_v2_snapshot_graph_accepts_reused_v1_manifests() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -2080,7 +2080,7 @@ async fn iceberg_snapshot_change_validation_skips_unchanged_history() {
         }));
     next_metadata["current-snapshot-id"] = serde_json::Value::from(11);
     next_metadata["refs"]["main"]["snapshot-id"] = serde_json::Value::from(11);
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, Some(&current_metadata), &next_metadata)
         .await
@@ -2116,7 +2116,7 @@ async fn iceberg_snapshot_registration_validates_only_active_snapshot_heads() {
     ]);
     metadata["current-snapshot-id"] = serde_json::Value::from(11);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -2169,7 +2169,7 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
     metadata["current-snapshot-id"] = serde_json::Value::from(current_snapshot_id);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": current_snapshot_id}});
     let current_metadata = table_metadata_json_for_validation();
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
@@ -2227,7 +2227,7 @@ async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(20);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 20}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -2263,7 +2263,7 @@ async fn iceberg_v2_snapshot_graph_accepts_embedded_v2_manifests() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -2307,7 +2307,7 @@ async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
     }]);
     metadata["current-snapshot-id"] = serde_json::Value::from(10);
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
-    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &namespace, &table, &entry);
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
@@ -16657,5 +16657,339 @@ fn resolver_builds_paths_under_reserved_table_boundary() {
     assert_eq!(
         resolver.metadata_dir_path(&table),
         ".rustfs-table/warehouses/warehouse1/namespaces/analytics/daily/tables/events/metadata"
+    );
+}
+
+#[tokio::test]
+async fn strong_catalog_table_rename_is_atomic_and_preserves_stable_table_state() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .expect("source namespace should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .expect("destination namespace should be created");
+    let source = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+    );
+    store
+        .create_table(source.clone())
+        .await
+        .expect("source table should be created");
+
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("table should rename");
+
+    assert!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .expect("source lookup should succeed")
+            .is_none()
+    );
+    let destination = store
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .expect("destination lookup should succeed")
+        .expect("renamed table should exist");
+    assert_eq!(destination.table_id, source.table_id);
+    assert_eq!(destination.table_uuid, source.table_uuid);
+    assert_eq!(destination.warehouse_location, source.warehouse_location);
+    assert_eq!(destination.metadata_location, source.metadata_location);
+    assert_eq!(destination.version_token, source.version_token);
+    assert_eq!(destination.generation, source.generation);
+    let old_manifest = format!(
+        "{}/manifest-00001.avro",
+        default_table_metadata_dir_path(&source_namespace, &source_table)
+    );
+    assert_eq!(
+        table_maintenance_object_kind_for_entry(&destination, None, &old_manifest),
+        Some(TableMetadataMaintenanceObjectKind::ManifestFile)
+    );
+    let resource = store
+        .resolve_table_data_plane_resource(bucket, "tables/table-id/data/part.parquet")
+        .await
+        .expect("data-plane lookup should succeed")
+        .expect("renamed table should own its warehouse prefix");
+    assert_eq!(resource.namespace, "curated");
+    assert_eq!(resource.table, "orders_v2");
+
+    let mut replacement = test_table_entry(
+        bucket,
+        &source_namespace,
+        &source_table,
+        default_table_metadata_file_path(&source_namespace, &source_table, "00001-replacement.metadata.json"),
+    );
+    replacement.table_id = "replacement-table-id".to_string();
+    replacement.table_uuid = "replacement-table-uuid".to_string();
+    replacement.warehouse_location = "s3://analytics/tables/replacement-table-id".to_string();
+    store
+        .create_table(replacement.clone())
+        .await
+        .expect("the source identifier should be reusable after rename");
+    let recreated_source = store
+        .load_table(bucket, "sales", "orders")
+        .await
+        .expect("recreated source lookup should succeed")
+        .expect("recreated source should exist");
+    assert_eq!(recreated_source.table_id, replacement.table_id);
+    assert_ne!(recreated_source.table_id, destination.table_id);
+    assert_ne!(recreated_source.table_uuid, destination.table_uuid);
+    assert_ne!(recreated_source.warehouse_location, destination.warehouse_location);
+    assert_ne!(recreated_source.metadata_location, destination.metadata_location);
+
+    let next_metadata_location =
+        table_metadata_file_path_for_entry(&destination, "00002.metadata.json").expect("next metadata path should resolve");
+    backend.seed_object(bucket, &next_metadata_location, b"{}".to_vec()).await;
+    let committed = store
+        .commit_table(TableCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: "curated".to_string(),
+            table: "orders_v2".to_string(),
+            commit_id: "rename-followup-commit".to_string(),
+            idempotency_key: Some("rename-followup-commit".to_string()),
+            operation: "append".to_string(),
+            expected_version_token: destination.version_token,
+            expected_metadata_location: destination.metadata_location,
+            new_metadata_location: next_metadata_location.clone(),
+            requirements: Vec::new(),
+            writer: Some("rename-test".to_string()),
+        })
+        .await
+        .expect("renamed table should accept a commit in its stable metadata directory");
+    assert_eq!(committed.table.metadata_location, next_metadata_location);
+
+    let restarted = StrongTableCatalogStore::new(backend);
+    let restarted_source = restarted
+        .load_table(bucket, "sales", "orders")
+        .await
+        .expect("source lookup after restart should succeed")
+        .expect("recreated source should survive restart");
+    assert_eq!(restarted_source.table_id, replacement.table_id);
+    let restarted_destination = restarted
+        .load_table(bucket, "curated", "orders_v2")
+        .await
+        .expect("destination lookup after restart should succeed")
+        .expect("destination should survive restart");
+    assert_eq!(restarted_destination.metadata_location, committed.table.metadata_location);
+    assert_eq!(
+        table_metadata_file_path_for_entry(&restarted_destination, "00003.metadata.json")
+            .expect("stable metadata path should survive restart"),
+        default_table_metadata_file_path(&source_namespace, &source_table, "00003.metadata.json")
+    );
+}
+
+#[tokio::test]
+async fn strong_catalog_table_rename_rejects_missing_and_conflicting_destinations() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend);
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    let destination_table = IdentifierSegment::parse("orders_v2").expect("destination table should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .expect("source namespace should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .expect("destination namespace should be created");
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+        ))
+        .await
+        .expect("source table should be created");
+    let mut existing = test_table_entry(
+        bucket,
+        &destination_namespace,
+        &destination_table,
+        default_table_metadata_file_path(&destination_namespace, &destination_table, "00001.metadata.json"),
+    );
+    existing.table_id = "destination-table-id".to_string();
+    existing.table_uuid = "destination-table-uuid".to_string();
+    existing.warehouse_location = "s3://analytics/tables/destination-table-id".to_string();
+    store
+        .create_table(existing)
+        .await
+        .expect("destination table should be created");
+
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::AlreadyExists(_))
+    );
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "missing", "orders_v3").await,
+        Err(TableCatalogStoreError::NamespaceNotFound(_))
+    );
+    assert_matches!(
+        store.rename_table(bucket, "sales", "missing", "curated", "orders_v3").await,
+        Err(TableCatalogStoreError::TableNotFound(_))
+    );
+
+    let destination_view = IdentifierSegment::parse("orders_view").expect("view should parse");
+    store
+        .create_view(test_view_entry(
+            bucket,
+            &destination_namespace,
+            &destination_view,
+            default_view_metadata_file_path(&destination_namespace, &destination_view, "00001.metadata.json"),
+        ))
+        .await
+        .expect("destination view should be created");
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_view").await,
+        Err(TableCatalogStoreError::AlreadyExists(_))
+    );
+    assert!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .expect("source lookup should succeed")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn strong_catalog_table_rename_does_not_publish_failed_snapshot() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .expect("source namespace should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .expect("destination namespace should be created");
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+        ))
+        .await
+        .expect("source table should be created");
+    backend
+        .fail_next_put(
+            RUSTFS_META_BUCKET,
+            &StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+        )
+        .await;
+
+    assert_matches!(
+        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
+        Err(TableCatalogStoreError::Internal(_))
+    );
+    assert!(
+        store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .expect("source lookup should succeed")
+            .is_some()
+    );
+    assert!(
+        store
+            .load_table(bucket, "curated", "orders_v2")
+            .await
+            .expect("destination lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn strong_catalog_table_rename_returns_success_after_committed_snapshot_reload_failure() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = StrongTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let source_namespace = Namespace::parse("sales").expect("source namespace should parse");
+    let destination_namespace = Namespace::parse("curated").expect("destination namespace should parse");
+    let source_table = IdentifierSegment::parse("orders").expect("source table should parse");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &source_namespace))
+        .await
+        .expect("source namespace should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination_namespace))
+        .await
+        .expect("destination namespace should be created");
+    store
+        .create_table(test_table_entry(
+            bucket,
+            &source_namespace,
+            &source_table,
+            default_table_metadata_file_path(&source_namespace, &source_table, "00001.metadata.json"),
+        ))
+        .await
+        .expect("source table should be created");
+    backend
+        .fail_next_read(
+            RUSTFS_META_BUCKET,
+            &StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path(),
+        )
+        .await;
+
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("durably committed rename should succeed despite local reload failure");
+    assert!(!store.is_hydrated_for_test().await);
+    assert!(
+        store
+            .load_table(bucket, "curated", "orders_v2")
+            .await
+            .expect("destination lookup should reload durable state")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn configured_object_catalog_rejects_table_rename() {
+    let store =
+        ConfiguredTableCatalogStore::new_for_test(TestCatalogObjectBackend::default(), TableCatalogBackingMode::ObjectBacked);
+
+    assert_matches!(
+        store
+            .rename_table("analytics", "sales", "orders", "curated", "orders_v2")
+            .await,
+        Err(TableCatalogStoreError::Unsupported(_))
     );
 }

@@ -859,24 +859,14 @@ fn max_partition_field_id(value: &serde_json::Value) -> i64 {
 pub(crate) struct TableSnapshotGraphValidationContext<'a, B> {
     backend: &'a B,
     table_bucket: &'a str,
-    namespace: &'a Namespace,
-    table: &'a IdentifierSegment,
     entry: &'a TableEntry,
 }
 
 impl<'a, B> TableSnapshotGraphValidationContext<'a, B> {
-    pub(crate) fn new(
-        backend: &'a B,
-        table_bucket: &'a str,
-        namespace: &'a Namespace,
-        table: &'a IdentifierSegment,
-        entry: &'a TableEntry,
-    ) -> Self {
+    pub(crate) fn new(backend: &'a B, table_bucket: &'a str, entry: &'a TableEntry) -> Self {
         Self {
             backend,
             table_bucket,
-            namespace,
-            table,
             entry,
         }
     }
@@ -1440,9 +1430,8 @@ fn snapshot_graph_object_key<B>(
     let object_key = table_catalog_object_key_from_location(context.table_bucket, location)
         .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot object location is invalid".to_string()))?;
     let warehouse_object_prefix = table_warehouse_object_prefix(context.entry)?;
-    let object_kind =
-        table_maintenance_object_kind(context.namespace, context.table, Some(&warehouse_object_prefix), &object_key)
-            .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot object is outside the table warehouse".to_string()))?;
+    let object_kind = table_maintenance_object_kind_for_entry(context.entry, Some(&warehouse_object_prefix), &object_key)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot object is outside the table warehouse".to_string()))?;
     if !table_maintenance_object_kind_matches_reference(&object_kind, &expected_kind) {
         return Err(TableCatalogStoreError::Invalid(
             "snapshot object kind does not match manifest metadata".to_string(),

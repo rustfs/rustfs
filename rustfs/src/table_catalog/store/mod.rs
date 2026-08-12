@@ -224,6 +224,20 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>>;
 
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let _ = (table_bucket, source_namespace, source_table, destination_namespace, destination_table);
+        Err(TableCatalogStoreError::Unsupported(
+            "table rename is not supported by this catalog store".to_string(),
+        ))
+    }
+
     async fn resolve_table_data_plane_resource(
         &self,
         table_bucket: &str,
@@ -1089,6 +1103,26 @@ where
         match self {
             Self::ObjectBacked(store) => store.load_table(table_bucket, namespace, table).await,
             Self::DurableStrong(store) => store.load_table(table_bucket, namespace, table).await,
+        }
+    }
+
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "table rename requires durable-strong catalog backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
+                    .await
+            }
         }
     }
 

@@ -80,6 +80,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&DROP_NAMESPACE_HANDLER),
     )?;
     r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/tables/rename").as_str(),
+        AdminOperation(&RENAME_TABLE_HANDLER),
+    )?;
+    r.insert(
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables").as_str(),
         AdminOperation(&LIST_TABLES_HANDLER),
