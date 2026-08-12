@@ -1062,7 +1062,8 @@ impl SetDisks {
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
-        let (mut shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+        let (mut shuffle_disks, mut parts_metadatas) =
+            Self::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts_metadata, &fi);
 
         let tmp_dir = Uuid::new_v4().to_string();
 
