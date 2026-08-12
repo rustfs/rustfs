@@ -32,14 +32,14 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rustfs_kms::backends::BackendCapabilities;
 use rustfs_kms::{
-    CreateKeyRequest, KeyUsage, KmsConfig, KmsError, KmsManager, KmsServiceManager, KmsServiceStatus, ObjectEncryptionService,
-    Result,
+    CreateKeyRequest, DeleteKeyRequest, KeyUsage, KmsConfig, KmsError, KmsManager, KmsServiceManager, KmsServiceStatus,
+    ObjectEncryptionService, Result,
 };
 use tempfile::TempDir;
 
@@ -126,6 +126,12 @@ pub struct TestKms {
     manager: Arc<KmsServiceManager>,
     kind: BackendKind,
     config: KmsConfig,
+    /// Ids of the keys [`TestKms::create_key`] created, so a run against a
+    /// persistent Vault can remove them afterwards instead of accumulating
+    /// `behavior-*` keys forever (rustfs/backlog#1774). Shared through an Arc
+    /// because the harness instance is consumed by the spec while the cleanup
+    /// runs after it.
+    created_keys: Arc<Mutex<Vec<String>>>,
     /// Held for the harness lifetime so the local key directory outlives a
     /// simulated process restart.
     _dir: Option<TempDir>,
@@ -147,6 +153,7 @@ impl TestKms {
             manager,
             kind: BackendKind::Local,
             config,
+            created_keys: Arc::new(Mutex::new(Vec::new())),
             _dir: Some(dir),
         }
     }
@@ -166,6 +173,7 @@ impl TestKms {
             manager,
             kind: BackendKind::VaultKv2,
             config,
+            created_keys: Arc::new(Mutex::new(Vec::new())),
             _dir: None,
         }
     }
@@ -180,6 +188,7 @@ impl TestKms {
             manager,
             kind: BackendKind::VaultTransit,
             config,
+            created_keys: Arc::new(Mutex::new(Vec::new())),
             _dir: None,
         }
     }
@@ -192,6 +201,7 @@ impl TestKms {
             manager,
             kind: BackendKind::Static,
             config,
+            created_keys: Arc::new(Mutex::new(Vec::new())),
             _dir: None,
         }
     }
@@ -253,7 +263,74 @@ impl TestKms {
             .await
             .unwrap_or_else(|error| panic!("create_key({name}) should succeed on {}: {error:?}", self.kind.name()));
         assert_eq!(response.key_id, name, "created key id must be the requested name");
+        self.created_keys
+            .lock()
+            .expect("created-keys lock")
+            .push(response.key_id.clone());
         response.key_id
+    }
+
+    /// Handle to the ids [`Self::create_key`] recorded, for cleanup that runs
+    /// after a spec consumed the harness instance.
+    pub fn created_keys_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.created_keys)
+    }
+
+    /// Remove this instance's recorded Vault keys; see [`cleanup_vault_keys`].
+    pub async fn cleanup(&self) {
+        cleanup_vault_keys(self.kind, &self.config, self.created_keys_handle()).await;
+    }
+}
+
+/// Best-effort removal of the Vault keys a harness instance created, so a
+/// persistent dev Vault does not accumulate `behavior-*` keys across runs
+/// (rustfs/backlog#1774). A no-op for the Local and Static backends, whose
+/// state dies with the per-test temp directory.
+///
+/// The deletion runs on a fresh manager over the same configuration — the
+/// case's own manager is consumed by the spec and may have been stopped by a
+/// restart scenario — with the immediate-deletion gate enabled on the cleanup
+/// configuration only, so the configuration under test keeps the gate at its
+/// production default and specs asserting the gate's refusal stay honest.
+///
+/// Failures are reported but never panic: cleanup runs after the spec's own
+/// assertions, and a Vault hiccup here must not turn a green behavior run red.
+pub async fn cleanup_vault_keys(kind: BackendKind, config: &KmsConfig, created_keys: Arc<Mutex<Vec<String>>>) {
+    if !kind.is_vault() {
+        return;
+    }
+    let key_ids: Vec<String> = created_keys.lock().expect("created-keys lock").drain(..).collect();
+    if key_ids.is_empty() {
+        return;
+    }
+    let config = config.clone().with_immediate_deletion_allowed();
+    let manager = start_manager(&config).await;
+    let kms = manager.get_manager().await.expect("KMS manager should be running");
+    for key_id in key_ids {
+        // The Transit backend deletes in two steps (first call parks the key in
+        // PendingDeletion, the next call destroys it); KV2 destroys on the
+        // first call and reports KeyNotFound on the second.
+        for _ in 0..2 {
+            match kms
+                .delete_key(DeleteKeyRequest {
+                    key_id: key_id.clone(),
+                    pending_window_in_days: None,
+                    force_immediate: Some(true),
+                    confirm_key_id: Some(key_id.clone()),
+                })
+                .await
+            {
+                Ok(_) => continue,
+                Err(KmsError::KeyNotFound { .. }) => break,
+                Err(error) => {
+                    eprintln!("vault key cleanup: could not delete {key_id}: {error:?}");
+                    break;
+                }
+            }
+        }
+    }
+    if let Err(error) = manager.stop().await {
+        eprintln!("vault key cleanup: could not stop the cleanup manager: {error:?}");
     }
 }
 
@@ -332,7 +409,12 @@ where
         .chain(live_vault_backends());
     for kind in kinds {
         let case = BackendCase::new(kind).await;
+        // Captured before the spec consumes the case; keys the spec creates
+        // through the harness afterwards still land in the shared list.
+        let config = case.kms.config().clone();
+        let created_keys = case.kms.created_keys_handle();
         spec(case).await;
+        cleanup_vault_keys(kind, &config, created_keys).await;
     }
 }
 
