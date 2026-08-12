@@ -30,6 +30,11 @@ use rustfs_utils::http::headers::{
     AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
     AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
 };
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+};
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
     JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
@@ -57,12 +62,6 @@ const BUSY_MESSAGE: &str = "The service is unavailable. Try again later.";
 const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
 const SLOW_DOWN_MESSAGE: &str = "Reduce your request rate.";
 const UNSUPPORTED_SQL_STRUCTURE_MESSAGE: &str = "We encountered an unsupported SQL structure. Check the SQL Reference.";
-use rustfs_utils::http::object_encryption_keys::{
-    INTERNAL_ENCRYPTION_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
-};
-
 // No canonical owner exists for the KMS key ARN prefix; keep it local.
 const SELECT_KMS_ARN_PREFIX: &str = "arn:aws:kms:";
 
