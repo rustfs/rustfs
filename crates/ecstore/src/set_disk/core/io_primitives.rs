@@ -2222,18 +2222,18 @@ impl SetDisks {
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
         let mut observations = observe.then(|| Vec::with_capacity(disks.len()));
-        let opts = Arc::new(ReadOptions {
+        let opts = ReadOptions {
             incl_free_versions,
             read_data,
             healing,
-        });
-        let org_bucket = Arc::new(org_bucket.to_string());
-        let bucket = Arc::new(bucket.to_string());
-        let object = Arc::new(object.to_string());
-        let version_id = Arc::new(version_id.to_string());
+        };
+        let org_bucket: Arc<str> = Arc::from(org_bucket);
+        let bucket: Arc<str> = Arc::from(bucket);
+        let object: Arc<str> = Arc::from(object);
+        let version_id: Arc<str> = Arc::from(version_id);
         let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
-            let opts = opts.clone();
+            let task_opts = opts;
             let org_bucket = org_bucket.clone();
             let bucket = bucket.clone();
             let object = object.clone();
@@ -2242,7 +2242,8 @@ impl SetDisks {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
-                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
+                        .await
                 } else {
                     Err(DiskError::DiskNotFound)
                 };
@@ -2307,21 +2308,21 @@ impl SetDisks {
         let mut observations = Vec::with_capacity(disks.len());
         let mut accumulator =
             MetadataQuorumAccumulator::new(disks.len(), default_parity_count, true).with_requested_version_id(version_id);
-        let opts = Arc::new(ReadOptions {
+        let opts = ReadOptions {
             incl_free_versions,
             read_data,
             healing,
-        });
-        let org_bucket = Arc::new(org_bucket.to_string());
-        let bucket = Arc::new(bucket.to_string());
-        let object = Arc::new(object.to_string());
-        let version_id = Arc::new(version_id.to_string());
+        };
+        let org_bucket: Arc<str> = Arc::from(org_bucket);
+        let bucket: Arc<str> = Arc::from(bucket);
+        let object: Arc<str> = Arc::from(object);
+        let version_id: Arc<str> = Arc::from(version_id);
         let mut join_set = JoinSet::new();
         let bounded_fanout = is_get_metadata_early_stop_bounded_fanout_enabled();
         let mut next_disk_index = 0usize;
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
-                let opts = opts.clone();
+                let task_opts = opts;
                 let org_bucket = org_bucket.clone();
                 let bucket = bucket.clone();
                 let object = object.clone();
@@ -2332,7 +2333,8 @@ impl SetDisks {
                         Self::record_read_version_call(&object, index);
                         #[cfg(test)]
                         Self::read_version_fanout_barrier(&object, index).await;
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
+                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
+                            .await
                     } else {
                         Err(DiskError::DiskNotFound)
                     };

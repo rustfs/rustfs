@@ -671,7 +671,13 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: &str = "RUSTFS_
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: usize = 512 * 1024;
 
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY";
-const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = false;
+// On by default (rustfs/backlog#1802): a small object whose data shards are
+// inlined in xl.meta is reassembled straight from the already-resolved
+// metadata, skipping the Erasure reconstruct pipeline. The path has a complete
+// fallback — if the inline reassembly returns None, the GET proceeds through
+// the normal shard-read pipeline, so a miss is correctness-neutral. Set to
+// `false` to force the legacy path (kill switch).
+const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = true;
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD";
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 1024;
 
@@ -1614,8 +1620,6 @@ enum GetDirectMemoryFallbackReason {
     Range,
     PartNumber,
     VersionId,
-    Versioned,
-    VersionSuspended,
     InclFreeVersions,
     SkipFreeVersion,
     DataMovement,
@@ -1641,8 +1645,6 @@ impl GetDirectMemoryFallbackReason {
             Self::Range => "range",
             Self::PartNumber => "part_number",
             Self::VersionId => "version_id",
-            Self::Versioned => "versioned",
-            Self::VersionSuspended => "version_suspended",
             Self::InclFreeVersions => "incl_free_versions",
             Self::SkipFreeVersion => "skip_free_version",
             Self::DataMovement => "data_movement",
@@ -1766,12 +1768,11 @@ fn get_small_object_direct_memory_decision_with_threshold(
     if opts.version_id.is_some() {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionId);
     }
-    if opts.versioned {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned);
-    }
-    if opts.version_suspended {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionSuspended);
-    }
+    // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+    // `fi` here is the already-resolved target version, so reassembling its inlined
+    // data shards is correct whether the bucket is versioned or not. This direct-memory
+    // decision still falls back for an explicit versionId (the `version_id` check above);
+    // a delete-marker latest is rejected below.
     if opts.incl_free_versions {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InclFreeVersions);
     }
@@ -8681,9 +8682,11 @@ mod tests {
             128 * 1024
         ));
 
+        // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+        // a latest-version read on a versioned bucket is eligible.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
-        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+        assert!(is_get_small_object_direct_memory_eligible_with_threshold(
             &None,
             &object_info,
             &fi,
@@ -8744,11 +8747,13 @@ mod tests {
             GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Range)
         );
 
+        // Bucket-level versioning no longer falls back (rustfs/backlog#1802): the
+        // latest version on a versioned bucket is served inline like any other.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &versioned_opts, true, 128 * 1024),
-            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned)
+            GetDirectMemoryDecision::Use { object_size: 1024 }
         );
 
         let mut encrypted = object_info.clone();
@@ -8796,8 +8801,6 @@ mod tests {
         assert_eq!(GetDirectMemoryFallbackReason::Range.as_str(), "range");
         assert_eq!(GetDirectMemoryFallbackReason::PartNumber.as_str(), "part_number");
         assert_eq!(GetDirectMemoryFallbackReason::VersionId.as_str(), "version_id");
-        assert_eq!(GetDirectMemoryFallbackReason::Versioned.as_str(), "versioned");
-        assert_eq!(GetDirectMemoryFallbackReason::VersionSuspended.as_str(), "version_suspended");
         assert_eq!(GetDirectMemoryFallbackReason::InclFreeVersions.as_str(), "incl_free_versions");
         assert_eq!(GetDirectMemoryFallbackReason::SkipFreeVersion.as_str(), "skip_free_version");
         assert_eq!(GetDirectMemoryFallbackReason::DataMovement.as_str(), "data_movement");
