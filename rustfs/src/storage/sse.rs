@@ -119,8 +119,14 @@ use rustfs_utils::http::object_encryption_keys::{
     MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
     MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
     MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEC_ORIGINAL_SIZE_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEC_ORIGINAL_SIZE_HEADER, normalize_managed_metadata,
+    stored_managed_encryption_key,
 };
+// The managed-SSE classifier lives in the shared encryption-keys module so the
+// scanner can reuse it (backlog#1643 PR-B0); these re-exports keep the
+// historical `crate::storage::sse` paths compiling.
+pub use rustfs_utils::http::object_encryption_keys::SSEType;
+pub(crate) use rustfs_utils::http::object_encryption_keys::contains_managed_encryption_metadata;
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
 #[cfg(feature = "rio-v2")]
@@ -783,28 +789,6 @@ pub struct DecryptionMaterial {
     pub key_kind: EncryptionKeyKind,
 }
 
-/// Type of encryption used
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SSEType {
-    /// SSE-S3 (AES256)
-    SseS3,
-    /// SSE-KMS (aws:kms)
-    SseKms,
-    /// SSE-C (customer-provided key)
-    SseC,
-}
-
-impl SSEType {
-    /// Stable scheme name for audit consumers.
-    fn audit_label(self) -> &'static str {
-        match self {
-            SSEType::SseS3 => "SSE-S3",
-            SSEType::SseKms => "SSE-KMS",
-            SSEType::SseC => "SSE-C",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionKeyKind {
     Direct,
@@ -1064,28 +1048,6 @@ pub async fn authorize_sse_kms_object_read(
     result
 }
 
-/// Resolve the scheme and KMS key a stored managed-SSE object was wrapped with.
-///
-/// Mirrors the lookup `apply_managed_decryption_material` performs, so both agree on
-/// which key a read is authorized against.
-fn stored_managed_encryption_key(metadata: &HashMap<String, String>) -> Option<(SSEType, String)> {
-    if !contains_managed_encryption_metadata(metadata) {
-        return None;
-    }
-
-    let sse_type = match metadata.get("x-amz-server-side-encryption")?.as_str() {
-        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
-        _ => SSEType::SseS3,
-    };
-    let key_id = normalize_managed_metadata(metadata)
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-
-    Some((sse_type, key_id))
-}
-
 // ============================================================================
 // Data-plane KMS audit attachment (SSE-S3 / SSE-KMS)
 // ============================================================================
@@ -1339,7 +1301,9 @@ fn envelope_master_key_version(envelope_bytes: &[u8]) -> Option<u32> {
 /// Master-key version of the envelope stored on an object, for the audit
 /// summary of a read against that object.
 fn stored_envelope_master_key_version(metadata: &HashMap<String, String>) -> Option<u32> {
-    let encoded = normalize_managed_metadata(metadata);
+    // No context recoder: the recode only ever inserts the context key, which
+    // this lookup never reads, so the normalized result is identical without it.
+    let encoded = normalize_managed_metadata(metadata, None);
     let encoded = encoded.get(INTERNAL_ENCRYPTION_KEY_HEADER)?;
     let envelope = BASE64_STANDARD.decode(encoded).ok()?;
     envelope_master_key_version(&envelope)
@@ -2484,7 +2448,7 @@ async fn apply_managed_decryption_material_inner(
 
     // Safe: presence is guaranteed by the contains_key check above.
     let server_side_encryption = metadata.get("x-amz-server-side-encryption").cloned().unwrap_or_default();
-    let normalized_metadata = normalize_managed_metadata(metadata);
+    let normalized_metadata = normalize_managed_metadata(metadata, Some(recode_minio_kms_context));
 
     let encryption_type = match server_side_encryption.as_str() {
         ServerSideEncryption::AES256 => SSEType::SseS3,
@@ -3226,14 +3190,6 @@ pub fn mark_encrypted_multipart_metadata(metadata: &mut HashMap<String, String>)
     metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
 }
 
-pub(crate) fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
-    metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
-        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
-        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
-        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
-}
-
 #[cfg(feature = "rio-v2")]
 fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool {
     metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
@@ -3279,47 +3235,16 @@ fn parse_minio_managed_sealed_key(
     Ok(Some(ManagedSealedKey { iv, sealed_key }))
 }
 
-fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<String, String> {
-    let mut normalized = metadata.clone();
-
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
-        && let Some(value) = metadata
-            .get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
-            .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
-            .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
-            .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER))
-    {
-        normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
-    }
-
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
-        && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
-    {
-        normalized.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), value.clone());
-    }
-
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_ALGORITHM_HEADER)
-        && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER)
-    {
-        normalized.insert(INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), value.clone());
-    }
-
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)
-    {
-        normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.clone());
-    }
-
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_CONTEXT_HEADER)
-        && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
-        && let Ok(decoded) = BASE64_STANDARD.decode(value)
-        && let Ok(context) = serde_json::from_slice::<HashMap<String, String>>(&decoded)
-        && let Ok(encoded) = serde_json::to_string(&context)
-    {
-        normalized.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
-    }
-
-    normalized
+/// Recodes a stored MinIO KMS context value (base64-wrapped JSON) into the
+/// plain-JSON form RustFS stores under [`INTERNAL_ENCRYPTION_CONTEXT_HEADER`].
+///
+/// Injected into the shared [`normalize_managed_metadata`] because the shared
+/// crate carries no JSON codec; any decode failure returns `None`, which skips
+/// the context mapping exactly like the historical inline `if let Ok` chain.
+fn recode_minio_kms_context(value: &str) -> Option<String> {
+    let decoded = BASE64_STANDARD.decode(value).ok()?;
+    let context = serde_json::from_slice::<HashMap<String, String>>(&decoded).ok()?;
+    serde_json::to_string(&context).ok()
 }
 
 // ============================================================================
@@ -3470,9 +3395,9 @@ mod tests {
         encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
         extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse, kms_operation_error,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64, normalize_managed_metadata,
-        reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption,
-        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        validate_ssec_params, verify_ssec_key_match,
+        recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption,
+        sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
+        validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -3480,6 +3405,38 @@ mod tests {
         SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
     };
     use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
+
+    /// backlog#1643 PR-B0 acceptance guard: the managed-SSE classifier must
+    /// have exactly one definition — in the shared encryption-keys module —
+    /// so the scanner and the S3 layer can never disagree on attribution.
+    /// This module may only re-export or call it.
+    #[test]
+    fn managed_sse_classifier_has_exactly_one_definition() {
+        let classifier_fns = [
+            "contains_managed_encryption_metadata",
+            "normalize_managed_metadata",
+            "stored_managed_encryption_key",
+        ];
+
+        let sse_src = include_str!("sse.rs");
+        let shared_src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/utils/src/http/object_encryption_keys.rs"))
+                .expect("shared encryption-keys module should be readable");
+
+        for name in classifier_fns {
+            // Built at runtime so this test's own source cannot satisfy the scan.
+            let definition = format!("fn {name}(");
+            assert!(
+                !sse_src.contains(&definition),
+                "{name} must not be redefined in storage/sse.rs; call the shared rustfs_utils::http::object_encryption_keys implementation instead"
+            );
+            assert_eq!(
+                shared_src.matches(&definition).count(),
+                1,
+                "{name} must be defined exactly once, in the shared encryption-keys module"
+            );
+        }
+    }
 
     #[test]
     fn anonymous_s3_request_builds_kms_principal() {
@@ -4851,7 +4808,7 @@ mod tests {
             (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
         ]);
 
-        let normalized = normalize_managed_metadata(&metadata);
+        let normalized = normalize_managed_metadata(&metadata, Some(recode_minio_kms_context));
 
         assert_eq!(
             normalized.get(INTERNAL_ENCRYPTION_KEY_HEADER),
