@@ -18,7 +18,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::{PartTransactionAction, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
+use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -212,6 +212,23 @@ fn encode_batch_read_version_response_payloads(
     }
 
     Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
+}
+
+fn decode_rename_data_request_file_info(
+    binary: &[u8],
+    json: &str,
+) -> std::result::Result<DecodedRpcPayload<FileInfo>, DiskError> {
+    decode_msgpack_or_json_with_source(binary, json, "FileInfo")
+}
+
+fn encode_rename_data_response_payloads(
+    rename_data_resp: &RenameDataResp,
+    request_decoded_from_msgpack: bool,
+) -> std::result::Result<(String, Vec<u8>), DiskError> {
+    let rename_data_resp_json = compat_response_json(rename_data_resp, request_decoded_from_msgpack)
+        .map_err(|err| DiskError::other(format!("encode RenameDataResp json failed: {err}")))?;
+    let rename_data_resp_bin = encode_msgpack_named(rename_data_resp, "RenameDataResp")?;
+    Ok((rename_data_resp_json, rename_data_resp_bin))
 }
 
 impl NodeService {
@@ -992,7 +1009,7 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
+            let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(RenameDataResponse {
@@ -1003,31 +1020,30 @@ impl NodeService {
                     }));
                 }
             };
+            let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
             match disk
-                .rename_data(&request.src_volume, &request.src_path, file_info, &request.dst_volume, &request.dst_path)
+                .rename_data(
+                    &request.src_volume,
+                    &request.src_path,
+                    decoded_file_info.value,
+                    &request.dst_volume,
+                    &request.dst_path,
+                )
                 .await
             {
                 Ok(rename_data_resp) => {
-                    let rename_data_resp_json = compat_response_json(&rename_data_resp, false);
-                    let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
-                    match (rename_data_resp_json, rename_data_resp_bin) {
-                        (Ok(rename_data_resp), Ok(rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                    match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
+                        Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
                             success: true,
                             rename_data_resp,
                             rename_data_resp_bin: rename_data_resp_bin.into(),
                             error: None,
                         })),
-                        (Err(err), _) => Ok(Response::new(RenameDataResponse {
+                        Err(err) => Ok(Response::new(RenameDataResponse {
                             success: false,
                             rename_data_resp: String::new(),
                             rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
-                        (_, Err(err)) => Ok(Response::new(RenameDataResponse {
-                            success: false,
-                            rename_data_resp: String::new(),
-                            rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            error: Some(err.into()),
                         })),
                     }
                 }
@@ -1476,12 +1492,14 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_msgpack_named, encode_read_multiple_response_payloads, snapshot_lease_disabled_response,
+        compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
+        encode_batch_read_version_response_payloads, encode_file_info_msgpack, encode_msgpack, encode_msgpack_named,
+        encode_read_multiple_response_payloads, encode_rename_data_response_payloads, snapshot_lease_disabled_response,
     };
-    use crate::storage::storage_api::DiskError;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
+    use crate::storage::storage_api::{DiskError, RenameDataResp};
+    use rustfs_filemeta::FileInfo;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use serde::{Deserialize, Serialize};
 
@@ -1656,6 +1674,48 @@ mod tests {
 
                 assert!(!json.is_empty(), "legacy JSON-only callers must keep receiving response JSON");
                 assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            },
+        );
+    }
+
+    #[test]
+    fn rename_data_response_payloads_follow_successful_request_codec() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let response = RenameDataResp::default();
+                let file_info = FileInfo::default();
+                let legacy_file_info_json = serde_json::to_string(&file_info).expect("FileInfo JSON should encode");
+                let legacy_request = decode_rename_data_request_file_info(&[], &legacy_file_info_json)
+                    .expect("legacy FileInfo JSON should decode");
+
+                let (legacy_json, legacy_bin) = encode_rename_data_response_payloads(&response, legacy_request.from_msgpack)
+                    .expect("legacy response payloads should encode");
+                assert!(!legacy_json.is_empty(), "JSON-only requests must retain response JSON");
+                assert!(!legacy_bin.is_empty(), "all callers must receive response msgpack");
+
+                let file_info_bin = encode_file_info_msgpack(&file_info).expect("FileInfo msgpack should encode");
+                let msgpack_request = decode_rename_data_request_file_info(&file_info_bin, &legacy_file_info_json)
+                    .expect("FileInfo msgpack should decode");
+                let (msgpack_json, msgpack_bin) = encode_rename_data_response_payloads(&response, msgpack_request.from_msgpack)
+                    .expect("msgpack response payloads should encode");
+                assert!(msgpack_json.is_empty(), "successfully decoded msgpack requests may omit response JSON");
+                let decoded: RenameDataResp =
+                    rmp_serde::from_slice(&msgpack_bin).expect("response msgpack should remain decodable");
+                assert_eq!(decoded.old_data_dir, response.old_data_dir);
+                assert_eq!(decoded.rollback_data_dir, response.rollback_data_dir);
+                assert_eq!(decoded.cleanup_data_dir, response.cleanup_data_dir);
+                assert_eq!(decoded.sign, response.sign);
+                assert_eq!(decoded.old_current_size, response.old_current_size);
+
+                let error = match decode_rename_data_request_file_info(b"not-msgpack", &legacy_file_info_json) {
+                    Ok(_) => panic!("malformed request msgpack must fail closed before response negotiation"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("decode FileInfo msgpack failed"), "unexpected error: {error}");
             },
         );
     }

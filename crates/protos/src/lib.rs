@@ -2513,7 +2513,7 @@ mod tests {
                 json_field: "rename_data_resp",
                 bin_field: "rename_data_resp_bin",
             },
-            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp, false);",
+            json_encoder: "let rename_data_resp_json = compat_response_json(rename_data_resp, request_decoded_from_msgpack)",
         },
     ];
 
