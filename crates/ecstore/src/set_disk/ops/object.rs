@@ -1110,53 +1110,78 @@ impl SetDisks {
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
+            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
+            let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
+            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
-            let writer_futs: Vec<_> = shuffle_disks
-                .iter()
-                .map(|disk_op| {
-                    let tmp_obj = tmp_object.clone();
-                    async move {
-                        if let Some(disk) = disk_op
-                            && disk.is_online().await
-                        {
-                            match create_bitrot_writer(
-                                is_inline_buffer,
-                                Some(disk),
-                                RUSTFS_META_TMP_BUCKET,
-                                &tmp_obj,
-                                shard_file_size,
-                                shard_size,
-                                HashAlgorithm::HighwayHash256S,
-                            )
-                            .await
-                            {
-                                Ok(writer) => (Some(writer), None),
-                                Err(err) => {
-                                    warn!(
-                                        event = EVENT_SET_DISK_WRITE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                        disk = ?disk,
-                                        state = "bitrot_writer_skipped",
-                                        error = ?err,
-                                        "Set disk bitrot writer skipped"
-                                    );
-                                    (None, Some(err))
-                                }
-                            }
-                        } else {
-                            (None, Some(DiskError::DiskNotFound))
-                        }
+            let (mut writers, errors) = if direct_inline_commit {
+                let online = join_all(shuffle_disks.iter().map(|disk| async move {
+                    if let Some(disk) = disk {
+                        disk.is_online().await
+                    } else {
+                        false
                     }
-                })
-                .collect();
-            let writer_results = join_all(writer_futs).await;
-            let mut writers = Vec::with_capacity(writer_results.len());
-            let mut errors = Vec::with_capacity(writer_results.len());
-            for (w, e) in writer_results {
-                writers.push(w);
-                errors.push(e);
-            }
+                }))
+                .await;
+                let mut errors = Vec::with_capacity(online.len());
+                for (disk, is_online) in shuffle_disks.iter_mut().zip(online) {
+                    if is_online {
+                        errors.push(None);
+                    } else {
+                        *disk = None;
+                        errors.push(Some(DiskError::DiskNotFound));
+                    }
+                }
+                (std::iter::repeat_with(|| None).take(shuffle_disks.len()).collect(), errors)
+            } else {
+                let writer_futs: Vec<_> = shuffle_disks
+                    .iter()
+                    .map(|disk_op| {
+                        let tmp_obj = tmp_object.clone();
+                        async move {
+                            if let Some(disk) = disk_op
+                                && disk.is_online().await
+                            {
+                                match create_bitrot_writer(
+                                    is_inline_buffer,
+                                    Some(disk),
+                                    RUSTFS_META_TMP_BUCKET,
+                                    &tmp_obj,
+                                    shard_file_size,
+                                    shard_size,
+                                    HashAlgorithm::HighwayHash256S,
+                                )
+                                .await
+                                {
+                                    Ok(writer) => (Some(writer), None),
+                                    Err(err) => {
+                                        warn!(
+                                            event = EVENT_SET_DISK_WRITE,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                            disk = ?disk,
+                                            state = "bitrot_writer_skipped",
+                                            error = ?err,
+                                            "Set disk bitrot writer skipped"
+                                        );
+                                        (None, Some(err))
+                                    }
+                                }
+                            } else {
+                                (None, Some(DiskError::DiskNotFound))
+                            }
+                        }
+                    })
+                    .collect();
+                let writer_results = join_all(writer_futs).await;
+                let mut writers = Vec::with_capacity(writer_results.len());
+                let mut errors = Vec::with_capacity(writer_results.len());
+                for (writer, error) in writer_results {
+                    writers.push(writer);
+                    errors.push(error);
+                }
+                (writers, errors)
+            };
             let writer_setup_elapsed = writer_setup_stage_start.map(|stage_start| stage_start.elapsed());
             let writer_setup_ms = writer_setup_elapsed
                 .map(|elapsed| elapsed.as_millis() as u64)
@@ -1194,8 +1219,6 @@ impl SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
-            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
                 usize::try_from(put_object_size).map_err(Error::other)?
             } else {
@@ -1203,12 +1226,16 @@ impl SetDisks {
             };
 
             let encode_stage_start = collect_stage_timing.then(Instant::now);
+            let mut inline_shards = None;
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
+                    .encode_inline_shards_with_size_hint(stream, small_size_hint)
                     .await
                 {
-                    Ok((r, w)) => (r, w),
+                    Ok((r, w, shards)) => {
+                        inline_shards = Some(shards);
+                        (r, w)
+                    }
                     Err(e) => {
                         error!("encode_inline_small err {:?}", e);
                         return Err(e.into());
@@ -1331,7 +1358,11 @@ impl SetDisks {
             // drop it below reconstructable quorum (backlog#852 / #799 B3).
             // `rename_data` re-checks write quorum over the surviving disks and
             // rolls back if too few remain.
-            let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+            let committed_shards = if matches!(write_path, SmallWritePath::Inline) {
+                shuffle_disks.iter().filter(|disk| disk.is_some()).count()
+            } else {
+                drop_failed_writer_disks(&mut shuffle_disks, &writers)
+            };
             if committed_shards < write_quorum {
                 return Err(Error::other(format!(
                     "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
@@ -1366,7 +1397,14 @@ impl SetDisks {
                     base_file_info.clone()
                 };
                 if is_inline_buffer {
-                    if let Some(writer) = writers[i].take() {
+                    if let Some(shards) = inline_shards.as_ref() {
+                        pfi.data = Some(
+                            shards
+                                .get(i)
+                                .cloned()
+                                .ok_or_else(|| Error::other(format!("inline encoder omitted disk shard {i}")))?,
+                        );
+                    } else if let Some(writer) = writers[i].take() {
                         pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
                     }
 
@@ -5618,6 +5656,160 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         .await;
 
         (temp_dirs, disk_stores, set_disks)
+    }
+}
+
+#[cfg(test)]
+mod inline_put_commit_path_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use tokio::io::AsyncReadExt;
+
+    async fn make_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_put_direct_commit_round_trips_verified_bitrot_shards() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-commit";
+        let object = "object.bin";
+        let payload: Vec<u8> = (0..16 * 1024).map(|index| (index % 251) as u8).collect();
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("inline PUT should commit");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist inline metadata: {err}"));
+            assert!(file_info.inline_data(), "disk {disk_index} should mark the shard inline");
+            let inline_data = file_info
+                .data
+                .as_ref()
+                .unwrap_or_else(|| panic!("disk {disk_index} should persist inline bitrot bytes"));
+            let erasure = erasure_from_file_info(&file_info, false).expect("persisted erasure layout should be valid");
+            let logical_shard_size =
+                usize::try_from(erasure.shard_file_size(payload.len() as i64)).expect("logical shard size should fit usize");
+            coding::bitrot_verify(
+                Cursor::new(inline_data.clone()),
+                inline_data.len(),
+                logical_shard_size,
+                HashAlgorithm::HighwayHash256S,
+                erasure.shard_size(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("disk {disk_index} inline shard should pass bitrot verification: {err}"));
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed inline object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("inline object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-quorum";
+        let exact_quorum_object = "exact-quorum.bin";
+        let below_quorum_object = "below-quorum.bin";
+        make_bucket(&disk_stores, bucket).await;
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[3] = None;
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![0x5a; 4 * 1024]);
+        set_disks
+            .put_object(bucket, exact_quorum_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("three online disks should satisfy the four-disk write quorum");
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let persisted = disk
+                .read_version("", bucket, exact_quorum_object, "", &ReadOptions::default())
+                .await;
+            assert_eq!(
+                persisted.is_ok(),
+                disk_index < 3,
+                "exact-quorum commit should publish only on the three online disks"
+            );
+        }
+
+        set_disks.disks.write().await[2] = None;
+        let mut reader = PutObjReader::from_vec(vec![0xa5; 4 * 1024]);
+        set_disks
+            .put_object(bucket, below_quorum_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("two online disks are one below the four-disk write quorum");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            assert!(
+                disk.read_version("", bucket, below_quorum_object, "", &ReadOptions::default())
+                    .await
+                    .is_err(),
+                "disk {disk_index} must not expose an object after pre-commit quorum failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_length_put_keeps_existing_pipeline_layout_and_round_trips() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "zero-length-put";
+        let object = "empty.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(Vec::new());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("zero-length PUT should commit through the existing pipeline");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist empty-object metadata: {err}"));
+            assert_eq!(file_info.size, 0);
+            assert_eq!(file_info.data.as_deref(), Some(&[][..]));
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("empty object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("empty object should stream");
+        assert!(restored.is_empty());
     }
 }
 
