@@ -29,9 +29,7 @@ fn main() {
     // 3. Access tracking example
     access_tracker_example();
 
-    // 4. Unified configuration example
-
-    // 5. Metrics recording example
+    // 4. Metrics recording example
     metrics_recording_example();
 }
 
