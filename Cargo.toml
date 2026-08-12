@@ -41,7 +41,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
-    "crates/rio-v2", # Next-generation Rust I/O compatibility layer
+    "crates/rio-v2", # MinIO on-disk format compatibility I/O layer (feature-gated, ships in no default build)
     "crates/replication", # Replication contracts and wire formats
     "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-types", # S3 event type definitions

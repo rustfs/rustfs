@@ -101,7 +101,10 @@ refactors.
 
 The `rustfs` binary crate composes these libraries into the running server.
 `ecstore` remains the storage engine at the architectural center; its internal
-module split is tracked under `docs/architecture/`.
+module split is tracked under `docs/architecture/`. `rio-v2` is the
+feature-gated MinIO on-disk format compatibility I/O layer; it ships in no
+default build (lifecycle:
+[docs/architecture/minio-file-format-compat.md](docs/architecture/minio-file-format-compat.md)).
 
 ## Architecture Invariants
 
