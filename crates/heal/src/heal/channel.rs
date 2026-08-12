@@ -1778,9 +1778,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_cancel_request_treats_unknown_path_as_stopped() {
+    async fn test_process_cancel_request_cancels_cluster_task_for_legacy_root_path() {
         let heal_manager = create_test_heal_manager();
-        let processor = HealChannelProcessor::new(heal_manager);
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_task_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_task_id = bucket_request.id.clone();
+        heal_manager
+            .submit_heal_request(cluster_request)
+            .await
+            .expect("cluster request should be accepted");
+        heal_manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager.clone());
         let (tx, rx) = oneshot::channel();
 
         processor
@@ -1794,6 +1807,38 @@ mod tests {
             .expect("cancel response should be returned");
         assert!(response.success);
         assert_eq!(response.request_id, ".");
+        assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
+        assert!(response.error.is_none());
+        assert!(matches!(
+            heal_manager.get_task_status(&cluster_task_id).await,
+            Err(crate::Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            heal_manager
+                .get_task_status(&bucket_task_id)
+                .await
+                .expect("bucket request should not match the root path"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_treats_unknown_path_as_stopped() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request("missing".to_string(), String::new(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, "missing");
         assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
         assert!(response.error.is_none());
     }
