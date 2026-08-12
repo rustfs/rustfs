@@ -71,6 +71,28 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
+pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
+
+pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = Vec::with_capacity(bucket.len() + object.len() + 1);
+    input.extend_from_slice(bucket.as_bytes());
+    input.push(0);
+    input.extend_from_slice(object.as_bytes());
+    let digest = Sha256::digest(input);
+    format!(
+        "{QUOTA_MUTATION_FENCE_PREFIX}{}",
+        hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
+    )
+}
+
+pub(crate) fn is_quota_mutation_fence_path(path: &str) -> bool {
+    path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 pub type DiskStore = Arc<Disk>;
 
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
@@ -94,6 +116,20 @@ impl SnapshotLeaseToken {
 
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[doc(hidden)]
+    pub fn revoke_all() -> Self {
+        Self(Uuid::nil())
+    }
+
+    #[doc(hidden)]
+    pub fn is_revoke_all(self) -> bool {
+        self.0.is_nil()
     }
 }
 

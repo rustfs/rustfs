@@ -40,6 +40,7 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::bucket::quota::reservation;
 use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, VersionPurgeStatusType, replication_state_to_filemeta, version_purge_status_to_filemeta,
 };
@@ -1495,9 +1496,215 @@ impl SetDisks {
                 });
             }
 
+            let quota_context =
+                reservation::begin(&self.ctx, bucket, object, opts.quota_admission, self.pool_index, self.set_index).await?;
+            let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
+            let mut replication_quota_size = None;
+
+            if opts.replication_request {
+                if quota_context.is_enforced() && opts.preserve_ciphertext {
+                    return Err(Error::PartMissingOrCorrupt);
+                }
+                if quota_context.is_enforced() {
+                    let observed_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                    let physical_size = u64::try_from(w_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                    let transformed = contains_key_str(&user_defined, SUFFIX_COMPRESSION)
+                        || parts_metadatas
+                            .first()
+                            .is_some_and(|metadata| should_persist_encryption_original_size(&metadata.metadata));
+                    let declared_size = get_str(&user_defined, SUFFIX_ACTUAL_SIZE)
+                        .map(|value| value.parse::<u64>().map_err(|_| Error::PartMissingOrCorrupt))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let declared_encryption_size = rustfs_utils::http::get_object_encryption_original_size(&user_defined)
+                        .map_err(Error::other)?
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| Error::PartMissingOrCorrupt)?
+                        .unwrap_or(0);
+                    let logical_size = observed_size.max(declared_size).max(declared_encryption_size);
+                    let persisted_size = if transformed {
+                        logical_size
+                    } else {
+                        logical_size.max(physical_size)
+                    };
+                    replication_quota_size = Some(logical_size.max(physical_size));
+                    actual_size = i64::try_from(persisted_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                    for metadata in &mut parts_metadatas {
+                        insert_str(&mut metadata.metadata, SUFFIX_ACTUAL_SIZE, persisted_size.to_string());
+                        if should_persist_encryption_original_size(&metadata.metadata) {
+                            metadata
+                                .metadata
+                                .insert("x-rustfs-encryption-original-size".to_string(), persisted_size.to_string());
+                        }
+                        if let Some(part) = metadata.parts.first_mut() {
+                            part.actual_size = actual_size;
+                        }
+                    }
+                }
+            } else if actual_size >= 0 {
+                let observed_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                let transformed = contains_key_str(&user_defined, SUFFIX_COMPRESSION)
+                    || parts_metadatas
+                        .first()
+                        .is_some_and(|metadata| should_persist_encryption_original_size(&metadata.metadata));
+                let server_observed_size = if transformed {
+                    observed_size
+                } else {
+                    observed_size.max(u64::try_from(w_size).map_err(|_| Error::PartMissingOrCorrupt)?)
+                };
+                actual_size = i64::try_from(server_observed_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                for metadata in &mut parts_metadatas {
+                    insert_str(&mut metadata.metadata, SUFFIX_ACTUAL_SIZE, server_observed_size.to_string());
+                    if should_persist_encryption_original_size(&metadata.metadata) {
+                        metadata
+                            .metadata
+                            .insert("x-rustfs-encryption-original-size".to_string(), server_observed_size.to_string());
+                    }
+                    if let Some(part) = metadata.parts.first_mut() {
+                        part.actual_size = actual_size;
+                    }
+                }
+            }
+
+            let (quota_old_size, quota_new_size) = if quota_context.is_enforced() {
+                let new_size = match replication_quota_size {
+                    Some(size) => size,
+                    None => u64::try_from(actual_size)
+                        .map_err(|_| Error::PartMissingOrCorrupt)?
+                        .max(u64::try_from(w_size).map_err(|_| Error::PartMissingOrCorrupt)?),
+                };
+                (reservation::replaced_logical_size(self, bucket, object, opts).await?, new_size)
+            } else {
+                (0, 0)
+            };
+            let mut quota_reservation = quota_context.reserve(quota_old_size, quota_new_size).await?;
+            let (commit_disks, quota_fence_tokens) = if quota_mutation_fence {
+                match Self::prepare_quota_mutation_fences(&shuffle_disks, bucket, object, write_quorum).await {
+                    Ok((disks, tokens)) => {
+                        for (metadata, token) in parts_metadatas.iter_mut().zip(tokens.iter().copied()) {
+                            if let Some(token) = token {
+                                insert_str(
+                                    &mut metadata.metadata,
+                                    crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                                    token.as_uuid().to_string(),
+                                );
+                            }
+                        }
+                        (disks, tokens)
+                    }
+                    Err(err) => {
+                        quota_reservation.abort().await;
+                        return Err(err);
+                    }
+                }
+            } else {
+                (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+            };
+            if quota_reservation.is_lock_lost()
+                || !quota_reservation.capability_proof_matches()
+                || object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || opts
+                    .namespace_lock_fence
+                    .as_ref()
+                    .is_some_and(NamespaceLockFence::is_lock_lost)
+                || opts
+                    .bucket_lifecycle_lock_fence
+                    .as_ref()
+                    .is_some_and(NamespaceLockFence::is_lock_lost)
+                || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
+                Self::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    bucket,
+                    object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "quota_reservation",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+            if let Err(err) = self
+                .require_current_restore_operation_id(
+                    bucket,
+                    object,
+                    opts,
+                    expected_restore_operation_id,
+                    "put_object_quota_reservation",
+                )
+                .await
+            {
+                Self::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    bucket,
+                    object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                return Err(err);
+            }
+
             let rename_stage_start = Instant::now();
-            let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
-                &shuffle_disks,
+            #[cfg(any(test, feature = "test-util"))]
+            pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterQuotaReservation).await;
+            if let Err(err) = quota_reservation.mark_commit_started().await {
+                Self::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    bucket,
+                    object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                return Err(err);
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeQuotaRename).await;
+            if quota_reservation.is_lock_lost()
+                || object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || opts
+                    .namespace_lock_fence
+                    .as_ref()
+                    .is_some_and(NamespaceLockFence::is_lock_lost)
+                || opts
+                    .bucket_lifecycle_lock_fence
+                    .as_ref()
+                    .is_some_and(NamespaceLockFence::is_lock_lost)
+                || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
+                Self::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    bucket,
+                    object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "quota_reservation",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+            let rename_result = Self::rename_data(
+                &commit_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
                 &parts_metadatas,
@@ -1505,7 +1712,18 @@ impl SetDisks {
                 object,
                 write_quorum,
             )
-            .await?;
+            .await;
+            if quota_mutation_fence {
+                let _ =
+                    Self::release_quota_mutation_fences(&commit_disks, &quota_fence_tokens, bucket, object, write_quorum).await;
+            }
+            if rename_result.is_ok() {
+                quota_reservation.commit().await;
+            }
+            let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = match rename_result {
+                Ok(result) => result,
+                Err(err) => return Err(err.into()),
+            };
             // Do this before any post-commit await so request cancellation cannot
             // bypass best-effort admission. A process crash before admission
             // remains subject to the existing scanner reconciliation path.
@@ -2636,6 +2854,8 @@ fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: boo
 pub enum PutObjectCommitPause {
     BeforeNamespace,
     AfterNamespace,
+    AfterQuotaReservation,
+    BeforeQuotaRename,
     BeforeMetadata,
 }
 
@@ -5565,6 +5785,124 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         .await;
 
         (temp_dirs, disk_stores, set_disks)
+    }
+}
+
+#[cfg(test)]
+mod replication_quota_safety_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn replication_put_quota_uses_physical_bytes_as_a_safety_floor() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "replication-put-quota-safety";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, "1".to_string());
+        let payload = vec![0x61; 4096];
+
+        let mut denied_opts = ObjectOptions {
+            replication_request: true,
+            user_defined: user_defined.clone(),
+            ..Default::default()
+        };
+        assert!(denied_opts.set_quota_admission(0, 4095));
+        let mut denied_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload.clone()), 4096, 1, None, None, false)
+                .expect("construct forged replication reader"),
+        );
+        let err = set_disks
+            .put_object(bucket, "object", &mut denied_reader, &denied_opts)
+            .await
+            .expect_err("server-observed bytes must prevent a tiny replication quota claim");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 0, limit: 4095 }));
+
+        let mut allowed_opts = ObjectOptions {
+            replication_request: true,
+            user_defined,
+            ..Default::default()
+        };
+        assert!(allowed_opts.set_quota_admission(0, 4096));
+        let mut allowed_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload), 4096, 1, None, None, false)
+                .expect("construct exact-boundary replication reader"),
+        );
+        let stored = set_disks
+            .put_object(bucket, "object", &mut allowed_reader, &allowed_opts)
+            .await
+            .expect("server-observed exact quota boundary should succeed");
+        assert_eq!(stored.get_actual_size().expect("stored logical size should parse"), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_put_cannot_persist_a_tiny_logical_size() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "direct-put-quota-safety";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let payload = vec![0x62; 4096];
+        let mut denied_opts = ObjectOptions::default();
+        assert!(denied_opts.set_quota_admission(0, 4095));
+        let mut denied_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload.clone()), 4096, 1, None, None, false)
+                .expect("construct forged direct reader"),
+        );
+        let err = set_disks
+            .put_object(bucket, "object", &mut denied_reader, &denied_opts)
+            .await
+            .expect_err("server-observed bytes must prevent a tiny direct quota claim");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 0, limit: 4095 }));
+
+        let mut allowed_opts = ObjectOptions::default();
+        assert!(allowed_opts.set_quota_admission(0, 4096));
+        let mut allowed_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload), 4096, 1, None, None, false)
+                .expect("construct exact-boundary direct reader"),
+        );
+        let stored = set_disks
+            .put_object(bucket, "object", &mut allowed_reader, &allowed_opts)
+            .await
+            .expect("server-observed exact quota boundary should succeed");
+        assert_eq!(stored.get_actual_size().expect("stored logical size should parse"), 4096);
+    }
+
+    #[tokio::test]
+    async fn quota_rejects_ciphertext_replication_without_a_server_observed_logical_size() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ciphertext-replication-quota-safety";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut user_defined = HashMap::new();
+        user_defined.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, "1".to_string());
+        let mut opts = ObjectOptions {
+            replication_request: true,
+            preserve_ciphertext: true,
+            user_defined,
+            ..Default::default()
+        };
+        assert!(opts.set_quota_admission(0, u64::MAX));
+        let payload = vec![0x63; 4096];
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload), 4096, 4096, None, None, false)
+                .expect("construct ciphertext replication reader"),
+        );
+        let err = set_disks
+            .put_object(bucket, "object", &mut reader, &opts)
+            .await
+            .expect_err("ciphertext replication without a server-observed logical size must fail closed");
+        assert!(matches!(err, StorageError::PartMissingOrCorrupt));
     }
 }
 

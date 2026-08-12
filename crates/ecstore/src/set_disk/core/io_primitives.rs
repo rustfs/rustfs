@@ -538,7 +538,7 @@ impl MetadataQuorumAccumulator {
         })
     }
 
-    pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
+    pub(crate) fn default_write_quorum(&self) -> usize {
         if self.default_parity_count == 0 || self.default_parity_count >= self.total_disks {
             return self.total_disks;
         }
@@ -2816,13 +2816,96 @@ impl SetDisks {
         self.set_drive_count - self.default_parity_count
     }
 
-    pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
+    pub(crate) fn default_write_quorum(&self) -> usize {
         let mut data_count = self.set_drive_count - self.default_parity_count;
         if data_count == self.default_parity_count {
             data_count += 1
         }
 
         data_count
+    }
+
+    pub(in crate::set_disk) async fn prepare_quota_mutation_fences(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+    ) -> crate::error::Result<(Vec<Option<DiskStore>>, Vec<Option<SnapshotLeaseToken>>)> {
+        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+        let results = join_all(disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let fence_path = fence_path.clone();
+            async move {
+                let disk = disk?;
+                match disk.acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path).await {
+                    Ok(token) => Some((disk, token)),
+                    Err(_) => None,
+                }
+            }
+        }))
+        .await;
+        if results.iter().flatten().count() < write_quorum {
+            for (disk, token) in results.iter().flatten() {
+                let _ = disk.release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, *token).await;
+            }
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+        let mut fenced_disks = Vec::with_capacity(results.len());
+        let mut tokens = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Some((disk, token)) => {
+                    fenced_disks.push(Some(disk));
+                    tokens.push(Some(token));
+                }
+                None => {
+                    fenced_disks.push(None);
+                    tokens.push(None);
+                }
+            }
+        }
+        Ok((fenced_disks, tokens))
+    }
+
+    pub(in crate::set_disk) async fn release_quota_mutation_fences(
+        disks: &[Option<DiskStore>],
+        tokens: &[Option<SnapshotLeaseToken>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+    ) -> crate::error::Result<()> {
+        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+        let results = join_all(disks.iter().zip(tokens).filter_map(|(disk, token)| {
+            let disk = disk.as_ref()?.clone();
+            let token = (*token)?;
+            let fence_path = fence_path.clone();
+            Some(async move { disk.release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token).await })
+        }))
+        .await;
+        if results.iter().filter(|result| result.is_ok()).count() < write_quorum {
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+        Ok(())
+    }
+
+    pub(in crate::set_disk) async fn abort_quota_reservation_after_fence(
+        reservation: crate::bucket::quota::reservation::QuotaReservation,
+        disks: &[Option<DiskStore>],
+        tokens: &[Option<SnapshotLeaseToken>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+        fenced: bool,
+    ) {
+        let safe_to_abort = !fenced
+            || Self::release_quota_mutation_fences(disks, tokens, bucket, object, write_quorum)
+                .await
+                .is_ok();
+        if safe_to_abort {
+            reservation.abort().await;
+        } else {
+            reservation.defer_after_fence();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]

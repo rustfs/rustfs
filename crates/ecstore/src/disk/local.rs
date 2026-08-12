@@ -22,17 +22,18 @@ use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
     DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
-    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
-    RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    conv_part_err_to_int,
+    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
+    QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
-    os,
+    is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
+    quota_mutation_fence_path,
 };
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
@@ -55,9 +56,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Error as IoError, SeekFrom};
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{
@@ -4751,6 +4750,25 @@ struct SnapshotLeaseEntry {
     tokens: HashSet<SnapshotLeaseToken>,
     pending_delete: Option<DeleteOptions>,
     deleting: bool,
+    mutation_fence: Option<Arc<QuotaMutationFenceState>>,
+}
+
+#[derive(Default)]
+struct QuotaMutationFenceState {
+    revoked: AtomicBool,
+    running: AtomicUsize,
+    notify: Notify,
+}
+
+struct QuotaMutationFenceClaim {
+    state: Arc<QuotaMutationFenceState>,
+}
+
+impl Drop for QuotaMutationFenceClaim {
+    fn drop(&mut self) {
+        self.state.running.fetch_sub(1, Ordering::AcqRel);
+        self.state.notify.notify_waiters();
+    }
 }
 
 #[derive(Default)]
@@ -7315,6 +7333,34 @@ fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
 }
 
 impl LocalDisk {
+    async fn claim_quota_mutation_fence(
+        &self,
+        volume: &str,
+        path: &str,
+        token: SnapshotLeaseToken,
+    ) -> Result<Arc<QuotaMutationFenceClaim>> {
+        let key = SnapshotLeaseKey {
+            volume: RUSTFS_META_BUCKET.to_string(),
+            path: quota_mutation_fence_path(volume, path),
+        };
+        let state = {
+            let registry = self.snapshot_leases.lock().await;
+            let entry = registry.entries.get(&key).ok_or(DiskError::FileNotFound)?;
+            let state = entry.mutation_fence.as_ref().ok_or(DiskError::FileNotFound)?;
+            if !entry.tokens.contains(&token) || state.revoked.load(Ordering::Acquire) {
+                return Err(DiskError::FileNotFound);
+            }
+            state.running.fetch_add(1, Ordering::AcqRel);
+            Arc::clone(state)
+        };
+        if state.revoked.load(Ordering::Acquire) {
+            state.running.fetch_sub(1, Ordering::AcqRel);
+            state.notify.notify_waiters();
+            return Err(DiskError::FileNotFound);
+        }
+        Ok(Arc::new(QuotaMutationFenceClaim { state }))
+    }
+
     async fn reserve_version_delete(&self, volume: &str, object: &str, data_dir: Uuid, rollback_dir: Uuid) -> Result<bool> {
         let path = format!("{object}/{data_dir}");
         let data_path = self.io_get_object_path(volume, &path)?;
@@ -8648,7 +8694,30 @@ impl DiskAPI for LocalDisk {
         // optimistic; this lease establishes the local commit/delete order and
         // remains owned by any blocking syscall that outlives async cancellation.
         let destination_object_path = self.io_get_object_path(dst_volume, dst_path)?;
+        let quota_fence_token =
+            match rustfs_utils::http::metadata_compat::get_consistent_str(&fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX) {
+                Some(value) => {
+                    let token = Uuid::parse_str(value).map_err(|_| DiskError::FileCorrupt)?;
+                    Some(SnapshotLeaseToken::from_slice(token.as_bytes())?)
+                }
+                None if rustfs_utils::http::metadata_compat::contains_key_str(
+                    &fi.metadata,
+                    QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                ) =>
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                None => None,
+            };
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX);
+        let quota_fence_claim = match quota_fence_token {
+            Some(token) => Some(self.claim_quota_mutation_fence(dst_volume, dst_path, token).await?),
+            None => None,
+        };
         let mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, dst_volume, &destination_object_path).await;
+        if let Some(claim) = quota_fence_claim {
+            mutation_lease.attach_external_guard(claim);
+        }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
         }
@@ -9638,11 +9707,26 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
-        let file_path = self.io_get_object_path(volume, path)?;
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
             path: path.to_string(),
         };
+        if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
+            let mut registry = self.snapshot_leases.lock().await;
+            let entry = registry.entries.entry(key).or_default();
+            let state = entry
+                .mutation_fence
+                .get_or_insert_with(|| Arc::new(QuotaMutationFenceState::default()));
+            if state.revoked.load(Ordering::Acquire) {
+                return Err(DiskError::FileNotFound);
+            }
+            let token = SnapshotLeaseToken::new();
+            entry.tokens.insert(token);
+            return Ok(token);
+        }
+
+        let file_path = self.io_get_object_path(volume, path)?;
+        let _mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, volume, &file_path).await;
         let token = {
             let mut registry = self.snapshot_leases.lock().await;
             if registry.entries.get(&key).is_some_and(|entry| entry.deleting) {
@@ -9670,6 +9754,48 @@ impl DiskAPI for LocalDisk {
             volume: volume.to_string(),
             path: path.to_string(),
         };
+        if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
+            if !token.is_revoke_all() {
+                let mut registry = self.snapshot_leases.lock().await;
+                let Some(entry) = registry.entries.get_mut(&key) else {
+                    return Ok(());
+                };
+                entry.tokens.remove(&token);
+                let removable = entry.tokens.is_empty()
+                    && entry
+                        .mutation_fence
+                        .as_ref()
+                        .is_none_or(|state| state.running.load(Ordering::Acquire) == 0);
+                if removable {
+                    registry.entries.remove(&key);
+                }
+                return Ok(());
+            }
+            let state = {
+                let mut registry = self.snapshot_leases.lock().await;
+                let Some(entry) = registry.entries.get_mut(&key) else {
+                    return Ok(());
+                };
+                let Some(state) = entry.mutation_fence.as_ref().cloned() else {
+                    registry.entries.remove(&key);
+                    return Ok(());
+                };
+                state.revoked.store(true, Ordering::Release);
+                entry.tokens.clear();
+                state
+            };
+            loop {
+                let notified = state.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if state.running.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+            self.snapshot_leases.lock().await.entries.remove(&key);
+            return Ok(());
+        }
         let opts = {
             let mut registry = self.snapshot_leases.lock().await;
             let Some(entry) = registry.entries.get_mut(&key) else {
@@ -18721,6 +18847,48 @@ mod test {
             .await
             .expect("releasing an already released token should be idempotent");
         assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn quota_mutation_fence_revoke_waits_for_active_claim_and_rejects_late_claims() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "quota-fence-volume";
+        let object = "object";
+        let fence_path = quota_mutation_fence_path(bucket, object);
+        let token = disk
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("quota mutation token should be prepared");
+        let claim = disk
+            .claim_quota_mutation_fence(bucket, object, token)
+            .await
+            .expect("prepared token should be claimable");
+
+        let release_disk = Arc::clone(&disk);
+        let mut release = tokio::spawn(async move {
+            release_disk
+                .release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, SnapshotLeaseToken::revoke_all())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut release).await.is_err(),
+            "revoke must wait until an already claimed mutation has finished"
+        );
+
+        drop(claim);
+        tokio::time::timeout(Duration::from_secs(1), release)
+            .await
+            .expect("revoke should wake after the final claim drops")
+            .expect("revoke task should not panic")
+            .expect("revoke should succeed");
+        assert!(matches!(
+            disk.claim_quota_mutation_fence(bucket, object, token).await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[tokio::test]

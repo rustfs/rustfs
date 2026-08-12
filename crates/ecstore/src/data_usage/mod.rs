@@ -1355,7 +1355,7 @@ impl BucketUsageAccumulator {
             return Ok(());
         }
 
-        let object_size = object.size.max(0) as u64;
+        let object_size = quota_object_size(object)?;
         self.current_live_versions = self.current_live_versions.saturating_add(1);
         self.size_histogram.add(object_size);
         self.total_size = self.total_size.saturating_add(object_size);
@@ -1383,6 +1383,20 @@ impl BucketUsageAccumulator {
             ..Default::default()
         }
     }
+}
+
+pub fn quota_object_size(object: &ObjectInfo) -> Result<u64, Error> {
+    let logical_size = u64::try_from(object.get_actual_size().map_err(Error::other)?).map_err(|_| Error::PartMissingOrCorrupt)?;
+    let persisted_part_size = if object.parts.is_empty() {
+        u64::try_from(object.size).map_err(|_| Error::PartMissingOrCorrupt)?
+    } else {
+        object.parts.iter().try_fold(0_u64, |total, part| {
+            let actual_size = u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+            let part_size = actual_size.max(u64::try_from(part.size).map_err(|_| Error::PartMissingOrCorrupt)?);
+            total.checked_add(part_size).ok_or(Error::PartMissingOrCorrupt)
+        })?
+    };
+    Ok(logical_size.max(persisted_part_size))
 }
 
 type UsageVersionPage = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -3122,6 +3136,80 @@ mod tests {
         assert_eq!(usage.size, 1003);
         assert_eq!(usage.object_versions_histogram.get("SINGLE_VERSION"), Some(&1));
         assert_eq!(usage.object_versions_histogram.get("BETWEEN_1000_AND_10000"), Some(&1));
+    }
+
+    #[test]
+    fn bucket_usage_uses_the_larger_of_logical_and_physical_size() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "4096".to_string());
+        let object = ObjectInfo {
+            name: "compressed".to_string(),
+            size: 128,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let mut usage = BucketUsageAccumulator::default();
+        usage
+            .record("bucket", &object)
+            .expect("valid compressed metadata should be counted");
+        assert_eq!(usage.finish().size, 4096);
+
+        let mut framed_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut framed_metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut framed_metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "1".to_string());
+        let framed = ObjectInfo {
+            name: "framed".to_string(),
+            size: 17,
+            user_defined: Arc::new(framed_metadata),
+            ..Default::default()
+        };
+        assert_eq!(quota_object_size(&framed).expect("physical framing must remain quota-accounted"), 17);
+
+        let mut corrupt_metadata = (*object.user_defined).clone();
+        rustfs_utils::http::insert_str(&mut corrupt_metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "-1".to_string());
+        let corrupt = ObjectInfo {
+            user_defined: Arc::new(corrupt_metadata),
+            ..object
+        };
+        assert!(
+            matches!(
+                BucketUsageAccumulator::default().record("bucket", &corrupt),
+                Err(Error::PartMissingOrCorrupt)
+            ),
+            "negative logical metadata must not become a smaller quota baseline"
+        );
+
+        let mut poisoned_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut poisoned_metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut poisoned_metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "1".to_string());
+        let poisoned = ObjectInfo {
+            name: "legacy-swift-metadata".to_string(),
+            size: 4096,
+            user_defined: Arc::new(poisoned_metadata),
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                size: 4096,
+                actual_size: 4096,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            quota_object_size(&poisoned).expect("persisted part accounting must bound legacy user metadata"),
+            4096
+        );
     }
 
     #[tokio::test]

@@ -158,6 +158,26 @@ impl QuotaChecker {
             .await
     }
 
+    pub async fn set_durable_quota_config_if_incarnation(
+        &mut self,
+        bucket: &str,
+        quota: BucketQuota,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+    ) -> Result<OffsetDateTime, QuotaError> {
+        let json_data = serde_json::to_vec(&quota).map_err(|e| QuotaError::InvalidConfig {
+            reason: format!("Failed to serialize quota config: {}", e),
+        })?;
+        let start_time = Instant::now();
+        let updated_at =
+            crate::bucket::metadata_sys::update_quota_if_incarnation(bucket, json_data, expected_incarnation_id, proof)
+                .await
+                .map_err(QuotaError::StorageError)?;
+
+        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
+        Ok(updated_at)
+    }
+
     async fn set_quota_config_for_incarnation(
         &mut self,
         bucket: &str,

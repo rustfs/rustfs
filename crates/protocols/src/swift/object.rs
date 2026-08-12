@@ -67,9 +67,38 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
 const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
 const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
+const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
 /// Maximum object size in bytes (5GB - Swift default)
 const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
+
+fn stored_swift_user_metadata_key(key: &str) -> String {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-amz-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        format!("{USER_METADATA_PREFIX}{key}")
+    } else {
+        key.to_string()
+    }
+}
+
+fn swift_user_metadata(headers: &HeaderMap) -> Option<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    let mut present = false;
+    for (header_name, header_value) in headers.iter() {
+        let header_name = header_name.as_str().to_lowercase();
+        let Some(key) = header_name.strip_prefix("x-object-meta-") else {
+            continue;
+        };
+        present = true;
+        if let Ok(value) = header_value.to_str() {
+            metadata.insert(stored_swift_user_metadata_key(key), value.to_string());
+        }
+    }
+    present.then_some(metadata)
+}
 
 /// Object key translator for Swift object names
 ///
@@ -303,15 +332,7 @@ where
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Extract Swift metadata from X-Object-Meta-* headers
-    let mut user_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            user_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut user_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 6. Extract Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -739,15 +760,7 @@ pub async fn update_object_metadata(
     }
 
     // 8. Extract new metadata from X-Object-Meta-* headers
-    let mut new_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            new_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut new_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 9. Also update Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -889,19 +902,8 @@ pub async fn copy_object(
     let mut new_metadata = (*src_info.user_defined).clone();
 
     // 11. If custom metadata headers provided, use those instead (Swift behavior)
-    let mut has_custom_meta = false;
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-") {
-            if !has_custom_meta {
-                // First custom meta header - clear source metadata
-                new_metadata.clear();
-                has_custom_meta = true;
-            }
-            if let Ok(value_str) = header_value.to_str() {
-                new_metadata.insert(meta_key.to_string(), value_str.to_string());
-            }
-        }
+    if let Some(custom_metadata) = swift_user_metadata(headers) {
+        new_metadata = custom_metadata;
     }
 
     // 12. Also check for Content-Type override
@@ -1121,6 +1123,23 @@ mod tests {
         assert!(ObjectKeyMapper::validate_object_name("file with spaces.pdf").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("special-chars_@#$.txt").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("unicode-文件.txt").is_ok());
+    }
+
+    #[test]
+    fn swift_user_metadata_cannot_materialize_internal_storage_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-object-meta-x-rustfs-internal-actual-size", "1".parse().expect("valid metadata value"));
+        headers.insert("x-object-meta-description", "safe".parse().expect("valid metadata value"));
+        let metadata = swift_user_metadata(&headers).expect("custom metadata should be detected");
+
+        assert_eq!(metadata.get("x-amz-meta-x-rustfs-internal-actual-size").map(String::as_str), Some("1"));
+        assert_eq!(metadata.get("description").map(String::as_str), Some("safe"));
+        assert!(!metadata.contains_key("x-rustfs-internal-actual-size"));
+        assert_eq!(
+            stored_swift_user_metadata_key("x-minio-encryption-original-size"),
+            "x-amz-meta-x-minio-encryption-original-size"
+        );
+        assert_eq!(stored_swift_user_metadata_key("description"), "description");
     }
 
     #[test]

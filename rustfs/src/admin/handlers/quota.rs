@@ -22,6 +22,7 @@ use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
 use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
 use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -293,16 +294,36 @@ impl Operation for SetBucketQuotaHandler {
             return Err(s3_error!(InvalidArgument, "{}", rustfs_config::QUOTA_INVALID_TYPE_ERROR_MSG));
         }
 
+        let fleet_proof = if request.quota.is_some() {
+            Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                S3Error::with_message(
+                    s3s::S3ErrorCode::ServiceUnavailable,
+                    "durable quota capability is not confirmed across the cluster".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+
         let quota = BucketQuota::new(request.quota);
 
         let metadata_sys_lock = bucket_metadata_from_context()
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let updated_at = quota_checker
-            .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to set quota: {}", e))?;
+        let updated_at = match fleet_proof.as_ref() {
+            Some(fleet_proof) => {
+                quota_checker
+                    .set_durable_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id, fleet_proof)
+                    .await
+            }
+            None => {
+                quota_checker
+                    .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
+                    .await
+            }
+        }
+        .map_err(ApiError::from)?;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
