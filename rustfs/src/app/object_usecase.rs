@@ -719,6 +719,9 @@ const GET_READER_STREAM_POLL_PENDING: &str = "pending";
 const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
+const GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM: &str = "reader_stream";
+const GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR: &str = "reader_error";
+const GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF: &str = "short_eof";
 const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE: &str = "object_data_cache";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED: &str = "object_data_cache_materialized";
@@ -772,6 +775,66 @@ fn tune_reader_stream_buffer_size(
     }
 
     selected_size
+}
+
+fn get_object_stream_size_bucket(expected: usize) -> &'static str {
+    rustfs_io_metrics::get_object_size_bucket(i64::try_from(expected).unwrap_or(i64::MAX))
+}
+
+fn classify_get_object_stream_read_error(err: &std::io::Error) -> &'static str {
+    if let Some(inner) = err.get_ref() {
+        if inner.is::<rustfs_rio::IncompleteBody>() {
+            return "short_eof";
+        }
+
+        if inner.is::<rustfs_rio::ChecksumMismatch>() {
+            return "bitrot";
+        }
+
+        let error_msg = inner.to_string().to_lowercase();
+        if error_msg.contains("bitrot") {
+            return "bitrot";
+        }
+        if error_msg.contains("read quorum") || error_msg.contains("insufficient read quorum") || error_msg.contains("erasure") {
+            return "read_quorum";
+        }
+    }
+
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof => "short_eof",
+        std::io::ErrorKind::TimedOut => "timeout",
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
+        _ => "io",
+    }
+}
+
+fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
+    if error_class == "short_eof" {
+        GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF
+    } else {
+        GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+    }
+}
+
+fn record_get_object_reader_stream_failure(
+    reason: &'static str,
+    error_class: &'static str,
+    strategy: &'static str,
+    buffer_source: &'static str,
+    expected: usize,
+    emitted: usize,
+    remaining: usize,
+) {
+    rustfs_io_metrics::record_get_object_streaming_body_failure(rustfs_io_metrics::GetObjectStreamingBodyFailure {
+        stage: GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM,
+        reason,
+        error_class,
+        strategy,
+        buffer_source,
+        size_bucket: get_object_stream_size_bucket(expected),
+        emitted_bytes: emitted,
+        remaining_bytes: remaining,
+    });
 }
 
 pin_project! {
@@ -1358,9 +1421,9 @@ where
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
                 let bytes = buf.freeze();
                 *this.remaining -= bytes.len();
+                *this.emitted += bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
-                    *this.emitted += bytes.len();
                     tracing::debug!(
                         emitted = *this.emitted,
                         expected = *this.expected,
@@ -1378,6 +1441,15 @@ where
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
+                record_get_object_reader_stream_failure(
+                    GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF,
+                    "short_eof",
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1389,6 +1461,16 @@ where
             }
             Poll::Ready(Err(err)) => {
                 this.reader.set(None);
+                let error_class = classify_get_object_stream_read_error(&err);
+                record_get_object_reader_stream_failure(
+                    get_object_stream_failure_reason(error_class),
+                    error_class,
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1445,8 +1527,6 @@ where
 
 struct GetObjectStreamingReader<R> {
     inner: Option<R>,
-    bucket: String,
-    key: String,
     // request_id + optional content_range are only used for diagnostic correlation and
     // failure bucketing; they do not alter stream behavior.
     request_id: String,
@@ -1467,8 +1547,8 @@ impl<R> GetObjectStreamingReader<R> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         inner: R,
-        bucket: &str,
-        key: &str,
+        _bucket: &str,
+        _key: &str,
         request_id: &str,
         content_range: Option<String>,
         expected: usize,
@@ -1478,8 +1558,6 @@ impl<R> GetObjectStreamingReader<R> {
     ) -> Self {
         Self {
             inner: Some(inner),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
             request_id: request_id.to_string(),
             content_range,
             expected,
@@ -1503,33 +1581,7 @@ impl<R> GetObjectStreamingReader<R> {
     // distinguish truncated upstream bodies, corruption, quorum issues, and
     // genuine downstream-close disconnects.
     fn classify_read_error(err: &std::io::Error) -> &'static str {
-        if let Some(inner) = err.get_ref() {
-            if inner.is::<rustfs_rio::IncompleteBody>() {
-                return "short_eof";
-            }
-
-            if inner.is::<rustfs_rio::ChecksumMismatch>() {
-                return "bitrot";
-            }
-
-            let error_msg = inner.to_string().to_lowercase();
-            if error_msg.contains("bitrot") {
-                return "bitrot";
-            }
-            if error_msg.contains("read quorum")
-                || error_msg.contains("insufficient read quorum")
-                || error_msg.contains("erasure")
-            {
-                return "read_quorum";
-            }
-        }
-
-        match err.kind() {
-            std::io::ErrorKind::UnexpectedEof => "short_eof",
-            std::io::ErrorKind::TimedOut => "timeout",
-            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
-            _ => "io",
-        }
+        classify_get_object_stream_read_error(err)
     }
 
     fn finish_ok(&mut self) {
@@ -1646,10 +1698,9 @@ impl<R> GetObjectStreamingReader<R> {
                 event = EVENT_GET_OBJECT_STREAM_BODY,
                 component = LOG_COMPONENT_APP,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
-                bucket = %self.bucket,
-                object = %self.key,
                 request_id = %self.request_id,
                 range = %self.content_range.as_deref().unwrap_or("full"),
+                size_bucket = get_object_stream_size_bucket(self.expected),
                 expected = self.expected,
                 emitted = self.emitted,
                 elapsed_ms = self.elapsed().as_millis(),
@@ -1683,10 +1734,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             resume_attempts = attempts,
@@ -1706,10 +1756,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1748,10 +1797,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                                         event = EVENT_GET_OBJECT_STREAM_BODY,
                                         component = LOG_COMPONENT_APP,
                                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                                        bucket = %self.bucket,
-                                        object = %self.key,
                                         request_id = %self.request_id,
                                         range = %self.content_range.as_deref().unwrap_or("full"),
+                                        size_bucket = get_object_stream_size_bucket(self.expected),
                                         expected = self.expected,
                                         emitted = self.emitted,
                                         elapsed_ms = elapsed.as_millis(),
@@ -1793,10 +1841,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1828,10 +1875,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         event = EVENT_GET_OBJECT_STREAM_BODY,
                         component = LOG_COMPONENT_APP,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                        bucket = %self.bucket,
-                        object = %self.key,
                         request_id = %self.request_id,
                         range = %self.content_range.as_deref().unwrap_or("full"),
+                        size_bucket = get_object_stream_size_bucket(self.expected),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1864,10 +1910,9 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
-            bucket = %self.bucket,
-            object = %self.key,
             request_id = %self.request_id,
             range = %self.content_range.as_deref().unwrap_or("full"),
+            size_bucket = get_object_stream_size_bucket(self.expected),
             expected = self.expected,
             emitted = self.emitted,
             elapsed_ms = self.elapsed().as_millis(),
@@ -15303,6 +15348,19 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
             Some(std::io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn get_object_stream_failure_labels_are_low_cardinality() {
+        assert_eq!(get_object_stream_failure_reason("short_eof"), GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF);
+        assert_eq!(
+            get_object_stream_failure_reason("timeout"),
+            GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+        );
+        assert_eq!(
+            get_object_stream_size_bucket(4 * 1024 * 1024),
+            rustfs_io_metrics::GET_OBJECT_SIZE_BUCKET_GT_1_MIB
         );
     }
 
