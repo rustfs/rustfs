@@ -1523,8 +1523,17 @@ impl SetDisks {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
             }
+
             let rename_stage_elapsed = rename_stage_start.elapsed();
             let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+
+            // `rename_data` has completed the authoritative quorum commit. The
+            // exact old-data-dir reclamation below is best-effort space cleanup;
+            // it must not serialize the next operation on this object.
+            drop(object_lock_guard);
+
             rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
             if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                 warn!(
@@ -1580,8 +1589,6 @@ impl SetDisks {
                     );
                 }
             }
-
-            drop(object_lock_guard); // drop object lock guard to release the lock
 
             for (i, op_disk) in online_disks.iter().enumerate() {
                 if let Some(disk) = op_disk
@@ -1679,10 +1686,6 @@ impl SetDisks {
                 error = %err,
                 "SetDisk put_object stage summary"
             );
-        }
-
-        if result.is_ok() {
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
         }
 
         if issue3031_diag_enabled() {
@@ -8668,8 +8671,10 @@ mod put_object_tmp_cleanup_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
+    use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     /// Large enough that the erasure shards are written as real tmp files
     /// (never inlined into xl.meta), so both tests exercise actual cleanup.
@@ -8752,6 +8757,168 @@ mod put_object_tmp_cleanup_tests {
         );
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn committed_put_releases_namespace_lock_before_old_data_cleanup() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-commit-lock-window";
+        let object = "commit-lock-window-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be committed");
+        let mut initial = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("initial object should populate the metadata cache");
+        let mut initial_body = Vec::new();
+        initial
+            .stream
+            .read_to_end(&mut initial_body)
+            .await
+            .expect("initial body should drain");
+        assert_eq!(initial_body, vec![b'0'; TEST_OBJECT_SIZE]);
+
+        let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+        let first_store = Arc::clone(&set_disks);
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+            .await
+            .expect("first overwrite should reach old-data cleanup");
+
+        let mut committed = tokio::time::timeout(
+            Duration::from_secs(30),
+            set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await
+        .expect("GET should not wait for old-data cleanup")
+        .expect("committed overwrite should be readable during old-data cleanup");
+        let mut committed_body = Vec::new();
+        committed
+            .stream
+            .read_to_end(&mut committed_body)
+            .await
+            .expect("committed overwrite body should drain");
+        assert_eq!(committed_body, vec![b'1'; TEST_OBJECT_SIZE]);
+
+        let second_commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let second_store = Arc::clone(&set_disks);
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            second_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), second_commit_barrier.wait_until_paused())
+            .await
+            .expect("second overwrite should acquire the namespace lock during cleanup");
+
+        cleanup_barrier.release();
+        first
+            .await
+            .expect("first overwrite task should join")
+            .expect("first overwrite should remain successful after cleanup");
+        drop(cleanup_barrier);
+        second_commit_barrier.release();
+        second
+            .await
+            .expect("second overwrite task should join")
+            .expect("second overwrite should commit after acquiring the released namespace lock");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the latest overwrite should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_commit_cleanup_does_not_retain_namespace_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-commit-lock-cancelled-cleanup";
+        let object = "commit-lock-cancelled-cleanup-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be committed");
+
+        let cleanup_tasks = rename_fanout_barrier::observe_tasks(object);
+        let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+        let first_store = Arc::clone(&set_disks);
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+            .await
+            .expect("first overwrite should reach old-data cleanup");
+
+        let second_commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let second_store = Arc::clone(&set_disks);
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            second_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), second_commit_barrier.wait_until_paused())
+            .await
+            .expect("second overwrite should acquire the namespace lock before cancellation");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("the first request should be cancelled during cleanup")
+                .is_cancelled()
+        );
+        assert!(
+            cleanup_tasks.running() >= 1,
+            "cancelled cleanup must remain observable until its disk task drains"
+        );
+        cleanup_barrier.release();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while cleanup_tasks.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled cleanup disk tasks should drain");
+        drop(cleanup_barrier);
+
+        second_commit_barrier.release();
+        second
+            .await
+            .expect("second overwrite task should join")
+            .expect("second overwrite should survive the earlier request cancellation");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the latest overwrite should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
     }
 
     #[tokio::test]
