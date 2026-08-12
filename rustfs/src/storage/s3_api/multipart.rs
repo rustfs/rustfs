@@ -140,7 +140,7 @@ pub(crate) fn parse_list_multipart_uploads_params(
     if let Some(key_marker) = &key_marker
         && !key_marker.starts_with(prefix.as_str())
     {
-        return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid key marker".to_string()));
     }
 
     Ok(ListMultipartUploadsParams {
@@ -390,7 +390,7 @@ mod tests {
         let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("other/key-marker".to_string()), None)
             .expect_err("expected invalid key marker");
 
-        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid key marker"));
     }
 
