@@ -2401,15 +2401,20 @@ async fn wait_for_site_replication_info<F>(
 where
     F: Fn(&SiteReplicationInfo) -> bool,
 {
-    for _ in 0..40 {
+    // 30s to match wait_for_replication_state: the three-node site tests run
+    // several full rustfs processes on one runner, so peer-state propagation
+    // can take well over 10s under CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let info = site_replication_info(env).await?;
         if predicate(&info) {
             return Ok(info);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication info did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication info did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_site_replication_status<F>(
@@ -2420,15 +2425,19 @@ async fn wait_for_site_replication_status<F>(
 where
     F: Fn(&SRStatusInfo) -> bool,
 {
-    for _ in 0..40 {
+    // Same 30s ceiling as wait_for_site_replication_info: the status probes
+    // fan out to every peer, so they see the same multi-process CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let status = site_replication_status(env, query).await?;
         if predicate(&status) {
             return Ok(status);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication status did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication status did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_replication_reset_target<F>(

@@ -5932,15 +5932,18 @@ fn peer_edit_fence(queries: &HashMap<String, String>) -> Option<(String, u64)> {
     Some((origin.clone(), generation))
 }
 
-/// True when a newer edit from the same origin site already landed here. The
-/// process mutex on the sending node cannot order deliveries issued by two
-/// nodes of that site, so ordering is decided here, on the generation the
-/// sender allocated under the distributed lock.
+/// True when a strictly newer edit from the same origin site already landed
+/// here. The process mutex on the sending node cannot order deliveries issued
+/// by two nodes of that site, so ordering is decided here, on the generation
+/// the sender allocated under the distributed lock. Equal generations are NOT
+/// stale: one edit legitimately fans out several deliveries under a single
+/// generation (the ILM-expiry edit sends every peer's record), and a replay of
+/// an applied delivery re-applies the same edit idempotently.
 fn peer_edit_delivery_is_stale(state: &SiteReplicationState, origin: &str, generation: u64) -> bool {
     state
         .applied_edit_generations
         .get(origin)
-        .is_some_and(|applied| *applied >= generation)
+        .is_some_and(|applied| *applied > generation)
 }
 
 fn record_applied_peer_edit_generation(state: &mut SiteReplicationState, origin: &str, generation: u64) {
@@ -12783,8 +12786,11 @@ mod tests {
 
         // The delivery that lost the race carries the older generation.
         assert!(peer_edit_delivery_is_stale(&state, "origin-site", 6));
-        // A replay of the generation already applied is stale too.
-        assert!(peer_edit_delivery_is_stale(&state, "origin-site", 7));
+        // The generation already applied is NOT stale: one edit fans out one
+        // delivery per peer record under a single generation (the ILM-expiry
+        // edit), so an equal-generation delivery is the same edit's next body
+        // (or an idempotent replay) and must apply.
+        assert!(!peer_edit_delivery_is_stale(&state, "origin-site", 7));
         // The next edit from that origin still applies...
         assert!(!peer_edit_delivery_is_stale(&state, "origin-site", 8));
         // ...and another origin site is ordered independently.
@@ -12796,6 +12802,65 @@ mod tests {
         assert_eq!(peer_edit_path_with_fence(None, 9), SITE_REPLICATION_PEER_EDIT_PATH);
         assert_eq!(peer_edit_path_with_fence(Some(""), 9), SITE_REPLICATION_PEER_EDIT_PATH);
         assert!(peer_edit_fence(&HashMap::new()).is_none());
+    }
+
+    /// One edit fans out one delivery per peer record under a single
+    /// generation (the ILM-expiry edit sends every peer's record). The
+    /// receiver's fenced sequence — staleness check, apply, raise the
+    /// high-water mark — must therefore accept every body of that fan-out,
+    /// not just the first, while a strictly older delivery stays rejected.
+    #[test]
+    fn peer_edit_fence_admits_every_body_of_one_edits_fan_out() {
+        let local = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([
+                ("site-a".to_string(), local.clone()),
+                (
+                    "site-b".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-b".to_string(),
+                        ..peer("site-b", "https://site-b.example.com")
+                    },
+                ),
+                (
+                    "site-c".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-c".to_string(),
+                        ..peer("site-c", "https://site-c.example.com")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let origin = "origin-site";
+        let generation = 2;
+
+        let bodies: Vec<PeerInfo> = state
+            .peers
+            .values()
+            .map(|peer| PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer.clone()
+            })
+            .collect();
+        for body in bodies {
+            assert!(
+                !peer_edit_delivery_is_stale(&state, origin, generation),
+                "a same-generation fan-out body must not be fenced out"
+            );
+            state = apply_internal_peer_edit(state, &local, body, None).expect("fan-out body applies");
+            record_applied_peer_edit_generation(&mut state, origin, generation);
+        }
+
+        assert!(
+            state.peers.values().all(|peer| peer.replicate_ilm_expiry),
+            "every peer record from the fan-out must be applied: {:?}",
+            state.peers
+        );
+        assert!(peer_edit_delivery_is_stale(&state, origin, generation - 1));
     }
 
     /// P1-15 review follow-up: a site that leaves the mesh drops below two
