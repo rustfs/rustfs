@@ -5761,7 +5761,7 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || object_lock_checks_required(&bucket).await;
+        let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
@@ -9574,6 +9574,13 @@ pub(super) async fn object_lock_checks_required(bucket: &str) -> bool {
         .map_or(true, |metadata| metadata.object_locking())
 }
 
+fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
+    match state {
+        metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
+        metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,
+    }
+}
+
 /// rustfs/backlog#1009: map the rename_data old-size backfill onto the
 /// `previous_current_size` value the usage-accounting helpers expect. Outer
 /// `None` = unknown (no quorum agreement, or a peer predates the field) — the
@@ -10157,6 +10164,23 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    #[test]
+    fn object_lock_checks_required_reuses_authoritative_state() {
+        assert!(!object_lock_checks_required_for_state(
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        ));
+
+        let configured = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        assert!(object_lock_checks_required_for_state(&configured));
+        assert!(object_lock_checks_required_for_state(&metadata_sys::ObjectLockConfigState::Fabricated));
     }
 
     #[test]
