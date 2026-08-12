@@ -2331,7 +2331,7 @@ impl ScannerIOCycle for ECStore {
                 state = "cycle_data_movement_active",
                 "Scanner cycle deferred while rebalance or decommission data movement is active"
             );
-            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None));
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Superseded, None));
         }
         let dirty_generation_before_bucket_list = dirty_usage_generation();
         let bucket_listing = self.list_bucket_for_scanner(&BucketOptions::default()).await?;
@@ -3982,6 +3982,7 @@ mod tests {
     use super::*;
     use crate::scanner_budget::ScannerCycleBudgetConfig;
     use crate::scanner_folder::ScannerItem;
+    use crate::storage_api::owner::{EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats};
     use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
     use crate::{
         DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
@@ -4094,6 +4095,42 @@ mod tests {
 
         assert!(!first.is_lock_lost());
         assert!(!second.is_lock_lost());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_is_superseded_while_rebalance_is_active() {
+        let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+        let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
+        pool_stats[0] = EcstoreRebalanceStats {
+            participating: true,
+            info: EcstoreRebalanceInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                status: EcstoreRebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        *store.rebalance_meta.write().await = Some(EcstoreRebalanceMeta {
+            id: Uuid::new_v4().to_string(),
+            pool_stats,
+            ..Default::default()
+        });
+        assert!(store.scanner_data_movement_active().await);
+
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            ScannerIOCycle::nsscanner_with_status(store.as_ref(), ctx, budget, updates, 1, 1, HealScanMode::Normal),
+        )
+        .await
+        .expect("rebalance-deferred scanner cycle should finish")
+        .expect("rebalance-deferred scanner cycle should succeed");
+
+        assert_eq!(result.status, ScannerCycleStatus::Superseded);
+        assert!(receiver.recv().await.is_none(), "rebalance-deferred cycle must not publish usage");
     }
 
     #[tokio::test]
