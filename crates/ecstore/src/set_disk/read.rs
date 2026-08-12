@@ -221,9 +221,9 @@ impl SetDisks {
         let disks = self.disks.read().await.clone();
         let required_reads = self.default_read_quorum();
 
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let version_id = version_id.to_string();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let object: Arc<str> = Arc::from(object);
+        let version_id: Arc<str> = Arc::from(version_id);
         let opts = *opts;
 
         let processor = runtime_sources::batch_processors().read_processor();
