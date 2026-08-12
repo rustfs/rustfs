@@ -56,6 +56,22 @@ use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
 
+#[inline]
+fn duration_millis_f64(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod duration_metrics_tests {
+    use super::duration_millis_f64;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_millis_preserves_sub_millisecond_precision() {
+        assert_eq!(duration_millis_f64(Duration::from_micros(125)), 0.125);
+    }
+}
+
 fn is_restore_control_metadata(key: &str) -> bool {
     key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str())
         || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS)
@@ -1107,8 +1123,12 @@ impl SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
-            let writer_setup_ms = writer_setup_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_writer_setup", writer_setup_ms as f64);
+            let writer_setup_elapsed = writer_setup_stage_start.elapsed();
+            let writer_setup_ms = writer_setup_elapsed.as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_writer_setup",
+                duration_millis_f64(writer_setup_elapsed),
+            );
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1138,11 +1158,16 @@ impl SetDisks {
 
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
+            let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
+                usize::try_from(put_object_size).map_err(Error::other)?
+            } else {
+                0
+            };
 
             let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
@@ -1152,7 +1177,7 @@ impl SetDisks {
                     }
                 },
                 SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
@@ -1178,8 +1203,9 @@ impl SetDisks {
                     }
                 },
             };
-            let encode_ms = encode_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", encode_ms as f64);
+            let encode_elapsed = encode_stage_start.elapsed();
+            let encode_ms = encode_elapsed.as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1497,8 +1523,9 @@ impl SetDisks {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
             }
-            let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
+            let rename_stage_elapsed = rename_stage_start.elapsed();
+            let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
             if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                 warn!(
                     event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
@@ -1527,9 +1554,13 @@ impl SetDisks {
                 let cleanup = self
                     .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
                     .await;
-                let cleanup_ms = cleanup_stage_start.elapsed().as_millis() as u64;
+                let cleanup_elapsed = cleanup_stage_start.elapsed();
+                let cleanup_ms = cleanup_elapsed.as_millis() as u64;
                 cleanup_stage_ms = Some(cleanup_ms);
-                rustfs_io_metrics::record_put_object_stage_duration("set_disk_old_data_cleanup", cleanup_ms as f64);
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_old_data_cleanup",
+                    duration_millis_f64(cleanup_elapsed),
+                );
                 self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
                     .await;
                 if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {

@@ -91,6 +91,11 @@ fn use_bytesmut_ingest() -> bool {
     })
 }
 
+fn small_ingest_capacity(erasure: &Erasure, size_hint: usize) -> usize {
+    let data_len = size_hint.min(erasure.block_size);
+    erasure.encoded_capacity_for_data_len(data_len).min(erasure.block_size)
+}
+
 /// Keeps the encoder producer scoped to its parent future. Tokio detaches a
 /// task when its `JoinHandle` is dropped, so the producer must be aborted when
 /// an upload is cancelled before the encode pipeline finishes.
@@ -540,13 +545,14 @@ impl Erasure {
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
         require_single_block: bool,
+        size_hint: usize,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
         use tokio::io::AsyncReadExt;
 
-        let mut buf = Vec::with_capacity(self.block_size);
+        let mut buf = Vec::with_capacity(small_ingest_capacity(&self, size_hint));
         let total = if require_single_block {
             let read_limit = self
                 .block_size
@@ -880,7 +886,24 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, false).await
+        let size_hint = self.block_size;
+        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+    }
+
+    /// Size-aware inline fast path. `size_hint` only controls the bounded initial
+    /// allocation; reads remain authoritative.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub async fn encode_inline_small_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
     }
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
@@ -895,7 +918,24 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, true).await
+        let size_hint = self.block_size;
+        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+    }
+
+    /// Size-aware single-block fast path. `size_hint` only controls the bounded
+    /// initial allocation; reads remain authoritative.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub async fn encode_single_block_non_inline_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
     }
 }
 
@@ -2293,7 +2333,10 @@ mod tests {
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
         let reader = tokio::io::BufReader::new(Cursor::new(Vec::<u8>::new()));
-        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, 1).await.unwrap();
+        let (_reader, total) = erasure
+            .encode_inline_small_with_size_hint(reader, &mut writers, 1, 0)
+            .await
+            .unwrap();
 
         assert_eq!(total, 0);
         // No shutdown was called, so nothing should be committed
@@ -2325,7 +2368,10 @@ mod tests {
         let payload = b"hello inline small";
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
-        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, DATA_SHARDS).await.unwrap();
+        let (_reader, total) = erasure
+            .encode_inline_small_with_size_hint(reader, &mut writers, DATA_SHARDS, 1)
+            .await
+            .unwrap();
 
         assert_eq!(total, payload.len());
         // All shards must have received data (shutdown flushed the bitrot header + shard bytes)
@@ -2392,7 +2438,7 @@ mod tests {
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload));
         let err = erasure
-            .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
+            .encode_single_block_non_inline_with_size_hint(reader, &mut writers, DATA_SHARDS, BLOCK_SIZE)
             .await
             .expect_err("single-block fast path must reject oversized readers");
 
@@ -2401,6 +2447,21 @@ mod tests {
         for c in committed {
             assert!(c.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn small_ingest_capacity_uses_bounded_size_hint() {
+        let erasure = Erasure::new(4, 2, 1024 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, 0), 0);
+        assert_eq!(small_ingest_capacity(&erasure, 4 * 1024), 6 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, 16 * 1024), 24 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, usize::MAX), 1024 * 1024);
+
+        let legacy = Erasure::new_with_options(4, 2, 1024 * 1024, true);
+        assert_eq!(small_ingest_capacity(&legacy, 4 * 1024), 6 * 1024);
+
+        let high_parity = Erasure::new(4, 12, 1024 * 1024);
+        assert_eq!(small_ingest_capacity(&high_parity, usize::MAX), 1024 * 1024);
     }
 
     #[tokio::test]

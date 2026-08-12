@@ -954,12 +954,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.multipart_metric_label());
+            let small_size_hint = if matches!(write_path, SmallWritePath::SingleBlockNonInline) {
+                usize::try_from(multipart_part_size).map_err(Error::other)?
+            } else {
+                0
+            };
             let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
             let (reader, w_size) = match write_path {
                 SmallWritePath::SingleBlockNonInline => {
                     Arc::clone(&erasure)
-                        .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                        .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                         .await?
                 }
                 SmallWritePath::PipelineBatchedLarge => {
