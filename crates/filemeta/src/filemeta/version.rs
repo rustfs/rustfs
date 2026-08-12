@@ -29,11 +29,12 @@ use super::*;
 use crate::{ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID,
+    RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS,
+    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_TIER_FV_ID,
     SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
     SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes,
     get_bytes, get_consistent_bytes, get_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
-    strip_internal_prefix, target_delete_marker_versions,
+    strip_internal_prefix, strip_internal_prefix_preserving_case, target_delete_marker_versions,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -258,63 +259,155 @@ fn parse_legacy_uuid_bytes(bytes: &[u8], field: &str) -> Result<Option<Uuid>> {
 /// Legacy RustFS writes used 16 raw UUID bytes. New writes and MinIO-migrated
 /// records use the provider's exact UTF-8 version text. Empty, nil UUID, and
 /// malformed bytes are not usable remote versions.
-fn transitioned_version_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Result<Option<String>> {
-    if !contains_key_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
-        return Ok(None);
-    }
-    let Some(value) = get_consistent_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) else {
-        return Ok(None);
+fn transition_version_state_from_bytes(value: Option<&[u8]>) -> Result<TransitionVersionState> {
+    let Some(value) = value else {
+        return Ok(TransitionVersionState::Unknown);
     };
-    let value = value.to_vec();
+    match value {
+        b"known-disabled" => Ok(TransitionVersionState::KnownDisabled),
+        b"suspended-null" => Ok(TransitionVersionState::SuspendedNull),
+        b"exact" => Ok(TransitionVersionState::Exact),
+        b"unknown" => Ok(TransitionVersionState::Unknown),
+        _ => Err(Error::FileCorrupt),
+    }
+}
+
+fn transitioned_version_from_bytes(value: Option<&[u8]>, state: TransitionVersionState) -> Option<String> {
+    let Some(value) = value else {
+        return None;
+    };
     if value.is_empty() {
-        return Ok(None);
+        return None;
     }
-    if let Ok(id) = Uuid::from_slice(&value) {
-        return Ok((!id.is_nil()).then(|| id.to_string()));
+    if state == TransitionVersionState::Unknown
+        && let Ok(id) = Uuid::from_slice(value)
+    {
+        return (!id.is_nil()).then(|| id.to_string());
     }
-    let Ok(value) = String::from_utf8(value) else {
-        return Ok(None);
+    let Ok(value) = std::str::from_utf8(value) else {
+        return None;
     };
     if value.is_empty()
         || value.len() > MAX_TRANSITION_VERSION_LEN
         || value.chars().any(char::is_control)
         || Uuid::parse_str(&value).is_ok_and(|id| id.is_nil())
     {
-        Ok(None)
+        None
     } else {
-        Ok(Some(value))
+        Some(value.to_string())
     }
 }
 
-fn transition_version_state_from_meta_sys(
-    meta_sys: &HashMap<String, Vec<u8>>,
-    version: Option<&str>,
-) -> Result<TransitionVersionState> {
-    if !contains_key_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE) {
-        return Ok(TransitionVersionState::Unknown);
-    }
-    let value = get_consistent_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE).ok_or(Error::FileCorrupt)?;
-    let state = match value {
-        b"known-disabled" => TransitionVersionState::KnownDisabled,
-        b"suspended-null" => TransitionVersionState::SuspendedNull,
-        b"exact" => TransitionVersionState::Exact,
-        b"unknown" => TransitionVersionState::Unknown,
-        _ => return Err(Error::FileCorrupt),
-    };
+fn validate_transition_version_state(state: TransitionVersionState, version: Option<&str>) -> Result<()> {
     let valid = match state {
         TransitionVersionState::Unknown | TransitionVersionState::KnownDisabled => version.is_none(),
         TransitionVersionState::SuspendedNull => version == Some("null"),
         TransitionVersionState::Exact => version.is_some_and(|value| value != "null"),
     };
-    valid.then_some(state).ok_or(Error::FileCorrupt)
+    valid.then_some(()).ok_or(Error::FileCorrupt)
 }
 
-fn transition_version_state_bytes(state: TransitionVersionState) -> &'static [u8] {
-    match state {
-        TransitionVersionState::Unknown => b"unknown",
-        TransitionVersionState::KnownDisabled => b"known-disabled",
-        TransitionVersionState::SuspendedNull => b"suspended-null",
-        TransitionVersionState::Exact => b"exact",
+#[derive(Default)]
+struct DerivedInternalMetadata<'a> {
+    checksum: Option<&'a [u8]>,
+    part_checksums: Option<&'a [u8]>,
+    transition_status: Option<&'a [u8]>,
+    transitioned_object: Option<&'a [u8]>,
+    transitioned_version: Option<&'a [u8]>,
+    transitioned_version_state: Option<&'a [u8]>,
+    transition_tier: Option<&'a [u8]>,
+}
+
+impl<'a> DerivedInternalMetadata<'a> {
+    fn from_meta_sys(meta_sys: &'a HashMap<String, Vec<u8>>) -> Result<Self> {
+        let mut metadata = Self::default();
+        for (key, value) in meta_sys {
+            let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
+                continue;
+            };
+            let slot = if suffix.eq_ignore_ascii_case(SUFFIX_CRC) {
+                &mut metadata.checksum
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_PART_CHECKSUMS) {
+                &mut metadata.part_checksums
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITION_STATUS) {
+                &mut metadata.transition_status
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_OBJECTNAME) {
+                &mut metadata.transitioned_object
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
+                &mut metadata.transitioned_version
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_STATE) {
+                &mut metadata.transitioned_version_state
+            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITION_TIER) {
+                &mut metadata.transition_tier
+            } else {
+                continue;
+            };
+            if slot.is_some_and(|current| current != value.as_slice()) {
+                return Err(Error::FileCorrupt);
+            }
+            *slot = Some(value.as_slice());
+        }
+        Ok(metadata)
+    }
+}
+
+struct UniquePartChecksums(HashMap<String, String>);
+
+impl<'de> serde::Deserialize<'de> for UniquePartChecksums {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniquePartChecksumsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for UniquePartChecksumsVisitor {
+            type Value = UniquePartChecksums;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of unique checksum name and value pairs")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut checksums = HashMap::with_capacity(seq.size_hint().unwrap_or_default());
+                while let Some((key, value)) = seq.next_element::<(String, String)>()? {
+                    if checksums.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate part checksum name"));
+                    }
+                }
+                Ok(UniquePartChecksums(checksums))
+            }
+        }
+
+        deserializer.deserialize_seq(UniquePartChecksumsVisitor)
+    }
+}
+
+impl FileInfo {
+    pub fn hydrate_data_movement_part_checksums(&mut self) -> Result<()> {
+        let present = self
+            .metadata
+            .keys()
+            .any(|key| has_internal_suffix(key, SUFFIX_PART_CHECKSUMS));
+        if !present {
+            return Ok(());
+        }
+        let encoded = rustfs_utils::http::get_consistent_str(&self.metadata, SUFFIX_PART_CHECKSUMS).ok_or(Error::FileCorrupt)?;
+        let persisted = serde_json::from_str::<Vec<(usize, UniquePartChecksums)>>(encoded).map_err(|_| Error::FileCorrupt)?;
+        let mut part_indices = HashMap::with_capacity(self.parts.len());
+        for (index, part) in self.parts.iter().enumerate() {
+            if part_indices.insert(part.number, index).is_some() {
+                return Err(Error::FileCorrupt);
+            }
+        }
+        for (part_number, UniquePartChecksums(checksums)) in persisted {
+            let index = part_indices.remove(&part_number).ok_or(Error::FileCorrupt)?;
+            let part = self.parts.get_mut(index).ok_or(Error::FileCorrupt)?;
+            part.checksums = Some(checksums);
+        }
+        Ok(())
     }
 }
 
@@ -322,19 +415,8 @@ fn set_transition_version_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: 
     if state == TransitionVersionState::Unknown {
         remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
     } else {
-        insert_bytes(
-            meta_sys,
-            SUFFIX_TRANSITIONED_VERSION_STATE,
-            transition_version_state_bytes(state).to_vec(),
-        );
+        insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
     }
-}
-
-fn legacy_transitioned_version_id_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Option<Uuid> {
-    transitioned_version_from_meta_sys(meta_sys)
-        .ok()
-        .flatten()
-        .and_then(|value| Uuid::parse_str(&value).ok())
 }
 
 fn transitioned_version_bytes(fi: &FileInfo) -> Option<Vec<u8>> {
@@ -447,6 +529,17 @@ impl FileMetaShallowVersion {
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         self.parse_version_meta()?.into_fileinfo(volume, path, all_parts)
+    }
+
+    pub(super) fn into_fileinfo_with_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        self.parse_version_meta()?
+            .into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)
     }
 }
 
@@ -769,6 +862,16 @@ impl FileMetaVersion {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
+        self.into_fileinfo_with_part_checksums(volume, path, all_parts, true)
+    }
+
+    pub(super) fn into_fileinfo_with_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
         // Only the Object arm carries part arrays and can fail the length guard; the
         // Legacy and Delete arms have no part arrays and stay infallible.
         let mut fi = match self.version_type {
@@ -788,7 +891,7 @@ impl FileMetaVersion {
                 self.object
                     .as_ref()
                     .unwrap_or(&default_object)
-                    .into_fileinfo(volume, path, all_parts)?
+                    .into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)?
             }
             VersionType::Delete => {
                 let default_marker = MetaDeleteMarker::default();
@@ -2390,7 +2493,18 @@ impl MetaObject {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
+        self.into_fileinfo_with_part_checksums(volume, path, all_parts, true)
+    }
+
+    fn into_fileinfo_with_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
         let version_id = self.version_id.filter(|&vid| !vid.is_nil());
+        let derived_metadata = DerivedInternalMetadata::from_meta_sys(&self.meta_sys)?;
 
         let parts = if all_parts {
             let n = self.part_numbers.len();
@@ -2474,7 +2588,10 @@ impl MetaObject {
             }
         }
 
-        let checksum = get_bytes(&self.meta_sys, SUFFIX_CRC).map(Bytes::from);
+        let checksum = derived_metadata
+            .checksum
+            .filter(|checksum| !checksum.is_empty())
+            .map(Bytes::copy_from_slice);
 
         let erasure = ErasureInfo {
             algorithm: self.erasure_algorithm.to_string(),
@@ -2486,20 +2603,29 @@ impl MetaObject {
             ..Default::default()
         };
 
-        let transition_status = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
-            .map(|v| String::from_utf8_lossy(&v).to_string())
+        let transition_status = derived_metadata
+            .transition_status
+            .filter(|value| !value.is_empty())
+            .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
-        let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
-            .map(|v| String::from_utf8_lossy(&v).to_string())
+        let transitioned_objname = derived_metadata
+            .transitioned_object
+            .filter(|value| !value.is_empty())
+            .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
-        let transition_version = transitioned_version_from_meta_sys(&self.meta_sys)?;
-        let transition_version_state = transition_version_state_from_meta_sys(&self.meta_sys, transition_version.as_deref())?;
+        let transition_version_state = transition_version_state_from_bytes(derived_metadata.transitioned_version_state)?;
+        let transition_version = transitioned_version_from_bytes(derived_metadata.transitioned_version, transition_version_state);
+        if derived_metadata.transitioned_version_state.is_some() {
+            validate_transition_version_state(transition_version_state, transition_version.as_deref())?;
+        }
         let transition_version_id = transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
-        let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
-            .map(|v| String::from_utf8_lossy(&v).to_string())
+        let transition_tier = derived_metadata
+            .transition_tier
+            .filter(|value| !value.is_empty())
+            .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
 
-        Ok(FileInfo {
+        let mut file_info = FileInfo {
             version_id,
             erasure,
             data_dir: self.data_dir,
@@ -2519,7 +2645,11 @@ impl MetaObject {
             transition_version_state,
             transition_tier,
             ..Default::default()
-        })
+        };
+        if all_parts && include_part_checksums {
+            file_info.hydrate_data_movement_part_checksums()?;
+        }
+        Ok(file_info)
     }
 
     pub fn set_transition(&mut self, fi: &FileInfo) {
@@ -2710,39 +2840,31 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
             continue;
         }
 
-        let sub_key_opt = strip_internal_prefix(k);
-        if let Some(ref sub_key) = sub_key_opt {
-            match sub_key.as_str() {
-                "replica-timestamp" => {
-                    has = true;
-                    rs.replica_timestamp = Some(OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
-                }
-                "replica-status" => {
-                    has = true;
-                    rs.replica_status = ReplicationStatusType::from(v.as_str());
-                }
-                "replication-timestamp" => {
-                    has = true;
-                    rs.replication_timestamp = Some(OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-                }
-                "replication-status" => {
-                    has = true;
-                    rs.replication_status_internal = Some(v.clone());
-                    rs.targets = replication_statuses_map(v.as_str());
-                }
-                _ => {
-                    if let Some(arn) = sub_key.strip_prefix("replication-reset-") {
-                        has = true;
-                        // Store the canonical full-header key so the map matches
-                        // the key `target_reset_header()` produces on the
-                        // write/lookup side. Storing the bare ARN keyed the map
-                        // inconsistently (bare on read, full on write), which
-                        // could drop reset state across merge/reflatten cycles
-                        // (backlog#799 B16).
-                        rs.reset_statuses_map
-                            .insert(crate::replication::target_reset_header(arn), v.clone());
-                    }
-                }
+        if let Some(sub_key) = strip_internal_prefix_preserving_case(k) {
+            if sub_key.eq_ignore_ascii_case(SUFFIX_REPLICA_TIMESTAMP) {
+                has = true;
+                rs.replica_timestamp = Some(parse_replication_timestamp(v).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+            } else if sub_key.eq_ignore_ascii_case(SUFFIX_REPLICA_STATUS) {
+                has = true;
+                rs.replica_status = ReplicationStatusType::from(v.as_str());
+            } else if sub_key.eq_ignore_ascii_case(SUFFIX_REPLICATION_TIMESTAMP) {
+                has = true;
+                rs.replication_timestamp = Some(parse_replication_timestamp(v).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+            } else if sub_key.eq_ignore_ascii_case(SUFFIX_REPLICATION_STATUS) {
+                has = true;
+                rs.replication_status_internal = Some(v.clone());
+                rs.targets = replication_statuses_map(v.as_str());
+            } else if let Some(arn) = rustfs_utils::http::internal_key_strip_suffix_prefix(k, SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            {
+                has = true;
+                // Store the canonical full-header key so the map matches
+                // the key `target_reset_header()` produces on the
+                // write/lookup side. Storing the bare ARN keyed the map
+                // inconsistently (bare on read, full on write), which
+                // could drop reset state across merge/reflatten cycles
+                // (backlog#799 B16).
+                rs.reset_statuses_map
+                    .insert(crate::replication::target_reset_header(&arn), v.clone());
             }
         }
     }
@@ -2808,19 +2930,30 @@ impl MetaDeleteMarker {
 
         if self.free_version() {
             fi.set_tier_free_version();
-            fi.transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
-                .map(|v| String::from_utf8_lossy(&v).to_string())
-                .unwrap_or_default();
-
-            fi.transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
-                .map(|v| String::from_utf8_lossy(&v).to_string())
-                .unwrap_or_default();
-
-            fi.transition_version = transitioned_version_from_meta_sys(&self.meta_sys).ok().flatten();
-            fi.transition_version_id = legacy_transitioned_version_id_from_meta_sys(&self.meta_sys);
-            fi.transition_version_state =
-                transition_version_state_from_meta_sys(&self.meta_sys, fi.transition_version.as_deref())
+            if let Ok(derived_metadata) = DerivedInternalMetadata::from_meta_sys(&self.meta_sys) {
+                fi.transition_tier = derived_metadata
+                    .transition_tier
+                    .filter(|value| !value.is_empty())
+                    .map(|value| String::from_utf8_lossy(value).to_string())
+                    .unwrap_or_default();
+                fi.transitioned_objname = derived_metadata
+                    .transitioned_object
+                    .filter(|value| !value.is_empty())
+                    .map(|value| String::from_utf8_lossy(value).to_string())
+                    .unwrap_or_default();
+                fi.transition_version_state = transition_version_state_from_bytes(derived_metadata.transitioned_version_state)
                     .unwrap_or(TransitionVersionState::Unknown);
+                fi.transition_version =
+                    transitioned_version_from_bytes(derived_metadata.transitioned_version, fi.transition_version_state);
+                fi.transition_version_id = fi.transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
+                if derived_metadata.transitioned_version_state.is_some()
+                    && validate_transition_version_state(fi.transition_version_state, fi.transition_version.as_deref()).is_err()
+                {
+                    fi.transition_version = None;
+                    fi.transition_version_id = None;
+                    fi.transition_version_state = TransitionVersionState::Unknown;
+                }
+            }
         }
 
         fi
@@ -2941,6 +3074,13 @@ impl From<FileInfo> for MetaDeleteMarker {
             if !is_internal_key(key) || is_skip_meta_key(key) {
                 continue;
             }
+            if rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_REPLICATION_RESET_ARN_PREFIX).is_some()
+                || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
+                    .is_some()
+            {
+                meta_sys.insert(key.clone(), metadata_value.as_bytes().to_vec());
+                continue;
+            }
             let Some(suffix) = strip_internal_prefix(key) else {
                 continue;
             };
@@ -2981,6 +3121,11 @@ impl From<FileInfo> for MetaDeleteMarker {
         }
         if !value.transition_tier.is_empty() {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
+        }
+        if let Some(state) = value.replication_state_internal.as_ref() {
+            persist_delete_marker_replication_state(&mut meta_sys, state);
+            persist_reset_statuses(&mut meta_sys, &state.reset_statuses_map);
+            persist_target_delete_marker_versions(&mut meta_sys, &state.target_delete_marker_version_ids, &value.metadata);
         }
         Self {
             version_id: value.version_id,
@@ -3278,6 +3423,7 @@ pub fn file_info_from_raw(
         FileInfoOpts {
             data: read_data,
             include_free_versions,
+            include_part_checksums: true,
         },
     )
 }
@@ -3285,6 +3431,7 @@ pub fn file_info_from_raw(
 pub struct FileInfoOpts {
     pub data: bool,
     pub include_free_versions: bool,
+    pub include_part_checksums: bool,
 }
 
 pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
@@ -3309,7 +3456,11 @@ pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opt
         });
     }
 
-    let fi = meta.into_fileinfo(volume, path, version_id, opts.data, opts.include_free_versions, true)?;
+    let fi = if opts.include_part_checksums {
+        meta.into_fileinfo(volume, path, version_id, opts.data, opts.include_free_versions, true)?
+    } else {
+        meta.into_fileinfo_without_part_checksums(volume, path, version_id, opts.data, opts.include_free_versions)?
+    };
     Ok(fi)
 }
 
@@ -3555,6 +3706,54 @@ mod tests {
         assert!(!converted.meta_sys.contains_key("content-type"));
     }
 
+    #[test]
+    fn delete_marker_conversion_does_not_lowercase_dynamic_replication_targets() {
+        let arn = "arn:rustfs:replication:us-east-1:TenantA:bucket";
+        let reset_suffix = format!("{SUFFIX_REPLICATION_RESET_ARN_PREFIX}{arn}");
+        let version_suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let mut marker = FileInfo::default();
+        marker.metadata.insert(
+            format!("{}{reset_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "2026-08-12T00:00:00Z;COMPLETED".to_string(),
+        );
+        marker.metadata.insert(
+            format!("{}{version_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "remote-version".to_string(),
+        );
+        marker.replication_state_internal = get_internal_replication_state(&marker.metadata);
+
+        let converted = MetaDeleteMarker::from(marker);
+
+        assert!(converted.meta_sys.keys().any(|key| key.ends_with(&reset_suffix)));
+        assert!(converted.meta_sys.keys().any(|key| key.ends_with(&version_suffix)));
+        assert!(!converted.meta_sys.keys().any(|key| key.contains("tenanta")));
+
+        let mut conflicting = FileInfo::default();
+        conflicting
+            .metadata
+            .insert(format!("{RUSTFS_INTERNAL_PREFIX}{version_suffix}"), "remote-version-a".to_string());
+        conflicting.metadata.insert(
+            format!("{}{version_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "remote-version-b".to_string(),
+        );
+        conflicting.replication_state_internal = get_internal_replication_state(&conflicting.metadata);
+        assert!(
+            conflicting
+                .replication_state_internal
+                .as_ref()
+                .is_some_and(|state| state.target_delete_marker_version_ids_corrupt)
+        );
+
+        let roundtrip = MetaDeleteMarker::from(conflicting).into_fileinfo("bucket", "object", false);
+        assert!(
+            roundtrip
+                .replication_state_internal
+                .as_ref()
+                .is_some_and(|state| state.target_delete_marker_version_ids_corrupt),
+            "conflicting dynamic aliases must remain corrupt across persistence"
+        );
+    }
+
     #[derive(Serialize)]
     enum LegacyDeleteVersionTypeFixture {
         #[serde(rename = "DeleteMarker")]
@@ -3661,6 +3860,122 @@ mod tests {
         let obj = object_with_parts(vec![1, 2], vec![10], vec![10, 20]);
         let res = obj.into_fileinfo("bucket", "key", true);
         assert!(matches!(res, Err(Error::FileCorrupt)), "short part_sizes must map to FileCorrupt");
+    }
+
+    #[test]
+    fn into_fileinfo_rejects_conflicting_derived_internal_aliases() {
+        for suffix in [
+            SUFFIX_CRC,
+            SUFFIX_TRANSITION_STATUS,
+            SUFFIX_TRANSITIONED_OBJECTNAME,
+            SUFFIX_TRANSITIONED_VERSION_ID,
+            SUFFIX_TRANSITIONED_VERSION_STATE,
+            SUFFIX_TRANSITION_TIER,
+        ] {
+            let mut meta_sys = HashMap::from([(format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), vec![0xff, 1])]);
+            meta_sys.insert(format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX), vec![0xfe, 2]);
+            let object = MetaObject {
+                meta_sys,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                object
+                    .into_fileinfo("bucket", "key", false)
+                    .expect_err("conflicting aliases must fail closed"),
+                Error::FileCorrupt,
+                "suffix {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn into_fileinfo_recovers_noncanonical_binary_checksum_alias() {
+        let checksum = vec![0xff, 0x00, 0x80, 0x01];
+        let object = MetaObject {
+            meta_sys: HashMap::from([("X-Minio-Internal-crc".to_string(), checksum.clone())]),
+            ..Default::default()
+        };
+
+        let file_info = object
+            .into_fileinfo("bucket", "key", false)
+            .expect("a single legacy checksum alias should remain readable");
+
+        assert_eq!(file_info.checksum.as_deref(), Some(checksum.as_slice()));
+    }
+
+    #[test]
+    fn into_fileinfo_recovers_data_movement_part_checksums() {
+        let mut object = object_with_parts(vec![1], vec![16], vec![16]);
+        insert_bytes(&mut object.meta_sys, SUFFIX_PART_CHECKSUMS, br#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_vec());
+
+        let file_info = object
+            .into_fileinfo("bucket", "key", true)
+            .expect("data movement part checksums should decode");
+
+        assert_eq!(
+            file_info.parts[0]
+                .checksums
+                .as_ref()
+                .and_then(|checksums| checksums.get("CRC32C"))
+                .map(String::as_str),
+            Some("AAAAAA==")
+        );
+
+        let mut deferred = object
+            .into_fileinfo_with_part_checksums("bucket", "key", true, false)
+            .expect("quorum candidates should retain raw checksum metadata");
+        assert!(deferred.parts[0].checksums.is_none());
+        deferred
+            .hydrate_data_movement_part_checksums()
+            .expect("the selected candidate should hydrate checksums once");
+        assert_eq!(deferred.parts[0].checksums, file_info.parts[0].checksums);
+
+        insert_bytes(&mut object.meta_sys, SUFFIX_PART_CHECKSUMS, b"not-json".to_vec());
+        assert_eq!(
+            object
+                .into_fileinfo("bucket", "key", true)
+                .expect_err("malformed data movement part checksums must fail closed"),
+            Error::FileCorrupt
+        );
+
+        for encoded in [
+            br#"[[1,[["CRC32C","AAAAAA=="]]],[1,[["CRC32C","BBBBBB=="]]]]"#.as_slice(),
+            br#"[[1,[["CRC32C","AAAAAA=="],["CRC32C","BBBBBB=="]]]]"#.as_slice(),
+        ] {
+            insert_bytes(&mut object.meta_sys, SUFFIX_PART_CHECKSUMS, encoded.to_vec());
+            assert_eq!(
+                object
+                    .into_fileinfo("bucket", "key", true)
+                    .expect_err("duplicate part checksum keys must fail closed"),
+                Error::FileCorrupt
+            );
+        }
+
+        insert_bytes(&mut object.meta_sys, SUFFIX_PART_CHECKSUMS, br#"[[2,[["CRC32C","AAAAAA=="]]]]"#.to_vec());
+        assert_eq!(
+            object
+                .into_fileinfo("bucket", "key", true)
+                .expect_err("a sidecar for an unknown part must fail closed"),
+            Error::FileCorrupt
+        );
+
+        object.meta_sys = HashMap::from([
+            (
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_PART_CHECKSUMS}"),
+                br#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_vec(),
+            ),
+            (
+                format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_PART_CHECKSUMS),
+                br#"[[1,[["CRC32C","BBBBBB=="]]]]"#.to_vec(),
+            ),
+        ]);
+        assert_eq!(
+            object
+                .into_fileinfo("bucket", "key", true)
+                .expect_err("conflicting sidecar aliases must fail closed"),
+            Error::FileCorrupt
+        );
     }
 
     #[test]
@@ -4231,6 +4546,31 @@ mod tests {
     }
 
     #[test]
+    fn meta_object_transition_exact_rejects_legacy_raw_uuid_encoding() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, sample_version_id().as_bytes().to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"exact".to_vec());
+
+        let err = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect_err("exact remote versions must use their UTF-8 provider representation");
+
+        assert_eq!(err, Error::FileCorrupt);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_mixed_case_alias_is_recovered() {
+        let id = sample_version_id();
+        let sys = HashMap::from([("X-Minio-Internal-transitioned-versionID".to_string(), id.as_bytes().to_vec())]);
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("a legacy mixed-case transition version alias should decode");
+
+        assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
+    }
+
+    #[test]
     fn meta_object_transition_version_id_opaque_text_is_preserved() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"opaque-generation-42".to_vec());
@@ -4271,14 +4611,36 @@ mod tests {
                 .map(Vec::as_slice),
             Some(b"exact".as_slice())
         );
+        let persisted_version = get_consistent_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID);
         assert_eq!(
-            legacy_transitioned_version_id_from_meta_sys(&object.meta_sys),
+            transitioned_version_from_bytes(persisted_version.as_deref(), TransitionVersionState::Unknown)
+                .and_then(|value| Uuid::parse_str(&value).ok()),
             Some(id),
             "UUID exact writes must remain readable by the legacy UUID consumer"
         );
         let decoded = object.into_fileinfo("b", "k", false).expect("exact state should round trip");
         assert_eq!(decoded.transition_version_state, TransitionVersionState::Exact);
         assert_eq!(decoded.transition_version.as_deref(), Some(expected_version.as_str()));
+    }
+
+    #[test]
+    fn meta_object_transition_version_state_exact_preserves_sixteen_byte_opaque_text() {
+        let expected_version = "opaque.wasabi_01";
+        assert_eq!(expected_version.len(), 16);
+        let fi = FileInfo {
+            transition_status: "complete".to_string(),
+            transition_version: Some(expected_version.to_string()),
+            transition_version_state: TransitionVersionState::Exact,
+            ..Default::default()
+        };
+
+        let decoded = MetaObject::from(fi)
+            .into_fileinfo("b", "k", false)
+            .expect("exact opaque transition version should round trip");
+
+        assert_eq!(decoded.transition_version.as_deref(), Some(expected_version));
+        assert_eq!(decoded.transition_version_id, None);
+        assert_eq!(decoded.transition_version_state, TransitionVersionState::Exact);
     }
 
     #[test]
@@ -4433,6 +4795,61 @@ mod tests {
 
         assert_eq!(fi.transition_version_id, Some(id));
         assert_eq!(fi.transition_version, Some(id.to_string()));
+    }
+
+    #[test]
+    fn delete_marker_free_version_recovers_mixed_case_transition_aliases() {
+        let id = sample_version_id();
+        let id_text = id.to_string();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        for (suffix, value) in [
+            (SUFFIX_TRANSITIONED_VERSION_ID, id_text.as_bytes()),
+            (SUFFIX_TRANSITIONED_VERSION_STATE, b"exact".as_slice()),
+            (SUFFIX_TRANSITION_TIER, b"WARM".as_slice()),
+            (SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".as_slice()),
+        ] {
+            sys.insert(format!("X-Minio-Internal-{suffix}"), value.to_vec());
+        }
+
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
+        assert_eq!(fi.transition_version_id, Some(id));
+        assert_eq!(fi.transition_version, Some(id.to_string()));
+        assert_eq!(fi.transition_version_state, TransitionVersionState::Exact);
+        assert_eq!(fi.transition_tier, "WARM");
+        assert_eq!(fi.transitioned_objname, "remote-object");
+    }
+
+    #[test]
+    fn delete_marker_free_version_rejects_conflicting_transition_aliases() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        sys.insert(
+            format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}"),
+            b"source-version".to_vec(),
+        );
+        sys.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_TRANSITIONED_VERSION_ID),
+            b"target-version".to_vec(),
+        );
+
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
+        assert_eq!(fi.transition_version, None);
+        assert_eq!(fi.transition_version_state, TransitionVersionState::Unknown);
+        assert!(fi.transition_tier.is_empty());
+        assert!(fi.transitioned_objname.is_empty());
     }
 
     #[test]
@@ -4758,7 +5175,7 @@ mod tests {
 
     #[test]
     fn target_delete_marker_version_metadata_is_forward_and_backward_compatible() {
-        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let arn = "arn:rustfs:replication:us-east-1:TenantA:bucket";
         let suffix = format!("{}{arn}", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX);
         let mut metadata = HashMap::from([(format!("{RUSTFS_INTERNAL_PREFIX}replication-status"), format!("{arn}=COMPLETED;"))]);
 
@@ -4803,7 +5220,7 @@ mod tests {
         // must keep it keyed by `target_reset_header(arn)` (not the bare ARN) so
         // `ReplicationState::target_state` finds it after a round trip
         // (backlog#799 B16).
-        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let arn = "arn:rustfs:replication:us-east-1:TenantA:bucket";
         let ts = "2026-06-30T00:00:00Z;reset-1".to_string();
         let key = crate::replication::target_reset_header(arn);
         let mut metadata = HashMap::new();
@@ -4820,6 +5237,33 @@ mod tests {
             ts,
             "lookup must find the round-tripped reset status"
         );
+    }
+
+    #[test]
+    fn get_internal_replication_state_accepts_rfc3339_and_rustfs_display_timestamps() {
+        let replica_timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let replication_timestamp = replica_timestamp + time::Duration::SECOND;
+        let metadata = HashMap::from([
+            (format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICA_STATUS}"), "REPLICA".to_string()),
+            (
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICA_TIMESTAMP}"),
+                replica_timestamp.to_string(),
+            ),
+            (
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICATION_STATUS}"),
+                "arn:rustfs:replication:us-east-1:TenantA:bucket=COMPLETED;".to_string(),
+            ),
+            (
+                format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_REPLICATION_TIMESTAMP}"),
+                replication_timestamp
+                    .format(&Rfc3339)
+                    .expect("RFC3339 timestamp should format"),
+            ),
+        ]);
+
+        let state = get_internal_replication_state(&metadata).expect("replication metadata should parse");
+        assert_eq!(state.replica_timestamp, Some(replica_timestamp));
+        assert_eq!(state.replication_timestamp, Some(replication_timestamp));
     }
 
     // ---- Header signature (backlog#861 / B12) ----

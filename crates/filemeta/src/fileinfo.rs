@@ -232,6 +232,17 @@ pub enum TransitionVersionState {
     Exact,
 }
 
+impl TransitionVersionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::KnownDisabled => "known-disabled",
+            Self::SuspendedNull => "suspended-null",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub volume: String,

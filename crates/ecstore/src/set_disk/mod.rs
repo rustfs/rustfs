@@ -3738,8 +3738,10 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
     if opts.version_id.is_some() {
         // Decommission/rebalance may recreate a delete marker on a new pool before that
         // exact version exists there, so we must still treat it as a mark-delete write.
-        if opts.data_movement && opts.delete_marker && !version_found {
+        let data_movement_missing_delete_marker = opts.data_movement && opts.delete_marker && !version_found;
+        if data_movement_missing_delete_marker {
             mark_delete = true;
+            delete_marker = true;
         }
 
         let delete_marker_version_purge = version_found && goi.delete_marker && !opts.version_purge_status().is_empty();
@@ -3748,7 +3750,10 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
             mark_delete = false;
         }
 
-        if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
+        if !data_movement_missing_delete_marker
+            && opts.version_purge_status().is_empty()
+            && opts.delete_marker_replication_status().is_empty()
+        {
             mark_delete = false;
         }
 
@@ -3790,6 +3795,19 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let storage_class_config = self.storage_class_config_snapshot();
+        let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+            && opts.bucket_lifecycle_lock_fence.is_none()
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+        {
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let _lock_guard = if !opts.no_lock {
             Some(
                 self.new_ns_lock(bucket, object)
@@ -3801,6 +3819,12 @@ impl SetDisks {
         } else {
             None
         };
+
+        if opts.http_preconditions.is_some()
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
+        }
 
         let disks = self.disks.read().await.clone();
         let storage_class = opts.user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str);
@@ -3814,6 +3838,20 @@ impl SetDisks {
         )?;
         let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
         let write_quorum = layout.write_quorum;
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+            || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "decommission_tiered_object_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
         let parts_metadata = vec![fi.clone(); disks.len()];
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
@@ -5210,6 +5248,22 @@ mod tests {
     fn resolve_delete_version_state_creates_marker_for_missing_latest_versioned_delete() {
         let opts = ObjectOptions {
             versioned: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(mark_delete);
+        assert!(delete_marker);
+    }
+
+    #[test]
+    fn resolve_delete_version_state_creates_missing_suspended_data_movement_marker() {
+        let opts = ObjectOptions {
+            version_suspended: true,
+            version_id: Some(Uuid::nil().to_string()),
+            data_movement: true,
+            delete_marker: true,
             ..Default::default()
         };
 
@@ -6902,6 +6956,7 @@ mod tests {
             rustfs_filemeta::FileInfoOpts {
                 data: false,
                 include_free_versions: false,
+                include_part_checksums: true,
             },
         )
         .expect("test file metadata should decode as file info")
@@ -7030,20 +7085,92 @@ mod tests {
     fn test_latest_fileinfo_selection_preserves_degraded_read_quorum_without_competing_latest() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
-        let metas = vec![
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 1),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 2),
-            FileInfo::default(),
-            FileInfo::default(),
-        ];
+        let mut first = quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 1);
+        rustfs_utils::http::insert_str(
+            &mut first.metadata,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            r#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_string(),
+        );
+        let mut second = first.clone();
+        second.erasure.index = 2;
+        let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
         let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
 
-        let (_, selected, selected_quorum) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
-            .expect("read quorum should remain enough when no competing latest is visible");
+        let (_, mut selected, selected_quorum) =
+            SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+                .expect("read quorum should remain enough when no competing latest is visible");
 
         assert_eq!(selected_quorum, 2);
         assert_eq!(selected.data_dir, Some(data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag-old");
+        assert!(selected.parts[0].checksums.is_none());
+        SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect("requested part checksums should hydrate after winner selection");
+        assert_eq!(
+            selected.parts[0]
+                .checksums
+                .as_ref()
+                .and_then(|checksums| checksums.get("CRC32C"))
+                .map(String::as_str),
+            Some("AAAAAA==")
+        );
+    }
+
+    #[test]
+    fn test_degraded_fileinfo_selection_rejects_malformed_part_checksum_metadata() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let mut first = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+        rustfs_utils::http::insert_str(&mut first.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, "not-json".to_string());
+        let mut second = first.clone();
+        second.erasure.index = 2;
+        let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+
+        let (_, mut selected, _) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+            .expect("winner selection should defer sidecar decoding");
+        let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect_err("a malformed degraded winner must fail closed when checksums are requested");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn test_pick_valid_fileinfo_rejects_malformed_part_checksum_metadata() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let mut meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+        rustfs_utils::http::insert_str(&mut meta.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, "not-json".to_string());
+        let mut second = meta.clone();
+        second.erasure.index = 2;
+
+        let mut selected = SetDisks::pick_valid_fileinfo(&[meta, second], Some(mod_time), None, 2)
+            .expect("winner selection should defer sidecar decoding");
+        let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect_err("a malformed winning part-checksum sidecar must fail closed when checksums are requested");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn test_part_checksum_hydration_rejects_invalid_algorithm_and_value() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        for encoded in [
+            r#"[[1,[["UNKNOWN","AAAAAA=="]]]]"#,
+            r#"[[1,[["CRC32C","not-base64"]]]]"#,
+            r#"[[1,[["CRC32C","AA=="]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA==-0"]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA==-1"]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA=="],["crc32c","BBBBBB=="]]]]"#,
+        ] {
+            let mut meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+            rustfs_utils::http::insert_str(&mut meta.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, encoded.to_string());
+
+            let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut meta)
+                .expect_err("invalid persisted part checksum metadata must fail closed");
+            assert_eq!(err, DiskError::FileCorrupt);
+        }
     }
 
     #[test]
@@ -10578,6 +10705,20 @@ mod tests {
 
         assert!(marker.delete_marker);
         let marker_version = marker.version_id.expect("versioned delete marker should carry a version id");
+        let create_only = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks.check_write_precondition(bucket, object, &create_only).await,
+            Some(StorageError::PreconditionFailed),
+            "data movement must not replace a target delete marker"
+        );
         let err = match set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
             .await

@@ -2915,6 +2915,7 @@ async fn read_stale_multipart_candidate(
         FileInfoOpts {
             data: false,
             include_free_versions: false,
+            include_part_checksums: false,
         },
     ) {
         Ok(file_info) => (Some(file_info.metadata), file_info.mod_time),

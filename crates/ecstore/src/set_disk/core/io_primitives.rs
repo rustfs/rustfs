@@ -2442,13 +2442,14 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
         let disks = self.get_disks_internal().await;
         if disks.is_empty() {
             return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
         }
 
         let read_quorum = disks.len().div_ceil(2).max(1);
-        let (raw_fileinfos, errs) = Self::read_all_raw_file_info(&disks, bucket, object, false).await;
+        let (raw_fileinfos, errs) = Self::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), false).await;
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             let object_err = to_object_err(err.into(), vec![bucket, object]);
@@ -2604,7 +2605,7 @@ impl SetDisks {
         //
         // `into_fileinfo` with an empty version_id selects the first non-free version
         // (see FileMeta::into_fileinfo); replicate that selection from the header here.
-        let vid = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
+        let vid = match meta.into_fileinfo_without_part_checksums(bucket, object, "", true, incl_free_vers) {
             Ok(finfo) if file_info_is_valid_for_metadata(&finfo) => finfo.version_id.unwrap_or(Uuid::nil()),
             _ => match meta
                 .versions
@@ -2627,7 +2628,13 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
+                match meta.into_fileinfo_without_part_checksums(
+                    bucket,
+                    object,
+                    vid.to_string().as_str(),
+                    read_data,
+                    incl_free_vers,
+                ) {
                     Ok(res) => match res.validate_for_metadata_read() {
                         Ok(_) => meta_file_infos[idx] = res,
                         Err(err) => errs[idx] = Some(err.into()),
@@ -4530,9 +4537,10 @@ impl SetDisks {
 
         match oi {
             Ok(oi) => {
-                // If top level is a delete marker proceed to upload.
+                // Ordinary writes may proceed past a top-level delete marker;
+                // data movement must not replace an acknowledged deletion.
                 if oi.delete_marker {
-                    return None;
+                    return opts.data_movement.then_some(StorageError::PreconditionFailed);
                 }
                 let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
                 let if_match = http_preconditions.if_match_value().map(str::to_owned);
@@ -6386,6 +6394,32 @@ mod tests {
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].version_id, fi.version_id);
         assert_eq!(versions.versions[0].name, object);
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_encodes_directory_key_but_returns_logical_name() {
+        let bucket = "exact-directory-versions-bucket";
+        let object = "prefix/directory/";
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let mut fi = metadata_test_fileinfo(object);
+        fi.version_id = Some(Uuid::new_v4());
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        disk.write_metadata(bucket, bucket, disk_object.as_str(), fi.clone())
+            .await
+            .expect("directory metadata should be written under the encoded key");
+        let set = io_primitives_test_set(vec![Some(disk)], 0).await;
+
+        let versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("exact directory version load should succeed")
+            .expect("exact directory version load should find metadata");
+
+        assert_eq!(versions.name, object);
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].name, object);
+        assert_eq!(versions.versions[0].version_id, fi.version_id);
     }
 
     #[tokio::test]

@@ -206,11 +206,54 @@ fn persist_reset_statuses(meta_sys: &mut HashMap<String, Vec<u8>>, reset_statuse
     }
 }
 
+pub fn parse_replication_timestamp(value: &str) -> Option<OffsetDateTime> {
+    const DISPLAY_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[year sign:automatic]-[month]-[day] [hour padding:none]:[minute]:[second].[subsecond] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]"
+    );
+    OffsetDateTime::parse(value, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(value, DISPLAY_FORMAT))
+        .ok()
+}
+
+fn format_replication_timestamp(value: Option<OffsetDateTime>) -> String {
+    let value = value.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn persist_delete_marker_replication_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: &ReplicationState) {
+    if !state.replica_status.is_empty() {
+        insert_bytes(meta_sys, SUFFIX_REPLICA_STATUS, state.replica_status.as_str().as_bytes().to_vec());
+        insert_bytes(
+            meta_sys,
+            SUFFIX_REPLICA_TIMESTAMP,
+            format_replication_timestamp(state.replica_timestamp).into_bytes(),
+        );
+    }
+    if let Some(status) = state.replication_status_internal.as_ref().filter(|status| !status.is_empty()) {
+        insert_bytes(meta_sys, SUFFIX_REPLICATION_STATUS, status.as_bytes().to_vec());
+        insert_bytes(
+            meta_sys,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            format_replication_timestamp(state.replication_timestamp).into_bytes(),
+        );
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub versions: Vec<FileMetaShallowVersion>,
     pub data: InlineData,
     pub meta_ver: u8,
+}
+
+struct FileInfoDecodeOptions {
+    read_data: bool,
+    include_free_versions: bool,
+    all_parts: bool,
+    include_part_checksums: bool,
 }
 
 impl FileMeta {
@@ -511,53 +554,8 @@ impl FileMeta {
         }
 
         if fi.deleted {
-            if !fi.delete_marker_replication_status().is_empty()
-                && let Some(delete_marker) = ventry.delete_marker.as_mut()
-            {
-                if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICA_STATUS,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replica_status.clone())
-                            .unwrap_or_default()
-                            .as_str()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICA_TIMESTAMP,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                } else {
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICATION_STATUS,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replication_status_internal.clone().unwrap_or_default())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICATION_TIMESTAMP,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                }
+            if let (Some(delete_marker), Some(state)) = (ventry.delete_marker.as_mut(), fi.replication_state_internal.as_ref()) {
+                persist_delete_marker_replication_state(&mut delete_marker.meta_sys, state);
             }
 
             if !fi.version_purge_status().is_empty()
@@ -609,51 +607,8 @@ impl FileMeta {
                         }
 
                         if let Some(delete_marker) = v.delete_marker.as_mut() {
-                            if !fi.delete_marker_replication_status().is_empty() {
-                                if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICA_STATUS,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replica_status.clone())
-                                            .unwrap_or_default()
-                                            .as_str()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICA_TIMESTAMP,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                } else {
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICATION_STATUS,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replication_status_internal.clone().unwrap_or_default())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICATION_TIMESTAMP,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                }
+                            if let Some(state) = fi.replication_state_internal.as_ref() {
+                                persist_delete_marker_replication_state(&mut delete_marker.meta_sys, state);
                             }
 
                             if let Some(state) = fi.replication_state_internal.as_ref() {
@@ -774,6 +729,47 @@ impl FileMeta {
         include_free_versions: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
+        self.into_fileinfo_with_part_checksums(
+            volume,
+            path,
+            version_id,
+            FileInfoDecodeOptions {
+                read_data,
+                include_free_versions,
+                all_parts,
+                include_part_checksums: true,
+            },
+        )
+    }
+
+    pub fn into_fileinfo_without_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        read_data: bool,
+        include_free_versions: bool,
+    ) -> Result<FileInfo> {
+        self.into_fileinfo_with_part_checksums(
+            volume,
+            path,
+            version_id,
+            FileInfoDecodeOptions {
+                read_data,
+                include_free_versions,
+                all_parts: true,
+                include_part_checksums: false,
+            },
+        )
+    }
+
+    fn into_fileinfo_with_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: FileInfoDecodeOptions,
+    ) -> Result<FileInfo> {
         let vid = {
             if !version_id.is_empty() {
                 Uuid::parse_str(version_id)?
@@ -795,7 +791,7 @@ impl FileMeta {
 
             if header.free_version() {
                 non_free_versions -= 1;
-                if include_free_versions
+                if opts.include_free_versions
                     && found_free_version.is_none()
                     && let Ok(found_free_fi) = ver.parse_version_meta()
                     && found_free_fi.version_type != VersionType::Invalid
@@ -806,7 +802,12 @@ impl FileMeta {
                     // Known side effect: if a disk holds only free versions and they are
                     // corrupt, `into_fileinfo` falls through to `FileNotFound` (not
                     // `FileCorrupt`), so that disk is not enqueued for heal.
-                    match found_free_fi.into_fileinfo(volume, path, all_parts) {
+                    match found_free_fi.into_fileinfo_with_part_checksums(
+                        volume,
+                        path,
+                        opts.all_parts,
+                        opts.include_part_checksums,
+                    ) {
                         Ok(mut free_fi) => {
                             free_fi.is_latest = true;
                             found_free_version = Some(free_fi);
@@ -834,14 +835,14 @@ impl FileMeta {
 
             found = true;
 
-            let mut fi = ver.into_fileinfo(volume, path, all_parts)?;
+            let mut fi = ver.into_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)?;
             fi.is_latest = is_latest;
 
             if let Some(_d) = succ_mod_time {
                 fi.successor_mod_time = succ_mod_time;
             }
 
-            if read_data && fi.inline_data() {
+            if opts.read_data && fi.inline_data() {
                 fi.data = self.find_inline_data_for_version(fi.version_id)?.map(bytes::Bytes::from);
             }
 
@@ -850,7 +851,7 @@ impl FileMeta {
 
         if !found {
             if version_id.is_empty() {
-                if include_free_versions
+                if opts.include_free_versions
                     && non_free_versions == 0
                     && let Some(free_version) = found_free_version
                 {
@@ -1535,6 +1536,68 @@ mod test {
         assert_eq!(meta_sys2.get(&rustfs_key).map(Vec::as_slice), Some(ts.as_bytes()));
         assert_eq!(meta_sys2.get(&minio_key).map(Vec::as_slice), Some(ts.as_bytes()));
         assert_eq!(meta_sys2.len(), 2, "must not create a double-prefixed key");
+    }
+
+    #[test]
+    fn persist_delete_marker_replication_state_keeps_replica_and_target_statuses() {
+        let replica_timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let replication_timestamp = replica_timestamp + time::Duration::SECOND;
+        let state = ReplicationState {
+            replica_status: ReplicationStatusType::Replica,
+            replica_timestamp: Some(replica_timestamp),
+            replication_status_internal: Some("arn:target=COMPLETED;".to_string()),
+            replication_timestamp: Some(replication_timestamp),
+            ..Default::default()
+        };
+        let mut meta_sys = HashMap::new();
+        let replica_timestamp_string = replica_timestamp
+            .format(&Rfc3339)
+            .expect("timestamp should format as RFC3339");
+        let replication_timestamp_string = replication_timestamp
+            .format(&Rfc3339)
+            .expect("timestamp should format as RFC3339");
+
+        persist_delete_marker_replication_state(&mut meta_sys, &state);
+
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICA_STATUS).as_deref(),
+            Some(b"REPLICA".as_slice())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICA_TIMESTAMP).as_deref(),
+            Some(replica_timestamp_string.as_bytes())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICATION_STATUS).as_deref(),
+            Some(b"arn:target=COMPLETED;".as_slice())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICATION_TIMESTAMP).as_deref(),
+            Some(replication_timestamp_string.as_bytes())
+        );
+    }
+
+    #[test]
+    fn persist_delete_marker_replication_timestamp_normalizes_second_offset_to_utc() {
+        let timestamp = OffsetDateTime::UNIX_EPOCH.to_offset(time::UtcOffset::from_hms(5, 30, 15).expect("valid offset"));
+        assert_eq!(parse_replication_timestamp(&timestamp.to_string()), Some(timestamp));
+        let state = ReplicationState {
+            replica_status: ReplicationStatusType::Replica,
+            replica_timestamp: Some(timestamp),
+            replication_status_internal: Some("arn:target=COMPLETED;".to_string()),
+            replication_timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        let mut meta_sys = HashMap::new();
+
+        persist_delete_marker_replication_state(&mut meta_sys, &state);
+
+        for suffix in [SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_TIMESTAMP] {
+            let persisted = rustfs_utils::http::get_bytes(&meta_sys, suffix).expect("timestamp must be persisted");
+            let persisted = std::str::from_utf8(&persisted).expect("timestamp must be UTF-8");
+            assert_eq!(parse_replication_timestamp(persisted), Some(timestamp));
+            assert_ne!(persisted, OffsetDateTime::UNIX_EPOCH.to_string());
+        }
     }
 
     /// Regression test for rustfs/rustfs#2715: a corrupted version count in

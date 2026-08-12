@@ -466,6 +466,28 @@ impl SetDisks {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
     }
 
+    pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
+        for part in &fi.parts {
+            let Some(checksums) = part.checksums.as_ref() else {
+                continue;
+            };
+            let mut algorithms = HashSet::with_capacity(checksums.len());
+            for (name, value) in checksums {
+                let Some(checksum) = rustfs_rio::Checksum::new_from_string(name, value) else {
+                    return Err(DiskError::FileCorrupt);
+                };
+                if checksum.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !algorithms.insert(checksum.checksum_type.base().0) {
+                    return Err(DiskError::FileCorrupt);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {
         hasher.update(value.len().to_le_bytes());
         hasher.update(value);

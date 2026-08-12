@@ -66,6 +66,88 @@ fn ensure_multipart_bucket_lifecycle_guard_held(
     Ok(())
 }
 
+#[cfg(test)]
+struct DataMovementMultipartGuardBarrierState {
+    bucket: String,
+    pause_at_arrival: usize,
+    arrivals: std::sync::atomic::AtomicUsize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DataMovementMultipartGuardBarrier {
+    state: Arc<DataMovementMultipartGuardBarrierState>,
+}
+
+#[cfg(test)]
+static DATA_MOVEMENT_MULTIPART_GUARD_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DataMovementMultipartGuardBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DataMovementMultipartGuardBarrier {
+    pub(crate) fn install(bucket: &str, pause_at_arrival: usize) -> Self {
+        assert!(pause_at_arrival > 0, "data movement multipart guard barrier needs an arrival");
+        let state = Arc::new(DataMovementMultipartGuardBarrierState {
+            bucket: bucket.to_string(),
+            pause_at_arrival,
+            arrivals: std::sync::atomic::AtomicUsize::new(0),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart guard barrier mutex should not poison");
+        assert!(slot.is_none(), "data movement multipart guard barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("data movement multipart operation should pass the bucket guard");
+    }
+}
+
+#[cfg(test)]
+impl Drop for DataMovementMultipartGuardBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart guard barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_data_movement_multipart_after_bucket_guard(bucket: &str, opts: &ObjectOptions) {
+    if !opts.data_movement {
+        return;
+    }
+    let barrier = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("data movement multipart guard barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket)
+        .cloned();
+    if let Some(barrier) = barrier {
+        let arrival = barrier.arrivals.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if arrival != barrier.pause_at_arrival {
+            return;
+        }
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 async fn list_pool_multipart_uploads_for_incarnation(
     pool: &crate::core::sets::Sets,
     bucket: &str,
@@ -177,6 +259,8 @@ impl ECStore {
         if opts.expected_bucket_incarnation_id != Some(current) {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
+        #[cfg(test)]
+        Box::pin(pause_data_movement_multipart_after_bucket_guard(bucket, &opts)).await;
         Ok((opts, guard))
     }
 
@@ -332,7 +416,7 @@ impl ECStore {
     ) -> Result<MultipartUploadResult> {
         self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts)
             .await
-            .map(|(res, _)| res)
+            .map(|(res, _, _)| res)
     }
 
     pub(crate) async fn handle_new_multipart_upload_with_pool_idx(
@@ -340,7 +424,7 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> Result<(MultipartUploadResult, usize)> {
+    ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
         check_new_multipart_args(bucket, object)?;
         let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         let opts = &opts;
@@ -349,7 +433,20 @@ impl ECStore {
             return self.pools[0]
                 .new_multipart_upload(bucket, object, opts)
                 .await
-                .map(|res| (res, 0));
+                .map(|res| (res, 0, opts.expected_bucket_incarnation_id));
+        }
+
+        if opts.data_movement && opts.version_id.is_some() {
+            let idx = self.select_data_movement_pool_idx(bucket, object, -1, opts, false).await?;
+            if idx == opts.src_pool_idx {
+                return Err(StorageError::DataMovementOverwriteErr(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    opts.version_id.clone().unwrap_or_default(),
+                ));
+            }
+            let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+            return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
@@ -372,7 +469,7 @@ impl ECStore {
 
             if !res.uploads.is_empty() {
                 let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-                return Ok((res, idx));
+                return Ok((res, idx, opts.expected_bucket_incarnation_id));
             }
         }
         let idx = self.get_pool_idx(bucket, object, -1).await?;
@@ -385,7 +482,7 @@ impl ECStore {
         }
 
         let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-        Ok((res, idx))
+        Ok((res, idx, opts.expected_bucket_incarnation_id))
     }
 
     #[instrument(skip(self))]
@@ -454,6 +551,28 @@ impl ECStore {
         }
 
         Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+
+    pub(crate) async fn put_object_part_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        check_put_object_part_args(bucket, object, upload_id)?;
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart upload requires data_movement options"));
+        }
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
+        pool.put_object_part(bucket, object, upload_id, part_id, data, &opts).await
     }
 
     #[instrument(skip(self))]
@@ -530,6 +649,26 @@ impl ECStore {
         Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
+    pub(crate) async fn abort_multipart_upload_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_abort_multipart_args(bucket, object, upload_id)?;
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart abort requires data_movement options"));
+        }
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
+        pool.abort_multipart_upload(bucket, object, upload_id, &opts).await
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_complete_multipart_upload(
         self: Arc<Self>,
@@ -573,6 +712,37 @@ impl ECStore {
         }
 
         Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+
+    pub(crate) async fn complete_multipart_upload_for_data_movement(
+        self: Arc<Self>,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        check_complete_multipart_args(bucket, object, upload_id)?;
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart completion requires data_movement options"));
+        }
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?
+            .clone();
+        let result = enqueue_transition_after_write(
+            pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, &opts)
+                .await,
+            LcEventSrc::S3CompleteMultipartUpload,
+        )
+        .await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
+        }
+        result
     }
 }
 
