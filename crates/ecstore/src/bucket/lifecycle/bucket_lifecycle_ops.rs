@@ -79,8 +79,8 @@ use rustfs_common::metrics::{
 };
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
-    ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
+    ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
@@ -2017,18 +2017,25 @@ fn is_slow_down(err: &Error) -> bool {
     matches!(err, Error::SlowDown)
 }
 
-pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
-    //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS")
-        && let Ok(num_expirations) = env_expiration_workers.parse::<usize>()
-    {
-        workers = num_expirations;
+/// Resolves the expiry worker count from the single documented knob,
+/// `RUSTFS_MAX_EXPIRY_WORKERS`: a set, parsable, non-zero value wins;
+/// anything else falls back to `min(cpus, 16)`. The historical
+/// `_RUSTFS_ILM_EXPIRATION_WORKERS` silent override and the
+/// `RUSTFS_DEFAULT_EXPIRY_WORKERS` zero-fallback were undocumented, unset in
+/// every known deployment, and are removed (backlog#1832).
+fn expiry_worker_count() -> usize {
+    let default = std::cmp::min(num_cpus::get(), 16);
+    match env::var(ENV_MAX_EXPIRY_WORKERS) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(workers) if workers > 0 => workers,
+            _ => default,
+        },
+        Err(_) => default,
     }
+}
 
-    if workers == 0 {
-        workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
-    }
+pub async fn init_background_expiry(api: Arc<ECStore>) {
+    let workers = expiry_worker_count();
 
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
@@ -5086,6 +5093,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 
 #[cfg(test)]
 mod tests {
+    use super::expiry_worker_count;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -5169,6 +5177,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
+    use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
@@ -7165,6 +7174,63 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    // SAFETY: same contract as with_transition_worker_env — only used from
+    // `#[serial]` tests, so no concurrent reader/writer can access the process
+    // environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    fn with_expiry_worker_env<F>(value: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original = env::var_os(ENV_MAX_EXPIRY_WORKERS);
+
+        match value {
+            Some(v) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, v);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original {
+            Some(v) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, v);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// backlog#1832: the single expiry knob must resolve all four env states
+    /// (unset / zero / valid / garbage); the removed `_RUSTFS_ILM_EXPIRATION_WORKERS`
+    /// override and `RUSTFS_DEFAULT_EXPIRY_WORKERS` fallback must stay gone.
+    #[test]
+    #[serial]
+    fn expiry_worker_count_resolves_all_env_states() {
+        let default = std::cmp::min(num_cpus::get(), 16);
+
+        with_expiry_worker_env(None, || {
+            assert_eq!(expiry_worker_count(), default, "unset env must fall back to min(cpus, 16)");
+        });
+        with_expiry_worker_env(Some("0"), || {
+            assert_eq!(expiry_worker_count(), default, "zero must fall back instead of spawning zero workers");
+        });
+        with_expiry_worker_env(Some("4"), || {
+            assert_eq!(expiry_worker_count(), 4, "a valid positive value must win");
+        });
+        with_expiry_worker_env(Some("not-a-number"), || {
+            assert_eq!(expiry_worker_count(), default, "garbage must fall back to the default");
+        });
     }
 
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
