@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live RustFS store with a pre-seeded test object (bucket 'dandan')"]
     async fn test_simple_sql() {
         let sql = "select * from S3Object";
         let input = SelectObjectContentInput {
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live RustFS store with a pre-seeded test object (bucket 'dandan')"]
     async fn test_func_sql() {
         let sql = "SELECT * FROM S3Object s";
         let input = SelectObjectContentInput {
