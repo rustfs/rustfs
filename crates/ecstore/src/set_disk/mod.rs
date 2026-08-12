@@ -735,10 +735,41 @@ mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 
+pub(in crate::set_disk) enum GetObjectMetadata<T> {
+    Owned(T),
+    Shared(Arc<T>),
+}
+
+impl<T> std::ops::Deref for GetObjectMetadata<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl<T: Clone> GetObjectMetadata<T> {
+    fn into_owned(self) -> T {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
+        }
+    }
+}
+
+type GetObjectFileInfo = (
+    GetObjectMetadata<FileInfo>,
+    GetObjectMetadata<Vec<FileInfo>>,
+    GetObjectMetadata<Vec<Option<DiskStore>>>,
+);
+
 pub(crate) struct PreparedGetObjectMetadata {
-    fi: FileInfo,
-    files: Vec<FileInfo>,
-    disks: Vec<Option<DiskStore>>,
+    fi: GetObjectMetadata<FileInfo>,
+    files: GetObjectMetadata<Vec<FileInfo>>,
+    disks: GetObjectMetadata<Vec<Option<DiskStore>>>,
     object_info: Option<ObjectInfo>,
 }
 
@@ -807,9 +838,9 @@ mod prepared_get_object_metadata_tests {
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
         let metadata = PreparedGetObjectMetadata {
-            fi: FileInfo::default(),
-            files: Vec::new(),
-            disks: Vec::new(),
+            fi: GetObjectMetadata::Owned(FileInfo::default()),
+            files: GetObjectMetadata::Owned(Vec::new()),
+            disks: GetObjectMetadata::Owned(Vec::new()),
             object_info: None,
         };
 
@@ -2465,13 +2496,13 @@ impl Hash for GetObjectMetadataCacheKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
-    fi: FileInfo,
-    parts_metadata: Vec<FileInfo>,
-    online_disks: Vec<Option<DiskStore>>,
+    fi: Arc<FileInfo>,
+    parts_metadata: Arc<Vec<FileInfo>>,
+    online_disks: Arc<Vec<Option<DiskStore>>>,
     read_quorum: usize,
 }
 
