@@ -23,9 +23,10 @@ pub(crate) fn iam_error_to_s3_error(err: IamError) -> S3Error {
         | IamError::NoSuchTempAccount(_)
         | IamError::NoSuchGroup(_)
         | IamError::NoSuchPolicy => S3ErrorCode::NoSuchResource,
-        IamError::InvalidAccessKeyLength | IamError::InvalidSecretKeyLength | IamError::AccessKeyAlreadyExists => {
-            S3ErrorCode::InvalidArgument
-        }
+        IamError::InvalidAccessKeyLength
+        | IamError::InvalidSecretKeyLength
+        | IamError::AccessKeyAlreadyExists
+        | IamError::GroupNameContainsReservedChars => S3ErrorCode::InvalidArgument,
         _ => S3ErrorCode::InternalError,
     };
 
@@ -73,6 +74,15 @@ mod tests {
         assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
         assert_eq!(s3_error.message(), Some("access key is already in use"));
+    }
+
+    #[test]
+    fn reserved_group_name_maps_to_invalid_argument() {
+        let s3_error = iam_error_to_s3_error(IamError::GroupNameContainsReservedChars);
+
+        assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(s3_error.message(), Some("group name contains reserved characters =,"));
     }
 
     #[test]
