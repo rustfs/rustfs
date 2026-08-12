@@ -331,7 +331,14 @@ impl From<std::io::Error> for DiskError {
         }
         match e.downcast::<DiskError>() {
             Ok(disk_error) => disk_error,
-            Err(io_error) => DiskError::Io(io_error),
+            // Mirror `From<io::Error> for StorageError`: a StorageError boxed
+            // through `From<StorageError> for io::Error` must recover its typed
+            // classification instead of degrading to `DiskError::Io`, which
+            // quorum aggregation (`reduce_errs`) would count as a distinct error.
+            Err(io_error) => match io_error.downcast::<crate::error::StorageError>() {
+                Ok(storage_error) => storage_error.into(),
+                Err(io_error) => DiskError::Io(io_error),
+            },
         }
     }
 }
@@ -951,6 +958,27 @@ mod tests {
         // Convert io::Error back to DiskError
         let recovered_disk_error: DiskError = io_with_disk_error.into();
         assert_eq!(original_disk_error, recovered_disk_error);
+    }
+
+    #[test]
+    fn test_io_error_with_storage_error_inside() {
+        use crate::error::StorageError;
+
+        // An io::Error boxing a disk-representable StorageError (as produced by
+        // `From<StorageError> for io::Error`) must recover the typed DiskError
+        // variant instead of degrading to an opaque DiskError::Io.
+        let io_with_storage_error: std::io::Error = StorageError::FaultyRemoteDisk.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FaultyRemoteDisk);
+
+        let io_with_storage_error: std::io::Error = StorageError::FileAccessDenied.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FileAccessDenied);
+
+        // A StorageError with no DiskError analog stays an opaque Io error.
+        let io_with_bucket_error: std::io::Error = StorageError::BucketNotFound("bucket".to_string()).into();
+        let recovered: DiskError = io_with_bucket_error.into();
+        assert!(matches!(recovered, DiskError::Io(_)));
     }
 
     #[test]
