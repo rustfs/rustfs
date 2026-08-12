@@ -362,9 +362,9 @@ impl SetDisks {
             healing: true,
         };
         let checks = target_disks.into_iter().map(|disk| {
-            let read_options = read_options.clone();
+            let task_read_options = read_options;
             async move {
-                let file_info = match disk.read_version("", bucket, object, version_id, &read_options).await {
+                let file_info = match disk.read_version("", bucket, object, version_id, &task_read_options).await {
                     Ok(file_info) => file_info,
                     Err(
                         DiskError::DiskNotFound

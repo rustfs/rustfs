@@ -224,7 +224,7 @@ impl SetDisks {
         let bucket = bucket.to_string();
         let object = object.to_string();
         let version_id = version_id.to_string();
-        let opts = opts.clone();
+        let opts = *opts;
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -235,9 +235,9 @@ impl SetDisks {
                     let bucket = bucket.clone();
                     let object = object.clone();
                     let version_id = version_id.clone();
-                    let opts = opts.clone();
+                    let task_opts = opts;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &opts).await }
+                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
                 })
             })
             .collect();
