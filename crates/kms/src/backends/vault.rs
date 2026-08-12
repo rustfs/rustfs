@@ -2758,10 +2758,14 @@ mod tests {
         use crate::config::{BackendConfig, KmsConfig};
         use crate::types::{CancelKeyDeletionRequest, CreateKeyRequest, DeleteKeyRequest, KeyStatus, KeyUsage};
 
+        // A dev Vault speaks plain HTTP, which validate() refuses unless
+        // development mode is declared on the config itself — the env override
+        // is applied by the config loaders, not by Default::default().
         let kms_config = KmsConfig {
             backend_config: BackendConfig::VaultKv2(Box::new(integration_vault_config())),
             ..Default::default()
-        };
+        }
+        .with_insecure_development_defaults();
         let backend = VaultKmsBackend::new(kms_config).await.expect("backend");
 
         let key_id = format!("cancel-persist-{}", uuid::Uuid::new_v4());
