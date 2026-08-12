@@ -7998,8 +7998,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
-                None,
-                None,
+                crate::data_movement::SourceCleanupBucketFence::default(),
                 "test_data_movement",
             )
             .await
@@ -8061,8 +8060,10 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
-                None,
-                Some(&bucket_guard),
+                crate::data_movement::SourceCleanupBucketFence {
+                    expected_incarnation_id: None,
+                    lifecycle_guard: Some(&bucket_guard),
+                },
                 "test_data_movement",
             )
             .await;

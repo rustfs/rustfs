@@ -729,7 +729,7 @@ impl FileMeta {
         include_free_versions: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
-        self.into_fileinfo_with_part_checksums(
+        self.to_fileinfo_with_part_checksums(
             volume,
             path,
             version_id,
@@ -750,7 +750,7 @@ impl FileMeta {
         read_data: bool,
         include_free_versions: bool,
     ) -> Result<FileInfo> {
-        self.into_fileinfo_with_part_checksums(
+        self.to_fileinfo_with_part_checksums(
             volume,
             path,
             version_id,
@@ -763,7 +763,7 @@ impl FileMeta {
         )
     }
 
-    fn into_fileinfo_with_part_checksums(
+    fn to_fileinfo_with_part_checksums(
         &self,
         volume: &str,
         path: &str,
@@ -802,12 +802,8 @@ impl FileMeta {
                     // Known side effect: if a disk holds only free versions and they are
                     // corrupt, `into_fileinfo` falls through to `FileNotFound` (not
                     // `FileCorrupt`), so that disk is not enqueued for heal.
-                    match found_free_fi.into_fileinfo_with_part_checksums(
-                        volume,
-                        path,
-                        opts.all_parts,
-                        opts.include_part_checksums,
-                    ) {
+                    match found_free_fi.to_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)
+                    {
                         Ok(mut free_fi) => {
                             free_fi.is_latest = true;
                             found_free_version = Some(free_fi);
@@ -835,7 +831,7 @@ impl FileMeta {
 
             found = true;
 
-            let mut fi = ver.into_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)?;
+            let mut fi = ver.to_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)?;
             fi.is_latest = is_latest;
 
             if let Some(_d) = succ_mod_time {

@@ -1708,6 +1708,106 @@ mod tests {
                     retry_reader.object_info = retry_source_info.clone();
                     temp_env::async_with_vars(
                         [
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, None::<&str>),
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED, None::<&str>),
+                        ],
+                        crate::data_movement::migrate_object(
+                            store.clone(),
+                            0,
+                            bucket.clone(),
+                            retry_reader,
+                            None,
+                            "test_data_movement_compatible_retry",
+                        ),
+                    )
+                    .await
+                    .expect("default multipart migration should not require the checksum sidecar capability");
+
+                    let compatible_target = store.pools[1]
+                        .get_object_info(
+                            &bucket,
+                            retry_object,
+                            &ObjectOptions {
+                                include_part_checksums: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read compatible multipart target metadata");
+                    assert_eq!(compatible_target.checksum, retry_source_info.checksum);
+                    assert!(compatible_target.parts.iter().all(|part| part.checksums.is_none()));
+                    assert!(!rustfs_utils::http::contains_key_str(
+                        &compatible_target.user_defined,
+                        rustfs_utils::http::SUFFIX_PART_CHECKSUMS
+                    ));
+                    let mut compatible_reader = store.pools[1]
+                        .get_object_reader(&bucket, retry_object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("read compatible multipart target body");
+                    let mut compatible_body = Vec::new();
+                    compatible_reader
+                        .stream
+                        .read_to_end(&mut compatible_body)
+                        .await
+                        .expect("drain compatible multipart target body");
+                    assert_eq!(compatible_body, retry_source_body);
+
+                    let mut compatible_retry_reader = store.pools[0]
+                        .get_object_reader(
+                            &bucket,
+                            retry_object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                raw_data_movement_read: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read source multipart object for compatible retry");
+                    compatible_retry_reader.object_info = retry_source_info.clone();
+                    temp_env::async_with_vars(
+                        [
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, None::<&str>),
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED, None::<&str>),
+                        ],
+                        crate::data_movement::migrate_object(
+                            store.clone(),
+                            0,
+                            bucket.clone(),
+                            compatible_retry_reader,
+                            None,
+                            "test_data_movement_compatible_retry",
+                        ),
+                    )
+                    .await
+                    .expect("compatible multipart migration retry should converge");
+                    let compatible_uploads = store.pools[1]
+                        .list_multipart_uploads(&bucket, retry_object, None, None, None, 100)
+                        .await
+                        .expect("list compatible target multipart uploads");
+                    assert!(compatible_uploads.uploads.is_empty(), "compatible retry staging must be aborted");
+
+                    store.pools[1]
+                        .delete_object(&bucket, retry_object, ObjectOptions::default())
+                        .await
+                        .expect("remove compatible target before fleet-confirmed migration");
+                    let mut retry_reader = store.pools[0]
+                        .get_object_reader(
+                            &bucket,
+                            retry_object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                raw_data_movement_read: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read source multipart object for fleet-confirmed migration");
+                    retry_reader.object_info = retry_source_info.clone();
+                    temp_env::async_with_vars(
+                        [
                             (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, Some("true")),
                             (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED, Some("true")),
                         ],
@@ -1919,6 +2019,301 @@ mod tests {
             .expect("spawn data movement test thread")
             .join()
             .expect("join data movement test thread");
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn data_movement_multipart_replaces_only_unlocked_owned_generation() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("build data movement replacement test runtime");
+                runtime.block_on(async move {
+                    let temp_dir = tempfile::tempdir().expect("create data movement replacement store dir");
+                    let (_ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "data-movement-stale-replacement",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("dm-stale-replacement-{}", uuid::Uuid::new_v4());
+                    store
+                        .make_bucket(
+                            &bucket,
+                            &MakeBucketOptions {
+                                lock_enabled: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create data movement replacement bucket");
+                    *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+
+                    let version_id = uuid::Uuid::new_v4();
+                    let old_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+                    let new_time = old_time + time::Duration::SECOND;
+                    let first_part_size = 5 * 1024 * 1024;
+                    let mut old_body = vec![b'a'; first_part_size];
+                    old_body.push(b'b');
+                    let mut new_body = vec![b'c'; first_part_size];
+                    new_body.push(b'd');
+
+                    let source_reader = |name: &str, body: Vec<u8>, mod_time, metadata: HashMap<String, String>| {
+                        let size = i64::try_from(body.len()).expect("source body size should fit i64");
+                        GetObjectReader {
+                            stream: Box::new(Cursor::new(body)),
+                            object_info: ObjectInfo {
+                                bucket: bucket.clone(),
+                                name: name.to_string(),
+                                version_id: Some(version_id),
+                                size,
+                                actual_size: size,
+                                etag: Some(format!("{name}-multipart-etag-2")),
+                                mod_time: Some(mod_time),
+                                user_defined: Arc::new(metadata),
+                                parts: Arc::new(vec![
+                                    ObjectPartInfo {
+                                        number: 1,
+                                        size: first_part_size,
+                                        actual_size: i64::try_from(first_part_size).expect("first part size should fit i64"),
+                                        etag: format!("{name}-part-1"),
+                                        ..Default::default()
+                                    },
+                                    ObjectPartInfo {
+                                        number: 2,
+                                        size: 1,
+                                        actual_size: 1,
+                                        etag: format!("{name}-part-2"),
+                                        ..Default::default()
+                                    },
+                                ]),
+                                ..Default::default()
+                            },
+                            buffered_body: None,
+                            body_source: Default::default(),
+                        }
+                    };
+
+                    let replaceable = "replaceable.bin";
+                    crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            replaceable,
+                            old_body.clone(),
+                            old_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
+                        ),
+                        None,
+                        "test_stale_target_seed",
+                    )
+                    .await
+                    .expect("seed old migrated target");
+                    let seeded_target = store.pools[1]
+                        .get_object_info(
+                            &bucket,
+                            replaceable,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version_id.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read old migrated target");
+                    let replacement_opts = ObjectOptions {
+                        data_movement: true,
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        mod_time: Some(new_time),
+                        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+                        ..Default::default()
+                    };
+                    assert!(
+                        crate::data_movement::can_replace_stale_data_movement_target(&seeded_target, &replacement_opts),
+                        "seeded target should be replaceable: {seeded_target:?}"
+                    );
+                    crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            replaceable,
+                            new_body.clone(),
+                            new_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
+                        ),
+                        None,
+                        "test_stale_target_replace",
+                    )
+                    .await
+                    .expect("newer source generation should replace the old migrated target");
+
+                    let replacement = store.pools[1]
+                        .get_object_info(
+                            &bucket,
+                            replaceable,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version_id.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read replaced target metadata");
+                    assert_eq!(replacement.mod_time, Some(new_time));
+                    assert_eq!(replacement.user_defined.get("x-amz-meta-generation").map(String::as_str), Some("new"));
+                    let mut replacement_reader = store.pools[1]
+                        .get_object_reader(
+                            &bucket,
+                            replaceable,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version_id.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read replaced target body");
+                    let mut replacement_body = Vec::new();
+                    replacement_reader
+                        .stream
+                        .read_to_end(&mut replacement_body)
+                        .await
+                        .expect("drain replaced target body");
+                    assert_eq!(replacement_body, new_body);
+
+                    let client_target = "client-target.bin";
+                    let client_body = b"client-owned exact version".to_vec();
+                    let mut client_reader = PutObjReader::from_vec(client_body.clone());
+                    store.pools[1]
+                        .put_object(
+                            &bucket,
+                            client_target,
+                            &mut client_reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version_id.to_string()),
+                                mod_time: Some(old_time),
+                                user_defined: HashMap::from([("x-amz-meta-owner".to_string(), "client".to_string())]),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("seed client-owned exact version");
+                    let err = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(client_target, new_body.clone(), new_time, HashMap::new()),
+                        None,
+                        "test_client_target_reject",
+                    )
+                    .await
+                    .expect_err("data movement must not replace a client-owned exact version");
+                    assert!(err.to_string().contains("complete_multipart_upload"), "unexpected migration error: {err}");
+                    let mut preserved_reader = store.pools[1]
+                        .get_object_reader(
+                            &bucket,
+                            client_target,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version_id.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read preserved client target");
+                    let mut preserved_body = Vec::new();
+                    preserved_reader
+                        .stream
+                        .read_to_end(&mut preserved_body)
+                        .await
+                        .expect("drain preserved client target");
+                    assert_eq!(preserved_body, client_body);
+
+                    let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(1))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .expect("retain-until date should format");
+                    for (object, mode) in [
+                        ("compliance-target.bin", s3s::dto::ObjectLockRetentionMode::COMPLIANCE),
+                        ("governance-target.bin", s3s::dto::ObjectLockRetentionMode::GOVERNANCE),
+                    ] {
+                        let retained_metadata = HashMap::from([
+                            (s3s::header::X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), mode.to_string()),
+                            (
+                                s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+                                retain_until.clone(),
+                            ),
+                        ]);
+                        crate::data_movement::migrate_object(
+                            store.clone(),
+                            0,
+                            bucket.clone(),
+                            source_reader(object, old_body.clone(), old_time, retained_metadata.clone()),
+                            None,
+                            "test_retained_target_seed",
+                        )
+                        .await
+                        .expect("seed retained migrated target");
+                        let err = crate::data_movement::migrate_object(
+                            store.clone(),
+                            0,
+                            bucket.clone(),
+                            source_reader(object, new_body.clone(), new_time, retained_metadata),
+                            None,
+                            "test_retained_target_replace",
+                        )
+                        .await
+                        .expect_err("active retention must block stale target replacement");
+                        assert!(err.to_string().contains("complete_multipart_upload"), "unexpected retention error: {err}");
+
+                        let mut retained_reader = store.pools[1]
+                            .get_object_reader(
+                                &bucket,
+                                object,
+                                None,
+                                HeaderMap::new(),
+                                &ObjectOptions {
+                                    versioned: true,
+                                    version_id: Some(version_id.to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("read retained target");
+                        let mut retained_body = Vec::new();
+                        retained_reader
+                            .stream
+                            .read_to_end(&mut retained_body)
+                            .await
+                            .expect("drain retained target");
+                        assert_eq!(retained_body, old_body);
+                    }
+
+                    for object in [replaceable, client_target, "compliance-target.bin", "governance-target.bin"] {
+                        let uploads = store.pools[1]
+                            .list_multipart_uploads(&bucket, object, None, None, None, 100)
+                            .await
+                            .expect("list target multipart staging");
+                        assert!(uploads.uploads.is_empty(), "data movement staging must be cleaned for {object}");
+                    }
+                });
+            })
+            .expect("spawn data movement replacement test thread")
+            .join()
+            .expect("join data movement replacement test thread");
     }
 
     #[tokio::test]
@@ -2275,12 +2670,7 @@ mod tests {
         let mut source_body = vec![b'a'; first_part_size];
         source_body.push(b'b');
         let source_size = i64::try_from(source_body.len()).expect("multipart source size should fit i64");
-        let guard_barrier = crate::store::multipart::DataMovementMultipartGuardBarrier::install(&bucket, 2);
-        let part_barrier = crate::set_disk::MultipartCommitBarrier::install(
-            &bucket,
-            object,
-            crate::set_disk::MultipartCommitPause::PutPartAfterRename,
-        );
+        let completion_barrier = crate::store::multipart::DataMovementMultipartCompletionBarrier::install(&bucket);
         let migration_store = store.clone();
         let migration_bucket = bucket.clone();
         let migration = tokio::spawn(async move {
@@ -2325,7 +2715,7 @@ mod tests {
             )
             .await
         });
-        guard_barrier.wait_until_paused().await;
+        completion_barrier.wait_until_paused().await;
         let unrelated_set = store.pools[1].get_disks_by_key(object);
         let original_disks = {
             let mut disks = unrelated_set.disks.write().await;
@@ -2335,9 +2725,7 @@ mod tests {
             }
             original
         };
-        drop(guard_barrier);
-        part_barrier.wait_until_paused().await;
-        drop(part_barrier);
+        drop(completion_barrier);
         let err = migration
             .await
             .expect("multipart migration task should join")

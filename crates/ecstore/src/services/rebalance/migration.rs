@@ -141,40 +141,6 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut, D, DFut>(
     pool_index: usize,
     version: &FileInfo,
     version_id: Option<String>,
-    max_attempts: usize,
-    ignore_data_usage_cache: bool,
-    transfer: F,
-    delete_marker: D,
-) -> MigrationVersionResult
-where
-    Backend: MigrationBackend + ?Sized,
-    F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
-    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
-    DFut: Future<Output = Result<ObjectInfo>> + Send,
-{
-    migrate_entry_version_with_incarnation(
-        set,
-        bucket,
-        pool_index,
-        version,
-        version_id,
-        None,
-        max_attempts,
-        ignore_data_usage_cache,
-        transfer,
-        delete_marker,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn migrate_entry_version_with_incarnation<Backend, F, Fut, D, DFut>(
-    set: &Backend,
-    bucket: String,
-    pool_index: usize,
-    version: &FileInfo,
-    version_id: Option<String>,
     expected_bucket_incarnation_id: Option<uuid::Uuid>,
     max_attempts: usize,
     ignore_data_usage_cache: bool,

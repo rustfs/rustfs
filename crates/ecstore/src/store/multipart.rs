@@ -67,40 +67,35 @@ fn ensure_multipart_bucket_lifecycle_guard_held(
 }
 
 #[cfg(test)]
-struct DataMovementMultipartGuardBarrierState {
+struct DataMovementMultipartCompletionBarrierState {
     bucket: String,
-    pause_at_arrival: usize,
-    arrivals: std::sync::atomic::AtomicUsize,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
-pub(crate) struct DataMovementMultipartGuardBarrier {
-    state: Arc<DataMovementMultipartGuardBarrierState>,
+pub(crate) struct DataMovementMultipartCompletionBarrier {
+    state: Arc<DataMovementMultipartCompletionBarrierState>,
 }
 
 #[cfg(test)]
-static DATA_MOVEMENT_MULTIPART_GUARD_BARRIER: std::sync::OnceLock<
-    std::sync::Mutex<Option<Arc<DataMovementMultipartGuardBarrierState>>>,
+static DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DataMovementMultipartCompletionBarrierState>>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-impl DataMovementMultipartGuardBarrier {
-    pub(crate) fn install(bucket: &str, pause_at_arrival: usize) -> Self {
-        assert!(pause_at_arrival > 0, "data movement multipart guard barrier needs an arrival");
-        let state = Arc::new(DataMovementMultipartGuardBarrierState {
+impl DataMovementMultipartCompletionBarrier {
+    pub(crate) fn install(bucket: &str) -> Self {
+        let state = Arc::new(DataMovementMultipartCompletionBarrierState {
             bucket: bucket.to_string(),
-            pause_at_arrival,
-            arrivals: std::sync::atomic::AtomicUsize::new(0),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
-        let mut slot = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+        let mut slot = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("data movement multipart guard barrier mutex should not poison");
-        assert!(slot.is_none(), "data movement multipart guard barrier must be unique");
+            .expect("data movement multipart completion barrier mutex should not poison");
+        assert!(slot.is_none(), "data movement multipart completion barrier must be unique");
         *slot = Some(Arc::clone(&state));
         Self { state }
     }
@@ -108,18 +103,18 @@ impl DataMovementMultipartGuardBarrier {
     pub(crate) async fn wait_until_paused(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
             .await
-            .expect("data movement multipart operation should pass the bucket guard");
+            .expect("data movement multipart operation should reach selected completion");
     }
 }
 
 #[cfg(test)]
-impl Drop for DataMovementMultipartGuardBarrier {
+impl Drop for DataMovementMultipartCompletionBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
-        let mut slot = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+        let mut slot = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("data movement multipart guard barrier mutex should not poison");
+            .expect("data movement multipart completion barrier mutex should not poison");
         if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
             *slot = None;
         }
@@ -127,22 +122,15 @@ impl Drop for DataMovementMultipartGuardBarrier {
 }
 
 #[cfg(test)]
-async fn pause_data_movement_multipart_after_bucket_guard(bucket: &str, opts: &ObjectOptions) {
-    if !opts.data_movement {
-        return;
-    }
-    let barrier = DATA_MOVEMENT_MULTIPART_GUARD_BARRIER
+async fn pause_data_movement_multipart_before_selected_completion(bucket: &str) {
+    let barrier = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .expect("data movement multipart guard barrier mutex should not poison")
+        .expect("data movement multipart completion barrier mutex should not poison")
         .as_ref()
         .filter(|barrier| barrier.bucket == bucket)
         .cloned();
     if let Some(barrier) = barrier {
-        let arrival = barrier.arrivals.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-        if arrival != barrier.pause_at_arrival {
-            return;
-        }
         barrier.arrived.notify_one();
         barrier.release.notified().await;
     }
@@ -259,8 +247,6 @@ impl ECStore {
         if opts.expected_bucket_incarnation_id != Some(current) {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        #[cfg(test)]
-        Box::pin(pause_data_movement_multipart_after_bucket_guard(bucket, &opts)).await;
         Ok((opts, guard))
     }
 
@@ -559,10 +545,12 @@ impl ECStore {
         bucket: &str,
         object: &str,
         upload_id: &str,
-        part_id: usize,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
+        let part_id = opts
+            .part_number
+            .ok_or_else(|| Error::other("targeted multipart upload requires a part number"))?;
         check_put_object_part_args(bucket, object, upload_id)?;
         if !opts.data_movement {
             return Err(Error::other("targeted multipart upload requires data_movement options"));
@@ -727,7 +715,32 @@ impl ECStore {
         if !opts.data_movement {
             return Err(Error::other("targeted multipart completion requires data_movement options"));
         }
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("data movement completion is missing its bucket incarnation"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("data movement completion is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other(
+                    "data movement Object Lock snapshot does not match the target bucket generation",
+                ));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
+        }
+        #[cfg(test)]
+        pause_data_movement_multipart_before_selected_completion(bucket).await;
         let pool = self
             .pools
             .get(target_pool_idx)

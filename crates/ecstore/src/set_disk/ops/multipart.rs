@@ -2067,6 +2067,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 achieved: 0,
             });
         }
+        if opts
+            .namespace_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "complete_multipart_upload_outer_lock",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
         if upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
             return Err(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "complete_multipart_upload_commit",
@@ -2086,6 +2099,74 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             "complete_multipart_upload_commit",
         )
         .await?;
+
+        if opts.data_movement
+            && opts.http_preconditions.is_some()
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
+        }
+        if opts.data_movement && opts.http_preconditions.is_some() && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: opts.version_id.clone(),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: opts.versioned,
+                        version_suspended: opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match current {
+                Ok(existing) if crate::data_movement::can_replace_stale_data_movement_target(&existing, opts) => {
+                    let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
+                        Error::other("data movement completion is missing its Object Lock configuration snapshot")
+                    })?;
+                    if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some() {
+                        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                    }
+                }
+                Ok(_) => return Err(StorageError::PreconditionFailed),
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "complete_multipart_upload_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        if opts
+            .namespace_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "complete_multipart_upload_outer_lock",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        if upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "complete_multipart_upload_commit",
+                bucket: RUSTFS_META_MULTIPART_BUCKET.to_string(),
+                object: upload_id_path.clone(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
@@ -2876,6 +2957,92 @@ mod tests {
                 .map(String::as_str),
             Some("AAAAAA==")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_data_movement_replacement_fails_before_commit_on_outer_fence_loss() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "data-movement-stale-fence-bucket";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let old_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let new_time = old_time + time::Duration::SECOND;
+
+        for (object, namespace_lock_fence, bucket_lifecycle_lock_fence) in [
+            ("metadata-fence", Some(NamespaceLockFence::lost_for_test()), None),
+            ("bucket-fence", None, Some(NamespaceLockFence::lost_for_test())),
+        ] {
+            let version_id = Uuid::new_v4();
+            let old_body = format!("old-{object}").into_bytes();
+            let mut old_reader = PutObjReader::from_vec(old_body.clone());
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut old_reader,
+                    &ObjectOptions {
+                        data_movement: true,
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        mod_time: Some(old_time),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed old data movement target");
+
+            let replacement_body = format!("new-{object}").into_bytes();
+            let create_opts = ObjectOptions {
+                data_movement: true,
+                ..Default::default()
+            };
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &replacement_body, &create_opts).await;
+            let complete_opts = ObjectOptions {
+                data_movement: true,
+                versioned: true,
+                version_id: Some(version_id.to_string()),
+                mod_time: Some(new_time),
+                http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+                namespace_lock_fence,
+                bucket_lifecycle_lock_fence,
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            };
+            let err = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect_err("a lost outer fence must abort stale target replacement");
+            assert!(matches!(err, StorageError::NamespaceLockQuorumUnavailable { .. }));
+
+            let mut preserved = set_disks
+                .get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read target after rejected replacement");
+            let mut preserved_body = Vec::new();
+            preserved
+                .stream
+                .read_to_end(&mut preserved_body)
+                .await
+                .expect("drain target after rejected replacement");
+            assert_eq!(preserved_body, old_body);
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload_id, true)
+                .await
+                .expect("fence loss must leave replacement staging retryable");
+        }
     }
 
     #[tokio::test]

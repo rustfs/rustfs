@@ -1216,7 +1216,7 @@ impl ECStore {
         )))
     }
 
-    async fn object_lock_config_snapshot_under_lifecycle_fence(
+    pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
         lifecycle_fence: &NamespaceLockFence,
@@ -3569,7 +3569,7 @@ mod tests {
             ReplicationStatusType::Replica.to_string(),
         );
         rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP, timestamp.clone());
-        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, timestamp.clone());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, timestamp);
         rustfs_utils::http::insert_str(
             &mut metadata,
             rustfs_utils::http::SUFFIX_REPLICATION_STATUS,

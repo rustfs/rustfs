@@ -16,7 +16,7 @@ use super::meta::{
     clone_arc_by_index, ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error,
     rebalance_metadata_not_initialized_error, should_ignore_rebalance_data_usage_cache,
 };
-use super::migration::{RebalanceMigrationBackend, migrate_entry_version_with_incarnation};
+use super::migration::{RebalanceMigrationBackend, migrate_entry_version};
 use super::worker::{
     RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
     resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
@@ -223,7 +223,7 @@ impl ECStore {
                 let store = self.clone();
                 async move { store.delete_object(&bucket, &object, opts).await }
             };
-            let result = migrate_entry_version_with_incarnation(
+            let result = migrate_entry_version(
                 &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref()),
                 bucket.clone(),
                 pool_index,
@@ -329,10 +329,12 @@ impl ECStore {
                         entry.name.as_str(),
                         &fivs,
                         &cleanup_preflight_allowed_missing,
-                        bucket_configs.bucket_incarnation_id,
-                        bucket_incarnation_fence
-                            .as_ref()
-                            .and_then(|guard| guard.namespace_lock_guard()),
+                        data_movement::SourceCleanupBucketFence {
+                            expected_incarnation_id: bucket_configs.bucket_incarnation_id,
+                            lifecycle_guard: bucket_incarnation_fence
+                                .as_ref()
+                                .and_then(|guard| guard.namespace_lock_guard()),
+                        },
                         "rebalance",
                     ),
                 )

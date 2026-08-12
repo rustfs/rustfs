@@ -3178,10 +3178,12 @@ impl ECStore {
                 entry.name.as_str(),
                 &fivs,
                 &cleanup_preflight_allowed_missing,
-                expected_bucket_incarnation_id,
-                bucket_incarnation_fence
-                    .as_ref()
-                    .and_then(|guard| guard.namespace_lock_guard()),
+                data_movement::SourceCleanupBucketFence {
+                    expected_incarnation_id: expected_bucket_incarnation_id,
+                    lifecycle_guard: bucket_incarnation_fence
+                        .as_ref()
+                        .and_then(|guard| guard.namespace_lock_guard()),
+                },
                 "decommission",
             )
             .await
@@ -3341,7 +3343,6 @@ impl ECStore {
                 let lifecycle_config = lifecycle_config.clone();
                 let object_lock_config = object_lock_config.clone();
                 let replication_config = replication_config.clone();
-                let expected_bucket_incarnation_id = expected_bucket_incarnation_id;
                 let entry_error = entry_error.clone();
                 let callback_rx = rx.clone();
                 move |entry: MetaCacheEntry| {

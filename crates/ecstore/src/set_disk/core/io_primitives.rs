@@ -4524,16 +4524,16 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Option<StorageError> {
-        let mut opts = opts.clone();
+        let mut lookup_opts = opts.clone();
 
-        let http_preconditions = opts.http_preconditions?;
-        opts.http_preconditions = None;
+        let http_preconditions = lookup_opts.http_preconditions?;
+        lookup_opts.http_preconditions = None;
 
         // Never claim a lock here, to avoid deadlock
         // - If no_lock is false, we must have obtained the lock out side of this function
         // - If no_lock is true, we should not obtain locks
-        opts.no_lock = true;
-        let oi = self.get_object_info(bucket, object, &opts).await;
+        lookup_opts.no_lock = true;
+        let oi = self.get_object_info(bucket, object, &lookup_opts).await;
 
         match oi {
             Ok(oi) => {
@@ -4544,7 +4544,9 @@ impl SetDisks {
                 }
                 let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
                 let if_match = http_preconditions.if_match_value().map(str::to_owned);
-                if should_prevent_write(&oi, if_none_match, if_match) {
+                if should_prevent_write(&oi, if_none_match, if_match)
+                    && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
+                {
                     return Some(StorageError::PreconditionFailed);
                 }
             }

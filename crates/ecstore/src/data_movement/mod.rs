@@ -294,12 +294,15 @@ pub(crate) fn prepare_tiered_data_movement_file_info(file_info: &mut rustfs_file
 }
 
 fn prepare_tiered_data_movement_file_info_for(file_info: &mut rustfs_filemeta::FileInfo, writer_enabled: bool) -> Result<()> {
+    if !writer_enabled {
+        rustfs_utils::http::remove_str(&mut file_info.metadata, SUFFIX_PART_CHECKSUMS);
+        for part in &mut file_info.parts {
+            part.checksums = None;
+        }
+        return Ok(());
+    }
+
     SetDisks::hydrate_selected_fileinfo_part_checksums(file_info).map_err(|_| Error::FileCorrupt)?;
-    let has_part_checksums = file_info
-        .parts
-        .iter()
-        .any(|part| part.checksums.as_ref().is_some_and(|checksums| !checksums.is_empty()));
-    ensure_data_movement_part_checksum_writer_allowed(has_part_checksums, writer_enabled)?;
     rustfs_utils::http::remove_str(&mut file_info.metadata, SUFFIX_PART_CHECKSUMS);
     if let Some(encoded) = data_movement_part_checksums(&file_info.parts)? {
         rustfs_utils::http::insert_str(&mut file_info.metadata, SUFFIX_PART_CHECKSUMS, encoded);
@@ -324,15 +327,6 @@ fn data_movement_part_checksum_writer_enabled() -> bool {
     )
 }
 
-fn ensure_data_movement_part_checksum_writer_allowed(has_part_checksums: bool, enabled: bool) -> Result<()> {
-    if has_part_checksums && !enabled {
-        return Err(Error::other(
-            "data movement per-part checksums require the fleet-confirmed writer capability",
-        ));
-    }
-    Ok(())
-}
-
 fn should_use_multipart_data_movement(object_info: &ObjectInfo, has_part_checksums: bool) -> bool {
     object_info.is_multipart()
         || has_part_checksums
@@ -340,7 +334,11 @@ fn should_use_multipart_data_movement(object_info: &ObjectInfo, has_part_checksu
         || object_info.parts.first().is_some_and(|part| part.number != 1)
 }
 
-fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> Result<ObjectOptions> {
+fn data_movement_complete_multipart_opts(
+    object_info: &ObjectInfo,
+    src_pool_idx: usize,
+    preserve_part_checksums: bool,
+) -> Result<ObjectOptions> {
     let mut user_defined = HashMap::new();
     insert_data_movement_checksum(&mut user_defined, object_info);
     let actual_size = object_info
@@ -350,7 +348,7 @@ fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx:
         return Err(Error::other("data movement source actual size is unknown"));
     }
     rustfs_utils::http::insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
-    if let Some(encoded) = data_movement_part_checksums(&object_info.parts)? {
+    if preserve_part_checksums && let Some(encoded) = data_movement_part_checksums(&object_info.parts)? {
         rustfs_utils::http::insert_str(&mut user_defined, SUFFIX_PART_CHECKSUMS, encoded);
     }
     Ok(ObjectOptions {
@@ -389,6 +387,40 @@ pub(crate) fn data_movement_target_precondition() -> HTTPPreconditions {
         if_none_match: Some("*".to_string()),
         ..Default::default()
     }
+}
+
+pub(crate) fn can_replace_stale_data_movement_target(target: &ObjectInfo, opts: &ObjectOptions) -> bool {
+    let Some(preconditions) = opts.http_preconditions.as_ref() else {
+        return false;
+    };
+    if !opts.data_movement
+        || preconditions.if_none_match_value() != Some("*")
+        || preconditions.if_match_value().is_some()
+        || target.delete_marker
+    {
+        return false;
+    }
+
+    let rustfs_marker = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED);
+    let minio_marker = format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+    if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED) != Some("true")
+        || target.user_defined.get(&rustfs_marker).map(String::as_str) != Some("true")
+        || target.user_defined.get(&minio_marker).map(String::as_str) != Some("true")
+    {
+        return false;
+    }
+
+    let version_matches = match (opts.version_id.as_deref(), target.version_id) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => uuid::Uuid::parse_str(expected).ok() == Some(actual),
+        _ => false,
+    };
+
+    version_matches
+        && target
+            .mod_time
+            .zip(opts.mod_time)
+            .is_some_and(|(target_time, source_time)| target_time < source_time)
 }
 
 fn data_movement_put_object_reader(
@@ -489,7 +521,7 @@ fn effective_part_actual_size(part: &ObjectPartInfo) -> Option<i64> {
         .or_else(|| i64::try_from(part.size).ok())
 }
 
-fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPartInfo) -> bool {
+fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPartInfo, compare_checksums: bool) -> bool {
     // Multipart migration rewrites part timestamps.
     source.number == target.number
         && source.etag == target.etag
@@ -500,8 +532,9 @@ fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPart
         )
         // A missing target compression index selects the safe full-read fallback.
         && (target.index.is_none() || source.index == target.index)
-        && source.checksums.as_ref().filter(|checksums| !checksums.is_empty())
-            == target.checksums.as_ref().filter(|checksums| !checksums.is_empty())
+        && (!compare_checksums
+            || source.checksums.as_ref().filter(|checksums| !checksums.is_empty())
+                == target.checksums.as_ref().filter(|checksums| !checksums.is_empty()))
 }
 
 fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<BTreeMap<usize, &ObjectPartInfo>> {
@@ -516,6 +549,10 @@ fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<BTreeMap<us
 }
 
 pub(crate) fn are_equivalent_data_movement_parts(source: &[ObjectPartInfo], target: &[ObjectPartInfo]) -> bool {
+    are_equivalent_data_movement_parts_for(source, target, true)
+}
+
+fn are_equivalent_data_movement_parts_for(source: &[ObjectPartInfo], target: &[ObjectPartInfo], compare_checksums: bool) -> bool {
     if source.len() != target.len() {
         return false;
     }
@@ -530,7 +567,7 @@ pub(crate) fn are_equivalent_data_movement_parts(source: &[ObjectPartInfo], targ
     source_parts.iter().all(|(number, source_part)| {
         target_parts
             .get(number)
-            .is_some_and(|target_part| is_equivalent_data_movement_part(source_part, target_part))
+            .is_some_and(|target_part| is_equivalent_data_movement_part(source_part, target_part, compare_checksums))
     })
 }
 
@@ -699,7 +736,12 @@ pub(crate) fn is_equivalent_data_movement_metadata(
             .all(|(key, value)| source.user_defined.get(key) == Some(value))
 }
 
-fn is_equivalent_data_movement_object_identity(source: &ObjectInfo, target: &ObjectInfo, compare_mod_time: bool) -> bool {
+fn is_equivalent_data_movement_object_identity(
+    source: &ObjectInfo,
+    target: &ObjectInfo,
+    compare_mod_time: bool,
+    compare_part_checksums: bool,
+) -> bool {
     let (Some(source_actual_size), Some(target_actual_size)) = (effective_actual_size(source), effective_actual_size(target))
     else {
         return false;
@@ -726,11 +768,11 @@ fn is_equivalent_data_movement_object_identity(source: &ObjectInfo, target: &Obj
         && source.transitioned_object.free_version == target.transitioned_object.free_version
         && source.transitioned_object.status == target.transitioned_object.status
         && source.transition_version_state == target.transition_version_state
-        && are_equivalent_data_movement_parts(&source.parts, &target.parts)
+        && are_equivalent_data_movement_parts_for(&source.parts, &target.parts, compare_part_checksums)
 }
 
 fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
-    is_equivalent_data_movement_object_identity(source, target, true)
+    is_equivalent_data_movement_object_identity(source, target, true, true)
 }
 
 fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
@@ -743,11 +785,11 @@ fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: 
             .is_some_and(|(source_time, target_time)| target_time > source_time)
 }
 
-fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
     let identity = data_movement_upload_identity(source);
     source.mod_time.is_some()
         && rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVEMENT_UPLOAD) == Some(identity.as_str())
-        && is_equivalent_data_movement_object_identity(source, target, false)
+        && is_equivalent_data_movement_object_identity(source, target, false, compare_part_checksums)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -895,6 +937,12 @@ pub(crate) enum SourceCleanupError {
     Storage(#[from] Error),
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SourceCleanupBucketFence<'a> {
+    pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
+    pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+}
+
 fn ensure_source_cleanup_versions_match(
     expected: &FileInfoVersions,
     current: &FileInfoVersions,
@@ -1007,8 +1055,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     object: &str,
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
-    expected_bucket_incarnation_id: Option<uuid::Uuid>,
-    bucket_lifecycle_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    bucket_fence: SourceCleanupBucketFence<'_>,
     op_label: &str,
 ) -> std::result::Result<ObjectInfo, SourceCleanupError> {
     let cleanup_key = encode_dir_object(object);
@@ -1018,7 +1065,10 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         .await
         .map_err(Error::from)?;
 
-    if bucket_lifecycle_guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+    if bucket_fence
+        .lifecycle_guard
+        .is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost)
+    {
         return Err(SourceCleanupError::Storage(Error::other(format!(
             "{op_label}: bucket incarnation fence was lost before source cleanup"
         ))));
@@ -1034,11 +1084,11 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         delete_prefix_object: true,
         data_movement: true,
         no_lock: true,
-        expected_bucket_incarnation_id,
+        expected_bucket_incarnation_id: bucket_fence.expected_incarnation_id,
         ..Default::default()
     };
     opts.add_namespace_lock_guard(&_guard);
-    if let Some(bucket_lifecycle_guard) = bucket_lifecycle_guard {
+    if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);
     }
     let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
@@ -1087,6 +1137,24 @@ fn resolve_data_movement_overwrite_resume_result(
     src_pool_idx: usize,
     target_pool_idx: usize,
 ) -> Result<bool> {
+    resolve_data_movement_overwrite_resume_result_for(
+        err,
+        target_result,
+        source,
+        src_pool_idx,
+        target_pool_idx,
+        data_movement_part_checksum_writer_enabled(),
+    )
+}
+
+fn resolve_data_movement_overwrite_resume_result_for(
+    err: &Error,
+    target_result: Result<Option<ObjectInfo>>,
+    source: &ObjectInfo,
+    src_pool_idx: usize,
+    target_pool_idx: usize,
+    compare_part_checksums: bool,
+) -> Result<bool> {
     if !should_check_data_movement_overwrite_resume(err)
         || !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx)
     {
@@ -1097,11 +1165,11 @@ fn resolve_data_movement_overwrite_resume_result(
         return Ok(false);
     };
 
-    if is_equivalent_data_movement_object(source, &target) {
+    if is_equivalent_data_movement_object_identity(source, &target, true, compare_part_checksums) {
         return Ok(true);
     }
 
-    if is_data_movement_upload_takeover_target(source, &target) {
+    if is_data_movement_upload_takeover_target(source, &target, compare_part_checksums) {
         return Ok(true);
     }
 
@@ -1115,17 +1183,19 @@ async fn should_treat_data_movement_overwrite_as_complete(
     bucket: &str,
     object_info: &ObjectInfo,
     err: &Error,
+    compare_part_checksums: bool,
 ) -> Result<bool> {
     if !should_check_data_movement_overwrite_resume(err) {
         return Ok(false);
     }
 
-    resolve_data_movement_overwrite_resume_result(
+    resolve_data_movement_overwrite_resume_result_for(
         err,
         find_data_movement_target_info(store, target_pool_idx, bucket, object_info).await,
         object_info,
         src_pool_idx,
         target_pool_idx,
+        compare_part_checksums,
     )
 }
 
@@ -1174,9 +1244,7 @@ pub(crate) async fn migrate_object(
         .iter()
         .any(|part| part.checksums.as_ref().is_some_and(|checksums| !checksums.is_empty()));
 
-    ensure_data_movement_part_checksum_writer_allowed(has_part_checksums, data_movement_part_checksum_writer_enabled()).map_err(
-        |err| data_movement_stage_error(op_label, "prepare_new_multipart", bucket.as_str(), object_info.name.as_str(), err),
-    )?;
+    let preserve_part_checksums = data_movement_part_checksum_writer_enabled();
 
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
@@ -1225,21 +1293,22 @@ pub(crate) async fn migrate_object(
                             err,
                         )
                     })?;
+                let part_opts = ObjectOptions {
+                    part_number: Some(part.number),
+                    preserve_etag: Some(part.etag.clone()),
+                    data_movement: true,
+                    src_pool_idx: pool_idx,
+                    expected_bucket_incarnation_id,
+                    ..Default::default()
+                };
                 let pi = match store
                     .put_object_part_for_data_movement(
                         target_pool_idx,
                         &bucket,
                         &object_info.name,
                         &res.upload_id,
-                        part.number,
                         &mut data,
-                        &ObjectOptions {
-                            preserve_etag: Some(part.etag.clone()),
-                            data_movement: true,
-                            src_pool_idx: pool_idx,
-                            expected_bucket_incarnation_id,
-                            ..Default::default()
-                        },
+                        &part_opts,
                     )
                     .await
                 {
@@ -1265,9 +1334,16 @@ pub(crate) async fn migrate_object(
                 };
             }
 
-            let mut complete_multipart_opts = data_movement_complete_multipart_opts(&object_info, pool_idx).map_err(|err| {
-                data_movement_stage_error(op_label, "prepare_complete_multipart", bucket.as_str(), object_info.name.as_str(), err)
-            })?;
+            let mut complete_multipart_opts =
+                data_movement_complete_multipart_opts(&object_info, pool_idx, preserve_part_checksums).map_err(|err| {
+                    data_movement_stage_error(
+                        op_label,
+                        "prepare_complete_multipart",
+                        bucket.as_str(),
+                        object_info.name.as_str(),
+                        err,
+                    )
+                })?;
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
             if let Err(err) = store
                 .clone()
@@ -1288,6 +1364,7 @@ pub(crate) async fn migrate_object(
                     bucket.as_str(),
                     &object_info,
                     &err,
+                    preserve_part_checksums,
                 )
                 .await?
                 {
@@ -1339,6 +1416,7 @@ pub(crate) async fn migrate_object(
                         bucket.as_str(),
                         &object_info,
                         &abort_err,
+                        preserve_part_checksums,
                     )
                     .await?
                     {
@@ -1442,6 +1520,7 @@ pub(crate) async fn migrate_object(
             bucket.as_str(),
             &object_info,
             &err,
+            preserve_part_checksums,
         )
         .await?
         {
@@ -1897,10 +1976,17 @@ mod tests {
         };
 
         let new_opts = data_movement_new_multipart_opts(&object_info, 0);
-        let complete_opts = data_movement_complete_multipart_opts(&object_info, 0).expect("complete opts should be created");
+        let compatible_opts =
+            data_movement_complete_multipart_opts(&object_info, 0, false).expect("compatible opts should be created");
+        let complete_opts =
+            data_movement_complete_multipart_opts(&object_info, 0, true).expect("complete opts should be created");
 
         assert!(!rustfs_utils::http::contains_key_str(&new_opts.user_defined, SUFFIX_PART_CHECKSUMS));
         assert!(rustfs_utils::http::contains_key_str(&new_opts.user_defined, SUFFIX_DATA_MOVEMENT_UPLOAD));
+        assert!(!rustfs_utils::http::contains_key_str(
+            &compatible_opts.user_defined,
+            SUFFIX_PART_CHECKSUMS
+        ));
         assert_eq!(
             rustfs_utils::http::get_consistent_str(&complete_opts.user_defined, SUFFIX_PART_CHECKSUMS),
             Some(r#"[[2,[["CRC32C","crc32c-value"]]]]"#)
@@ -1921,11 +2007,14 @@ mod tests {
         assert!(!data_movement_part_checksum_writer_enabled_for(true, false));
         assert!(!data_movement_part_checksum_writer_enabled_for(false, true));
         assert!(data_movement_part_checksum_writer_enabled_for(true, true));
-        let has_part_checksums = object_info.parts.iter().any(|part| part.checksums.is_some());
-        assert!(has_part_checksums);
-        assert!(ensure_data_movement_part_checksum_writer_allowed(has_part_checksums, false).is_err());
-        assert!(ensure_data_movement_part_checksum_writer_allowed(has_part_checksums, true).is_ok());
-        assert!(ensure_data_movement_part_checksum_writer_allowed(false, false).is_ok());
+        let mut compatible = FileInfo {
+            parts: object_info.parts.as_ref().clone(),
+            ..Default::default()
+        };
+        prepare_tiered_data_movement_file_info_for(&mut compatible, false)
+            .expect("disabled sidecar writer should preserve data movement compatibility");
+        assert!(compatible.parts.iter().all(|part| part.checksums.is_none()));
+        assert!(!rustfs_utils::http::contains_key_str(&compatible.metadata, SUFFIX_PART_CHECKSUMS));
 
         let empty = ObjectInfo {
             parts: Arc::new(vec![ObjectPartInfo {
@@ -1952,12 +2041,16 @@ mod tests {
         let mut valid = FileInfo {
             parts: vec![ObjectPartInfo {
                 number: 1,
-                checksums: Some(valid_checksums.clone()),
+                checksums: Some(valid_checksums),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert!(prepare_tiered_data_movement_file_info_for(&mut valid.clone(), false).is_err());
+        let mut compatible = valid.clone();
+        prepare_tiered_data_movement_file_info_for(&mut compatible, false)
+            .expect("disabled sidecar writer should omit optional part checksums");
+        assert!(compatible.parts.iter().all(|part| part.checksums.is_none()));
+        assert!(!rustfs_utils::http::contains_key_str(&compatible.metadata, SUFFIX_PART_CHECKSUMS));
         prepare_tiered_data_movement_file_info_for(&mut valid, true).expect("valid legacy part checksums should be encoded");
         assert_eq!(
             rustfs_utils::http::get_consistent_str(&valid.metadata, SUFFIX_PART_CHECKSUMS),
@@ -2308,7 +2401,7 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = data_movement_complete_multipart_opts(&object_info, 7).expect("complete opts should encode metadata");
+        let opts = data_movement_complete_multipart_opts(&object_info, 7, false).expect("complete opts should encode metadata");
 
         assert!(opts.versioned);
         assert!(opts.data_movement);
@@ -2387,7 +2480,7 @@ mod tests {
 
             let put_opts = data_movement_put_object_opts(&object_info, 9);
             let complete_opts =
-                data_movement_complete_multipart_opts(&object_info, 9).expect("complete opts should encode metadata");
+                data_movement_complete_multipart_opts(&object_info, 9, false).expect("complete opts should encode metadata");
 
             assert_eq!(
                 put_opts
@@ -2404,6 +2497,58 @@ mod tests {
                 Some("*")
             );
         }
+    }
+
+    #[test]
+    fn test_stale_data_movement_target_replacement_requires_exact_owned_generation() {
+        let version_id = Uuid::from_u128(41);
+        let source_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2);
+        let opts = ObjectOptions {
+            data_movement: true,
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            mod_time: Some(source_time),
+            http_preconditions: Some(data_movement_target_precondition()),
+            ..Default::default()
+        };
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, SUFFIX_DATA_MOVED, "true".to_string());
+        let target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(source_time - time::Duration::SECOND),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        assert!(can_replace_stale_data_movement_target(&target, &opts));
+
+        let mut client_target = target.clone();
+        client_target.user_defined = Arc::new(HashMap::new());
+        assert!(!can_replace_stale_data_movement_target(&client_target, &opts));
+
+        let mut single_marker = target.clone();
+        Arc::make_mut(&mut single_marker.user_defined)
+            .remove(&format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX));
+        assert!(!can_replace_stale_data_movement_target(&single_marker, &opts));
+
+        let mut conflicting_marker = target.clone();
+        Arc::make_mut(&mut conflicting_marker.user_defined).insert(
+            format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "false".to_string(),
+        );
+        assert!(!can_replace_stale_data_movement_target(&conflicting_marker, &opts));
+
+        let mut different_version = target.clone();
+        different_version.version_id = Some(Uuid::from_u128(42));
+        assert!(!can_replace_stale_data_movement_target(&different_version, &opts));
+
+        let mut same_generation = target.clone();
+        same_generation.mod_time = Some(source_time);
+        assert!(!can_replace_stale_data_movement_target(&same_generation, &opts));
+
+        let mut delete_marker = target;
+        delete_marker.delete_marker = true;
+        assert!(!can_replace_stale_data_movement_target(&delete_marker, &opts));
     }
 
     #[test]
@@ -2528,8 +2673,12 @@ mod tests {
     }
 
     fn overwrite_resume_for_target(source: &ObjectInfo, target: ObjectInfo) -> bool {
+        overwrite_resume_for_target_with_checksums(source, target, data_movement_part_checksum_writer_enabled())
+    }
+
+    fn overwrite_resume_for_target_with_checksums(source: &ObjectInfo, target: ObjectInfo, compare_part_checksums: bool) -> bool {
         let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
-        resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), source, 0, 1)
+        resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target)), source, 0, 1, compare_part_checksums)
             .expect("overwrite target should be evaluated")
     }
 
@@ -2890,7 +3039,7 @@ mod tests {
         parts[0].checksums = None;
         target.parts = Arc::new(parts);
 
-        assert!(!overwrite_resume_for_target(&source, target));
+        assert!(!overwrite_resume_for_target_with_checksums(&source, target, true));
     }
 
     #[test]
@@ -3030,6 +3179,27 @@ mod tests {
             .expect("equivalent overwrite target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn test_overwrite_resume_omits_part_checksums_only_in_compatible_mode() {
+        let source = overwrite_equivalence_source();
+        let mut target = source.clone();
+        let mut target_parts = target.parts.as_ref().clone();
+        for part in &mut target_parts {
+            part.checksums = None;
+        }
+        target.parts = Arc::new(target_parts);
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        assert!(
+            resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target.clone())), &source, 0, 1, false)
+                .expect("compatible migration should accept an omitted optional checksum sidecar")
+        );
+        assert!(
+            !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target)), &source, 0, 1, true)
+                .expect("fleet-confirmed migration should compare persisted part checksums")
+        );
     }
 
     #[test]
