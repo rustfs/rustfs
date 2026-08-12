@@ -27,6 +27,7 @@ use crate::backends::{
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
@@ -114,7 +115,12 @@ struct TransitKeyMetadata {
 }
 
 /// Serializable version of TransitKeyMetadata for KV v2 persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written so fields the current build does not know
+/// are counted and warned about instead of vanishing silently — this record
+/// is compatibility-bound in both directions (older and newer builds read
+/// each other's writes), so `deny_unknown_fields` is not an option.
+#[derive(Debug, Clone, Serialize)]
 struct TransitKeyMetadataPersisted {
     key_usage: KeyUsage,
     description: Option<String>,
@@ -125,6 +131,168 @@ struct TransitKeyMetadataPersisted {
     origin: String,
     created_by: Option<String>,
     current_version: u32,
+}
+
+impl UnknownFieldSummary {
+    fn record_for_transit_key_metadata(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("vault-transit-key-metadata") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "Vault Transit key metadata record contains unknown fields"
+            );
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TransitKeyMetadataPersisted {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+        use std::fmt;
+
+        enum Field {
+            KeyUsage,
+            Description,
+            Tags,
+            KeyState,
+            CreatedAt,
+            DeletionDate,
+            Origin,
+            CreatedBy,
+            CurrentVersion,
+            Unknown(BoundedUnknownFieldName),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a Vault Transit key metadata field name")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(match value {
+                            "key_usage" => Field::KeyUsage,
+                            "description" => Field::Description,
+                            "tags" => Field::Tags,
+                            "key_state" => Field::KeyState,
+                            "created_at" => Field::CreatedAt,
+                            "deletion_date" => Field::DeletionDate,
+                            "origin" => Field::Origin,
+                            "created_by" => Field::CreatedBy,
+                            "current_version" => Field::CurrentVersion,
+                            _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct TransitKeyMetadataPersistedVisitor;
+
+        impl<'de> Visitor<'de> for TransitKeyMetadataPersistedVisitor {
+            type Value = TransitKeyMetadataPersisted;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Vault Transit key metadata record")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                macro_rules! read_field {
+                    ($slot:ident, $name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field($name));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                let mut key_usage = None;
+                let mut description = None;
+                let mut tags = None;
+                let mut key_state = None;
+                let mut created_at = None;
+                let mut deletion_date = None;
+                let mut origin = None;
+                let mut created_by = None;
+                let mut current_version = None;
+                let mut unknown_fields = UnknownFieldSummary::default();
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::KeyUsage => read_field!(key_usage, "key_usage"),
+                        Field::Description => read_field!(description, "description"),
+                        Field::Tags => read_field!(tags, "tags"),
+                        Field::KeyState => read_field!(key_state, "key_state"),
+                        Field::CreatedAt => read_field!(created_at, "created_at"),
+                        Field::DeletionDate => read_field!(deletion_date, "deletion_date"),
+                        Field::Origin => read_field!(origin, "origin"),
+                        Field::CreatedBy => read_field!(created_by, "created_by"),
+                        Field::CurrentVersion => read_field!(current_version, "current_version"),
+                        Field::Unknown(field) => {
+                            let _: IgnoredAny = map.next_value()?;
+                            unknown_fields.observe(field);
+                        }
+                    }
+                }
+
+                let metadata = TransitKeyMetadataPersisted {
+                    key_usage: key_usage.ok_or_else(|| de::Error::missing_field("key_usage"))?,
+                    description: description.unwrap_or(None),
+                    tags: tags.ok_or_else(|| de::Error::missing_field("tags"))?,
+                    key_state: key_state.ok_or_else(|| de::Error::missing_field("key_state"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?,
+                    deletion_date: deletion_date.unwrap_or(None),
+                    origin: origin.ok_or_else(|| de::Error::missing_field("origin"))?,
+                    created_by: created_by.unwrap_or(None),
+                    current_version: current_version.ok_or_else(|| de::Error::missing_field("current_version"))?,
+                };
+                unknown_fields.record_for_transit_key_metadata();
+                Ok(metadata)
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "key_usage",
+            "description",
+            "tags",
+            "key_state",
+            "created_at",
+            "deletion_date",
+            "origin",
+            "created_by",
+            "current_version",
+        ];
+        deserializer.deserialize_struct("TransitKeyMetadataPersisted", FIELDS, TransitKeyMetadataPersistedVisitor)
+    }
 }
 
 impl TransitKeyMetadata {
@@ -2131,6 +2299,41 @@ mod tests {
         let metadata = TransitKeyMetadata::synthesized();
         assert_eq!(metadata.key_state, KeyState::Enabled);
         assert!(metadata.deletion_date.is_none());
+    }
+
+    #[test]
+    fn transit_key_metadata_unknown_fields_remain_readable_and_are_observed() {
+        // A record written by a newer build carries fields this build does not
+        // know. It must stay readable — and the drop must be visible, not
+        // silent (rustfs/backlog#1641). Only the field name may be logged.
+        let persisted: TransitKeyMetadataPersisted = TransitKeyMetadata::synthesized().into();
+        let mut value = serde_json::to_value(&persisted).expect("serialize metadata record");
+        let object = value.as_object_mut().expect("metadata record serializes to an object");
+        object.insert("field_from_the_future".to_string(), serde_json::json!("field value must not be logged"));
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let parsed: TransitKeyMetadataPersisted = metrics::with_local_recorder(&recorder, || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                serde_json::from_value(value).expect("unknown fields must remain readable")
+            })
+        });
+        assert_eq!(parsed.key_state, KeyState::Enabled);
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "vault-transit-key-metadata"), 1);
+
+        let output = logs.output();
+        assert!(
+            output.contains("Vault Transit key metadata record contains unknown fields"),
+            "got: {output}"
+        );
+        assert!(output.contains("field_from_the_future"));
+        assert!(!output.contains("field value must not be logged"));
     }
 
     /// KV2 write acknowledgement (`SecretVersionMetadata`) for `kv2::set`.

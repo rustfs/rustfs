@@ -26,6 +26,7 @@ use crate::backends::{
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
@@ -60,7 +61,12 @@ pub struct VaultKmsClient {
 }
 
 /// Key data stored in Vault
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written so fields the current build does not know
+/// are counted and warned about instead of vanishing silently — this record
+/// is compatibility-bound in both directions (older and newer builds read
+/// each other's writes), so `deny_unknown_fields` is not an option.
+#[derive(Debug, Clone, Serialize)]
 struct VaultKeyData {
     /// Key algorithm
     algorithm: String,
@@ -106,6 +112,187 @@ struct VaultKeyData {
     /// deserializing.
     #[serde(default)]
     baseline_version: Option<u32>,
+}
+
+impl UnknownFieldSummary {
+    fn record_for_vault_kv2_key(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("vault-kv2-key") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "Vault KV2 key record contains unknown fields"
+            );
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VaultKeyData {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+        use std::fmt;
+
+        enum Field {
+            Algorithm,
+            Usage,
+            CreatedAt,
+            Status,
+            Version,
+            Description,
+            Metadata,
+            Tags,
+            DeletionDate,
+            RotatedAt,
+            EncryptedKeyMaterial,
+            BaselineVersion,
+            Unknown(BoundedUnknownFieldName),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a Vault KV2 key record field name")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(match value {
+                            "algorithm" => Field::Algorithm,
+                            "usage" => Field::Usage,
+                            "created_at" => Field::CreatedAt,
+                            "status" => Field::Status,
+                            "version" => Field::Version,
+                            "description" => Field::Description,
+                            "metadata" => Field::Metadata,
+                            "tags" => Field::Tags,
+                            "deletion_date" => Field::DeletionDate,
+                            "rotated_at" => Field::RotatedAt,
+                            "encrypted_key_material" => Field::EncryptedKeyMaterial,
+                            "baseline_version" => Field::BaselineVersion,
+                            _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct VaultKeyDataVisitor;
+
+        impl<'de> Visitor<'de> for VaultKeyDataVisitor {
+            type Value = VaultKeyData;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Vault KV2 key record")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                macro_rules! read_field {
+                    ($slot:ident, $name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field($name));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                let mut algorithm = None;
+                let mut usage = None;
+                let mut created_at = None;
+                let mut status = None;
+                let mut version = None;
+                let mut description = None;
+                let mut metadata = None;
+                let mut tags = None;
+                let mut deletion_date = None;
+                let mut rotated_at = None;
+                let mut encrypted_key_material = None;
+                let mut baseline_version = None;
+                let mut unknown_fields = UnknownFieldSummary::default();
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Algorithm => read_field!(algorithm, "algorithm"),
+                        Field::Usage => read_field!(usage, "usage"),
+                        Field::CreatedAt => read_field!(created_at, "created_at"),
+                        Field::Status => read_field!(status, "status"),
+                        Field::Version => read_field!(version, "version"),
+                        Field::Description => read_field!(description, "description"),
+                        Field::Metadata => read_field!(metadata, "metadata"),
+                        Field::Tags => read_field!(tags, "tags"),
+                        Field::DeletionDate => read_field!(deletion_date, "deletion_date"),
+                        Field::RotatedAt => read_field!(rotated_at, "rotated_at"),
+                        Field::EncryptedKeyMaterial => read_field!(encrypted_key_material, "encrypted_key_material"),
+                        Field::BaselineVersion => read_field!(baseline_version, "baseline_version"),
+                        Field::Unknown(field) => {
+                            let _: IgnoredAny = map.next_value()?;
+                            unknown_fields.observe(field);
+                        }
+                    }
+                }
+
+                let key_data = VaultKeyData {
+                    algorithm: algorithm.ok_or_else(|| de::Error::missing_field("algorithm"))?,
+                    usage: usage.ok_or_else(|| de::Error::missing_field("usage"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?,
+                    status: status.ok_or_else(|| de::Error::missing_field("status"))?,
+                    version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+                    description: description.unwrap_or(None),
+                    metadata: metadata.ok_or_else(|| de::Error::missing_field("metadata"))?,
+                    tags: tags.ok_or_else(|| de::Error::missing_field("tags"))?,
+                    deletion_date: deletion_date.unwrap_or(None),
+                    rotated_at: rotated_at.unwrap_or(None),
+                    encrypted_key_material: encrypted_key_material
+                        .ok_or_else(|| de::Error::missing_field("encrypted_key_material"))?,
+                    baseline_version: baseline_version.unwrap_or(None),
+                };
+                unknown_fields.record_for_vault_kv2_key();
+                Ok(key_data)
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "algorithm",
+            "usage",
+            "created_at",
+            "status",
+            "version",
+            "description",
+            "metadata",
+            "tags",
+            "deletion_date",
+            "rotated_at",
+            "encrypted_key_material",
+            "baseline_version",
+        ];
+        deserializer.deserialize_struct("VaultKeyData", FIELDS, VaultKeyDataVisitor)
+    }
 }
 
 /// Immutable per-version master key material record stored under
@@ -2463,6 +2650,38 @@ mod tests {
         let legacy: VaultKeyData = serde_json::from_value(value).expect("legacy record must deserialize");
         assert_eq!(legacy.baseline_version, None);
         assert_eq!(legacy.version, 1);
+    }
+
+    #[test]
+    fn vault_key_data_unknown_fields_remain_readable_and_are_observed() {
+        // A record written by a newer build carries fields this build does not
+        // know. It must stay readable — and the drop must be visible, not
+        // silent (rustfs/backlog#1641). Only the field name may be logged; the
+        // value can sit next to key material.
+        let mut value = serde_json::to_value(healthy_key_data()).expect("serialize key data");
+        let object = value.as_object_mut().expect("key data serializes to an object");
+        object.insert("field_from_the_future".to_string(), serde_json::json!("field value must not be logged"));
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let parsed: VaultKeyData = metrics::with_local_recorder(&recorder, || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                serde_json::from_value(value).expect("unknown fields must remain readable")
+            })
+        });
+        assert_eq!(parsed.algorithm, healthy_key_data().algorithm);
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "vault-kv2-key"), 1);
+
+        let output = logs.output();
+        assert!(output.contains("Vault KV2 key record contains unknown fields"), "got: {output}");
+        assert!(output.contains("field_from_the_future"));
+        assert!(!output.contains("field value must not be logged"));
     }
 
     #[test]
