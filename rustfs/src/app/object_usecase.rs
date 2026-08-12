@@ -6432,11 +6432,7 @@ impl DefaultObjectUsecase {
         })
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, req),
-        fields(start_time=?time::OffsetDateTime::now_utc())
-    )]
+    #[instrument(level = "trace", skip(self, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {

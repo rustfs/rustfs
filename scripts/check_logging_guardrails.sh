@@ -988,6 +988,7 @@ trace_hot_spans=(
   "crates/ecstore/src/core/sets.rs:list_objects_v2"
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+  "rustfs/src/app/object_usecase.rs:execute_get_object"
 )
 
 for hot_span in "${trace_hot_spans[@]}"; do
