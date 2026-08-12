@@ -115,7 +115,7 @@ use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
 use crate::table_catalog;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
@@ -2621,16 +2621,16 @@ fn should_use_small_eager_put_path(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
 where
     R: AsyncRead + Unpin,
+    B: bytes::BufMut,
 {
-    let mut buf = pool.acquire_buffer(size).await;
-    buf.resize(size, 0);
     let mut filled = 0;
 
     while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+        let mut remaining = (&mut *buf).limit(size - filled);
+        let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
             .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
         if read == 0 {
@@ -2640,13 +2640,22 @@ where
     }
 
     let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+    let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
         .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
 
+    Ok(())
+}
+
+async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = pool.acquire_buffer(size).await;
+    read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
 
@@ -2657,27 +2666,8 @@ async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Resu
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; size];
-    let mut filled = 0;
-
-    while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
-            .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-        if read == 0 {
-            return Err(s3_error!(IncompleteBody));
-        }
-        filled += read;
-    }
-
-    let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
-        .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-    if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
+    let mut buf = Vec::with_capacity(size);
+    read_small_put_body_into(&mut body, &mut buf, size).await?;
     Ok(std::io::Cursor::new(buf))
 }
 
@@ -15253,16 +15243,65 @@ mod tests {
         );
     }
 
+    struct FragmentedBody {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for FragmentedBody {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining()).min(2);
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InitializedLengthProbe {
+        data: std::io::Cursor<Vec<u8>>,
+        initialized_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for InitializedLengthProbe {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")
+                .push(buf.initialized().len());
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
-    async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
+    async fn read_small_put_body_exact_pooled_reads_exact_bytes_without_prefill() {
         let pool = get_concurrency_manager().bytes_pool();
-        let body = std::io::Cursor::new(b"hello".to_vec());
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
 
         let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
             .await
             .expect("pooled exact read should succeed");
 
         assert_eq!(&buffer[..5], b"hello");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first pooled body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -15276,6 +15315,131 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_rejects_extra_body() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello!".to_vec());
+
+        let err = match read_small_put_body_exact_pooled(body, 5, pool.as_ref()).await {
+            Ok(_) => panic!("extra pooled body should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_exact_bytes_without_prefill() {
+        let body = std::io::Cursor::new(b"hello".to_vec());
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(reader.get_ref().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_short_and_extra_bodies() {
+        let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
+            .await
+            .expect_err("short direct body should fail");
+        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
+            .await
+            .expect_err("extra direct body should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_handles_empty_body_boundary() {
+        let empty = read_small_put_body_exact_direct(std::io::Cursor::new(Vec::<u8>::new()), 0)
+            .await
+            .expect("empty direct body should succeed");
+        assert!(empty.get_ref().is_empty());
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
+            .await
+            .expect_err("non-empty body declared as empty should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_error_after_partial_read() {
+        struct PartialThenError {
+            delivered_prefix: bool,
+        }
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.delivered_prefix {
+                    return Poll::Ready(Err(std::io::Error::other("body read failed")));
+                }
+
+                self.delivered_prefix = true;
+                buf.put_slice(b"he");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let err = read_small_put_body_exact_direct(PartialThenError { delivered_prefix: false }, 5)
+            .await
+            .expect_err("a partial body followed by an I/O error must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_accepts_fragmented_body() {
+        let reader = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect("a fragmented exact-length body should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_fragmented_extra_body() {
+        let err = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello!".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect_err("a fragmented body longer than declared must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_into_uninitialized_spare_capacity() {
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
+
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
