@@ -37,6 +37,3 @@ pub const TOTAL_WORKERS: i64 = 4;
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const ISO8601_DATEFORMAT: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-
-pub const GET_OBJECT_ATTRIBUTES_TAGS: &str = "ETag,Checksum,StorageClass,ObjectSize,ObjectParts";
-pub const GET_OBJECT_ATTRIBUTES_MAX_PARTS: i64 = 1000;
