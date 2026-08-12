@@ -85,7 +85,7 @@ runs:
         repo-token: ${{ github.token }}
 
     - name: Install flatc
-      uses: Nugine/setup-flatc@e7855e994773ce90094a3f1626d4afc9080c23ae # v1
+      uses: Nugine/setup-flatc@698800de72a96bfb22cf60431dc21a2ff9a7e07b # v1
       with:
         version: "25.12.19"
 
