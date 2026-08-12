@@ -516,39 +516,6 @@ fn check_claims_from_token_with_context(
     Ok(HashMap::new())
 }
 
-/// Check for Keystone authentication headers and authenticate if present
-/// Returns Some((Credentials, is_owner)) if Keystone authentication succeeds
-/// Returns None if no Keystone headers present (fall back to standard auth)
-///
-/// Reserved for future use (alternative Keystone auth path)
-#[allow(dead_code)]
-pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credentials, bool)>> {
-    use crate::auth_keystone;
-
-    if !auth_keystone::is_keystone_enabled() {
-        return Ok(None);
-    }
-
-    match auth_keystone::authenticate_keystone(headers).await? {
-        Some(cred) => {
-            // Keystone credentials are never "owner" in the traditional sense
-            // unless they have admin role
-            let is_owner = cred
-                .groups
-                .as_ref()
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .any(|g| g.eq_ignore_ascii_case("admin") || g.eq_ignore_ascii_case("reseller_admin"))
-                })
-                .unwrap_or(false);
-
-            Ok(Some((cred, is_owner)))
-        }
-        None => Ok(None),
-    }
-}
-
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
     let token = hds
         .get("x-amz-security-token")
