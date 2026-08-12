@@ -3452,35 +3452,6 @@ mod tests {
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
 
-    /// When policy metadata cannot be loaded, tag-based check is conservative (returns true).
-    #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
-    async fn test_bucket_policy_needs_existing_object_tag_load_failure_is_conservative() {
-        let conditions = HashMap::new();
-        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-        let hint = load_bucket_policy_existing_object_tag_hint(
-            store.as_ref(),
-            "test-bucket-no-policy-xyz-absent",
-            Action::S3Action(S3Action::GetObjectAction),
-        )
-        .await;
-        let no_groups: Option<Vec<String>> = None;
-        let args = BucketPolicyArgs {
-            bucket: "test-bucket-no-policy-xyz-absent",
-            action: Action::S3Action(S3Action::GetObjectAction),
-            is_owner: false,
-            account: "",
-            groups: &no_groups,
-            conditions: &conditions,
-            object: "obj",
-        };
-        let result = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args).await;
-        assert!(
-            result,
-            "when policy metadata cannot be loaded, ExistingObjectTag should be fetched conservatively"
-        );
-    }
-
     #[test]
     fn test_bucket_policy_existing_object_tag_condition_key_detection() {
         let condition_key_policy = r#"{

@@ -16668,7 +16668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
             .bucket("test-bucket".to_string())
@@ -16811,7 +16810,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
         let restore_request = RestoreRequest {
             days: Some(1),
