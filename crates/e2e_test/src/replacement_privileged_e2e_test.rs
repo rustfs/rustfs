@@ -618,7 +618,8 @@ mod tests {
                 saw_live_loss = true;
                 continue;
             }
-            if saw_live_loss && line.contains("Heal auto-scan cycle completed") {
+            if saw_live_loss && (line.contains("Heal auto disk scanner idle") || line.contains("Heal auto-scan cycle completed"))
+            {
                 return true;
             }
         }
@@ -764,9 +765,11 @@ mod tests {
         S: FnMut() -> F,
         F: std::future::Future<Output = Result<serde_json::Value, Box<dyn Error + Send + Sync>>>,
     {
-        let first = sample_replacement_completion(target_disk, &mut census, &mut status).await?;
+        let missing = census()?;
+        let status = status().await?;
+        let first = replacement_completion_state(&status, target_disk, missing)?;
         if matches!(first, CompletionSample::CompletedWithIncomplete(_)) {
-            return sample_replacement_completion(target_disk, census, status).await;
+            return replacement_completion_state(&status, target_disk, census()?);
         }
         Ok(first)
     }
@@ -893,24 +896,30 @@ mod tests {
             "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed",
             target
         ));
-        assert!(!live_disk_loss_scan_completed(
-            "Heal auto-scan cycle completed\nHeal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed",
+        assert!(live_disk_loss_scan_completed(
+            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle",
             target
         ));
         assert!(!live_disk_loss_scan_completed(
-            "event=disk_health_check_failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed",
+            "Heal auto disk scanner idle\nHeal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed",
             target
         ));
         assert!(!live_disk_loss_scan_completed(
-            "Heal auto-scan disk inspection failed endpoint=/mnt/other disk_state=check_failed\nHeal auto-scan cycle completed",
+            "event=disk_health_check_failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle",
+            target
+        ));
+        assert!(!live_disk_loss_scan_completed(
+            "Heal auto-scan disk inspection failed endpoint=/mnt/other disk_state=check_failed\nHeal auto disk scanner idle",
             target
         ));
         let path = std::env::temp_dir().join(format!("rustfs-replacement-scan-{}.log", std::process::id()));
-        let stale = "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed\n";
+        let stale =
+            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle\n";
         fs::write(&path, stale)?;
         let offset = log_len(&path)?;
         assert!(!live_disk_loss_scan_completed_from_path(&path, offset, target)?);
-        let fresh = "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed\n";
+        let fresh =
+            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle\n";
         fs::write(&path, format!("{stale}{fresh}"))?;
         assert!(live_disk_loss_scan_completed_from_path(&path, offset, target)?);
         fs::remove_file(path)?;
@@ -996,11 +1005,20 @@ mod tests {
         assert_eq!(result, CompletionSample::Ready);
         assert!(samples.borrow().is_empty());
 
+        let status_samples = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::from([
+            serde_json::json!({
+                "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
+            }),
+            serde_json::json!({
+                "cluster": {"definitive": false, "records": []}
+            }),
+        ])));
         let persistent = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::from([
             BTreeSet::from(["missing".to_string()]),
             BTreeSet::from(["still-missing".to_string()]),
         ])));
         let census_samples = persistent.clone();
+        let statuses = status_samples.clone();
         let result = confirm_replacement_completion(
             Path::new("/mnt/target"),
             move || {
@@ -1009,10 +1027,14 @@ mod tests {
                     .pop_front()
                     .ok_or_else(|| "missing census sample".into())
             },
-            || async {
-                Ok(serde_json::json!({
-                    "cluster": {"definitive": true, "records": [{"state": "completed", "targetSlots": ["/mnt/target"]}]}
-                }))
+            move || {
+                let statuses = statuses.clone();
+                async move {
+                    statuses
+                        .borrow_mut()
+                        .pop_front()
+                        .ok_or_else(|| "missing status sample".into())
+                }
             },
         )
         .await
@@ -1022,6 +1044,7 @@ mod tests {
             CompletionSample::CompletedWithIncomplete(BTreeSet::from(["still-missing".to_string()]))
         );
         assert!(persistent.borrow().is_empty());
+        assert_eq!(status_samples.borrow().len(), 1);
     }
 
     #[test]
