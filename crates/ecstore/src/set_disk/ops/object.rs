@@ -5774,6 +5774,110 @@ mod inline_put_commit_path_tests {
     }
 
     #[tokio::test]
+    async fn inline_put_direct_commit_handles_post_encode_rename_failures() {
+        use crate::disk::health_state::RuntimeDriveHealthState;
+
+        let payload = vec![0x5a; 4 * 1024];
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-post-encode-quorum";
+        let object = "exact-quorum.bin";
+        make_bucket(&disk_stores, bucket).await;
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let put = {
+            let set_disks = Arc::clone(&set_disks);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(payload);
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            })
+        };
+        barrier.wait_until_paused().await;
+        disk_stores[3].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        barrier.release();
+        put.await
+            .expect("exact-quorum PUT task should complete")
+            .expect("one post-encode rename failure should preserve write quorum");
+        disk_stores[3].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let persisted = disk.read_version("", bucket, object, "", &ReadOptions::default()).await;
+            assert_eq!(
+                persisted.is_ok(),
+                disk_index < 3,
+                "only disks that completed rename_data may publish the exact-quorum object"
+            );
+        }
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-post-encode-rollback";
+        let object = "rollback.bin";
+        let old_payload = vec![0x31; 4 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+        let mut old_reader = PutObjReader::from_vec(old_payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut old_reader, &ObjectOptions::default())
+            .await
+            .expect("old inline object should commit");
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let mut old_disk_data = Vec::with_capacity(disk_stores.len());
+        for disk in &disk_stores {
+            old_disk_data.push(
+                disk.read_version("", bucket, object, "", &read_data)
+                    .await
+                    .expect("old inline shard should be readable before overwrite")
+                    .data,
+            );
+        }
+
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let put = {
+            let set_disks = Arc::clone(&set_disks);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(payload);
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            })
+        };
+        barrier.wait_until_paused().await;
+        for disk in &disk_stores[2..] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        }
+        barrier.release();
+        put.await
+            .expect("quorum-minus-one PUT task should complete")
+            .expect_err("two post-encode rename failures must fail write quorum");
+        for disk in &disk_stores[2..] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        }
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let restored = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should retain the old inline object: {err}"));
+            assert_eq!(restored.data, old_disk_data[disk_index]);
+        }
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("old object should remain readable after quorum rollback");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("old object should stream after quorum rollback");
+        assert_eq!(restored, old_payload);
+    }
+
+    #[tokio::test]
     async fn zero_length_put_keeps_existing_pipeline_layout_and_round_trips() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "zero-length-put";
