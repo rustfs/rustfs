@@ -1006,16 +1006,6 @@ impl TransitionCore {
         client.abort_multipart_upload(bucket_name, object, upload_id).await
     }
 
-    pub async fn get_bucket_policy(&self, bucket_name: &str) -> Result<String, std::io::Error> {
-        let client = self.0.clone();
-        client.get_bucket_policy(bucket_name).await
-    }
-
-    pub async fn put_bucket_policy(&self, bucket_name: &str, bucket_policy: &str) -> Result<(), std::io::Error> {
-        let client = self.0.clone();
-        client.put_bucket_policy(bucket_name, bucket_policy).await
-    }
-
     pub async fn get_object(
         &self,
         bucket_name: &str,
