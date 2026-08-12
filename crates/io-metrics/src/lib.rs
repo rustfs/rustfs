@@ -103,6 +103,12 @@ pub fn put_stage_metrics_enabled() -> bool {
     PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Start a PUT-stage timer only when detailed PUT attribution is enabled.
+#[inline(always)]
+pub fn put_stage_timer() -> Option<std::time::Instant> {
+    put_stage_metrics_enabled().then(std::time::Instant::now)
+}
+
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
     GET_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
@@ -2012,6 +2018,13 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
+#[inline(always)]
+pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Option<std::time::Instant>) {
+    if let Some(started_at) = started_at {
+        record_put_object_stage_duration(stage, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -2825,6 +2838,17 @@ mod tests {
         record_put_object_stage_duration("set_disk_encode", 5.0);
         // Still disabled
         assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn test_put_stage_timer_follows_metrics_switch() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        assert!(put_stage_timer().is_none());
+
+        set_put_stage_metrics_enabled(true);
+        assert!(put_stage_timer().is_some());
+        set_put_stage_metrics_enabled(false);
     }
 
     #[test]

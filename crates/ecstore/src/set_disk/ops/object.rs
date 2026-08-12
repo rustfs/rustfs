@@ -1074,9 +1074,10 @@ impl SetDisks {
             let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
+            let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
-            let writer_setup_stage_start = Instant::now();
+            let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
             let writer_futs: Vec<_> = shuffle_disks
                 .iter()
                 .map(|disk_op| {
@@ -1123,12 +1124,16 @@ impl SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
-            let writer_setup_elapsed = writer_setup_stage_start.elapsed();
-            let writer_setup_ms = writer_setup_elapsed.as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_writer_setup",
-                duration_millis_f64(writer_setup_elapsed),
-            );
+            let writer_setup_elapsed = writer_setup_stage_start.map(|stage_start| stage_start.elapsed());
+            let writer_setup_ms = writer_setup_elapsed
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default();
+            if let Some(writer_setup_elapsed) = writer_setup_elapsed {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_writer_setup",
+                    duration_millis_f64(writer_setup_elapsed),
+                );
+            }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1164,7 +1169,7 @@ impl SetDisks {
                 0
             };
 
-            let encode_stage_start = Instant::now();
+            let encode_stage_start = collect_stage_timing.then(Instant::now);
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
                     .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
@@ -1203,9 +1208,11 @@ impl SetDisks {
                     }
                 },
             };
-            let encode_elapsed = encode_stage_start.elapsed();
-            let encode_ms = encode_elapsed.as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
+            let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
+            let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
+            if let Some(encode_elapsed) = encode_elapsed {
+                rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
+            }
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {

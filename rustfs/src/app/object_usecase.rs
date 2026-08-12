@@ -5571,7 +5571,7 @@ impl DefaultObjectUsecase {
         // Bucket-quota admission runs exactly once, and only now that the authoritative object length is known. `size` is the same basis the settle phase records via ObjectInfo.size (actual, pre-compression/pre-encryption logical size), NOT the aws-chunked wire Content-Length. When no quota is configured this stays a zero-extra-I/O fast path; once a hard quota is set, checker/config/usage faults fail closed with a retryable error.
         self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
 
-        let ingress_stage_start = std::time::Instant::now();
+        let ingress_stage_start = rustfs_io_metrics::put_stage_timer();
         let should_compress =
             is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
         let server_side_encryption_requested =
@@ -5635,9 +5635,13 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let bucket_validate_stage_start = rustfs_io_metrics::put_stage_timer();
         validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
 
+        let sse_config_stage_start = rustfs_io_metrics::put_stage_timer();
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -5703,7 +5707,9 @@ impl DefaultObjectUsecase {
 
         let mut metadata = metadata.unwrap_or_default();
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let object_lock_config_stage_start = rustfs_io_metrics::put_stage_timer();
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -5725,6 +5731,7 @@ impl DefaultObjectUsecase {
             has_explicit_object_lock_retention,
         )?;
 
+        let put_opts_stage_start = rustfs_io_metrics::put_stage_timer();
         let mut opts: ObjectOptions = put_opts_with_replication_authorization(
             &bucket,
             &key,
@@ -5735,6 +5742,7 @@ impl DefaultObjectUsecase {
         )
         .await
         .map_err(ApiError::from)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         apply_put_request_object_lock_opts(
             &bucket,
@@ -5757,6 +5765,7 @@ impl DefaultObjectUsecase {
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
+        let prelookup_stage_start = prelookup_required.then(rustfs_io_metrics::put_stage_timer).flatten();
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
                 get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
@@ -5782,6 +5791,7 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_prelookup", prelookup_stage_start);
 
         let actual_size = size;
 
@@ -5870,15 +5880,13 @@ impl DefaultObjectUsecase {
             put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
         }
         rustfs_io_metrics::record_put_object_path(put_path);
-        rustfs_io_metrics::record_put_object_stage_duration(
-            "ingress_prepare",
-            ingress_stage_start.elapsed().as_secs_f64() * 1000.0,
-        );
+        rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
+        let encryption_stage_start = rustfs_io_metrics::put_stage_timer();
         let write_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
@@ -5922,6 +5930,7 @@ impl DefaultObjectUsecase {
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
         let mut reader = PutObjReader::new(reader);
 
@@ -5938,9 +5947,11 @@ impl DefaultObjectUsecase {
         // post-commit schedule (see the reuse site further down), so a
         // replication-config hot update can no longer split the two phases
         // (https://github.com/rustfs/backlog/issues/1320).
+        let replication_decision_stage_start = rustfs_io_metrics::put_stage_timer();
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
@@ -5952,7 +5963,12 @@ impl DefaultObjectUsecase {
         }
 
         let cache_adapter = self.object_data_cache();
+        let cache_invalidate_before_stage_start = rustfs_io_metrics::put_stage_timer();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            "app_cache_invalidate_before",
+            cache_invalidate_before_stage_start,
+        );
 
         let store_put_watchdog = tokio_util::sync::CancellationToken::new();
         spawn_traced({
@@ -5992,6 +6008,7 @@ impl DefaultObjectUsecase {
         let object_traffic_progress = object_traffic_health
             .as_deref()
             .and_then(ObjectTrafficHealth::track_write_storage);
+        let store_put_stage_start = rustfs_io_metrics::put_stage_timer();
         let (obj_info, backfilled_old_current_size) = match store
             .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
             .await
@@ -6017,6 +6034,7 @@ impl DefaultObjectUsecase {
             }
             Err(err) => {
                 store_put_watchdog.cancel();
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
                 warn!(
                     target: "rustfs::app::object_usecase",
                     event = EVENT_PUT_OBJECT_STORE_RETURNED,
@@ -6038,10 +6056,12 @@ impl DefaultObjectUsecase {
                 return result;
             }
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
         drop(object_traffic_progress);
         #[cfg(test)]
         wait_for_put_post_store_test_hook(&bucket).await;
 
+        let post_store_stage_start = rustfs_io_metrics::put_stage_timer();
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
         let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
 
@@ -6140,10 +6160,13 @@ impl DefaultObjectUsecase {
         let result = Ok(response);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
+        let capacity_update_stage_start = rustfs_io_metrics::put_stage_timer();
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
 
         // Record PutObject metrics via zero-copy-metrics
         {
