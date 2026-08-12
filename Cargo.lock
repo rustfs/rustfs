@@ -9345,7 +9345,6 @@ dependencies = [
 name = "rustfs-data-usage"
 version = "1.0.0-rc.1"
 dependencies = [
- "async-trait",
  "hotpath",
  "rmp-serde",
  "rustfs-filemeta",

@@ -37,7 +37,6 @@ hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-filemeta/hotpath-cpu"]
 hotpath.workspace = true
 serde = { workspace = true, features = ["derive"] }
 rmp-serde = { workspace = true }
-async-trait = { workspace = true }
 rustfs-filemeta = { workspace = true }
 
 [lib]
