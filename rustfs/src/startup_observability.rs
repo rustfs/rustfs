@@ -24,14 +24,63 @@ pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: Cancell
     init_update_check();
     crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
-    if startup_runtime_sources::observability_metric_enabled() {
+    let metrics_enabled = startup_runtime_sources::observability_metric_enabled();
+    configure_metric_gates(metrics_enabled);
+
+    if metrics_enabled {
         // Load persisted compression stats into memory early, before any PUTs can occur.
         init_compression_total_memory_from_backend(store).await;
-        startup_runtime_sources::set_put_stage_metrics_enabled(true);
-        startup_runtime_sources::set_get_stage_metrics_enabled(true);
-        startup_runtime_sources::set_metrics_enabled(true);
         startup_runtime_sources::init_metrics_runtime(ctx.clone());
         crate::memory_observability::init_memory_observability(ctx.clone());
         init_auto_tuner(ctx).await;
+    }
+}
+
+fn configure_metric_gates(metrics_enabled: bool) {
+    let put_stage_metrics_enabled = metrics_enabled
+        && rustfs_utils::get_env_bool(
+            rustfs_config::observability::ENV_OBS_PUT_STAGE_METRICS_ENABLED,
+            rustfs_config::DEFAULT_OBS_PUT_STAGE_METRICS_ENABLED,
+        );
+    startup_runtime_sources::set_put_stage_metrics_enabled(put_stage_metrics_enabled);
+    startup_runtime_sources::set_get_stage_metrics_enabled(metrics_enabled);
+    startup_runtime_sources::set_metrics_enabled(metrics_enabled);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PUT_STAGE_ENV: &str = rustfs_config::observability::ENV_OBS_PUT_STAGE_METRICS_ENABLED;
+
+    #[test]
+    #[serial_test::serial]
+    fn put_stage_metrics_require_explicit_opt_in() {
+        let previous_metrics = rustfs_io_metrics::metrics_enabled();
+        let previous_get_stages = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_put_stages = rustfs_io_metrics::put_stage_metrics_enabled();
+
+        temp_env::with_var(PUT_STAGE_ENV, None::<&str>, || {
+            configure_metric_gates(true);
+            assert!(rustfs_io_metrics::metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_metrics_enabled());
+            assert!(!rustfs_io_metrics::put_stage_metrics_enabled());
+        });
+
+        temp_env::with_var(PUT_STAGE_ENV, Some("true"), || {
+            configure_metric_gates(true);
+            assert!(rustfs_io_metrics::metrics_enabled());
+            assert!(rustfs_io_metrics::get_stage_metrics_enabled());
+            assert!(rustfs_io_metrics::put_stage_metrics_enabled());
+
+            configure_metric_gates(false);
+            assert!(!rustfs_io_metrics::metrics_enabled());
+            assert!(!rustfs_io_metrics::get_stage_metrics_enabled());
+            assert!(!rustfs_io_metrics::put_stage_metrics_enabled());
+        });
+
+        startup_runtime_sources::set_metrics_enabled(previous_metrics);
+        startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
+        startup_runtime_sources::set_put_stage_metrics_enabled(previous_put_stages);
     }
 }
