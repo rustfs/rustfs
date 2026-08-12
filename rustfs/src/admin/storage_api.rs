@@ -197,10 +197,10 @@ pub(crate) mod lifecycle {
     pub(crate) use super::ecstore_bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
         claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
-        load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
-        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
-        persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
-        request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+        load_manual_transition_job_record, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
+        manual_transition_scope_admission_lease_expired, persist_manual_transition_job_progress_if_owned,
+        renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel, save_manual_transition_job_record,
+        update_manual_transition_job_record,
     };
     pub(crate) type ManualTransitionCancelCheck =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionCancelCheck;

@@ -24,10 +24,10 @@ use crate::admin::storage_api::lifecycle::{
     claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
     delete_transition_candidate_for_operator, enqueue_transition_for_existing_objects_scoped,
     finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
-    load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
-    manual_transition_job_lease_expired, manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
+    load_manual_transition_job_record, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
+    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
     persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
-    request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+    request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
 use crate::auth::{check_key_valid, get_session_token};
@@ -645,35 +645,15 @@ fn json_response<T: Serialize>(response: &T, status: StatusCode) -> S3Result<S3R
     Ok(S3Response::with_headers((status, Body::from(body)), headers))
 }
 
-async fn update_manual_transition_job_record_cas(
+async fn update_manual_transition_job_record_if_owned(
     store: Arc<ECStore>,
     job_id: Uuid,
     expected_lease_id: Uuid,
-    mut update: impl FnMut(&mut ManualTransitionJobRecord),
+    mut update: impl FnMut(&mut ManualTransitionJobRecord) -> bool,
 ) -> S3Result<ManualTransitionJobRecord> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(store.clone(), job_id)
-            .await
-            .map_err(|err| map_manual_transition_job_load_error(err, job_id))?;
-        if record.lease_id != expected_lease_id {
-            return Err(s3_error!(OperationAborted, "manual transition job ownership changed; retry the request"));
-        }
-        update(&mut record);
-        match save_manual_transition_job_record_if_current(store.clone(), &record, &etag).await {
-            Ok(()) => return Ok(record),
-            Err(StorageError::PreconditionFailed) => continue,
-            Err(err) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("manual transition job store failed: {err}"),
-                ));
-            }
-        }
-    }
-    Err(s3_error!(
-        OperationAborted,
-        "manual transition job record changed concurrently; retry the request"
-    ))
+    update_manual_transition_job_record(store, job_id, Some(expected_lease_id), |record| update(record))
+        .await
+        .map_err(|err| map_manual_transition_job_load_error(err, job_id))
 }
 
 fn manual_transition_durable_cancel_check(store: Arc<ECStore>, job_id: Uuid) -> ManualTransitionCancelCheck {
@@ -748,7 +728,10 @@ async fn finalize_manual_transition_job(
     lease_id: Uuid,
     result: Result<ManualTransitionRunReport, StorageError>,
 ) -> Option<ManualTransitionJobRecord> {
-    let updated = update_manual_transition_job_record_cas(store.clone(), job_id, lease_id, |record| {
+    let updated = update_manual_transition_job_record_if_owned(store.clone(), job_id, lease_id, |record| {
+        if record.is_terminal() {
+            return false;
+        }
         let cancel_requested = record.cancel_requested;
         match &result {
             Ok(report) => {
@@ -768,6 +751,7 @@ async fn finalize_manual_transition_job(
                 }
             }
         }
+        true
     })
     .await;
     match updated {
@@ -852,15 +836,23 @@ async fn start_manual_transition_job(
     match claim_manual_transition_scope_admission(store.clone(), &ManualTransitionScopeAdmission::from_job(&record)).await {
         Ok(ManualTransitionScopeAdmissionClaim::Claimed) => {}
         Ok(ManualTransitionScopeAdmissionClaim::Conflict(active)) => {
-            let _ = update_manual_transition_job_record_cas(store.clone(), job_id, record.lease_id, |record| {
+            let _ = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
+                if record.is_terminal() {
+                    return false;
+                }
                 record.fail("manual transition admission conflict");
+                true
             })
             .await;
             return Ok(StartManualTransitionJobResult::Conflict(manual_transition_job_conflict_response(*active)));
         }
         Err(err) => {
-            let _ = update_manual_transition_job_record_cas(store.clone(), job_id, record.lease_id, |record| {
+            let _ = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
+                if record.is_terminal() {
+                    return false;
+                }
                 record.fail(format!("manual transition admission failed: {err}"));
+                true
             })
             .await;
             return Err(S3Error::with_message(
@@ -1001,9 +993,12 @@ impl Operation for ManualTransitionJobStatusHandler {
                         && !manual_transition_scope_admission_lease_expired(&admission)
                 });
             if !local_active && !leased_elsewhere && manual_transition_job_lease_expired(&record) {
-                record = update_manual_transition_job_record_cas(store.clone(), job_id, record.lease_id, |record| {
+                record = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
                     if record.state == ManualTransitionJobState::Running && manual_transition_job_lease_expired(record) {
                         record.mark_unknown_if_unowned();
+                        true
+                    } else {
+                        false
                     }
                 })
                 .await?;

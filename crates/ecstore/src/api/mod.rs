@@ -65,7 +65,7 @@ pub mod bucket {
                 persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease,
                 renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel,
                 save_manual_transition_job_record, save_manual_transition_job_record_if_current,
-                save_manual_transition_scope_admission_if_absent,
+                save_manual_transition_scope_admission_if_absent, update_manual_transition_job_record,
             };
         }
 

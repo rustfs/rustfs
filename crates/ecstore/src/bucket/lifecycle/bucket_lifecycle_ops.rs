@@ -28,9 +28,9 @@ use crate::bucket::lifecycle::manual_transition_job::{
     load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_pending_task_records,
     manual_transition_job_id_from_record_object_name, manual_transition_job_lease_expired,
     manual_transition_worker_result_task_key, persist_manual_transition_job_progress_if_owned,
-    reconcile_manual_transition_worker_results, record_manual_transition_worker_result,
+    reconcile_manual_transition_worker_results_if_owned, record_manual_transition_worker_result,
     record_manual_transition_worker_result_with_reason, renew_manual_transition_job_lease_if_owned,
-    save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent,
+    save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent, update_manual_transition_job_record,
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
@@ -2213,7 +2213,18 @@ async fn recover_manual_transition_job(
 
     let recovery_unknown_snapshot = ManualTransitionQueueSnapshot::default();
     if record.scan_completed {
-        let reconciled = reconcile_manual_transition_worker_results(api.clone(), job_id, recovery_unknown_snapshot).await?;
+        let reconciled = match reconcile_manual_transition_worker_results_if_owned(
+            api.clone(),
+            job_id,
+            record.lease_id,
+            recovery_unknown_snapshot,
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+            Err(err) => return Err(err),
+        };
         if reconciled.is_terminal() {
             release_manual_transition_recovery_admission(api, &reconciled).await;
             return match reconciled.state {
@@ -2270,18 +2281,21 @@ async fn recover_manual_transition_job(
         return Ok(ManualTransitionJobRecoveryOutcome::Resumed);
     }
 
-    let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-    if record.mark_unknown_if_worker_results_lost(recovery_unknown_snapshot)
-        || record.mark_unknown_if_recovery_would_skip_pending_page(recovery_unknown_snapshot)
+    let mut marked_unknown = false;
+    let record = match update_manual_transition_job_record(api.clone(), job_id, Some(recovery_lease_id), |record| {
+        marked_unknown = record.mark_unknown_if_worker_results_lost(recovery_unknown_snapshot)
+            || record.mark_unknown_if_recovery_would_skip_pending_page(recovery_unknown_snapshot);
+        marked_unknown
+    })
+    .await
     {
-        return match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                release_manual_transition_recovery_admission(api, &record).await;
-                Ok(ManualTransitionJobRecoveryOutcome::Unknown)
-            }
-            Err(Error::PreconditionFailed) => Ok(ManualTransitionJobRecoveryOutcome::Skipped),
-            Err(err) => Err(err),
-        };
+        Ok(record) => record,
+        Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+        Err(err) => return Err(err),
+    };
+    if marked_unknown {
+        release_manual_transition_recovery_admission(api, &record).await;
+        return Ok(ManualTransitionJobRecoveryOutcome::Unknown);
     }
 
     let mut options = record.resume_options();
@@ -2398,25 +2412,17 @@ async fn finalize_recovered_manual_transition_job(
     expected_lease_id: Uuid,
     result: Result<ManualTransitionRunReport, Error>,
 ) -> Result<ManualTransitionJobRecord, Error> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if record.lease_id != expected_lease_id {
-            return Err(Error::PreconditionFailed);
-        }
+    update_manual_transition_job_record(api, job_id, Some(expected_lease_id), |record| {
         if record.is_terminal() {
-            return Ok(record);
+            return false;
         }
         match &result {
             Ok(report) => record.complete(report.clone(), manual_transition_queue_snapshot()),
             Err(err) => record.fail(format!("manual transition recovery failed: {err}")),
         }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => return Ok(record),
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(Error::PreconditionFailed)
+        true
+    })
+    .await
 }
 
 async fn release_manual_transition_recovery_admission(api: Arc<ECStore>, record: &ManualTransitionJobRecord) {
@@ -2466,23 +2472,18 @@ fn spawn_manual_transition_recovery_heartbeat(api: Arc<ECStore>, job_id: Uuid, l
 }
 
 async fn abandon_manual_transition_recovery_lease(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> Result<(), Error> {
-    for _ in 0..4 {
-        let (mut record, etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
-            Ok(record) => record,
-            Err(Error::ConfigNotFound) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if record.lease_id != lease_id || record.is_terminal() {
-            return Ok(());
+    match update_manual_transition_job_record(api, job_id, Some(lease_id), |record| {
+        if record.is_terminal() {
+            return false;
         }
         record.abandon_recovery_lease(lease_id);
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => return Ok(()),
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+        true
+    })
+    .await
+    {
+        Ok(_) | Err(Error::ConfigNotFound | Error::PreconditionFailed) => Ok(()),
+        Err(err) => Err(err),
     }
-    Ok(())
 }
 
 fn tier_free_version_recovery_enabled() -> bool {
@@ -5116,7 +5117,7 @@ mod tests {
     };
     use crate::bucket::lifecycle::config_boundary;
     use crate::bucket::lifecycle::manual_transition_job::{
-        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressCasBarrier, ManualTransitionScopeAdmission,
+        ManualTransitionJobCasBarrier, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
         ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason,
         ManualTransitionWorkerResult, ManualTransitionWorkerResultRecord, claim_manual_transition_scope_admission,
         delete_manual_transition_scope_admission_if_current, legacy_manual_transition_scope_key,
@@ -8605,7 +8606,7 @@ mod tests {
             .await
             .expect("running scope admission should save");
         let lease_id = record.lease_id;
-        let barrier = ManualTransitionProgressCasBarrier::install(job_id);
+        let barrier = ManualTransitionJobCasBarrier::install(job_id);
         let progress_store = ecstore.clone();
         let progress = tokio::spawn(async move {
             persist_manual_transition_job_progress_if_owned(
@@ -8714,6 +8715,63 @@ mod tests {
         assert_eq!(loaded.owner_id, "owner-b");
         assert_eq!(loaded.report.scanned, 0);
         assert!(loaded.report.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_reconcile_rejects_lease_takeover_during_cas() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-reconcile-lease-race-{}", job_id.simple());
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &ManualTransitionRunOptions::default(), "owner-a");
+        record.scan_completed = true;
+        let stale_lease_id = record.lease_id;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let task = ManualTransitionTaskRecord::new(job_id, &task_key, &bucket, "logs/a", None, "WARM");
+        assert!(
+            save_manual_transition_task_if_absent(ecstore.clone(), &task)
+                .await
+                .expect("task journal marker should save")
+        );
+
+        let barrier = ManualTransitionJobCasBarrier::install(job_id);
+        let heartbeat_store = ecstore.clone();
+        let heartbeat = tokio::spawn(async move {
+            renew_manual_transition_job_lease_if_owned(
+                heartbeat_store,
+                job_id,
+                stale_lease_id,
+                ManualTransitionQueueSnapshot::default(),
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+
+        let (mut recovered, etag) = load_manual_transition_job_record_with_etag(ecstore.clone(), job_id)
+            .await
+            .expect("running job record should load during reconciliation");
+        recovered.lease_id = Uuid::new_v4();
+        recovered.owner_id = "owner-b".to_string();
+        save_manual_transition_job_record_if_current(ecstore.clone(), &recovered, &etag)
+            .await
+            .expect("recovery owner should replace the lease");
+        barrier.release();
+
+        let error = heartbeat
+            .await
+            .expect("heartbeat task should join")
+            .expect_err("stale reconciliation must reject the recovery lease");
+        assert_eq!(error, Error::PreconditionFailed);
+        let loaded = load_manual_transition_job_record(ecstore, job_id)
+            .await
+            .expect("recovered job record should load");
+        assert_eq!(loaded.lease_id, recovered.lease_id);
+        assert_eq!(loaded.owner_id, "owner-b");
+        assert_eq!(loaded.state, ManualTransitionJobState::Running);
+        assert_eq!(loaded.report.enqueued, 0);
     }
 
     #[tokio::test]

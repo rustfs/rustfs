@@ -48,7 +48,7 @@ const MANUAL_TRANSITION_WORKER_RESULT_SCAN_LIMIT: i32 = 1000;
 const MANUAL_TRANSITION_JOB_CAS_RETRIES: usize = 4;
 
 #[cfg(test)]
-struct ManualTransitionProgressCasBarrierState {
+struct ManualTransitionJobCasBarrierState {
     job_id: Uuid,
     paused: std::sync::atomic::AtomicBool,
     arrived: tokio::sync::Notify,
@@ -56,31 +56,30 @@ struct ManualTransitionProgressCasBarrierState {
 }
 
 #[cfg(test)]
-pub(crate) struct ManualTransitionProgressCasBarrier {
-    state: Arc<ManualTransitionProgressCasBarrierState>,
+pub(crate) struct ManualTransitionJobCasBarrier {
+    state: Arc<ManualTransitionJobCasBarrierState>,
 }
 
 #[cfg(test)]
-static MANUAL_TRANSITION_PROGRESS_CAS_BARRIER: std::sync::OnceLock<
-    std::sync::Mutex<Option<Arc<ManualTransitionProgressCasBarrierState>>>,
-> = std::sync::OnceLock::new();
+static MANUAL_TRANSITION_JOB_CAS_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<ManualTransitionJobCasBarrierState>>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
-impl ManualTransitionProgressCasBarrier {
+impl ManualTransitionJobCasBarrier {
     pub(crate) fn install(job_id: Uuid) -> Self {
-        let state = Arc::new(ManualTransitionProgressCasBarrierState {
+        let state = Arc::new(ManualTransitionJobCasBarrierState {
             job_id,
             paused: std::sync::atomic::AtomicBool::new(false),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
         });
-        let mut slot = MANUAL_TRANSITION_PROGRESS_CAS_BARRIER
+        let mut slot = MANUAL_TRANSITION_JOB_CAS_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("manual transition progress CAS barrier mutex should not poison");
         assert!(
             slot.is_none(),
-            "manual transition progress CAS barrier must be installed by one test at a time"
+            "manual transition job CAS barrier must be installed by one test at a time"
         );
         *slot = Some(Arc::clone(&state));
         drop(slot);
@@ -98,7 +97,7 @@ impl ManualTransitionProgressCasBarrier {
             }
         })
         .await
-        .expect("manual transition progress should reach the deterministic CAS barrier");
+        .expect("manual transition job update should reach the deterministic CAS barrier");
     }
 
     pub(crate) fn release(&self) {
@@ -107,10 +106,10 @@ impl ManualTransitionProgressCasBarrier {
 }
 
 #[cfg(test)]
-impl Drop for ManualTransitionProgressCasBarrier {
+impl Drop for ManualTransitionJobCasBarrier {
     fn drop(&mut self) {
         self.release();
-        let mut slot = MANUAL_TRANSITION_PROGRESS_CAS_BARRIER
+        let mut slot = MANUAL_TRANSITION_JOB_CAS_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("manual transition progress CAS barrier mutex should not poison");
@@ -121,8 +120,8 @@ impl Drop for ManualTransitionProgressCasBarrier {
 }
 
 #[cfg(test)]
-async fn pause_manual_transition_progress_before_first_save(job_id: Uuid) {
-    let barrier = MANUAL_TRANSITION_PROGRESS_CAS_BARRIER
+async fn pause_manual_transition_job_before_first_cas(job_id: Uuid) {
+    let barrier = MANUAL_TRANSITION_JOB_CAS_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("manual transition progress CAS barrier mutex should not poison")
@@ -140,7 +139,7 @@ async fn pause_manual_transition_progress_before_first_save(job_id: Uuid) {
             .release
             .acquire()
             .await
-            .expect("manual transition progress CAS barrier should remain open")
+            .expect("manual transition job CAS barrier should remain open")
             .forget();
     }
 }
@@ -1154,6 +1153,54 @@ pub async fn save_manual_transition_job_record_if_current(
     .await
 }
 
+/// Applies a job-record mutation with optimistic concurrency control.
+///
+/// The mutation returns whether the record needs to be persisted. When a lease
+/// is supplied, ownership is checked again after every conflicting write.
+pub async fn update_manual_transition_job_record<F>(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Option<Uuid>,
+    update: F,
+) -> EcstoreResult<ManualTransitionJobRecord>
+where
+    F: FnMut(&mut ManualTransitionJobRecord) -> bool,
+{
+    update_manual_transition_job_record_from(api, job_id, expected_lease_id, None, update).await
+}
+
+async fn update_manual_transition_job_record_from<F>(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Option<Uuid>,
+    mut current: Option<(ManualTransitionJobRecord, String)>,
+    mut update: F,
+) -> EcstoreResult<ManualTransitionJobRecord>
+where
+    F: FnMut(&mut ManualTransitionJobRecord) -> bool,
+{
+    for _ in 0..MANUAL_TRANSITION_JOB_CAS_RETRIES {
+        let (mut record, etag) = match current.take() {
+            Some(current) => current,
+            None => load_manual_transition_job_record_with_etag(api.clone(), job_id).await?,
+        };
+        if expected_lease_id.is_some_and(|lease_id| record.lease_id != lease_id) {
+            return Err(Error::PreconditionFailed);
+        }
+        if !update(&mut record) {
+            return Ok(record);
+        }
+        #[cfg(test)]
+        pause_manual_transition_job_before_first_cas(job_id).await;
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => return Ok(record),
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
 pub(crate) async fn save_manual_transition_worker_result_if_absent(
     api: Arc<ECStore>,
     record: &ManualTransitionWorkerResultRecord,
@@ -1413,98 +1460,112 @@ pub async fn reconcile_manual_transition_worker_results(
     job_id: Uuid,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
+    reconcile_manual_transition_worker_results_inner(api, job_id, None, queue_snapshot, false).await
+}
+
+pub(crate) async fn reconcile_manual_transition_worker_results_if_owned(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Uuid,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    reconcile_manual_transition_worker_results_inner(api, job_id, Some(expected_lease_id), queue_snapshot, false).await
+}
+
+async fn reconcile_manual_transition_worker_results_inner(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Option<Uuid>,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+    mark_missing_results_unknown: bool,
+) -> EcstoreResult<ManualTransitionJobRecord> {
     let task_stats = match scan_manual_transition_task_journal(api.clone(), job_id).await? {
         ManualTransitionTaskJournal::Stats(stats) => stats,
         ManualTransitionTaskJournal::Corrupt(error) => {
-            return mark_manual_transition_job_unknown_for_task_journal_error(api, job_id, error, queue_snapshot).await;
+            return mark_manual_transition_job_unknown_for_task_journal_error(
+                api,
+                job_id,
+                expected_lease_id,
+                error,
+                queue_snapshot,
+            )
+            .await;
         }
     };
     let stats = match scan_manual_transition_worker_result_journal(api.clone(), job_id).await? {
         ManualTransitionWorkerResultJournal::Stats(stats) => stats,
         ManualTransitionWorkerResultJournal::Corrupt(error) => {
-            return mark_manual_transition_job_unknown_for_worker_result_journal_error(api, job_id, error, queue_snapshot).await;
+            return mark_manual_transition_job_unknown_for_worker_result_journal_error(
+                api,
+                job_id,
+                expected_lease_id,
+                error,
+                queue_snapshot,
+            )
+            .await;
         }
     };
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        let changed = record.apply_worker_result_counts(
+    let mut changed = false;
+    let record = update_manual_transition_job_record(api.clone(), job_id, expected_lease_id, |record| {
+        let counts_changed = record.apply_worker_result_counts(
             stats.stats.completed,
             stats.stats.failed,
             &stats.stats.tier_failure_by_reason,
             task_stats.queued,
             queue_snapshot,
         );
-        if !changed {
-            return Ok(record);
-        }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                if record.is_terminal() {
-                    delete_manual_transition_scope_admission_if_current(
-                        api.clone(),
-                        &record.scope_key,
-                        record.job_id,
-                        record.lease_id,
-                    )
-                    .await?;
-                } else {
-                    renew_manual_transition_scope_admission_from_job(api, &record).await?;
-                }
-                return Ok(record);
-            }
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+        let became_unknown = mark_missing_results_unknown && record.mark_unknown_if_worker_results_lost(queue_snapshot);
+        changed = counts_changed || became_unknown;
+        changed
+    })
+    .await?;
+    if !changed {
+        return Ok(record);
     }
-    Err(Error::PreconditionFailed)
+    if record.is_terminal() {
+        delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
+    } else {
+        renew_manual_transition_scope_admission_from_job(api, &record).await?;
+    }
+    Ok(record)
 }
 
 async fn mark_manual_transition_job_unknown_for_task_journal_error(
     api: Arc<ECStore>,
     job_id: Uuid,
+    expected_lease_id: Option<Uuid>,
     error: String,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if !record.mark_unknown_for_task_journal_error(error.clone(), queue_snapshot) {
-            return Ok(record);
-        }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id)
-                    .await?;
-                return Ok(record);
-            }
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+    let mut changed = false;
+    let record = update_manual_transition_job_record(api.clone(), job_id, expected_lease_id, |record| {
+        changed = record.mark_unknown_for_task_journal_error(error.clone(), queue_snapshot);
+        changed
+    })
+    .await?;
+    if changed && record.is_terminal() {
+        delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
     }
-    Err(Error::PreconditionFailed)
+    Ok(record)
 }
 
 async fn mark_manual_transition_job_unknown_for_worker_result_journal_error(
     api: Arc<ECStore>,
     job_id: Uuid,
+    expected_lease_id: Option<Uuid>,
     error: String,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if !record.mark_unknown_for_worker_result_journal_error(error.clone(), queue_snapshot) {
-            return Ok(record);
-        }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id)
-                    .await?;
-                return Ok(record);
-            }
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+    let mut changed = false;
+    let record = update_manual_transition_job_record(api.clone(), job_id, expected_lease_id, |record| {
+        changed = record.mark_unknown_for_worker_result_journal_error(error.clone(), queue_snapshot);
+        changed
+    })
+    .await?;
+    if changed && record.is_terminal() {
+        delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
     }
-    Err(Error::PreconditionFailed)
+    Ok(record)
 }
 
 pub async fn save_manual_transition_scope_admission_if_absent(
@@ -1701,19 +1762,14 @@ async fn find_active_legacy_manual_transition_scope_conflict(
 }
 
 pub async fn request_manual_transition_job_cancel(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionJobRecord> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+    update_manual_transition_job_record(api, job_id, None, |record| {
         if record.is_terminal() || record.cancel_requested {
-            return Ok(record);
+            return false;
         }
         record.mark_cancel_requested();
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => return Ok(record),
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(Error::PreconditionFailed)
+        true
+    })
+    .await
 }
 
 pub async fn persist_manual_transition_job_progress(
@@ -1722,8 +1778,8 @@ pub async fn persist_manual_transition_job_progress(
     report: &ManualTransitionRunReport,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    let lease_id = load_manual_transition_job_record(api.clone(), job_id).await?.lease_id;
-    persist_manual_transition_job_progress_if_owned(api, job_id, lease_id, report, queue_snapshot).await
+    let current = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+    persist_manual_transition_job_progress_inner(api, job_id, current.0.lease_id, Some(current), report, queue_snapshot).await
 }
 
 pub async fn persist_manual_transition_job_progress_if_owned(
@@ -1733,27 +1789,29 @@ pub async fn persist_manual_transition_job_progress_if_owned(
     report: &ManualTransitionRunReport,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    for _ in 0..MANUAL_TRANSITION_JOB_CAS_RETRIES {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if record.lease_id != expected_lease_id {
-            return Err(Error::PreconditionFailed);
-        }
+    persist_manual_transition_job_progress_inner(api, job_id, expected_lease_id, None, report, queue_snapshot).await
+}
+
+async fn persist_manual_transition_job_progress_inner(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Uuid,
+    current: Option<(ManualTransitionJobRecord, String)>,
+    report: &ManualTransitionRunReport,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    let record = update_manual_transition_job_record_from(api.clone(), job_id, Some(expected_lease_id), current, |record| {
         if record.state != ManualTransitionJobState::Running {
-            return Ok(record);
+            return false;
         }
         record.update_running_progress(report.clone(), queue_snapshot);
-        #[cfg(test)]
-        pause_manual_transition_progress_before_first_save(job_id).await;
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                renew_manual_transition_scope_admission_from_job(api, &record).await?;
-                return Ok(record);
-            }
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+        true
+    })
+    .await?;
+    if record.state == ManualTransitionJobState::Running {
+        renew_manual_transition_scope_admission_from_job(api, &record).await?;
     }
-    Err(Error::PreconditionFailed)
+    Ok(record)
 }
 
 pub async fn record_manual_transition_worker_result(
@@ -1786,8 +1844,8 @@ pub async fn renew_manual_transition_job_lease(
     job_id: Uuid,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    let lease_id = load_manual_transition_job_record(api.clone(), job_id).await?.lease_id;
-    renew_manual_transition_job_lease_if_owned(api, job_id, lease_id, queue_snapshot).await
+    let current = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+    renew_manual_transition_job_lease_inner(api, job_id, current.0.lease_id, Some(current), queue_snapshot).await
 }
 
 pub async fn renew_manual_transition_job_lease_if_owned(
@@ -1796,41 +1854,50 @@ pub async fn renew_manual_transition_job_lease_if_owned(
     expected_lease_id: Uuid,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
-    for _ in 0..MANUAL_TRANSITION_JOB_CAS_RETRIES {
-        let (mut record, mut etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        if record.lease_id != expected_lease_id {
-            return Err(Error::PreconditionFailed);
-        }
-        if record.state != ManualTransitionJobState::Running {
-            return Ok(record);
-        }
-        if record.scan_completed && queue_snapshot.queued == 0 && queue_snapshot.active == 0 {
-            record = reconcile_manual_transition_worker_results(api.clone(), job_id, queue_snapshot).await?;
-            if record.is_terminal() || !record.report.worker_transition_pending() {
-                return Ok(record);
-            }
-            (record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-            if record.lease_id != expected_lease_id {
-                return Err(Error::PreconditionFailed);
-            }
-        }
-        let became_terminal = record.mark_unknown_if_worker_results_lost(queue_snapshot);
-        if !became_terminal {
-            record.renew_lease(queue_snapshot);
-        }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {}
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
-        if became_terminal {
-            delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
-        } else {
-            renew_manual_transition_scope_admission_from_job(api, &record).await?;
-        }
-        return Ok(record);
+    renew_manual_transition_job_lease_inner(api, job_id, expected_lease_id, None, queue_snapshot).await
+}
+
+async fn renew_manual_transition_job_lease_inner(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    expected_lease_id: Uuid,
+    current: Option<(ManualTransitionJobRecord, String)>,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    let (current, current_etag) = match current {
+        Some(current) => current,
+        None => load_manual_transition_job_record_with_etag(api.clone(), job_id).await?,
+    };
+    if current.lease_id != expected_lease_id {
+        return Err(Error::PreconditionFailed);
     }
-    Err(Error::PreconditionFailed)
+    if current.state != ManualTransitionJobState::Running {
+        return Ok(current);
+    }
+    if current.scan_completed && queue_snapshot.queued == 0 && queue_snapshot.active == 0 {
+        return reconcile_manual_transition_worker_results_inner(api, job_id, Some(expected_lease_id), queue_snapshot, true)
+            .await;
+    }
+    let record = update_manual_transition_job_record_from(
+        api.clone(),
+        job_id,
+        Some(expected_lease_id),
+        Some((current, current_etag)),
+        |record| {
+            if record.state != ManualTransitionJobState::Running {
+                return false;
+            }
+            record.renew_lease(queue_snapshot);
+            true
+        },
+    )
+    .await?;
+    if record.is_terminal() {
+        delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
+    } else if record.state == ManualTransitionJobState::Running {
+        renew_manual_transition_scope_admission_from_job(api, &record).await?;
+    }
+    Ok(record)
 }
 
 async fn renew_manual_transition_scope_admission_from_job(
@@ -1852,6 +1919,9 @@ async fn renew_manual_transition_scope_admission_from_job(
             .lease_expires_at_unix_nanos
             .max(admission.lease_expires_at_unix_nanos);
         renewed_admission.updated_at_unix_nanos = renewed_admission.updated_at_unix_nanos.max(admission.updated_at_unix_nanos);
+        if renewed_admission == admission {
+            return Ok(());
+        }
         match save_manual_transition_scope_admission_if_current(api.clone(), &renewed_admission, &admission_etag).await {
             Ok(()) => return Ok(()),
             Err(Error::PreconditionFailed) => continue,
