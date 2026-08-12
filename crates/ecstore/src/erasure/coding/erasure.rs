@@ -968,6 +968,15 @@ impl Erasure {
         self.data_shards + self.parity_shards
     }
 
+    pub(crate) fn encoded_capacity_for_data_len(&self, data_len: usize) -> usize {
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
+        shard_size_fn(data_len, self.data_shards).saturating_mul(self.total_shard_count())
+    }
+
     /// Whether the erasure dimensions are safe for the shard/offset arithmetic.
     ///
     /// `block_size` and `data_shards` come straight from on-disk metadata; a

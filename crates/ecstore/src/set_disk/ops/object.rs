@@ -1158,11 +1158,16 @@ impl SetDisks {
 
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
+            let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
+                usize::try_from(put_object_size).map_err(Error::other)?
+            } else {
+                0
+            };
 
             let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
@@ -1172,7 +1177,7 @@ impl SetDisks {
                     }
                 },
                 SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
