@@ -750,8 +750,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 0,
                 object_info.size,
                 &mut output,
-                fi,
-                files,
+                fi.into_owned(),
+                files.into_owned(),
                 &disks,
                 self.set_index,
                 self.pool_index,
@@ -867,8 +867,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
-                fi,
-                files,
+                fi.into_owned(),
+                files.into_owned(),
                 &disks,
                 set_index,
                 pool_index,
@@ -3198,7 +3198,8 @@ impl SetDisks {
         // Force the full quorum fanout (allow_early_stop=false): `disks` is the
         // write target below, and an early-stop subset would only carry read
         // quorum, failing write quorum on update_object_meta (backlog#872).
-        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
+        let (fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
+        let mut fi = fi.into_owned();
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
         if let Some(eval_metadata) = &opts.eval_metadata {
@@ -3221,7 +3222,7 @@ impl SetDisks {
             });
         }
 
-        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
+        self.update_object_meta(bucket, object, fi.clone(), &disks).await?;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
@@ -4625,7 +4626,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     _lock_guard = guard_opt;
         // }
 
-        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let (fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let mut fi = fi.into_owned();
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -4739,7 +4741,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 cloned_fi.size,
                 &mut writer,
                 cloned_fi,
-                meta_arr,
+                meta_arr.into_owned(),
                 &online_disks,
                 set_index,
                 pool_index,
@@ -4863,7 +4865,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         let current = self.get_object_fileinfo(bucket, object, &commit_opts, true, false).await;
-        let (mut current_fi, _, _) = match current {
+        let (current_fi, _, _) = match current {
             Ok(current) => current,
             Err(err) => {
                 drop(transition_lock_guard);
@@ -4874,6 +4876,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Err(err);
             }
         };
+        let mut current_fi = current_fi.into_owned();
         let source_matches = current_fi.version_id == fi.version_id
             && current_fi.data_dir == fi.data_dir
             && current_fi.mod_time == fi.mod_time
@@ -6232,9 +6235,9 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: fi.clone(),
-                    parts_metadata,
-                    online_disks,
+                    fi: Arc::new((*fi).clone()),
+                    parts_metadata: Arc::new(parts_metadata.into_owned()),
+                    online_disks: Arc::new(online_disks.into_owned()),
                     read_quorum: 2,
                 }),
             )

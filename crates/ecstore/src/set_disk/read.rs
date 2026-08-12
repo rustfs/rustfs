@@ -116,9 +116,9 @@ impl SetDisks {
             .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
-    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<Arc<GetObjectMetadataCacheEntry>> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
-            MetadataCacheLookup::Hit(entry) => Some((*entry).clone()),
+            MetadataCacheLookup::Hit(entry) => Some(entry),
             MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
         }
     }
@@ -180,9 +180,9 @@ impl SetDisks {
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: fi.clone(),
-            parts_metadata: parts_metadata.to_vec(),
-            online_disks: online_disks.to_vec(),
+            fi: Arc::new(fi.clone()),
+            parts_metadata: Arc::new(parts_metadata.to_vec()),
+            online_disks: Arc::new(online_disks.to_vec()),
             read_quorum,
         });
         self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
@@ -257,7 +257,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         caller_allows_early_stop: bool,
-    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+    ) -> Result<GetObjectFileInfo> {
         self.get_object_fileinfo_gated(bucket, object, opts, read_data, caller_allows_early_stop)
             .await
     }
@@ -274,7 +274,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         allow_early_stop: bool,
-    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+    ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
@@ -300,7 +300,11 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok((cached.fi.clone(), cached.parts_metadata.clone(), cached.online_disks.clone()));
+                    return Ok((
+                        GetObjectMetadata::Shared(Arc::clone(&cached.fi)),
+                        GetObjectMetadata::Shared(Arc::clone(&cached.parts_metadata)),
+                        GetObjectMetadata::Shared(Arc::clone(&cached.online_disks)),
+                    ));
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -423,7 +427,11 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        Ok((fi, parts_metadata, op_online_disks))
+        Ok((
+            GetObjectMetadata::Owned(fi),
+            GetObjectMetadata::Owned(parts_metadata),
+            GetObjectMetadata::Owned(op_online_disks),
+        ))
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -2680,6 +2688,39 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    async fn get_object_fileinfo_cache_hit_shares_cached_metadata() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let parts_metadata = vec![fi.clone()];
+        let online_disks = Vec::new();
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
+            .await;
+        let cached = set
+            .cached_get_object_fileinfo("bucket", "object")
+            .await
+            .expect("fresh cache entry should be returned");
+
+        let (returned_fi, returned_parts_metadata, returned_online_disks) = set
+            .get_object_fileinfo("bucket", "object", &ObjectOptions::default(), true, false)
+            .await
+            .expect("cache-backed metadata lookup should succeed");
+
+        assert!(
+            matches!(returned_fi, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.fi)),
+            "cache hits must share FileInfo ownership"
+        );
+        assert!(
+            matches!(returned_parts_metadata, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.parts_metadata)),
+            "cache hits must share the metadata vector"
+        );
+        assert!(
+            matches!(returned_online_disks, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.online_disks)),
+            "cache hits must share the online-disk vector"
+        );
+    }
+
+    #[tokio::test]
     async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
         let set = new_metadata_cache_test_set().await;
 
@@ -2718,9 +2759,9 @@ mod metadata_cache_tests {
                 ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: fi.clone(),
-                    parts_metadata: vec![fi],
-                    online_disks: vec![None],
+                    fi: Arc::new(fi.clone()),
+                    parts_metadata: Arc::new(vec![fi]),
+                    online_disks: Arc::new(vec![None]),
                     read_quorum: 1,
                 }),
             )
@@ -2734,9 +2775,6 @@ mod metadata_cache_tests {
 
     #[tokio::test]
     async fn get_object_metadata_cache_rejects_stale_entries() {
-        // moka handles TTL expiry automatically via time_to_live(250ms).
-        // This test verifies that entries inserted with the cache API are retrievable
-        // while fresh, and that the cache API works correctly.
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
@@ -2748,6 +2786,14 @@ mod metadata_cache_tests {
             set.cached_get_object_fileinfo("bucket", "object").await.is_some(),
             "freshly inserted entry should be returned"
         );
+
+        tokio::time::timeout(GET_OBJECT_METADATA_CACHE_TTL + Duration::from_secs(1), async {
+            while set.cached_get_object_fileinfo("bucket", "object").await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metadata cache entry should expire after its TTL");
     }
 
     #[tokio::test]
@@ -2809,9 +2855,13 @@ mod metadata_cache_tests {
         barrier.wait_until_paused().await;
         set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
-        read.await
+        let (fi, parts_metadata, online_disks) = read
+            .await
             .expect("metadata read task should not panic")
             .expect("metadata fanout should still return its selected FileInfo");
+        assert!(matches!(fi, GetObjectMetadata::Owned(_)));
+        assert!(matches!(parts_metadata, GetObjectMetadata::Owned(_)));
+        assert!(matches!(online_disks, GetObjectMetadata::Owned(_)));
 
         assert!(
             set.get_object_metadata_cache
@@ -2858,9 +2908,9 @@ mod metadata_cache_tests {
         let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: fi.clone(),
-            parts_metadata: vec![fi],
-            online_disks: Vec::new(),
+            fi: Arc::new(fi.clone()),
+            parts_metadata: Arc::new(vec![fi]),
+            online_disks: Arc::new(Vec::new()),
             read_quorum: 0,
         });
 
@@ -2968,9 +3018,9 @@ mod metadata_cache_tests {
         let entry = |fi: FileInfo| {
             Arc::new(GetObjectMetadataCacheEntry {
                 created_at: Instant::now(),
-                parts_metadata: vec![fi.clone()],
-                fi,
-                online_disks: Vec::new(),
+                parts_metadata: Arc::new(vec![fi.clone()]),
+                fi: Arc::new(fi),
+                online_disks: Arc::new(Vec::new()),
                 read_quorum: 0,
             })
         };
@@ -5479,33 +5529,36 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_codec_streaming_uses_conservative_default_min_size() {
-        temp_env::with_vars(
-            [
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
-            ],
-            || {
-                let below_threshold_fi = codec_streaming_test_fileinfo(512 * 1024, 1);
-                let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
-                assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
-                );
+    fn codec_streaming_default_min_size_meets_direct_memory_ceiling() {
+        for engine in [None, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, engine),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
+                ],
+                || {
+                    let below_threshold_fi = codec_streaming_test_fileinfo(128 * 1024 - 1, 1);
+                    let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true)
+                            .decision,
+                        GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                    );
 
-                let threshold_fi = codec_streaming_test_fileinfo(1_048_576, 1);
-                let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
-                assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Use
-                );
-            },
-        );
+                    let threshold_fi = codec_streaming_test_fileinfo(128 * 1024, 1);
+                    let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
+                        GetCodecStreamingDecision::Use
+                    );
+                },
+            );
+        }
     }
 
     #[test]
@@ -5803,10 +5856,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5827,10 +5880,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5848,10 +5901,10 @@ mod tests {
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5931,10 +5984,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("0")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5951,10 +6004,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("100")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(

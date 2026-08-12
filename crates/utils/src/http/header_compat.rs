@@ -30,8 +30,8 @@ use std::borrow::Cow;
 
 const RUSTFS_PREFIX: &str = "x-rustfs-";
 const MINIO_PREFIX: &str = "x-minio-";
-const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
-const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+pub const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+pub const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 const MINIO_INTERNAL_ENCRYPTION_PREFIX: &str = "x-minio-internal-server-side-encryption-";
 const MINIO_INTERNAL_ENCRYPTED_MULTIPART: &str = "x-minio-internal-encrypted-multipart";
 const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = super::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER;
