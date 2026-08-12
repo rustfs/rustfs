@@ -14,19 +14,23 @@
 
 use crate::IamStorageError;
 use rustfs_policy::policy::Error as PolicyError;
+use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    PolicyError(#[from] PolicyError),
+    // Arc payloads keep Clone variant-preserving for the non-cloneable inner
+    // errors (backlog#1831 PR2). Display is unchanged; the source() chain is
+    // not forwarded (Arc<E> does not implement std::error::Error).
+    #[error("{0}")]
+    PolicyError(Arc<PolicyError>),
 
     #[error("{0}")]
     StringError(String),
 
     #[error("crypto: {0}")]
-    CryptoError(#[from] rustfs_crypto::Error),
+    CryptoError(Arc<rustfs_crypto::Error>),
 
     #[error("user '{0}' does not exist")]
     NoSuchUser(String),
@@ -114,9 +118,9 @@ impl PartialEq for Error {
 impl Clone for Error {
     fn clone(&self) -> Self {
         match self {
-            Error::PolicyError(e) => Error::StringError(e.to_string()), // Convert to string since PolicyError may not be cloneable
+            Error::PolicyError(e) => Error::PolicyError(Arc::clone(e)),
             Error::StringError(s) => Error::StringError(s.clone()),
-            Error::CryptoError(e) => Error::StringError(format!("crypto: {e}")), // Convert to string
+            Error::CryptoError(e) => Error::CryptoError(Arc::clone(e)),
             Error::NoSuchUser(s) => Error::NoSuchUser(s.clone()),
             Error::NoSuchAccount(s) => Error::NoSuchAccount(s.clone()),
             Error::NoSuchServiceAccount(s) => Error::NoSuchServiceAccount(s.clone()),
@@ -140,6 +144,18 @@ impl Clone for Error {
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
             Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
         }
+    }
+}
+
+impl From<PolicyError> for Error {
+    fn from(e: PolicyError) -> Self {
+        Error::PolicyError(Arc::new(e))
+    }
+}
+
+impl From<rustfs_crypto::Error> for Error {
+    fn from(e: rustfs_crypto::Error) -> Self {
+        Error::CryptoError(Arc::new(e))
     }
 }
 
@@ -192,9 +208,9 @@ impl From<rustfs_policy::error::Error> for Error {
             rustfs_policy::error::Error::ContainsReservedChars => Error::ContainsReservedChars,
             rustfs_policy::error::Error::GroupNameContainsReservedChars => Error::GroupNameContainsReservedChars,
             rustfs_policy::error::Error::IamSysNotInitialized => Error::IamSysNotInitialized,
-            rustfs_policy::error::Error::PolicyError(e) => Error::PolicyError(e),
+            rustfs_policy::error::Error::PolicyError(e) => Error::PolicyError(Arc::new(e)),
             rustfs_policy::error::Error::StringError(s) => Error::StringError(s),
-            rustfs_policy::error::Error::CryptoError(e) => Error::CryptoError(e),
+            rustfs_policy::error::Error::CryptoError(e) => Error::CryptoError(Arc::new(e)),
             rustfs_policy::error::Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
             // These policy variants had dead same-name twins on iam::Error (zero
             // construction and zero match sites, removed in backlog#1831); the
@@ -383,6 +399,31 @@ mod tests {
         // but it becomes ErrorKind::Other when cloned
         assert_eq!(converted_io.kind(), ErrorKind::Other);
         assert!(converted_io.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn clone_preserves_variant_identity_and_message() {
+        // backlog#1831 PR2: cloning must never demote a variant to a different
+        // one (the old Clone stringified PolicyError/CryptoError into
+        // StringError). Pin discriminant and rendered message across clone.
+        let errors = vec![
+            Error::PolicyError(Arc::new(PolicyError::NonAction)),
+            Error::CryptoError(Arc::new(rustfs_crypto::Error::ErrInvalidKeyLength)),
+            Error::Io(std::io::Error::other("io payload")),
+            Error::StringError("plain".to_string()),
+            Error::NoSuchUser("u".to_string()),
+            Error::ConfigNotFound,
+        ];
+
+        for error in errors {
+            let cloned = error.clone();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&cloned),
+                "clone must keep the variant of {error:?}"
+            );
+            assert_eq!(error.to_string(), cloned.to_string(), "clone must keep the rendered message");
+        }
     }
 
     #[test]
