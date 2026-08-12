@@ -1311,7 +1311,7 @@ mod test {
         assert!(bm.object_locking(), "object lock active via parsed config");
     }
 
-    /// backlog#580: KNOWN GAP (weisd 2026-03-06 "inline_data 前缀不同"). RustFS's
+    /// backlog#580: KNOWN GAP (flagged 2026-03-06: "inline_data 前缀不同"). RustFS's
     /// inline-data extraction does not yet recover the object body from a
     /// MinIO-written bucket-metadata object: `into_fileinfo(read_data=true).data`
     /// returns bytes that are not the `.metadata.bin` blob (no `format|version`
@@ -1319,7 +1319,7 @@ mod test {
     /// inline-data framing is handled on the read path.
     /// backlog#580: prove RustFS reads a MinIO-written **inlined** bucket-metadata
     /// object end-to-end. MinIO stores inline data as `[bitrot hash][object body]`
-    /// (the "`inline_data` 前缀不同" that weisd flagged on 2026-03-06 is that
+    /// (the "`inline_data` 前缀不同" gap flagged on 2026-03-06 is that
     /// bitrot prefix, not a format incompatibility). Running the raw inline shard
     /// through RustFS's `BitrotReader` with the default `HighwayHash256S` must
     /// verify the checksum and yield the exact `.metadata.bin` blob.

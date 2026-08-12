@@ -355,37 +355,6 @@ pub enum S3Action {
     GetBucketQuotaAction,
 }
 
-// #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
-// #[serde(try_from = "&str", into = "&str")]
-// pub enum AdminAction {
-//     #[strum(serialize = "admin:*")]
-//     AllActions,
-//     #[strum(serialize = "admin:Profiling")]
-//     ProfilingAdminAction,
-//     #[strum(serialize = "admin:ServerTrace")]
-//     TraceAdminAction,
-//     #[strum(serialize = "admin:ConsoleLog")]
-//     ConsoleLogAdminAction,
-//     #[strum(serialize = "admin:ServerInfo")]
-//     ServerInfoAdminAction,
-//     #[strum(serialize = "admin:OBDInfo")]
-//     HealthInfoAdminAction,
-//     #[strum(serialize = "admin:TopLocksInfo")]
-//     TopLocksAdminAction,
-//     #[strum(serialize = "admin:LicenseInfo")]
-//     LicenseInfoAdminAction,
-//     #[strum(serialize = "admin:BandwidthMonitor")]
-//     BandwidthMonitorAction,
-//     #[strum(serialize = "admin:InspectData")]
-//     InspectDataAction,
-//     #[strum(serialize = "admin:Prometheus")]
-//     PrometheusAdminAction,
-//     #[strum(serialize = "admin:ListServiceAccounts")]
-//     ListServiceAccountsAdminAction,
-//     #[strum(serialize = "admin:CreateServiceAccount")]
-//     CreateServiceAccountAdminAction,
-// }
-
 // AdminAction - admin policy action.
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
