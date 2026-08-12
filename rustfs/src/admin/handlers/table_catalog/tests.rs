@@ -2512,7 +2512,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         crate::table_catalog::TableCatalogBackingMode::DurableStrong,
     ] {
         let metadata_backend = TestTableCatalogObjectBackend::default();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         create_standard_events_table(&store, &metadata_backend, &namespace).await;
         let first_request = serde_json::json!({
@@ -2559,7 +2559,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
             }
         }
 
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new(metadata_backend.clone(), mode);
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
         let second = standard_commit_table_response(
             &store,
             &trusted_table_commit_backend(&metadata_backend),

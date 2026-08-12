@@ -21,8 +21,39 @@ mod strong;
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
-pub(super) use strong::StrongTableCatalogSnapshot;
-pub(crate) use strong::StrongTableCatalogStore;
+pub(super) use strong::{
+    STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
+    StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,
+    table_catalog_bucket_snapshot_fingerprint,
+};
+pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
+
+fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("table bucket", entry.version)?;
+    if entry.table_bucket.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("table bucket name cannot be empty".to_string()));
+    }
+    if entry.catalog_type != TABLE_BUCKET_CATALOG_TYPE {
+        return Err(TableCatalogStoreError::Invalid("unsupported table bucket catalog type".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_table_entry_version_and_id(entry: &TableEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("table", entry.version)?;
+    if entry.table_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("table id cannot be empty".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_view_entry_version_and_id(entry: &ViewEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("view", entry.version)?;
+    if entry.view_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("view id cannot be empty".to_string()));
+    }
+    Ok(())
+}
 
 fn validate_namespace_entry_identity(entry: &NamespaceEntry) -> TableCatalogStoreResult<Namespace> {
     validate_catalog_entry_version("namespace", entry.version)?;
@@ -406,8 +437,31 @@ pub(crate) enum TableCatalogPutPrecondition {
     IfMatch(String),
 }
 
+pub(in crate::table_catalog) fn catalog_list_next_continuation(
+    seen: &mut BTreeSet<String>,
+    is_truncated: bool,
+    next: Option<String>,
+) -> TableCatalogStoreResult<Option<String>> {
+    if !is_truncated {
+        return Ok(None);
+    }
+    let next = next.filter(|next| !next.is_empty()).ok_or_else(|| {
+        TableCatalogStoreError::Internal("truncated catalog object listing has no continuation token".to_string())
+    })?;
+    if !seen.insert(next.clone()) {
+        return Err(TableCatalogStoreError::Internal(
+            "catalog object listing continuation token did not advance".to_string(),
+        ));
+    }
+    Ok(Some(next))
+}
+
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
+    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
+        None
+    }
+
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 
     async fn read_object_limited(
@@ -845,10 +899,16 @@ where
     B: TableCatalogObjectBackend,
 {
     pub(crate) fn from_env(backend: B) -> TableCatalogStoreResult<Self> {
-        Ok(Self::new(backend, TableCatalogBackingMode::from_env()?))
+        Ok(match TableCatalogBackingMode::from_env()? {
+            TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
+            TableCatalogBackingMode::DurableStrong => {
+                Self::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
+            }
+        })
     }
 
-    pub(crate) fn new(backend: B, mode: TableCatalogBackingMode) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(backend: B, mode: TableCatalogBackingMode) -> Self {
         match mode {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
             TableCatalogBackingMode::DurableStrong => Self::DurableStrong(StrongTableCatalogStore::new(backend)),
@@ -1352,12 +1412,14 @@ where
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
+    strong_runtime: StrongTableCatalogRuntime,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            strong_runtime: self.strong_runtime.clone(),
         }
     }
 }
@@ -1366,8 +1428,8 @@ impl<S> EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+    pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
+        Self { store, strong_runtime }
     }
 }
 
@@ -1378,6 +1440,10 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
+        Some(self.strong_runtime.clone())
+    }
+
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default(), None)
             .await
@@ -1537,6 +1603,7 @@ where
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
         let mut continuation = None;
+        let mut seen_continuations = BTreeSet::new();
         let mut objects = BTreeSet::new();
         let max_keys = i32::try_from(TABLE_CATALOG_LIST_MAX_KEYS)
             .map_err(|_| TableCatalogStoreError::Internal("catalog list limit exceeds storage API range".to_string()))?;
@@ -1553,14 +1620,10 @@ where
                 objects.insert(object.name);
             }
 
-            if !result.is_truncated {
-                break;
-            }
-
-            let Some(next) = result.next_continuation_token else {
-                break;
+            match catalog_list_next_continuation(&mut seen_continuations, result.is_truncated, result.next_continuation_token)? {
+                Some(next) => continuation = Some(next),
+                None => break,
             };
-            continuation = Some(next);
         }
 
         Ok(objects.into_iter().collect())
@@ -1627,20 +1690,6 @@ where
         opts: ObjectOptions,
         max_size: Option<usize>,
     ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
-        let info = match self.store.get_object_info(bucket, object, &opts).await {
-            Ok(info) => info,
-            Err(err) if is_missing_storage_error(&err) => return Ok(None),
-            Err(err) => return Err(storage_error_to_catalog("read catalog object info", err)),
-        };
-        if let Some(max_size) = max_size {
-            let object_size = usize::try_from(info.size)
-                .map_err(|_| TableCatalogStoreError::Invalid(format!("catalog object {bucket}/{object} has an invalid size")))?;
-            if object_size > max_size {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
-                )));
-            }
-        }
         let mut reader = match self
             .store
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
@@ -1650,6 +1699,17 @@ where
             Err(err) if is_missing_storage_error(&err) => return Ok(None),
             Err(err) => return Err(storage_error_to_catalog("read catalog object", err)),
         };
+        if let Some(max_size) = max_size {
+            let object_size = usize::try_from(reader.object_info.size)
+                .map_err(|_| TableCatalogStoreError::Invalid(format!("catalog object {bucket}/{object} has an invalid size")))?;
+            if object_size > max_size {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+                )));
+            }
+        }
+        let etag = reader.object_info.etag.clone();
+        let mod_time = reader.object_info.mod_time;
         let mut data = Vec::new();
         if let Some(max_size) = max_size {
             let read_limit = u64::try_from(max_size.saturating_add(1)).unwrap_or(u64::MAX);
@@ -1666,11 +1726,7 @@ where
                 TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}"))
             })?;
         }
-        Ok(Some(TableCatalogObject {
-            data,
-            etag: info.etag,
-            mod_time: info.mod_time,
-        }))
+        Ok(Some(TableCatalogObject { data, etag, mod_time }))
     }
 
     async fn put_object_with_options(

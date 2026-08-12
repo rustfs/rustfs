@@ -286,17 +286,15 @@ where
         if table.state != TableCatalogEntryState::Active {
             continue;
         }
-        let Ok(warehouse_object_prefix) = table_warehouse_object_prefix(&table) else {
-            continue;
-        };
+        let warehouse_object_prefix = table_warehouse_object_prefix(&table)?;
         if !object.starts_with(&warehouse_object_prefix) {
             continue;
         }
-        if matched
-            .as_ref()
-            .is_some_and(|current| current.warehouse_object_prefix.len() >= warehouse_object_prefix.len())
-        {
-            continue;
+        if let Some(current) = matched.as_ref() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "object {object} matches overlapping active table warehouse prefixes {} and {warehouse_object_prefix}",
+                current.warehouse_object_prefix
+            )));
         }
         matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
     }
