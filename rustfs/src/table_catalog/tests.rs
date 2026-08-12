@@ -985,10 +985,10 @@ fn manifest_list_avro_bytes_with_spec(manifest_paths: &[&str], partition_spec_id
             "#,
     )
     .expect("manifest list avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
     for manifest_path in manifest_paths {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 (
                     "manifest_path".to_string(),
                     apache_avro::types::Value::String((*manifest_path).to_string()),
@@ -1027,9 +1027,9 @@ fn v1_manifest_list_avro_bytes(manifest_path: &str) -> Vec<u8> {
         "#,
     )
     .expect("v1 manifest list schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("v1 manifest list writer should initialize");
     writer
-        .append(apache_avro::types::Value::Record(vec![
+        .append_value(apache_avro::types::Value::Record(vec![
             ("manifest_path".to_string(), apache_avro::types::Value::String(manifest_path.to_string())),
             ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
             ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
@@ -1067,9 +1067,9 @@ fn v1_manifest_avro_bytes(data_file_path: &str) -> Vec<u8> {
         "#,
     )
     .expect("v1 manifest schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("v1 manifest writer should initialize");
     writer
-        .append(apache_avro::types::Value::Record(vec![
+        .append_value(apache_avro::types::Value::Record(vec![
             ("status".to_string(), apache_avro::types::Value::Int(1)),
             ("snapshot_id".to_string(), apache_avro::types::Value::Long(10)),
             (
@@ -1346,9 +1346,10 @@ fn iceberg_manifest_validation_accepts_deflate_and_rejects_unknown_content() {
         "#,
     )
     .expect("manifest list schema should parse");
-    let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), apache_avro::Codec::Deflate(Default::default()));
+    let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), apache_avro::Codec::Deflate(Default::default()))
+        .expect("compressed manifest list writer should initialize");
     writer
-        .append(apache_avro::types::Value::Record(vec![
+        .append_value(apache_avro::types::Value::Record(vec![
             (
                 "manifest_path".to_string(),
                 apache_avro::types::Value::String("s3://warehouse/tables/table-id/metadata/manifest.avro".to_string()),
@@ -1366,6 +1367,45 @@ fn iceberg_manifest_validation_accepts_deflate_and_rejects_unknown_content() {
     let error = data_file_references_from_manifest_avro(&unknown_content)
         .expect_err("unknown Iceberg manifest content values must be rejected");
     assert!(matches!(error, TableCatalogStoreError::Invalid(_)));
+}
+
+#[test]
+fn apache_avro_021_iceberg_manifest_fixtures_remain_readable() {
+    // Fixed 0.21 output prevents this compatibility check from becoming a current-version round trip.
+    let manifest_list = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/table_catalog/apache-avro-0.21-manifest-list.avro"
+    ));
+    let manifest_list = decode_manifest_list_avro(manifest_list).expect("apache-avro 0.21 manifest list should remain readable");
+    assert_eq!(manifest_list.references.len(), 1);
+    let manifest_list_reference = &manifest_list.references[0];
+    assert_eq!(manifest_list_reference.format_version, 2);
+    assert_eq!(
+        manifest_list_reference.manifest_path,
+        "s3://warehouse/tables/table-id/metadata/manifest-021.avro"
+    );
+    assert_eq!(manifest_list_reference.manifest_length, Some(4096));
+    assert_eq!(manifest_list_reference.partition_spec_id, Some(3));
+    assert_eq!(manifest_list_reference.sequence_number, Some(9));
+    assert_eq!(manifest_list_reference.min_sequence_number, Some(8));
+    assert_eq!(manifest_list_reference.added_snapshot_id, Some(101));
+
+    let manifest = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/table_catalog/apache-avro-0.21-manifest.avro"
+    ));
+    let manifest = decode_manifest_avro(manifest).expect("apache-avro 0.21 manifest should remain readable");
+    assert_eq!(manifest.references.len(), 1);
+    let data_file = &manifest.references[0];
+    assert_eq!(data_file.format_version, 2);
+    assert_eq!(data_file.location, "s3://warehouse/tables/table-id/data/part-021.parquet");
+    assert_eq!(data_file.snapshot_id, Some(101));
+    assert_eq!(data_file.sequence_number, Some(9));
+    assert_eq!(data_file.file_sequence_number, Some(9));
+    assert_eq!(data_file.record_count, Some(10));
+    assert_eq!(data_file.file_size_bytes, Some(1024));
+    assert_eq!(data_file.sort_order_id, Some(7));
+    assert_eq!(data_file.partition, vec![("dt".to_string(), apache_avro::types::Value::Date(20_312))]);
 }
 
 #[tokio::test]
@@ -1856,10 +1896,10 @@ fn manifest_avro_bytes_with_status(files: &[(&str, i32, i32)]) -> Vec<u8> {
             "#,
     )
     .expect("manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
     for (file_path, content, status) in files {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(*status)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
@@ -1911,10 +1951,10 @@ fn manifest_avro_bytes_with_dt_partition(files: &[(&str, i32, &str)]) -> Vec<u8>
             "#,
     )
     .expect("partitioned manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("partitioned manifest writer should initialize");
     for (file_path, content, partition_value) in files {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(1)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
@@ -1971,10 +2011,10 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
             "#,
     )
     .expect("sort-order manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("sorted manifest writer should initialize");
     for (file_path, content, sort_order_id) in files {
         writer
-            .append(apache_avro::types::Value::Record(vec![
+            .append_value(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(1)),
                 ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
