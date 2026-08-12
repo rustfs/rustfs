@@ -234,11 +234,17 @@ mod test {
 
     #[test]
     fn test_format_v1() {
+        // A freshly created format must survive a serialize -> parse roundtrip
+        // unchanged (identity on every on-disk field).
         let format = FormatV3::new(1, 4);
+        let serialized = serde_json::to_string(&format).expect("FormatV3 must serialize to JSON");
+        let reparsed = FormatV3::try_from(serialized.as_str()).expect("serialized FormatV3 must parse back");
+        assert_eq!(reparsed, format);
 
-        let str = serde_json::to_string(&format);
-        println!("{str:?}");
-
+        // minio-file-format-compat: this literal pins the on-disk format.json
+        // shape (erasure version "1", distributionAlgo "CRCMOD"). `this` always
+        // carries the disk's own UUID in real format.json files; a JSON null
+        // there was never parseable and never written by MinIO or RustFS.
         let data = r#"
         {
             "version": "1",
@@ -246,7 +252,7 @@ mod test {
             "id": "321b3874-987d-4c15-8fa5-757c956b1243",
             "xl": {
                 "version": "1",
-                "this": null,
+                "this": "8ab9a908-f869-4f1f-8e42-eb067ffa7eb5",
                 "sets": [
                     [
                         "8ab9a908-f869-4f1f-8e42-eb067ffa7eb5",
@@ -259,9 +265,23 @@ mod test {
             }
         }"#;
 
-        let p = FormatV3::try_from(data);
+        let parsed = FormatV3::try_from(data).expect("pinned v1 format.json literal must keep parsing");
 
-        println!("{p:?}");
+        assert_eq!(parsed.version, FormatMetaVersion::V1);
+        assert_eq!(parsed.format, FormatBackend::Erasure);
+        assert_eq!(
+            parsed.id,
+            Uuid::parse_str("321b3874-987d-4c15-8fa5-757c956b1243").expect("literal id is a valid UUID")
+        );
+        assert_eq!(parsed.erasure.version, FormatErasureVersion::V1);
+        assert_eq!(
+            parsed.erasure.this,
+            Uuid::parse_str("8ab9a908-f869-4f1f-8e42-eb067ffa7eb5").expect("literal this is a valid UUID")
+        );
+        assert_eq!(parsed.erasure.sets.len(), 1);
+        assert_eq!(parsed.erasure.sets[0].len(), 4);
+        assert_eq!(parsed.erasure.sets[0][0], parsed.erasure.this);
+        assert_eq!(parsed.erasure.distribution_algo, DistributionAlgoVersion::V1);
     }
 
     #[test]
