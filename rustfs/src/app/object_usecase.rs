@@ -2044,6 +2044,18 @@ struct GetObjectResumeContext {
     identity: GetObjectResumeIdentity,
 }
 
+fn get_object_store_headers(request_headers: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
+        if let Some(value) = request_headers.get(name) {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
 impl GetObjectResumeContext {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2061,17 +2073,9 @@ impl GetObjectResumeContext {
         {
             opts.version_id = Some(version_id.to_string());
         }
-        let mut ssec_headers = HeaderMap::new();
-        for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-            if let Some(value) = request_headers.get(name) {
-                // The store's instrumented spans record the header argument at
-                // debug level; mark the replayed values sensitive so the SSE-C
-                // key is redacted there on every resume attempt.
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                ssec_headers.insert(name, value);
-            }
-        }
+        // Store spans record their header argument at debug level. Retain only
+        // the SSE-C inputs needed to reopen the reader and keep them redacted.
+        let ssec_headers = get_object_store_headers(request_headers);
         Self {
             store,
             bucket: bucket.to_string(),
@@ -4455,6 +4459,7 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
+        let store_headers = get_object_store_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4469,7 +4474,7 @@ impl DefaultObjectUsecase {
             .await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+                store.get_object_reader(bucket, key, rs.clone(), store_headers.clone(), opts),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4596,7 +4601,7 @@ impl DefaultObjectUsecase {
             drop(metadata_admission.take());
             let outcome = coordinate_cold_fill(&coordinator, cache_key, waiter_deadline, Some(proposed_producer_deadline), {
                 let adapter = &cache_adapter;
-                let headers = &req.headers;
+                let headers = &store_headers;
                 let store = &store;
                 let range = &rs;
                 let object_traffic_health = &object_traffic_health;
@@ -4760,7 +4765,7 @@ impl DefaultObjectUsecase {
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                prepared.with_headers(req.headers.clone()).into_reader(),
+                prepared.with_headers(store_headers.clone()).into_reader(),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4785,14 +4790,14 @@ impl DefaultObjectUsecase {
                 .map_err(map_get_object_reader_error)?;
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    prepared.with_headers(req.headers.clone()).into_reader(),
+                    prepared.with_headers(store_headers.clone()).into_reader(),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
@@ -13722,6 +13727,11 @@ mod tests {
         request_headers.insert(SSEC_KEY_MD5_HEADER, HeaderValue::from_static("bWQ1"));
         request_headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test"));
         request_headers.insert("x-amz-security-token", HeaderValue::from_static("session-token"));
+        let store_headers = get_object_store_headers(&request_headers);
+        assert_eq!(store_headers.len(), 3, "only store-consumed SSE-C headers are forwarded");
+        assert!(store_headers.values().all(HeaderValue::is_sensitive));
+        assert!(store_headers.get(http::header::AUTHORIZATION).is_none());
+        assert!(store_headers.get("x-amz-security-token").is_none());
         let plain_info = ObjectInfo {
             size: 11,
             ..Default::default()
