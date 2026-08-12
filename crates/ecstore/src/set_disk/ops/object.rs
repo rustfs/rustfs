@@ -61,6 +61,10 @@ fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_slot: usize) -> usize {
+    committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
+}
+
 #[cfg(test)]
 mod duration_metrics_tests {
     use super::duration_millis_f64;
@@ -69,6 +73,38 @@ mod duration_metrics_tests {
     #[test]
     fn duration_millis_preserves_sub_millisecond_precision() {
         assert_eq!(duration_millis_f64(Duration::from_micros(125)), 0.125);
+    }
+}
+
+#[cfg(test)]
+mod put_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn committed_file_info_follows_exact_quorum_success_slot() {
+        let mut first_success = FileInfo::new("bucket/object", 2, 2);
+        first_success.name = "first-success".to_string();
+        let mut second_success = first_success.clone();
+        second_success.name = "second-success".to_string();
+        let mut parts_metadata = vec![FileInfo::default(), first_success, second_success, FileInfo::default()];
+        let committed_disks = [None, Some(()), Some(()), None];
+
+        assert_eq!(
+            committed_disks.iter().filter(|disk| disk.is_some()).count(),
+            2,
+            "fixture must meet exact quorum"
+        );
+        let selected_slot = committed_response_metadata_slot(&committed_disks, 3);
+        let selected = std::mem::take(&mut parts_metadata[selected_slot]);
+
+        assert_eq!(selected.name, "first-success");
+        assert_eq!(parts_metadata[1], FileInfo::default(), "selected metadata should move without cloning");
+        assert_eq!(parts_metadata[2].name, "second-success", "other committed metadata must remain available");
+        assert_eq!(
+            committed_response_metadata_slot::<()>(&[None, None, None, None], 3),
+            3,
+            "a violated post-commit success-mask invariant must not turn a durable PUT into an error"
+        );
     }
 }
 
@@ -1059,11 +1095,7 @@ impl SetDisks {
         }
 
         fi.data_dir = Some(Uuid::new_v4());
-
-        let parts_metadata = vec![fi.clone(); disks.len()];
-
-        let (mut shuffle_disks, mut parts_metadatas) =
-            Self::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts_metadata, &fi);
+        let mut shuffle_disks = Self::shuffle_disks_owned(disks, &fi.erasure.distribution);
 
         let tmp_dir = Uuid::new_v4().to_string();
 
@@ -1306,8 +1338,33 @@ impl SetDisks {
                 )));
             }
 
-            for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
-                pfi.metadata = user_defined.clone();
+            fi.metadata = user_defined;
+            fi.mod_time = mod_time;
+            fi.size = w_size as i64;
+            fi.versioned = opts.versioned || opts.version_suspended;
+            fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
+            if opts.data_movement {
+                fi.set_data_moved();
+            }
+            let parity_blocks = fi.erasure.parity_blocks;
+
+            let response_metadata_slot = shuffle_disks
+                .iter()
+                .rposition(Option::is_some)
+                .ok_or_else(|| Error::other("put_object write quorum unavailable after encode"))?;
+            let mut base_file_info = fi;
+            let mut parts_metadatas = Vec::with_capacity(shuffle_disks.len());
+            for (i, disk) in shuffle_disks.iter().enumerate() {
+                if disk.is_none() {
+                    parts_metadatas.push(FileInfo::default());
+                    continue;
+                }
+
+                let mut pfi = if i == response_metadata_slot {
+                    std::mem::take(&mut base_file_info)
+                } else {
+                    base_file_info.clone()
+                };
                 if is_inline_buffer {
                     if let Some(writer) = writers[i].take() {
                         pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
@@ -1315,21 +1372,15 @@ impl SetDisks {
 
                     pfi.set_inline_data();
                 }
-
-                pfi.mod_time = mod_time;
-                pfi.size = w_size as i64;
-                pfi.versioned = opts.versioned || opts.version_suspended;
-                pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
-                pfi.checksum = fi.checksum.clone();
-
-                if opts.data_movement {
-                    pfi.set_data_moved();
-                }
+                parts_metadatas.push(pfi);
             }
+            let committed_version_id = parts_metadatas[response_metadata_slot].version_id;
+            let committed_data_dir = parts_metadatas[response_metadata_slot].data_dir;
+            let is_compressed = parts_metadatas[response_metadata_slot].is_compressed();
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
-            if fi.erasure.parity_blocks == 0 {
+            if parity_blocks == 0 {
                 let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
                 let logical_shard_size = usize::try_from(erasure.shard_file_size(written_size))
                     .map_err(|_| Error::other("put_object shard size overflows usize"))?;
@@ -1526,7 +1577,7 @@ impl SetDisks {
                     Some(self.pool_index),
                     Some(self.set_index),
                 );
-                request.object_version_id = fi.version_id.map(|version_id| version_id.to_string());
+                request.object_version_id = committed_version_id.map(|version_id| version_id.to_string());
                 tokio::spawn(async move {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
@@ -1561,7 +1612,7 @@ impl SetDisks {
 
             let mut cleanup_stage_ms: Option<u64> = None;
             if let Some(old_dir) = op_old_dir {
-                let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+                let committed_dir = committed_data_dir.unwrap_or_default().to_string();
                 let cleanup_stage_start = Instant::now();
                 // backlog#898: reclaiming the dereferenced old data dir is
                 // best-effort and returns a receipt (never `Err`). A failed GC
@@ -1598,16 +1649,10 @@ impl SetDisks {
                 }
             }
 
-            for (i, op_disk) in online_disks.iter().enumerate() {
-                if let Some(disk) = op_disk
-                    && disk.is_online().await
-                {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
-            }
+            let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
+            let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
 
-            if fi.is_compressed() {
+            if is_compressed {
                 record_compression_total_memory(actual_size as u64, w_size as u64).await;
             }
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
