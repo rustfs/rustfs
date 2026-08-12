@@ -3,7 +3,10 @@
 RustFS lets operators choose how much fsync work runs on the object write
 path. The default (`strict`) preserves the fully synced behavior RustFS has
 always shipped; the relaxed tiers are **opt-in** trades of power-loss
-durability for latency/IOPS.
+durability for latency/IOPS. Note that **newly created buckets default to
+`relaxed`** (see [New-bucket default](#new-bucket-default)) — a gradual
+migration that leaves the process-wide default and all pre-existing buckets
+on `strict`.
 
 ## Configuration
 
@@ -13,6 +16,9 @@ RUSTFS_DURABILITY_MODE=strict|relaxed|none   # default: strict
 
 # Legacy binary switch (kept for compatibility, superseded by the above)
 RUSTFS_DRIVE_SYNC_ENABLE=true|false          # default: true
+
+# Tier seeded into a NEWLY CREATED bucket's own override (see "New-bucket default")
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed|strict|none|inherit   # default: relaxed
 ```
 
 Resolution rules:
@@ -137,6 +143,39 @@ curl -X DELETE "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>"
 
 `mc` integration is a follow-up; for now the admin API above is the
 configuration plane.
+
+### New-bucket default
+
+A bucket created after this feature ships gets a `relaxed` override **seeded
+into its own metadata** at creation time (rustfs/backlog#1811), so it opts
+into MinIO's default posture (object data still fdatasynced; xl.meta and
+directory-entry fsyncs left to the page cache) without touching the
+process-wide default. This is a gradual migration:
+
+- **Pre-existing buckets are unaffected.** A bucket with no `durability.json`
+  entry keeps following the process-wide mode (`strict` by default), exactly
+  as before.
+- **The process-wide default stays `strict`.** `RUSTFS_DURABILITY_MODE` and
+  `RUSTFS_DRIVE_SYNC_ENABLE` are unchanged; only newly created buckets carry
+  their own `relaxed` override.
+- **System-critical namespaces stay pinned to `strict`** regardless of any
+  override (see [System-critical pinning](#system-critical-pinning)).
+
+The seeded tier is controlled by an env var read once per bucket creation
+(bucket creation is not a hot path):
+
+```bash
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=relaxed   # default: seed `relaxed`
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=strict    # seed `strict` instead
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=none      # seed `none` instead
+RUSTFS_NEW_BUCKET_DURABILITY_MODE=inherit   # seed nothing: follow the global mode
+```
+
+`inherit` (and any unrecognized value, which fails closed to `inherit`) means
+the new bucket gets no override and follows the process-wide mode. Set this
+cluster-wide to opt out of the new default entirely. The seed only applies at
+bucket creation; it never retroactively rewrites existing buckets. To change
+an existing bucket's tier, use the per-bucket admin API above.
 
 ### Resolution order
 
