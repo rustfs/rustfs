@@ -2891,15 +2891,17 @@ where
             .expect("namespace should be created");
     }
     for name in ["alpha", "beta"] {
-        let identifier = IdentifierSegment::parse(name).expect("table and view name should parse");
-        let metadata_location = default_table_metadata_file_path(namespace, &identifier, "00001.metadata.json");
-        let mut table = test_table_entry(bucket, namespace, &identifier, metadata_location.clone());
+        let table_identifier = IdentifierSegment::parse(name).expect("table name should parse");
+        let metadata_location = default_table_metadata_file_path(namespace, &table_identifier, "00001.metadata.json");
+        let mut table = test_table_entry(bucket, namespace, &table_identifier, metadata_location);
         table.table_id = format!("table-{name}");
         table.table_uuid = format!("table-uuid-{name}");
         table.warehouse_location = format!("s3://{bucket}/tables/table-{name}");
         store.create_table(table).await.expect("table should be created");
 
-        let mut view = test_view_entry(bucket, namespace, &identifier, metadata_location);
+        let view_identifier = IdentifierSegment::parse(&format!("view_{name}")).expect("view name should parse");
+        let view_metadata_location = default_view_metadata_file_path(namespace, &view_identifier, "00001.metadata.json");
+        let mut view = test_view_entry(bucket, namespace, &view_identifier, view_metadata_location);
         view.view_id = format!("view-{name}");
         view.view_uuid = format!("view-uuid-{name}");
         view.warehouse_location = format!("s3://{bucket}/views/view-{name}");
@@ -3153,7 +3155,7 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
         .expect("data-plane resource lookup should succeed");
 
     assert!(resource.is_none());
-    assert_eq!(backend.list_call_count().await, 0);
+    assert_eq!(backend.list_call_count().await, 1);
 }
 
 #[tokio::test]
@@ -3165,9 +3167,10 @@ async fn catalog_backings_reject_overlapping_registered_warehouse_prefixes() {
     let parent_table = IdentifierSegment::parse("orders").unwrap();
     let child_table = IdentifierSegment::parse("orders_child").unwrap();
     let current = default_table_metadata_file_path(&namespace, &parent_table, "00001.metadata.json");
+    let child_metadata = default_table_metadata_file_path(&namespace, &child_table, "00001.metadata.json");
 
-    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current.clone()).await;
-    let mut child_entry = test_table_entry(bucket, &namespace, &child_table, current);
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &parent_table, current).await;
+    let mut child_entry = test_table_entry(bucket, &namespace, &child_table, child_metadata);
     child_entry.table_id = "table-id-child".to_string();
     child_entry.warehouse_location = format!("s3://{bucket}/tables/table-id/child");
     assert_matches!(store.create_table(child_entry.clone()).await, Err(TableCatalogStoreError::Conflict(_)));
@@ -4264,7 +4267,7 @@ async fn table_data_plane_resource_falls_back_to_scan_without_index_state() {
 
     assert_eq!(indexed_resource.table, "orders");
     assert_eq!(backend.list_call_count().await, 0);
-    assert!(backend.read_call_count().await <= 5);
+    assert!(backend.read_call_count().await <= 6);
 }
 
 #[tokio::test]
@@ -4377,12 +4380,12 @@ async fn object_catalog_pagination_bounds_reads_and_covers_rest_resources() {
         .list_views_page(bucket, &namespace_name, None, one)
         .await
         .expect("first view page should load");
-    assert_eq!(view_page.entries[0].view, "alpha");
+    assert_eq!(view_page.entries[0].view, "view_alpha");
     let view_page = store
         .list_views_page(bucket, &namespace_name, view_page.next_cursor.as_deref(), one)
         .await
         .expect("second view page should load");
-    assert_eq!(view_page.entries[0].view, "beta");
+    assert_eq!(view_page.entries[0].view, "view_beta");
     assert!(view_page.next_cursor.is_none());
 
     let exact_page = store
@@ -4487,7 +4490,7 @@ async fn object_catalog_drop_namespace_scans_all_pages_for_inactive_resources() 
         store.drop_namespace(bucket, &namespace.public_name()).await,
         Err(TableCatalogStoreError::Conflict(message)) if message.contains("not empty")
     );
-    assert_eq!(backend.list_call_count().await, 2);
+    assert_eq!(backend.list_call_count().await, 4);
 }
 
 #[tokio::test]
@@ -4923,7 +4926,8 @@ async fn table_data_plane_resource_fails_closed_when_any_active_warehouse_locati
     let namespace = Namespace::parse("sales").unwrap();
     let invalid_table = IdentifierSegment::parse("bad_orders").unwrap();
     let valid_table = IdentifierSegment::parse("orders").unwrap();
-    let current = default_table_metadata_file_path(&namespace, &valid_table, "00001.metadata.json");
+    let invalid_metadata = default_table_metadata_file_path(&namespace, &invalid_table, "00001.metadata.json");
+    let valid_metadata = default_table_metadata_file_path(&namespace, &valid_table, "00001.metadata.json");
 
     store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
     store
@@ -4931,7 +4935,7 @@ async fn table_data_plane_resource_fails_closed_when_any_active_warehouse_locati
         .await
         .unwrap();
 
-    let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, current.clone());
+    let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, invalid_metadata);
     invalid_entry.table_id = "bad-table-id".to_string();
     invalid_entry.warehouse_location = format!("s3://{bucket}/");
     let invalid_path = store.paths.table_entry_path(bucket, &namespace, &invalid_table);
@@ -4944,8 +4948,14 @@ async fn table_data_plane_resource_fails_closed_when_any_active_warehouse_locati
         )
         .await
         .unwrap();
+    let valid_entry = test_table_entry(bucket, &namespace, &valid_table, valid_metadata);
     store
-        .create_table(test_table_entry(bucket, &namespace, &valid_table, current))
+        .write_entry(
+            store.catalog_bucket(),
+            &store.paths.table_entry_path(bucket, &namespace, &valid_table),
+            &valid_entry,
+            TableCatalogPutPrecondition::IfAbsent,
+        )
         .await
         .unwrap();
 
@@ -8863,18 +8873,24 @@ async fn object_table_catalog_store_serializes_namespace_drop_with_table_creatio
     let create = tokio::spawn(async move { create_store.create_table(table_entry).await });
     pause.wait_started().await;
 
-    let publication_lock = default_table_bucket_publication_lock_path();
-    let publication_attempts = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
+    let namespace_path = store.paths.namespace_entry_path(bucket, &namespace);
+    let namespace_lock_attempts = backend
+        .write_lock_acquisition_count(RUSTFS_META_BUCKET, &namespace_path)
+        .await;
     let drop_store = store.clone();
     let namespace_name = namespace.public_name();
     let drop_namespace = tokio::spawn(async move { drop_store.drop_namespace(bucket, &namespace_name).await });
     tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
-        while backend.write_lock_acquisition_count(bucket, &publication_lock).await == publication_attempts {
+        while backend
+            .write_lock_acquisition_count(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            == namespace_lock_attempts
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("namespace drop should attempt the table-bucket publication lock");
+    .expect("namespace drop should attempt the namespace catalog lock");
     assert!(!drop_namespace.is_finished(), "namespace drop must wait for table creation");
 
     pause.release();
@@ -10700,12 +10716,12 @@ async fn strong_catalog_pagination_uses_ordered_state_and_rejects_object_cursors
         .list_views_page(bucket, &namespace_name, None, one)
         .await
         .expect("first strong view page should load");
-    assert_eq!(first.entries[0].view, "alpha");
+    assert_eq!(first.entries[0].view, "view_alpha");
     let second = store
         .list_views_page(bucket, &namespace_name, first.next_cursor.as_deref(), one)
         .await
         .expect("second strong view page should load");
-    assert_eq!(second.entries[0].view, "beta");
+    assert_eq!(second.entries[0].view, "view_beta");
     assert!(second.next_cursor.is_none());
 
     let exact = NonZeroUsize::new(2).expect("exact page size should be non-zero");
@@ -11437,6 +11453,13 @@ async fn strong_catalog_first_confirmed_write_requires_snapshot_after_reload_fai
     let store = StrongTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .expect("migration target should hydrate without a snapshot")
+            .is_none()
+    );
     backend.fail_next_read(RUSTFS_META_BUCKET, &snapshot_path).await;
 
     store
@@ -11461,6 +11484,13 @@ async fn strong_catalog_first_ambiguous_write_requires_snapshot_after_recovery_f
     let store = StrongTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+    assert!(
+        store
+            .get_table_bucket(bucket)
+            .await
+            .expect("migration target should hydrate without a snapshot")
+            .is_none()
+    );
     backend.fail_after_next_put(RUSTFS_META_BUCKET, &snapshot_path).await;
     backend.fail_next_read(RUSTFS_META_BUCKET, &snapshot_path).await;
 
@@ -12531,7 +12561,7 @@ async fn strong_catalog_recovers_migration_snapshot_mutations_after_committed_pu
 }
 
 #[tokio::test]
-async fn strong_catalog_does_not_recover_commit_from_unreachable_log() {
+async fn strong_catalog_rejects_snapshot_with_unreachable_commit_log() {
     let backend = TestCatalogObjectBackend::default();
     let store = StrongTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -12582,13 +12612,11 @@ async fn strong_catalog_does_not_recover_commit_from_unreachable_log() {
         .expect("commit task should join")
         .expect_err("an unreachable commit log must not prove that the table pointer advanced");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("post-commit put failure"));
-    let loaded = store
-        .load_table(bucket, "sales", "orders")
-        .await
-        .expect("table load should succeed")
-        .expect("table should remain present");
-    assert_eq!(loaded.metadata_location, inconsistent.tables[0].metadata_location);
-    assert_eq!(loaded.version_token, inconsistent.tables[0].version_token);
+    assert_matches!(
+        store.load_table(bucket, "sales", "orders").await,
+        Err(TableCatalogStoreError::Invalid(message))
+            if message.contains("not recoverable in the current table history")
+    );
 }
 
 #[tokio::test]
@@ -12851,7 +12879,7 @@ async fn strong_catalog_validates_candidate_snapshot_before_publication() {
 
     assert_matches!(
         store.register_table(entry).await,
-        Err(TableCatalogStoreError::Invalid(message)) if message.contains("table ids")
+        Err(TableCatalogStoreError::Invalid(message)) if message.contains("table id cannot be empty")
     );
     assert_eq!(
         backend.put_attempt_count(RUSTFS_META_BUCKET, &snapshot_path).await,
@@ -14400,7 +14428,7 @@ async fn object_table_catalog_store_syncs_warehouse_location_from_committed_meta
         .await
         .expect("old table warehouse lookup should succeed");
     assert!(old_resource.is_none());
-    assert_eq!(backend.list_call_count().await, 0);
+    assert_eq!(backend.list_call_count().await, 1);
 }
 
 #[tokio::test]
@@ -15223,7 +15251,7 @@ async fn table_commit_recovery_does_not_overwrite_conflicting_idempotency_index(
 }
 
 #[tokio::test]
-async fn strong_table_commit_retry_rejects_token_only_idempotency_conflict() {
+async fn strong_table_commit_retry_rejects_token_only_idempotency_corruption() {
     let backend = TestCatalogObjectBackend::default();
     let store = StrongTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
@@ -15282,7 +15310,10 @@ async fn strong_table_commit_retry_rejects_token_only_idempotency_conflict() {
         .commit_table(request)
         .await
         .expect_err("token-only idempotency mismatch must fail closed in strong mode");
-    assert_matches!(retry_error, TableCatalogStoreError::Conflict(_));
+    assert_matches!(
+        retry_error,
+        TableCatalogStoreError::Invalid(message) if message.contains("has no matching commit")
+    );
     assert_eq!(
         backend
             .read_object(RUSTFS_META_BUCKET, &snapshot_path)

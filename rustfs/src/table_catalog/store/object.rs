@@ -4209,8 +4209,7 @@ where
                 Some(resource) => Ok(Some(resource)),
                 None => scan_table_data_plane_resource_for_object(self, table_bucket, object).await,
             },
-            Err(err @ TableCatalogStoreError::Conflict(_)) => Err(err),
-            Err(err) => {
+            Err(err @ TableCatalogStoreError::Internal(_)) => {
                 tracing::warn!(
                     table_bucket = %table_bucket,
                     error = %err,
@@ -4218,6 +4217,7 @@ where
                 );
                 scan_table_data_plane_resource_for_object(self, table_bucket, object).await
             }
+            Err(err) => Err(err),
         }
     }
 

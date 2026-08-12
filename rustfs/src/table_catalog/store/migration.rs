@@ -844,6 +844,13 @@ where
             .await?;
         let existing_fence = self.read_backing_migration_fence(table_bucket).await?;
         let strong_store = StrongTableCatalogStore::new(self.backend.clone());
+        if let Some((fence, _)) = existing_fence.as_ref()
+            && fence.status == TableCatalogBackingMigrationFenceStatus::Preparing
+            && !fence.target_bucket_existed
+            && Self::migration_target_snapshot_state(fence) == TableCatalogBackingMigrationTargetSnapshotState::Absent
+        {
+            strong_store.restore_absent_migration_snapshot_baseline().await?;
+        }
         let source_table_bucket_names = self.object_backed_table_buckets().await?.into_keys().collect::<BTreeSet<_>>();
         if !strong_store.table_bucket_names().await?.is_subset(&source_table_bucket_names) {
             return Err(TableCatalogStoreError::Conflict(
