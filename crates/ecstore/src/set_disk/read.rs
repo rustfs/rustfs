@@ -5479,33 +5479,36 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_codec_streaming_uses_conservative_default_min_size() {
-        temp_env::with_vars(
-            [
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
-            ],
-            || {
-                let below_threshold_fi = codec_streaming_test_fileinfo(512 * 1024, 1);
-                let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
-                assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
-                );
+    fn codec_streaming_default_min_size_meets_direct_memory_ceiling() {
+        for engine in [None, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, engine),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
+                ],
+                || {
+                    let below_threshold_fi = codec_streaming_test_fileinfo(128 * 1024 - 1, 1);
+                    let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true)
+                            .decision,
+                        GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                    );
 
-                let threshold_fi = codec_streaming_test_fileinfo(1_048_576, 1);
-                let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
-                assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Use
-                );
-            },
-        );
+                    let threshold_fi = codec_streaming_test_fileinfo(128 * 1024, 1);
+                    let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
+                        GetCodecStreamingDecision::Use
+                    );
+                },
+            );
+        }
     }
 
     #[test]
@@ -5803,10 +5806,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5827,10 +5830,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5848,10 +5851,10 @@ mod tests {
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5931,10 +5934,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("0")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5951,10 +5954,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("100")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
