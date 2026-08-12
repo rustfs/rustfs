@@ -63,7 +63,7 @@
 | list_objects_v2_metadata_extension_test | 1 |  |
 | list_objects_v2_pagination_test | 12 | ✅ |
 | mc_mirror_small_bucket_test | 1 |  |
-| multipart_auth_test | 97 |  |
+| multipart_auth_test | 85 |  |
 | multipart_storage_class_test | 3 | ✅ |
 | namespace_lock_quorum_test | 2 |  |
 | negative_sigv4_test | 6 | ✅ |
