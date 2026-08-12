@@ -3190,23 +3190,28 @@ async fn try_read_inline_data_shards_direct(
         return None;
     }
 
-    let mut body = Vec::with_capacity(object_size);
-    let mut remaining = object_size;
-    for reader in readers.iter_mut().take(data_shards) {
+    let shards_needed = object_size.div_ceil(read_length);
+    if shards_needed > data_shards {
+        return None;
+    }
+    let encoded_capacity = read_length.checked_mul(shards_needed)?;
+    let mut body = Vec::with_capacity(encoded_capacity);
+    for reader in readers.iter_mut().take(shards_needed) {
         let reader = reader.as_mut()?;
-        let mut shard = vec![0u8; read_length];
-        let Ok(read) = reader.read(&mut shard).await else {
+        let Ok(read) = reader.read_appending(&mut body, read_length).await else {
             return None;
         };
         if read != read_length {
             return None;
         }
 
-        let take = remaining.min(shard.len());
-        body.extend_from_slice(&shard[..take]);
-        remaining -= take;
-        if remaining == 0 {
-            return Some(Bytes::from(body));
+        if body.len() >= object_size {
+            let body = Bytes::from(body);
+            return Some(if body.len() == object_size {
+                body
+            } else {
+                body.slice(..object_size)
+            });
         }
     }
 
@@ -8847,10 +8852,17 @@ mod tests {
         ));
     }
 
-    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
-        let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+    async fn inline_bitrot_files_for_payload_with_mode(
+        payload: &[u8],
+        uses_legacy: bool,
+    ) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        let erasure = coding::Erasure::new_with_options(4, 2, 1024 * 1024, uses_legacy);
         let read_length = erasure.shard_file_offset(0, payload.len(), payload.len());
-        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let checksum_algo = if uses_legacy {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            HashAlgorithm::HighwayHash256S
+        };
         let shards = erasure.encode_data(payload).expect("payload should encode");
         let mut files = Vec::with_capacity(shards.len());
 
@@ -8870,6 +8882,10 @@ mod tests {
         }
 
         (erasure, files, read_length, checksum_algo)
+    }
+
+    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        inline_bitrot_files_for_payload_with_mode(payload, false).await
     }
 
     fn inline_data_shard_fileinfo(
@@ -8952,14 +8968,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_data_shards_direct_read_reassembles_legacy_payload_with_padding() {
+        let payload = b"legacy inline payload whose size is not divisible by the data shard count";
+        let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload_with_mode(payload, true).await;
+        assert_ne!(payload.len() % erasure.data_shards, 0, "test payload must exercise EC padding");
+        let mut readers = build_inline_bitrot_readers(
+            &files,
+            erasure.data_shards,
+            "bucket",
+            "object",
+            read_length,
+            erasure.shard_size(),
+            &checksum_algo,
+            false,
+        )
+        .await
+        .expect("legacy inline bitrot readers should build");
+
+        let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, payload.len())
+            .await
+            .expect("legacy data shard direct read should succeed");
+
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
     async fn inline_data_shards_direct_read_rejects_corrupt_shard() {
         let payload = b"small inline object payload that will be corrupted";
         let (erasure, mut files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
-        let first = files[0].data.as_mut().expect("first shard should exist");
-        let mut corrupted = first.to_vec();
+        let second = files[1].data.as_mut().expect("second shard should exist");
+        let mut corrupted = second.to_vec();
         let last = corrupted.last_mut().expect("encoded shard should not be empty");
         *last ^= 0xff;
-        *first = Bytes::from(corrupted);
+        *second = Bytes::from(corrupted);
 
         let mut readers = build_inline_bitrot_readers(
             &files,
@@ -8976,7 +9018,7 @@ mod tests {
 
         let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len()).await;
 
-        assert!(body.is_none());
+        assert!(body.is_none(), "a later corrupt shard must discard the already-appended body prefix");
     }
 
     #[test]

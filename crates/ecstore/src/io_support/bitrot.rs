@@ -623,11 +623,12 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    let inline_source = inline_data.is_some();
     let source = BitrotReaderSource {
         inline_data,
         disk: disk.cloned(),
-        bucket: bucket.to_string(),
-        path: path.to_string(),
+        bucket: if inline_source { String::new() } else { bucket.to_string() },
+        path: if inline_source { String::new() } else { path.to_string() },
         offset,
         length,
         use_mmap_read,
@@ -698,11 +699,12 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
 ) -> (BitrotReader<ShardReader>, DeferredReaderStripeHandle) {
     let stripe_stride = shard_size + checksum_algo.size();
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    let inline_source = inline_data.is_some();
     let source = BitrotReaderSource {
         inline_data,
         disk,
-        bucket: bucket.to_string(),
-        path: path.to_string(),
+        bucket: if inline_source { String::new() } else { bucket.to_string() },
+        path: if inline_source { String::new() } else { path.to_string() },
         offset,
         length,
         use_mmap_read,
