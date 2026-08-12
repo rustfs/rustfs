@@ -221,7 +221,7 @@ impl MetadataFanoutDiagnostics {
         self.observations.iter().filter(|observation| observation.ignored).count()
     }
 
-    pub(in crate::set_disk) fn error_responses(&self) -> usize {
+    pub(in crate::set_disk) fn non_valid_responses(&self) -> usize {
         self.total_responses().saturating_sub(self.valid_responses())
     }
 
@@ -272,7 +272,7 @@ impl MetadataFanoutDiagnostics {
             self.total_responses(),
             self.valid_responses(),
             self.ignored_responses(),
-            self.error_responses(),
+            self.non_valid_responses(),
         );
         for observation in &self.observations {
             rustfs_io_metrics::record_get_object_metadata_response(path, observation.outcome);
@@ -6037,7 +6037,7 @@ mod tests {
         assert_eq!(diagnostics.total_responses(), 3);
         assert_eq!(diagnostics.valid_responses(), 1);
         assert_eq!(diagnostics.ignored_responses(), 1);
-        assert_eq!(diagnostics.error_responses(), 2);
+        assert_eq!(diagnostics.non_valid_responses(), 2);
         assert_eq!(diagnostics.first_response_latency(), Some(Duration::from_millis(10)));
         assert_eq!(diagnostics.first_valid_response_latency(), Some(Duration::from_millis(30)));
         assert_eq!(diagnostics.slowest_response_latency(), Some(Duration::from_millis(30)));

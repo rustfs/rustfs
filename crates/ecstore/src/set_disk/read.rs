@@ -30,12 +30,12 @@ use crate::diagnostics::get::{
     GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
     GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
     GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
-    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_SETUP_DROP_PENDING,
-    GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM, GET_STAGE_READER_TASK_BITROT_READER_INIT,
-    GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
-    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
+    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, mark_get_object_downstream_closed,
+    record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
@@ -349,7 +349,12 @@ impl SetDisks {
             self.default_parity_count,
         )
         .await?;
-        metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
+            GET_OBJECT_PATH_INTERNAL_META
+        } else {
+            GET_OBJECT_PATH_LEGACY_DUPLEX
+        };
+        metadata_fanout_diagnostics.record(metadata_metrics_path);
         let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
@@ -387,7 +392,7 @@ impl SetDisks {
 
         let (op_online_disks, fi, fileinfo_selection_quorum) =
             Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)?;
-        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, fileinfo_selection_quorum);
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
         if errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
@@ -3415,7 +3420,7 @@ mod tests {
         );
         assert_eq!(diagnostics.total_responses(), 9);
         assert_eq!(diagnostics.valid_responses(), 1);
-        assert_eq!(diagnostics.error_responses(), 8);
+        assert_eq!(diagnostics.non_valid_responses(), 8);
     }
 
     #[test]
@@ -3430,7 +3435,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.ignored_responses(), 2);
-        assert_eq!(diagnostics.error_responses(), 3);
+        assert_eq!(diagnostics.non_valid_responses(), 3);
         assert_eq!(diagnostics.observations[0].outcome, GET_METADATA_RESPONSE_DISK_NOT_FOUND);
         assert_eq!(diagnostics.observations[1].outcome, GET_METADATA_RESPONSE_IGNORED);
         assert_eq!(diagnostics.observations[2].outcome, GET_METADATA_RESPONSE_NOT_FOUND);
@@ -3498,7 +3503,7 @@ mod tests {
 
         assert_eq!(diagnostics.total_responses(), 3);
         assert_eq!(diagnostics.valid_responses(), 3);
-        assert_eq!(diagnostics.error_responses(), 0);
+        assert_eq!(diagnostics.non_valid_responses(), 0);
         assert!(
             diagnostics
                 .observations
