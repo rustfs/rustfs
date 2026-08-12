@@ -846,31 +846,45 @@ impl RemoteDisk {
     /// default to 1 (see [`internode_idempotent_read_retries`]). MUST NOT be used for write/lock
     /// RPCs — those must never auto-retry (quorum/idempotency safety). The `operation` closure is
     /// re-invoked per attempt, so it must be `Fn` (rebuild the request from borrowed inputs, do not
-    /// move captured state out).
+    /// move captured state out). Attempts and backoff share one total timeout budget.
     async fn execute_read_with_retry<T, F, Fut>(&self, op: &'static str, operation: F, timeout_duration: Duration) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        let deadline = (!timeout_duration.is_zero()).then(|| time::Instant::now() + timeout_duration);
         let max_retries = internode_idempotent_read_retries();
         let mut attempt = 0usize;
         loop {
-            // Only the final attempt marks the disk faulty / evicts the channel. Earlier retries
-            // ignore the failure, so a transient error cannot flip the disk into a faulty
-            // short-circuit (which would defeat the retry) or over-count failures.
+            let attempt_timeout = deadline
+                .map(|deadline| deadline.saturating_duration_since(time::Instant::now()))
+                .unwrap_or(Duration::ZERO);
+            if deadline.is_some() && attempt_timeout.is_zero() {
+                self.record_timeout(op, timeout_duration);
+                return Err(DiskError::Timeout);
+            }
+
             let health_action = if attempt >= max_retries {
                 FailureHealthAction::MarkFailure
             } else {
                 FailureHealthAction::IgnoreFailure
             };
             match self
-                .execute_with_timeout_for_op_and_health_action(op, &operation, timeout_duration, health_action)
+                .execute_with_timeout_for_op_and_health_action(op, &operation, attempt_timeout, health_action)
                 .await
             {
                 Err(err) if attempt < max_retries && is_network_like_disk_error(&err) => {
+                    if matches!(err, DiskError::Timeout) && deadline.is_some_and(|deadline| time::Instant::now() >= deadline) {
+                        self.mark_faulty("read_operation_deadline");
+                        return Err(err);
+                    }
                     attempt += 1;
                     let backoff = REMOTE_DISK_READ_RETRY_BASE_BACKOFF
                         .saturating_mul(1u32 << u32::try_from(attempt - 1).unwrap_or(4).min(4));
+                    if deadline.is_some_and(|deadline| deadline.saturating_duration_since(time::Instant::now()) <= backoff) {
+                        attempt = max_retries;
+                        continue;
+                    }
                     debug!(
                         endpoint = %self.endpoint,
                         addr = %self.addr,
@@ -878,7 +892,17 @@ impl RemoteDisk {
                         attempt,
                         "retrying idempotent read-only RPC after transient network error"
                     );
-                    tokio::time::sleep(backoff).await;
+                    if let Some(deadline) = deadline {
+                        if time::timeout_at(deadline, time::sleep(backoff)).await.is_err() {
+                            self.record_timeout(op, timeout_duration);
+                            return Err(DiskError::Timeout);
+                        }
+                    } else {
+                        time::sleep(backoff).await;
+                    }
+                    if self.health.is_faulty() {
+                        return Err(DiskError::FaultyDisk);
+                    }
                 }
                 other => return other,
             }
@@ -957,30 +981,33 @@ impl RemoteDisk {
                 operation_result
             }
             Err(_) => {
-                // Timeout occurred, mark disk as potentially faulty
-                counter!(
-                    "rustfs_drive_op_timeout_total",
-                    "endpoint" => self.endpoint.to_string(),
-                    "op" => op.to_string()
-                )
-                .increment(1);
+                self.record_timeout(op, timeout_duration);
                 if failure_health_action == FailureHealthAction::MarkFailure {
                     self.mark_faulty_and_evict("operation_timeout").await;
                 }
-                warn!(
-                    event = EVENT_REMOTE_DISK_RPC,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                    endpoint = %self.endpoint,
-                    addr = %self.addr,
-                    op,
-                    timeout_ms = timeout_duration.as_millis(),
-                    state = "timeout",
-                    "Remote disk operation timed out"
-                );
                 Err(DiskError::Timeout)
             }
         }
+    }
+
+    fn record_timeout(&self, op: &'static str, timeout_duration: Duration) {
+        counter!(
+            "rustfs_drive_op_timeout_total",
+            "endpoint" => self.endpoint.to_string(),
+            "op" => op.to_string()
+        )
+        .increment(1);
+        warn!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            addr = %self.addr,
+            op,
+            timeout_ms = timeout_duration.as_millis(),
+            state = "timeout",
+            "Remote disk operation timed out"
+        );
     }
 
     async fn handle_network_like_error<T>(
@@ -1016,7 +1043,7 @@ impl RemoteDisk {
         }
     }
 
-    async fn mark_faulty_and_evict(&self, reason: &'static str) {
+    fn mark_faulty(&self, reason: &'static str) -> bool {
         let previous_state = self.runtime_state();
         let transitioned_to_offline = self.mark_suspect_or_offline(reason);
         let state = self.runtime_state();
@@ -1053,6 +1080,12 @@ impl RemoteDisk {
                     "Remote disk marked suspect"
                 );
             }
+        }
+        state != previous_state
+    }
+
+    async fn mark_faulty_and_evict(&self, reason: &'static str) {
+        if self.mark_faulty(reason) {
             counter!(
                 "rustfs_drive_connection_evict_total",
                 "endpoint" => self.endpoint.to_string(),
@@ -2068,7 +2101,7 @@ impl DiskAPI for RemoteDisk {
 
                 Ok(file_info)
             },
-            get_max_timeout_duration(),
+            get_drive_metadata_timeout(),
         )
         .await
     }
@@ -5094,6 +5127,436 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_reset_during_backoff_preserves_recovery() {
+        let remote_disk = Arc::new(new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_attempt = Arc::new(tokio::sync::Notify::new());
+        let started = time::Instant::now();
+
+        let task_disk = Arc::clone(&remote_disk);
+        let task_attempts = Arc::clone(&attempts);
+        let task_first_attempt = Arc::clone(&first_attempt);
+        let task = tokio::spawn(async move {
+            task_disk
+                .execute_read_with_retry(
+                    "read_version",
+                    move || {
+                        let attempt = task_attempts.fetch_add(1, Ordering::SeqCst);
+                        let first_attempt = Arc::clone(&task_first_attempt);
+                        async move {
+                            if attempt == 0 {
+                                time::sleep(Duration::from_millis(20)).await;
+                                first_attempt.notify_one();
+                                return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                    std_io::ErrorKind::ConnectionRefused,
+                                    "connection refused",
+                                )));
+                            }
+                            Ok(())
+                        }
+                    },
+                    Duration::from_millis(100),
+                )
+                .await
+        });
+
+        first_attempt.notified().await;
+        tokio::task::yield_now().await;
+        remote_disk.health.reset_for_store_init_retry(&remote_disk.endpoint);
+        let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+            .expect("remote disk address should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+        task.await
+            .expect("retry task should finish")
+            .expect("the retry should succeed after the health reset");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(70));
+        assert_eq!(
+            remote_disk.health.waiting_count(),
+            0,
+            "health reset must not underflow the waiting counter"
+        );
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Online);
+        assert!(
+            runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await,
+            "a recovered channel must survive the retry backoff"
+        );
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_still_retries_within_shared_deadline() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+            .expect("remote disk address should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+
+        remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionReset,
+                                "connection reset",
+                            )));
+                        }
+                        Ok(())
+                    }
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("a retry that fits the shared deadline should succeed");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Online);
+        assert!(runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_uses_remaining_budget_for_final_attempt() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = time::Instant::now();
+        let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+            .expect("remote disk address should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+
+        let err = remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            time::sleep(Duration::from_millis(20)).await;
+                            return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionRefused,
+                                "connection refused",
+                            )));
+                        }
+                        std::future::pending::<Result<()>>().await
+                    }
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("the final retry should consume only the remaining total budget");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+        assert!(!runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_uses_final_attempt_at_exact_backoff_boundary() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = time::Instant::now();
+
+        let err = remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            time::sleep(Duration::from_millis(50)).await;
+                            return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionRefused,
+                                "connection refused",
+                            )));
+                        }
+                        std::future::pending::<Result<()>>().await
+                    }
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("the exact backoff boundary should be reserved for a final attempt");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_uses_final_attempt_below_backoff_budget() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = time::Instant::now();
+
+        let err = remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            time::sleep(Duration::from_millis(80)).await;
+                            return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionRefused,
+                                "connection refused",
+                            )));
+                        }
+                        std::future::pending::<Result<()>>().await
+                    }
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("remaining budget below backoff should be reserved for a final attempt");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_zero_timeout_disables_the_deadline() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = time::Instant::now();
+
+        remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionReset,
+                                "connection reset",
+                            )));
+                        }
+                        Ok(())
+                    }
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("zero timeout should allow a retry without a deadline");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(started.elapsed(), REMOTE_DISK_READ_RETRY_BASE_BACKOFF);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_zero_retries_runs_once() {
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_IDEMPOTENT_READ_RETRIES, Some("0"))], async {
+            let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = time::Instant::now();
+            let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+                .expect("remote disk address should parse")
+                .connect_lazy();
+            runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+
+            let err = remote_disk
+                .execute_read_with_retry(
+                    "read_version",
+                    || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionReset,
+                                "connection reset",
+                            )))
+                        }
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect_err("zero retries should return the first network error");
+
+            assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == std_io::ErrorKind::ConnectionReset));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert!(!runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await);
+            remote_disk.cancel_token.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_attempt_timeout_marks_health_without_evicting() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+            .expect("remote disk address should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+
+        let err = remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<()>>()
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("an in-flight attempt that consumes the deadline should time out");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+        assert!(runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await);
+        assert_eq!(
+            recorder.counter_value(
+                "rustfs_drive_op_timeout_total",
+                &[
+                    ("endpoint", remote_disk.endpoint.to_string().as_str()),
+                    ("op", "read_version")
+                ]
+            ),
+            1
+        );
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_does_not_retry_business_errors() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let err = remote_disk
+            .execute_read_with_retry(
+                "read_version",
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { Err::<(), Error>(DiskError::FileNotFound) }
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("business errors should be returned directly");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_honors_configured_retry_count() {
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_IDEMPOTENT_READ_RETRIES, Some("2"))], async {
+            let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = time::Instant::now();
+            let channel = TonicEndpoint::from_shared(remote_disk.addr.clone())
+                .expect("remote disk address should parse")
+                .connect_lazy();
+            runtime_sources::cache_test_node_channel(remote_disk.addr.clone(), channel).await;
+
+            let err = remote_disk
+                .execute_read_with_retry(
+                    "read_version",
+                    || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                std_io::ErrorKind::ConnectionReset,
+                                "connection reset",
+                            )))
+                        }
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect_err("exhausted retries should return the last network error");
+
+            assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == std_io::ErrorKind::ConnectionReset));
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert_eq!(started.elapsed(), Duration::from_millis(150));
+            assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert!(!runtime_sources::test_node_channel_is_cached(&remote_disk.addr).await);
+            remote_disk.cancel_token.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_stops_when_disk_turns_offline_during_backoff() {
+        let remote_disk = Arc::new(new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_attempt = Arc::new(tokio::sync::Notify::new());
+        let task_disk = Arc::clone(&remote_disk);
+        let task_attempts = Arc::clone(&attempts);
+        let task_first_attempt = Arc::clone(&first_attempt);
+
+        let task = tokio::spawn(async move {
+            task_disk
+                .execute_read_with_retry(
+                    "read_version",
+                    move || {
+                        let attempt = task_attempts.fetch_add(1, Ordering::SeqCst);
+                        let first_attempt = Arc::clone(&task_first_attempt);
+                        async move {
+                            if attempt == 0 {
+                                first_attempt.notify_one();
+                                return Err::<(), Error>(DiskError::Io(std_io::Error::new(
+                                    std_io::ErrorKind::ConnectionReset,
+                                    "connection reset",
+                                )));
+                            }
+                            Ok(())
+                        }
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        first_attempt.notified().await;
+        tokio::task::yield_now().await;
+        remote_disk
+            .health
+            .force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        time::advance(REMOTE_DISK_READ_RETRY_BASE_BACKOFF).await;
+        let err = task
+            .await
+            .expect("retry task should finish")
+            .expect_err("an offline disk must stop before the next attempt");
+
+        assert_eq!(err, DiskError::FaultyDisk);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        remote_disk.cancel_token.cancel();
+    }
+
     #[tokio::test]
     async fn test_execute_with_timeout_evicts_cached_connection() {
         let addr = "http://127.0.0.1:59991".to_string();
@@ -5600,6 +6063,40 @@ mod tests {
         })
         .await;
 
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn read_version_uses_the_metadata_timeout_on_a_stalled_peer() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
+            return;
+        };
+        let remote_disk = remote_disk_for_addr(&base_addr).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("10")),
+            ],
+            async {
+                let started = time::Instant::now();
+                let err = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    remote_disk.read_version("bucket", "bucket", "object", "", &ReadOptions::default()),
+                )
+                .await
+                .expect("read_version must use the shorter metadata deadline")
+                .expect_err("a stalled peer must fail read_version");
+
+                assert!(matches!(err, DiskError::Timeout), "expected the metadata deadline to fire, got {err:?}");
+                assert!(started.elapsed() >= Duration::from_millis(900));
+                assert!(started.elapsed() < Duration::from_secs(2));
+            },
+        )
+        .await;
+
+        remote_disk.cancel_token.cancel();
         accept_task.abort();
     }
 
