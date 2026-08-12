@@ -15,7 +15,7 @@
 use crate::cluster::rpc::client::{
     AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client,
 };
-use crate::cluster::rpc::set_tonic_mutation_body_digest;
+use crate::cluster::rpc::set_tonic_rolling_mutation_body_digest;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustfs_lock::{
@@ -32,6 +32,10 @@ use tokio::time::timeout;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tracing::{debug, info, warn};
+
+fn attach_lock_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(request: &mut Request<T>) -> std::io::Result<()> {
+    set_tonic_rolling_mutation_body_digest(request)
+}
 
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
@@ -319,7 +323,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = match self.execute_rpc("lock", &resource_summary, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
@@ -358,7 +362,7 @@ impl LockClient for RemoteClient {
                 })
                 .collect::<Result<Vec<_>>>()?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = match self
             .execute_rpc("lock_batch", &resource_summary, client.lock_batch(req))
@@ -400,7 +404,7 @@ impl LockClient for RemoteClient {
         let mut client = self.get_client().await?;
         let resource_summary = unlock_request.resource.to_string();
         let mut req = Request::new(GenerallyLockRequest { args: request_string });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("release", &resource_summary, client.un_lock(req))
             .await?
@@ -427,7 +431,7 @@ impl LockClient for RemoteClient {
                 })
                 .collect::<Result<Vec<_>>>()?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = self
             .execute_rpc("release_batch", &resource_summary, client.un_lock_batch(req))
@@ -450,7 +454,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&refresh_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("refresh", &resource_summary, client.refresh(req))
             .await?
@@ -470,7 +474,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&force_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("force_release", &resource_summary, client.force_un_lock(req))
             .await?
@@ -495,7 +499,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&status_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         // Try exclusive lock first with very short timeout
         let resp = match self.execute_rpc("check_status", &resource_summary, client.lock(req)).await {
@@ -510,7 +514,7 @@ impl LockClient for RemoteClient {
                 args: serde_json::to_string(&status_request)
                     .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
             });
-            set_tonic_mutation_body_digest(&mut release_req)?;
+            attach_lock_mutation_body_digest(&mut release_req)?;
             let _ = self
                 .execute_rpc("check_status_release", &resource_summary, client.un_lock(release_req))
                 .await;
@@ -624,6 +628,31 @@ mod tests {
         LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner-a")
             .with_acquire_timeout(timeout_duration)
             .with_priority(LockPriority::Normal)
+    }
+
+    #[test]
+    fn lock_mutation_helper_marks_single_and_batch_requests_for_rolling_auth() {
+        let mut single = Request::new(GenerallyLockRequest {
+            args: "single-lock".to_string(),
+        });
+        attach_lock_mutation_body_digest(&mut single).expect("single lock digest must be attached");
+        assert!(
+            single
+                .extensions()
+                .get::<crate::cluster::rpc::http_auth::RollingMutationBodyDigest>()
+                .is_some()
+        );
+
+        let mut batch = Request::new(BatchGenerallyLockRequest {
+            args: vec!["batch-lock".to_string()],
+        });
+        attach_lock_mutation_body_digest(&mut batch).expect("batch lock digest must be attached");
+        assert!(
+            batch
+                .extensions()
+                .get::<crate::cluster::rpc::http_auth::RollingMutationBodyDigest>()
+                .is_some()
+        );
     }
 
     #[tokio::test]

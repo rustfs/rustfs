@@ -1,6 +1,6 @@
 ---
 name: rust-code-quality
-description: Enforce Rust-specific code quality rules on every code change. Use before merge to catch unwrap abuse, silent truncation, unnecessary cloning, lock ordering violations, recursion risks, and error type anti-patterns.
+description: Enforce Rust-specific code quality rules on every Rust change. Use before merge to catch unwrap abuse, silent truncation, unnecessary cloning, lock ordering violations, recursion risks, and error type anti-patterns.
 ---
 
 # Rust Code Quality Gate
@@ -12,27 +12,29 @@ Use this skill on every Rust code change to enforce quality rules that `cargo cl
 1. Identify changed `.rs` files.
 2. Run automated checks on changed files.
 3. Run manual review checklist on the diff.
-4. Report findings; block merge if P0/P1 issues exist.
+4. Resolve or rebut every finding with evidence; P0/P1 findings cannot be deferred.
 
 ## Automated Checks
 
-Run these on every changed `.rs` file (excluding test modules):
+Use these searches to find candidates in changed `.rs` files. Inspect syntax,
+`#[cfg(test)]` scope, and the changed hunk before reporting a finding; text
+filters do not reliably distinguish production code from tests.
 
 ```bash
-# 1. unwrap/expect in production code
-rg -n '\.unwrap\(\)|\.expect\(' <changed-files> | grep -v '#\[cfg(test)\]' | grep -v 'test' | grep -v 'bench'
+# 1. unwrap/expect candidates
+rg -n '\.unwrap\(\)|\.expect\(' <changed-files>
 
 # 2. Silent type truncation via `as` cast
 rg -n ' as (u8|u16|u32|u64|usize|i8|i16|i32|i64|isize)\b' <changed-files>
 
 # 3. String as error type
-rg -n 'Result<.*String>' <changed-files> | grep -v test
+rg -n 'Result<.*String>' <changed-files>
 
 # 4. Box<dyn Error> in public APIs
-rg -n 'Box<dyn.*Error' <changed-files> | grep -v test
+rg -n 'Box<dyn.*Error' <changed-files>
 
 # 5. println/eprintln in production
-rg -n 'println!\|eprintln!' <changed-files> | grep -v test
+rg -n 'println!\|eprintln!' <changed-files>
 
 # 6. Ordering::Relaxed usage (verify each is intentional)
 rg -n 'Ordering::Relaxed' <changed-files>
@@ -46,37 +48,35 @@ rg -n 'unwrap_or_default\(\)|unwrap_or\(' <changed-files>
 For every Rust code change, verify:
 
 ### Error Handling
-- [ ] No `unwrap()` or `expect()` in production code without justification comment
+- [ ] Every production `unwrap()` or `expect()` is infallible by type or a checked invariant; explain only non-obvious invariants, using an existing type, a useful `expect` message, or a concise comment
 - [ ] No `Result<_, String>` in public API signatures
-- [ ] No `Box<dyn Error>` in public trait/struct methods
+- [ ] Public library APIs use domain errors unless deliberate error erasure at a boundary is part of the contract
 - [ ] `Error::source()` is overridden when inner error is stored
-- [ ] Error messages are actionable (what failed, with what input)
+- [ ] Error messages are actionable without exposing secret input
 
 ### Type Safety
 - [ ] No silent `as` truncation (negative→unsigned, large→small)
-- [ ] `try_into()` or explicit clamping used for numeric conversions
-- [ ] No `f64 as usize` without prior clamping
+- [ ] Fallible numeric conversions use `TryFrom`/`try_into()` and return a typed error; clamp or saturate only when the domain explicitly requires it
+- [ ] Floating-point to integer conversion validates finiteness, sign, and range before conversion
 
 ### Concurrency
 - [ ] Lock acquisition order is documented when multiple locks are used, and matches every other call site taking any overlapping subset (ABBA check)
 - [ ] No `tokio::sync` lock guard (read or write) held across `.await` without bounded hold time — long-lived read guards wedge writers (#4195)
-- [ ] Concurrent counters use `compare_exchange` loops, not load-then-store
+- [ ] Atomic read-modify-write uses the direct `fetch_*` operation when possible; use `compare_exchange` only for conditional updates
 - [ ] `std::sync::Mutex` in async context is held only briefly, never across `.await`
 
 ### Memory and Performance
-- [ ] No `.clone()` on structs with >5 heap-allocated fields in hot paths
-- [ ] `HashMap::with_capacity()` / `Vec::with_capacity()` used when size is known
-- [ ] Large buffers wrapped in `Arc` rather than cloned
-- [ ] Temporary string computations use `&str` or `Cow<str>` instead of `String`
+- [ ] On an identified hot path, report cloning or allocation only with a concrete per-request/per-object cost or benchmark signal
+- [ ] Prefer borrowing, moving, `Bytes`/`Arc`, or capacity reservation only when it reduces that cost without obscuring ownership or APIs
 
 ### Recursion Safety
-- [ ] Recursive functions have a depth limit or use iterative traversal
+- [ ] Recursion over untrusted, persisted, or otherwise unbounded input has a depth limit or uses iterative traversal
 - [ ] Tree/cache traversals handle corrupted/cyclic input safely
 
 ### Testing
-- [ ] Every test function has at least one `assert!`
-- [ ] Tests use `.expect("context")` not bare `.unwrap()`
-- [ ] No `println!`/`eprintln!` in production code (use `tracing`)
+- [ ] Tests have an observable failure criterion; delegated assertions, `#[should_panic]`, snapshot/property checks, and meaningful `Result` failures do not need a redundant `assert!`
+- [ ] Use `expect` only when its message improves failure diagnosis; do not add boilerplate to self-evident test setup
+- [ ] Test volume and line count are never treated as production-code growth
 
 ### Serde
 - [ ] Structs from untrusted input have `#[serde(deny_unknown_fields)]`
@@ -88,18 +88,18 @@ For every Rust code change, verify:
 - [ ] New string literals don't duplicate existing constants
 
 ### Reuse and Necessity
-- [ ] No new helper duplicating an existing workspace utility (`crates/utils`, `crates/common`, the touched crate) or plain std/tokio behavior no wrapper refines; reused helpers match the call site's semantics (normalization, error type, backoff, durability gating)
+- [ ] No new helper duplicates `crates/utils`, `crates/common`, the touched crate, the likely domain-owning crate, a relevant direct dependency, or plain std/tokio behavior; reused helpers match the call site's semantics
 - [ ] No branch without a nameable concrete trigger; no re-validation of what a validated upstream layer on the same path already guarantees (Cross-Cutting Domain Invariant patterns and pre-destructive-action re-checks are load-bearing — keep them)
 - [ ] Error context attached once where actionable, not re-wrapped at every hop; no typed→generic error conversion below aggregation/quorum layers
-- [ ] No comments narrating the next line, restating a signature, or describing the change itself (invariant comments — lock ordering, `SAFETY`, unwrap justification — are not narration)
+- [ ] Comments avoid narration and change history while completely stating non-obvious lock, `SAFETY`, durability, compatibility, and unwrap invariants
 - [ ] No near-duplicate test pinning the same code path and poison-value class as an existing test (boundary companions — n==max vs max+1, absent/empty/nil UUID — are never near-duplicates)
 
 ## Severity Classification
 
-- **P0 (Block merge)**: `unwrap()` in request hot path, silent truncation on user input, lock ordering violation, recursion without depth limit
-- **P1 (Must fix)**: `Result<_, String>` in public API, unnecessary clone in hot path, `Box<dyn Error>` in trait method, `unwrap_or_default()` on a domain-required value (metadata, quorum, version id)
-- **P2 (Should fix)**: Missing `assert!` in test, `println!` in production, missing `with_capacity`, new helper duplicating an existing workspace utility, defensive branch with no nameable trigger (corrupt or stale persisted/peer data is always a nameable trigger for boundary-crossing values), near-duplicate test, redundant error re-wrapping
-- **P3 (Nice to fix)**: Naming convention violation, missing doc comment, `as_ptr()` vs `Arc::ptr_eq`, narrating comment
+- **P0 (Block merge)**: demonstrated data loss, security breach, remote crash, or deadlock
+- **P1 (Must fix)**: concrete correctness, compatibility, or material hot-path regression
+- **P2 (Should fix)**: avoidable duplication or maintainability issue with a concrete simpler replacement
+- **P3 (Nice to fix)**: local style or clarity issue with no behavioral risk
 
 ## Output Template
 
@@ -107,10 +107,10 @@ For every Rust code change, verify:
 ## Rust Code Quality Report
 
 ### Automated Scan
-- unwrap/expect in production: N found
-- as casts: N found
-- String errors: N found
-- println/eprintln: N found
+- unwrap/expect candidates inspected: N
+- numeric-cast candidates inspected: N
+- error-type candidates inspected: N
+- output-macro candidates inspected: N
 
 ### Findings
 - [P1] `path:line` — description

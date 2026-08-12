@@ -14,6 +14,7 @@
 
 use super::metadata_sys::get_bucket_metadata_sys;
 use crate::error::{Result, StorageError};
+use crate::store::ECStore;
 use rustfs_policy::policy::{BucketPolicy, BucketPolicyArgs};
 
 pub struct PolicySys {}
@@ -25,6 +26,10 @@ impl PolicySys {
 
     pub async fn try_is_allowed(args: &BucketPolicyArgs<'_>) -> Result<bool> {
         Self::is_allowed_with_policy(args, Self::get(args.bucket).await).await
+    }
+
+    pub async fn try_is_allowed_for_store(store: &ECStore, args: &BucketPolicyArgs<'_>) -> Result<bool> {
+        Self::is_allowed_with_policy(args, store.get_bucket_policy(args.bucket).await.map(|(policy, _)| policy)).await
     }
 
     async fn is_allowed_with_policy(args: &BucketPolicyArgs<'_>, policy: Result<BucketPolicy>) -> Result<bool> {

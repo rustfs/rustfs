@@ -225,7 +225,9 @@ jobs:
           VERSION="${{ needs.resolve.outputs.version }}"
           DEB_ARCH="${{ matrix.deb_arch }}"
           # DEB version: replace - with ~ (1.0.0-beta.12 -> 1.0.0~beta.12)
-          DEB_VERSION="${VERSION/-/~}"
+          # Use a variable for ~ to prevent tilde expansion by bash
+          TILDE='~'
+          DEB_VERSION="${VERSION/-/$TILDE}"
           PKG_DIR="rustfs_${DEB_VERSION}_${DEB_ARCH}"
 
           echo "Building DEB: ${PKG_DIR}.deb"
@@ -320,6 +322,17 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential
           sudo gem install fpm
 
+          # Create config file for fpm (DEB build creates it in its package dir structure,
+          # but fpm needs the file to exist before packaging)
+          mkdir -p ./tmp-pkg/etc/default
+          cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
           fpm -s dir -t rpm \
             --name rustfs \
             --version "$VERSION" \
@@ -360,6 +373,7 @@ jobs:
             ) \
             --config-files /etc/default/rustfs \
             ./bin/rustfs=/usr/bin/rustfs \
+            ./tmp-pkg/etc/default/rustfs=/etc/default/rustfs \
             deploy/build/rustfs.service=/lib/systemd/system/rustfs.service \
             LICENSE=/usr/share/doc/rustfs/LICENSE \
             README.md=/usr/share/doc/rustfs/README.md

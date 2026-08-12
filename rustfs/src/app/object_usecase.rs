@@ -222,6 +222,7 @@ use crate::app::object_data_cache::{
 };
 #[cfg(test)]
 use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_cold_fill_disk_permit_owner_for_test};
+use crate::app::object_traffic_health::ObjectTrafficHealth;
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -707,6 +708,8 @@ const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
 const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
+const MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = 512 * 1024;
+const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
@@ -716,6 +719,9 @@ const GET_READER_STREAM_POLL_PENDING: &str = "pending";
 const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
+const GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM: &str = "reader_stream";
+const GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR: &str = "reader_error";
+const GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF: &str = "short_eof";
 const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE: &str = "object_data_cache";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED: &str = "object_data_cache_materialized";
@@ -762,7 +768,73 @@ fn tune_reader_stream_buffer_size(
         return selected_size.max(LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
     }
 
+    if stream_strategy == GetObjectStreamStrategy::Standard
+        && response_content_length >= MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES
+    {
+        return selected_size.max(MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
+    }
+
     selected_size
+}
+
+fn get_object_stream_size_bucket(expected: usize) -> &'static str {
+    rustfs_io_metrics::get_object_size_bucket(i64::try_from(expected).unwrap_or(i64::MAX))
+}
+
+fn classify_get_object_stream_read_error(err: &std::io::Error) -> &'static str {
+    if let Some(inner) = err.get_ref() {
+        if inner.is::<rustfs_rio::IncompleteBody>() {
+            return "short_eof";
+        }
+
+        if inner.is::<rustfs_rio::ChecksumMismatch>() {
+            return "bitrot";
+        }
+
+        let error_msg = inner.to_string().to_lowercase();
+        if error_msg.contains("bitrot") {
+            return "bitrot";
+        }
+        if error_msg.contains("read quorum") || error_msg.contains("insufficient read quorum") || error_msg.contains("erasure") {
+            return "read_quorum";
+        }
+    }
+
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof => "short_eof",
+        std::io::ErrorKind::TimedOut => "timeout",
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
+        _ => "io",
+    }
+}
+
+fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
+    if error_class == "short_eof" {
+        GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF
+    } else {
+        GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+    }
+}
+
+fn record_get_object_reader_stream_failure(
+    reason: &'static str,
+    error_class: &'static str,
+    strategy: &'static str,
+    buffer_source: &'static str,
+    expected: usize,
+    emitted: usize,
+    remaining: usize,
+) {
+    rustfs_io_metrics::record_get_object_streaming_body_failure(rustfs_io_metrics::GetObjectStreamingBodyFailure {
+        stage: GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM,
+        reason,
+        error_class,
+        strategy,
+        buffer_source,
+        size_bucket: get_object_stream_size_bucket(expected),
+        emitted_bytes: emitted,
+        remaining_bytes: remaining,
+    });
 }
 
 pin_project! {
@@ -1349,9 +1421,9 @@ where
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
                 let bytes = buf.freeze();
                 *this.remaining -= bytes.len();
+                *this.emitted += bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
-                    *this.emitted += bytes.len();
                     tracing::debug!(
                         emitted = *this.emitted,
                         expected = *this.expected,
@@ -1369,6 +1441,15 @@ where
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
+                record_get_object_reader_stream_failure(
+                    GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF,
+                    "short_eof",
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1380,6 +1461,16 @@ where
             }
             Poll::Ready(Err(err)) => {
                 this.reader.set(None);
+                let error_class = classify_get_object_stream_read_error(&err);
+                record_get_object_reader_stream_failure(
+                    get_object_stream_failure_reason(error_class),
+                    error_class,
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1436,8 +1527,6 @@ where
 
 struct GetObjectStreamingReader<R> {
     inner: Option<R>,
-    bucket: String,
-    key: String,
     // request_id + optional content_range are only used for diagnostic correlation and
     // failure bucketing; they do not alter stream behavior.
     request_id: String,
@@ -1458,8 +1547,8 @@ impl<R> GetObjectStreamingReader<R> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         inner: R,
-        bucket: &str,
-        key: &str,
+        _bucket: &str,
+        _key: &str,
         request_id: &str,
         content_range: Option<String>,
         expected: usize,
@@ -1469,8 +1558,6 @@ impl<R> GetObjectStreamingReader<R> {
     ) -> Self {
         Self {
             inner: Some(inner),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
             request_id: request_id.to_string(),
             content_range,
             expected,
@@ -1494,33 +1581,7 @@ impl<R> GetObjectStreamingReader<R> {
     // distinguish truncated upstream bodies, corruption, quorum issues, and
     // genuine downstream-close disconnects.
     fn classify_read_error(err: &std::io::Error) -> &'static str {
-        if let Some(inner) = err.get_ref() {
-            if inner.is::<rustfs_rio::IncompleteBody>() {
-                return "short_eof";
-            }
-
-            if inner.is::<rustfs_rio::ChecksumMismatch>() {
-                return "bitrot";
-            }
-
-            let error_msg = inner.to_string().to_lowercase();
-            if error_msg.contains("bitrot") {
-                return "bitrot";
-            }
-            if error_msg.contains("read quorum")
-                || error_msg.contains("insufficient read quorum")
-                || error_msg.contains("erasure")
-            {
-                return "read_quorum";
-            }
-        }
-
-        match err.kind() {
-            std::io::ErrorKind::UnexpectedEof => "short_eof",
-            std::io::ErrorKind::TimedOut => "timeout",
-            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
-            _ => "io",
-        }
+        classify_get_object_stream_read_error(err)
     }
 
     fn finish_ok(&mut self) {
@@ -1637,10 +1698,9 @@ impl<R> GetObjectStreamingReader<R> {
                 event = EVENT_GET_OBJECT_STREAM_BODY,
                 component = LOG_COMPONENT_APP,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
-                bucket = %self.bucket,
-                object = %self.key,
                 request_id = %self.request_id,
                 range = %self.content_range.as_deref().unwrap_or("full"),
+                size_bucket = get_object_stream_size_bucket(self.expected),
                 expected = self.expected,
                 emitted = self.emitted,
                 elapsed_ms = self.elapsed().as_millis(),
@@ -1674,10 +1734,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             resume_attempts = attempts,
@@ -1697,10 +1756,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1739,10 +1797,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                                         event = EVENT_GET_OBJECT_STREAM_BODY,
                                         component = LOG_COMPONENT_APP,
                                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                                        bucket = %self.bucket,
-                                        object = %self.key,
                                         request_id = %self.request_id,
                                         range = %self.content_range.as_deref().unwrap_or("full"),
+                                        size_bucket = get_object_stream_size_bucket(self.expected),
                                         expected = self.expected,
                                         emitted = self.emitted,
                                         elapsed_ms = elapsed.as_millis(),
@@ -1784,10 +1841,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1819,10 +1875,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         event = EVENT_GET_OBJECT_STREAM_BODY,
                         component = LOG_COMPONENT_APP,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                        bucket = %self.bucket,
-                        object = %self.key,
                         request_id = %self.request_id,
                         range = %self.content_range.as_deref().unwrap_or("full"),
+                        size_bucket = get_object_stream_size_bucket(self.expected),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1855,10 +1910,9 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
-            bucket = %self.bucket,
-            object = %self.key,
             request_id = %self.request_id,
             range = %self.content_range.as_deref().unwrap_or("full"),
+            size_bucket = get_object_stream_size_bucket(self.expected),
             expected = self.expected,
             emitted = self.emitted,
             elapsed_ms = self.elapsed().as_millis(),
@@ -2951,6 +3005,8 @@ fn normalize_delete_objects_version_id(
 
 #[cfg(test)]
 type DeleteSnapshotTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
+#[cfg(test)]
+type PutPostStoreTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
 
 #[cfg(test)]
 static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
@@ -2958,6 +3014,8 @@ static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>
 static DELETE_SOURCE_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 #[cfg(test)]
 static DELETE_OBJECTS_AUTH_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+#[cfg(test)]
+static PUT_POST_STORE_TEST_HOOK: OnceLock<Mutex<Option<PutPostStoreTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn install_delete_snapshot_test_hook(
@@ -3048,6 +3106,33 @@ async fn wait_for_delete_objects_auth_test_hook(bucket: &str) {
     };
     if let Some((_bucket, loaded, resume)) = hook {
         loaded.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+fn install_put_post_store_test_hook(bucket: String, entered: Arc<tokio::sync::Barrier>, resume: Arc<tokio::sync::Barrier>) {
+    *PUT_POST_STORE_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("PUT post-store test hook lock should not be poisoned") = Some((bucket, entered, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_put_post_store_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = PUT_POST_STORE_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("PUT post-store test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, entered, resume)) = hook {
+        entered.wait().await;
         resume.wait().await;
     }
 }
@@ -3895,6 +3980,14 @@ pub struct DefaultObjectUsecase {
     get_object_timeout_policy: Option<GetObjectTimeoutPolicy>,
 }
 
+async fn track_object_read_setup<F>(health: Option<&ObjectTrafficHealth>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let _progress = health.and_then(ObjectTrafficHealth::track_read_storage);
+    future.await
+}
+
 impl DefaultObjectUsecase {
     fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
         size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
@@ -3949,6 +4042,13 @@ impl DefaultObjectUsecase {
 
     fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
         current_object_data_cache_for_context(self.context.as_deref())
+    }
+
+    fn object_traffic_health(&self) -> Option<Arc<ObjectTrafficHealth>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_traffic_health())
+            .or_else(|| current_app_context().map(|context| context.object_traffic_health()))
     }
 
     fn base_buffer_size(&self) -> usize {
@@ -4351,6 +4451,7 @@ impl DefaultObjectUsecase {
         rs: Option<HTTPRangeSpec>,
         opts: &ObjectOptions,
         part_number: Option<usize>,
+        object_traffic_health: Option<Arc<ObjectTrafficHealth>>,
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
@@ -4366,10 +4467,12 @@ impl DefaultObjectUsecase {
                 key,
             )
             .await?;
-            let reader = store
-                .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
-                .await
-                .map_err(map_get_object_reader_error)?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             let read_setup =
                 Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
             return Ok(GetObjectPreparedRead { io_planning, read_setup });
@@ -4390,10 +4493,12 @@ impl DefaultObjectUsecase {
             .await?,
         );
         let mut prepared = Some(
-            store
-                .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
-                .await
-                .map_err(map_get_object_reader_error)?,
+            track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?,
         );
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
@@ -4494,6 +4599,7 @@ impl DefaultObjectUsecase {
                 let headers = &req.headers;
                 let store = &store;
                 let range = &rs;
+                let object_traffic_health = &object_traffic_health;
                 move |producer| {
                     let adapter = Arc::clone(adapter);
                     let engine_plan = engine_plan.clone();
@@ -4503,6 +4609,7 @@ impl DefaultObjectUsecase {
                     let bucket = bucket.to_owned();
                     let key = key.to_owned();
                     let opts = opts.clone();
+                    let object_traffic_health = object_traffic_health.as_ref().map(Arc::clone);
                     async move {
                         let producer_deadline = producer.deadline();
                         let cancellation = producer.cancellation_token();
@@ -4548,7 +4655,10 @@ impl DefaultObjectUsecase {
                             }
                         };
 
-                        let prepare = store.prepare_get_object_reader(&bucket, &key, range.clone(), HeaderMap::new(), &opts);
+                        let prepare = track_object_read_setup(
+                            object_traffic_health.as_deref(),
+                            store.prepare_get_object_reader(&bucket, &key, range.clone(), HeaderMap::new(), &opts),
+                        );
                         let prepared = match match await_cold_fill_startup(prepare, &cancellation, producer_deadline).await {
                             Ok(result) => result,
                             Err(ColdFillStartupWaitError::Cancelled) => {
@@ -4602,7 +4712,8 @@ impl DefaultObjectUsecase {
                             || {
                                 #[cfg(test)]
                                 record_cold_fill_reader_open_for_test(&reader_open_plan);
-                                prepared.with_headers(h).into_reader()
+                                let open_reader = prepared.with_headers(h).into_reader();
+                                async move { track_object_read_setup(object_traffic_health.as_deref(), open_reader).await }
                             },
                             ColdFillProducerExecution {
                                 expected,
@@ -4647,11 +4758,12 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader = prepared
-                .with_headers(req.headers.clone())
-                .into_reader()
-                .await
-                .map_err(map_get_object_reader_error)?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                prepared.with_headers(req.headers.clone()).into_reader(),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4665,19 +4777,25 @@ impl DefaultObjectUsecase {
             )
             .await?;
             let reader = if legacy_hook_missed {
-                store
-                    .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
-                    .await
-                    .map_err(map_get_object_reader_error)?
-                    .with_headers(req.headers.clone())
-                    .into_reader()
-                    .await
-                    .map_err(map_get_object_reader_error)?
+                let prepared = track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?;
+                track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    prepared.with_headers(req.headers.clone()).into_reader(),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?
             } else {
-                store
-                    .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
-                    .await
-                    .map_err(map_get_object_reader_error)?
+                track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?
             };
             (io_planning, reader)
         };
@@ -5485,8 +5603,8 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let use_small_eager_put_path =
-            should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_empty_or_small_eager_put_path = size == 0
+            || should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let zero_copy_eager_put_path_status =
             zero_copy_eager_put_path_status(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
@@ -5498,7 +5616,7 @@ impl DefaultObjectUsecase {
             "stream_compressed"
         } else if use_zero_copy_eager_put_path {
             "zero_copy_eager"
-        } else if use_small_eager_put_path {
+        } else if use_empty_or_small_eager_put_path {
             "small_eager"
         } else {
             "streaming"
@@ -5712,7 +5830,7 @@ impl DefaultObjectUsecase {
                 let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
                 rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
-            } else if use_small_eager_put_path {
+            } else if use_empty_or_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -5866,6 +5984,14 @@ impl DefaultObjectUsecase {
             }
         });
 
+        let object_traffic_health = if use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path {
+            self.object_traffic_health()
+        } else {
+            None
+        };
+        let object_traffic_progress = object_traffic_health
+            .as_deref()
+            .and_then(ObjectTrafficHealth::track_write_storage);
         let (obj_info, backfilled_old_current_size) = match store
             .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
             .await
@@ -5912,6 +6038,9 @@ impl DefaultObjectUsecase {
                 return result;
             }
         };
+        drop(object_traffic_progress);
+        #[cfg(test)]
+        wait_for_put_post_store_test_hook(&bucket).await;
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
         let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
@@ -6352,6 +6481,10 @@ impl DefaultObjectUsecase {
         // naming nonexistent buckets fail before the versioning lookup in
         // get_opts. The store comes from the request-bound server context
         // (backlog#1052 S6), not the process-global handle.
+        let object_traffic_health = self.object_traffic_health();
+        let object_metadata_progress = object_traffic_health
+            .as_deref()
+            .and_then(ObjectTrafficHealth::track_read_metadata);
         let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let Some(store) = self.object_store() else {
             lifecycle.finish_err();
@@ -6392,6 +6525,7 @@ impl DefaultObjectUsecase {
             rs,
             opts,
         } = request_context;
+        drop(object_metadata_progress);
 
         let manager = get_concurrency_manager();
 
@@ -6407,6 +6541,7 @@ impl DefaultObjectUsecase {
                 rs,
                 &opts,
                 part_number,
+                object_traffic_health,
             )
             .await
         {
@@ -11142,6 +11277,278 @@ mod tests {
         (store, context)
     }
 
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn object_progress_tracks_real_get_and_small_put_lock_waits() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let context = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("false"))], async {
+            crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await
+        })
+        .await;
+        let store = context.object_store();
+        let bucket = format!("object-progress-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("object progress bucket must be created");
+        put_real_cold_fill_object(&store, &bucket, object, b"initial").await;
+
+        let metadata_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let metadata_resume = Arc::new(tokio::sync::Barrier::new(2));
+        crate::storage::options::install_versioning_config_test_hook(
+            bucket.clone(),
+            Arc::clone(&metadata_entered),
+            Arc::clone(&metadata_resume),
+        );
+        let metadata_input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("metadata GET input must build");
+        let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let metadata_get = tokio::spawn(async move {
+            metadata_usecase
+                .execute_get_object(build_request(metadata_input, Method::GET))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
+            .await
+            .expect("GET must enter the bucket metadata stage");
+        assert!(object_traffic_health.snapshot().read_stalled);
+        assert!(!metadata_get.is_finished(), "GET must still be waiting in bucket metadata");
+        metadata_resume.wait().await;
+        let metadata_response = tokio::time::timeout(Duration::from_secs(10), metadata_get)
+            .await
+            .expect("metadata GET must finish after release")
+            .expect("metadata GET task must join")
+            .expect("metadata GET must succeed after release");
+        assert!(!object_traffic_health.snapshot().read_stalled);
+        drop(metadata_response);
+
+        let read_lock = store
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("read test namespace lock must be created")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("read test namespace lock must be held");
+        let get_input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("GET input must build");
+        let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let get = tokio::spawn(async move { get_usecase.execute_get_object(build_request(get_input, Method::GET)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !object_traffic_health.read_storage_stalled_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked GET must publish a storage stall");
+        assert!(!get.is_finished(), "GET must still be waiting for the held namespace lock");
+        drop(read_lock);
+        let get_response = tokio::time::timeout(Duration::from_secs(10), get)
+            .await
+            .expect("GET must finish after releasing the lock")
+            .expect("GET task must join")
+            .expect("GET must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().read_stalled);
+        drop(get_response);
+
+        let write_lock = store
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("write test namespace lock must be created")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("write test namespace lock must be held");
+        let post_store_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let post_store_resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
+        let payload = Bytes::from_static(b"replacement");
+        let put_input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let put_usecase = DefaultObjectUsecase::with_context(Some(context));
+        let put = tokio::spawn(async move {
+            put_usecase
+                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked small PUT must publish a storage stall");
+        assert!(!put.is_finished(), "PUT must still be waiting for the held namespace lock");
+        drop(write_lock);
+        tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
+            .await
+            .expect("PUT must reach the first post-store hook");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        assert!(!put.is_finished(), "PUT must remain blocked after the store guard has ended");
+        post_store_resume.wait().await;
+        tokio::time::timeout(Duration::from_secs(10), put)
+            .await
+            .expect("PUT must finish after releasing the lock")
+            .expect("PUT task must join")
+            .expect("PUT must succeed after releasing the lock");
+        let recovered = object_traffic_health.snapshot();
+        assert!(!recovered.read_stalled);
+        assert!(!recovered.write_stalled);
+    }
+
+    #[tokio::test]
+    async fn object_progress_tracks_zero_byte_and_zero_copy_put_lock_waits() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let context =
+            crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+        let store = context.object_store();
+        let bucket = format!("progress-buffered-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("buffered PUT progress bucket must be created");
+
+        let extra_body_object = "zero-byte-extra.bin";
+        let extra_body_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(extra_body_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"x")))))
+            .content_length(Some(88))
+            .build()
+            .expect("zero-byte extra-body PUT input must build");
+        let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut extra_body_request = build_request(extra_body_input, Method::PUT);
+        extra_body_request.headers = streaming_headers(Some("0"));
+        let extra_body_err = extra_body_usecase
+            .execute_put_object(&FS::new(), extra_body_request)
+            .await
+            .expect_err("decoded zero-byte PUT with body data must fail");
+        assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        let lookup_err = store
+            .get_object_info(&bucket, extra_body_object, &ObjectOptions::default())
+            .await
+            .expect_err("rejected zero-byte PUT must not create an object");
+        assert!(is_err_object_not_found(&lookup_err));
+
+        let zero_object = "zero-byte.bin";
+        let zero_write_lock = store
+            .new_ns_lock(&bucket, zero_object)
+            .await
+            .expect("zero-byte PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-byte PUT namespace lock must be held");
+        let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+        let (body_release_tx, body_release_rx) = tokio::sync::oneshot::channel();
+        let pending_zero_body = StreamingBlob::wrap(futures::stream::once(async move {
+            body_polled_tx.send(()).expect("zero-byte body poll signal must be received");
+            body_release_rx.await.expect("zero-byte body EOF must be released");
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let zero_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(zero_object.to_string())
+            .body(Some(pending_zero_body))
+            .content_length(Some(87))
+            .build()
+            .expect("zero-byte PUT input must build");
+        let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut zero_request = build_request(zero_input, Method::PUT);
+        zero_request.headers = streaming_headers(Some("0"));
+        let zero_put = tokio::spawn(async move { zero_usecase.execute_put_object(&FS::new(), zero_request).await });
+
+        tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
+            .await
+            .expect("zero-byte PUT body must be polled for EOF")
+            .expect("zero-byte PUT body poll signal must be sent");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for request EOF");
+
+        body_release_tx.send(()).expect("zero-byte PUT body EOF must be released");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fully received zero-byte PUT must publish a storage stall");
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for the held namespace lock");
+
+        drop(zero_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_put)
+            .await
+            .expect("zero-byte PUT must finish after releasing the lock")
+            .expect("zero-byte PUT task must join")
+            .expect("zero-byte PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+
+        let zero_copy_object = "zero-copy-eager.jpg";
+        let zero_copy_payload = Bytes::from(vec![b'z'; 1024 * 1024 + 1]);
+        let zero_copy_size = i64::try_from(zero_copy_payload.len()).expect("zero-copy payload length must fit i64");
+        let zero_copy_headers = HeaderMap::new();
+        assert!(!is_disk_compressible(&zero_copy_headers, zero_copy_object));
+        assert_eq!(
+            zero_copy_eager_put_path_status(zero_copy_size, &zero_copy_headers, false, false, false),
+            PUT_EAGER_STATUS_ELIGIBLE,
+            "test payload must exercise the production zero-copy eager path",
+        );
+        let zero_copy_write_lock = store
+            .new_ns_lock(&bucket, zero_copy_object)
+            .await
+            .expect("zero-copy PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-copy PUT namespace lock must be held");
+        let zero_copy_input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key(zero_copy_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(zero_copy_payload))))
+            .content_length(Some(zero_copy_size))
+            .build()
+            .expect("zero-copy PUT input must build");
+        let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
+        let zero_copy_put = tokio::spawn(async move {
+            zero_copy_usecase
+                .execute_put_object(&FS::new(), build_request(zero_copy_input, Method::PUT))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked zero-copy eager PUT must publish a storage stall");
+        assert!(
+            !zero_copy_put.is_finished(),
+            "zero-copy PUT must still be waiting for the held namespace lock"
+        );
+
+        drop(zero_copy_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_copy_put)
+            .await
+            .expect("zero-copy PUT must finish after releasing the lock")
+            .expect("zero-copy PUT task must join")
+            .expect("zero-copy PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+    }
+
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
         let mut reader = PutObjReader::from_vec(body.to_vec());
         store
@@ -14584,7 +14991,11 @@ mod tests {
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, MI_B as i64, GetObjectStreamStrategy::Standard),
-            128 * 1024
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(256 * 1024, 2 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::LargeSequentialReadahead),
@@ -14937,6 +15348,19 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
             Some(std::io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn get_object_stream_failure_labels_are_low_cardinality() {
+        assert_eq!(get_object_stream_failure_reason("short_eof"), GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF);
+        assert_eq!(
+            get_object_stream_failure_reason("timeout"),
+            GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+        );
+        assert_eq!(
+            get_object_stream_size_bucket(4 * 1024 * 1024),
+            rustfs_io_metrics::GET_OBJECT_SIZE_BUCKET_GT_1_MIB
         );
     }
 

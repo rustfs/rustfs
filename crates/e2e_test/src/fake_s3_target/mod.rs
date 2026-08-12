@@ -30,10 +30,10 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteObjectInput, DeleteObjectOutput, ETag,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, ETag,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat,
-    UploadPartInput, UploadPartOutput,
+    HeadObjectInput, HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ObjectVersionId, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::validation::{AwsNameValidation, NameValidation};
@@ -91,6 +91,7 @@ pub enum Operation {
     GetObject,
     HeadObject,
     DeleteObject,
+    ListObjectVersions,
     CreateMultipartUpload,
     UploadPart,
     CompleteMultipartUpload,
@@ -109,6 +110,8 @@ pub enum FaultAction {
     /// already have buffered the rest of the current frame; the journal reports
     /// the threshold, and the backend never receives or stores the request.
     DisconnectAfterBytes(usize),
+    /// Apply the request, then close the connection before returning its response.
+    DisconnectAfterResponse,
     /// Drain a request body in fixed-size slices, sleeping after every slice.
     SlowDrain { chunk_bytes: usize, delay: Duration },
     /// Store the request normally but replace the response ETag.
@@ -141,6 +144,8 @@ struct ControlState {
 
 #[derive(Default)]
 struct StoreState {
+    assign_own_version_ids: bool,
+    assign_own_multipart_version_ids: bool,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
     total_bytes: usize,
@@ -383,6 +388,22 @@ impl FakeS3Target {
             .is_some_and(|version| !version.delete_marker)
     }
 
+    /// Make the target mint its own version ids instead of mirroring the
+    /// forwarded source version id — models a generic S3 service.
+    pub fn assign_own_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_version_ids = enabled;
+    }
+
+    /// Mint own version ids for the multipart path only — models a target
+    /// that adopts PutObject version ids but not CreateMultipartUpload ones.
+    pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_multipart_version_ids = enabled;
+    }
+
+    pub fn active_multipart_upload_count(&self) -> usize {
+        lock(&self.backend.store).uploads.len()
+    }
+
     /// Queue `times` copies of a fault for one operation.
     pub fn inject(&self, operation: Operation, action: FaultAction, times: usize) {
         if times == 0 {
@@ -431,6 +452,25 @@ impl FakeS3Target {
 
     pub fn take_requests(&self) -> Vec<RequestRecord> {
         lock(&self.control).requests.drain(..).collect()
+    }
+
+    /// Stored versions for one key as `(version_id, is_delete_marker)`, oldest
+    /// first. Empty when the bucket or key does not exist. Lets purge tests
+    /// assert on the target's actual state instead of inferring it from the
+    /// request journal (a versioned DELETE is a silent no-op for missing ids).
+    pub fn stored_versions(&self, bucket: &str, key: &str) -> Vec<(String, bool)> {
+        let state = lock(&self.backend.store);
+        state
+            .buckets
+            .get(bucket)
+            .and_then(|bucket_state| bucket_state.objects.get(key))
+            .map(|versions| {
+                versions
+                    .iter()
+                    .map(|version| (version.version_id.clone(), version.delete_marker))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn shutdown(mut self) {
@@ -633,6 +673,7 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
     let operation = match (method, key.is_some()) {
         (&Method::HEAD, false) => Operation::HeadBucket,
         (&Method::GET, false) if query.contains_key("versioning") => Operation::GetBucketVersioning,
+        (&Method::GET, false) if query.contains_key("versions") => Operation::ListObjectVersions,
         (&Method::PUT, true) if upload_id.is_some() && part_number.is_some() => Operation::UploadPart,
         (&Method::PUT, true) if upload_id.is_some() || query.contains_key("partNumber") => Operation::Unknown,
         (&Method::POST, true) if query.contains_key("uploads") => Operation::CreateMultipartUpload,
@@ -689,10 +730,17 @@ fn validate_retained_identifier(value: String, field: &str) -> S3Result<String> 
     }
 }
 
-fn new_version_id(headers: &HeaderMap) -> S3Result<String> {
+/// `assign_own` models a target that mints its own version ids (a generic S3
+/// service): the forwarded source-version-id header is validated but NOT
+/// mirrored into the stored version.
+fn new_version_id(headers: &HeaderMap, assign_own: bool) -> S3Result<String> {
     let Some(value) = header_value(headers, &SOURCE_VERSION_ID_HEADERS) else {
         return Ok(Uuid::new_v4().to_string());
     };
+    if assign_own {
+        validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
+        return Ok(Uuid::new_v4().to_string());
+    }
     let value = validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
     let version_id = Uuid::parse_str(&value).map_err(|_| s3s::s3_error!(InvalidArgument, "source version ID must be a UUID"))?;
     Ok(version_id.to_string())
@@ -777,7 +825,10 @@ async fn apply_non_body_fault(fault: Option<&RequestFault>, control: &Mutex<Cont
             update_consumed(control, fault.expect("matched fault").sequence, 0);
             Err(scripted_disconnect_error())
         }
-        Some(FaultAction::SlowDrain { .. }) | Some(FaultAction::WrongEtag) | None => Ok(()),
+        Some(FaultAction::SlowDrain { .. })
+        | Some(FaultAction::WrongEtag)
+        | Some(FaultAction::DisconnectAfterResponse)
+        | None => Ok(()),
     }
 }
 
@@ -818,7 +869,7 @@ async fn collect_stream(
             Some(FaultAction::SlowDrain { chunk_bytes, delay }) => {
                 return collect_stream_slow(body, capacity, *chunk_bytes, *delay).await;
             }
-            Some(FaultAction::WrongEtag) | None => {}
+            Some(FaultAction::WrongEtag) | Some(FaultAction::DisconnectAfterResponse) | None => {}
         }
 
         let mut output = BytesMut::with_capacity(capacity);
@@ -879,6 +930,9 @@ fn maybe_wrong_etag(fault: Option<&RequestFault>, e_tag: String) -> String {
 fn apply_response_fault<T>(mut response: S3Response<T>, fault: Option<&RequestFault>) -> S3Response<T> {
     if fault.is_some_and(|fault| fault.action == FaultAction::WrongEtag) {
         response.headers.insert(ETAG, HeaderValue::from_static(WRONG_ETAG));
+    }
+    if fault.is_some_and(|fault| fault.action == FaultAction::DisconnectAfterResponse) {
+        response.headers.insert(DISCONNECT_HEADER, HeaderValue::from_static("true"));
     }
     response
 }
@@ -1068,6 +1122,63 @@ impl S3 for FakeBackend {
         ))
     }
 
+    /// Prefix + max-keys subset only — enough for the replication-check probe
+    /// key allocation. No pagination markers or delimiter folding.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let state = lock(&self.store);
+        let Some(bucket_state) = state.buckets.get(&req.input.bucket) else {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
+        };
+        let prefix = req.input.prefix.as_deref().unwrap_or_default();
+        let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
+
+        let mut keys: Vec<&String> = bucket_state.objects.keys().filter(|key| key.starts_with(prefix)).collect();
+        keys.sort();
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        'keys: for key in keys {
+            for version in bucket_state.objects[key].iter().rev() {
+                if versions.len() + delete_markers.len() >= max_keys {
+                    break 'keys;
+                }
+                if version.delete_marker {
+                    delete_markers.push(DeleteMarkerEntry {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        ..Default::default()
+                    });
+                } else {
+                    versions.push(s3s::dto::ObjectVersion {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        e_tag: Some(ETag::Strong(version.e_tag.clone())),
+                        size: Some(version.body.len() as i64),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        drop(state);
+
+        Ok(apply_response_fault(
+            S3Response::new(ListObjectVersionsOutput {
+                name: Some(req.input.bucket),
+                versions: Some(versions),
+                delete_markers: Some(delete_markers),
+                ..Default::default()
+            }),
+            fault.as_ref(),
+        ))
+    }
+
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let fault = request_fault(&req);
         let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
@@ -1078,7 +1189,8 @@ impl S3 for FakeBackend {
         let input = req.input;
         let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control).await?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
-        let version_id = new_version_id(&headers)?;
+        let assign_own = lock(&self.store).assign_own_version_ids;
+        let version_id = new_version_id(&headers, assign_own)?;
         let e_tag = match source_etag(&headers)? {
             Some(value) => value,
             None => {
@@ -1121,7 +1233,7 @@ impl S3 for FakeBackend {
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
                 ..Default::default()
             }),
@@ -1143,7 +1255,7 @@ impl S3 for FakeBackend {
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
                 ..Default::default()
             }),
@@ -1212,7 +1324,9 @@ impl S3 for FakeBackend {
             ));
         }
 
-        let version_id = new_version_id(&headers)?;
+        // `state` is the live store guard: read the flag from it. Re-locking
+        // would self-deadlock (the store mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         upsert_version(
             &mut state,
             &input.bucket,
@@ -1252,12 +1366,16 @@ impl S3 for FakeBackend {
         ensure_upload_budget(&state)?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
         let upload_id = Uuid::new_v4().to_string();
+        // Read the flag before the mutable borrow of `state.uploads` below
+        // (and never re-lock the store: the mutex is not reentrant).
+        let mint_own = state.assign_own_version_ids || state.assign_own_multipart_version_ids;
+        let version_id = new_version_id(&headers, mint_own)?;
         state.uploads.insert(
             upload_id.clone(),
             MultipartState {
                 bucket: input.bucket.clone(),
                 key: input.key.clone(),
-                version_id: new_version_id(&headers)?,
+                version_id,
                 content_type: input.content_type,
                 metadata: input.metadata,
                 parts: BTreeMap::new(),

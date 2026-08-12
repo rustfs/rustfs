@@ -42,6 +42,7 @@ target results remain present when another target fails.
         "Versioning": { "Status": "OK" },
         "ObjectLock": { "Status": "OK" },
         "Put": { "Status": "OK" },
+        "VersionFidelity": { "Status": "OK" },
         "DeleteMarker": { "Status": "OK" },
         "VersionDelete": { "Status": "OK" },
         "Cleanup": {
@@ -58,3 +59,19 @@ Phase states are `OK`, `FAILED`, or `SKIPPED`. Errors are single-line, bounded
 to 512 bytes, and omit remote messages, endpoints, credentials, signatures, and
 authorization material. A cleanup failure is always explicit; it is never
 reported as a successful check.
+
+`VersionFidelity` pins the version-identity contract on **both** write paths:
+the probe PUT carries a source version id (header plus `?versionId=` query,
+the exact shape live replication uses) and the target must answer with the
+same id, and a second probe repeats it through CreateMultipartUpload ->
+UploadPart -> CompleteMultipartUpload, where the target fixes the version at
+initiate and only reports it on completion. A target can adopt PutObject ids
+and still mint its own for multipart, which would leave multipart deletes and
+heals addressing a version that never existed; the failure message names the
+path that drifted. Targets that
+mint their own version ids break every version-addressed operation that
+follows (version deletes, heal re-drives), so the phase fails with the
+machine-readable extension key `"Code": "BucketRemoteTargetVersionMismatch"`,
+the later mutation phases are skipped, and cleanup still removes the probe via
+the version id the target actually assigned. `Code` only appears on failures
+that callers are expected to branch on; Go decoders ignore the unknown key.

@@ -584,10 +584,14 @@ fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
 ///
 /// **Deprecated**: Use `adaptive_duplex_buffer_size()` for object-size-aware sizing.
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
-        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
-    )
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+            rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+        )
+        .max(1)
+    })
 }
 
 /// Get adaptive duplex buffer size based on object size.
@@ -597,12 +601,15 @@ pub fn get_duplex_buffer_size() -> usize {
 fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
     const KB: usize = 1024;
     const MB: usize = 1024 * 1024;
-    match object_size {
-        0..=1_048_576 => 64 * KB,           // <= 1MB: 64KB
+    let target = match object_size {
+        0..=131_072 => 64 * KB,             // <= 128KB: 64KB
+        131_073..=1_048_576 => 512 * KB,    // <= 1MB: reduce duplex backpressure without a 1MB pipe per request
         1_048_577..=16_777_216 => MB,       // <= 16MB: 1MB
         16_777_217..=268_435_456 => 4 * MB, // <= 256MB: 4MB
         _ => 8 * MB,                        // > 256MB: 8MB
-    }
+    };
+    let object_cap = usize::try_from(object_size).ok().filter(|size| *size > 0).unwrap_or(target);
+    target.min(object_cap.max(64 * KB)).min(get_duplex_buffer_size())
 }
 
 // ============================================================================
@@ -664,7 +671,13 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: &str = "RUSTFS_
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: usize = 512 * 1024;
 
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY";
-const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = false;
+// On by default (rustfs/backlog#1802): a small object whose data shards are
+// inlined in xl.meta is reassembled straight from the already-resolved
+// metadata, skipping the Erasure reconstruct pipeline. The path has a complete
+// fallback — if the inline reassembly returns None, the GET proceeds through
+// the normal shard-read pipeline, so a miss is correctness-neutral. Set to
+// `false` to force the legacy path (kill switch).
+const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = true;
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD";
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 1024;
 
@@ -672,10 +685,10 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
-// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
-// reads without version_id / healing / free-version needs) and still requires
-// a full read-quorum agreement before stopping. Set the env var to `false` to
-// fall back to full-wait metadata fanout.
+// requests `should_allow_metadata_early_stop` classifies as safe (latest-version
+// metadata-only reads by default, without version_id / healing / free-version
+// needs) and still requires a full read-quorum agreement before stopping. Set
+// the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
@@ -683,6 +696,12 @@ const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
+
+const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = false;
+
+const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
 
 // --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
 
@@ -830,11 +849,8 @@ mod prepared_get_object_metadata_tests {
                     .prepare_get_object_metadata(bucket, object, &opts)
                     .await
                     .expect("prepared metadata should resolve");
-                assert_eq!(
-                    calls.total(disk_call_counters::KIND_READ_VERSION),
-                    4,
-                    "preparation should fan out to each online disk exactly once"
-                );
+                let prepared_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
+                assert_eq!(prepared_calls, 4, "default prepared GET metadata should keep full data-read fanout");
 
                 let mut reader = set_disks
                     .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
@@ -1189,6 +1205,46 @@ fn is_version_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+fn is_get_metadata_data_read_early_stop_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+                DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+fn is_get_metadata_early_stop_bounded_fanout_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
+                DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT,
             )
         })
     }
@@ -1564,8 +1620,6 @@ enum GetDirectMemoryFallbackReason {
     Range,
     PartNumber,
     VersionId,
-    Versioned,
-    VersionSuspended,
     InclFreeVersions,
     SkipFreeVersion,
     DataMovement,
@@ -1591,8 +1645,6 @@ impl GetDirectMemoryFallbackReason {
             Self::Range => "range",
             Self::PartNumber => "part_number",
             Self::VersionId => "version_id",
-            Self::Versioned => "versioned",
-            Self::VersionSuspended => "version_suspended",
             Self::InclFreeVersions => "incl_free_versions",
             Self::SkipFreeVersion => "skip_free_version",
             Self::DataMovement => "data_movement",
@@ -1716,12 +1768,11 @@ fn get_small_object_direct_memory_decision_with_threshold(
     if opts.version_id.is_some() {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionId);
     }
-    if opts.versioned {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned);
-    }
-    if opts.version_suspended {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionSuspended);
-    }
+    // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+    // `fi` here is the already-resolved target version, so reassembling its inlined
+    // data shards is correct whether the bucket is versioned or not. This direct-memory
+    // decision still falls back for an explicit versionId (the `version_id` check above);
+    // a delete-marker latest is rejected below.
     if opts.incl_free_versions {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InclFreeVersions);
     }
@@ -8631,9 +8682,11 @@ mod tests {
             128 * 1024
         ));
 
+        // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+        // a latest-version read on a versioned bucket is eligible.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
-        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+        assert!(is_get_small_object_direct_memory_eligible_with_threshold(
             &None,
             &object_info,
             &fi,
@@ -8694,11 +8747,13 @@ mod tests {
             GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Range)
         );
 
+        // Bucket-level versioning no longer falls back (rustfs/backlog#1802): the
+        // latest version on a versioned bucket is served inline like any other.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &versioned_opts, true, 128 * 1024),
-            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned)
+            GetDirectMemoryDecision::Use { object_size: 1024 }
         );
 
         let mut encrypted = object_info.clone();
@@ -8746,8 +8801,6 @@ mod tests {
         assert_eq!(GetDirectMemoryFallbackReason::Range.as_str(), "range");
         assert_eq!(GetDirectMemoryFallbackReason::PartNumber.as_str(), "part_number");
         assert_eq!(GetDirectMemoryFallbackReason::VersionId.as_str(), "version_id");
-        assert_eq!(GetDirectMemoryFallbackReason::Versioned.as_str(), "versioned");
-        assert_eq!(GetDirectMemoryFallbackReason::VersionSuspended.as_str(), "version_suspended");
         assert_eq!(GetDirectMemoryFallbackReason::InclFreeVersions.as_str(), "incl_free_versions");
         assert_eq!(GetDirectMemoryFallbackReason::SkipFreeVersion.as_str(), "skip_free_version");
         assert_eq!(GetDirectMemoryFallbackReason::DataMovement.as_str(), "data_movement");
@@ -11085,5 +11138,14 @@ mod tests {
                 "offline (None) disk slot must map to DiskNotFound in-place, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_duplex_buffer_size_raises_mid_sized_gets_without_penalizing_tiny_objects() {
+        assert_eq!(adaptive_duplex_buffer_size(64 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(128 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(256 * 1024), 256 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(1024 * 1024), 512 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(2 * 1024 * 1024), 1024 * 1024);
     }
 }

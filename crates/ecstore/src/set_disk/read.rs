@@ -224,7 +224,7 @@ impl SetDisks {
         let bucket = bucket.to_string();
         let object = object.to_string();
         let version_id = version_id.to_string();
-        let opts = opts.clone();
+        let opts = *opts;
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -235,9 +235,9 @@ impl SetDisks {
                     let bucket = bucket.clone();
                     let object = object.clone();
                     let version_id = version_id.clone();
-                    let opts = opts.clone();
+                    let task_opts = opts;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &opts).await }
+                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
                 })
             })
             .collect();
@@ -3834,18 +3834,42 @@ mod tests {
                 assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
                 // observe=false (non-observed fanout) also disables early-stop.
                 assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
-                // Data reads are never eligible regardless of caller opt-in.
                 assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
             },
         );
     }
 
     #[test]
-    fn metadata_early_stop_rejects_data_reads() {
+    fn metadata_early_stop_keeps_data_reads_opt_in_by_default() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, None),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
+                assert!(should_allow_metadata_early_stop(false, "", false, false));
+                assert!(!should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
                 (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                assert!(should_allow_metadata_early_stop(true, "", false, false));
+                assert!(should_allow_metadata_early_stop(true, "version-id", false, false));
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
             ],
             || {
                 assert!(!should_allow_metadata_early_stop(true, "", false, false));

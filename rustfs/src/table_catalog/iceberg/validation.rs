@@ -175,6 +175,46 @@ pub(crate) fn table_metadata_warehouse_location(
     metadata_warehouse_location(table_bucket, metadata_location, metadata_object, validate_table_warehouse_location)
 }
 
+pub(crate) fn canonical_json_sha256(metadata: &serde_json::Value) -> TableCatalogStoreResult<String> {
+    let canonical = serde_json::to_vec(metadata)
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to encode metadata digest input: {err}")))?;
+    Ok(hex_simd::encode_to_string(Sha256::digest(canonical), hex_simd::AsciiCase::Lower))
+}
+
+pub(crate) fn validate_commit_metadata_digest(
+    request: &TableCommitRequest,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<()> {
+    let mut expected_digest = None;
+    for requirement in &request.requirements {
+        if requirement.get("type").and_then(serde_json::Value::as_str) != Some(TABLE_METADATA_DIGEST_REQUIREMENT_TYPE) {
+            continue;
+        }
+        if expected_digest.is_some() {
+            return Err(TableCatalogStoreError::Invalid(
+                "commit contains duplicate metadata digest requirements".to_string(),
+            ));
+        }
+        expected_digest = Some(
+            requirement
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .filter(|digest| rustfs_utils::crypto::is_sha256_checksum(digest))
+                .ok_or_else(|| TableCatalogStoreError::Invalid("commit metadata digest is invalid".to_string()))?,
+        );
+    }
+    let Some(expected_digest) = expected_digest else {
+        return Ok(());
+    };
+    let metadata = decode_table_metadata_json(&request.new_metadata_location, &metadata_object.data)?;
+    if canonical_json_sha256(&metadata)? != expected_digest {
+        return Err(TableCatalogStoreError::Conflict(
+            "new metadata object changed after commit validation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn view_metadata_warehouse_location(
     table_bucket: &str,
     metadata_location: &str,
@@ -195,6 +235,10 @@ pub(crate) fn warehouse_index_candidate_prefixes(object: &str) -> Vec<&str> {
     }
     prefixes.reverse();
     prefixes
+}
+
+pub(crate) fn warehouse_object_prefixes_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 pub(crate) fn table_data_plane_resource_from_entry(table: TableEntry, warehouse_object_prefix: String) -> TableDataPlaneResource {
@@ -1352,7 +1396,9 @@ where
         validate_snapshot_graph_data_file_reference(reference, format_version, manifest_sequence_number)?;
         let object_key = snapshot_graph_object_key(context, &reference.location, reference.object_kind.clone())?;
         match reference.entry_status {
-            Some(0 | 1) if budget.validated_live_objects.insert(object_key.clone()) => live_object_keys.push(object_key),
+            Some(0 | 1) if budget.validated_live_objects.insert(object_key.clone()) => {
+                live_object_keys.push(object_key);
+            }
             Some(0 | 1) => {}
             Some(2) => {}
             Some(_) => {

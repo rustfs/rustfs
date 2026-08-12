@@ -18,6 +18,7 @@ use crate::common::{
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
+    RequestRecord,
 };
 use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
@@ -629,6 +630,17 @@ async fn put_bucket_replication_with_delete_statuses(
     delete_marker_status: &str,
     version_delete_status: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    put_bucket_replication_with_statuses(env, bucket, target_arn, delete_marker_status, version_delete_status, "Enabled").await
+}
+
+async fn put_bucket_replication_with_statuses(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arn: &str,
+    delete_marker_status: &str,
+    version_delete_status: Option<&str>,
+    existing_object_status: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let delete_replication = version_delete_status
         .map(|status| format!("<DeleteReplication><Status>{status}</Status></DeleteReplication>"))
         .unwrap_or_default();
@@ -644,7 +656,7 @@ async fn put_bucket_replication_with_delete_statuses(
     </DeleteMarkerReplication>
     {delete_replication}
     <ExistingObjectReplication>
-      <Status>Enabled</Status>
+      <Status>{existing_object_status}</Status>
     </ExistingObjectReplication>
     <Destination>
       <Bucket>{target_arn}</Bucket>
@@ -2594,6 +2606,9 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
     assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["Targets"][0]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
+    // A RustFS target adopts the source version id, so the P1-19
+    // version-identity probe passes.
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
     assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
@@ -7484,6 +7499,900 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     // With B's outbound proven, the inbound replica must stay put across
     // multiple fast-scanner cycles.
     assert_replication_key_absent(&client_a, bucket_c, replica_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-19 review follow-up: multipart fixes the target version at initiate
+/// and only reports it on completion, so a target can adopt PutObject
+/// version ids and still mint its own there — the check must not report OK
+/// while multipart deletes and heals would silently miss.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_multipart_only_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-fidelity-dst";
+    target.create_bucket(target_bucket);
+    // PutObject mirrors the source version id; CreateMultipartUpload does not.
+    target.assign_own_multipart_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(payload["Status"], "FAILED", "multipart drift must fail the check: {payload}");
+    let target_report = &payload["Targets"][0];
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "{payload}");
+    assert_eq!(fidelity["Code"], "BucketRemoteTargetVersionMismatch", "{payload}");
+    assert!(
+        fidelity["Error"]
+            .as_str()
+            .is_some_and(|error| error.contains("CreateMultipartUpload")),
+        "the failure must name the multipart path: {payload}"
+    );
+    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    let probe_key = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .and_then(|record| record.key)
+        .ok_or("the probe PUT never reached the fake target")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "both probe versions must be cleaned up on the mismatching target"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "multipart-cleanup-dst";
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "multipart-cleanup-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    for failed_operation in [FakeTargetOperation::UploadPart, FakeTargetOperation::CompleteMultipartUpload] {
+        target.clear_faults();
+        target.take_requests();
+        target.inject(failed_operation, FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE), 16);
+
+        let response = run_replication_check(&source_env, source_bucket).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await?;
+        assert_eq!(
+            payload["Status"], "FAILED",
+            "the injected multipart failure must fail the check: {payload}"
+        );
+
+        let requests = target.requests();
+        assert!(
+            requests.iter().any(|request| {
+                request.operation == failed_operation
+                    && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+            }),
+            "the check must reach the injected {failed_operation:?} failure: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+            "the failed {failed_operation:?} probe must be aborted: {requests:?}"
+        );
+        assert_eq!(
+            target.active_multipart_upload_count(),
+            0,
+            "the failed {failed_operation:?} probe must not leave multipart state"
+        );
+        assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+    }
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::CompleteMultipartUpload, FakeTargetFault::DisconnectAfterResponse, 16);
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "OK",
+        "NoSuchUpload after an ambiguous complete means the multipart artifact is gone: {payload}"
+    );
+    let requests = target.requests();
+    let completed_key = requests
+        .iter()
+        .find(|request| {
+            request.operation == FakeTargetOperation::CompleteMultipartUpload
+                && request.fault == Some(FakeTargetFault::DisconnectAfterResponse)
+        })
+        .and_then(|request| request.key.as_deref())
+        .expect("the scripted complete response disconnect must be observed");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.operation == FakeTargetOperation::AbortMultipartUpload),
+        "the ambiguous complete must still attempt abort: {requests:?}"
+    );
+    assert_eq!(target.active_multipart_upload_count(), 0);
+    assert!(
+        target.stored_versions(target_bucket, completed_key).is_empty(),
+        "outer cleanup must remove the object committed before the response disconnect"
+    );
+
+    target.clear_faults();
+    target.take_requests();
+    target.inject(FakeTargetOperation::UploadPart, FakeTargetFault::Status(StatusCode::FORBIDDEN), 16);
+    target.inject(
+        FakeTargetOperation::AbortMultipartUpload,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        16,
+    );
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "FAILED", "{payload}");
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Status"], "FAILED",
+        "an unremoved multipart probe must be reported as a cleanup failure: {payload}"
+    );
+    assert_eq!(
+        target_report["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "the primary multipart error must remain the target error: {payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["VersionFidelity"]["Error"], "s3:ReplicateObject permissions missing for replication user",
+        "{payload}"
+    );
+    assert_eq!(
+        target_report["Phases"]["Cleanup"]["Error"], "failed to abort multipart replication probe",
+        "{payload}"
+    );
+    assert!(
+        target.requests().iter().any(|request| {
+            request.operation == FakeTargetOperation::AbortMultipartUpload
+                && request.fault == Some(FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE))
+        }),
+        "the abort failure must be observed"
+    );
+    assert_eq!(
+        target.active_multipart_upload_count(),
+        1,
+        "the report must match the retained multipart state"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-19 (backlog#1675): the supported replication contract is targets that
+/// adopt the source version id (RustFS/MinIO semantics). A target that mints
+/// its own version ids silently breaks every version-addressed operation that
+/// follows — version deletes and heal re-drives never match, diverging the
+/// two sides. replication-check must surface this explicitly: a
+/// VersionFidelity phase that compares the probe PUT's response version id
+/// against the sent source version id and fails with
+/// BucketRemoteTargetVersionMismatch — while still cleaning up the probe
+/// object via the version id the target actually assigned.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_version_minting_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "version-fidelity-dst";
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "version-fidelity-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "FAILED",
+        "a version-minting target must fail the replication check: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "FAILED", "target must be FAILED: {payload}");
+    let fidelity = &target_report["Phases"]["VersionFidelity"];
+    assert_eq!(fidelity["Status"], "FAILED", "VersionFidelity phase must fail: {payload}");
+    assert_eq!(
+        fidelity["Code"], "BucketRemoteTargetVersionMismatch",
+        "the failure must carry a machine-readable code: {payload}"
+    );
+    // The probe PUT itself succeeded (fidelity is judged from its response);
+    // the later mutation phases are pointless against a drifting target and
+    // must be skipped, but cleanup still runs.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // The probe PUT must carry the source version as `?versionId=` — the
+    // exact shape live replication uses (P0-5), and the only shape MinIO
+    // consumes. The journal records the query value.
+    let probe_put = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .ok_or("the probe PUT never reached the fake target")?;
+    let probe_query_version = probe_put
+        .version_id
+        .as_deref()
+        .ok_or("the probe PUT must carry a versionId query")?;
+    assert!(
+        uuid::Uuid::parse_str(probe_query_version).is_ok(),
+        "the probe versionId query must be the source uuid, got {probe_query_version}"
+    );
+
+    // No probe residue: cleanup must address the version id the target
+    // actually assigned, not the source id (which never matched anything).
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "the probe object must be cleaned up on the mismatching target"
+    );
+
+    Ok(())
+}
+
+// --- P1-21 (backlog#1675): delayed delete-marker purge failure handling ---
+//
+// The fixtures below wire a versioned source bucket to a FakeS3Target with the
+// default replication shape: DeleteMarkerReplication=Enabled and
+// DeleteReplication omitted. With version-delete replication unconfigured,
+// purging the source marker version emits no replication event, and the data
+// scanner cannot see a source version that is gone — the delayed purge watcher
+// spawned by the marker replication is the ONLY channel that can remove the
+// replicated marker from the target.
+
+const DELAYED_PURGE_KEY: &str = "doc.txt";
+
+fn delayed_purge_process_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = replication_fast_env();
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    env
+}
+
+async fn start_delayed_purge_fixture(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(FakeS3Target, RustFSTestEnvironment, Client), Box<dyn Error + Send + Sync>> {
+    let target = FakeS3Target::start().await?;
+    target.create_bucket(target_bucket);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], &delayed_purge_process_env())
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    Ok((target, source_env, source_client))
+}
+
+/// PUT an object, stack a delete marker on it, and wait until the fake target
+/// stores the marker replica. Returns the source marker version id — the fake
+/// target mirrors it because delete replication forwards
+/// `x-*-source-version-id`.
+///
+/// Timing budget for callers: the delayed purge watcher only observes the
+/// source for ~4s after the marker replication completes, so the source-side
+/// marker-version DELETE must be issued promptly after this returns (the
+/// 100ms journal poll below keeps the detection latency small).
+async fn replicate_delete_marker(
+    target: &FakeS3Target,
+    target_bucket: &str,
+    source_client: &Client,
+    source_bucket: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .body(ByteStream::from_static(b"delayed purge payload"))
+        .send()
+        .await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .send()
+        .await?;
+    assert_eq!(delete.delete_marker(), Some(true), "unversioned DELETE must create a marker");
+    let marker_version = delete
+        .version_id()
+        .ok_or("source DELETE omitted the marker version ID")?
+        .to_string();
+
+    // Wait for ANY delete marker: a target that mints its own version ids
+    // does not mirror the source one.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let replicated = target
+            .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            .iter()
+            .any(|(_, delete_marker)| *delete_marker);
+        if replicated {
+            return Ok(marker_version);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("fake target never stored the replicated delete marker; journal: {:?}", target.requests()).into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Journal records of purge attempts: target DELETE calls addressing the marker
+/// version explicitly. The marker-creation replica DELETE carries no
+/// `versionId` query, so the version id is an exact discriminator.
+fn delayed_purge_attempts(target: &FakeS3Target, marker_version: &str) -> Vec<RequestRecord> {
+    target
+        .requests()
+        .into_iter()
+        .filter(|record| {
+            record.operation == FakeTargetOperation::DeleteObject
+                && record.key.as_deref() == Some(DELAYED_PURGE_KEY)
+                && record.version_id.as_deref() == Some(marker_version)
+        })
+        .collect()
+}
+
+async fn wait_for_target_marker_purged(
+    target: &FakeS3Target,
+    target_bucket: &str,
+    max_wait: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let marker_present = target
+            .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            .iter()
+            .any(|(_, delete_marker)| *delete_marker);
+        if !marker_present {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "target delete marker was never purged; target state: {:?}",
+                target.stored_versions(target_bucket, DELAYED_PURGE_KEY)
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// P1-21: the delayed purge's single target DELETE currently swallows failures
+/// (`let _ =`), so one transient target error strands the replicated marker on
+/// the target forever. Contract under test: a failed purge attempt is retried
+/// within the watch window and converges once the fault clears.
+#[tokio::test]
+#[serial]
+async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-retry-src";
+    let target_bucket = "delayed-purge-retry-dst";
+    let (target, _source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    // Four scripted failures. Fault budget accounting (each journal record
+    // consumes one fault, including the SDK's own per-request retries):
+    // deleting the marker version fans out over the version-purge replication
+    // channel (initial attempt + its fast in-memory MRF retries) plus the
+    // delayed purge watcher's single pre-fix attempt — three target DELETE calls
+    // in total today, empirically (see the exhaustion test's journal). Four
+    // faults outlast all of them, so only a delayed-purge retry in a later
+    // watch round can converge. If the SDK retry configuration ever changes,
+    // re-derive this budget from a fresh journal capture.
+    target.inject(
+        FakeTargetOperation::DeleteObject,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        4,
+    );
+
+    // Purge the marker at the source. The watcher spawned when the marker
+    // replication completed moments ago observes the source marker vanish
+    // within its watch window and drives the target purge.
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // Tight window on purpose: a fixed delayed purge retries on 1s rounds and
+    // converges within ~5s, while any straggling backoff retry from the other
+    // channels would land later and must not be what turns this test green.
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(15)).await?;
+
+    let attempts = delayed_purge_attempts(&target, &marker_version);
+    assert!(
+        attempts.len() >= 2,
+        "expected the faulted purge attempt plus at least one retry, got: {attempts:?}"
+    );
+    assert!(
+        attempts.iter().any(|record| record.fault.is_none()),
+        "expected a clean purge attempt after the fault script drained, got: {attempts:?}"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-21 review follow-up: the watcher must purge the version the TARGET
+/// assigned to the replicated marker, not one derived from the source uuid.
+/// A target that mints its own version ids answers a source-derived purge
+/// with an idempotent 204, which used to look like success and strand the
+/// real marker on the target forever.
+#[tokio::test]
+#[serial]
+async fn test_delayed_delete_marker_purge_uses_target_assigned_version() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-mint-src";
+    let target_bucket = "delayed-purge-mint-dst";
+    let (target, _source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+    // The target ignores the forwarded source-version-id header and mints its
+    // own ids for both the object and the replicated delete marker.
+    target.assign_own_version_ids(true);
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // The replicated marker carries a target-minted version id, so nothing
+    // but the recorded mapping can address it.
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(25)).await?;
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-21: when every watch-window purge attempt fails, the purge intent must
+/// survive as a durable MRF entry and replay on the next startup; once the
+/// replayed purge succeeds, the entry must be acknowledged instead of being
+/// retained as Missed forever.
+#[tokio::test]
+#[serial]
+async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays_on_restart() -> TestResult {
+    init_logging();
+    let source_bucket = "delayed-purge-mrf-src";
+    let target_bucket = "delayed-purge-mrf-dst";
+    let (target, mut source_env, source_client) = start_delayed_purge_fixture(source_bucket, target_bucket).await?;
+
+    let marker_version = replicate_delete_marker(&target, target_bucket, &source_client, source_bucket).await?;
+
+    // Outlast the whole watch window: every in-process purge attempt fails.
+    target.inject(
+        FakeTargetOperation::DeleteObject,
+        FakeTargetFault::Status(StatusCode::SERVICE_UNAVAILABLE),
+        64,
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(DELAYED_PURGE_KEY)
+        .version_id(&marker_version)
+        .send()
+        .await?;
+
+    // Let the watch window drain before restarting. The wall-clock length is
+    // not 5x1s: every faulted attempt embeds the SDK's own per-request 503
+    // retries (a few seconds each), so instead of a fixed sleep, wait until
+    // the faulted attempts stop arriving (the watcher exhausted its rounds and
+    // persisted the purge intent), then give the MRF persister its 100ms
+    // flush interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_seen = delayed_purge_attempts(&target, &marker_version).len();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let seen = delayed_purge_attempts(&target, &marker_version).len();
+        if seen != last_seen {
+            last_seen = seen;
+            quiet_since = tokio::time::Instant::now();
+        }
+        if last_seen > 0 && quiet_since.elapsed() >= Duration::from_secs(5) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("purge attempts never quiesced (saw {last_seen}); journal: {:?}", target.requests()).into());
+        }
+    }
+    sleep(Duration::from_secs(1)).await;
+
+    let marker_survives_faults = target
+        .stored_versions(target_bucket, DELAYED_PURGE_KEY)
+        .iter()
+        .any(|(_, delete_marker)| *delete_marker);
+    assert!(marker_survives_faults, "scripted faults must have blocked every in-process purge attempt");
+
+    target.clear_faults();
+    let attempts_before_restart = delayed_purge_attempts(&target, &marker_version).len();
+
+    // Startup MRF replay must re-drive the purge and clean the target.
+    source_env
+        .restart_server_preserving_data(vec![], &delayed_purge_process_env())
+        .await?;
+    wait_for_target_marker_purged(&target, target_bucket, Duration::from_secs(30)).await?;
+    let attempts_after_replay = delayed_purge_attempts(&target, &marker_version).len();
+    assert!(
+        attempts_after_replay > attempts_before_restart,
+        "the restart replay must have issued the purge DELETE"
+    );
+
+    // The successful replay must acknowledge the MRF entry: another restart may
+    // not re-drive the purge again.
+    source_env
+        .restart_server_preserving_data(vec![], &delayed_purge_process_env())
+        .await?;
+    sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        delayed_purge_attempts(&target, &marker_version).len(),
+        attempts_after_replay,
+        "acknowledged purge-intent MRF entries must not replay again"
+    );
+
+    target.shutdown().await;
+
+    Ok(())
+}
+
+// --- P1-20 (backlog#1675): scanner existing-object compensation matrix ---
+//
+// Every case below inverts the order used by the rest of this file: objects
+// are written FIRST and the replication rule arrives afterwards, so the only
+// channel that can move the pre-existing objects is the data scanner's
+// existing-object resync pass. Negative cells ("never compensated") are
+// contracts and are asserted over multiple scanner cycles, always next to a
+// replicated control key that proves the scanner and the live path are
+// running — an absent key on a dead scanner proves nothing.
+
+/// Envs + buckets only: versioning, the remote target, and the rule variant
+/// are wired by each test (the null-version case must PUT before the source
+/// bucket becomes versioned). The source runs with FAST_SCANNER_ENV so
+/// existing keys are rescanned within seconds instead of 16 dir cycles.
+async fn build_scanner_compensation_pair(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment), Box<dyn Error + Send + Sync>> {
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    source_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await?;
+    target_env
+        .create_s3_client()
+        .create_bucket()
+        .bucket(target_bucket)
+        .send()
+        .await?;
+
+    Ok((source_env, target_env))
+}
+
+/// P1-20: objects that already exist when a rule with
+/// ExistingObjectReplication=Enabled arrives are compensated by the scanner's
+/// existing-object resync pass, whatever wrote them — plain PUT, CopyObject,
+/// or Snowball auto-extract. The pinned exception is a null-version object
+/// (written before the bucket became versioned): the scanner heal gate skips
+/// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
+/// must NEVER be compensated.
+#[tokio::test]
+#[serial]
+async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-comp-src";
+    let target_bucket = "scanner-comp-dst";
+    let (source_env, target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    // Null-version cell: PUT before versioning; the object keeps the nil
+    // version id forever.
+    let null_key = "pre-versioning-null.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(null_key)
+        .body(ByteStream::from_static(b"null version payload"))
+        .send()
+        .await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    // Pre-existing objects from three write paths, all before any replication
+    // config exists (their replication status stays Empty).
+    let plain_key = "existing-plain.txt";
+    let plain_payload = "existing plain payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(plain_key)
+        .body(ByteStream::from_static(plain_payload.as_bytes()))
+        .send()
+        .await?;
+
+    let copy_key = "existing-copy.txt";
+    source_client
+        .copy_object()
+        .bucket(source_bucket)
+        .key(copy_key)
+        .copy_source(format!("{source_bucket}/{plain_key}"))
+        .send()
+        .await?;
+
+    let member_key = "snowball/existing-member.txt";
+    let member_payload: &[u8] = b"existing snowball member payload";
+    let mut builder = tokio_tar::Builder::new(std::io::Cursor::new(Vec::new()));
+    let mut header = tokio_tar::Header::new_gnu();
+    header.set_size(member_payload.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, member_key, std::io::Cursor::new(member_payload))
+        .await?;
+    let archive = builder.into_inner().await?.into_inner();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("existing-members.tar")
+        .metadata("Snowball-Auto-Extract", "true")
+        .body(ByteStream::from(archive))
+        .send()
+        .await?;
+    // The extracted member must exist locally before the rule arrives, or it
+    // would replicate through the live path instead of the scanner.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if source_client
+            .head_object()
+            .bucket(source_bucket)
+            .key(member_key)
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("snowball member was never extracted on the source".into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Only now wire the remote target and the Enabled rule.
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    // Control key written after the rule replicates through the live path.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner compensation for each pre-existing write path.
+    wait_for_replicated_object(&target_client, target_bucket, plain_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
+    wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
+
+    // Null-version contract: with every sibling compensated (scanner proven
+    // live), the nil-version object must stay absent across further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, null_key, Duration::from_secs(6)).await?;
+
+    Ok(())
+}
+
+/// P1-20: ExistingObjectReplication=Disabled is a contract, not a delay — the
+/// scanner must NEVER compensate objects that predate the rule, while objects
+/// written after the rule replicate normally (the setting only gates the
+/// existing-object resync path).
+#[tokio::test]
+#[serial]
+async fn test_scanner_never_compensates_when_existing_object_replication_disabled() -> TestResult {
+    init_logging();
+    let source_bucket = "scanner-disabled-src";
+    let target_bucket = "scanner-disabled-dst";
+    let (source_env, mut target_env) = build_scanner_compensation_pair(source_bucket, target_bucket).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let existing_key = "existing-disabled.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(existing_key)
+        .body(ByteStream::from_static(b"existing disabled payload"))
+        .send()
+        .await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_statuses(&source_env, source_bucket, &target_arn, "Enabled", None, "Disabled").await?;
+
+    // The live path is unaffected by the Disabled existing-object setting.
+    let control_key = "control-live.txt";
+    let control_payload = "control live payload";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(control_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_replicated_object(&target_client, target_bucket, control_key, control_payload).await?;
+
+    // Scanner-only witness. A live-path control key alone would let this test
+    // pass while the existing-object scanner is disabled or wedged, so make
+    // the scanner itself observable: an object whose replication FAILED while
+    // the target was down can only be re-driven by the data scanner's
+    // replication heal pass (see FAST_SCANNER_ENV), and that pass is NOT
+    // gated by ExistingObjectReplication. The witness lives in the same
+    // bucket and prefix as the pre-existing key, so a heal pass that reached
+    // it necessarily walked the pre-existing key in the same scan.
+    let witness_key = "scanner-witness.txt";
+    let witness_payload = "scanner witness payload";
+    target_env.stop_server();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(witness_key)
+        .body(ByteStream::from_static(witness_payload.as_bytes()))
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, source_bucket, witness_key, "FAILED", false).await?;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+    let target_client = target_env.create_s3_client();
+    wait_for_replicated_object(&target_client, target_bucket, witness_key, witness_payload).await?;
+
+    // The scanner demonstrably swept this bucket; the pre-existing key must
+    // still be absent, and stay absent over further cycles.
+    assert_replication_key_absent(&target_client, target_bucket, existing_key, Duration::from_secs(6)).await?;
 
     Ok(())
 }

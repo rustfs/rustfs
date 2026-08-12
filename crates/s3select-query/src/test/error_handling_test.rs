@@ -16,7 +16,7 @@
 mod error_handling_tests {
     use crate::get_global_db;
     use rustfs_s3select_api::{
-        QueryError,
+        QueryError, SelectError,
         query::{Context, Query},
     };
     use s3s::dto::{
@@ -98,7 +98,6 @@ mod error_handling_tests {
             "INSERT INTO S3Object VALUES (1, 'test')",
             "UPDATE S3Object SET name = 'test'",
             "DELETE FROM S3Object",
-            "CREATE TABLE test (id INT)",
             "DROP TABLE S3Object",
         ];
 
@@ -110,6 +109,68 @@ mod error_handling_tests {
             let result = db.execute(&query).await;
             // These should either fail with syntax error or not implemented error
             assert!(result.is_err(), "Expected error for unsupported SQL: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_select_statement_is_typed_unsupported_structure() {
+        let sql = "CREATE TABLE test (id INT)";
+        let input = create_test_input_with_sql(sql);
+        let db = get_global_db(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let error = match db.execute(&query).await {
+            Err(error) => error,
+            Ok(_) => panic!("non-SELECT statement must fail"),
+        };
+
+        assert!(matches!(error.select_error(), SelectError::UnsupportedSqlStructure { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_function_argument_coercion_failure_is_typed() {
+        for sql in ["SELECT ROUND(3.14, 1.1) FROM S3Object", "SELECT SQRT(1, 2) FROM S3Object"] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let error = match db.execute(&query).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid function arguments must fail during planning: {sql}"),
+            };
+
+            assert_eq!(
+                error.select_error(),
+                SelectError::IncorrectSqlFunctionArgumentType,
+                "unexpected planner error for {sql}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_other_planner_failures_remain_invalid_query() {
+        for sql in [
+            "SELECT DEFINITELY_UNKNOWN_FUNCTION(1) FROM S3Object",
+            "SELECT 1 + 'text' FROM S3Object",
+        ] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let error = match db.execute(&query).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid query must fail during planning: {sql}"),
+            };
+
+            assert_eq!(
+                error.select_error(),
+                SelectError::InvalidQuery,
+                "unexpected planner error for {sql}: {error:?}"
+            );
         }
     }
 

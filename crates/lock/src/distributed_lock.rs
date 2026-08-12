@@ -40,6 +40,7 @@ const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const LOCK_ACQUIRE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCK_ACQUIRE_SPARE_HEDGES: usize = 1;
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
 const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
 const UNRECOVERABLE_QUORUM_FAILURE_PREFIX: &str = "unrecoverable quorum failure";
@@ -672,13 +673,22 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
-    fn spawn_lock_requests(&self, request: &LockRequest) -> JoinSet<LockAcquireTaskResult> {
-        let mut pending = JoinSet::new();
-        for (idx, client) in self.clients.iter().cloned().enumerate() {
+    fn spawn_lock_requests_until(
+        &self,
+        pending: &mut JoinSet<LockAcquireTaskResult>,
+        request: &LockRequest,
+        next_client_index: &mut usize,
+        target_pending: usize,
+    ) {
+        while pending.len() < target_pending {
+            let Some(client) = self.clients.get(*next_client_index).cloned() else {
+                break;
+            };
+            let idx = *next_client_index;
+            *next_client_index = (*next_client_index).saturating_add(1);
             let request = request.clone();
             pending.spawn(async move { (idx, client.acquire_lock(&request).await) });
         }
-        pending
     }
 
     fn lock_acquire_retry_backoff(attempt: usize, rng: &mut impl rand::Rng) -> Duration {
@@ -911,7 +921,16 @@ impl DistributedLock {
     async fn acquire_lock_quorum_once(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
         let required_quorum = self.required_quorum(request.lock_type);
         let attempt_started = Instant::now();
-        let mut pending = self.spawn_lock_requests(request);
+        let mut pending = JoinSet::new();
+        let mut next_client_index = 0usize;
+        self.spawn_lock_requests_until(
+            &mut pending,
+            request,
+            &mut next_client_index,
+            required_quorum
+                .saturating_add(LOCK_ACQUIRE_SPARE_HEDGES)
+                .min(self.clients.len()),
+        );
         let mut individual_locks: Vec<HeldLockEntry> = Vec::new();
         let fallback_lock_id = request.lock_id.clone();
         let mut last_failure = None;
@@ -1085,7 +1104,15 @@ impl DistributedLock {
                 });
             }
 
-            if individual_locks.len() + pending.len() < required_quorum {
+            let needed = required_quorum.saturating_sub(individual_locks.len());
+            self.spawn_lock_requests_until(
+                &mut pending,
+                request,
+                &mut next_client_index,
+                needed.saturating_add(LOCK_ACQUIRE_SPARE_HEDGES),
+            );
+            let unstarted_clients = self.clients.len().saturating_sub(next_client_index);
+            if individual_locks.len() + pending.len() + unstarted_clients < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(
                     individual_locks.iter().map(HeldLockEntry::release_entry).collect(),
@@ -1905,6 +1932,99 @@ mod tests {
         assert!(should_warn_lock_failure("Unrecoverable quorum failure: 1/3 required"));
         assert!(!should_warn_lock_failure("Remote lock RPC timed out: RPC timed out after 50ms"));
         assert!(!should_warn_lock_failure("Lock acquisition timeout"));
+    }
+
+    #[tokio::test]
+    async fn shared_lock_acquire_starts_quorum_plus_one_clients() {
+        let seen_ids = (0..4).map(|_| Arc::new(Mutex::new(Vec::new()))).collect::<Vec<_>>();
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success {
+                    delay: Duration::from_millis(20),
+                }],
+                seen_ids[0].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success {
+                    delay: Duration::from_millis(20),
+                }],
+                seen_ids[1].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success {
+                    delay: Duration::from_millis(200),
+                }],
+                seen_ids[2].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success { delay: Duration::ZERO }],
+                seen_ids[3].clone(),
+            )),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Shared, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("shared lock acquisition should not error")
+            .expect("read quorum should be reached");
+
+        assert_eq!(guard.entries.len(), 2, "read quorum should track exactly two acquired entries");
+        assert_eq!(
+            seen_ids[3].lock().unwrap().len(),
+            0usize,
+            "fourth client should stay unstarted while one hedge is pending"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn shared_lock_acquire_replenishes_after_early_failure() {
+        let seen_ids = (0..4).map(|_| Arc::new(Mutex::new(Vec::new()))).collect::<Vec<_>>();
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Failure {
+                    error: "lock already held",
+                    delay: Duration::ZERO,
+                }],
+                seen_ids[0].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success {
+                    delay: Duration::from_millis(80),
+                }],
+                seen_ids[1].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success {
+                    delay: Duration::from_millis(120),
+                }],
+                seen_ids[2].clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![AcquirePlan::Success { delay: Duration::ZERO }],
+                seen_ids[3].clone(),
+            )),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Shared, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("shared lock acquisition should not error")
+            .expect("read quorum should be reached after replenishing the failed slot");
+
+        assert_eq!(guard.entries.len(), 2, "read quorum should be reached");
+        assert_eq!(
+            seen_ids[3].lock().unwrap().len(),
+            1usize,
+            "fourth client should be started after an early failure"
+        );
+        drop(guard);
     }
 
     #[tokio::test]

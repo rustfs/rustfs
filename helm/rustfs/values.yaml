@@ -370,6 +370,7 @@ gatewayApi:
       name: websecure
       port: 8443
   hostname: example.rustfs.com
+  httpToHttpsRedirect: true
   existingGateway:
     name: ""
     namespace: ""

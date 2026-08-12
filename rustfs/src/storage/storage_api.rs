@@ -109,9 +109,9 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, recursive_force_delete_is_authorized,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
@@ -435,7 +435,8 @@ pub(crate) mod ecstore_data_usage {
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached, store_data_usage_in_backend,
+        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached,
+        seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 }
 
@@ -1034,6 +1035,10 @@ pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec
     ecstore_config::com::save_config_no_lock(api, file, data).await
 }
 
+pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<()> {
+    ecstore_config::com::delete_config_no_lock(api, file).await
+}
+
 pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -1444,10 +1449,6 @@ pub(crate) async fn get_bucket_accelerate_config(
     ecstore_bucket::metadata_sys::get_accelerate_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_bucket_policy_raw(bucket).await
-}
-
 pub(crate) async fn get_bucket_cors_config(bucket: &str) -> Result<(s3s::dto::CORSConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_cors_config(bucket).await
 }
@@ -1460,12 +1461,6 @@ pub(crate) async fn get_bucket_object_lock_config(
     bucket: &str,
 ) -> Result<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
-}
-
-pub(crate) async fn get_public_access_block_config(
-    bucket: &str,
-) -> Result<(s3s::dto::PublicAccessBlockConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_public_access_block_config(bucket).await
 }
 
 pub(crate) async fn get_bucket_replication_config(

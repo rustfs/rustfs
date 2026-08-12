@@ -294,6 +294,18 @@ pub const GET_OBJECT_SIZE_BUCKET_LE_256_KIB: &str = "le_256kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_512_KIB: &str = "le_512kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_1_MIB: &str = "le_1mib";
 pub const GET_OBJECT_SIZE_BUCKET_GT_1_MIB: &str = "gt_1mib";
+pub const GET_OBJECT_SIZE_BUCKET_UNKNOWN: &str = "unknown";
+
+pub struct GetObjectStreamingBodyFailure {
+    pub stage: &'static str,
+    pub reason: &'static str,
+    pub error_class: &'static str,
+    pub strategy: &'static str,
+    pub buffer_source: &'static str,
+    pub size_bucket: &'static str,
+    pub emitted_bytes: usize,
+    pub remaining_bytes: usize,
+}
 
 /// Return the bounded size bucket used by small-object GET diagnostics.
 #[inline(always)]
@@ -590,6 +602,44 @@ pub fn record_get_object_reader_stream_poll(
         "outcome" => outcome
     )
     .record(duration_secs);
+}
+
+/// Record a GET response body failure with bounded attribution labels.
+#[inline(always)]
+pub fn record_get_object_streaming_body_failure(failure: GetObjectStreamingBodyFailure) {
+    if !metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_streaming_body_failure_total",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_io_get_object_streaming_body_failure_emitted_bytes",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .record(usize_to_f64(failure.emitted_bytes));
+    histogram!(
+        "rustfs_io_get_object_streaming_body_failure_remaining_bytes",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .record(usize_to_f64(failure.remaining_bytes));
 }
 
 /// Record a poll of the single-chunk in-memory GetObject handoff stream.
@@ -2914,6 +2964,16 @@ mod tests {
         record_list_objects(50.0, 100, false);
         record_error("get_object", "timeout");
         record_cpu_usage(25.5);
+        record_get_object_streaming_body_failure(GetObjectStreamingBodyFailure {
+            stage: "reader_stream",
+            reason: "short_eof",
+            error_class: "short_eof",
+            strategy: "standard",
+            buffer_source: "selected",
+            size_bucket: GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
+            emitted_bytes: 1024,
+            remaining_bytes: 512,
+        });
 
         // Enabled: the same recorders run their emission bodies without panicking.
         set_metrics_enabled(true);
@@ -2922,6 +2982,16 @@ mod tests {
         record_list_objects(50.0, 100, false);
         record_error("get_object", "timeout");
         record_cpu_usage(25.5);
+        record_get_object_streaming_body_failure(GetObjectStreamingBodyFailure {
+            stage: "reader_stream",
+            reason: "reader_error",
+            error_class: "timeout",
+            strategy: "standard",
+            buffer_source: "selected",
+            size_bucket: GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
+            emitted_bytes: 2048,
+            remaining_bytes: 256,
+        });
 
         set_metrics_enabled(false);
     }

@@ -23,8 +23,8 @@ impl Operation for RestListViewsHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = list_views_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -40,9 +40,9 @@ impl Operation for RestCreateViewHandler {
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
         let request = read_json_body::<CreateViewRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let response =
             create_view_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
         build_json_response(StatusCode::OK, &response)
@@ -59,8 +59,8 @@ impl Operation for RestLoadViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let metadata_backend = table_catalog_backend()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = load_view_response(&store, &metadata_backend, &warehouse, &namespace, &view).await?;
         build_json_response(StatusCode::OK, &response)
@@ -77,8 +77,8 @@ impl Operation for RestViewExistsHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         Ok(empty_response(view_exists_status(&store, &warehouse, &namespace, &view).await?))
     }
 }
@@ -93,9 +93,9 @@ impl Operation for RestReplaceViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<RestCommitViewRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = replace_view_response(&store, &metadata_backend, &warehouse, &namespace, &view, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -112,8 +112,8 @@ impl Operation for RestDropViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         drop_view_in_store(&store, &warehouse, &namespace, &view).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }

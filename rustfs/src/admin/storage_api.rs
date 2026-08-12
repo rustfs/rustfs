@@ -183,6 +183,7 @@ pub(crate) mod bandwidth {
 }
 
 pub(crate) mod bucket_target_sys {
+    pub(crate) use super::ecstore_bucket::bucket_target_sys::append_version_id_query;
     pub(crate) type AdvancedPutOptions = super::ecstore_bucket::bucket_target_sys::AdvancedPutOptions;
     pub(crate) type BucketTargetError = super::ecstore_bucket::bucket_target_sys::BucketTargetError;
     pub(crate) type BucketTargetSys = super::ecstore_bucket::bucket_target_sys::BucketTargetSys;
@@ -792,7 +793,9 @@ pub(crate) mod data_usage {
 }
 
 pub(crate) mod access {
-    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+    pub(crate) use crate::storage::storage_api::access_consumer::{
+        ReqInfo, authorize_internal_object_request, authorize_request,
+    };
     pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 
@@ -898,6 +901,10 @@ pub(crate) mod runtime {
 
     #[cfg(test)]
     pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+}
+
+pub(crate) mod s3 {
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
 }
 
 pub(crate) mod tier {

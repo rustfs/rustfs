@@ -19,6 +19,7 @@ pub mod heal_channel;
 pub mod last_minute;
 pub mod metrics;
 mod readiness;
+pub mod table_catalog;
 
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};

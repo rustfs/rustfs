@@ -298,6 +298,7 @@ impl From<StorageError> for ApiError {
             | StorageError::ErasureWriteQuorum
             | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::SlowDown,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
+            StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
             StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
@@ -325,7 +326,7 @@ impl From<StorageError> for ApiError {
             _ => S3ErrorCode::InternalError,
         };
 
-        let message = if code == S3ErrorCode::InternalError {
+        let message = if matches!(&err, StorageError::QuotaExceeded { .. }) || code == S3ErrorCode::InternalError {
             err.to_string()
         } else if let StorageError::InvalidArgument(_, _, reason) = &err
             && !reason.is_empty()
@@ -623,6 +624,7 @@ mod tests {
             (StorageError::DecommissionNotStarted, S3ErrorCode::InvalidRequest),
             (StorageError::DecommissionAlreadyRunning, S3ErrorCode::InvalidRequest),
             (StorageError::RebalanceAlreadyRunning, S3ErrorCode::InvalidRequest),
+            (StorageError::QuotaExceeded { current: 5, limit: 10 }, S3ErrorCode::InvalidRequest),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),
             (StorageError::ObjectNotFound("test".into(), "test".into()), S3ErrorCode::NoSuchKey),
             (StorageError::ConfigNotFound, S3ErrorCode::NoSuchKey),
@@ -706,6 +708,14 @@ mod tests {
 
         assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn quota_exceeded_preserves_existing_s3_error_contract() {
+        let api_error: ApiError = StorageError::QuotaExceeded { current: 5, limit: 10 }.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::InvalidRequest);
+        assert_eq!(api_error.message, "Bucket quota exceeded. Current usage: 5 bytes, limit: 10 bytes");
     }
 
     #[test]
