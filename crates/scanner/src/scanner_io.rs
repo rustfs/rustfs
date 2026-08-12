@@ -2195,10 +2195,44 @@ pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>>
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerCycleDeferReason {
+    ActivityBaselineUnavailable,
+    DataMovement,
+}
+
+impl ScannerCycleDeferReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ActivityBaselineUnavailable => "activity_baseline_unavailable",
+            Self::DataMovement => "data_movement",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScannerCycleStatus {
     Complete,
     Incomplete,
     Superseded,
+    Deferred(ScannerCycleDeferReason),
+}
+
+enum ScannerActivityPreflight {
+    Ready(crate::scanner::ScannerActivitySnapshot),
+    ActivityBaselineUnavailable(String),
+    DataMovement,
+}
+
+fn scanner_activity_preflight(
+    activity: std::result::Result<crate::scanner::ScannerActivitySnapshot, String>,
+) -> ScannerActivityPreflight {
+    match activity {
+        Err(error) => ScannerActivityPreflight::ActivityBaselineUnavailable(error),
+        Ok(snapshot) if !crate::scanner::scanner_activity_allows_usage_publication(&snapshot) => {
+            ScannerActivityPreflight::DataMovement
+        }
+        Ok(snapshot) => ScannerActivityPreflight::Ready(snapshot),
+    }
 }
 
 #[derive(Debug)]
@@ -2307,9 +2341,9 @@ impl ScannerIOCycle for ECStore {
         let child_token = ctx.child_token();
 
         let distributed = self.setup_is_dist_erasure().await;
-        let activity_before = match crate::scanner::probe_scanner_activity(self, distributed).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
+        let activity_before = match scanner_activity_preflight(crate::scanner::probe_scanner_activity(self, distributed).await) {
+            ScannerActivityPreflight::Ready(snapshot) => snapshot,
+            ScannerActivityPreflight::ActivityBaselineUnavailable(err) => {
                 warn!(
                     target: "rustfs::scanner::io",
                     event = EVENT_SCANNER_SET_STATE,
@@ -2319,20 +2353,26 @@ impl ScannerIOCycle for ECStore {
                     error = %err,
                     "Scanner cycle skipped because cluster activity could not be baselined"
                 );
-                return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None));
+                return Ok(ScannerCycleResult::new(
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+                    None,
+                ));
+            }
+            ScannerActivityPreflight::DataMovement => {
+                debug!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_data_movement_active",
+                    "Scanner cycle deferred while rebalance or decommission data movement is active"
+                );
+                return Ok(ScannerCycleResult::new(
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                    None,
+                ));
             }
         };
-        if !crate::scanner::scanner_activity_allows_usage_publication(&activity_before) {
-            debug!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_SET_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                state = "cycle_data_movement_active",
-                "Scanner cycle deferred while rebalance or decommission data movement is active"
-            );
-            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Superseded, None));
-        }
         let dirty_generation_before_bucket_list = dirty_usage_generation();
         let bucket_listing = self.list_bucket_for_scanner(&BucketOptions::default()).await?;
         let mut bucket_plan_complete = bucket_listing.topology_complete;
@@ -4005,6 +4045,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
+        let preflight = scanner_activity_preflight(Err("peer rustfs-node3:9000 is temporarily offline".to_string()));
+
+        match preflight {
+            ScannerActivityPreflight::ActivityBaselineUnavailable(error) => {
+                assert_eq!(error, "peer rustfs-node3:9000 is temporarily offline");
+            }
+            ScannerActivityPreflight::Ready(_) | ScannerActivityPreflight::DataMovement => {
+                panic!("an unavailable activity baseline must defer the scanner cycle");
+            }
+        }
+    }
+
     async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
         init_ecstore_config_for_scanner_tests();
         let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
@@ -4099,7 +4153,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn scanner_cycle_is_superseded_while_rebalance_is_active() {
+    async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
         let (_temp_dir, store) = setup_two_pool_scanner_store().await;
         let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
         pool_stats[0] = EcstoreRebalanceStats {
@@ -4129,7 +4183,7 @@ mod tests {
         .expect("rebalance-deferred scanner cycle should finish")
         .expect("rebalance-deferred scanner cycle should succeed");
 
-        assert_eq!(result.status, ScannerCycleStatus::Superseded);
+        assert_eq!(result.status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement));
         assert!(receiver.recv().await.is_none(), "rebalance-deferred cycle must not publish usage");
     }
 

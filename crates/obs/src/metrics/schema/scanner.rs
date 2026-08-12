@@ -460,7 +460,7 @@ pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::
 pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleResult,
-        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded.",
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded, 5 deferred.",
         &[],
         subsystems::SCANNER,
     )

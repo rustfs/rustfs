@@ -30,8 +30,8 @@ use crate::runtime_config::{
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
-    ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified, dirty_usage_buckets_pending, dirty_usage_generation,
-    scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
+    ScannerCycleDeferReason, ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified, dirty_usage_buckets_pending,
+    dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
@@ -41,7 +41,8 @@ use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
     CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
-    emit_scan_cycle_complete, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
+    emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded,
+    global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -84,7 +85,7 @@ const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total
 const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SCANNER_SCHEDULE_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
-/// First-retry delay after a usage snapshot is superseded by concurrent writes.
+/// First-retry delay after a scanner cycle cannot publish authoritative usage.
 ///
 /// A superseded cycle is the *expected* outcome of the dirty-usage fast path:
 /// a write burst marks buckets dirty, the scanner wakes within milliseconds,
@@ -94,14 +95,15 @@ const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// otherwise idle instance whose clean-idle backoff had doubled a 60 s
 /// interval), which defeats the fast path it is meant to protect.
 ///
-/// The exponential growth in [`ScannerSupersededBackoff::retry_interval`] is
+/// The exponential growth in [`ScannerRetryBackoff::retry_interval`] is
 /// what protects against a persistently hot bucket driving an unbroken
 /// full-scan loop, so it can start small: 5 s, 10 s, 20 s … capped by
-/// [`SUPERSEDED_RETRY_MAX_INTERVAL`]. A one-off race recovers in seconds; a
+/// [`SCANNER_RETRY_MAX_INTERVAL`]. A one-off race recovers in seconds; a
 /// genuinely hot bucket still reaches minute-scale backoff within a handful of
-/// cycles.
-const SUPERSEDED_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
-const SUPERSEDED_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// cycles. Preflight deferrals use the same bounded schedule so a temporarily
+/// unavailable peer cannot drive a tight retry loop.
+const SCANNER_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
+const SCANNER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -338,6 +340,7 @@ pub(crate) enum ScannerCycleOutcome {
     CompletedWithPendingMaintenance,
     Partial,
     Superseded,
+    Deferred(ScannerCycleDeferReason),
     Failed,
 }
 
@@ -382,22 +385,16 @@ struct ScannerCleanIdleBackoff {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ScannerSupersededBackoff {
+struct ScannerRetryBackoff {
     consecutive_cycles: u32,
 }
 
-impl ScannerSupersededBackoff {
-    fn record_cycle(&mut self, outcome: ScannerCycleOutcome) {
-        match outcome {
-            ScannerCycleOutcome::Superseded => {
-                self.consecutive_cycles = self.consecutive_cycles.saturating_add(1);
-            }
-            ScannerCycleOutcome::Completed
-            | ScannerCycleOutcome::CompletedWithPendingMaintenance
-            | ScannerCycleOutcome::Partial
-            | ScannerCycleOutcome::Failed => {
-                self.consecutive_cycles = 0;
-            }
+impl ScannerRetryBackoff {
+    fn record_retryable_cycle(&mut self, retryable: bool) {
+        if retryable {
+            self.consecutive_cycles = self.consecutive_cycles.saturating_add(1);
+        } else {
+            self.consecutive_cycles = 0;
         }
     }
 
@@ -406,8 +403,8 @@ impl ScannerSupersededBackoff {
         let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
         let base_interval = configured_interval
             .max(Duration::from_secs(1))
-            .min(SUPERSEDED_RETRY_BASE_INTERVAL);
-        let cap = SUPERSEDED_RETRY_MAX_INTERVAL.max(configured_interval.max(Duration::from_secs(1)));
+            .min(SCANNER_RETRY_BASE_INTERVAL);
+        let cap = SCANNER_RETRY_MAX_INTERVAL.max(configured_interval.max(Duration::from_secs(1)));
         Some(base_interval.saturating_mul(multiplier).min(cap))
     }
 }
@@ -3008,6 +3005,21 @@ async fn run_data_scanner_cycle(
                 ScannerCycleOutcome::Failed
             };
         }
+        ScannerCycleOutcome::Deferred(reason) => {
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                reason = reason.as_str(),
+                state = "deferred",
+                "Scanner cycle deferred before usage scanning began"
+            );
+            emit_scan_cycle_deferred(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(reason);
+        }
         ScannerCycleOutcome::Superseded => {
             info!(
                 target: "rustfs::scanner",
@@ -3201,7 +3213,8 @@ async fn run_data_scanner_with_maintenance_state(
     let mut dirty_usage_generation_seen = dirty_usage_generation();
     let mut runtime_config_generation_seen = scanner_runtime_config_generation();
     let mut clean_idle_backoff = ScannerCleanIdleBackoff::default();
-    let mut superseded_backoff = ScannerSupersededBackoff::default();
+    let mut superseded_backoff = ScannerRetryBackoff::default();
+    let mut deferred_backoff = ScannerRetryBackoff::default();
     let initial_runtime_config = resolve_scanner_runtime_config();
     if clean_idle_topology_supported
         && scanner_clean_idle_backoff_configured(&initial_runtime_config)
@@ -3331,7 +3344,8 @@ async fn run_data_scanner_with_maintenance_state(
         )
         .await
         .unwrap_or(ScannerCycleOutcome::Failed);
-        superseded_backoff.record_cycle(initial_outcome);
+        superseded_backoff.record_retryable_cycle(initial_outcome == ScannerCycleOutcome::Superseded);
+        deferred_backoff.record_retryable_cycle(matches!(initial_outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
@@ -3416,7 +3430,9 @@ async fn run_data_scanner_with_maintenance_state(
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
         let superseded_retry_interval = superseded_backoff.retry_interval(runtime_config.cycle_interval);
-        if let Some(retry_interval) = superseded_retry_interval {
+        let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
+        let convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
+        if let Some(retry_interval) = convergence_retry_interval {
             wait_plan.effective_interval = retry_interval;
             wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
         }
@@ -3443,6 +3459,8 @@ async fn run_data_scanner_with_maintenance_state(
             clean_idle_backoff_enabled = backoff_enabled,
             superseded_retry_backoff_enabled = superseded_retry_interval.is_some(),
             superseded_cycles = superseded_backoff.consecutive_cycles,
+            deferred_retry_backoff_enabled = deferred_retry_interval.is_some(),
+            deferred_cycles = deferred_backoff.consecutive_cycles,
             lifecycle_active = maintenance_features.lifecycle,
             replication_active = maintenance_features.replication,
             feature_inspection_failed = maintenance_features.inspection_failed,
@@ -3457,13 +3475,12 @@ async fn run_data_scanner_with_maintenance_state(
             activity_poll_interval,
             &mut scanner_activity_seen,
             ScannerCycleObservedGenerations {
-                // A superseded cycle already observed concurrent writes. Hold
-                // further dirty notifications until the bounded retry timer so
-                // a hot bucket cannot drive an unbroken full-scan loop.
-                dirty_usage: superseded_retry_interval.is_none().then_some(dirty_usage_generation_seen),
+                // A non-converged cycle holds further activity notifications
+                // until its bounded retry timer to avoid an unbroken scan loop.
+                dirty_usage: convergence_retry_interval.is_none().then_some(dirty_usage_generation_seen),
                 runtime_config: runtime_config_generation_seen,
                 maintenance: maintenance_generation_before_wait,
-                defer_cluster_activity: superseded_retry_interval.is_some(),
+                defer_cluster_activity: convergence_retry_interval.is_some(),
             },
             || guard.is_lock_lost(),
             || probe_scanner_activity(storeapi.as_ref(), distributed),
@@ -3540,7 +3557,8 @@ async fn run_data_scanner_with_maintenance_state(
         )
         .await
         .unwrap_or(ScannerCycleOutcome::Failed);
-        superseded_backoff.record_cycle(outcome);
+        superseded_backoff.record_retryable_cycle(outcome == ScannerCycleOutcome::Superseded);
+        deferred_backoff.record_retryable_cycle(matches!(outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;
@@ -3710,6 +3728,12 @@ fn scanner_cycle_completion_outcome(
 ) -> ScannerCycleOutcome {
     match (scan_status, usage_persist_outcome) {
         (_, DataUsagePersistOutcome::Failed) => ScannerCycleOutcome::Failed,
+        (ScannerCycleStatus::Deferred(reason), DataUsagePersistOutcome::NoUpdate)
+            if !has_dirty_usage && !has_failed_dirty_usage =>
+        {
+            ScannerCycleOutcome::Deferred(reason)
+        }
+        (ScannerCycleStatus::Deferred(_), _) => ScannerCycleOutcome::Failed,
         (ScannerCycleStatus::Superseded, _) if !has_failed_dirty_usage => ScannerCycleOutcome::Superseded,
         (ScannerCycleStatus::Superseded, _) => ScannerCycleOutcome::Failed,
         (
@@ -6554,6 +6578,46 @@ mod tests {
     #[test]
     fn test_scanner_cycle_completion_prioritizes_persist_failure() {
         assert_eq!(
+            scanner_cycle_completion_outcome(
+                ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+                DataUsagePersistOutcome::NoUpdate,
+                false,
+                false,
+            ),
+            ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(
+                ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                DataUsagePersistOutcome::Saved,
+                false,
+                false,
+            ),
+            ScannerCycleOutcome::Failed
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(
+                ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                DataUsagePersistOutcome::NoUpdate,
+                true,
+                false,
+            ),
+            ScannerCycleOutcome::Failed
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(
+                ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                DataUsagePersistOutcome::Failed,
+                false,
+                false,
+            ),
+            ScannerCycleOutcome::Failed
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(ScannerCycleStatus::Incomplete, DataUsagePersistOutcome::NoUpdate, false, false),
+            ScannerCycleOutcome::Failed
+        );
+        assert_eq!(
             scanner_cycle_completion_outcome(ScannerCycleStatus::Incomplete, DataUsagePersistOutcome::Failed, true, true),
             ScannerCycleOutcome::Failed
         );
@@ -6940,47 +7004,47 @@ mod tests {
 
     #[test]
     fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
-        let mut backoff = ScannerSupersededBackoff::default();
+        let mut backoff = ScannerRetryBackoff::default();
         assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
         for expected in [5, 10, 20, 40, 80, 160, 320] {
-            backoff.record_cycle(ScannerCycleOutcome::Superseded);
+            backoff.record_retryable_cycle(true);
             assert_eq!(
                 backoff.retry_interval(Duration::from_secs(24 * 60 * 60)),
                 Some(Duration::from_secs(expected))
             );
         }
         for _ in 0..20 {
-            backoff.record_cycle(ScannerCycleOutcome::Superseded);
+            backoff.record_retryable_cycle(true);
         }
         assert_eq!(
             backoff.retry_interval(Duration::from_secs(24 * 60 * 60)),
             Some(Duration::from_secs(24 * 60 * 60))
         );
 
-        backoff.record_cycle(ScannerCycleOutcome::Completed);
+        backoff.record_retryable_cycle(false);
         assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
     }
 
     #[test]
     fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
-        let mut backoff = ScannerSupersededBackoff::default();
-        backoff.record_cycle(ScannerCycleOutcome::Superseded);
+        let mut backoff = ScannerRetryBackoff::default();
+        backoff.record_retryable_cycle(true);
 
         // A configured cycle shorter than the base still wins: retrying sooner
         // than the operator's own cadence buys nothing.
         assert_eq!(backoff.retry_interval(Duration::from_secs(3)), Some(Duration::from_secs(3)));
-        backoff.record_cycle(ScannerCycleOutcome::Superseded);
+        backoff.record_retryable_cycle(true);
         assert_eq!(backoff.retry_interval(Duration::from_secs(3)), Some(Duration::from_secs(6)));
     }
 
     #[test]
     fn superseded_retry_backoff_grows_from_the_default_cycle() {
-        let mut backoff = ScannerSupersededBackoff::default();
+        let mut backoff = ScannerRetryBackoff::default();
         // The first race after a write burst retries in seconds, not a whole
         // cycle, while repeated supersedes still climb toward the cap.
         for expected in [5, 10, 20, 40] {
-            backoff.record_cycle(ScannerCycleOutcome::Superseded);
+            backoff.record_retryable_cycle(true);
             assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(expected)));
         }
     }

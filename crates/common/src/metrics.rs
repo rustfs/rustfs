@@ -915,11 +915,13 @@ const SCAN_CYCLE_RESULT_SUCCESS: u8 = 1;
 const SCAN_CYCLE_RESULT_ERROR: u8 = 2;
 const SCAN_CYCLE_RESULT_PARTIAL: u8 = 3;
 const SCAN_CYCLE_RESULT_SUPERSEDED: u8 = 4;
+const SCAN_CYCLE_RESULT_DEFERRED: u8 = 5;
 const SCAN_CYCLE_RESULT_UNKNOWN_LABEL: &str = "unknown";
 const SCAN_CYCLE_RESULT_SUCCESS_LABEL: &str = "success";
 const SCAN_CYCLE_RESULT_ERROR_LABEL: &str = "error";
 const SCAN_CYCLE_RESULT_PARTIAL_LABEL: &str = "partial";
 const SCAN_CYCLE_RESULT_SUPERSEDED_LABEL: &str = "superseded";
+const SCAN_CYCLE_RESULT_DEFERRED_LABEL: &str = "deferred";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScanCyclePartialReason {
@@ -1424,6 +1426,7 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
         SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
         SCAN_CYCLE_RESULT_PARTIAL => SCAN_CYCLE_RESULT_PARTIAL_LABEL,
         SCAN_CYCLE_RESULT_SUPERSEDED => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL,
+        SCAN_CYCLE_RESULT_DEFERRED => SCAN_CYCLE_RESULT_DEFERRED_LABEL,
         _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
     }
 }
@@ -1750,6 +1753,11 @@ pub fn emit_scan_cycle_partial_with_source(
 pub fn emit_scan_cycle_superseded(duration: Duration) {
     global_metrics().record_scan_cycle_superseded(duration);
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL).increment(1);
+}
+
+pub fn emit_scan_cycle_deferred(duration: Duration) {
+    global_metrics().record_scan_cycle_deferred(duration);
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_DEFERRED_LABEL).increment(1);
 }
 
 pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
@@ -2542,6 +2550,17 @@ impl Metrics {
         self.superseded_scan_cycles.fetch_add(1, Ordering::Relaxed);
         self.last_scan_cycle_result
             .store(SCAN_CYCLE_RESULT_SUPERSEDED, Ordering::Relaxed);
+        self.last_scan_cycle_partial_reason
+            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
+        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
+        self.last_scan_cycle_duration_millis
+            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+    }
+
+    pub fn record_scan_cycle_deferred(&self, duration: Duration) {
+        self.record_scanner_cycle_end_time();
+        self.last_scan_cycle_result
+            .store(SCAN_CYCLE_RESULT_DEFERRED, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason
             .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
         self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
@@ -4261,6 +4280,21 @@ mod tests {
         assert_eq!(report.last_cycle_duration_seconds, 0.75);
         assert_eq!(report.failed_cycles, 0);
         assert_eq!(report.superseded_cycles, 1);
+        assert_eq!(report.partial_cycles, 0);
+    }
+
+    #[tokio::test]
+    async fn report_tracks_deferred_cycle_without_failed_increment() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_deferred(Duration::from_millis(250));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_result, SCAN_CYCLE_RESULT_DEFERRED_LABEL);
+        assert_eq!(report.last_cycle_result_code, u64::from(SCAN_CYCLE_RESULT_DEFERRED));
+        assert_eq!(report.last_cycle_duration_seconds, 0.25);
+        assert_eq!(report.failed_cycles, 0);
+        assert_eq!(report.superseded_cycles, 0);
         assert_eq!(report.partial_cycles, 0);
     }
 
