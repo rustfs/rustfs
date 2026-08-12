@@ -785,9 +785,15 @@ mod tests {
         let heal_manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(heal_manager);
 
-        // Verify processor is created successfully
-        let _sender = processor.get_response_sender();
-        // If we can get the sender, processor was created correctly
+        let sender = processor.get_response_sender();
+        sender
+            .send(HealChannelResponse {
+                request_id: "request-id".to_string(),
+                success: true,
+                data: None,
+                error: None,
+            })
+            .expect("a freshly constructed processor must accept responses on its channel");
     }
 
     #[test]
