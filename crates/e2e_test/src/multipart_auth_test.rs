@@ -285,6 +285,198 @@ async fn allow_anonymous_put_object(
     Ok(())
 }
 
+/// One rejected POST Object upload driven end-to-end (backlog#1838): starts a
+/// fresh server, allows anonymous PutObject on `bucket`, posts an anonymous
+/// POST Object form whose policy carries `policy_conditions` and whose form
+/// carries `form_fields` on top of the mandatory key+policy fields, then
+/// asserts the expected status, error code, and lowercase-body mention.
+/// `case` prefixes every assertion message so a failing table row is
+/// identifiable at a glance.
+#[allow(clippy::too_many_arguments)]
+async fn run_post_object_policy_case(
+    bucket: &str,
+    object_key: &str,
+    policy_conditions: Vec<serde_json::Value>,
+    form_fields: &[(&str, &str)],
+    file_body: &[u8],
+    expected_status: reqwest::StatusCode,
+    expected_code: &str,
+    expected_mention: &str,
+    case: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(policy_conditions);
+
+    let mut post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy);
+    for (name, value) in form_fields {
+        post_form = post_form.text(name.to_string(), value.to_string());
+    }
+    let post_form = post_form.part(
+        "file",
+        reqwest::multipart::Part::bytes(file_body.to_vec())
+            .file_name("upload.txt")
+            .mime_str("text/plain")?,
+    );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    let response_body_lower = response_body.to_ascii_lowercase();
+
+    assert_eq!(status, expected_status, "[{case}] unexpected status, body: {response_body}");
+    assert!(
+        response_body.contains(expected_code),
+        "[{case}] response should contain {expected_code}, got: {response_body}"
+    );
+    assert!(
+        response_body_lower.contains(expected_mention),
+        "[{case}] response should mention {expected_mention}, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+/// Table-driven fold of the nine `*_missing_from_policy_conditions` POST
+/// Object tests (backlog#1838 PR1). Every row keeps its original test's exact
+/// bucket, key, form field, file body, and expected error strings; the shared
+/// shape is: policy pins bucket + key + content-length-range only, the form
+/// smuggles one extra field the policy never declared, and the upload must be
+/// rejected with 403 AccessDenied naming the offending field.
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_fields_missing_from_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    // (case, bucket, object_key, form field, file body, expected code, expected mention)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        (&'static str, &'static str),
+        &'static [u8],
+        &'static str,
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "cache-control",
+            "anon-post-policy-cache-control-missing",
+            "uploads/cache-control-missing.txt",
+            ("Cache-Control", "max-age=60"),
+            b"post-policy-cache-control-missing",
+            "AccessDenied",
+            "cache-control",
+        ),
+        (
+            "content-language",
+            "anon-post-policy-content-language-missing",
+            "uploads/content-language-missing.txt",
+            ("Content-Language", "en-US"),
+            b"post-policy-content-language-missing",
+            "AccessDenied",
+            "content-language",
+        ),
+        (
+            "content-encoding",
+            "anon-post-policy-content-encoding-missing",
+            "uploads/content-encoding-missing.txt",
+            ("Content-Encoding", "gzip"),
+            b"post-policy-content-encoding-missing",
+            "AccessDenied",
+            "content-encoding",
+        ),
+        (
+            "website-redirect-location",
+            "anon-post-policy-website-redirect-missing",
+            "uploads/website-redirect-missing.txt",
+            ("x-amz-website-redirect-location", "/docs/landing.html"),
+            b"post-policy-website-redirect-missing",
+            "AccessDenied",
+            "x-amz-website-redirect-location",
+        ),
+        (
+            "expires",
+            "anon-post-policy-expires-missing",
+            "uploads/expires-missing-object.txt",
+            ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+            b"post-policy-expires-missing",
+            "AccessDenied",
+            "expires",
+        ),
+        (
+            "tagging",
+            "anon-post-policy-tagging-missing",
+            "uploads/tagging-missing-object.txt",
+            ("x-amz-tagging", "project=alpha&env=test"),
+            b"post-policy-tagging-missing",
+            "AccessDenied",
+            "x-amz-tagging",
+        ),
+        (
+            "metadata",
+            "anon-post-policy-meta-reject",
+            "uploads/meta-reject-object.txt",
+            ("x-amz-meta-project", "alpha-demo"),
+            b"post-policy-body",
+            "<Code>AccessDenied</Code>",
+            "x-amz-meta-project",
+        ),
+        (
+            "metadata-new-key",
+            "anon-post-policy-meta-name-missing",
+            "uploads/meta-name-missing.txt",
+            ("x-amz-meta-name", "demo-name"),
+            b"post-policy-meta-name-missing",
+            "<Code>AccessDenied</Code>",
+            "x-amz-meta-name",
+        ),
+        (
+            "content-type",
+            "anon-post-policy-content-type-missing",
+            "uploads/content-type-missing.txt",
+            ("Content-Type", "text/plain"),
+            b"post-policy-content-type-missing",
+            "AccessDenied",
+            "content-type",
+        ),
+    ];
+
+    for (case, bucket, object_key, form_field, file_body, expected_code, expected_mention) in cases {
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[*form_field],
+            file_body,
+            reqwest::StatusCode::FORBIDDEN,
+            expected_code,
+            expected_mention,
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2871,59 +3063,6 @@ async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch() -> R
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_cache_control_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-cache-control-missing";
-    let object_key = "uploads/cache-control-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Cache-Control", "max-age=60")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-cache-control-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("cache-control"),
-        "response should mention cache-control, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3029,59 +3168,6 @@ async fn test_anonymous_post_object_rejects_content_language_policy_mismatch()
     assert!(
         response_body_lower.contains("content-language"),
         "response should mention content-language mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_language_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-language-missing";
-    let object_key = "uploads/content-language-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Language", "en-US")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-language-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-language"),
-        "response should mention content-language, got: {response_body}"
     );
 
     Ok(())
@@ -3201,59 +3287,6 @@ async fn test_anonymous_post_object_rejects_content_encoding_policy_mismatch()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_content_encoding_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-encoding-missing";
-    let object_key = "uploads/content-encoding-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Encoding", "gzip")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-encoding-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-encoding"),
-        "response should mention content-encoding, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_website_redirect_location_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3306,59 +3339,6 @@ async fn test_anonymous_post_object_accepts_website_redirect_location_exact_poli
     let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
     let uploaded = get_out.body.collect().await?.into_bytes();
     assert_eq!(uploaded.as_ref(), expected_body.as_slice());
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_website_redirect_location_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-website-redirect-missing";
-    let object_key = "uploads/website-redirect-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-website-redirect-location", "/docs/landing.html")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-website-redirect-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("x-amz-website-redirect-location"),
-        "response should mention x-amz-website-redirect-location, got: {response_body}"
-    );
 
     Ok(())
 }
@@ -3524,59 +3504,6 @@ async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch() -> R
     assert!(
         response_body_lower.contains("expires"),
         "response should mention Expires mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-expires-missing";
-    let object_key = "uploads/expires-missing-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Expires", "Wed, 21 Oct 2037 07:28:00 GMT")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-expires-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("expires"),
-        "response should mention Expires, got: {response_body}"
     );
 
     Ok(())
@@ -4112,115 +4039,6 @@ async fn test_anonymous_post_object_rejects_tagging_field_policy_mismatch() -> R
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_tagging_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-tagging-missing";
-    let object_key = "uploads/tagging-missing-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-tagging", "project=alpha&env=test")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-tagging-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("x-amz-tagging"),
-        "response should mention x-amz-tagging, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-reject";
-    let object_key = "uploads/meta-reject-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-project", "alpha-demo")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(
-        response_body.contains("<Code>AccessDenied</Code>"),
-        "response should contain AccessDenied code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("x-amz-meta-project"),
-        "response should mention the missing metadata field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_metadata_field_exact_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4384,59 +4202,6 @@ async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_condit
     let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
     let uploaded = get_out.body.collect().await?.into_bytes();
     assert_eq!(uploaded.as_ref(), expected_body.as_slice());
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_field_missing_from_policy_conditions_for_new_key()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-name-missing";
-    let object_key = "uploads/meta-name-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-name", "demo-name")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-meta-name-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("<Code>AccessDenied</Code>"));
-    assert!(
-        response_body_lower.contains("x-amz-meta-name"),
-        "response should mention x-amz-meta-name, got: {response_body}"
-    );
 
     Ok(())
 }
@@ -4871,59 +4636,6 @@ async fn test_anonymous_post_object_rejects_content_type_policy_mismatch() -> Re
     assert!(
         response_body_lower.contains("content-type"),
         "response should mention the conflicting field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_type_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-type-missing";
-    let object_key = "uploads/content-type-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Type", "text/plain")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-type-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-type"),
-        "response should mention content-type, got: {response_body}"
     );
 
     Ok(())
