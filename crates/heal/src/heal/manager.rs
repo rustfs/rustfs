@@ -52,6 +52,7 @@ const EVENT_HEAL_MAINLINE_THROTTLE: &str = "heal_mainline_throttle";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
+const LEGACY_ROOT_HEAL_PATH: &str = ".";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -601,7 +602,7 @@ impl RetryingHeal {
 
 fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
     let heal_path = heal_path.trim_matches('/');
-    if heal_path.is_empty() {
+    if heal_path.is_empty() || heal_path == LEGACY_ROOT_HEAL_PATH {
         return matches!(heal_type, HealType::Cluster);
     }
 
@@ -5108,6 +5109,17 @@ mod tests {
         assert!(!bucket_cancel_token.is_cancelled());
         assert!(manager.retrying_heals.lock().await.get(&cluster_request_id).is_none());
         assert!(manager.retrying_heals.lock().await.get(&bucket_request_id).is_some());
+    }
+
+    #[test]
+    fn test_heal_type_matches_path_accepts_legacy_root() {
+        assert!(heal_type_matches_path(&HealType::Cluster, LEGACY_ROOT_HEAL_PATH));
+        assert!(!heal_type_matches_path(
+            &HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            LEGACY_ROOT_HEAL_PATH,
+        ));
     }
 
     #[tokio::test]
