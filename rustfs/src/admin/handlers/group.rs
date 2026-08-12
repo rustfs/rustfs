@@ -619,7 +619,7 @@ impl Operation for UpdateGroupMembers {
                 && is_err_no_such_group(&err)
                 && has_space_be(&args.group)
             {
-                return Err(s3_error!(InvalidArgument, "group not found"));
+                return Err(s3_error!(InvalidArgument, "group name contains whitespace"));
             }
 
             iam_store
