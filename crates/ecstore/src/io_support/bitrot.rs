@@ -120,26 +120,41 @@ struct BitrotReaderSource {
 
 impl BitrotReaderSource {
     async fn open(self) -> disk::error::Result<Option<BoxedObjectReader>> {
-        if let Some(data) = self.inline_data {
-            let mut rd = Cursor::new(data);
-            let offset = u64::try_from(self.offset).map_err(|_| DiskError::FileCorrupt)?;
-            rd.set_position(offset);
-            Ok(Some(ShardReader::InMemory(rd)))
-        } else if let Some(disk) = self.disk {
-            open_disk_reader(
-                &disk,
-                &self.bucket,
-                &self.path,
-                self.offset,
-                self.length,
-                self.use_mmap_read,
-                self.stage_metrics.map(|metrics| metrics.path),
-            )
+        open_reader_source(
+            self.inline_data,
+            self.disk.as_ref(),
+            &self.bucket,
+            &self.path,
+            self.offset,
+            self.length,
+            self.use_mmap_read,
+            self.stage_metrics.map(|metrics| metrics.path),
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_reader_source(
+    inline_data: Option<Bytes>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    use_mmap_read: bool,
+    metrics_path: Option<&'static str>,
+) -> disk::error::Result<Option<BoxedObjectReader>> {
+    if let Some(data) = inline_data {
+        let mut reader = Cursor::new(data);
+        reader.set_position(u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?);
+        Ok(Some(ShardReader::InMemory(reader)))
+    } else if let Some(disk) = disk {
+        open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path)
             .await
             .map(Some)
-        } else {
-            Ok(None)
-        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -623,23 +638,22 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
-    let inline_source = inline_data.is_some();
-    let source = BitrotReaderSource {
-        inline_data,
-        disk: disk.cloned(),
-        bucket: if inline_source { String::new() } else { bucket.to_string() },
-        path: if inline_source { String::new() } else { path.to_string() },
-        offset,
-        length,
-        use_mmap_read,
-        stage_metrics,
-    };
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
     }
 
     let file_open_start = stage_metrics_enabled.then(Instant::now);
-    let reader = source.open().await?;
+    let reader = open_reader_source(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        use_mmap_read,
+        stage_metrics.map(|metrics| metrics.path),
+    )
+    .await?;
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.file_open_stage, file_open_start);
     }

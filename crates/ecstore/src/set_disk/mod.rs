@@ -2367,6 +2367,8 @@ pub struct SetDisks {
     pub default_parity_count: usize,
     pub set_index: usize,
     pub pool_index: usize,
+    /// Stable namespace shared by every object lock created for this set.
+    set_lock_namespace: Arc<str>,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
@@ -2768,6 +2770,7 @@ impl SetDisks {
         instance_ctx: Arc<InstanceContext>,
     ) -> Arc<Self> {
         let ctx = instance_ctx;
+        let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -2775,6 +2778,7 @@ impl SetDisks {
             default_parity_count,
             set_index,
             pool_index,
+            set_lock_namespace,
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
@@ -4932,6 +4936,28 @@ mod tests {
             matches!(local_guard, NamespaceLockGuard::Fast(_)),
             "a plain-erasure instance context must select the local lock strategy"
         );
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_reuses_the_set_namespace_allocation() {
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+
+        assert_eq!(&*set.set_lock_namespace, "set-0-0");
+        let before = Arc::strong_count(&set.set_lock_namespace);
+        let lock = set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.set_lock_namespace),
+            before + 1,
+            "each lock should share the set namespace instead of formatting a new String"
+        );
+        drop(lock);
+        assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
     }
 
     struct SetupTypeGuard {
