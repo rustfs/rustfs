@@ -3318,6 +3318,9 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
             return;
         }
     };
+    if configs.table_bucket_enabled {
+        return;
+    }
     let Some(lifecycle) = configs.lifecycle else {
         return;
     };
@@ -3978,6 +3981,9 @@ async fn enqueue_expiry_for_existing_object_group(
 
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let configs = metadata_boundary::get_expiry_configs(&api, bucket).await?;
+    if configs.table_bucket_enabled {
+        return Ok(());
+    }
     let Some(lc) = configs.lifecycle else {
         return Ok(());
     };
@@ -4194,12 +4200,16 @@ pub async fn expire_transitioned_object(
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> Result<ObjectInfo, std::io::Error> {
+    let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
+        .await
+        .ok_or_else(|| std::io::Error::other("lifecycle expiry is not allowed for this bucket"))?;
     let snapshot = lifecycle_delete_config_snapshot(&api, oi)
         .await
         .map_err(std::io::Error::other)?;
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
+    opts.add_namespace_lock_guard(&publication_guard);
     opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
@@ -4789,6 +4799,43 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
         .await
 }
 
+async fn lifecycle_expiry_publication_guard(
+    api: &ECStore,
+    oi: &ObjectInfo,
+    bucket_incarnation_id: Uuid,
+) -> Option<rustfs_lock::NamespaceLockGuard> {
+    let result = async {
+        let lock = api
+            .new_ns_lock(&oi.bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await?;
+        let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
+        if guard.is_lock_lost() {
+            return Err(Error::other("table-bucket publication lock was lost before lifecycle delete admission"));
+        }
+        if !metadata_boundary::lifecycle_expiry_allowed(api, &oi.bucket, bucket_incarnation_id).await? {
+            return Ok(None);
+        }
+        Ok(Some(guard))
+    }
+    .await;
+    match result {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_DELETE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "authorize_lifecycle_expiry",
+                error = %err,
+                "Lifecycle delete admission failed"
+            );
+            None
+        }
+    }
+}
+
 pub async fn apply_expiry_on_transitioned_object(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
@@ -4812,6 +4859,9 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> bool {
+    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
+        return false;
+    };
     let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -4837,6 +4887,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
+    opts.add_namespace_lock_guard(&publication_guard);
 
     if lc_event.action.delete_versioned() {
         opts.version_id = oi.version_id.map(|v| v.to_string());
@@ -5033,7 +5084,7 @@ mod tests {
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
-        jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
+        get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
         manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
@@ -5090,7 +5141,6 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::WarmBackend as _;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
-    #[cfg(feature = "test-util")]
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
@@ -10316,6 +10366,85 @@ mod tests {
                 .await
                 .is_ok(),
             "scanner must leave the due object intact"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_lifecycle_expiry_does_not_delete_from_table_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("table-bucket-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let mut reader = PutObjReader::from_vec(b"referenced table data".to_vec());
+        let object_info = ecstore
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("table data object should be created");
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket enablement should acquire the publication lock");
+        let expiry_store = ecstore.clone();
+        let expiry_object = object_info.clone();
+        let (expiry_started_tx, expiry_started_rx) = tokio::sync::oneshot::channel();
+        let mut expiry = tokio::spawn(async move {
+            let event = crate::bucket::lifecycle::lifecycle::Event {
+                action: IlmAction::DeleteAction,
+                ..Default::default()
+            };
+            let bucket_incarnation_id = expiry_store
+                .bucket_incarnation_id_from_disk(&expiry_object.bucket)
+                .await
+                .expect("bucket incarnation should be available");
+            expiry_started_tx.send(()).expect("lifecycle expiry start should be observed");
+            super::apply_expiry_on_non_transitioned_objects(
+                expiry_store,
+                &expiry_object,
+                &event,
+                &LcEventSrc::Scanner,
+                bucket_incarnation_id,
+            )
+            .await
+        });
+        expiry_started_rx.await.expect("lifecycle expiry should start");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut expiry)
+                .await
+                .is_err(),
+            "queued lifecycle expiry must wait for table-bucket enablement"
+        );
+
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
+        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        sys.persist_and_set(metadata)
+            .await
+            .expect("table bucket marker should be persisted");
+        sys.reload_from_store(&bucket)
+            .await
+            .expect("table bucket marker should become authoritative");
+        drop(enable_guard);
+        assert!(
+            !tokio::time::timeout(StdDuration::from_secs(2), expiry)
+                .await
+                .expect("queued lifecycle expiry should resume after enablement")
+                .expect("queued lifecycle expiry task should join"),
+            "a queued lifecycle task must be rejected after the bucket becomes table-enabled"
+        );
+        assert!(
+            ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_ok(),
+            "table data must remain readable after lifecycle admission rejects the delete"
         );
     }
 

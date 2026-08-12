@@ -72,9 +72,10 @@ pub(crate) use error::{TableCatalogStoreError, TableCatalogStoreResult};
 pub(crate) use iceberg::*;
 pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use identifier::{
-    default_table_data_dir_path, default_table_delete_dir_path, default_table_metadata_dir_path,
-    default_table_metadata_file_path, default_view_metadata_file_path, is_valid_table_metadata_location,
-    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
+    default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
+    default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
+    default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_view_metadata_location,
+    metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
@@ -89,12 +90,16 @@ pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
+    "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
 pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
+pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
 pub(crate) const TABLE_MANIFEST_AVRO_MAX_SIZE: usize = 128 * 1024 * 1024;
@@ -104,7 +109,7 @@ const TABLE_MANIFEST_AVRO_MAX_HEADER_ENTRIES: usize = 1_024;
 const TABLE_COMMIT_MAX_MANIFESTS: usize = 10_000;
 const TABLE_COMMIT_MAX_AVRO_BYTES: usize = 512 * 1024 * 1024;
 const TABLE_COMMIT_MAX_FILE_REFERENCES: usize = 1_000_000;
-const TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY: usize = 16;
+pub(crate) const TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY: usize = 16;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";

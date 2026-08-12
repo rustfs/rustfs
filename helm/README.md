@@ -268,6 +268,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.httpToHttpsRedirect | bool | `true` | To enable/disable the redirect httproute. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
 | gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
 | gatewayApi.listeners.https.name | string | `websecure` | Gateway API https listener name. |

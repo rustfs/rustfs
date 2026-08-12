@@ -1860,7 +1860,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             object_size += ext_part.size;
-            object_actual_size += ext_part.actual_size;
+            if opts.quota_admission.is_some() && ext_part.actual_size < 0 {
+                return Err(Error::PartMissingOrCorrupt);
+            }
+            object_actual_size = object_actual_size
+                .checked_add(ext_part.actual_size)
+                .ok_or(Error::PartMissingOrCorrupt)?;
 
             fi.parts.push(completed_multipart_object_part(p.part_num, ext_part));
         }
@@ -1889,6 +1894,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        if let Some(admission) = opts.quota_admission {
+            let quota_operation_size = u64::try_from(object_actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+            if quota_operation_size > admission.remaining() {
+                return Err(Error::QuotaExceeded {
+                    current: admission.current_usage(),
+                    limit: admission.quota_limit(),
+                });
+            }
+        }
         if let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC) {
             if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(&rc_crc) {
                 fi.checksum = Some(Bytes::from(rc_crc_bytes));
@@ -2551,29 +2565,157 @@ mod tests {
             .new_multipart_upload(bucket, object, create_opts)
             .await
             .expect("multipart upload should be created");
+        let part = put_test_part(set_disks, bucket, object, &upload.upload_id, 1, content, content.len() as i64).await;
+        (upload.upload_id, vec![part])
+    }
+
+    async fn put_test_part(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number: usize,
+        content: &[u8],
+        actual_size: i64,
+    ) -> CompletePart {
         let mut reader = PutObjReader::new(
-            HashReader::from_stream(
-                Cursor::new(content.to_vec()),
-                content.len() as i64,
-                content.len() as i64,
-                None,
-                None,
-                false,
-            )
-            .expect("hash reader should be constructed"),
+            HashReader::from_stream(Cursor::new(content.to_vec()), content.len() as i64, actual_size, None, None, false)
+                .expect("hash reader should be constructed"),
         );
         let part = set_disks
-            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .put_object_part(bucket, object, upload_id, part_number, &mut reader, &ObjectOptions::default())
             .await
             .expect("uploading the part should succeed");
-        (
-            upload.upload_id,
-            vec![CompletePart {
-                part_num: part.part_num,
-                etag: part.etag,
-                ..Default::default()
-            }],
-        )
+        CompletePart {
+            part_num: part.part_num,
+            etag: part.etag,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_quota_rejection_preserves_destination_and_upload() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-quota-admission-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let existing_payload = b"existing object";
+        let mut existing_reader = PutObjReader::from_vec(existing_payload.to_vec());
+        let existing = set_disks
+            .put_object(bucket, object, &mut existing_reader, &ObjectOptions::default())
+            .await
+            .expect("existing object should be stored");
+
+        let payload = vec![0x51; 4096];
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &payload, &ObjectOptions::default()).await;
+        let mut denied_opts = ObjectOptions::default();
+        assert!(denied_opts.set_quota_admission(100, 4195));
+
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &denied_opts)
+            .await
+            .expect_err("completion larger than the remaining quota must be rejected");
+        assert!(matches!(
+            err,
+            StorageError::QuotaExceeded {
+                current: 100,
+                limit: 4195
+            }
+        ));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("quota rejection must preserve the existing destination");
+        assert_eq!(current.etag, existing.etag);
+        assert!(
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload_id, false)
+                .await
+                .is_ok(),
+            "quota rejection must leave the multipart upload retryable"
+        );
+
+        let mut allowed_opts = ObjectOptions::default();
+        assert!(allowed_opts.set_quota_admission(100, 4196));
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts, &allowed_opts)
+            .await
+            .expect("completion at the exact remaining-quota boundary should succeed");
+        assert_eq!(completed.get_actual_size().expect("completed logical size should resolve"), 4096);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_quota_uses_compressed_logical_size() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-compressed-quota-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let mut create_opts = ObjectOptions::default();
+        insert_str(&mut create_opts.user_defined, SUFFIX_COMPRESSION, "S2".to_string());
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("multipart upload should be created");
+        let part = put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x52; 128], 8192).await;
+        let mut complete_opts = ObjectOptions::default();
+        assert!(complete_opts.set_quota_admission(0, 4096));
+
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect_err("logical size above the remaining quota must be rejected");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 0, limit: 4096 }));
+        assert!(
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+                .await
+                .is_ok(),
+            "quota rejection must leave compressed parts retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_quota_rejects_invalid_logical_sizes() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-invalid-logical-size-bucket";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let mut create_opts = ObjectOptions::default();
+        insert_str(&mut create_opts.user_defined, SUFFIX_COMPRESSION, "S2".to_string());
+        let mut complete_opts = ObjectOptions::default();
+        assert!(complete_opts.set_quota_admission(0, u64::MAX));
+
+        let negative_upload = set_disks
+            .new_multipart_upload(bucket, "negative", &create_opts)
+            .await
+            .expect("negative-size upload should be created");
+        let negative_part = put_test_part(&set_disks, bucket, "negative", &negative_upload.upload_id, 1, &[0x53], -1).await;
+        let negative_err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, "negative", &negative_upload.upload_id, vec![negative_part], &complete_opts)
+            .await
+            .expect_err("negative logical size must fail closed");
+        assert!(matches!(negative_err, StorageError::PartMissingOrCorrupt));
+
+        let overflow_upload = set_disks
+            .new_multipart_upload(bucket, "overflow", &create_opts)
+            .await
+            .expect("overflow upload should be created");
+        let first = put_test_part(&set_disks, bucket, "overflow", &overflow_upload.upload_id, 1, &[0x54], i64::MAX).await;
+        let second = put_test_part(&set_disks, bucket, "overflow", &overflow_upload.upload_id, 2, &[0x55], 1).await;
+        let overflow_err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, "overflow", &overflow_upload.upload_id, vec![first, second], &complete_opts)
+            .await
+            .expect_err("overflowing logical size must fail closed");
+        assert!(matches!(overflow_err, StorageError::PartMissingOrCorrupt));
     }
 
     async fn assert_complete_first_linearizes(bucket: &'static str, object: &'static str, create_opts: ObjectOptions) {

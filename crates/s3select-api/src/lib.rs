@@ -14,7 +14,12 @@
 
 #![recursion_limit = "256"]
 
-use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
+use datafusion::{
+    arrow::error::ArrowError,
+    common::{DataFusionError, SchemaError},
+    parquet::errors::ParquetError,
+    sql::sqlparser::parser::ParserError,
+};
 use std::{error::Error as StdError, fmt::Display};
 use thiserror::Error;
 
@@ -67,23 +72,88 @@ pub enum QueryError {
     StoreError { e: String },
 }
 
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum S3SelectPolicyError {
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SelectError {
+    #[error("The file is not in a supported compression format. Only GZIP and BZIP2 are supported.")]
+    InvalidCompressionFormat,
+
+    #[error("The data source type is not valid. Only CSV, JSON, and Parquet are supported.")]
+    InvalidDataSource,
+
+    #[error(
+        "Object decompression failed. Check that the object is properly compressed using the format specified in the request."
+    )]
+    TruncatedInput,
+
+    #[error("An error occurred while parsing the CSV file. Check the file and try again.")]
+    CsvParsingError,
+
+    #[error("An error occurred while parsing the JSON file. Check the file and try again.")]
+    JsonParsingError,
+
+    #[error("An error occurred while parsing the Parquet file. Check the file and try again.")]
+    ParquetParsingError,
+
+    #[error("{message}")]
+    ParseSelectFailure { message: String },
+
+    #[error("The SQL expression is invalid.")]
+    InvalidQuery,
+
+    #[error("The SQL expression contains a data type that is not valid.")]
+    InvalidDataType,
+
+    #[error("An incorrect argument type was specified in a function call in the SQL expression.")]
+    IncorrectSqlFunctionArgumentType,
+
+    #[error("The data source path in the SQL expression is not supported.")]
+    DataSourcePathUnsupported,
+
     #[error("Unsupported S3 Select SQL structure: {message}")]
     UnsupportedSqlStructure { message: String },
+
+    #[error("We encountered an unsupported SQL operation.")]
+    UnsupportedSqlOperation,
+
+    #[error("A column name or a path provided does not exist in the SQL expression.")]
+    EvaluatorBindingDoesNotExist,
+
+    #[error("The field name matches to multiple fields in the file. Check the SQL expression and the file, and try again.")]
+    AmbiguousFieldName,
+
+    #[error("The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.")]
+    InvalidScanRange,
 
     #[error("S3 Select query concurrency limit reached")]
     QueryConcurrencyLimit,
 
     #[error("S3 Select query exceeded the {seconds}-second execution limit")]
     QueryTimeout { seconds: u64 },
+
+    #[error("S3 Select query resource limit exceeded")]
+    ResourceExhausted,
+
+    #[error("The specified bucket does not exist.")]
+    BucketNotFound,
+
+    #[error("The specified key does not exist.")]
+    ObjectNotFound,
+
+    #[error("The query was canceled")]
+    Canceled,
+
+    #[error("An internal error occurred.")]
+    InternalError,
 }
+
+pub type S3SelectPolicyError = SelectError;
+
+const MAX_ERROR_SOURCE_DEPTH: usize = 16;
 
 impl QueryError {
     fn source_error<T: StdError + 'static>(&self) -> Option<&T> {
         let mut err: &(dyn StdError + 'static) = self;
-        for _ in 0..16 {
+        for _ in 0..MAX_ERROR_SOURCE_DEPTH {
             if let Some(source) = err.downcast_ref::<T>() {
                 return Some(source);
             }
@@ -99,10 +169,113 @@ impl QueryError {
     pub fn s3_select_policy_error(&self) -> Option<&S3SelectPolicyError> {
         self.source_error()
     }
+
+    pub fn select_error(&self) -> SelectError {
+        let mut err: &(dyn StdError + 'static) = match self {
+            Self::Datafusion { source } => source.as_ref(),
+            _ => self,
+        };
+        for _ in 0..MAX_ERROR_SOURCE_DEPTH {
+            if let Some(select_error) = classify_select_error_source(err) {
+                return select_error;
+            }
+            let Some(source) = err.source() else {
+                break;
+            };
+            err = source;
+        }
+
+        match self {
+            QueryError::NotImplemented { .. } => SelectError::UnsupportedSqlOperation,
+            QueryError::MultiStatement { .. } => SelectError::UnsupportedSqlStructure {
+                message: "multiple SQL statements are not supported".to_string(),
+            },
+            QueryError::BuildQueryDispatcher { .. } | QueryError::FunctionExists { .. } | QueryError::StoreError { .. } => {
+                SelectError::InternalError
+            }
+            QueryError::Cancel => SelectError::Canceled,
+            QueryError::FunctionNotExists { .. } => SelectError::InvalidQuery,
+            QueryError::Datafusion { .. } | QueryError::Parser { .. } => SelectError::InternalError,
+        }
+    }
 }
 
-impl From<S3SelectPolicyError> for QueryError {
-    fn from(value: S3SelectPolicyError) -> Self {
+fn classify_select_error_source(err: &(dyn StdError + 'static)) -> Option<SelectError> {
+    if let Some(error) = err.downcast_ref::<SelectError>() {
+        return Some(error.clone());
+    }
+    if let Some(error) = err.downcast_ref::<object_store::SelectObjectStoreError>() {
+        return Some(error.select_error());
+    }
+    if let Some(error) = err.downcast_ref::<datafusion::object_store::Error>() {
+        return match error {
+            datafusion::object_store::Error::NotFound { source, .. } => Some(
+                source
+                    .downcast_ref::<object_store::SelectObjectStoreError>()
+                    .map_or(SelectError::ObjectNotFound, object_store::SelectObjectStoreError::select_error),
+            ),
+            _ => None,
+        };
+    }
+    if let Some(error) = err.downcast_ref::<ParserError>() {
+        return Some(SelectError::ParseSelectFailure {
+            message: error.to_string(),
+        });
+    }
+    if let Some(error) = err.downcast_ref::<ArrowError>() {
+        return match error {
+            ArrowError::CsvError(_) => Some(SelectError::CsvParsingError),
+            ArrowError::JsonError(_) => Some(SelectError::JsonParsingError),
+            ArrowError::ParquetError(_) => Some(SelectError::ParquetParsingError),
+            ArrowError::CastError(_) | ArrowError::ParseError(_) => Some(SelectError::InvalidDataType),
+            ArrowError::MemoryError(_) => Some(SelectError::ResourceExhausted),
+            ArrowError::ExternalError(_) | ArrowError::IoError(_, _) => None,
+            _ => Some(SelectError::InternalError),
+        };
+    }
+    if let Some(error) = err.downcast_ref::<ParquetError>() {
+        return match error {
+            ParquetError::External(_) => None,
+            _ => Some(SelectError::ParquetParsingError),
+        };
+    }
+    if let Some(error) = err.downcast_ref::<SchemaError>() {
+        return Some(match error {
+            SchemaError::FieldNotFound { .. } => SelectError::EvaluatorBindingDoesNotExist,
+            SchemaError::AmbiguousReference { .. }
+            | SchemaError::DuplicateQualifiedField { .. }
+            | SchemaError::DuplicateUnqualifiedField { .. } => SelectError::AmbiguousFieldName,
+        });
+    }
+    if let Some(error) = err.downcast_ref::<DataFusionError>() {
+        return match error {
+            DataFusionError::NotImplemented(_) => Some(SelectError::UnsupportedSqlOperation),
+            DataFusionError::Plan(_) => Some(SelectError::InvalidQuery),
+            DataFusionError::ResourcesExhausted(_) => Some(SelectError::ResourceExhausted),
+            DataFusionError::Internal(_)
+            | DataFusionError::Execution(_)
+            | DataFusionError::Configuration(_)
+            | DataFusionError::Substrait(_)
+            | DataFusionError::Ffi(_) => Some(SelectError::InternalError),
+            DataFusionError::ArrowError(_, _)
+            | DataFusionError::ParquetError(_)
+            | DataFusionError::ObjectStore(_)
+            | DataFusionError::IoError(_)
+            | DataFusionError::SQL(_, _)
+            | DataFusionError::SchemaError(_, _)
+            | DataFusionError::ExecutionJoin(_)
+            | DataFusionError::External(_)
+            | DataFusionError::Context(_, _)
+            | DataFusionError::Diagnostic(_, _)
+            | DataFusionError::Collection(_)
+            | DataFusionError::Shared(_) => None,
+        };
+    }
+    None
+}
+
+impl From<SelectError> for QueryError {
+    fn from(value: SelectError) -> Self {
         Self::Datafusion {
             source: Box::new(DataFusionError::External(Box::new(value))),
         }
@@ -161,7 +334,7 @@ mod tests {
         };
         assert_eq!(err.to_string(), "Multi-statement not allow, found num:2, sql:SELECT 1; SELECT 2;");
 
-        let err = S3SelectPolicyError::UnsupportedSqlStructure {
+        let err = SelectError::UnsupportedSqlStructure {
             message: "JOIN is not supported".to_string(),
         };
         assert_eq!(err.to_string(), "Unsupported S3 Select SQL structure: JOIN is not supported");
@@ -170,11 +343,11 @@ mod tests {
         assert_eq!(err.to_string(), "The query has been canceled");
 
         assert_eq!(
-            S3SelectPolicyError::QueryConcurrencyLimit.to_string(),
+            SelectError::QueryConcurrencyLimit.to_string(),
             "S3 Select query concurrency limit reached"
         );
         assert_eq!(
-            S3SelectPolicyError::QueryTimeout { seconds: 300 }.to_string(),
+            SelectError::QueryTimeout { seconds: 300 }.to_string(),
             "S3 Select query exceeded the 300-second execution limit"
         );
 
@@ -223,12 +396,132 @@ mod tests {
 
     #[test]
     fn policy_error_is_recoverable_from_query_error() {
-        let err: QueryError = S3SelectPolicyError::QueryTimeout { seconds: 300 }.into();
+        let err: QueryError = SelectError::QueryTimeout { seconds: 300 }.into();
 
-        assert!(matches!(
-            err.s3_select_policy_error(),
-            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
-        ));
+        assert!(matches!(err.s3_select_policy_error(), Some(SelectError::QueryTimeout { seconds: 300 })));
+    }
+
+    #[test]
+    fn query_error_classifies_data_errors_without_display_matching() {
+        let cases = [
+            (
+                DataFusionError::ArrowError(Box::new(ArrowError::CsvError("private csv detail".to_string())), None),
+                SelectError::CsvParsingError,
+            ),
+            (
+                DataFusionError::ArrowError(Box::new(ArrowError::JsonError("private json detail".to_string())), None),
+                SelectError::JsonParsingError,
+            ),
+            (
+                DataFusionError::ParquetError(Box::new(ParquetError::General("private parquet detail".to_string()))),
+                SelectError::ParquetParsingError,
+            ),
+            (
+                DataFusionError::External(Box::new(SelectError::TruncatedInput)),
+                SelectError::TruncatedInput,
+            ),
+            (
+                DataFusionError::ArrowError(
+                    Box::new(ArrowError::InvalidArgumentError("private implementation detail".to_string())),
+                    None,
+                ),
+                SelectError::InternalError,
+            ),
+            (
+                DataFusionError::ArrowError(Box::new(ArrowError::CastError("invalid cast".to_string())), None),
+                SelectError::InvalidDataType,
+            ),
+            (
+                DataFusionError::ArrowError(Box::new(ArrowError::MemoryError("query memory limit".to_string())), None),
+                SelectError::ResourceExhausted,
+            ),
+            (
+                DataFusionError::Execution("private execution detail".to_string()),
+                SelectError::InternalError,
+            ),
+            (DataFusionError::Plan("invalid expression".to_string()), SelectError::InvalidQuery),
+            (
+                DataFusionError::NotImplemented("unsupported expression".to_string()),
+                SelectError::UnsupportedSqlOperation,
+            ),
+            (
+                DataFusionError::SchemaError(
+                    Box::new(SchemaError::FieldNotFound {
+                        field: Box::new(datafusion::common::Column::from_name("missing")),
+                        valid_fields: Vec::new(),
+                    }),
+                    Box::new(None),
+                ),
+                SelectError::EvaluatorBindingDoesNotExist,
+            ),
+            (
+                DataFusionError::SchemaError(
+                    Box::new(SchemaError::AmbiguousReference {
+                        field: Box::new(datafusion::common::Column::from_name("duplicate")),
+                    }),
+                    Box::new(None),
+                ),
+                SelectError::AmbiguousFieldName,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let error = QueryError::from(source);
+            assert_eq!(error.select_error(), expected, "wrong classification for {error:?}");
+        }
+    }
+
+    #[test]
+    fn query_error_preserves_typed_object_store_classification() {
+        let bucket_error = QueryError::from(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::NotFound {
+            path: "private-bucket/private-object".to_string(),
+            source: Box::new(object_store::SelectObjectStoreError::BucketNotFound {
+                source: SelectStorageError::BucketNotFound("private-bucket".to_string()),
+            }),
+        })));
+        let object_error = QueryError::from(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::NotFound {
+            path: "private-bucket/private-object".to_string(),
+            source: Box::new(object_store::SelectObjectStoreError::ObjectNotFound {
+                source: SelectStorageError::ObjectNotFound("private-bucket".to_string(), "private-object".to_string()),
+            }),
+        })));
+        let scan_range_error =
+            QueryError::from(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "test",
+                source: Box::new(object_store::SelectObjectStoreError::InvalidScanRange),
+            })));
+        let storage_error = QueryError::from(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+            store: "test",
+            source: Box::new(object_store::SelectObjectStoreError::Storage {
+                source: SelectStorageError::LessData,
+            }),
+        })));
+
+        assert_eq!(bucket_error.select_error(), SelectError::BucketNotFound);
+        assert_eq!(object_error.select_error(), SelectError::ObjectNotFound);
+        assert_eq!(scan_range_error.select_error(), SelectError::InvalidScanRange);
+        assert_eq!(storage_error.select_error(), SelectError::InternalError);
+    }
+
+    #[test]
+    fn select_error_source_traversal_stops_at_the_depth_bound() {
+        #[derive(Debug)]
+        struct CyclicError;
+
+        impl std::fmt::Display for CyclicError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cyclic error")
+            }
+        }
+
+        impl StdError for CyclicError {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(self)
+            }
+        }
+
+        let error = QueryError::from(DataFusionError::External(Box::new(CyclicError)));
+        assert_eq!(error.select_error(), SelectError::InternalError);
     }
 
     #[test]

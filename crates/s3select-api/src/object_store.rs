@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectOptions,
+    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader, SelectObjectOptions,
     SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore, SnapshotConsistencyError,
     query::{
         parser::RustFsDialect,
@@ -113,6 +113,38 @@ pub(crate) enum EcObjectStoreBuildError {
     StoreUnavailable,
     #[error("SelectObjectContent snapshot consistency failure: {0}")]
     Snapshot(#[source] SnapshotConsistencyError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SelectObjectStoreError {
+    #[error("SelectObjectContent bucket does not exist")]
+    BucketNotFound {
+        #[source]
+        source: SelectStorageError,
+    },
+    #[error("SelectObjectContent object does not exist")]
+    ObjectNotFound {
+        #[source]
+        source: SelectStorageError,
+    },
+    #[error("SelectObjectContent storage failure")]
+    Storage {
+        #[source]
+        source: SelectStorageError,
+    },
+    #[error("SelectObjectContent ScanRange is invalid")]
+    InvalidScanRange,
+}
+
+impl SelectObjectStoreError {
+    pub(crate) fn select_error(&self) -> SelectError {
+        match self {
+            Self::BucketNotFound { .. } => SelectError::BucketNotFound,
+            Self::ObjectNotFound { .. } => SelectError::ObjectNotFound,
+            Self::InvalidScanRange => SelectError::InvalidScanRange,
+            Self::Storage { .. } => SelectError::InternalError,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -502,8 +534,7 @@ fn map_prepare_snapshot_error(bucket: &str, object: &str, err: PrepareSelectObje
 }
 
 fn map_build_error_to_s3(error: EcObjectStoreBuildError) -> S3Error {
-    let message = error.to_string();
-    let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, message);
+    let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, SelectError::InternalError.to_string());
     s3_error.set_source(Box::new(error));
     s3_error
 }
@@ -519,15 +550,21 @@ fn snapshot_read_error(bucket: &str, object: &str, err: SelectObjectSnapshotRead
 }
 
 fn map_storage_error(bucket: &str, object: &str, err: SelectStorageError) -> o_Error {
-    if select_is_err_bucket_not_found(&err) || select_is_err_object_not_found(&err) || select_is_err_version_not_found(&err) {
+    if select_is_err_bucket_not_found(&err) {
         return o_Error::NotFound {
             path: format!("{bucket}/{object}"),
-            source: Box::new(err),
+            source: Box::new(SelectObjectStoreError::BucketNotFound { source: err }),
+        };
+    }
+    if select_is_err_object_not_found(&err) || select_is_err_version_not_found(&err) {
+        return o_Error::NotFound {
+            path: format!("{bucket}/{object}"),
+            source: Box::new(SelectObjectStoreError::ObjectNotFound { source: err }),
         };
     }
     o_Error::Generic {
         store: "EcObjectStore",
-        source: Box::new(err),
+        source: Box::new(SelectObjectStoreError::Storage { source: err }),
     }
 }
 
@@ -602,7 +639,7 @@ fn parse_scan_range_from_bounds(
 fn invalid_scan_range_store_error() -> o_Error {
     o_Error::Generic {
         store: "EcObjectStore",
-        source: format!("ScanRange: {INVALID_SCAN_RANGE_MESSAGE}").into(),
+        source: Box::new(SelectObjectStoreError::InvalidScanRange),
     }
 }
 
@@ -1150,7 +1187,11 @@ where
         })?
         .map_err(|e| o_Error::Generic {
             store: "EcObjectStore",
-            source: Box::new(e),
+            source: if e.kind() == std::io::ErrorKind::InvalidData {
+                Box::new(SelectError::JsonParsingError)
+            } else {
+                Box::new(e)
+            },
         })?;
 
         // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
@@ -1341,12 +1382,13 @@ mod test {
         SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
         bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
         extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
-        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, scan_range_from_bounds, scan_range_stream,
-        select_read_headers, snapshot_last_modified, validate_json_document_size,
+        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, map_storage_error, scan_range_from_bounds,
+        scan_range_stream, select_read_headers, snapshot_last_modified, validate_json_document_size,
     };
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
+    use crate::{QueryError, SelectError, SelectStorageError};
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
@@ -2686,6 +2728,69 @@ mod test {
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(source.to_string().contains("2 bytes remaining"));
         assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_document_stream_has_typed_select_error() {
+        let input = b"{bad".to_vec();
+        let memory_pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+        let mut output = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input.clone())),
+            input.len() as u64,
+            None,
+            memory_pool,
+            None,
+        );
+
+        let source = output
+            .next()
+            .await
+            .expect("malformed JSON should produce one stream error")
+            .expect_err("malformed JSON DOCUMENT must fail");
+        let error = QueryError::from(DataFusionError::ObjectStore(Box::new(source)));
+
+        assert_eq!(error.select_error(), SelectError::JsonParsingError);
+        assert!(output.next().await.is_none());
+    }
+
+    #[test]
+    fn storage_error_mapper_preserves_protocol_classification() {
+        let classify = |source| QueryError::from(DataFusionError::ObjectStore(Box::new(source))).select_error();
+
+        assert_eq!(
+            classify(map_storage_error(
+                "private-bucket",
+                "private-object",
+                SelectStorageError::BucketNotFound("private-bucket".to_string()),
+            )),
+            SelectError::BucketNotFound
+        );
+        assert_eq!(
+            classify(map_storage_error(
+                "private-bucket",
+                "private-object",
+                SelectStorageError::ObjectNotFound("private-bucket".to_string(), "private-object".to_string()),
+            )),
+            SelectError::ObjectNotFound
+        );
+        assert_eq!(
+            classify(map_storage_error("private-bucket", "private-object", SelectStorageError::LessData)),
+            SelectError::InternalError
+        );
+        assert_eq!(
+            classify(scan_range_from_bounds(Some(10), None, 10).expect_err("out-of-bounds range must fail")),
+            SelectError::InvalidScanRange
+        );
+        let parquet_source = map_storage_error(
+            "private-bucket",
+            "private-object",
+            SelectStorageError::ObjectNotFound("private-bucket".to_string(), "private-object".to_string()),
+        );
+        let parquet_error = QueryError::from(DataFusionError::ParquetError(Box::new(
+            datafusion::parquet::errors::ParquetError::External(Box::new(parquet_source)),
+        )));
+        assert_eq!(parquet_error.select_error(), SelectError::ObjectNotFound);
     }
 
     #[test]

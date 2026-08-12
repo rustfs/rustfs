@@ -26,8 +26,8 @@ impl Operation for RestListNamespacesHandler {
             None => TableCatalogResource::warehouse(&warehouse),
         };
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -49,8 +49,8 @@ impl Operation for RestCreateNamespaceHandler {
             "namespace creation",
         )
         .await?;
-        let store = table_catalog_store()?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let response = create_namespace_response(&store, &warehouse, request, table_bucket_enabled).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -65,8 +65,8 @@ impl Operation for RestGetNamespaceHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = get_namespace_response(&store, &warehouse, &namespace).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -81,8 +81,8 @@ impl Operation for RestDropNamespaceHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableNamespaceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
@@ -97,7 +97,7 @@ impl Operation for RestUpdateNamespacePropertiesHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::UpdateTableNamespacePropertiesAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_bounded_json_body::<UpdateNamespacePropertiesRequest>(
             &req.headers,
             req.input,
@@ -106,7 +106,7 @@ impl Operation for RestUpdateNamespacePropertiesHandler {
             "namespace properties",
         )
         .await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = update_namespace_properties_response(&store, &warehouse, &namespace, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -121,8 +121,8 @@ impl Operation for RestNamespaceExistsHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         Ok(empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
     }
 }

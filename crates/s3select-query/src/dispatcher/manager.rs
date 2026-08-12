@@ -38,7 +38,7 @@ use datafusion::{
 use futures::Stream;
 use parking_lot::Mutex;
 use rustfs_s3select_api::{
-    QueryError, QueryResult, S3SelectPolicyError,
+    QueryError, QueryResult, SelectError,
     query::{
         Query,
         ast::ExtStatement,
@@ -128,7 +128,7 @@ impl QueryDispatcher for SimpleQueryDispatcher {
             .query_admission
             .clone()
             .try_acquire_owned()
-            .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
+            .map_err(|_| QueryError::from(SelectError::QueryConcurrencyLimit))?;
         Ok(QueryAdmission::new(Arc::new(permit)))
     }
 
@@ -245,7 +245,7 @@ impl SimpleQueryDispatcher {
                     .query_admission
                     .clone()
                     .try_acquire_owned()
-                    .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
+                    .map_err(|_| QueryError::from(SelectError::QueryConcurrencyLimit))?;
                 Arc::new(permit)
             }
         };
@@ -293,7 +293,7 @@ impl SimpleQueryDispatcher {
     ) -> QueryResult<T> {
         let deadline = query_tracker.deadline();
         let timeout_error = || {
-            S3SelectPolicyError::QueryTimeout {
+            SelectError::QueryTimeout {
                 seconds: query_tracker.timeout_seconds(),
             }
             .into()
@@ -343,11 +343,11 @@ impl SimpleQueryDispatcher {
             return QueryError::Cancel;
         }
         match query_tracker.status() {
-            QueryExecutionStatus::TimedOut => S3SelectPolicyError::QueryTimeout {
+            QueryExecutionStatus::TimedOut => SelectError::QueryTimeout {
                 seconds: query_tracker.timeout_seconds(),
             }
             .into(),
-            QueryExecutionStatus::Active if Instant::now() >= query_tracker.deadline() => S3SelectPolicyError::QueryTimeout {
+            QueryExecutionStatus::Active if Instant::now() >= query_tracker.deadline() => SelectError::QueryTimeout {
                 seconds: query_tracker.timeout_seconds(),
             }
             .into(),
@@ -430,15 +430,11 @@ impl SimpleQueryDispatcher {
                         } else if *info == *USE {
                             file_format = file_format.with_has_header(true);
                         } else {
-                            return Err(QueryError::NotImplemented {
-                                err: "unsupported FileHeaderInfo".to_string(),
-                            });
+                            return Err(SelectError::InvalidDataSource.into());
                         }
                     }
                     _ => {
-                        return Err(QueryError::NotImplemented {
-                            err: "unsupported FileHeaderInfo".to_string(),
-                        });
+                        return Err(SelectError::InvalidDataSource.into());
                     }
                 }
                 if let Some(quote) = csv.quote_character.as_ref() {
@@ -462,9 +458,7 @@ impl SimpleQueryDispatcher {
                     .unwrap_or_else(|| ".json".to_string());
                 (ListingOptions::new(Arc::new(file_format)).with_file_extension(file_ext), false, false)
             } else {
-                return Err(QueryError::NotImplemented {
-                    err: "not support this file type".to_string(),
-                });
+                return Err(SelectError::InvalidDataSource.into());
             };
 
         let resolve_schema = listing_options.infer_schema(session.inner(), &table_path).await?;
@@ -642,7 +636,7 @@ impl Stream for TrackedRecordBatchStream {
 }
 
 fn query_timeout_error(timeout_seconds: u64) -> datafusion::common::DataFusionError {
-    datafusion::common::DataFusionError::External(Box::new(S3SelectPolicyError::QueryTimeout {
+    datafusion::common::DataFusionError::External(Box::new(SelectError::QueryTimeout {
         seconds: timeout_seconds,
     }))
 }
@@ -791,7 +785,7 @@ mod tests {
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use rustfs_s3select_api::{
-        QueryError, QueryResult, S3SelectPolicyError,
+        QueryError, QueryResult, SelectError,
         query::{
             Context as QueryContext, Query,
             dispatcher::QueryDispatcher,
@@ -1339,6 +1333,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_csv_header_info_is_typed_invalid_data_source() {
+        let mut input = test_input();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("test input should use CSV")
+            .file_header_info = Some(FileHeaderInfo::from_static("INVALID"));
+        let input = Arc::new(input);
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        let dispatcher = SimpleQueryDispatcherBuilder::default()
+            .with_input(Arc::clone(&input))
+            .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+            .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+            .with_parser(Arc::new(DefaultParser::default()))
+            .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)))
+            .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+            .build()
+            .expect("query dispatcher should build");
+        let query = Query::new(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+        );
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("query should acquire admission");
+
+        let error = match dispatcher.build_logical_plan(query_state_machine).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid FileHeaderInfo must fail while building the provider"),
+        };
+
+        assert_eq!(error.select_error(), SelectError::InvalidDataSource);
+    }
+
+    #[tokio::test]
     async fn csv_query_uses_custom_record_delimiter_across_file_partitions() {
         const ROW_COUNT: usize = 200_000;
 
@@ -1420,7 +1455,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryConcurrencyLimit))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryConcurrencyLimit))
         ));
     }
 
@@ -1474,7 +1509,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryConcurrencyLimit))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryConcurrencyLimit))
         ));
     }
 
@@ -1571,7 +1606,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 0 }))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryTimeout { seconds: 0 }))
         ));
         assert_eq!(admission.available_permits(), 1);
     }
@@ -1601,7 +1636,7 @@ mod tests {
 
         assert!(matches!(
             dispatcher.execute_logical_plan(logical_plan, query_state_machine).await,
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 300 }))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryTimeout { seconds: 300 }))
         ));
         assert_eq!(admission.available_permits(), 1);
     }
@@ -1742,7 +1777,7 @@ mod tests {
         assert_eq!(admission.available_permits(), 1);
         assert!(matches!(
             dispatcher.build_logical_plan(query_state_machine).await,
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 1 }))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryTimeout { seconds: 1 }))
         ));
     }
 
@@ -1843,7 +1878,7 @@ mod tests {
         release_drop_tx.send(()).expect("release result drop");
         assert!(matches!(
             task.await.expect("deadline task should finish"),
-            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 1 }))
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::QueryTimeout { seconds: 1 }))
         ));
         assert_eq!(admission.available_permits(), 1);
     }
@@ -1985,8 +2020,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<S3SelectPolicyError>(),
-            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
+            source.downcast_ref::<SelectError>(),
+            Some(SelectError::QueryTimeout { seconds: 300 })
         ));
         assert!(inner_dropped.load(Ordering::SeqCst));
         assert_eq!(admission.available_permits(), 1);
@@ -2124,8 +2159,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<S3SelectPolicyError>(),
-            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
+            source.downcast_ref::<SelectError>(),
+            Some(SelectError::QueryTimeout { seconds: 300 })
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());
@@ -2174,8 +2209,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<S3SelectPolicyError>(),
-            Some(S3SelectPolicyError::QueryTimeout { seconds: 1 })
+            source.downcast_ref::<SelectError>(),
+            Some(SelectError::QueryTimeout { seconds: 1 })
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());

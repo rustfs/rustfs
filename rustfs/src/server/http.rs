@@ -88,6 +88,7 @@ use tonic::{Request, Status};
 use tower::{Service, ServiceBuilder};
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -108,6 +109,10 @@ const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_SIZE_BYTES: &str = "rustfs_http_ser
 const METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS: &str = "rustfs_http_server_response_body_chunk_latency_seconds";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS: &str = "rustfs_http_server_response_body_stream_duration_seconds";
 const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_server_connection_cap_saturated_total";
+const HTTP_STREAMING_BODY_FAILURE_STAGE_TRANSPORT: &str = "http_transport";
+const HTTP_STREAMING_BODY_FAILURE_REASON_TRANSPORT: &str = "transport_failure";
+const HTTP_STREAMING_BODY_FAILURE_CLASS_TRANSPORT: &str = "transport";
+const HTTP_STREAMING_BODY_FAILURE_UNKNOWN: &str = "unknown";
 
 /// Cached handle for the per-response-body-chunk byte counter. A streamed GET
 /// emits many chunks, so resolving the `counter!` registry entry once — the
@@ -355,6 +360,27 @@ fn record_active_http_requests(delta: i64) {
             .saturating_sub(decrement)
     };
     gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
+}
+
+#[inline]
+fn record_http_transport_streaming_body_failure() {
+    rustfs_io_metrics::record_get_object_streaming_body_failure(rustfs_io_metrics::GetObjectStreamingBodyFailure {
+        stage: HTTP_STREAMING_BODY_FAILURE_STAGE_TRANSPORT,
+        reason: HTTP_STREAMING_BODY_FAILURE_REASON_TRANSPORT,
+        error_class: HTTP_STREAMING_BODY_FAILURE_CLASS_TRANSPORT,
+        strategy: HTTP_STREAMING_BODY_FAILURE_UNKNOWN,
+        buffer_source: HTTP_STREAMING_BODY_FAILURE_UNKNOWN,
+        size_bucket: rustfs_io_metrics::GET_OBJECT_SIZE_BUCKET_UNKNOWN,
+        emitted_bytes: 0,
+        remaining_bytes: 0,
+    });
+}
+
+#[inline]
+fn record_http_transport_failure_if_body_error(error: &ServerErrorsFailureClass) {
+    if matches!(error, ServerErrorsFailureClass::Error(_)) {
+        record_http_transport_streaming_body_failure();
+    }
 }
 
 pub(crate) fn active_http_requests() -> u64 {
@@ -1591,6 +1617,7 @@ fn process_connection(
                                 LABEL_HTTP_STATUS_CLASS => "transport"
                             )
                             .increment(1);
+                            record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
                 )
@@ -1688,6 +1715,7 @@ fn process_connection(
                                 LABEL_HTTP_STATUS_CLASS => "transport"
                             )
                             .increment(1);
+                            record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
                 )

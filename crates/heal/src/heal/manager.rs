@@ -65,6 +65,14 @@ fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bo
                 && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)))
 }
 
+fn replacement_discovery_error_is_expected_for_deferred_endpoint(
+    error: &Error,
+    endpoint: &str,
+    deferred_replacement_endpoints: &HashSet<String>,
+) -> bool {
+    matches!(error, Error::Disk(DiskError::UnformattedDisk)) && deferred_replacement_endpoints.contains(endpoint)
+}
+
 fn unblock_replacement_recovery_sets_after_validation(
     blocked_sets: &mut HashSet<String>,
     retry_succeeded: HashSet<String>,
@@ -2500,6 +2508,7 @@ impl HealManager {
                         let mut endpoints = HashMap::<String, Vec<Endpoint>>::new();
                         let mut durable_recoveries = HashMap::<String, (String, Vec<Endpoint>, Vec<String>, String)>::new();
                         let mut conflicted_recovery_sets = HashSet::<String>::new();
+                        let mut deferred_replacement_endpoints = HashSet::<String>::new();
                         let local_disks = {
                             let local_disk_map = local_disk_map_read().await;
                             local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
@@ -2577,6 +2586,7 @@ impl HealManager {
                                     if !super::replacement_readiness::auto_replacement_target_ready(disk, &local_disks)
                                         .await
                                     {
+                                        deferred_replacement_endpoints.insert(endpoint.to_string());
                                         skipped_invalid_count += 1;
                                         debug!(
                                             target: "rustfs::heal::manager",
@@ -2650,6 +2660,24 @@ impl HealManager {
                             let replacement_task_ids = match ResumeUtils::get_replacement_intent_tasks(disk).await {
                                 Ok(task_ids) => task_ids,
                                 Err(error) => {
+                                    let endpoint_string = endpoint.to_string();
+                                    if replacement_discovery_error_is_expected_for_deferred_endpoint(
+                                        &error,
+                                        &endpoint_string,
+                                        &deferred_replacement_endpoints,
+                                    ) {
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %endpoint,
+                                            disk_state = "replacement_path_unavailable",
+                                            result = "recovery_records_unavailable",
+                                            "Replacement recovery discovery skipped for deferred replacement"
+                                        );
+                                        continue;
+                                    }
                                     if let Some(set_disk_id) = &disk_set_disk_id {
                                         conflicted_recovery_sets.insert(set_disk_id.clone());
                                     }
@@ -4652,6 +4680,28 @@ mod tests {
             &Error::TaskExecutionFailed {
                 message: "Failed to list replacement recovery records: temporary I/O error".to_string(),
             }
+        ));
+    }
+
+    #[test]
+    fn replacement_recovery_discovery_unformatted_is_quiet_only_for_deferred_endpoint() {
+        let error = Error::Disk(DiskError::UnformattedDisk);
+        let deferred = HashSet::from(["endpoint-a".to_string()]);
+
+        assert!(replacement_discovery_error_is_expected_for_deferred_endpoint(
+            &error,
+            "endpoint-a",
+            &deferred
+        ));
+        assert!(!replacement_discovery_error_is_expected_for_deferred_endpoint(
+            &error,
+            "endpoint-b",
+            &deferred
+        ));
+        assert!(!replacement_discovery_error_is_expected_for_deferred_endpoint(
+            &Error::Disk(DiskError::Timeout),
+            "endpoint-a",
+            &deferred
         ));
     }
 

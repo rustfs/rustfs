@@ -211,6 +211,26 @@ impl ObjectLockConfigSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaAdmission {
+    current_usage: u64,
+    quota_limit: u64,
+}
+
+impl QuotaAdmission {
+    pub(crate) fn current_usage(self) -> u64 {
+        self.current_usage
+    }
+
+    pub(crate) fn quota_limit(self) -> u64 {
+        self.quota_limit
+    }
+
+    pub(crate) fn remaining(self) -> u64 {
+        self.quota_limit - self.current_usage
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -275,12 +295,22 @@ pub struct ObjectOptions {
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Server-derived bucket-quota snapshot for commit-boundary admission.
+    pub quota_admission: Option<QuotaAdmission>,
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
 impl ObjectOptions {
+    pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
+        self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
+            current_usage,
+            quota_limit,
+        });
+        self.quota_admission.is_some()
+    }
+
     pub(crate) fn overwrites_existing_version(&self) -> bool {
         self.version_id.is_some() || !self.versioned || self.version_suspended
     }

@@ -64,9 +64,40 @@ impl BucketDurabilityConfig {
     }
 }
 
+/// Default durability tier seeded into a newly created bucket's metadata
+/// (rustfs/backlog#1811). `relaxed` aligns new buckets with MinIO's default
+/// posture: object data is still fdatasynced, while xl.meta and directory-entry
+/// fsyncs follow the relaxed durability gate.
+pub const ENV_NEW_BUCKET_DURABILITY_MODE: &str = "RUSTFS_NEW_BUCKET_DURABILITY_MODE";
+pub const DEFAULT_NEW_BUCKET_DURABILITY_MODE: &str = BUCKET_DURABILITY_MODE_RELAXED;
+
+/// The `durability.json` bytes to seed into a freshly created bucket's metadata.
+/// Empty means "no override" (the bucket then follows the global
+/// `RUSTFS_DURABILITY_MODE`); otherwise the serialized chosen tier. Operators
+/// can set `inherit` to disable the new-bucket override. Invalid values also
+/// fail closed to inherit the global mode instead of seeding a surprising tier.
+pub fn new_bucket_durability_config_json() -> Vec<u8> {
+    let raw = std::env::var(ENV_NEW_BUCKET_DURABILITY_MODE).unwrap_or_else(|_| DEFAULT_NEW_BUCKET_DURABILITY_MODE.to_string());
+    let mode = raw.trim();
+    if mode.eq_ignore_ascii_case("inherit") || mode.is_empty() || !BucketDurabilityConfig::is_valid_mode(mode) {
+        return Vec::new();
+    }
+    serde_json::to_vec(&BucketDurabilityConfig::new(mode)).expect("BucketDurabilityConfig serialization cannot fail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn new_bucket_seeded_mode() -> Option<String> {
+        let json = new_bucket_durability_config_json();
+        if json.is_empty() {
+            return None;
+        }
+        serde_json::from_slice::<BucketDurabilityConfig>(&json)
+            .expect("new-bucket durability config must serialize")
+            .normalized_mode()
+    }
 
     #[test]
     fn valid_modes_are_recognized() {
@@ -98,5 +129,34 @@ mod tests {
         // Empty object deserializes to the "inherit" default.
         let empty: BucketDurabilityConfig = serde_json::from_slice(b"{}").expect("deserialize empty");
         assert_eq!(empty.normalized_mode(), None);
+    }
+
+    #[test]
+    fn new_bucket_default_seeds_relaxed_when_unset() {
+        temp_env::with_var_unset(ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            assert_eq!(new_bucket_seeded_mode().as_deref(), Some(BUCKET_DURABILITY_MODE_RELAXED));
+        });
+    }
+
+    #[test]
+    fn new_bucket_default_honors_explicit_tiers() {
+        for mode in [
+            BUCKET_DURABILITY_MODE_STRICT,
+            BUCKET_DURABILITY_MODE_RELAXED,
+            BUCKET_DURABILITY_MODE_NONE,
+        ] {
+            temp_env::with_var(ENV_NEW_BUCKET_DURABILITY_MODE, Some(mode), || {
+                assert_eq!(new_bucket_seeded_mode().as_deref(), Some(mode));
+            });
+        }
+    }
+
+    #[test]
+    fn new_bucket_default_can_inherit_global_mode() {
+        for mode in ["inherit", "", "bogus"] {
+            temp_env::with_var(ENV_NEW_BUCKET_DURABILITY_MODE, Some(mode), || {
+                assert_eq!(new_bucket_seeded_mode(), None);
+            });
+        }
     }
 }
