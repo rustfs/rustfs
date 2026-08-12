@@ -883,6 +883,30 @@ fn internode_status_error(method: &Method, url: &str, operation: Option<&'static
     InternodeHttpError::new(classified, context).into_io_error()
 }
 
+type HttpByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
+
+/// An async reader that can also transfer received HTTP body chunks without
+/// copying their contents into an intermediate caller buffer.
+pub trait ChunkReader: AsyncRead + Send + Sync + Unpin {
+    /// Appends at most `max` bytes as owned chunks. A zero result is EOF.
+    fn poll_read_chunks(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        max: usize,
+        chunks: &mut Vec<Bytes>,
+    ) -> Poll<io::Result<usize>>;
+}
+
+pub type ChunkReaderBox = Box<dyn ChunkReader>;
+
+struct HttpReaderInit {
+    stream: HttpByteStream,
+    track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
+    stall_timeout: Option<Duration>,
+    request_started: Instant,
+}
+
 pin_project! {
     pub struct HttpReader {
         url:String,
@@ -895,7 +919,21 @@ pin_project! {
         request_started: Instant,
         duration_recorded: bool,
         #[pin]
-        inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
+        inner: StreamReader<HttpByteStream, Bytes>,
+    }
+}
+
+pin_project! {
+    pub struct HttpChunkReader {
+        track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
+        stall_timeout: Option<Duration>,
+        stall_timer: Option<Pin<Box<Sleep>>>,
+        request_started: Instant,
+        duration_recorded: bool,
+        #[pin]
+        inner: HttpByteStream,
+        current: Option<Bytes>,
     }
 }
 
@@ -934,12 +972,34 @@ impl HttpReader {
         _read_buf_size: usize,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let track_internode_metrics = is_internode_rpc_url(&url);
-        let internode_operation = internode_rpc_operation(&url);
-        let client = get_http_client(&url).await.inspect_err(|_| {
+        let init = Self::open(&url, &method, &headers, body, stall_timeout).await?;
+        Ok(Self {
+            inner: StreamReader::new(init.stream),
+            url,
+            method,
+            headers,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+        })
+    }
+
+    async fn open(
+        url: &str,
+        method: &Method,
+        headers: &HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<HttpReaderInit> {
+        let track_internode_metrics = is_internode_rpc_url(url);
+        let internode_operation = internode_rpc_operation(url);
+        let client = get_http_client(url).await.inspect_err(|_| {
             record_internode_error(track_internode_metrics, internode_operation);
         })?;
-        let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
+        let mut request: RequestBuilder = client.request(method.clone(), url).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
         }
@@ -949,7 +1009,7 @@ impl HttpReader {
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
-            internode_reqwest_error(&method, &url, internode_operation, e)
+            internode_reqwest_error(method, url, internode_operation, e)
         })?;
 
         record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
@@ -959,12 +1019,12 @@ impl HttpReader {
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classified.kind);
-            return Err(internode_classified_error(&method, &url, internode_operation, classified));
+            return Err(internode_classified_error(method, url, internode_operation, classified));
         }
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
-        let stream_error_url = url.clone();
+        let stream_error_url = url.to_owned();
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
@@ -973,17 +1033,12 @@ impl HttpReader {
             internode_reqwest_body_error(&stream_error_method, &stream_error_url, internode_operation, e)
         });
 
-        Ok(Self {
-            inner: StreamReader::new(Box::pin(stream)),
-            url,
-            method,
-            headers,
+        Ok(HttpReaderInit {
+            stream: Box::pin(stream),
             track_internode_metrics,
             internode_operation,
-            stall_timer: None,
             stall_timeout,
             request_started,
-            duration_recorded: false,
         })
     }
     pub fn url(&self) -> &str {
@@ -1000,7 +1055,6 @@ impl HttpReader {
 impl AsyncRead for HttpReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
-
         let filled_before = buf.filled().len();
         match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
@@ -1048,6 +1102,166 @@ impl AsyncRead for HttpReader {
                     this.duration_recorded,
                 );
                 Poll::Ready(Err(err))
+            }
+        }
+    }
+}
+
+impl HttpChunkReader {
+    pub async fn new_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout).await?;
+        Ok(Self {
+            inner: init.stream,
+            current: None,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+        })
+    }
+}
+
+impl AsyncRead for HttpChunkReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut this = self.project();
+        loop {
+            if let Some(mut current) = this.current.take() {
+                let take = current.len().min(buf.remaining());
+                buf.put_slice(&current.split_to(take));
+                if !current.is_empty() {
+                    *this.current = Some(current);
+                }
+                record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, take);
+                *this.stall_timer = None;
+                return Poll::Ready(Ok(()));
+            }
+
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => *this.current = Some(bytes),
+                Poll::Ready(Some(Err(err))) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(None) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    *this.stall_timer = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => {
+                    let Some(stall_timeout) = *this.stall_timeout else {
+                        return Poll::Pending;
+                    };
+                    let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
+                    if timer.as_mut().poll(cx).is_ready() {
+                        record_internode_operation_duration_once(
+                            *this.track_internode_metrics,
+                            *this.internode_operation,
+                            *this.request_started,
+                            this.duration_recorded,
+                        );
+                        record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
+                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                        return Poll::Ready(Err(Error::new(
+                            io::ErrorKind::TimedOut,
+                            "HttpReader stall timeout: no data received before deadline",
+                        )));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl ChunkReader for HttpChunkReader {
+    fn poll_read_chunks(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        max: usize,
+        chunks: &mut Vec<Bytes>,
+    ) -> Poll<io::Result<usize>> {
+        if max == 0 {
+            return Poll::Ready(Err(Error::new(io::ErrorKind::InvalidInput, "chunk read limit must be non-zero")));
+        }
+
+        let mut this = self.project();
+        loop {
+            if let Some(mut current) = this.current.take() {
+                let take = current.len().min(max);
+                chunks.push(current.split_to(take));
+                if !current.is_empty() {
+                    *this.current = Some(current);
+                }
+                record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, take);
+                *this.stall_timer = None;
+                return Poll::Ready(Ok(take));
+            }
+
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => *this.current = Some(bytes),
+                Poll::Ready(Some(Err(err))) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(None) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    *this.stall_timer = None;
+                    return Poll::Ready(Ok(0));
+                }
+                Poll::Pending => {
+                    let Some(stall_timeout) = *this.stall_timeout else {
+                        return Poll::Pending;
+                    };
+                    let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
+                    if timer.as_mut().poll(cx).is_ready() {
+                        record_internode_operation_duration_once(
+                            *this.track_internode_metrics,
+                            *this.internode_operation,
+                            *this.request_started,
+                            this.duration_recorded,
+                        );
+                        record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
+                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                        return Poll::Ready(Err(Error::new(
+                            io::ErrorKind::TimedOut,
+                            "HttpReader stall timeout: no data received before deadline",
+                        )));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -2013,6 +2227,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_chunk_reader_handoff_preserves_boundaries_and_eof() {
+        let state = TestState::default();
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .expect("reader should open");
+        let mut chunks = Vec::new();
+
+        let zero = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 0, &mut chunks))
+            .await
+            .expect_err("zero chunk bound is invalid");
+        assert_eq!(zero.kind(), io::ErrorKind::InvalidInput);
+
+        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 2, &mut chunks))
+            .await
+            .expect("first chunk read should succeed");
+        assert_eq!(first, 2);
+        assert_eq!(chunks.concat(), b"he");
+
+        let second = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 8, &mut chunks))
+            .await
+            .expect("second chunk read should succeed");
+        assert_eq!(second, 3);
+        assert_eq!(chunks.concat(), b"hello");
+
+        let eof = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 8, &mut chunks))
+            .await
+            .expect("EOF should not be an error");
+        assert_eq!(eof, 0);
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn http_reader_records_walk_dir_recv_bytes() {
         let state = TestState::default();
         let Some((base_url, handle)) = start_test_server(state.clone()).await else {
@@ -2338,6 +2588,36 @@ mod tests {
             .expect_err("terminal body errors must not become clean EOF");
 
         assert_eq!(&partial, b"partial");
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("body error should retain internode classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::BodyStreamAborted);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_chunk_reader_surfaces_body_error_after_partial_data() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/fail-after-partial");
+        let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .expect("chunk reader should accept the successful response headers");
+        let mut chunks = Vec::new();
+
+        let read = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 64, &mut chunks))
+            .await
+            .expect("partial response bytes should arrive before the terminal error");
+        let err = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 64, &mut chunks))
+            .await
+            .expect_err("terminal body errors must not become clean EOF");
+
+        assert_eq!(read, 7);
+        assert_eq!(chunks.concat(), b"partial");
         let source = err
             .get_ref()
             .and_then(|source| source.downcast_ref::<InternodeHttpError>())
