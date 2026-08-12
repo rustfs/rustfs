@@ -1052,7 +1052,13 @@ pub async fn authorize_sse_kms_object_read(
     // Only a denial is recorded here: an allowed read goes on to unwrap the key,
     // and that operation reports its own outcome.
     if let Err(error) = &result {
-        record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+        record_managed_kms_outcome(
+            principal,
+            sse_type,
+            Some(&key_id),
+            || stored_envelope_master_key_version(metadata),
+            Err(error),
+        );
     }
 
     result
@@ -1290,22 +1296,53 @@ impl std::error::Error for KmsDataPlaneFailure {
 /// Record the outcome of one managed-SSE operation on the request's audit entry.
 ///
 /// A `None` principal marks an internal caller — replication, lifecycle, heal —
-/// which has no S3 audit entry to attach to.
+/// which has no S3 audit entry to attach to. `key_version` is a closure for
+/// exactly that caller: extracting the version means base64-decoding and
+/// parsing the stored envelope, work that must not run on the internal hot
+/// paths that discard it.
 fn record_managed_kms_outcome(
     principal: Option<&SseKmsPrincipal>,
     sse_type: SSEType,
     key_id: Option<&str>,
+    key_version: impl FnOnce() -> Option<u32>,
     result: Result<(), &ApiError>,
 ) {
     let Some(audit) = principal.and_then(|principal| principal.request_audit.as_ref()) else {
         return;
     };
 
-    // The KMS key version is not observable on the data path: neither the
-    // generated data key nor the stored envelope surfaces the master-key version
-    // that wrapped it. Recording a fabricated version would be worse than
-    // omitting the tag, so it stays absent until KMS reports it.
-    audit.record(sse_type, key_id, None, result.err().map(kms_data_plane_error_class));
+    audit.record(sse_type, key_id, key_version(), result.err().map(kms_data_plane_error_class));
+}
+
+/// Master-key version recorded in a managed-SSE data-key envelope, if the
+/// wrapping backend recorded one.
+///
+/// `None` is the honest answer for every other shape: Transit and AWS wrap
+/// into opaque ciphertext that is not an envelope, Local records no version,
+/// and pre-versioning envelopes never carried the field. The single field is
+/// read through `serde_json::Value` rather than a full `DataKeyEnvelope`
+/// parse, so the audit path cannot double-count the envelope's unknown-field
+/// observability and touches nothing else in the envelope.
+fn envelope_master_key_version(envelope_bytes: &[u8]) -> Option<u32> {
+    if !is_data_key_envelope(envelope_bytes) {
+        return None;
+    }
+    u32::try_from(
+        serde_json::from_slice::<Value>(envelope_bytes)
+            .ok()?
+            .get("master_key_version")?
+            .as_u64()?,
+    )
+    .ok()
+}
+
+/// Master-key version of the envelope stored on an object, for the audit
+/// summary of a read against that object.
+fn stored_envelope_master_key_version(metadata: &HashMap<String, String>) -> Option<u32> {
+    let encoded = normalize_managed_metadata(metadata);
+    let encoded = encoded.get(INTERNAL_ENCRYPTION_KEY_HEADER)?;
+    let envelope = BASE64_STANDARD.decode(encoded).ok()?;
+    envelope_master_key_version(&envelope)
 }
 
 pub(crate) struct SseObjectEncryptionResolver;
@@ -2287,8 +2324,14 @@ async fn apply_managed_encryption_material(
         // The resolved key is only known on success: it may come from the request,
         // the bucket default or the KMS service default. On failure the audit entry
         // records what the caller asked for, which is what a reader needs to see.
-        Ok(material) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
-        Err(error) => record_managed_kms_outcome(principal, requested_sse_type, requested_key_id.as_deref(), Err(error)),
+        Ok(material) => record_managed_kms_outcome(
+            principal,
+            material.sse_type,
+            material.kms_key_id.as_deref(),
+            || material.encrypted_data_key.as_deref().and_then(envelope_master_key_version),
+            Ok(()),
+        ),
+        Err(error) => record_managed_kms_outcome(principal, requested_sse_type, requested_key_id.as_deref(), || None, Err(error)),
     }
 
     result
@@ -2404,10 +2447,22 @@ async fn apply_managed_decryption_material(
         // `None` means the object carries no managed-SSE metadata — SSE-C and
         // plaintext objects never reach KMS and must not appear in the summary.
         Ok(None) => {}
-        Ok(Some(material)) => record_managed_kms_outcome(principal, material.sse_type, material.kms_key_id.as_deref(), Ok(())),
+        Ok(Some(material)) => record_managed_kms_outcome(
+            principal,
+            material.sse_type,
+            material.kms_key_id.as_deref(),
+            || stored_envelope_master_key_version(metadata),
+            Ok(()),
+        ),
         Err(error) => {
             if let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) {
-                record_managed_kms_outcome(principal, sse_type, Some(&key_id), Err(error));
+                record_managed_kms_outcome(
+                    principal,
+                    sse_type,
+                    Some(&key_id),
+                    || stored_envelope_master_key_version(metadata),
+                    Err(error),
+                );
             }
         }
     }
@@ -6444,5 +6499,64 @@ mod tests {
     fn a_request_that_did_no_kms_work_reports_no_tags() {
         let scope = super::KmsRequestAuditScope::register("quiet-request");
         assert!(scope.audit_tags().is_empty());
+    }
+
+    /// The canonical seven-field envelope, with `master_key_version` grafted on
+    /// when a wrapping version is wanted.
+    fn audit_test_envelope(master_key_version: Option<u32>) -> Vec<u8> {
+        let mut envelope = serde_json::json!({
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        });
+        if let Some(version) = master_key_version {
+            envelope
+                .as_object_mut()
+                .expect("envelope is an object")
+                .insert("master_key_version".to_string(), serde_json::json!(version));
+        }
+        serde_json::to_vec(&envelope).expect("encode envelope")
+    }
+
+    #[test]
+    fn envelope_master_key_version_reads_only_true_envelopes() {
+        // A versioned envelope reports the wrapping version.
+        assert_eq!(super::envelope_master_key_version(&audit_test_envelope(Some(3))), Some(3));
+        // A pre-versioning envelope has no version to report.
+        assert_eq!(super::envelope_master_key_version(&audit_test_envelope(None)), None);
+        // Opaque backend ciphertext (Transit, AWS) is not an envelope.
+        assert_eq!(super::envelope_master_key_version(b"vault:v2:abcdefgh"), None);
+        // JSON that is not the envelope shape must not be probed for a version.
+        assert_eq!(super::envelope_master_key_version(br#"{"master_key_version": 9}"#), None);
+    }
+
+    #[test]
+    fn stored_envelope_master_key_version_reads_both_metadata_families() {
+        let envelope = BASE64_STANDARD.encode(audit_test_envelope(Some(2)));
+
+        // RustFS-branded stored key.
+        let metadata = HashMap::from([(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), envelope.clone())]);
+        assert_eq!(super::stored_envelope_master_key_version(&metadata), Some(2));
+
+        // MinIO-branded stored key reaches the same answer through
+        // normalize_managed_metadata — the dual internal metadata key rule.
+        let metadata = HashMap::from([(super::MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), envelope)]);
+        assert_eq!(super::stored_envelope_master_key_version(&metadata), Some(2));
+
+        assert_eq!(super::stored_envelope_master_key_version(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn recorded_key_versions_reach_the_audit_tags() {
+        let scope = super::KmsRequestAuditScope::register("versioned-request");
+        let slot = super::kms_request_audit("versioned-request").expect("a registered request must resolve its slot");
+        slot.record(SSEType::SseKms, Some("finance-key"), Some(3), None);
+        let tags = scope.audit_tags();
+        assert_eq!(audit_tag(&tags, "kmsKeyVersion").as_deref(), Some("3"));
+        assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("success"));
     }
 }
