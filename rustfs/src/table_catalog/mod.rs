@@ -362,4 +362,7 @@ fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStor
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests;

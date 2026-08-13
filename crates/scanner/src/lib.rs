@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(
     // missing_docs,

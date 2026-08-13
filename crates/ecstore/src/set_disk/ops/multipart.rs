@@ -2296,140 +2296,157 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
-        let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
-
-        // Crash-consistency injection: hard power loss after the upload is fully
-        // staged and locked but before the authoritative rename_data commit. No
-        // disk has moved the staged data, so a crash here must leave any prior
-        // committed version byte-for-byte intact (rustfs/backlog#864) and the
-        // upload fully retryable. Compiles to a no-op outside `#[cfg(test)]`.
-        if crash_inject::should_crash_at(CrashPoint::MultipartBeforeCommitRename, object) {
-            return Err(StorageError::Unexpected);
-        }
-
-        // The trailing `_` drops the rename_data old-size backfill
-        // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
-        // `get_object_info` lookup, so the backfill has no consumer here yet.
-        let (online_disks, convergence, op_old_dir, cleanup_disks, _) = Self::rename_data(
-            &shuffle_disks,
-            RUSTFS_META_MULTIPART_BUCKET,
-            &upload_id_path,
-            &parts_metadatas,
-            bucket,
-            object,
-            write_quorum,
-        )
-        .await?;
-
-        // Detach admission before any post-commit await: client cancellation
-        // must not couple durable convergence repair to cleanup work.
-        if convergence.needs_heal() {
-            let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
-                bucket.to_string(),
-                Some(object.to_string()),
-                false,
-                Some(HealChannelPriority::Normal),
-                Some(self.pool_index),
-                Some(self.set_index),
-            );
-            request.object_version_id = fi
-                .version_id
-                .or_else(|| opts.version_suspended.then(Uuid::nil))
-                .map(|version_id| version_id.to_string());
-            tokio::spawn(async move {
-                let _ = rustfs_common::heal_channel::send_heal_request(request).await;
-            });
-        }
-
-        // Crash-consistency injection: hard power loss after the authoritative
-        // rename_data commit succeeded but before the stale part.N.meta cleanup.
-        // The new version is durably committed and visible, so a crash here must
-        // leave the object readable as the new version; the un-reclaimed staging
-        // parts are swept by a retried completion or upload GC (rustfs/backlog#946).
-        // Compiles to a no-op outside `#[cfg(test)]`.
-        if crash_inject::should_crash_at(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object) {
-            return Err(StorageError::Unexpected);
-        }
-
-        // backlog#946: reclaim the stale per-part metadata (and any superfluous
-        // part.N data files no longer in the completed set) only *after* the
-        // authoritative rename_data commit above has succeeded. If rename_data
-        // fails write quorum and returns via `?`, the upload directory must keep
-        // its part.N.meta so a retried CompleteMultipartUpload can still read the
-        // parts; deleting them before the commit would strand the upload
-        // permanently. This mirrors the "clean up only after commit" pattern
-        // already used for the old data-dir GC and the upload-dir delete_all below.
-        self.cleanup_multipart_path(&parts).await;
-
-        if let Some(old_dir) = op_old_dir {
-            let committed_dir = fi.data_dir.unwrap_or_default().to_string();
-            // backlog#898: best-effort reclaim of the dereferenced old data dir.
-            // Returns a receipt (never `Err`); a failed GC must not turn an
-            // already-committed multipart completion into a 503.
-            let cleanup = self
-                .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
-                .await;
-            self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
-                .await;
-        }
-
-        if let Some(stage_start) = complete_tail_stage_start {
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "multipart_complete_tail",
-                stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
-
-        #[cfg(test)]
-        pause_multipart_commit(bucket, object, MultipartCommitPause::AfterRename).await;
-
-        let cleanup_store = self.clone();
-        let cleanup_upload_id_path = upload_id_path.clone();
-        let cleanup_bucket = bucket.to_owned();
-        let cleanup_object = object.to_owned();
-        let cleanup_upload_id = upload_id.to_owned();
-        let cleanup_handle = tokio::spawn(async move {
+        let commit_set = self.clone();
+        let commit_bucket = bucket.to_owned();
+        let commit_object = object.to_owned();
+        let commit_upload_id = upload_id.to_owned();
+        let commit_upload_id_path = upload_id_path.clone();
+        let commit_version_suspended = opts.version_suspended;
+        let commit_is_versioned = opts.versioned || opts.version_suspended;
+        let commit_capacity_scope_token = opts.capacity_scope_token;
+        let commit_object_lock_guard = object_lock_guard.take();
+        let detach_commit_owner = commit_object_lock_guard.is_some() || upload_guard.is_some();
+        let commit = async move {
+            let _object_lock_guard = commit_object_lock_guard;
             let _upload_guard = upload_guard;
-            if let Err(err) = cleanup_store
-                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &cleanup_upload_id_path, write_quorum)
+            let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
+
+            // Crash-consistency injection: hard power loss after the upload is fully
+            // staged and locked but before the authoritative rename_data commit. No
+            // disk has moved the staged data, so a crash here must leave any prior
+            // committed version byte-for-byte intact (rustfs/backlog#864) and the
+            // upload fully retryable. Compiles to a no-op outside `#[cfg(test)]`.
+            if crash_inject::should_crash_at(CrashPoint::MultipartBeforeCommitRename, &commit_object) {
+                return Err(StorageError::Unexpected);
+            }
+
+            // The trailing `_` drops the rename_data old-size backfill
+            // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
+            // `get_object_info` lookup, so the backfill has no consumer here yet.
+            let (online_disks, convergence, op_old_dir, cleanup_disks, _) = SetDisks::rename_data(
+                &shuffle_disks,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &commit_upload_id_path,
+                &parts_metadatas,
+                &commit_bucket,
+                &commit_object,
+                write_quorum,
+            )
+            .await?;
+
+            // Detach admission before any post-commit await: client cancellation
+            // must not couple durable convergence repair to cleanup work.
+            if convergence.needs_heal() {
+                let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    commit_bucket.clone(),
+                    Some(commit_object.clone()),
+                    false,
+                    Some(HealChannelPriority::Normal),
+                    Some(commit_set.pool_index),
+                    Some(commit_set.set_index),
+                );
+                request.object_version_id = fi
+                    .version_id
+                    .or_else(|| commit_version_suspended.then(Uuid::nil))
+                    .map(|version_id| version_id.to_string());
+                tokio::spawn(async move {
+                    let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                });
+            }
+
+            // Crash-consistency injection: hard power loss after the authoritative
+            // rename_data commit succeeded but before the stale part.N.meta cleanup.
+            // The new version is durably committed and visible, so a crash here must
+            // leave the object readable as the new version; the un-reclaimed staging
+            // parts are swept by a retried completion or upload GC (rustfs/backlog#946).
+            // Compiles to a no-op outside `#[cfg(test)]`.
+            if crash_inject::should_crash_at(CrashPoint::MultipartAfterCommitBeforePartsCleanup, &commit_object) {
+                return Err(StorageError::Unexpected);
+            }
+
+            // backlog#946: reclaim the stale per-part metadata (and any superfluous
+            // part.N data files no longer in the completed set) only *after* the
+            // authoritative rename_data commit above has succeeded. If rename_data
+            // fails write quorum and returns via `?`, the upload directory must keep
+            // its part.N.meta so a retried CompleteMultipartUpload can still read the
+            // parts; deleting them before the commit would strand the upload
+            // permanently. This mirrors the "clean up only after commit" pattern
+            // already used for the old data-dir GC and the upload-dir delete_all below.
+            commit_set.cleanup_multipart_path(&parts).await;
+
+            if let Some(old_dir) = op_old_dir {
+                let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+                // backlog#898: best-effort reclaim of the dereferenced old data dir.
+                // Returns a receipt (never `Err`); a failed GC must not turn an
+                // already-committed multipart completion into a 503.
+                let cleanup = commit_set
+                    .commit_rename_data_dir(
+                        &cleanup_disks,
+                        &commit_bucket,
+                        &commit_object,
+                        &old_dir.to_string(),
+                        &committed_dir,
+                        write_quorum,
+                    )
+                    .await;
+                commit_set
+                    .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
+                    .await;
+            }
+
+            if let Some(stage_start) = complete_tail_stage_start {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "multipart_complete_tail",
+                    stage_start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+
+            #[cfg(test)]
+            pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterRename).await;
+
+            if let Err(err) = commit_set
+                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &commit_upload_id_path, write_quorum)
                 .await
             {
                 warn!(
-                    bucket = %cleanup_bucket,
-                    object = %cleanup_object,
-                    upload_id = %cleanup_upload_id,
+                    bucket = %commit_bucket,
+                    object = %commit_object,
+                    upload_id = %commit_upload_id,
                     error = ?err,
                     "completed multipart upload staging cleanup did not reach write quorum"
                 );
             }
-        });
-        if let Err(err) = cleanup_handle.await {
-            warn!(
-                bucket = %bucket,
-                object = %object,
-                upload_id = %upload_id,
-                error = ?err,
-                "completed multipart upload staging cleanup task failed"
-            );
-        }
-        drop(object_lock_guard); // drop object lock guard to release the lock
 
-        for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk
-                && disk.is_online().await
-            {
-                fi = parts_metadatas[i].clone();
-                break;
+            for (i, op_disk) in online_disks.iter().enumerate() {
+                if let Some(disk) = op_disk
+                    && disk.is_online().await
+                {
+                    fi = parts_metadatas[i].clone();
+                    break;
+                }
             }
+
+            commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
+
+            fi.is_latest = true;
+
+            commit_set
+                .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
+                .await;
+
+            drop(_object_lock_guard); // drop object lock guard to release the lock
+            drop(_upload_guard);
+
+            Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
+        };
+
+        if detach_commit_owner {
+            tokio::spawn(commit)
+                .await
+                .map_err(|err| Error::other(format!("complete_multipart_upload commit task failed: {err}")))?
+        } else {
+            commit.await
         }
-
-        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
-
-        fi.is_latest = true;
-
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
-
-        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 }
 
@@ -4877,6 +4894,74 @@ mod tests {
                 assert!(
                     matches!(list_err, StorageError::InvalidUploadID(..)),
                     "ListParts should return InvalidUploadID after completion, got {list_err:?}"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn cancelled_complete_keeps_upload_lock_through_tail_cleanup() {
+        temp_env::async_with_vars(
+            [
+                (crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60")),
+            ],
+            async {
+                let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+                let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+                let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+                let bucket = "multipart-cancelled-tail-lock-bucket";
+                let object = "object";
+                make_bucket_on_all(&disk_stores, bucket).await;
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &[0x53; 4096], &ObjectOptions::default()).await;
+                let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+                signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
+                signaling.clear_observed();
+                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
+
+                let complete_store = set_disks.clone();
+                let complete_upload_id = upload_id.clone();
+                let complete = tokio::spawn(async move {
+                    complete_store
+                        .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                        .await
+                });
+                barrier.wait_until_paused().await;
+
+                let abort_store = set_disks.clone();
+                let abort_upload_id = upload_id.clone();
+                let abort = tokio::spawn(async move {
+                    abort_store
+                        .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
+                        .await
+                });
+                signaling.wait_for_attempts(2).await;
+                tokio::task::yield_now().await;
+                assert!(!abort.is_finished(), "abort must wait while completion tail owns the upload lock");
+
+                complete.abort();
+                assert!(
+                    complete
+                        .await
+                        .expect_err("the completion request should be cancellable while the tail is paused")
+                        .is_cancelled()
+                );
+                tokio::task::yield_now().await;
+                assert!(!abort.is_finished(), "cancelling the completion waiter must not release the upload lock");
+
+                barrier.release();
+                let abort_err = abort
+                    .await
+                    .expect("abort task should not panic")
+                    .expect_err("the committed upload should no longer exist when abort acquires the lock");
+                assert!(
+                    matches!(abort_err, StorageError::InvalidUploadID(..)),
+                    "abort should return InvalidUploadID after the detached completion tail, got {abort_err:?}"
                 );
             },
         )
