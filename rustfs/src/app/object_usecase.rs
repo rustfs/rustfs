@@ -6544,14 +6544,18 @@ impl DefaultObjectUsecase {
         })
     }
 
-    pub fn execute_get_object(
+    #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
+    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        self.execute_get_object_boxed(req).await
+    }
+
+    fn execute_get_object_boxed(
         &self,
         req: S3Request<GetObjectInput>,
     ) -> impl std::future::Future<Output = S3Result<S3Response<GetObjectOutput>>> + Send + '_ {
         Box::pin(self.execute_get_object_inner(req))
     }
 
-    #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
     #[hotpath::measure(
         label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_get_object",
         impl_type = "DefaultObjectUsecase"
