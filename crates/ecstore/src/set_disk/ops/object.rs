@@ -6030,6 +6030,51 @@ mod inline_put_commit_path_tests {
     }
 
     #[tokio::test]
+    async fn ec_8_4_versioned_budget_reaches_put_placement_decision() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[12]).expect("EC8+4 storage class should resolve"),
+        );
+        let bucket = "ec-8-4-versioned-inline-budget";
+        let object = "object.bin";
+        let payload = vec![0x73; 64 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        let options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &options)
+            .await
+            .expect("versioned EC8+4 PUT should use the reduced inline budget");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist versioned EC8+4 metadata: {err}"));
+            assert!(
+                !file_info.inline_data(),
+                "disk {disk_index} must keep the versioned shard outside xl.meta"
+            );
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &options)
+            .await
+            .expect("versioned non-inline EC8+4 object should remain readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("versioned non-inline EC8+4 object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
     async fn inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "inline-direct-quorum";

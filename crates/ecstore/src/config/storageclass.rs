@@ -151,7 +151,7 @@ pub struct Config {
     optimize: Option<String>,
     inline_block: usize,
     initialized: bool,
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     inline_block_explicit: bool,
     #[serde(skip)]
     standard_parities: Vec<PoolParity>,
@@ -811,6 +811,25 @@ mod tests {
         assert_eq!(decoded.parity_for_sc(STANDARD, 4), None);
         assert_eq!(decoded.parities_for_sc(STANDARD), None);
         assert!(validate_parity(0, 0).is_err());
+    }
+
+    #[test]
+    fn explicit_inline_block_survives_config_round_trip() {
+        let cfg = lookup_config_for_pools_with_env(
+            &KVS::new(),
+            &[12],
+            StorageClassEnvOverrides {
+                inline_block: Some("128KiB".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("explicit inline block should resolve");
+        assert!(cfg.should_inline(100 * 1024, 8, false));
+
+        let encoded = serde_json::to_string(&cfg).expect("config should serialize");
+        assert!(encoded.contains("\"inline_block_explicit\":true"));
+        let decoded: Config = serde_json::from_str(&encoded).expect("explicit inline config should deserialize");
+        assert!(decoded.should_inline(100 * 1024, 8, false));
     }
 
     #[test]
