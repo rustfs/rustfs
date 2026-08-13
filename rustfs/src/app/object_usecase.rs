@@ -162,8 +162,9 @@ use s3s::dto::{
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
-    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
+    ServerSideEncryptionByDefault, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
@@ -2566,6 +2567,25 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
     headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
+}
+
+/// Managed SSE resolved from a bucket default encryption rule on the copy path.
+///
+/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
+/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
+/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
+/// instead lets a same-name copy under a malformed bucket default pass the
+/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
+/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
+/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
+/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
+/// (backlog#1826).
+fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
+    match sse.sse_algorithm.as_str() {
+        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    }
 }
 
 fn should_use_small_eager_put_path(
@@ -7181,11 +7201,7 @@ impl DefaultObjectUsecase {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
                         .as_ref()
-                        .and_then(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-                            "aws:kms" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
-                            _ => None,
-                        })
+                        .map(bucket_default_write_sse)
                 })
             })
         });
@@ -9575,7 +9591,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -9768,6 +9785,46 @@ mod tests {
         assert!(lookup_opts.http_preconditions.is_none());
         assert_eq!(lookup_opts.version_id.as_deref(), Some(version_id.as_str()));
         assert!(lookup_opts.no_lock);
+    }
+
+    // A malformed bucket-default algorithm reaches this resolution only through
+    // corrupt or hand-edited bucket metadata (PutBucketEncryption validates the
+    // value), so the invariant is pinned here rather than end-to-end: the copy
+    // path must resolve managed AES256 exactly like PUT/extract. With an
+    // unencrypted same-name source and no SSE-C, the resolved default alone
+    // keeps `copy_changes_encryption` true, so the metadata-only shortcut stays
+    // off while `sse_encryption` mints a fresh DEK (backlog#1826).
+    #[test]
+    fn copy_bucket_default_unknown_sse_algorithm_falls_back_to_aes256() {
+        let config = ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
+                    kms_master_key_id: None,
+                }),
+                bucket_key_enabled: None,
+            }],
+        };
+
+        let effective_sse = config
+            .rules
+            .first()
+            .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+            .map(bucket_default_write_sse);
+
+        assert_eq!(effective_sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+
+        // Valid algorithms map to themselves, byte-identical to the PUT path.
+        for (configured, expected) in [
+            (ServerSideEncryption::AES256, ServerSideEncryption::AES256),
+            (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
+        ] {
+            let sse = ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from_static(configured),
+                kms_master_key_id: None,
+            };
+            assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
+        }
     }
 
     #[test]
@@ -16611,7 +16668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
             .bucket("test-bucket".to_string())
@@ -16754,7 +16810,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
         let restore_request = RestoreRequest {
             days: Some(1),

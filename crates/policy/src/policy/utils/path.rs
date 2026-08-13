@@ -53,6 +53,15 @@ impl<'a> LazyBuf<'a> {
 }
 
 /// copy from golang(path.Clean)
+///
+/// DELIBERATE DUPLICATION — do not replace with `rustfs_utils::path::clean`.
+/// This is a faithful port of Go's slash-only `path.Clean`, which is what S3
+/// ARN/resource matching requires: policy resource paths are opaque S3 keys,
+/// and a backslash in a key is object-name data, never a separator. The utils
+/// version is Windows-aware (`filepath.Clean` semantics: converts backslashes
+/// to forward slashes), so swapping it in would change policy evaluation on
+/// Windows — a security-adjacent behavior change. Mirror note sits on the
+/// utils implementation (backlog#1833).
 pub fn clean(path: &str) -> String {
     if path.is_empty() {
         return ".".into();

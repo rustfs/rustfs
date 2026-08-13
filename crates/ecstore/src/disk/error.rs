@@ -113,6 +113,9 @@ pub enum DiskError {
     #[error("bit-rot hash algorithm is invalid")]
     BitrotHashAlgoInvalid,
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("Rename across devices not allowed, please fix your backend configuration")]
     CrossDeviceLink,
 
@@ -143,6 +146,9 @@ pub enum DiskError {
     #[error("io error {0}")]
     Io(#[source] io::Error),
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("source stalled")]
     SourceStalled,
 
@@ -642,19 +648,6 @@ impl Hash for DiskError {
 // is currently commented out to avoid complexity. These can be re-enabled
 // when needed for specific disk quorum checking and error aggregation logic.
 
-/// Bitrot errors
-#[derive(Debug, thiserror::Error)]
-pub enum BitrotErrorType {
-    #[error("bitrot checksum verification failed")]
-    BitrotChecksumMismatch { expected: String, got: String },
-}
-
-impl From<BitrotErrorType> for DiskError {
-    fn from(e: BitrotErrorType) -> Self {
-        DiskError::other(e)
-    }
-}
-
 /// Context wrapper for file access errors
 #[derive(Debug, thiserror::Error)]
 pub struct FileAccessDeniedWithContext {
@@ -867,19 +860,6 @@ mod tests {
         let json_str = r#"{"invalid": json}"#; // Invalid JSON
         let json_error = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
         let _disk_error: DiskError = json_error.into();
-    }
-
-    #[test]
-    fn test_bitrot_error_type() {
-        let bitrot_error = BitrotErrorType::BitrotChecksumMismatch {
-            expected: "abc123".to_string(),
-            got: "def456".to_string(),
-        };
-
-        assert!(bitrot_error.to_string().contains("bitrot checksum verification failed"));
-
-        let disk_error: DiskError = bitrot_error.into();
-        assert!(matches!(disk_error, DiskError::Io(_)));
     }
 
     #[test]

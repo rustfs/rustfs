@@ -21,6 +21,13 @@ use crate::{
     Xxhash3, Xxhash64, Xxhash128,
 };
 
+// DELIBERATE DUPLICATION of the x-amz-checksum-* names that also exist as
+// AMZ_CHECKSUM_* in rustfs-utils' headers module (crates/utils/src/http/
+// headers.rs): this crate is a zero-internal-dependency leaf, so it cannot
+// import them, and it additionally owns the RustFS extension names
+// (sha512/xxhash*) that utils does not carry. Values are pinned by the S3
+// wire protocol; do not merge without a maintainer decision on the leaf
+// boundary (backlog#1833).
 pub const CRC_32_HEADER_NAME: &str = "x-amz-checksum-crc32";
 pub const CRC_32_C_HEADER_NAME: &str = "x-amz-checksum-crc32c";
 pub const SHA_1_HEADER_NAME: &str = "x-amz-checksum-sha1";

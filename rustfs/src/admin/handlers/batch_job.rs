@@ -35,11 +35,10 @@
 //! When RustFS grows a real batch-job engine, these handlers should be rewired to
 //! it; the request parsing and response shapes here are intended to stay stable.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -70,17 +69,7 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
 }
 
 async fn validate_batch_job_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
-    };
-
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
-
-    Ok(cred)
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
 }
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {

@@ -131,9 +131,9 @@ module split is tracked under `docs/architecture/`.
      why it stays local).
    - ✅ RESOLVED: `BackpressureConfig` and `DataUsageInfo` each have exactly one
      definition (`crates/io-core/src/backpressure.rs`,
-     `crates/data-usage/src/data_usage.rs`). A zero-consumer
-     `BackpressureSettings` copy lingers in `crates/io-metrics/src/config.rs`;
-     its removal is tracked in rustfs/backlog#1833.
+     `crates/data-usage/src/data_usage.rs`). The zero-consumer
+     `BackpressureSettings` copy that lingered in io-metrics was removed
+     (rustfs/backlog#1833).
 
 4. **ecstore does not know about HTTP or S3 protocol details.** It operates on
    storage-level abstractions (objects, buckets, disks, pools).
