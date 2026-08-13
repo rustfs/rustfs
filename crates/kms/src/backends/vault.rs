@@ -208,6 +208,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
             RotatedAt,
             EncryptedKeyMaterial,
             BaselineVersion,
+            WrapBudgetReserved,
             Unknown(BoundedUnknownFieldName),
         }
 
@@ -242,6 +243,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                             "rotated_at" => Field::RotatedAt,
                             "encrypted_key_material" => Field::EncryptedKeyMaterial,
                             "baseline_version" => Field::BaselineVersion,
+                            "wrap_budget_reserved" => Field::WrapBudgetReserved,
                             _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
                         })
                     }
@@ -285,6 +287,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                 let mut rotated_at = None;
                 let mut encrypted_key_material = None;
                 let mut baseline_version = None;
+                let mut wrap_budget_reserved = None;
                 let mut unknown_fields = UnknownFieldSummary::default();
 
                 while let Some(field) = map.next_key()? {
@@ -301,6 +304,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                         Field::RotatedAt => read_field!(rotated_at, "rotated_at"),
                         Field::EncryptedKeyMaterial => read_field!(encrypted_key_material, "encrypted_key_material"),
                         Field::BaselineVersion => read_field!(baseline_version, "baseline_version"),
+                        Field::WrapBudgetReserved => read_field!(wrap_budget_reserved, "wrap_budget_reserved"),
                         Field::Unknown(field) => {
                             let _: IgnoredAny = map.next_value()?;
                             unknown_fields.observe(field);
@@ -322,6 +326,9 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                     encrypted_key_material: encrypted_key_material
                         .ok_or_else(|| de::Error::missing_field("encrypted_key_material"))?,
                     baseline_version: baseline_version.unwrap_or(None),
+                    // Mirrors the struct's #[serde(default)]: absent on records
+                    // written before the wrap-budget field existed.
+                    wrap_budget_reserved: wrap_budget_reserved.unwrap_or(0),
                 };
                 unknown_fields.record_for_vault_kv2_key();
                 Ok(key_data)
