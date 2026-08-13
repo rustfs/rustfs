@@ -82,7 +82,7 @@ async fn remove_stream(stream_name: &str) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live NATS JetStream server (see module docs; RUSTFS_TEST_NATS_URL overrides)"]
 async fn missing_stream_fails_the_health_check() {
     let stream_name = format!("RUSTFS_TEST_{}", Uuid::new_v4().simple());
     let args = jetstream_args("rustfs.events", &stream_name);
@@ -94,7 +94,7 @@ async fn missing_stream_fails_the_health_check() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live NATS JetStream server (see module docs; RUSTFS_TEST_NATS_URL overrides)"]
 async fn valid_stream_passes_the_health_check() {
     let stream_name = format!("RUSTFS_TEST_{}", Uuid::new_v4().simple());
     let subject = "rustfs.events";
@@ -106,7 +106,7 @@ async fn valid_stream_passes_the_health_check() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live NATS JetStream server (see module docs; RUSTFS_TEST_NATS_URL overrides)"]
 async fn stream_not_capturing_the_subject_fails_the_health_check() {
     let stream_name = format!("RUSTFS_TEST_{}", Uuid::new_v4().simple());
     // The stream binds a different subject than the target publishes to.
@@ -118,7 +118,7 @@ async fn stream_not_capturing_the_subject_fails_the_health_check() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live NATS JetStream server (see module docs; RUSTFS_TEST_NATS_URL overrides)"]
 async fn too_small_duplicate_window_fails_the_health_check() {
     let stream_name = format!("RUSTFS_TEST_{}", Uuid::new_v4().simple());
     let subject = "rustfs.events";

@@ -59,3 +59,6 @@ mod configured_roundtrip_test;
 
 #[cfg(test)]
 mod kms_authorization_negative_matrix_test;
+
+#[cfg(test)]
+mod kms_ilm_sse_kms_test;

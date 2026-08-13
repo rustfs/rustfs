@@ -163,6 +163,46 @@ impl LockMetricsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
+    #[test]
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_lock_optimization_enabled(true);
+            record_lock_optimization_enabled(false);
+            record_spin_attempt(true);
+            record_spin_attempt(false);
+            record_spin_count_change(100);
+            record_spin_count_change(200);
+            record_lock_hold_time(Duration::from_millis(10));
+            record_lock_hold_time(Duration::from_millis(100));
+            record_early_release();
+            record_contention_event();
+        });
+
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_lock_optimization_enabled",
+            "rustfs_lock_spin_successes",
+            "rustfs_lock_spin_failures",
+            "rustfs_lock_spin_count",
+            "rustfs_lock_hold_time_secs",
+            "rustfs_lock_early_releases",
+            "rustfs_lock_contentions",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
+    }
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use std::sync::{Arc, Mutex};
 
@@ -253,40 +293,6 @@ mod tests {
 
     impl HistogramFn for NoopHistogram {
         fn record(&self, _value: f64) {}
-    }
-
-    #[test]
-    fn test_record_lock_optimization_enabled() {
-        record_lock_optimization_enabled(true);
-        record_lock_optimization_enabled(false);
-    }
-
-    #[test]
-    fn test_record_spin_attempt() {
-        record_spin_attempt(true);
-        record_spin_attempt(false);
-    }
-
-    #[test]
-    fn test_record_spin_count_change() {
-        record_spin_count_change(100);
-        record_spin_count_change(200);
-    }
-
-    #[test]
-    fn test_record_lock_hold_time() {
-        record_lock_hold_time(Duration::from_millis(10));
-        record_lock_hold_time(Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_record_early_release() {
-        record_early_release();
-    }
-
-    #[test]
-    fn test_record_contention_event() {
-        record_contention_event();
     }
 
     #[test]
