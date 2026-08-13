@@ -86,7 +86,7 @@ use super::storage_api::object_usecase::options::{
     namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
     put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
-use super::storage_api::object_usecase::request_context::{self, spawn_traced};
+use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
@@ -7506,31 +7506,50 @@ impl DefaultObjectUsecase {
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
-        let oi = store
-            .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
-            .await
-            .map_err(ApiError::from)?;
-        drop(_self_copy_lock_guard);
+        let copy_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let src_bucket = src_bucket.clone();
+            let src_key = src_key.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let src_opts = src_opts.clone();
+            let dst_opts = dst_opts.clone();
+            async move {
+                let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
+                let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
+                let _self_copy_lock_guard = _self_copy_lock_guard;
 
-        // Reuse the single pre-commit replication decision (see `dsc` above) so
-        // the persisted pending marker and the schedule always agree, mirroring
-        // the PUT path.
-        if dsc.replicate_any() {
-            schedule_object_replication(oi.clone(), store.clone(), dsc).await;
-        }
+                let oi = store
+                    .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
-        let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+                // Reuse the single pre-commit replication decision (see `dsc` above) so
+                // the persisted pending marker and the schedule always agree, mirroring
+                // the PUT path.
+                if dsc.replicate_any() {
+                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc).await;
+                }
 
-        let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Update quota tracking after successful copy
-        if has_bucket_metadata {
-            if dest_versioned {
-                record_bucket_object_version_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
-            } else {
-                record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+                maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+                let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+
+                let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                if has_bucket_metadata {
+                    if dest_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+                    }
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                Ok::<_, S3Error>((oi, dest_versioned))
             }
-        }
+        });
+        let (oi, dest_versioned) = copy_commit.await.map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
+        })??;
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
         let dest_version = if dest_versioned { raw_dest_version } else { None };
@@ -7578,7 +7597,7 @@ impl DefaultObjectUsecase {
             }
         }
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
+            e_tag: oi.etag.as_ref().map(|etag| to_s3s_etag(etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             checksum_crc32: response_checksums.crc32,
             checksum_crc32c: response_checksums.crc32c,
@@ -7609,7 +7628,6 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
