@@ -257,6 +257,15 @@ where
     tokio::spawn(tracing::Instrument::instrument(fut, tracing::Span::current()));
 }
 
+/// Spawn a request-internal task and return its join handle to the caller.
+pub fn spawn_traced_join<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(tracing::Instrument::instrument(fut, tracing::Span::current()))
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
