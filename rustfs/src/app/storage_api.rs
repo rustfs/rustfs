@@ -942,7 +942,9 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
-    pub(crate) use crate::storage::storage_api::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use crate::storage::storage_api::ecstore_compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod deadlock_detector {

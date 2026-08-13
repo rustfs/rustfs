@@ -409,7 +409,9 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use rustfs_ecstore::api::compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod ecstore_cluster {

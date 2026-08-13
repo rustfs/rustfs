@@ -1839,6 +1839,7 @@ async fn four_node_multipart_disk_compression_roundtrip() -> TestResult {
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     cluster.start().await?;
 
     let bucket = "inline-multipart-compression-roundtrip";
@@ -1873,6 +1874,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
     cluster.start().await?;
 

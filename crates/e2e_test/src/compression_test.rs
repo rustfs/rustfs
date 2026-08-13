@@ -72,6 +72,7 @@ async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Resul
     command
         .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_COMPRESSION_ENABLED", "true")
+        .env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true")
         .args([
             "--address",
             &env.address,
@@ -652,6 +653,7 @@ async fn start_rustfs_with_compression_and_sse(
     let process = Command::new(&binary_path)
         .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_COMPRESSION_ENABLED", "true")
+        .env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true")
         .env("RUSTFS_SSE_S3_MASTER_KEY", master_key)
         .env("RUST_LOG", "rustfs=info,rustfs_ecstore=info")
         .stdout(std::process::Stdio::from(server_log))
