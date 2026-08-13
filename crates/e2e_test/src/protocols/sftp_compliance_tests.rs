@@ -2854,7 +2854,7 @@ pub(crate) mod cmptst_30 {
         result
     }
 
-    #[ignore]
+    #[ignore = "timing-sensitive backend-pressure latency probe; run explicitly with --ignored"]
     #[tokio::test]
     async fn regression() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::common::init_logging();
