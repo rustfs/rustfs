@@ -1718,20 +1718,23 @@ pub(crate) fn build_ssec_read_headers(
     let mut headers = HeaderMap::new();
 
     if let Some(algorithm) = algorithm
-        && let Ok(value) = HeaderValue::from_str(algorithm.as_str())
+        && let Ok(mut value) = HeaderValue::from_str(algorithm.as_str())
     {
+        value.set_sensitive(true);
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, value);
     }
 
     if let Some(key) = key
-        && let Ok(value) = HeaderValue::from_str(key.as_str())
+        && let Ok(mut value) = HeaderValue::from_str(key.as_str())
     {
+        value.set_sensitive(true);
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, value);
     }
 
     if let Some(key_md5) = key_md5
-        && let Ok(value) = HeaderValue::from_str(key_md5.as_str())
+        && let Ok(mut value) = HeaderValue::from_str(key_md5.as_str())
     {
+        value.set_sensitive(true);
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, value);
     }
 
@@ -3480,6 +3483,21 @@ mod tests {
         SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
     };
     use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
+
+    #[test]
+    fn ssec_read_headers_are_sensitive() {
+        let headers = super::build_ssec_read_headers(
+            Some(&SSECustomerAlgorithm::from("AES256".to_string())),
+            Some(&SSECustomerKey::from("dHJhbnNwb3J0LXNlY3JldA==".to_string())),
+            Some(&SSECustomerKeyMD5::from("bWQ1LXNlY3JldA==".to_string())),
+        );
+
+        assert_eq!(headers.len(), 3);
+        assert!(headers.values().all(HeaderValue::is_sensitive));
+        let debug = format!("{headers:?}");
+        assert!(!debug.contains("dHJhbnNwb3J0LXNlY3JldA=="));
+        assert!(!debug.contains("bWQ1LXNlY3JldA=="));
+    }
 
     #[test]
     fn anonymous_s3_request_builds_kms_principal() {

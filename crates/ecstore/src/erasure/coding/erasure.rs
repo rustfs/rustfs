@@ -29,6 +29,46 @@ use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
 
+pub(crate) struct EncodedBlock {
+    data: Bytes,
+    shard_size: usize,
+}
+
+impl EncodedBlock {
+    fn empty() -> Self {
+        Self {
+            data: Bytes::new(),
+            shard_size: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.data.len()
+    }
+
+    pub(crate) fn shards(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        debug_assert!(self.shard_size > 0, "only non-empty encoded blocks reach shard writers");
+        debug_assert_eq!(self.data.len() % self.shard_size, 0);
+        self.data.chunks_exact(self.shard_size)
+    }
+
+    fn into_shards(mut self, shard_count: usize) -> Vec<Bytes> {
+        if self.shard_size == 0 {
+            return vec![Bytes::new(); shard_count];
+        }
+
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            shards.push(self.data.split_to(self.shard_size));
+        }
+        shards
+    }
+}
+
 const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
 
@@ -675,106 +715,48 @@ impl Erasure {
     #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
     #[hotpath::measure(impl_type = "Erasure")]
     pub fn encode_data(&self, data: &[u8]) -> io::Result<Vec<Bytes>> {
-        let shard_size_fn = if self.uses_legacy {
-            calc_shard_size_legacy
-        } else {
-            calc_shard_size
-        };
-        let per_shard_size = shard_size_fn(data.len(), self.data_shards);
-        if per_shard_size == 0 {
-            return Ok(vec![Bytes::new(); self.total_shard_count()]);
-        }
-        let need_total_size = per_shard_size * self.total_shard_count();
+        self.encode_data_block_inner(data)
+            .map(|block| block.into_shards(self.total_shard_count()))
+    }
 
-        let mut data_buffer = BytesMut::with_capacity(need_total_size);
+    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
+    #[hotpath::measure(label = "Erasure::encode_data", impl_type = "Erasure")]
+    pub(crate) fn encode_data_block(&self, data: &[u8]) -> io::Result<EncodedBlock> {
+        self.encode_data_block_inner(data)
+    }
+
+    fn encode_data_block_inner(&self, data: &[u8]) -> io::Result<EncodedBlock> {
+        let mut data_buffer = BytesMut::with_capacity(self.encoded_capacity_for_data_len(data.len()));
         data_buffer.extend_from_slice(data);
-        data_buffer.resize(need_total_size, 0u8);
-
-        {
-            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
-
-            if self.parity_shards > 0 {
-                if self.uses_legacy {
-                    if let Some(encoder) = self.legacy_encoder.as_ref() {
-                        encoder.encode(data_slices)?;
-                    } else {
-                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
-                    }
-                } else if let Some(encoder) = self.encoder.as_ref() {
-                    encoder.encode(data_slices)?;
-                } else {
-                    warn!("parity_shards > 0, but encoder is None");
-                }
-            }
-        }
-
-        // Zero-copy split, all shards reference data_buffer
-        let mut data_buffer = data_buffer.freeze();
-        let mut shards = Vec::with_capacity(self.total_shard_count());
-        for _ in 0..self.total_shard_count() {
-            let shard = data_buffer.split_to(per_shard_size);
-            shards.push(shard);
-        }
-
-        Ok(shards)
+        self.encode_buffer(data_buffer, data.len())
     }
 
     /// Encode owned data, avoiding a copy when the caller already has a heap buffer.
     /// Falls back to copying into a new buffer if zero-copy conversion fails.
     #[hotpath::measure(impl_type = "Erasure")]
     pub fn encode_data_owned(&self, data: Vec<u8>) -> io::Result<Vec<Bytes>> {
-        let shard_size_fn = if self.uses_legacy {
-            calc_shard_size_legacy
-        } else {
-            calc_shard_size
-        };
-        let per_shard_size = shard_size_fn(data.len(), self.data_shards);
-        if per_shard_size == 0 {
-            return Ok(vec![Bytes::new(); self.total_shard_count()]);
-        }
-        let need_total_size = per_shard_size * self.total_shard_count();
+        self.encode_data_owned_block_inner(data)
+            .map(|block| block.into_shards(self.total_shard_count()))
+    }
 
+    #[hotpath::measure(label = "Erasure::encode_data_owned", impl_type = "Erasure")]
+    pub(crate) fn encode_data_owned_block(&self, data: Vec<u8>) -> io::Result<EncodedBlock> {
+        self.encode_data_owned_block_inner(data)
+    }
+
+    fn encode_data_owned_block_inner(&self, data: Vec<u8>) -> io::Result<EncodedBlock> {
+        let data_len = data.len();
         // Try zero-copy: Vec<u8> -> Bytes -> BytesMut (succeeds when refcount == 1)
-        let mut data_buffer = match Bytes::from(data).try_into_mut() {
-            Ok(mut bm) => {
-                bm.resize(need_total_size, 0u8);
-                bm
-            }
+        let data_buffer = match Bytes::from(data).try_into_mut() {
+            Ok(data_buffer) => data_buffer,
             Err(b) => {
                 // Rare path: refcount != 1, fall back to copy
-                let mut bm = BytesMut::with_capacity(need_total_size);
-                bm.extend_from_slice(&b);
-                bm.resize(need_total_size, 0u8);
-                bm
+                let mut data_buffer = BytesMut::with_capacity(self.encoded_capacity_for_data_len(data_len));
+                data_buffer.extend_from_slice(&b);
+                data_buffer
             }
         };
-
-        {
-            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
-
-            if self.parity_shards > 0 {
-                if self.uses_legacy {
-                    if let Some(encoder) = self.legacy_encoder.as_ref() {
-                        encoder.encode(data_slices)?;
-                    } else {
-                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
-                    }
-                } else if let Some(encoder) = self.encoder.as_ref() {
-                    encoder.encode(data_slices)?;
-                } else {
-                    warn!("parity_shards > 0, but encoder is None");
-                }
-            }
-        }
-
-        let mut data_buffer = data_buffer.freeze();
-        let mut shards = Vec::with_capacity(self.total_shard_count());
-        for _ in 0..self.total_shard_count() {
-            let shard = data_buffer.split_to(per_shard_size);
-            shards.push(shard);
-        }
-
-        Ok(shards)
+        self.encode_buffer(data_buffer, data_len)
     }
 
     /// Encode data from an owned `BytesMut` buffer, avoiding the initial copy
@@ -786,7 +768,17 @@ impl Erasure {
     /// `data_len <= block_size` — both shard-size formulas are monotone in
     /// `data_len` — so this function never reallocates the buffer.
     #[hotpath::measure(impl_type = "Erasure")]
-    pub fn encode_data_bytes_mut(&self, mut data_buffer: BytesMut, data_len: usize) -> io::Result<Vec<Bytes>> {
+    pub fn encode_data_bytes_mut(&self, data_buffer: BytesMut, data_len: usize) -> io::Result<Vec<Bytes>> {
+        self.encode_buffer(data_buffer, data_len)
+            .map(|block| block.into_shards(self.total_shard_count()))
+    }
+
+    #[hotpath::measure(label = "Erasure::encode_data_bytes_mut", impl_type = "Erasure")]
+    pub(crate) fn encode_data_bytes_mut_block(&self, data_buffer: BytesMut, data_len: usize) -> io::Result<EncodedBlock> {
+        self.encode_buffer(data_buffer, data_len)
+    }
+
+    fn encode_buffer(&self, mut data_buffer: BytesMut, data_len: usize) -> io::Result<EncodedBlock> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
         } else {
@@ -794,7 +786,7 @@ impl Erasure {
         };
         let per_shard_size = shard_size_fn(data_len, self.data_shards);
         if per_shard_size == 0 {
-            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+            return Ok(EncodedBlock::empty());
         }
         let need_total_size = per_shard_size * self.total_shard_count();
 
@@ -821,14 +813,10 @@ impl Erasure {
             }
         }
 
-        let mut data_buffer = data_buffer.freeze();
-        let mut shards = Vec::with_capacity(self.total_shard_count());
-        for _ in 0..self.total_shard_count() {
-            let shard = data_buffer.split_to(per_shard_size);
-            shards.push(shard);
-        }
-
-        Ok(shards)
+        Ok(EncodedBlock {
+            data: data_buffer.freeze(),
+            shard_size: per_shard_size,
+        })
     }
 
     /// Decode and reconstruct missing data shards in-place.
@@ -1498,10 +1486,16 @@ mod tests {
     fn encode_data_owned_matches_borrowed_path() {
         for uses_legacy in [false, true] {
             let erasure = Erasure::new_with_options(4, 2, 64, uses_legacy);
-
-            assert_owned_encode_matches_borrowed(&erasure, Vec::new());
-            assert_owned_encode_matches_borrowed(&erasure, b"small payload".to_vec());
-            assert_owned_encode_matches_borrowed(&erasure, (0_u8..37).collect());
+            for data in [
+                Vec::new(),
+                vec![0xA5; 1],
+                b"small payload".to_vec(),
+                (0_u8..37).collect(),
+                vec![0xA5; erasure.block_size - 1],
+                vec![0x5A; erasure.block_size],
+            ] {
+                assert_owned_encode_matches_borrowed(&erasure, data);
+            }
         }
     }
 
@@ -1545,6 +1539,52 @@ mod tests {
                 assert_eq!(truncated, borrowed);
             }
         }
+    }
+
+    #[test]
+    fn streaming_encoded_block_uses_one_contiguous_backing_buffer() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(8, 8, 64, uses_legacy);
+
+            for data_len in [0, 1, 63, 64] {
+                let data = (0..data_len).map(|i| i as u8).collect::<Vec<_>>();
+                let expected = erasure.encode_data(&data).expect("public encode should succeed");
+                let borrowed = erasure
+                    .encode_data_block(&data)
+                    .expect("borrowed streaming encode should succeed");
+                let owned = erasure
+                    .encode_data_owned_block(data.clone())
+                    .expect("owned streaming encode should succeed");
+                let bytes_mut = erasure
+                    .encode_data_bytes_mut_block(BytesMut::from(&data[..]), data.len())
+                    .expect("BytesMut streaming encode should succeed");
+
+                assert_eq!(borrowed.queued_bytes(), owned.queued_bytes());
+                assert_eq!(borrowed.queued_bytes(), bytes_mut.queued_bytes());
+
+                if data_len == 0 {
+                    assert!(expected.iter().all(Bytes::is_empty));
+                    assert!(borrowed.is_empty());
+                    assert!(owned.is_empty());
+                    assert!(bytes_mut.is_empty());
+                    continue;
+                }
+
+                assert!(borrowed.shards().eq(expected.iter().map(Bytes::as_ref)));
+                assert!(owned.shards().eq(expected.iter().map(Bytes::as_ref)));
+                assert!(bytes_mut.shards().eq(expected.iter().map(Bytes::as_ref)));
+                assert_eq!(borrowed.shards().len(), 16);
+                let first = borrowed.shards().next().expect("encoded block should have shards").as_ptr();
+                for (index, shard) in borrowed.shards().enumerate() {
+                    assert_eq!(shard.as_ptr(), first.wrapping_add(index * shard.len()));
+                }
+            }
+        }
+        assert_eq!(
+            std::mem::size_of::<EncodedBlock>(),
+            std::mem::size_of::<Bytes>() + std::mem::size_of::<usize>(),
+            "queue entries must contain one backing buffer handle, not per-shard handles"
+        );
     }
 
     /// HP-10 capacity invariant: both shard-size formulas are monotone in `data_len`,

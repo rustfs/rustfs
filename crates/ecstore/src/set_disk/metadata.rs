@@ -85,6 +85,15 @@ impl SetDisks {
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
     }
 
+    pub(super) fn get_multipart_upload_dir(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> String {
+        let upload_dir = Self::get_upload_id_dir(bucket, object, upload_id);
+        if data_movement {
+            format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{upload_dir}")
+        } else {
+            upload_dir
+        }
+    }
+
     pub(super) fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
         let path = format!("{bucket}/{object}");
         let mut hasher = Sha256::new();
@@ -464,6 +473,28 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
+    }
+
+    pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
+        for part in &fi.parts {
+            let Some(checksums) = part.checksums.as_ref() else {
+                continue;
+            };
+            let mut algorithms = HashSet::with_capacity(checksums.len());
+            for (name, value) in checksums {
+                let Some(checksum) = rustfs_rio::Checksum::new_from_string(name, value) else {
+                    return Err(DiskError::FileCorrupt);
+                };
+                if checksum.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !algorithms.insert(checksum.checksum_type.base().0) {
+                    return Err(DiskError::FileCorrupt);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {
@@ -1079,6 +1110,25 @@ impl SetDisks {
         shuffled_disks
     }
 
+    pub(super) fn shuffle_disks_owned(mut disks: Vec<Option<DiskStore>>, distribution: &[usize]) -> Vec<Option<DiskStore>> {
+        if distribution.is_empty() {
+            return disks;
+        }
+
+        let mut shuffled_disks = vec![None; disks.len()];
+        for (index, disk) in disks.iter_mut().enumerate() {
+            let Some(slot) = distribution
+                .get(index)
+                .and_then(|block_index| block_index.checked_sub(1))
+                .filter(|slot| *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_disks[slot] = disk.take();
+        }
+        shuffled_disks
+    }
+
     pub(super) fn shuffle_check_parts(parts_errs: &[usize], distribution: &[usize]) -> Vec<usize> {
         if distribution.is_empty() {
             return parts_errs.to_vec();
@@ -1390,6 +1440,23 @@ mod tests {
         assert_eq!(owned_slots, expected_slots, "fallback disk slots must match the borrowing variant");
     }
 
+    #[tokio::test]
+    async fn owned_shuffle_preserves_fresh_put_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let fi = FileInfo::new("bucket/object", 2, 1);
+        let parts = vec![fi.clone(); fi.erasure.distribution.len()];
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+
+        assert!(owned_disks.iter().all(Option::is_some), "fresh PUT must retain every online disk");
+        assert_eq!(
+            owned_parts,
+            vec![fi; owned_disks.len()],
+            "fresh PUT metadata with pending shard indexes must survive init fallback"
+        );
+    }
+
     // backlog#949: corrupt/adversarial distribution values (0 or > N) must not
     // trigger a `usize` underflow / out-of-bounds panic in the shuffle helpers.
     #[test]
@@ -1417,6 +1484,22 @@ mod tests {
         // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
         let result = SetDisks::shuffle_disks(&disks, &[0, 9, 3, 4]);
         assert_eq!(result.len(), disks.len(), "output length must be preserved");
+    }
+
+    #[tokio::test]
+    async fn owned_disk_shuffle_matches_borrowing_variant() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut disks = shuffle_test_disks(&tempdir, 4).await;
+        disks[1] = None;
+        disks[3] = None;
+        let distribution = [3, 1, 4, 2];
+
+        let expected = SetDisks::shuffle_disks(&disks, &distribution);
+        let actual = SetDisks::shuffle_disks_owned(disks, &distribution);
+
+        let expected_slots = expected.iter().map(Option::is_some).collect::<Vec<_>>();
+        let actual_slots = actual.iter().map(Option::is_some).collect::<Vec<_>>();
+        assert_eq!(actual_slots, expected_slots, "owned shuffle must preserve disk placement");
     }
 
     #[tokio::test]

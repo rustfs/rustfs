@@ -157,7 +157,7 @@ impl MetaCacheEntry {
                 });
             }
 
-            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false, true)?;
+            let fi = fm.into_fileinfo_without_part_checksums(bucket, self.name.as_str(), "", false, false)?;
             return Ok(fi);
         }
 
@@ -169,6 +169,7 @@ impl MetaCacheEntry {
             FileInfoOpts {
                 data: false,
                 include_free_versions: false,
+                include_part_checksums: false,
             },
         )
     }
@@ -2156,5 +2157,39 @@ mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.file_info_versions("bucket")));
         let inner = caught.expect("file_info_versions must not panic");
         assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt");
+    }
+
+    #[test]
+    fn metacache_to_fileinfo_ignores_part_checksum_sidecar_regardless_of_cache_state() {
+        let mut meta = FileMeta::load(&create_real_xlmeta().expect("create real xl.meta")).expect("load real xl.meta");
+        let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("valid fixture version id");
+        let (index, mut version) = meta.find_version(Some(version_id)).expect("find fixture object version");
+        rustfs_utils::http::insert_bytes(
+            &mut version.object.as_mut().expect("fixture object").meta_sys,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            b"not-json".to_vec(),
+        );
+        meta.versions[index] = FileMetaShallowVersion::try_from(version).expect("replace fixture object version");
+        let encoded = meta.marshal_msg().expect("marshal object metadata");
+
+        let uncached = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded.clone(),
+            cached: None,
+            reusable: false,
+        }
+        .to_fileinfo("bucket")
+        .expect("uncached metacache conversion must stay lazy");
+        let cached = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+        .to_fileinfo("bucket")
+        .expect("cached metacache conversion must stay lazy");
+
+        assert_eq!(cached, uncached);
+        assert!(cached.parts.iter().all(|part| part.checksums.is_none()));
     }
 }

@@ -869,6 +869,14 @@ impl KmsConfig {
                 // `mount_path` is deprecated and unused by this backend, so an empty value
                 // is deliberately not an error.
 
+                // `kv_mount` is: it is the mount every read, write and listing is
+                // routed through, and an empty one produces a path Vault has no
+                // handler for. Rejecting it here names the setting; letting it
+                // through spends a round-trip to report an unroutable path.
+                if config.kv_mount.is_empty() {
+                    return Err(KmsError::configuration_error("Vault KV2 mount cannot be empty"));
+                }
+
                 // Validate TLS configuration if using HTTPS
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
@@ -1966,6 +1974,34 @@ mod tests {
         vault_config(VaultAuthMethod::token_file(PathBuf::from("/run/vault-agent/token")))
             .validate()
             .expect("well-formed token file auth must validate");
+    }
+
+    /// Every KV2 read, write and listing is routed through `kv_mount`, so an
+    /// empty one names a path no Vault engine answers. The Transit backend
+    /// already rejects its own empty mounts; this closes the same gap on the
+    /// setting whose absence otherwise surfaces as an unroutable-path failure at
+    /// the first Vault call.
+    #[test]
+    fn test_validate_rejects_an_empty_kv2_mount() {
+        let kv2_config = |kv_mount: &str| KmsConfig {
+            backend: KmsBackend::VaultKv2,
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "a-real-token".to_string(),
+                },
+                kv_mount: kv_mount.to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let error = kv2_config("")
+            .validate()
+            .expect_err("an empty KV2 mount must be rejected as a configuration error");
+        assert!(error.to_string().contains("mount"), "got {error}");
+
+        kv2_config("secret").validate().expect("a named KV2 mount must validate");
     }
 
     #[test]

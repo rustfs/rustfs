@@ -433,6 +433,47 @@ fn is_cas_conflict(error: &ClientError) -> bool {
     )
 }
 
+/// Whether a Vault LIST failed with the 404 that means "the path was routed,
+/// and there is nothing under it".
+///
+/// Vault answers a LIST of a path holding no entries with a 404 whose `errors`
+/// array is empty. A path with no mount behind it answers with the same status
+/// but carries a "no handler for route" message, so the empty `errors` array is
+/// what separates "reachable but empty" from "nothing mounted there".
+/// `ClientError`'s `Display` renders both as a bare "(status code 404)", so the
+/// distinction survives only on the typed error.
+///
+/// This separates a routed path from an unrouted one, not a correct mount from
+/// a wrong one. Two configurations still read as empty: a `kv_mount` pointing at
+/// a KV v1 engine, which routes the KV2 metadata path and finds nothing under
+/// it, and (on OSS Vault) a `namespace` that does not exist. Telling those apart
+/// needs a `sys/mounts` read the KMS token is not required to be allowed to
+/// make, so no LIST-based probe can catch them.
+fn is_empty_vault_list(error: &ClientError) -> bool {
+    matches!(error, ClientError::APIError { code: 404, errors } if errors.is_empty())
+}
+
+/// Message for a KV2 listing failure, naming the mount it was made against.
+///
+/// `ClientError`'s `Display` carries only the status code — never the `errors`
+/// array, and for a body it could not parse not even that — so on its own it
+/// reaches the operator as an unexplained failure against an unnamed mount.
+/// Vault's own message says which route found no handler, so it rides along.
+/// What Vault reported is repeated rather than diagnosed: a message-bearing 404
+/// also covers a mount of the wrong type and, on Vault Enterprise, a mount
+/// filtered out of this namespace or replica.
+///
+/// `listed` names what was being listed (`"keys"`, `"key version records"`) and
+/// only reaches error text, never a metric label.
+fn describe_kv2_list_failure(kv_mount: &str, listed: &str, error: &ClientError) -> String {
+    match error {
+        ClientError::APIError { code: 404, errors } => {
+            format!("Failed to list {listed} in Vault kv_mount '{kv_mount}': {}", errors.join("; "))
+        }
+        other => format!("Failed to list {listed} in Vault kv_mount '{kv_mount}': {other}"),
+    }
+}
+
 /// Map a KV2 record read failure onto the typed error surface.
 ///
 /// The three record-level outcomes are told apart from a backend outcome here,
@@ -961,9 +1002,15 @@ impl VaultKmsClient {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
                 match kv2::list(&vault.client, &self.kv_mount, &self.key_path_prefix).await {
                     Ok(keys) => Ok(Some(keys)),
-                    Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                    Err(ClientError::ResponseWrapError) => Ok(None),
+                    // The prefix holds nothing until the first key is created,
+                    // which is where every deployment starts. A 404 that
+                    // carries a Vault message instead means the request found
+                    // no mount to answer it, and that is a configuration
+                    // failure, not an empty listing.
+                    Err(error) if is_empty_vault_list(&error) => Ok(None),
                     Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                        KmsError::backend_error(format!("Failed to list keys in Vault: {e}"))
+                        KmsError::backend_error(describe_kv2_list_failure(&self.kv_mount, "keys", &e))
                     })),
                 }
             })
@@ -985,7 +1032,10 @@ impl VaultKmsClient {
     /// List the names of a key's immutable version records.
     ///
     /// `None` means the versions directory does not exist — the key was never
-    /// rotated and has no version records.
+    /// rotated and has no version records. A 404 that carries a Vault message is
+    /// not that: `delete_key` purges the version records this returns before it
+    /// removes the key itself, so an unrouted path read as "no versions" would
+    /// turn the purge into a no-op and leave master key material behind.
     async fn list_key_version_records(&self, key_id: &str) -> Result<Option<Vec<String>>> {
         let versions_dir = self.key_versions_dir(key_id);
         let versions_dir = versions_dir.as_str();
@@ -993,9 +1043,10 @@ impl VaultKmsClient {
             let vault = self.vault().map_err(AttemptError::fatal)?;
             match kv2::list(&vault.client, &self.kv_mount, versions_dir).await {
                 Ok(versions) => Ok(Some(versions)),
-                Err(ClientError::ResponseWrapError) | Err(ClientError::APIError { code: 404, .. }) => Ok(None),
+                Err(ClientError::ResponseWrapError) => Ok(None),
+                Err(error) if is_empty_vault_list(&error) => Ok(None),
                 Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                    KmsError::backend_error(format!("Failed to list key version records in Vault: {e}"))
+                    KmsError::backend_error(describe_kv2_list_failure(&self.kv_mount, "key version records", &e))
                 })),
             }
         })
@@ -1836,22 +1887,19 @@ impl VaultKmsClient {
     pub(crate) async fn health_check(&self) -> Result<()> {
         debug!("Performing Vault health check");
 
-        // Use list_vault_keys but handle the case where no keys exist (which is normal)
+        // `list_vault_keys` already reports the empty-prefix 404 as an empty
+        // listing, which is the state every deployment starts in. Anything that
+        // reaches here is a real failure and must fail the check that gates
+        // startup — including the 404 from a `kv_mount` with no engine behind
+        // it, which no listing can be served from.
         match self.list_vault_keys().await {
             Ok(_) => {
                 debug!("Vault health check passed - successfully listed keys");
                 Ok(())
             }
             Err(e) => {
-                // Check if the error is specifically about "no keys found" or 404
-                let error_msg = e.to_string();
-                if error_msg.contains("status code 404") || error_msg.contains("No such key") {
-                    debug!("Vault health check passed - 404 error is expected when no keys exist yet");
-                    Ok(())
-                } else {
-                    warn!(error = %e, "Vault KMS health check failed");
-                    Err(e)
-                }
+                warn!(error = %e, "Vault KMS health check failed");
+                Err(e)
             }
         }
     }
@@ -2322,6 +2370,14 @@ mod tests {
         }
     }
 
+    /// The 404 a Vault LIST answers with when no mount is routed at the path.
+    /// The message names the route, exactly as Vault writes it — so a test that
+    /// wants to prove the mount name was interpolated into an error cannot look
+    /// for the bare mount name, which this payload already contains.
+    fn missing_mount_404() -> ScriptedResponse {
+        ScriptedResponse::error(404, "no handler for route \"secret/metadata/rustfs/kms/keys/\". route entry not found.")
+    }
+
     /// KV2 read payload (the `data` field of the Vault envelope) for a key record.
     fn kv2_read_data(key_data: &VaultKeyData) -> serde_json::Value {
         serde_json::json!({
@@ -2417,6 +2473,136 @@ mod tests {
             matches!(error, KmsError::BackendError { .. }),
             "a transient backend failure must not be reported as a damaged record: {error:?}"
         );
+    }
+
+    /// A 404 whose `errors` array is empty is Vault reporting an empty prefix,
+    /// which is where every deployment starts: no key has been created yet, so
+    /// the health check that gates KMS startup must pass. Failing it would keep
+    /// a first-ever deployment from ever starting.
+    #[tokio::test]
+    async fn health_check_passes_on_an_empty_kv2_prefix() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::empty_list_404()]).await;
+
+        client
+            .health_check()
+            .await
+            .expect("a mounted KV2 engine with no keys yet must pass the health check");
+
+        assert_eq!(
+            vault.requests(),
+            vec!["LIST /v1/secret/metadata/rustfs/kms/keys".to_string()],
+            "the check must list the configured mount and prefix, once"
+        );
+    }
+
+    /// The same status with a Vault message behind it means nothing is routed at
+    /// `kv_mount`. That must fail the health check: passing it let a KMS whose
+    /// configured mount does not exist report itself healthy at startup and then
+    /// answer every listing with "no keys".
+    #[tokio::test]
+    async fn health_check_fails_when_the_kv2_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![missing_mount_404()]).await;
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("a missing KV2 mount must fail the health check");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+        let message = error.to_string();
+        // Not a bare `contains("secret")`: the scripted route text carries the
+        // mount name too, so only the composed phrase proves it was interpolated.
+        assert!(
+            message.contains("kv_mount 'secret'"),
+            "the failure must name the mount it was made against: {message}"
+        );
+        assert!(
+            message.contains("no handler for route"),
+            "the failure must carry Vault's own explanation: {message}"
+        );
+    }
+
+    /// A 404 whose body is not a Vault error at all — a reverse proxy's own page,
+    /// say — cannot be read as an empty prefix, and must still say which mount
+    /// failed. `vaultrs` only builds an `APIError` from a body it could parse, so
+    /// this arrives as a different variant and takes the fallback message.
+    #[tokio::test]
+    async fn list_keys_fails_closed_on_a_404_whose_body_is_not_a_vault_error() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 404,
+            body: "<html><body>404 Not Found</body></html>".to_string(),
+        }])
+        .await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a 404 that is not a Vault error must not read as an empty listing");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+        assert!(
+            error.to_string().contains("kv_mount 'secret'"),
+            "an unparseable failure must still name the mount: {error}"
+        );
+    }
+
+    /// The empty-prefix 404 on the listing path is an empty result set, not a
+    /// backend failure.
+    #[tokio::test]
+    async fn list_keys_returns_an_empty_page_on_an_empty_kv2_prefix() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::empty_list_404()]).await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("an empty KV2 prefix must list as empty, not fail");
+        assert!(response.keys.is_empty(), "got {:?}", response.keys);
+        assert!(!response.truncated, "an empty listing has nothing left to page through");
+        assert_eq!(response.next_marker, None);
+    }
+
+    /// A missing mount must not read as "you have no keys": that answer is
+    /// indistinguishable from a KMS whose keys are all gone, and the deletion
+    /// sweep takes its census over exactly this listing.
+    #[tokio::test]
+    async fn list_keys_fails_when_the_kv2_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![missing_mount_404()]).await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a missing KV2 mount must fail the listing, not empty it");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+        assert!(
+            error.to_string().contains("kv_mount 'secret'"),
+            "the failure must name the mount it was made against: {error}"
+        );
+    }
+
+    /// The version-record listing takes the same discriminator, and for a
+    /// sharper reason: `delete_key` purges the records it returns before
+    /// removing the key, so an unrouted path read as "no versions" would skip
+    /// the purge and leave master key material in Vault.
+    #[tokio::test]
+    async fn key_version_records_fail_when_the_kv2_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![missing_mount_404()]).await;
+
+        let error = client
+            .list_key_version_records("wired-key")
+            .await
+            .expect_err("a missing KV2 mount must not read as 'this key was never rotated'");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// A key that was never rotated has no versions directory, and Vault answers
+    /// that with the empty-list 404 — still "no version records", not a failure.
+    #[tokio::test]
+    async fn key_version_records_are_absent_for_a_never_rotated_key() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::empty_list_404()]).await;
+
+        let versions = client
+            .list_key_version_records("wired-key")
+            .await
+            .expect("a key with no versions directory must list as absent, not fail");
+        assert_eq!(versions, None);
     }
 
     /// A record whose body is present but not a key record is corrupt material,
@@ -2729,6 +2915,47 @@ mod tests {
         }
     }
 
+    /// The scripted tests assert what this backend does with each of Vault's two
+    /// 404 shapes; this one asserts that Vault still produces the shape they
+    /// assume. An empty prefix must arrive as a 404 the client reads as an empty
+    /// listing — if a Vault release ever answered it differently, every scripted
+    /// test would stay green while a first-ever deployment stopped starting.
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn live_health_check_passes_on_an_empty_kv2_prefix() {
+        let config = VaultConfig {
+            key_path_prefix: format!("rustfs/kms/empty-probe/{}", uuid::Uuid::new_v4()),
+            ..integration_vault_config()
+        };
+        let client = VaultKmsClient::new(config, &KmsConfig::default()).await.expect("client");
+
+        client
+            .health_check()
+            .await
+            .expect("a prefix nothing was ever written to must pass the health check");
+    }
+
+    /// The other direction, against the same real Vault: a mount that does not
+    /// exist must fail the check that gates startup, and say which mount.
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn live_health_check_fails_when_the_kv2_mount_is_missing() {
+        let config = VaultConfig {
+            kv_mount: "rustfs-kms-definitely-not-mounted".to_string(),
+            ..integration_vault_config()
+        };
+        let client = VaultKmsClient::new(config, &KmsConfig::default()).await.expect("client");
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("a kv_mount with no engine behind it must fail the health check");
+        assert!(
+            error.to_string().contains("rustfs-kms-definitely-not-mounted"),
+            "the failure must name the mount it was made against: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_key_version_paths_stay_under_the_key() {
         let client = VaultKmsClient::new(integration_vault_config(), &KmsConfig::default())
@@ -2895,6 +3122,45 @@ mod tests {
             errors: Vec::new(),
         };
         assert!(!is_cas_conflict(&not_found));
+    }
+
+    /// The whole discriminator: same status, opposite meanings, told apart by
+    /// whether Vault attached a message.
+    #[test]
+    fn test_is_empty_vault_list_only_matches_the_empty_list_404() {
+        let empty_prefix = ClientError::APIError {
+            code: 404,
+            errors: Vec::new(),
+        };
+        assert!(is_empty_vault_list(&empty_prefix));
+
+        let missing_mount = ClientError::APIError {
+            code: 404,
+            errors: vec!["no handler for route \"secret/metadata/rustfs/kms/keys/\". route entry not found.".to_string()],
+        };
+        assert!(!is_empty_vault_list(&missing_mount));
+
+        // The mount name is deliberately one that cannot appear in the route
+        // text, so the assertion below can only pass by interpolation.
+        let message = describe_kv2_list_failure("kv-not-the-route", "keys", &missing_mount);
+        assert!(
+            message.contains("no handler for route"),
+            "the reported failure must carry Vault's own explanation, which its Display drops: {message}"
+        );
+        assert!(
+            message.contains("kv_mount 'kv-not-the-route'"),
+            "the reported failure must name the mount it was made against: {message}"
+        );
+
+        // Only a 404 means "not there"; every other status is an outcome of its
+        // own and must never be read as an empty listing.
+        for code in [400u16, 403, 500, 503] {
+            let other = ClientError::APIError {
+                code,
+                errors: Vec::new(),
+            };
+            assert!(!is_empty_vault_list(&other), "status {code}");
+        }
     }
 
     fn integration_generate_request(key_id: &str) -> GenerateKeyRequest {
@@ -4292,8 +4558,9 @@ mod tests {
         let (vault, client) = scripted_client(vec![
             ScriptedResponse::ok(kv2_metadata_read_data(7)),
             ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
-            // The versions directory does not exist yet.
-            ScriptedResponse::error(404, "not found"),
+            // The versions directory does not exist yet: Vault reports that as a
+            // 404 with an empty `errors` array.
+            ScriptedResponse::empty_list_404(),
             // Freeze version 1, persist the baseline, create version 2, switch.
             ScriptedResponse::ok(kv2_write_ack()),
             ScriptedResponse::ok(kv2_write_ack()),
@@ -4663,7 +4930,10 @@ mod tests {
         /// directory at all.
         fn versions_listing(&self) -> ScriptedResponse {
             if self.version_records.is_empty() {
-                return ScriptedResponse::error(404, "not found");
+                // Vault answers a LIST of a path holding nothing with a 404
+                // carrying an empty `errors` array — not a message-bearing one,
+                // which would mean the path was never routed at all.
+                return ScriptedResponse::empty_list_404();
             }
             let keys: Vec<String> = self.version_records.iter().map(|record| record.version.to_string()).collect();
             ScriptedResponse::ok(serde_json::json!({ "keys": keys }))

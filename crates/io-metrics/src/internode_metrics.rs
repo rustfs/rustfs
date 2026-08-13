@@ -196,22 +196,19 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     },
 ];
 
+static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
+
+/// Injects the stable server label (node name or address) stamped on
+/// internode metrics. The runtime calls this when the local node name is
+/// published (see ecstore's `set_local_node_name`); the first write wins.
+/// io-metrics is a leaf crate and no longer resolves node identity itself
+/// (backlog#1834) — before injection the label reads "unset".
+pub fn set_internode_server_label(label: impl Into<String>) {
+    let _ = STABLE_SERVER_LABEL.set(label.into());
+}
+
 fn current_server_label() -> &'static str {
-    static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
-    static FALLBACK_SERVER_LABEL: LazyLock<String> = LazyLock::new(rustfs_utils::get_local_ip_with_default);
-
-    if let Some(server) = STABLE_SERVER_LABEL.get() {
-        return server.as_str();
-    }
-
-    if let Some(server) = rustfs_common::try_get_global_local_node_name() {
-        let _ = STABLE_SERVER_LABEL.set(server);
-        if let Some(server) = STABLE_SERVER_LABEL.get() {
-            return server.as_str();
-        }
-    }
-
-    FALLBACK_SERVER_LABEL.as_str()
+    STABLE_SERVER_LABEL.get().map(String::as_str).unwrap_or("unset")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

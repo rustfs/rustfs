@@ -16,7 +16,7 @@ use super::meta::{
     clone_arc_by_index, ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error,
     rebalance_metadata_not_initialized_error, should_ignore_rebalance_data_usage_cache,
 };
-use super::migration::migrate_entry_version;
+use super::migration::{RebalanceMigrationBackend, migrate_entry_version};
 use super::worker::{
     RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
     resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
@@ -144,6 +144,11 @@ impl ECStore {
             return Ok(RebalanceEntryOutcome::Completed);
         }
 
+        let bucket_incarnation_fence = match bucket_configs.bucket_incarnation_id {
+            Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
+            None => None,
+        };
+
         let mut fivs =
             resolve_rebalance_file_info_versions_result(entry.file_info_versions(&bucket), bucket.as_str(), entry.name.as_str())?;
 
@@ -203,9 +208,14 @@ impl ECStore {
             }
 
             let version_id = version.version_id.map(|v| v.to_string());
+            let expected_bucket_incarnation_id = bucket_configs.bucket_incarnation_id;
             let mut transfer = |src_pool_idx: usize, bucket: String, rd: GetObjectReader| {
                 let store = self.clone();
-                async move { store.rebalance_object(src_pool_idx, bucket, rd).await }
+                async move {
+                    store
+                        .rebalance_object(src_pool_idx, bucket, rd, expected_bucket_incarnation_id)
+                        .await
+                }
             };
             // Route delete-marker migration through the store layer so it lands on the
             // cross-pool target (excluding the source pool), not back onto the source set.
@@ -214,11 +224,12 @@ impl ECStore {
                 async move { store.delete_object(&bucket, &object, opts).await }
             };
             let result = migrate_entry_version(
-                set.as_ref(),
+                &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref()),
                 bucket.clone(),
                 pool_index,
                 version,
                 version_id.clone(),
+                expected_bucket_incarnation_id,
                 rebalance_max_attempts(),
                 should_ignore_rebalance_data_usage_cache(bucket.as_str()),
                 &mut transfer,
@@ -303,6 +314,9 @@ impl ECStore {
         }
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len(), expired) {
+            if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                return Err(Error::other("rebalance bucket incarnation fence was lost before source cleanup"));
+            }
             let cleanup_result = self
                 .finish_rebalance_entry_after_cleanup(
                     pool_index,
@@ -315,6 +329,12 @@ impl ECStore {
                         entry.name.as_str(),
                         &fivs,
                         &cleanup_preflight_allowed_missing,
+                        data_movement::SourceCleanupBucketFence {
+                            expected_incarnation_id: bucket_configs.bucket_incarnation_id,
+                            lifecycle_guard: bucket_incarnation_fence
+                                .as_ref()
+                                .and_then(|guard| guard.namespace_lock_guard()),
+                        },
                         "rebalance",
                     ),
                 )
@@ -389,8 +409,14 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rd))]
-    async fn rebalance_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
-        data_movement::migrate_object(self, pool_idx, bucket, rd, "rebalance_object").await
+    async fn rebalance_object(
+        self: Arc<Self>,
+        pool_idx: usize,
+        bucket: String,
+        rd: GetObjectReader,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        data_movement::migrate_object(self, pool_idx, bucket, rd, expected_bucket_incarnation_id, "rebalance_object").await
     }
 
     async fn update_rebalance_last_error(&self, pool_idx: usize, message: String) -> Result<()> {

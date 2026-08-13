@@ -667,18 +667,6 @@ impl SelectObjectSnapshotLockLossWake {
     }
 }
 
-fn select_object_ssec_headers(headers: &HeaderMap) -> HeaderMap {
-    use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-
-    let mut selected = HeaderMap::new();
-    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-        if let Some(value) = headers.get(name) {
-            selected.insert(name, value.clone());
-        }
-    }
-    selected
-}
-
 // LockRegistry clones its canonical client Arc for each endpoint host, so an
 // exact Arc set identifies one distributed namespace-lock quorum domain.
 fn same_distributed_lock_domain(left: &[Arc<dyn rustfs_lock::LockClient>], right: &[Arc<dyn rustfs_lock::LockClient>]) -> bool {
@@ -918,7 +906,7 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && is_data_movement_delete_marker(target)
         && source.version_id == target.version_id
         && source.mod_time == target.mod_time
-        && source.user_defined == target.user_defined
+        && is_equivalent_data_movement_delete_marker_metadata(&source.user_defined, &target.user_defined)
         && source.user_tags == target.user_tags
         && source.replication_status_internal == target.replication_status_internal
         && source.replication_status == target.replication_status
@@ -926,8 +914,162 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && source.version_purge_status == target.version_purge_status
 }
 
+fn is_equivalent_data_movement_delete_marker_metadata(
+    source: &HashMap<String, String>,
+    target: &HashMap<String, String>,
+) -> bool {
+    matches!(
+        (
+            data_movement_delete_marker_metadata_identity(source),
+            data_movement_delete_marker_metadata_identity(target)
+        ),
+        (Some(source), Some(target)) if source == target
+    )
+}
+
+fn data_movement_delete_marker_metadata_identity(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    let mut identity = HashMap::with_capacity(metadata.len());
+    let mut local_tier_free_version_id = None;
+    for (key, value) in metadata {
+        let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
+            identity.insert(key.clone(), value.clone());
+            continue;
+        };
+
+        if suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_TIER_FV_ID) {
+            let version_id = Uuid::parse_str(value).ok().filter(|version_id| !version_id.is_nil())?;
+            if local_tier_free_version_id.is_some_and(|expected| expected != version_id) {
+                return None;
+            }
+            local_tier_free_version_id = Some(version_id);
+            continue;
+        }
+
+        let canonical_suffix = [
+            rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            rustfs_utils::http::SUFFIX_PURGESTATUS,
+        ]
+        .into_iter()
+        .find(|candidate| suffix.eq_ignore_ascii_case(candidate))
+        .map(str::to_string)
+        .or_else(|| {
+            [
+                rustfs_utils::http::SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+            ]
+            .into_iter()
+            .find_map(|prefix| {
+                suffix
+                    .get(..prefix.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                    .then(|| format!("{prefix}{}", &suffix[prefix.len()..]))
+            })
+        })
+        .unwrap_or_else(|| suffix.to_string());
+        let canonical_value = if canonical_suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP)
+            || canonical_suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP)
+        {
+            rustfs_filemeta::parse_replication_timestamp(value)?
+                .unix_timestamp_nanos()
+                .to_string()
+        } else {
+            value.clone()
+        };
+        let canonical_key = format!("{}{canonical_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        if identity
+            .insert(canonical_key, canonical_value.clone())
+            .is_some_and(|existing| existing != canonical_value)
+        {
+            return None;
+        }
+    }
+    for (status_suffix, timestamp_suffix) in [
+        (rustfs_utils::http::SUFFIX_REPLICA_STATUS, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP),
+        (
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+        ),
+    ] {
+        let status_key = format!("{}{status_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        let timestamp_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        match (identity.contains_key(&status_key), identity.contains_key(&timestamp_key)) {
+            (true, false) => {
+                identity.insert(timestamp_key, OffsetDateTime::UNIX_EPOCH.unix_timestamp_nanos().to_string());
+            }
+            (false, true) => return None,
+            _ => {}
+        }
+    }
+    Some(identity)
+}
+
 fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
     info.delete_marker
+}
+
+fn is_expected_data_movement_delete_marker_source(source: &ObjectInfo, expected_mod_time: Option<OffsetDateTime>) -> bool {
+    is_data_movement_delete_marker(source)
+        && source.mod_time.is_some()
+        && source.mod_time == expected_mod_time
+        && data_movement_delete_marker_metadata_identity(&source.user_defined).is_some()
+}
+
+fn current_data_movement_delete_marker_opts(source: &ObjectInfo, opts: &ObjectOptions) -> Option<ObjectOptions> {
+    let replica_status = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICA_STATUS);
+    let replica_timestamp = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP);
+    let (replica_status, replica_timestamp) = match (replica_status, replica_timestamp) {
+        (None, None) => Default::default(),
+        (Some(status), timestamp) => {
+            let status = crate::bucket::replication::ReplicationStatusType::from(status.as_str());
+            if status.is_empty() {
+                return None;
+            }
+            let timestamp = match timestamp {
+                Some(timestamp) => rustfs_filemeta::parse_replication_timestamp(&timestamp)?,
+                None => OffsetDateTime::UNIX_EPOCH,
+            };
+            (status, Some(timestamp))
+        }
+        (None, Some(_)) => return None,
+    };
+    let replication_status = rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_STATUS);
+    let replication_timestamp =
+        rustfs_utils::http::get_str(&source.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP);
+    let (replication_status, replication_timestamp, replication_targets) = match (replication_status, replication_timestamp) {
+        (None, None) => Default::default(),
+        (Some(status), timestamp) => {
+            let direct_status = crate::bucket::replication::ReplicationStatusType::from(status.as_str());
+            let targets = crate::bucket::replication::replication_statuses_map(status.as_str());
+            if direct_status.is_empty() && targets.is_empty() {
+                return None;
+            }
+            let timestamp = match timestamp {
+                Some(timestamp) => rustfs_filemeta::parse_replication_timestamp(&timestamp)?,
+                None => OffsetDateTime::UNIX_EPOCH,
+            };
+            (Some(status), Some(timestamp), targets)
+        }
+        (None, Some(_)) => return None,
+    };
+    let mut state = source.replication_state();
+    if state.target_delete_marker_version_ids_corrupt {
+        return None;
+    }
+    state.replica_status = replica_status;
+    state.replica_timestamp = replica_timestamp;
+    state.replication_status_internal = replication_status;
+    state.replication_timestamp = replication_timestamp;
+    state.targets = replication_targets;
+    state.replicate_decision_str = source.replication_decision.clone();
+    state.delete_marker = true;
+
+    let mut target_opts = opts.clone();
+    target_opts.mod_time = source.mod_time;
+    target_opts.delete_replication = Some(state);
+    Some(target_opts)
 }
 
 fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> ObjectInfo {
@@ -936,14 +1078,21 @@ fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> O
 
 fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo, target: &ObjectInfo) -> bool {
     let expected = expected_data_movement_tiered_object(source);
+    let Some(source_actual_size) = effective_object_actual_size(&expected) else {
+        return false;
+    };
+    let Some(target_actual_size) = effective_object_actual_size(target) else {
+        return false;
+    };
 
     source.version_id == target.version_id
         && !target.delete_marker
         && source.size == target.size
         && source.get_etag() == target.etag
         && source.checksum == target.checksum
+        && crate::data_movement::are_equivalent_data_movement_parts(&source.parts, &target.parts)
         && source.mod_time == target.mod_time
-        && expected.user_defined == target.user_defined
+        && crate::data_movement::is_equivalent_data_movement_metadata(&expected, target, source_actual_size, target_actual_size)
         && expected.user_tags == target.user_tags
         && expected.expires == target.expires
         && expected.storage_class == target.storage_class
@@ -952,11 +1101,12 @@ fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo,
         && expected.version_purge_status_internal == target.version_purge_status_internal
         && expected.version_purge_status == target.version_purge_status
         && expected.transitioned_object.status == target.transitioned_object.status
+        && expected.transition_version_state == target.transition_version_state
         && expected.transitioned_object.name == target.transitioned_object.name
         && expected.transitioned_object.tier == target.transitioned_object.tier
         && expected.transitioned_object.version_id == target.transitioned_object.version_id
         && expected.transitioned_object.free_version == target.transitioned_object.free_version
-        && effective_object_actual_size(target) == Some(source.size)
+        && source_actual_size == target_actual_size
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -1054,7 +1204,7 @@ impl ECStore {
         )))
     }
 
-    async fn object_lock_config_snapshot_under_lifecycle_fence(
+    pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
         lifecycle_fence: &NamespaceLockFence,
@@ -1134,7 +1284,7 @@ impl ECStore {
             pool,
             bucket: bucket.to_owned(),
             object,
-            headers: select_object_ssec_headers(headers),
+            headers: rustfs_utils::http::project_ssec_transport_headers(headers),
             opts,
             object_info,
             logical_size,
@@ -1454,7 +1604,8 @@ impl ECStore {
         target_pool_idx: usize,
         opts: &ObjectOptions,
     ) -> Result<Option<ObjectInfo>> {
-        let lookup_opts = version_aware_lookup_opts(opts, true);
+        let mut lookup_opts = version_aware_lookup_opts(opts, true);
+        lookup_opts.include_part_checksums = true;
 
         let Some(pool) = self.pools.get(target_pool_idx) else {
             return Err(Error::other(format!(
@@ -1521,6 +1672,25 @@ impl ECStore {
     ) -> Result<()> {
         check_put_object_args(bucket, object)?;
 
+        let mut opts = opts.clone();
+        let bucket_incarnation_fence = if is_meta_bucketname(bucket) {
+            None
+        } else {
+            let expected = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("tiered data movement is missing its bucket incarnation snapshot"))?;
+            let guard = self.acquire_bucket_incarnation_fence(bucket, expected).await?;
+            if let Some(namespace_guard) = guard.namespace_lock_guard() {
+                opts.add_bucket_lifecycle_lock_guard(namespace_guard);
+            }
+            Some(guard)
+        };
+
+        let mut fi = fi.clone();
+        if opts.data_movement {
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut fi)?;
+        }
+
         let object = encode_dir_object(object);
 
         if self.single_pool() {
@@ -1533,7 +1703,8 @@ impl ECStore {
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
             Self::resolve_decommission_target_pool_idx_result(
-                self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true).await,
+                self.select_data_movement_pool_idx(bucket, &object, fi.size, &opts, true)
+                    .await,
                 bucket,
                 &object,
             )?
@@ -1550,7 +1721,7 @@ impl ECStore {
                 .await;
             let target_pool_idx = resolve_data_movement_resume_target_pool(idx, resume_target_pool_idx, opts.src_pool_idx);
             if self
-                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts, target_pool_idx)
+                .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, target_pool_idx)
                 .await?
             {
                 return Ok(());
@@ -1563,17 +1734,30 @@ impl ECStore {
             ));
         }
 
-        Self::resolve_decommission_tiered_object_result(
-            self.pools[idx]
-                .get_disks_by_key(&object)
-                .decommission_tiered_object(bucket, &object, fi, opts)
-                .await,
-            bucket,
-            &object,
-        )
+        let result = self.pools[idx]
+            .get_disks_by_key(&object)
+            .decommission_tiered_object(bucket, &object, &fi, &opts)
+            .await;
+        if matches!(result, Err(Error::PreconditionFailed)) {
+            if self
+                .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, idx)
+                .await?
+            {
+                return Ok(());
+            }
+            return Err(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object,
+                opts.version_id.clone().unwrap_or_default(),
+            ));
+        }
+        if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(Error::other("tiered data movement bucket incarnation fence was lost during target write"));
+        }
+        Self::resolve_decommission_tiered_object_result(result, bucket, &object)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, h))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(
         &self,
@@ -1607,15 +1791,7 @@ impl ECStore {
         Ok(Self::attach_read_lock_guard(reader, read_lock_guard))
     }
 
-    #[instrument(level = "debug", skip(self, data))]
-    #[hotpath::measure(impl_type = "ECStore")]
-    pub(super) async fn handle_put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+    async fn prepare_put_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(String, ObjectOptions)> {
         check_put_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
@@ -1642,22 +1818,20 @@ impl ECStore {
             };
             snapshot.add_lock_fences(&mut opts);
         }
+        Ok((object, opts))
+    }
 
-        // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
-        // around precondition checks and the final rename/commit.
+    async fn select_put_object_pool_idx(&self, bucket: &str, object: &str, size: i64, opts: &ObjectOptions) -> Result<usize> {
         if self.single_pool() {
-            return self.pools[0]
-                .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-                .await;
+            return Ok(0);
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
-            self.select_data_movement_pool_idx(bucket, &object, data.size(), &opts, false)
-                .await?
+            self.select_data_movement_pool_idx(bucket, object, size, opts, false).await?
         } else if opts.no_lock {
-            self.get_pool_idx_no_lock(bucket, &object, data.size()).await?
+            self.get_pool_idx_no_lock(bucket, object, size).await?
         } else {
-            self.get_pool_idx(bucket, &object, data.size()).await?
+            self.get_pool_idx(bucket, object, size).await?
         };
 
         if opts.data_movement && idx == opts.src_pool_idx {
@@ -1667,7 +1841,50 @@ impl ECStore {
                 opts.version_id.clone().unwrap_or_default(),
             ));
         }
+        Ok(idx)
+    }
 
+    pub(crate) async fn put_object_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(usize, Result<ObjectInfo>)> {
+        if !opts.data_movement {
+            return Err(Error::other("data movement PUT requires data_movement options"));
+        }
+        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let idx = self
+            .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
+            .await?;
+        let result = self.pools[idx]
+            .put_object_with_old_current_size(bucket, &object, data, &opts)
+            .await
+            .map(|(object_info, _)| object_info);
+        let result = enqueue_transition_after_write(result, LcEventSrc::S3PutObject).await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        Ok((idx, result))
+    }
+
+    #[instrument(level = "debug", skip(self, data))]
+    #[hotpath::measure(impl_type = "ECStore")]
+    pub(super) async fn handle_put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let idx = self
+            .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
+            .await?;
+
+        // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
+        // around precondition checks and the final rename/commit.
         self.pools[idx]
             .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
@@ -2110,6 +2327,50 @@ impl ECStore {
             };
             let target_pool_idx =
                 resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
+            let mut delete_marker_target_opts = None;
+
+            if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
+                let source = self
+                    .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
+                    .await?;
+                let Some(source) = source else {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                };
+                if !is_expected_data_movement_delete_marker_source(&source, opts.mod_time) {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                }
+                let Some(target_opts) = current_data_movement_delete_marker_opts(&source, &opts) else {
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                };
+                let target = self
+                    .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
+                    .await?;
+                if let Some(target) = target {
+                    if is_equivalent_data_movement_delete_marker(&source, &target) {
+                        let mut target = target;
+                        target.name = decode_dir_object(object);
+                        return Ok(target);
+                    }
+                    return Err(StorageError::DataMovementOverwriteErr(
+                        bucket.to_owned(),
+                        object.to_owned(),
+                        opts.version_id.unwrap_or_default(),
+                    ));
+                }
+                delete_marker_target_opts = Some(target_opts);
+            }
 
             if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 if let Ok((source_pool_info, _)) = existing_pool_info
@@ -2137,7 +2398,8 @@ impl ECStore {
                 ));
             }
 
-            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+            let target_opts = delete_marker_target_opts.unwrap_or(opts);
+            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, target_opts).await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
         }
@@ -3087,25 +3349,6 @@ mod tests {
     }
 
     #[test]
-    fn select_snapshot_retains_only_ssec_headers() {
-        use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-
-        let mut headers = HeaderMap::new();
-        headers.insert(SSEC_ALGORITHM_HEADER, "AES256".parse().expect("valid SSE-C algorithm header"));
-        headers.insert(SSEC_KEY_HEADER, "secret-key".parse().expect("valid SSE-C key header"));
-        headers.insert(SSEC_KEY_MD5_HEADER, "key-md5".parse().expect("valid SSE-C key digest header"));
-        headers.insert("authorization", "credential".parse().expect("valid authorization header"));
-
-        let selected = select_object_ssec_headers(&headers);
-
-        assert_eq!(selected.len(), 3);
-        assert_eq!(selected.get(SSEC_ALGORITHM_HEADER), headers.get(SSEC_ALGORITHM_HEADER));
-        assert_eq!(selected.get(SSEC_KEY_HEADER), headers.get(SSEC_KEY_HEADER));
-        assert_eq!(selected.get(SSEC_KEY_MD5_HEADER), headers.get(SSEC_KEY_MD5_HEADER));
-        assert!(selected.get("authorization").is_none());
-    }
-
-    #[test]
     fn tier_delete_entry_is_prepared_and_bound_to_source_generation() {
         let identity = [9_u8; 32];
         let mut metadata = HashMap::new();
@@ -3198,6 +3441,247 @@ mod tests {
             ..target
         };
         assert!(!is_equivalent_data_movement_delete_marker(&source, &mismatched));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_accepts_distinct_local_free_version_ids() {
+        let mut source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut source.user_defined),
+            rustfs_utils::http::SUFFIX_TIER_FV_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_TIER_FV_ID,
+            Uuid::from_u128(3).to_string(),
+        );
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+
+        Arc::make_mut(&mut target.user_defined).insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, rustfs_utils::http::SUFFIX_TIER_FV_ID),
+            Uuid::from_u128(4).to_string(),
+        );
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_accepts_replication_alias_expansion() {
+        let key = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS
+        );
+        let timestamp_key = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP
+        );
+        let source = ObjectInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(HashMap::from([
+                (key.clone(), "arn=COMPLETED;".to_string()),
+                (timestamp_key, "1970-01-01T00:00:01Z".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            (OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND).to_string(),
+        );
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+
+        Arc::make_mut(&mut target.user_defined).insert(key, "arn=FAILED;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn data_movement_delete_marker_source_requires_persisted_mod_time() {
+        let source = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!is_expected_data_movement_delete_marker_source(&source, None));
+
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..source
+        };
+        assert!(is_expected_data_movement_delete_marker_source(&source, Some(OffsetDateTime::UNIX_EPOCH)));
+        assert!(!is_expected_data_movement_delete_marker_source(&source, None));
+    }
+
+    #[test]
+    fn data_movement_delete_marker_uses_current_source_replication_state() {
+        let expected_timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let timestamp = expected_timestamp.to_string();
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            ReplicationStatusType::Replica.to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP, timestamp.clone());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, timestamp);
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            &format!(
+                "{}{}",
+                rustfs_utils::http::SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+                "arn:minio:replication::TenantA:bucket"
+            ),
+            "reset-id".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            &format!(
+                "{}{}",
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+                "arn:minio:replication::TenantA:bucket"
+            ),
+            "target-version".to_string(),
+        );
+        let source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            replication_status_internal: Some("arn=COMPLETED;".to_string()),
+            replication_decision: "arn=replicate;".to_string(),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            mod_time: source.mod_time,
+            delete_replication: Some(ReplicationState {
+                replication_status_internal: Some("arn=PENDING;".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let target_opts = current_data_movement_delete_marker_opts(&source, &opts).expect("valid current source state");
+        let state = target_opts.delete_replication.as_ref().expect("current replication state");
+        assert_eq!(state.replication_status_internal.as_deref(), Some("arn=COMPLETED;"));
+        assert_eq!(state.replica_status, crate::bucket::replication::ReplicationStatusType::Replica);
+        assert_eq!(state.replica_timestamp, Some(expected_timestamp));
+        assert_eq!(state.replication_timestamp, state.replica_timestamp);
+        assert_eq!(state.replicate_decision_str, "arn=replicate;");
+        assert_eq!(
+            state
+                .reset_statuses_map
+                .get("arn:minio:replication::TenantA:bucket")
+                .map(String::as_str),
+            Some("reset-id")
+        );
+        assert_eq!(
+            state
+                .target_delete_marker_version_ids
+                .get("arn:minio:replication::TenantA:bucket")
+                .map(String::as_str),
+            Some("target-version")
+        );
+    }
+
+    #[test]
+    fn data_movement_delete_marker_rejects_corrupt_target_version_maps() {
+        let suffix = format!("{}not-an-arn", rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX);
+        let mut malformed = HashMap::new();
+        rustfs_utils::http::insert_str(&mut malformed, &suffix, "target-version".to_string());
+        let malformed_source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(malformed),
+            ..Default::default()
+        };
+        assert!(current_data_movement_delete_marker_opts(&malformed_source, &ObjectOptions::default()).is_none());
+
+        let mut conflicted = HashMap::new();
+        let suffix = format!(
+            "{}arn:minio:replication::target:bucket",
+            rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX
+        );
+        rustfs_utils::http::insert_str(&mut conflicted, &suffix, "target-version-a".to_string());
+        conflicted.insert(
+            format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            "target-version-b".to_string(),
+        );
+        let conflicted_source = ObjectInfo {
+            user_defined: Arc::new(conflicted),
+            ..malformed_source.clone()
+        };
+        assert!(current_data_movement_delete_marker_opts(&conflicted_source, &ObjectOptions::default()).is_none());
+
+        let mut over_cap = HashMap::new();
+        for index in 0..=1_000 {
+            let suffix = format!(
+                "{}arn:minio:replication::target:bucket-{index}",
+                rustfs_utils::http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX
+            );
+            rustfs_utils::http::insert_str(&mut over_cap, &suffix, format!("target-version-{index}"));
+        }
+        let over_cap_source = ObjectInfo {
+            user_defined: Arc::new(over_cap),
+            ..malformed_source
+        };
+        assert!(current_data_movement_delete_marker_opts(&over_cap_source, &ObjectOptions::default()).is_none());
+    }
+
+    #[test]
+    fn data_movement_delete_marker_normalizes_legacy_missing_replication_timestamps() {
+        let mut source_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+            ReplicationStatusType::Replica.to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn=COMPLETED;".to_string(),
+        );
+        let source = ObjectInfo {
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            replication_status_internal: Some("arn=COMPLETED;".to_string()),
+            user_defined: Arc::new(source_metadata),
+            ..Default::default()
+        };
+
+        let target_opts = current_data_movement_delete_marker_opts(&source, &ObjectOptions::default())
+            .expect("legacy status-only metadata should remain migratable");
+        let state = target_opts
+            .delete_replication
+            .expect("replication state should be reconstructed");
+        assert_eq!(state.replica_timestamp, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(state.replication_timestamp, Some(OffsetDateTime::UNIX_EPOCH));
+
+        let mut target_metadata = (*source.user_defined).clone();
+        let epoch = OffsetDateTime::UNIX_EPOCH
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        rustfs_utils::http::insert_str(&mut target_metadata, rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP, epoch.clone());
+        rustfs_utils::http::insert_str(&mut target_metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, epoch);
+        assert!(is_equivalent_data_movement_delete_marker_metadata(&source.user_defined, &target_metadata));
     }
 
     #[test]
@@ -3345,10 +3829,81 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_data_movement_tiered_object_uses_logical_compressed_and_encrypted_sizes() {
+        let mut compressed = tiered_equivalence_source();
+        compressed.size = 600;
+        rustfs_utils::http::insert_str(&mut compressed.metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        rustfs_utils::http::insert_str(&mut compressed.metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "1024".to_string());
+        let compressed_target = tiered_equivalence_target(&compressed);
+        assert!(is_equivalent_data_movement_tiered_object(&compressed, &compressed_target));
+
+        let mut encrypted = tiered_equivalence_source();
+        encrypted.size = 640;
+        encrypted.metadata.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(),
+            "key-id".to_string(),
+        );
+        encrypted.metadata.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(),
+            "1024".to_string(),
+        );
+        let encrypted_target = tiered_equivalence_target(&encrypted);
+        assert!(is_equivalent_data_movement_tiered_object(&encrypted, &encrypted_target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_accepts_transition_alias_expansion() {
+        let mut source = tiered_equivalence_source();
+        let suffix = rustfs_utils::http::SUFFIX_TRANSITION_TIER;
+        source.metadata.insert(
+            format!("{}{suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            source.transition_tier.clone(),
+        );
+        let mut target = tiered_equivalence_target(&source);
+        Arc::make_mut(&mut target.user_defined)
+            .insert(rustfs_utils::http::internal_key_rustfs(suffix), source.transition_tier.clone());
+
+        assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_requires_hydrated_part_checksums() {
+        let mut source = tiered_equivalence_source();
+        source.parts = vec![rustfs_filemeta::ObjectPartInfo {
+            number: 1,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
+            checksums: Some(HashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
+            ..Default::default()
+        }];
+        rustfs_utils::http::insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            r#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_string(),
+        );
+        let mut target = tiered_equivalence_target(&source);
+        Arc::make_mut(&mut target.parts)[0].mod_time = None;
+        assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+
+        let mut missing = target;
+        Arc::make_mut(&mut missing.parts)[0].checksums = None;
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &missing));
+    }
+
+    #[test]
     fn equivalent_data_movement_tiered_object_rejects_transition_mismatch() {
         let source = tiered_equivalence_source();
         let mut target = tiered_equivalence_target(&source);
         target.transitioned_object.name = "remote/target".to_string();
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_transition_version_state_mismatch() {
+        let mut source = tiered_equivalence_source();
+        source.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        let mut target = tiered_equivalence_target(&source);
+        target.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }
@@ -4022,6 +4577,8 @@ mod tests {
             assert_eq!(snapshot.headers.get(SSEC_KEY_HEADER), request_headers.get(SSEC_KEY_HEADER));
             assert_eq!(snapshot.headers.get(SSEC_KEY_MD5_HEADER), request_headers.get(SSEC_KEY_MD5_HEADER));
             assert!(snapshot.headers.get("authorization").is_none());
+            assert!(snapshot.headers.values().all(http::HeaderValue::is_sensitive));
+            assert!(!format!("{:?}", snapshot.headers).contains("secret-key"));
             assert_eq!(
                 snapshot.logical_size(),
                 u64::try_from(payload.len()).expect("test payload length should fit in u64")

@@ -37,6 +37,7 @@ crc-fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync", "fs", "rt-multi-thread"] }
@@ -54,7 +55,6 @@ arc-swap.workspace = true
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 proptest = "1"
-serde_json.workspace = true
 
 [[bench]]
 name = "xl_meta_bench"

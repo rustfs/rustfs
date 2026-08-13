@@ -109,6 +109,7 @@ async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &s
         FileInfoOpts {
             data: true, // need inline data for inline objects
             include_free_versions: false,
+            include_part_checksums: true,
         },
     ) {
         Ok(f) => f,

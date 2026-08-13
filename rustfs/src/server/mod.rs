@@ -45,7 +45,6 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
-pub(crate) use event::convert_ecstore_object_info;
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler,
@@ -74,8 +73,6 @@ pub(crate) use prefix::{
     PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX,
     VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
-pub(crate) use readiness::DependencyReadiness;
-pub(crate) use readiness::DependencyReadinessReport;
 pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use readiness::collect_dependency_readiness_report;
@@ -84,8 +81,7 @@ pub use readiness::publish_ready_when_runtime_ready;
 pub(crate) use readiness::snapshot_dependency_readiness_report;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
 
-#[derive(Clone, Copy, Debug)]
-pub struct RemoteAddr(pub std::net::SocketAddr);
+pub use crate::shared_types::RemoteAddr;
 
 pub struct ShutdownHandle {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
