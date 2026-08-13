@@ -208,6 +208,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
             RotatedAt,
             EncryptedKeyMaterial,
             BaselineVersion,
+            WrapBudgetReserved,
             Unknown(BoundedUnknownFieldName),
         }
 
@@ -242,6 +243,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                             "rotated_at" => Field::RotatedAt,
                             "encrypted_key_material" => Field::EncryptedKeyMaterial,
                             "baseline_version" => Field::BaselineVersion,
+                            "wrap_budget_reserved" => Field::WrapBudgetReserved,
                             _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
                         })
                     }
@@ -285,6 +287,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                 let mut rotated_at = None;
                 let mut encrypted_key_material = None;
                 let mut baseline_version = None;
+                let mut wrap_budget_reserved = None;
                 let mut unknown_fields = UnknownFieldSummary::default();
 
                 while let Some(field) = map.next_key()? {
@@ -301,6 +304,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                         Field::RotatedAt => read_field!(rotated_at, "rotated_at"),
                         Field::EncryptedKeyMaterial => read_field!(encrypted_key_material, "encrypted_key_material"),
                         Field::BaselineVersion => read_field!(baseline_version, "baseline_version"),
+                        Field::WrapBudgetReserved => read_field!(wrap_budget_reserved, "wrap_budget_reserved"),
                         Field::Unknown(field) => {
                             let _: IgnoredAny = map.next_value()?;
                             unknown_fields.observe(field);
@@ -322,6 +326,10 @@ impl<'de> Deserialize<'de> for VaultKeyData {
                     encrypted_key_material: encrypted_key_material
                         .ok_or_else(|| de::Error::missing_field("encrypted_key_material"))?,
                     baseline_version: baseline_version.unwrap_or(None),
+                    // Absent on records written before wrap accounting existed, and
+                    // on records an older build rewrote; zero restarts the
+                    // reservation rather than blocking a wrap.
+                    wrap_budget_reserved: wrap_budget_reserved.unwrap_or(0),
                 };
                 unknown_fields.record_for_vault_kv2_key();
                 Ok(key_data)
@@ -341,6 +349,7 @@ impl<'de> Deserialize<'de> for VaultKeyData {
             "rotated_at",
             "encrypted_key_material",
             "baseline_version",
+            "wrap_budget_reserved",
         ];
         deserializer.deserialize_struct("VaultKeyData", FIELDS, VaultKeyDataVisitor)
     }
@@ -3012,6 +3021,54 @@ mod tests {
         let legacy: VaultKeyData = serde_json::from_value(value).expect("legacy record must deserialize");
         assert_eq!(legacy.baseline_version, None);
         assert_eq!(legacy.version, 1);
+    }
+
+    /// Every declared `VaultKeyData` field must survive a serialize/deserialize
+    /// round trip through the hand-written `Deserialize`.
+    ///
+    /// The hand-written impl lists its fields three times (the `Field` enum, the
+    /// match arms, the struct literal), so a field added to the struct alone
+    /// compiles on its own branch and only breaks once both branches merge —
+    /// which is exactly how `wrap_budget_reserved` briefly broke the build.
+    /// Asserting against the serialized key set makes the deserializer's
+    /// coverage a test failure rather than a merge-order accident.
+    #[test]
+    fn vault_key_data_deserializer_covers_every_serialized_field() {
+        let mut key_data = healthy_key_data();
+        key_data.wrap_budget_reserved = 7_000_000;
+        key_data.baseline_version = Some(2);
+        key_data.rotated_at = Some(Zoned::now());
+        key_data.deletion_date = Some(Zoned::now());
+        key_data.description = Some("described".to_string());
+
+        let value = serde_json::to_value(&key_data).expect("serialize key data");
+        let serialized_fields: Vec<String> = value
+            .as_object()
+            .expect("key data serializes to an object")
+            .keys()
+            .cloned()
+            .collect();
+
+        // Every serialized field must be a known field: an unknown one would be
+        // counted by the unknown-field observer instead of being read back.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let restored: VaultKeyData =
+            metrics::with_local_recorder(&recorder, || serde_json::from_value(value).expect("round trip"));
+        assert_eq!(
+            crate::test_support::unknown_field_metric(&recorder, "vault-kv2-key"),
+            0,
+            "a serialized field was not recognized by the deserializer; fields: {serialized_fields:?}"
+        );
+
+        // And every value must survive, not just parse.
+        assert_eq!(restored.wrap_budget_reserved, key_data.wrap_budget_reserved);
+        assert_eq!(restored.baseline_version, key_data.baseline_version);
+        assert_eq!(restored.version, key_data.version);
+        assert_eq!(restored.status, key_data.status);
+        assert_eq!(restored.description, key_data.description);
+        assert_eq!(restored.encrypted_key_material, key_data.encrypted_key_material);
+        assert!(restored.rotated_at.is_some());
+        assert!(restored.deletion_date.is_some());
     }
 
     #[test]
