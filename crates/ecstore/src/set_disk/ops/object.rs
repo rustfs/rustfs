@@ -5994,6 +5994,37 @@ mod inline_put_commit_path_tests {
     }
 
     #[tokio::test]
+    async fn repeated_gets_reuse_the_set_erasure_shell() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "get-erasure-shell-cache";
+        let object = "object.bin";
+        let payload = vec![0x4d; 1024 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("non-inline object should commit");
+        assert!(set_disks.erasure_cache.entries.read().is_empty());
+
+        for _ in 0..2 {
+            let mut object_reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("cached-shell GET should succeed");
+            let mut restored = Vec::new();
+            object_reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("cached-shell GET should stream");
+            assert_eq!(restored, payload);
+            assert_eq!(set_disks.erasure_cache.entries.read().len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "inline-direct-quorum";

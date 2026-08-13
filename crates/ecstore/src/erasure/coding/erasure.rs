@@ -71,7 +71,8 @@ impl EncodedBlock {
 
 const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
-const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
+const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 16;
+const LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES: usize = 1024 * 1024;
 
 type ModernReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<ReedSolomon>>>;
 type LegacyReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<LegacyReedSolomonEncoder>>>;
@@ -158,6 +159,12 @@ impl LegacyReedSolomonEncoder {
         })
     }
 
+    fn should_cache_workspace(&self, shard_len: usize) -> bool {
+        shard_len
+            .checked_mul(self.data_shards + self.parity_shards)
+            .is_some_and(|bytes| bytes <= LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES)
+    }
+
     fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
         let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
         if shards_vec.is_empty() {
@@ -197,12 +204,14 @@ impl LegacyReedSolomonEncoder {
             }
         }
         drop(result);
-        let mut cache = self
-            .encoder_cache
-            .write()
-            .map_err(|_| io::Error::other("Failed to return encoder to cache"))?;
-        if cache.is_none() {
-            *cache = Some(encoder);
+        if self.should_cache_workspace(shard_len) {
+            let mut cache = self
+                .encoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to return encoder to cache"))?;
+            if cache.is_none() {
+                *cache = Some(encoder);
+            }
         }
         Ok(())
     }
@@ -270,12 +279,14 @@ impl LegacyReedSolomonEncoder {
 
         drop(result);
 
-        let mut cache = self
-            .decoder_cache
-            .write()
-            .map_err(|_| io::Error::other("Failed to return decoder to cache"))?;
-        if cache.is_none() {
-            *cache = Some(decoder);
+        if self.should_cache_workspace(shard_len) {
+            let mut cache = self
+                .decoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to return decoder to cache"))?;
+            if cache.is_none() {
+                *cache = Some(decoder);
+            }
         }
 
         Ok(())
@@ -1446,6 +1457,24 @@ mod tests {
             .expect("same legacy shard layout should be initialized");
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn legacy_workspace_cache_rejects_oversize_buffers_and_isolates_layouts() {
+        let four_plus_two = Erasure::new_with_options(4, 2, 64, true)
+            .legacy_encoder
+            .expect("legacy codec should be initialized");
+        let four_plus_one = Erasure::new_with_options(4, 1, 64, true)
+            .legacy_encoder
+            .expect("distinct parity layout should be initialized");
+        let three_plus_two = Erasure::new_with_options(3, 2, 64, true)
+            .legacy_encoder
+            .expect("distinct data layout should be initialized");
+
+        assert!(!Arc::ptr_eq(&four_plus_two, &four_plus_one));
+        assert!(!Arc::ptr_eq(&four_plus_two, &three_plus_two));
+        assert!(four_plus_two.should_cache_workspace(LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES / 6));
+        assert!(!four_plus_two.should_cache_workspace(LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES / 6 + 1));
     }
 
     #[test]
