@@ -3638,11 +3638,15 @@ fn apply_set_snapshot_file_update(
     let snapshot_id =
         crate::table_catalog::validate_iceberg_statistics_file(&value, update_field, kind).map_err(catalog_store_error)?;
     if let Some(deprecated_snapshot_id) = update.get("snapshot-id") {
-        let deprecated_snapshot_id = deprecated_snapshot_id
-            .as_i64()
-            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-id must be an integer"))?;
+        let deprecated_snapshot_id = deprecated_snapshot_id.as_i64().ok_or_else(|| {
+            iceberg_rest_error(ICEBERG_ERROR_BAD_REQUEST, StatusCode::BAD_REQUEST, "snapshot-id must be an integer")
+        })?;
         if deprecated_snapshot_id != snapshot_id {
-            return Err(s3_error!(InvalidRequest, "{update_field}.snapshot-id does not match snapshot-id"));
+            return Err(iceberg_rest_error(
+                ICEBERG_ERROR_BAD_REQUEST,
+                StatusCode::BAD_REQUEST,
+                format!("{update_field}.snapshot-id does not match snapshot-id"),
+            ));
         }
     }
     let values = ensure_array_field(metadata, metadata_field)?;

@@ -2603,6 +2603,7 @@ where
             budget.manifests.insert(manifest_key, Arc::clone(&references));
             references
         };
+        validate_snapshot_graph_manifest_content(manifest_location, references.as_ref())?;
         budget.charge_file_references(references.len())?;
         validate_snapshot_graph_data_files(
             context,
@@ -2619,6 +2620,28 @@ where
         manifests.push(references);
     }
     Ok(manifests)
+}
+
+fn validate_snapshot_graph_manifest_content(
+    manifest: &SnapshotGraphManifestLocation,
+    references: &[ManifestDataFileReference],
+) -> TableCatalogStoreResult<()> {
+    let content_matches = match manifest.content {
+        Some(0) => references
+            .iter()
+            .all(|reference| reference.content == ManifestDataFileContent::Data),
+        Some(1) => references
+            .iter()
+            .all(|reference| reference.content != ManifestDataFileContent::Data),
+        None => true,
+        Some(_) => false,
+    };
+    if !content_matches {
+        return Err(TableCatalogStoreError::Invalid(
+            "manifest-list content does not match manifest file content".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn snapshot_graph_manifest_locations<B>(

@@ -1980,8 +1980,9 @@ fn catalog_assigns_read_only_schema_spec_and_sort_order_ids() {
     assert_eq!(updated["partition-specs"][1]["fields"][1]["field-id"], 1001);
     assert_eq!(updated["default-spec-id"], 1);
     assert_eq!(updated["last-partition-id"], 1001);
-    assert_eq!(updated["sort-orders"].as_array().map(Vec::len), Some(1));
-    assert_eq!(updated["sort-orders"][0]["order-id"], 0);
+    assert_eq!(updated["sort-orders"].as_array().map(Vec::len), Some(2));
+    assert_eq!(updated["sort-orders"][0]["order-id"], 1);
+    assert_eq!(updated["sort-orders"][1]["order-id"], 0);
     assert_eq!(updated["default-sort-order-id"], 0);
 }
 
@@ -5684,25 +5685,36 @@ async fn table_refs_response_reports_current_and_user_defined_refs() {
     let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
     let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
     seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+    let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+    metadata["last-sequence-number"] = serde_json::Value::from(2);
+    metadata["snapshots"] = serde_json::json!([
+        {
+            "snapshot-id": 9,
+            "sequence-number": 1,
+            "timestamp-ms": 1,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-9.avro",
+            "summary": {"operation": "append"}
+        },
+        {
+            "snapshot-id": 10,
+            "parent-snapshot-id": 9,
+            "sequence-number": 2,
+            "timestamp-ms": 2,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+            "summary": {"operation": "append"}
+        }
+    ]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["snapshot-log"] = serde_json::json!([
+        {"timestamp-ms": 1, "snapshot-id": 9},
+        {"timestamp-ms": 2, "snapshot-id": 10}
+    ]);
+    metadata["refs"] = serde_json::json!({
+        "main": {"snapshot-id": 10, "type": "branch"},
+        "audit": {"snapshot-id": 9, "type": "tag"}
+    });
     backend
-        .put_json_with_mod_time(
-            bucket,
-            &current,
-            serde_json::json!({
-                "current-snapshot-id": 10,
-                "refs": {
-                    "main": {
-                        "snapshot-id": 10,
-                        "type": "branch"
-                    },
-                    "audit": {
-                        "snapshot-id": 9,
-                        "type": "tag"
-                    }
-                }
-            }),
-            Some(OffsetDateTime::UNIX_EPOCH),
-        )
+        .put_json_with_mod_time(bucket, &current, metadata, Some(OffsetDateTime::UNIX_EPOCH))
         .await;
 
     let response = table_refs_response(&store, &backend, bucket, &namespace, "events")
@@ -6085,9 +6097,10 @@ async fn external_catalog_bridge_sync_conflicts_leave_pointer_unchanged() {
 }
 
 #[test]
-fn snapshot_conflict_requirements_validate_current_snapshot_id() {
+fn snapshot_conflict_requirements_validate_snapshot_ref_id() {
     let metadata = serde_json::json!({
-        "current-snapshot-id": 10
+        "current-snapshot-id": 10,
+        "refs": {"main": {"type": "branch", "snapshot-id": 10}}
     });
 
     let matching = vec![serde_json::json!({
@@ -6194,31 +6207,28 @@ fn snapshot_conflict_rejects_unknown_parent_or_stale_sequence_number() {
 
 #[test]
 fn snapshot_updates_move_only_the_declared_reference() {
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "current-snapshot-id": 10,
-        "last-sequence-number": 4,
-        "snapshots": [
-            {
-                "snapshot-id": 9,
-                "sequence-number": 3,
-                "timestamp-ms": 1000,
-                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-9.avro",
-                "summary": {"operation": "append"}
-            },
-            {
-                "snapshot-id": 10,
-                "parent-snapshot-id": 9,
-                "sequence-number": 4,
-                "timestamp-ms": 1234,
-                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
-                "summary": {"operation": "append"}
-            }
-        ],
-        "refs": {"main": {"snapshot-id": 10, "type": "branch"}},
-        "snapshot-log": [{"timestamp-ms": 1234, "snapshot-id": 10}],
-        "metadata-log": []
-    });
+    let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["last-sequence-number"] = serde_json::Value::from(4);
+    metadata["snapshots"] = serde_json::json!([
+        {
+            "snapshot-id": 9,
+            "sequence-number": 3,
+            "timestamp-ms": 1000,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-9.avro",
+            "summary": {"operation": "append"}
+        },
+        {
+            "snapshot-id": 10,
+            "parent-snapshot-id": 9,
+            "sequence-number": 4,
+            "timestamp-ms": 1234,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+            "summary": {"operation": "append"}
+        }
+    ]);
+    metadata["refs"] = serde_json::json!({"main": {"snapshot-id": 10, "type": "branch"}});
+    metadata["snapshot-log"] = serde_json::json!([{"timestamp-ms": 1234, "snapshot-id": 10}]);
     let add_snapshot = serde_json::json!({
         "action": "add-snapshot",
         "snapshot": {
@@ -6288,15 +6298,8 @@ fn snapshot_updates_move_only_the_declared_reference() {
 
 #[test]
 fn newly_added_main_snapshot_uses_its_snapshot_timestamp_in_history() {
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "current-snapshot-id": -1,
-        "last-sequence-number": 0,
-        "snapshots": [],
-        "refs": {},
-        "snapshot-log": [],
-        "metadata-log": []
-    });
+    let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+    metadata["current-snapshot-id"] = serde_json::Value::from(-1);
     let updated = apply_table_commit_updates_at(
         metadata,
         &[
@@ -7898,6 +7901,7 @@ async fn mismatched_commit_identifiers_leave_catalog_pointers_unchanged() {
 #[test]
 fn table_updates_apply_standard_statistics_and_metadata_cleanup_actions() {
     let metadata = serde_json::json!({
+        "last-updated-ms": 1,
         "schemas": [
             {"type": "struct", "schema-id": 0, "fields": []},
             {"type": "struct", "schema-id": 1, "fields": []}
@@ -7988,6 +7992,7 @@ fn remove_snapshots_rejects_mixed_snapshot_id_types() {
 #[test]
 fn remove_snapshots_removes_associated_statistics_entries() {
     let metadata = serde_json::json!({
+        "last-updated-ms": 1,
         "snapshots": [{"snapshot-id": 10}, {"snapshot-id": 11}],
         "snapshot-log": [{"snapshot-id": 10}, {"snapshot-id": 11}],
         "statistics": [
@@ -8017,6 +8022,7 @@ fn remove_snapshots_removes_associated_statistics_entries() {
 #[test]
 fn removing_snapshots_clears_dangling_references_and_current_snapshot() {
     let metadata = serde_json::json!({
+        "last-updated-ms": 1,
         "current-snapshot-id": 10,
         "snapshots": [{"snapshot-id": 10}, {"snapshot-id": 11}],
         "refs": {
@@ -8044,6 +8050,7 @@ fn removing_snapshots_clears_dangling_references_and_current_snapshot() {
 #[test]
 fn removing_an_intermediate_snapshot_truncates_earlier_history() {
     let metadata = serde_json::json!({
+        "last-updated-ms": 1,
         "current-snapshot-id": 12,
         "snapshots": [{"snapshot-id": 10}, {"snapshot-id": 11}, {"snapshot-id": 12}],
         "refs": {"main": {"snapshot-id": 12, "type": "branch"}},
@@ -8068,6 +8075,7 @@ fn removing_an_intermediate_snapshot_truncates_earlier_history() {
 #[test]
 fn removing_main_snapshot_reference_clears_current_snapshot() {
     let metadata = serde_json::json!({
+        "last-updated-ms": 1,
         "current-snapshot-id": 10,
         "snapshots": [{"snapshot-id": 10}],
         "refs": {"main": {"snapshot-id": 10, "type": "branch"}},
@@ -8130,7 +8138,8 @@ fn table_statistics_updates_reject_malformed_standard_files() {
     ] {
         let error = apply_table_commit_updates_at(metadata.clone(), &[update], "metadata/00001.metadata.json", 100)
             .expect_err("malformed statistics updates must fail");
-        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
     }
 }
 
@@ -9993,6 +10002,27 @@ async fn create_standard_recent_events_view<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    ensure_table_bucket_entry(store, "warehouse", true)
+        .await
+        .expect("table bucket entry should be seeded");
+    if store
+        .get_namespace("warehouse", &namespace.public_name())
+        .await
+        .expect("namespace lookup should succeed")
+        .is_none()
+    {
+        create_namespace_response(
+            store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: namespace.public_name().split('.').map(str::to_string).collect(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+    }
     let request: CreateViewRequest = serde_json::from_value(serde_json::json!({
         "name": "recent_events",
         "schema": {"type": "struct", "fields": []},
@@ -10938,13 +10968,10 @@ async fn metadata_location_api_loads_and_updates_current_pointer() {
     )
     .expect("table entry should build");
     let table_uuid = entry.table_uuid.clone();
+    let warehouse_location = entry.warehouse_location.clone();
     store.register_table(entry).await.expect("table should register");
     metadata_backend
-        .put_json(
-            "warehouse",
-            current_location,
-            test_table_metadata_json(&table_uuid, "s3://warehouse/tables/table-id"),
-        )
+        .put_json("warehouse", current_location, test_table_metadata_json(&table_uuid, &warehouse_location))
         .await;
     let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
         .await
@@ -10955,11 +10982,7 @@ async fn metadata_location_api_loads_and_updates_current_pointer() {
     );
     let next_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
     metadata_backend
-        .put_json(
-            "warehouse",
-            next_location,
-            test_table_metadata_json(&table_uuid, "s3://warehouse/tables/table-id"),
-        )
+        .put_json("warehouse", next_location, test_table_metadata_json(&table_uuid, &warehouse_location))
         .await;
 
     let updated = update_table_metadata_location_response(

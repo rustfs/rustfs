@@ -4550,12 +4550,11 @@ where
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
-        if next_metadata_state
+        let warehouse_relocation = next_metadata_state
             .warehouse_location
             .as_ref()
-            .is_some_and(|warehouse_location| warehouse_location != &current.warehouse_location)
-            && !publication.holds_table_bucket(&request.table_bucket)
-        {
+            .is_some_and(|warehouse_location| warehouse_location != &current.warehouse_location);
+        if warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket) {
             return table_commit_result(
                 &request.table_bucket,
                 &request.namespace,
@@ -4641,8 +4640,8 @@ where
             );
         }
 
-        if !publication.holds_table_bucket(&request.table_bucket)
-            || !publication.holds_table(&request.table_bucket, &request.namespace, &request.table)
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table)
+            || (warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket))
         {
             self.delete_created_table_warehouse_index(&next, reservation, "table publication fence lost")
                 .await;

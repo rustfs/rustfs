@@ -2556,12 +2556,11 @@ where
                     ))
                 })?
         };
-        if next_metadata_state
+        let warehouse_relocation = next_metadata_state
             .warehouse_location
             .as_ref()
-            .is_some_and(|warehouse_location| warehouse_location != &current_warehouse_location)
-            && !publication.holds_table_bucket(&request.table_bucket)
-        {
+            .is_some_and(|warehouse_location| warehouse_location != &current_warehouse_location);
+        if warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket) {
             return table_commit_result(
                 &request.table_bucket,
                 &request.namespace,
@@ -2588,7 +2587,9 @@ where
         let result = match prepared_result {
             Ok((result, snapshot, precondition)) => {
                 let postcondition = Self::commit_write_postcondition(&request.table_bucket, &result.commit_log);
-                let snapshot_result = if publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+                let snapshot_result = if publication.holds_table(&request.table_bucket, &request.namespace, &request.table)
+                    && (!warehouse_relocation || publication.holds_table_bucket(&request.table_bucket))
+                {
                     self.finalize_snapshot_write(snapshot, precondition, postcondition).await
                 } else {
                     Err(TableCatalogStoreError::Internal(

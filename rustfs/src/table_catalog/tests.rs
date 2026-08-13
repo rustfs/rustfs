@@ -1033,11 +1033,15 @@ fn manifest_list_avro_bytes(manifests: &[(&str, usize)]) -> Vec<u8> {
 }
 
 fn manifest_list_avro_bytes_with_spec(manifests: &[(&str, usize)], partition_spec_id: i32) -> Vec<u8> {
+    manifest_list_avro_bytes_with_spec_and_content(manifests, partition_spec_id, 0)
+}
+
+fn manifest_list_avro_bytes_with_spec_and_content(manifests: &[(&str, usize)], partition_spec_id: i32, content: i32) -> Vec<u8> {
     let manifests = manifests
         .iter()
-        .map(|(path, length)| (*path, *length, partition_spec_id, 7_i64, 20_i64))
+        .map(|(path, length)| (*path, *length, partition_spec_id, content, 7_i64, 20_i64))
         .collect::<Vec<_>>();
-    crate::table_catalog::test_support::manifest_list_avro_entries_with_partition_specs(&manifests)
+    crate::table_catalog::test_support::manifest_list_avro_entries_with_content(&manifests)
 }
 
 fn manifest_list_avro_bytes_with_spec_and_null_counts(
@@ -2826,7 +2830,7 @@ async fn iceberg_v2_snapshot_graph_rejects_embedded_v2_manifests() {
 }
 
 #[tokio::test]
-async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
+async fn iceberg_snapshot_graph_rejects_delete_files_in_data_manifest() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
@@ -2861,9 +2865,54 @@ async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("a data manifest must not contain delete files");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest-list content does not match manifest file content".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_accepts_delete_files_in_delete_manifest() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/list-10.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/snap-delete-manifest.avro";
+    let delete_file = "s3://warehouse/tables/table-id/data/position-deletes.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(delete_file, 1)]);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-10.avro",
+            manifest_list_avro_bytes_with_spec_and_content(&[(manifest, manifest_bytes.len())], 0, 1),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-delete-manifest.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/position-deletes.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "delete"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
-        .expect("manifest content should identify delete files stored under the data directory");
+        .expect("a delete manifest may contain delete files regardless of their object directory");
 }
 
 #[tokio::test]
@@ -3077,6 +3126,7 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"},
                       {"name": "sort_order_id", "type": ["null", "int"], "default": null}
@@ -3104,6 +3154,7 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                         (

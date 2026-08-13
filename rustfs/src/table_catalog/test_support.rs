@@ -74,6 +74,16 @@ pub(crate) fn manifest_list_avro_entries(manifests: &[(&str, usize, i64, i64)]) 
 }
 
 pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, usize, i32, i64, i64)]) -> Vec<u8> {
+    let manifests = manifests
+        .iter()
+        .map(|(path, length, spec_id, sequence_number, snapshot_id)| {
+            (*path, *length, *spec_id, 0, *sequence_number, *snapshot_id)
+        })
+        .collect::<Vec<_>>();
+    manifest_list_avro_entries_with_content(&manifests)
+}
+
+pub(crate) fn manifest_list_avro_entries_with_content(manifests: &[(&str, usize, i32, i32, i64, i64)]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -99,7 +109,7 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
     )
     .expect("manifest list avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
-    for (manifest_path, manifest_length, partition_spec_id, sequence_number, snapshot_id) in manifests {
+    for (manifest_path, manifest_length, partition_spec_id, content, sequence_number, snapshot_id) in manifests {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
                 (
@@ -111,7 +121,7 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
                     apache_avro::types::Value::Long(i64::try_from(*manifest_length).expect("test manifest length should fit")),
                 ),
                 ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
-                ("content".to_string(), apache_avro::types::Value::Int(0)),
+                ("content".to_string(), apache_avro::types::Value::Int(*content)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
                 ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
                 ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
@@ -225,6 +235,7 @@ pub(crate) fn manifest_avro_bytes_with_partition_spec(
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"}
                     ]
@@ -253,6 +264,7 @@ pub(crate) fn manifest_avro_bytes_with_partition_spec(
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                     ]),
@@ -289,6 +301,7 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"}
                     ]
@@ -312,6 +325,7 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                     ]),
