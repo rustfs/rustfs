@@ -11846,7 +11846,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial]
     async fn ecstore_new_succeeds_on_fresh_local_volumes() {
         let test_base_dir = format!("/tmp/rustfs_ecstore_empty_boot_{}", Uuid::new_v4());
