@@ -14,9 +14,7 @@
 
 //! Example demonstrating metrics and configuration usage.
 
-use rustfs_io_metrics::{
-    AccessTracker, AdaptiveTTL, CacheConfig, CacheSettings, IoConfig, IoSchedulerSettings, record_cache_size,
-};
+use rustfs_io_metrics::{AccessTracker, AdaptiveTTL, CacheConfig, record_cache_size};
 use std::time::Duration;
 
 fn main() {
@@ -31,10 +29,7 @@ fn main() {
     // 3. Access tracking example
     access_tracker_example();
 
-    // 4. Unified configuration example
-    unified_config_example();
-
-    // 5. Metrics recording example
+    // 4. Metrics recording example
     metrics_recording_example();
 }
 
@@ -105,26 +100,6 @@ fn access_tracker_example() {
     // Get top keys
     let top_keys = tracker.top_keys(3);
     println!("  Top keys: {:?}", top_keys);
-
-    println!();
-}
-
-fn unified_config_example() {
-    println!("--- Unified Configuration ---");
-
-    let config = IoConfig::new()
-        .with_cache(
-            CacheSettings::new()
-                .with_max_capacity(5000)
-                .with_ttl(Duration::from_secs(600)),
-        )
-        .with_scheduler(IoSchedulerSettings::new().with_max_concurrent_reads(64));
-
-    println!("  Cache capacity: {}", config.cache.max_capacity);
-    println!("  Cache TTL: {:?}", config.cache.default_ttl);
-    println!("  Max concurrent reads: {}", config.scheduler.max_concurrent_reads);
-    println!("  Backpressure high watermark: {}", config.backpressure.high_watermark);
-    println!("  Default timeout: {:?}", config.timeout.default_timeout);
 
     println!();
 }

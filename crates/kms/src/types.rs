@@ -259,6 +259,14 @@ pub struct KeyInfo {
     /// verdict to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_due_reason: Option<RotationDueReason>,
+    /// Wrap operations reserved against the key's current material, reported
+    /// only by backends that count wraps (the Vault KV2 backend today). An
+    /// approximate value that by design overestimates the wraps actually
+    /// performed. In-process transport for the deletion worker's aggregate
+    /// wrap gauge, deliberately kept off the serialized admin surface: per-key
+    /// exposure would need its own contract decision and snapshot pin.
+    #[serde(skip)]
+    pub wrap_budget_reserved: Option<u64>,
 }
 
 impl From<MasterKeyInfo> for KeyInfo {
@@ -277,6 +285,7 @@ impl From<MasterKeyInfo> for KeyInfo {
             created_by: master_key.created_by,
             rotation_due: false,
             rotation_due_reason: None,
+            wrap_budget_reserved: None,
         }
     }
 }

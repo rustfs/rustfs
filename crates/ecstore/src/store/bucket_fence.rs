@@ -161,6 +161,10 @@ impl BucketIncarnationFenceGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
     }
+
+    pub(crate) fn namespace_lock_guard(&self) -> Option<&NamespaceLockGuard> {
+        self.inner.as_ref()
+    }
 }
 
 impl Drop for BucketIncarnationFenceGuard {

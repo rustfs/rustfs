@@ -22,12 +22,13 @@ use crate::diagnostics::get::{
 #[cfg(feature = "hotpath")]
 use crate::disk::FileWriter;
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, MmapCopyStageMetrics, error::DiskError};
-use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
+use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter, ShardChunkRead};
 use bytes::Bytes;
 use rustfs_config::{
     DEFAULT_OBJECT_MMAP_READ_ENABLE, DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH, ENV_OBJECT_MMAP_READ_ENABLE,
     ENV_OBJECT_MMAP_READ_MAX_LENGTH, ENV_OBJECT_ZERO_COPY_ENABLE,
 };
+use rustfs_rio::ChunkReaderBox;
 use rustfs_utils::HashAlgorithm;
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -51,6 +52,7 @@ tokio::task_local! {
 /// (rustfs/backlog#1159). Everything else is a stream and keeps the old path.
 pub enum ShardReader {
     InMemory(Cursor<Bytes>),
+    Chunked(ChunkReaderBox),
     Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
 }
 
@@ -58,6 +60,7 @@ impl AsyncRead for ShardReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::InMemory(cursor) => Pin::new(cursor).poll_read(cx, buf),
+            Self::Chunked(reader) => Pin::new(&mut **reader).poll_read(cx, buf),
             Self::Stream(reader) => Pin::new(reader).poll_read(cx, buf),
         }
     }
@@ -67,7 +70,19 @@ impl crate::erasure::coding::ShardSource for ShardReader {
     fn try_take_block(&mut self, n: usize) -> Option<Bytes> {
         match self {
             Self::InMemory(cursor) => cursor.try_take_block(n),
-            Self::Stream(_) => None,
+            Self::Chunked(_) | Self::Stream(_) => None,
+        }
+    }
+
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<ShardChunkRead>> {
+        let Self::Chunked(reader) = self.get_mut() else {
+            return Poll::Ready(Ok(ShardChunkRead::Unsupported));
+        };
+        match Pin::new(&mut **reader).poll_read_chunk(cx, max) {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Ok(ShardChunkRead::Chunk(chunk))),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(ShardChunkRead::Eof)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -120,26 +135,41 @@ struct BitrotReaderSource {
 
 impl BitrotReaderSource {
     async fn open(self) -> disk::error::Result<Option<BoxedObjectReader>> {
-        if let Some(data) = self.inline_data {
-            let mut rd = Cursor::new(data);
-            let offset = u64::try_from(self.offset).map_err(|_| DiskError::FileCorrupt)?;
-            rd.set_position(offset);
-            Ok(Some(ShardReader::InMemory(rd)))
-        } else if let Some(disk) = self.disk {
-            open_disk_reader(
-                &disk,
-                &self.bucket,
-                &self.path,
-                self.offset,
-                self.length,
-                self.use_mmap_read,
-                self.stage_metrics.map(|metrics| metrics.path),
-            )
+        open_reader_source(
+            self.inline_data,
+            self.disk.as_ref(),
+            &self.bucket,
+            &self.path,
+            self.offset,
+            self.length,
+            self.use_mmap_read,
+            self.stage_metrics.map(|metrics| metrics.path),
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_reader_source(
+    inline_data: Option<Bytes>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    use_mmap_read: bool,
+    metrics_path: Option<&'static str>,
+) -> disk::error::Result<Option<BoxedObjectReader>> {
+    if let Some(data) = inline_data {
+        let mut reader = Cursor::new(data);
+        reader.set_position(u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?);
+        Ok(Some(ShardReader::InMemory(reader)))
+    } else if let Some(disk) = disk {
+        open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path)
             .await
             .map(Some)
-        } else {
-            Ok(None)
-        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -329,6 +359,17 @@ async fn open_disk_reader(
 ) -> disk::error::Result<ShardReader> {
     let metrics_path = metrics_path.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
     let stage_metrics_enabled = metrics_path.is_some();
+
+    // Preserve HTTP body ownership only on healthy remote reads. Instrumented
+    // and local paths retain their existing AsyncRead wrappers.
+    if use_mmap_read
+        && !disk.is_local()
+        && !stage_metrics_enabled
+        && !cfg!(feature = "hotpath")
+        && let Some(reader) = disk.read_file_stream_chunks(bucket, path, offset, length).await?
+    {
+        return Ok(ShardReader::Chunked(reader));
+    }
 
     // Mmap-copy materializes the whole `offset..offset+length` range as one
     // owned allocation before any byte is served, and GET/heal shard reads
@@ -623,23 +664,22 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
-    let inline_source = inline_data.is_some();
-    let source = BitrotReaderSource {
-        inline_data,
-        disk: disk.cloned(),
-        bucket: if inline_source { String::new() } else { bucket.to_string() },
-        path: if inline_source { String::new() } else { path.to_string() },
-        offset,
-        length,
-        use_mmap_read,
-        stage_metrics,
-    };
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
     }
 
     let file_open_start = stage_metrics_enabled.then(Instant::now);
-    let reader = source.open().await?;
+    let reader = open_reader_source(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        use_mmap_read,
+        stage_metrics.map(|metrics| metrics.path),
+    )
+    .await?;
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.file_open_stage, file_open_start);
     }
@@ -766,6 +806,50 @@ pub async fn create_bitrot_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_rio::ChunkReader;
+    use std::collections::VecDeque;
+
+    struct TestChunkReader {
+        chunks: VecDeque<Bytes>,
+    }
+
+    impl TestChunkReader {
+        fn new(bytes: Bytes, fragment_sizes: &[usize]) -> Self {
+            let mut chunks = VecDeque::new();
+            let mut offset = 0;
+            for &size in fragment_sizes {
+                let end = (offset + size).min(bytes.len());
+                if offset < end {
+                    chunks.push_back(bytes.slice(offset..end));
+                }
+                offset = end;
+            }
+            if offset < bytes.len() {
+                chunks.push_back(bytes.slice(offset..));
+            }
+            Self { chunks }
+        }
+    }
+
+    impl AsyncRead for TestChunkReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("test chunk reader must use chunk handoff")))
+        }
+    }
+
+    impl ChunkReader for TestChunkReader {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Poll::Ready(Ok(None));
+            };
+            let take = chunk.len().min(max);
+            if take < chunk.len() {
+                self.chunks.push_front(chunk.split_off(take));
+            }
+            chunk.truncate(take);
+            Poll::Ready(Ok(Some(chunk)))
+        }
+    }
 
     #[cfg(feature = "hotpath")]
     use crate::cluster::rpc::RemoteDisk;
@@ -1654,5 +1738,50 @@ mod tests {
         let error = wrapper.unwrap_err();
         println!("error: {error:?}");
         assert_eq!(error, DiskError::DiskNotFound);
+    }
+
+    #[tokio::test]
+    async fn shard_reader_chunked_path_verifies_fragmented_remote_block() {
+        const SHARD_SIZE: usize = 1024;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![42u8; SHARD_SIZE];
+        let mut encoded = Vec::new();
+        crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD_SIZE, algo.clone())
+            .write(&data)
+            .await
+            .expect("test shard should encode");
+
+        let source = TestChunkReader::new(Bytes::from(encoded), &[3, 7, 17, 31]);
+        let mut reader = BitrotReader::new(ShardReader::Chunked(Box::new(source)), SHARD_SIZE, algo, false);
+        let mut output = Vec::with_capacity(SHARD_SIZE);
+        reader
+            .read_appending(&mut output, SHARD_SIZE)
+            .await
+            .expect("fragmented remote shard should verify");
+
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn shard_reader_chunked_path_handles_more_than_one_poll_budget() {
+        const SHARD_SIZE: usize = 1024;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![42u8; SHARD_SIZE];
+        let mut encoded = Vec::new();
+        crate::erasure::coding::BitrotWriter::new(&mut encoded, SHARD_SIZE, algo.clone())
+            .write(&data)
+            .await
+            .expect("test shard should encode");
+
+        let fragment_sizes = vec![1; encoded.len()];
+        let source = TestChunkReader::new(Bytes::from(encoded), &fragment_sizes);
+        let mut reader = BitrotReader::new(ShardReader::Chunked(Box::new(source)), SHARD_SIZE, algo, false);
+        let mut output = Vec::with_capacity(SHARD_SIZE);
+        reader
+            .read_appending(&mut output, SHARD_SIZE)
+            .await
+            .expect("fragmented remote shard should verify after multiple polls");
+
+        assert_eq!(output, data);
     }
 }

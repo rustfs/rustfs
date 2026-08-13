@@ -113,9 +113,9 @@ use crate::app::runtime_sources::{
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
-use crate::server::convert_ecstore_object_info;
+use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
@@ -162,8 +162,9 @@ use s3s::dto::{
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
-    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
+    ServerSideEncryptionByDefault, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
@@ -193,7 +194,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
@@ -2044,6 +2045,18 @@ struct GetObjectResumeContext {
     identity: GetObjectResumeIdentity,
 }
 
+fn get_object_store_headers(request_headers: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
+        if let Some(value) = request_headers.get(name) {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
 impl GetObjectResumeContext {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2061,17 +2074,9 @@ impl GetObjectResumeContext {
         {
             opts.version_id = Some(version_id.to_string());
         }
-        let mut ssec_headers = HeaderMap::new();
-        for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-            if let Some(value) = request_headers.get(name) {
-                // The store's instrumented spans record the header argument at
-                // debug level; mark the replayed values sensitive so the SSE-C
-                // key is redacted there on every resume attempt.
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                ssec_headers.insert(name, value);
-            }
-        }
+        // Store spans record their header argument at debug level. Retain only
+        // the SSE-C inputs needed to reopen the reader and keep them redacted.
+        let ssec_headers = get_object_store_headers(request_headers);
         Self {
             store,
             bucket: bucket.to_string(),
@@ -2564,6 +2569,25 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
 }
 
+/// Managed SSE resolved from a bucket default encryption rule on the copy path.
+///
+/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
+/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
+/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
+/// instead lets a same-name copy under a malformed bucket default pass the
+/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
+/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
+/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
+/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
+/// (backlog#1826).
+fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
+    match sse.sse_algorithm.as_str() {
+        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    }
+}
+
 fn should_use_small_eager_put_path(
     size: i64,
     headers: &HeaderMap,
@@ -2597,16 +2621,16 @@ fn should_use_small_eager_put_path(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
 where
     R: AsyncRead + Unpin,
+    B: bytes::BufMut,
 {
-    let mut buf = pool.acquire_buffer(size).await;
-    buf.resize(size, 0);
     let mut filled = 0;
 
     while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+        let mut remaining = (&mut *buf).limit(size - filled);
+        let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
             .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
         if read == 0 {
@@ -2616,13 +2640,22 @@ where
     }
 
     let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+    let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
         .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
 
+    Ok(())
+}
+
+async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = pool.acquire_buffer(size).await;
+    read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
 
@@ -2633,27 +2666,8 @@ async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Resu
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; size];
-    let mut filled = 0;
-
-    while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
-            .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-        if read == 0 {
-            return Err(s3_error!(IncompleteBody));
-        }
-        filled += read;
-    }
-
-    let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
-        .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-    if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
+    let mut buf = Vec::with_capacity(size);
+    read_small_put_body_into(&mut body, &mut buf, size).await?;
     Ok(std::io::Cursor::new(buf))
 }
 
@@ -4455,6 +4469,7 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
+        let store_headers = get_object_store_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4469,7 +4484,7 @@ impl DefaultObjectUsecase {
             .await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+                store.get_object_reader(bucket, key, rs.clone(), store_headers.clone(), opts),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4596,7 +4611,7 @@ impl DefaultObjectUsecase {
             drop(metadata_admission.take());
             let outcome = coordinate_cold_fill(&coordinator, cache_key, waiter_deadline, Some(proposed_producer_deadline), {
                 let adapter = &cache_adapter;
-                let headers = &req.headers;
+                let headers = &store_headers;
                 let store = &store;
                 let range = &rs;
                 let object_traffic_health = &object_traffic_health;
@@ -4760,7 +4775,7 @@ impl DefaultObjectUsecase {
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                prepared.with_headers(req.headers.clone()).into_reader(),
+                prepared.with_headers(store_headers.clone()).into_reader(),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4785,14 +4800,14 @@ impl DefaultObjectUsecase {
                 .map_err(map_get_object_reader_error)?;
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    prepared.with_headers(req.headers.clone()).into_reader(),
+                    prepared.with_headers(store_headers.clone()).into_reader(),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    store.get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts),
+                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
@@ -5571,7 +5586,8 @@ impl DefaultObjectUsecase {
         // Bucket-quota admission runs exactly once, and only now that the authoritative object length is known. `size` is the same basis the settle phase records via ObjectInfo.size (actual, pre-compression/pre-encryption logical size), NOT the aws-chunked wire Content-Length. When no quota is configured this stays a zero-extra-I/O fast path; once a hard quota is set, checker/config/usage faults fail closed with a retryable error.
         self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
 
-        let ingress_stage_start = std::time::Instant::now();
+        let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
+        let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
             is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
         let server_side_encryption_requested =
@@ -5635,9 +5651,13 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
         validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
 
+        let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -5703,7 +5723,9 @@ impl DefaultObjectUsecase {
 
         let mut metadata = metadata.unwrap_or_default();
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -5725,6 +5747,7 @@ impl DefaultObjectUsecase {
             has_explicit_object_lock_retention,
         )?;
 
+        let put_opts_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut opts: ObjectOptions = put_opts_with_replication_authorization(
             &bucket,
             &key,
@@ -5735,6 +5758,7 @@ impl DefaultObjectUsecase {
         )
         .await
         .map_err(ApiError::from)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         apply_put_request_object_lock_opts(
             &bucket,
@@ -5753,10 +5777,11 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || object_lock_checks_required(&bucket).await;
+        let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
+        let prelookup_stage_start = (prelookup_required && put_stage_metrics_enabled).then(Instant::now);
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
                 get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
@@ -5782,6 +5807,7 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_prelookup", prelookup_stage_start);
 
         let actual_size = size;
 
@@ -5870,15 +5896,13 @@ impl DefaultObjectUsecase {
             put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
         }
         rustfs_io_metrics::record_put_object_path(put_path);
-        rustfs_io_metrics::record_put_object_stage_duration(
-            "ingress_prepare",
-            ingress_stage_start.elapsed().as_secs_f64() * 1000.0,
-        );
+        rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
+        let encryption_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let write_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
@@ -5922,6 +5946,7 @@ impl DefaultObjectUsecase {
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
         let mut reader = PutObjReader::new(reader);
 
@@ -5938,9 +5963,11 @@ impl DefaultObjectUsecase {
         // post-commit schedule (see the reuse site further down), so a
         // replication-config hot update can no longer split the two phases
         // (https://github.com/rustfs/backlog/issues/1320).
+        let replication_decision_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
@@ -5952,7 +5979,12 @@ impl DefaultObjectUsecase {
         }
 
         let cache_adapter = self.object_data_cache();
+        let cache_invalidate_before_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            "app_cache_invalidate_before",
+            cache_invalidate_before_stage_start,
+        );
 
         let store_put_watchdog = tokio_util::sync::CancellationToken::new();
         spawn_traced({
@@ -5992,6 +6024,7 @@ impl DefaultObjectUsecase {
         let object_traffic_progress = object_traffic_health
             .as_deref()
             .and_then(ObjectTrafficHealth::track_write_storage);
+        let store_put_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let (obj_info, backfilled_old_current_size) = match store
             .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
             .await
@@ -6017,6 +6050,7 @@ impl DefaultObjectUsecase {
             }
             Err(err) => {
                 store_put_watchdog.cancel();
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
                 warn!(
                     target: "rustfs::app::object_usecase",
                     event = EVENT_PUT_OBJECT_STORE_RETURNED,
@@ -6038,10 +6072,12 @@ impl DefaultObjectUsecase {
                 return result;
             }
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
         drop(object_traffic_progress);
         #[cfg(test)]
         wait_for_put_post_store_test_hook(&bucket).await;
 
+        let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
         let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
 
@@ -6140,10 +6176,13 @@ impl DefaultObjectUsecase {
         let result = Ok(response);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
+        let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
 
         // Record PutObject metrics via zero-copy-metrics
         {
@@ -6698,9 +6737,10 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        opts.include_part_checksums = object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS);
 
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -7176,11 +7216,7 @@ impl DefaultObjectUsecase {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
                         .as_ref()
-                        .and_then(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-                            "aws:kms" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
-                            _ => None,
-                        })
+                        .map(bucket_default_write_sse)
                 })
             })
         });
@@ -9551,6 +9587,13 @@ pub(super) async fn object_lock_checks_required(bucket: &str) -> bool {
         .map_or(true, |metadata| metadata.object_locking())
 }
 
+fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
+    match state {
+        metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
+        metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,
+    }
+}
+
 /// rustfs/backlog#1009: map the rename_data old-size backfill onto the
 /// `previous_current_size` value the usage-accounting helpers expect. Outer
 /// `None` = unknown (no quorum agreement, or a peer predates the field) — the
@@ -9570,7 +9613,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -9763,6 +9807,46 @@ mod tests {
         assert!(lookup_opts.http_preconditions.is_none());
         assert_eq!(lookup_opts.version_id.as_deref(), Some(version_id.as_str()));
         assert!(lookup_opts.no_lock);
+    }
+
+    // A malformed bucket-default algorithm reaches this resolution only through
+    // corrupt or hand-edited bucket metadata (PutBucketEncryption validates the
+    // value), so the invariant is pinned here rather than end-to-end: the copy
+    // path must resolve managed AES256 exactly like PUT/extract. With an
+    // unencrypted same-name source and no SSE-C, the resolved default alone
+    // keeps `copy_changes_encryption` true, so the metadata-only shortcut stays
+    // off while `sse_encryption` mints a fresh DEK (backlog#1826).
+    #[test]
+    fn copy_bucket_default_unknown_sse_algorithm_falls_back_to_aes256() {
+        let config = ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
+                    kms_master_key_id: None,
+                }),
+                bucket_key_enabled: None,
+            }],
+        };
+
+        let effective_sse = config
+            .rules
+            .first()
+            .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+            .map(bucket_default_write_sse);
+
+        assert_eq!(effective_sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+
+        // Valid algorithms map to themselves, byte-identical to the PUT path.
+        for (configured, expected) in [
+            (ServerSideEncryption::AES256, ServerSideEncryption::AES256),
+            (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
+        ] {
+            let sse = ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from_static(configured),
+                kms_master_key_id: None,
+            };
+            assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
+        }
     }
 
     #[test]
@@ -10134,6 +10218,23 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    #[test]
+    fn object_lock_checks_required_reuses_authoritative_state() {
+        assert!(!object_lock_checks_required_for_state(
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        ));
+
+        let configured = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        assert!(object_lock_checks_required_for_state(&configured));
+        assert!(object_lock_checks_required_for_state(&metadata_sys::ObjectLockConfigState::Fabricated));
     }
 
     #[test]
@@ -13722,6 +13823,11 @@ mod tests {
         request_headers.insert(SSEC_KEY_MD5_HEADER, HeaderValue::from_static("bWQ1"));
         request_headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test"));
         request_headers.insert("x-amz-security-token", HeaderValue::from_static("session-token"));
+        let store_headers = get_object_store_headers(&request_headers);
+        assert_eq!(store_headers.len(), 3, "only store-consumed SSE-C headers are forwarded");
+        assert!(store_headers.values().all(HeaderValue::is_sensitive));
+        assert!(store_headers.get(http::header::AUTHORIZATION).is_none());
+        assert!(store_headers.get("x-amz-security-token").is_none());
         let plain_info = ObjectInfo {
             size: 11,
             ..Default::default()
@@ -15138,16 +15244,65 @@ mod tests {
         );
     }
 
+    struct FragmentedBody {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for FragmentedBody {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining()).min(2);
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InitializedLengthProbe {
+        data: std::io::Cursor<Vec<u8>>,
+        initialized_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for InitializedLengthProbe {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")
+                .push(buf.initialized().len());
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
-    async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
+    async fn read_small_put_body_exact_pooled_reads_exact_bytes_without_prefill() {
         let pool = get_concurrency_manager().bytes_pool();
-        let body = std::io::Cursor::new(b"hello".to_vec());
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
 
         let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
             .await
             .expect("pooled exact read should succeed");
 
         assert_eq!(&buffer[..5], b"hello");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first pooled body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -15161,6 +15316,131 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_rejects_extra_body() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello!".to_vec());
+
+        let err = match read_small_put_body_exact_pooled(body, 5, pool.as_ref()).await {
+            Ok(_) => panic!("extra pooled body should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_exact_bytes_without_prefill() {
+        let body = std::io::Cursor::new(b"hello".to_vec());
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(reader.get_ref().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_short_and_extra_bodies() {
+        let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
+            .await
+            .expect_err("short direct body should fail");
+        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
+            .await
+            .expect_err("extra direct body should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_handles_empty_body_boundary() {
+        let empty = read_small_put_body_exact_direct(std::io::Cursor::new(Vec::<u8>::new()), 0)
+            .await
+            .expect("empty direct body should succeed");
+        assert!(empty.get_ref().is_empty());
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
+            .await
+            .expect_err("non-empty body declared as empty should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_error_after_partial_read() {
+        struct PartialThenError {
+            delivered_prefix: bool,
+        }
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.delivered_prefix {
+                    return Poll::Ready(Err(std::io::Error::other("body read failed")));
+                }
+
+                self.delivered_prefix = true;
+                buf.put_slice(b"he");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let err = read_small_put_body_exact_direct(PartialThenError { delivered_prefix: false }, 5)
+            .await
+            .expect_err("a partial body followed by an I/O error must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_accepts_fragmented_body() {
+        let reader = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect("a fragmented exact-length body should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_fragmented_extra_body() {
+        let err = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello!".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect_err("a fragmented body longer than declared must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_into_uninitialized_spare_capacity() {
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
+
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -16601,7 +16881,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
             .bucket("test-bucket".to_string())
@@ -16744,7 +17023,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
         let restore_request = RestoreRequest {
             days: Some(1),

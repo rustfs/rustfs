@@ -5,6 +5,13 @@ All notable changes to the rustfs-io-core and rustfs-io-metrics crates will be d
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+#### rustfs-io-metrics
+- **Unified configuration** (added in 0.0.5): the zero-consumer `IoConfig`, `CacheSettings`, `IoSchedulerSettings`, `BackpressureSettings`, `TimeoutSettings`, `DeadlockDetectionSettings` types and their `DEFAULT_*` constants were removed (rustfs/rustfs#6008); rustfs-io-core's `IoSchedulerConfig`/`BackpressureConfig` remain the canonical configuration types.
+
 ## [0.0.5] - 2025-01-XX
 
 ### Added

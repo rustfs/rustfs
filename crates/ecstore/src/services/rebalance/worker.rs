@@ -406,6 +406,7 @@ pub(super) async fn load_rebalance_bucket_configs(api: &ECStore, bucket: &str) -
 
     let expiry_configs = crate::bucket::lifecycle::get_expiry_configs(api, bucket).await?;
     Ok(RebalanceBucketConfigs {
+        bucket_incarnation_id: Some(api.bucket_incarnation_id_from_disk(bucket).await?),
         lifecycle_config: expiry_configs.lifecycle.map(|config| (*config).clone()),
         object_lock_config: expiry_configs.object_lock.map(|config| (*config).clone()),
         replication_config: resolve_rebalance_optional_bucket_config_result(

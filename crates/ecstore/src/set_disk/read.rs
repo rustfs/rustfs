@@ -19,7 +19,7 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
-    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
+    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
     GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
     GET_METADATA_CACHE_REASON_VERSIONED, GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA,
@@ -340,7 +340,7 @@ impl SetDisks {
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
         // core/io_primitives.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
+        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
             &disks,
             "",
             bucket,
@@ -394,8 +394,17 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (op_online_disks, fi, fileinfo_selection_quorum) =
+        let (op_online_disks, mut fi, fileinfo_selection_quorum) =
             Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)?;
+        let include_part_checksums =
+            opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
+        if include_part_checksums {
+            Self::hydrate_selected_fileinfo_part_checksums(&mut fi)?;
+        } else {
+            for metadata in std::iter::once(&mut fi).chain(parts_metadata.iter_mut()) {
+                rustfs_utils::http::remove_str(&mut metadata.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+            }
+        }
         metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
         if errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
@@ -1826,6 +1835,9 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
     if opts.part_number.is_some() {
         return Some(GET_METADATA_CACHE_REASON_PART_NUMBER);
     }
+    if opts.include_part_checksums {
+        return Some(GET_METADATA_CACHE_REASON_PART_CHECKSUMS);
+    }
     if opts.data_movement {
         return Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT);
     }
@@ -2495,6 +2507,16 @@ mod metadata_cache_tests {
         assert_eq!(
             get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
             Some(GET_METADATA_CACHE_REASON_PART_NUMBER)
+        );
+
+        opts = ObjectOptions {
+            include_part_checksums: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_PART_CHECKSUMS)
         );
 
         opts = ObjectOptions {

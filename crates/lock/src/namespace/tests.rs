@@ -357,6 +357,16 @@ async fn test_namespace_lock_with_local_manager() {
 }
 
 #[tokio::test]
+async fn namespace_lock_preserves_shared_namespace_storage() {
+    let namespace: Arc<str> = Arc::from("shared-namespace");
+    let namespace_ptr = Arc::as_ptr(&namespace);
+    let local = LocalLock::new_shared(namespace.clone(), Arc::new(GlobalLockManager::new()));
+
+    assert_eq!(local.namespace(), namespace.as_ref());
+    assert_eq!(local.namespace().as_ptr(), namespace_ptr.cast::<u8>());
+}
+
+#[tokio::test]
 async fn test_namespace_lock_with_clients() {
     let clients = vec![ClientFactory::create_local(), ClientFactory::create_local()];
     let lock = NamespaceLock::with_clients("multi-client".to_string(), clients);

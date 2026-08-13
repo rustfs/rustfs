@@ -5,9 +5,10 @@ availability, what to expect when several nodes are down at once (sequential
 cold start), and how to read the degraded-mode signals. Written for the
 failure pattern reported in rustfs/rustfs#4304.
 
-> Upgrading the binary or container image never changes the on-disk data
-> format. Replacing the executable and restarting is safe; no migration step
-> runs on startup.
+> Upgrading the binary or container image does not change the on-disk data
+> format unless an explicitly enabled feature documents a version floor.
+> Replacing the executable and restarting does not run a migration step on
+> startup.
 
 > [!WARNING]
 > The release that switches local SSE wrapped DEKs from the legacy
@@ -18,6 +19,17 @@ failure pattern reported in rustfs/rustfs#4304.
 > writes and background lifecycle or replication work, upgrade every node,
 > and then resume traffic. Downgrading or rolling back after new encrypted
 > objects are written is not supported.
+
+> [!WARNING]
+> `RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_WRITE` remains inactive unless
+> `RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED` is also `true`. Enable
+> both only after every node that can read or write object metadata supports
+> the `part-checksums` sidecar and the fleet has adopted that version as its
+> rollback floor. Leave either setting disabled throughout a mixed-version
+> rolling upgrade. Once rebalance or decommission has migrated a legacy
+> checksummed multipart object with both settings enabled, rolling back to an
+> older build is not supported: older readers ignore the sidecar and can
+> report an object checksum in place of the requested part checksum.
 
 ## TL;DR
 

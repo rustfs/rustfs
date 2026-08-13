@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live NATS JetStream server (docker run nats:2 -js; RUSTFS_TEST_NATS_URL overrides)"]
     async fn tls_change_rebuilds_the_context_and_drains_the_old_acker() {
         // A TLS fingerprint change on the publish path rebuilds the cached context from the new client and drains the old acker.
         let subject = format!("rustfs.tlsrebuild.{}", Uuid::new_v4().simple());
@@ -839,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live NATS JetStream server (docker run nats:2 -js; RUSTFS_TEST_NATS_URL overrides)"]
     async fn tls_change_after_a_failed_reconnect_still_rebuilds_the_context() {
         // A rotation detected while the broker is unreachable does not orphan the cached context: a failed reconnect followed by a successful one ends bound to the rebuilt context.
         let subject = format!("rustfs.tlsfail.{}", Uuid::new_v4().simple());
@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live NATS JetStream server (docker run nats:2 -js; RUSTFS_TEST_NATS_URL overrides)"]
     async fn publish_gate_rejects_an_unsafe_stream_and_heals_after_the_stream_is_fixed() {
         // The gate rejects every publish while the stream's duplicate window is below the retry lifetime, and starts publishing once the operator widens it, without a restart.
         let subject = format!("rustfs.gate.{}", Uuid::new_v4().simple());
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live NATS JetStream server (docker run nats:2 -js; RUSTFS_TEST_NATS_URL overrides)"]
     async fn a_remapped_subject_is_rejected_by_the_ack_stream_check_and_the_entry_stays_queued() {
         // After a subject remap the takeover stream acknowledges, so the ack-stream check rejects it with the mismatch detail, keeps the entry queued, and resets the verdict for re-validation.
         let subject = format!("rustfs.remap.{}", Uuid::new_v4().simple());

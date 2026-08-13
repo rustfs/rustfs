@@ -28,12 +28,17 @@ pub struct LocalLock {
     /// Global lock manager for fast local locks
     manager: Arc<GlobalLockManager>,
     /// Namespace identifier
-    namespace: String,
+    namespace: Arc<str>,
 }
 
 impl LocalLock {
     /// Create new local lock
     pub fn new(namespace: String, manager: Arc<GlobalLockManager>) -> Self {
+        Self::new_shared(namespace.into(), manager)
+    }
+
+    /// Create a local lock that shares an existing namespace allocation.
+    pub(crate) fn new_shared(namespace: Arc<str>, manager: Arc<GlobalLockManager>) -> Self {
         Self { namespace, manager }
     }
 

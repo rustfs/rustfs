@@ -164,6 +164,9 @@ pub(crate) async fn local_node_name() -> String {
 }
 
 pub(crate) async fn set_local_node_name(node_name: String) {
+    // Also stamp the internode-metrics server label: io-metrics is a leaf
+    // crate and no longer resolves node identity itself (backlog#1834).
+    rustfs_io_metrics::internode_metrics::set_internode_server_label(node_name.as_str());
     rustfs_common::set_global_local_node_name(&node_name).await;
 }
 

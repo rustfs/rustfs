@@ -2401,15 +2401,20 @@ async fn wait_for_site_replication_info<F>(
 where
     F: Fn(&SiteReplicationInfo) -> bool,
 {
-    for _ in 0..40 {
+    // 30s to match wait_for_replication_state: the three-node site tests run
+    // several full rustfs processes on one runner, so peer-state propagation
+    // can take well over 10s under CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let info = site_replication_info(env).await?;
         if predicate(&info) {
             return Ok(info);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication info did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication info did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_site_replication_status<F>(
@@ -2420,15 +2425,19 @@ async fn wait_for_site_replication_status<F>(
 where
     F: Fn(&SRStatusInfo) -> bool,
 {
-    for _ in 0..40 {
+    // Same 30s ceiling as wait_for_site_replication_info: the status probes
+    // fan out to every peer, so they see the same multi-process CI load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let status = site_replication_status(env, query).await?;
         if predicate(&status) {
             return Ok(status);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("site replication status did not reach expected state on {}", env.address).into());
+        }
         sleep(Duration::from_millis(250)).await;
     }
-
-    Err(format!("site replication status did not reach expected state on {}", env.address).into())
 }
 
 async fn wait_for_replication_reset_target<F>(
@@ -4235,37 +4244,49 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         "tag rule with disabled delete-marker replication created a marker: {tagged_state:?}"
     );
 
-    set_bucket_versioning(&source_env, source_bucket, BucketVersioningStatus::Suspended).await?;
-    set_bucket_versioning(&target_env_a, target_bucket_a, BucketVersioningStatus::Suspended).await?;
-    let null_put = source_client
+    // AWS S3 and MinIO both reject suspending versioning on a bucket that
+    // carries a replication configuration (InvalidBucketState): suspension
+    // would mint null versions that versioned replication can never converge.
+    let suspend_err = source_client
+        .put_bucket_versioning()
+        .bucket(source_bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("suspending versioning on a replication source must be rejected");
+    assert_eq!(
+        suspend_err.as_service_error().and_then(|error| error.code()),
+        Some("InvalidBucketState"),
+        "suspension on a replication source must fail with InvalidBucketState: {suspend_err:?}"
+    );
+
+    // The rejected suspension must leave the versioning + replication state
+    // fully intact: a fresh matched PUT still replicates with a real version.
+    let post_reject_put = source_client
         .put_object()
         .bucket(source_bucket)
-        .key("prefix/null.txt")
-        .body(ByteStream::from_static(b"null version"))
+        .key("prefix/after-rejected-suspend.txt")
+        .body(ByteStream::from_static(b"still replicating"))
         .send()
         .await?;
-    assert!(null_put.version_id().is_none(), "suspended source PUT must create a null version");
-    wait_for_replication_state(&target_client_a, target_bucket_a, "null version did not replicate", |state| {
-        state
-            .iter()
-            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && !entry.delete_marker)
-    })
-    .await?;
-    let null_delete = source_client
-        .delete_object()
-        .bucket(source_bucket)
-        .key("prefix/null.txt")
-        .send()
-        .await?;
-    assert!(
-        null_delete.version_id().is_none(),
-        "suspended source DELETE must create a null delete marker"
-    );
-    wait_for_replication_state(&target_client_a, target_bucket_a, "null delete marker did not replicate", |state| {
-        state
-            .iter()
-            .any(|entry| entry.key == "prefix/null.txt" && entry.version_id == "null" && entry.delete_marker)
-    })
+    let post_reject_version_id = post_reject_put
+        .version_id()
+        .ok_or("PUT after rejected suspension omitted version ID")?
+        .to_string();
+    wait_for_replication_state(
+        &target_client_a,
+        target_bucket_a,
+        "replication stopped after rejected versioning suspension",
+        |state| {
+            state
+                .iter()
+                .any(|entry| entry.key == "prefix/after-rejected-suspend.txt" && entry.version_id == post_reject_version_id)
+        },
+    )
     .await?;
 
     Ok(())
