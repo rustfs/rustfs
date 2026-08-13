@@ -1429,54 +1429,12 @@ fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
 }
 
 fn manifest_list_avro_bytes_with_spec(manifest_paths: &[&str], partition_spec_id: i32) -> Vec<u8> {
-    let schema = apache_avro::Schema::parse_str(
-        r#"
-            {
-              "type": "record",
-              "name": "manifest_file",
-              "fields": [
-                {"name": "manifest_path", "type": "string"},
-                {"name": "manifest_length", "type": "long"},
-                {"name": "partition_spec_id", "type": "int"},
-                {"name": "content", "type": "int"},
-                {"name": "sequence_number", "type": "long"},
-                {"name": "min_sequence_number", "type": "long"},
-                {"name": "added_snapshot_id", "type": "long"},
-                {"name": "added_files_count", "type": "int"},
-                {"name": "existing_files_count", "type": "int"},
-                {"name": "deleted_files_count", "type": "int"},
-                {"name": "added_rows_count", "type": "long"},
-                {"name": "existing_rows_count", "type": "long"},
-                {"name": "deleted_rows_count", "type": "long"}
-              ]
-            }
-            "#,
-    )
-    .expect("manifest list avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
-    for manifest_path in manifest_paths {
-        writer
-            .append_value(apache_avro::types::Value::Record(vec![
-                (
-                    "manifest_path".to_string(),
-                    apache_avro::types::Value::String((*manifest_path).to_string()),
-                ),
-                ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
-                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(partition_spec_id)),
-                ("content".to_string(), apache_avro::types::Value::Int(0)),
-                ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
-                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
-                ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
-                ("added_files_count".to_string(), apache_avro::types::Value::Int(1)),
-                ("existing_files_count".to_string(), apache_avro::types::Value::Int(0)),
-                ("deleted_files_count".to_string(), apache_avro::types::Value::Int(0)),
-                ("added_rows_count".to_string(), apache_avro::types::Value::Long(1)),
-                ("existing_rows_count".to_string(), apache_avro::types::Value::Long(0)),
-                ("deleted_rows_count".to_string(), apache_avro::types::Value::Long(0)),
-            ]))
-            .expect("manifest list record should append");
-    }
-    writer.into_inner().expect("manifest list avro bytes should flush")
+    // Historical fixed values of this file's fixtures: sequence 7, snapshot 20.
+    let manifests = manifest_paths
+        .iter()
+        .map(|path| (*path, partition_spec_id, 7_i64, 20_i64))
+        .collect::<Vec<_>>();
+    crate::table_catalog::test_support::manifest_list_avro_entries_with_partition_specs(&manifests)
 }
 
 fn v1_manifest_list_avro_bytes(manifest_path: &str) -> Vec<u8> {
@@ -2336,55 +2294,13 @@ fn manifest_avro_bytes(files: &[(&str, i32)]) -> Vec<u8> {
 }
 
 fn manifest_avro_bytes_with_status(files: &[(&str, i32, i32)]) -> Vec<u8> {
-    let schema = apache_avro::Schema::parse_str(
-        r#"
-            {
-              "type": "record",
-              "name": "manifest_entry",
-              "fields": [
-                {"name": "status", "type": "int"},
-                {"name": "snapshot_id", "type": "long"},
-                {"name": "sequence_number", "type": "long"},
-                {"name": "file_sequence_number", "type": "long"},
-                {
-                  "name": "data_file",
-                  "type": {
-                    "type": "record",
-                    "name": "data_file",
-                    "fields": [
-                      {"name": "content", "type": "int"},
-                      {"name": "file_path", "type": "string"},
-                      {"name": "record_count", "type": "long"},
-                      {"name": "file_size_in_bytes", "type": "long"}
-                    ]
-                  }
-                }
-              ]
-            }
-            "#,
-    )
-    .expect("manifest avro schema should parse");
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
-    for (file_path, content, status) in files {
-        writer
-            .append_value(apache_avro::types::Value::Record(vec![
-                ("status".to_string(), apache_avro::types::Value::Int(*status)),
-                ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
-                ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
-                ("file_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
-                (
-                    "data_file".to_string(),
-                    apache_avro::types::Value::Record(vec![
-                        ("content".to_string(), apache_avro::types::Value::Int(*content)),
-                        ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
-                        ("record_count".to_string(), apache_avro::types::Value::Long(1)),
-                        ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
-                    ]),
-                ),
-            ]))
-            .expect("manifest record should append");
-    }
-    writer.into_inner().expect("manifest avro bytes should flush")
+    // Historical fixed values of this file's fixtures: snapshot 20, sequence 7
+    // (the shared constructor takes snapshot_id fourth, sequence fifth).
+    let files = files
+        .iter()
+        .map(|(path, content, status)| (*path, *content, *status, 20_i64, 7_i64))
+        .collect::<Vec<_>>();
+    crate::table_catalog::test_support::manifest_avro_bytes(&files)
 }
 
 fn manifest_avro_bytes_with_dt_partition(files: &[(&str, i32, &str)]) -> Vec<u8> {

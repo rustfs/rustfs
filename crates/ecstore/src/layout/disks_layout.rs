@@ -21,7 +21,8 @@ use tracing::debug;
 
 /// Supported set sizes this is used to find the optimal
 /// single set size.
-const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+pub(crate) const MAX_ERASURE_SET_DRIVE_COUNT: usize = 16;
+const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, MAX_ERASURE_SET_DRIVE_COUNT];
 const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
 #[derive(Deserialize, Debug, Default)]
@@ -327,7 +328,7 @@ fn possible_set_counts(set_size: usize) -> Vec<usize> {
 
 /// checks whether given count is a valid set size for erasure coding.
 fn is_valid_set_size(count: usize) -> bool {
-    count >= SET_SIZES[0] && count <= SET_SIZES[SET_SIZES.len() - 1]
+    count >= SET_SIZES[0] && count <= MAX_ERASURE_SET_DRIVE_COUNT
 }
 
 /// Final set size with all the symmetry accounted for.

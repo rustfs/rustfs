@@ -22,6 +22,8 @@
 //! bucket-metadata-sys OnceCell) — under `cargo nextest` each test runs
 //! in its own process so the OnceCell never collides.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::{

@@ -25,7 +25,7 @@
 // The lowercase stored forms, matching exactly what encryption_material_to_metadata
 // persists. The read-path SSE-C check is case-sensitive, so restoring under any
 // other casing would classify the replica as managed-SSE and reject SSE-C GETs.
-use super::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
+use super::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
 pub const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 pub const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
@@ -84,6 +84,20 @@ pub const SSEC_REPLICATION_TRANSPORT_HEADERS: &[(&str, &str)] = &[
     (MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, REPLICATION_SSE_SEALED_KEY_HEADER),
     (MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, REPLICATION_ENCRYPTED_MULTIPART_HEADER),
 ];
+
+/// Retains only the SSE-C headers consumed by object readers and marks their
+/// values sensitive so instrumented storage calls cannot expose key material.
+pub fn project_ssec_transport_headers(headers: &http::HeaderMap) -> http::HeaderMap {
+    let mut projected = http::HeaderMap::new();
+    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
+        if let Some(value) = headers.get(name) {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            projected.insert(name, value);
+        }
+    }
+    projected
+}
 
 /// Prefixes of replication SSE transport keys whose values carry encryption
 /// material and must never reach logs. Consumed by `rustfs_filemeta` redaction.
@@ -154,6 +168,22 @@ pub fn is_replication_stripped_encryption_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssec_transport_projection_retains_only_redacted_reader_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(SSEC_ALGORITHM_HEADER, http::HeaderValue::from_static("AES256"));
+        headers.insert(SSEC_KEY_HEADER, http::HeaderValue::from_static("secret-key"));
+        headers.insert(SSEC_KEY_MD5_HEADER, http::HeaderValue::from_static("key-md5"));
+        headers.insert(http::header::AUTHORIZATION, http::HeaderValue::from_static("credential"));
+
+        let projected = project_ssec_transport_headers(&headers);
+
+        assert_eq!(projected.len(), 3);
+        assert!(projected.values().all(http::HeaderValue::is_sensitive));
+        assert!(projected.get(http::header::AUTHORIZATION).is_none());
+        assert!(!format!("{projected:?}").contains("secret-key"));
+    }
 
     #[test]
     fn transport_metadata_roundtrip_restores_stored_keys() {

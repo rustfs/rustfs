@@ -2022,6 +2022,21 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn read_file_stream_chunks(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+        self.track_disk_health_with_op(
+            "read_file_stream_chunks",
+            || async { self.disk.read_file_stream_chunks(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
         self.track_disk_health_with_op(
             "read_file_mmap_copy",

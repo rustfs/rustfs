@@ -54,8 +54,9 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params, create_bitrot_reader_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled, object_mmap_read_max_length,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params,
+    create_bitrot_reader_from_bytes_with_stage_metrics, create_deferred_bitrot_reader_with_stripe_handle,
+    object_mmap_read_enabled, object_mmap_read_max_length,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::FutureExt as _;
@@ -1390,13 +1391,13 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
         return;
     }
 
-    let inline_data = files[idx].data.as_deref();
+    let inline_data = files[idx].data.clone();
     let data_dir = files[idx].data_dir.unwrap_or_default();
     let disk = disks[idx].as_ref();
     let path = format!("{object}/{data_dir}/part.{part_number}");
 
     reader_tasks.push(Box::pin(async move {
-        let result = create_bitrot_reader_with_stage_metrics(
+        let result = create_bitrot_reader_from_bytes_with_stage_metrics(
             inline_data,
             disk,
             bucket,
@@ -1688,14 +1689,14 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     for (idx, disk_op) in disks.iter().enumerate() {
         setup.mark_scheduled(idx);
-        let inline_data = files[idx].data.as_deref();
+        let inline_data = files[idx].data.clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let disk = disk_op.as_ref();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
-            let result = create_bitrot_reader_with_stage_metrics(
+            let result = create_bitrot_reader_from_bytes_with_stage_metrics(
                 inline_data,
                 disk,
                 bucket,
@@ -2477,6 +2478,7 @@ impl SetDisks {
                 join_set.spawn(async move {
                     let response_start = Instant::now();
                     let result = if let Some(disk) = disk {
+                        #[allow(clippy::let_unit_value)]
                         let _fanout_task_guard = Self::rename_fanout_task_guard(&object);
                         Self::record_read_version_call(&object, index);
                         #[cfg(test)]
@@ -3123,16 +3125,19 @@ impl SetDisks {
         let results = fanout.await.map_err(|_| DiskError::Unexpected)?;
 
         for (idx, result) in results.iter().enumerate() {
-            match result.as_ref().map_err(|_| DiskError::Unexpected)? {
-                Ok(res) => {
+            match result {
+                Ok(Ok(res)) => {
                     data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
                     cleanup_data_dirs[idx] = res.cleanup_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
                     old_current_sizes[idx] = res.old_current_size;
                     errs.push(None);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     errs.push(Some(e.clone()));
+                }
+                Err(_) => {
+                    errs.push(Some(DiskError::Unexpected));
                 }
             }
         }
@@ -5894,7 +5899,7 @@ mod tests {
         let object = "legacy-inline-data-get-object";
         let payload = b"legacy inline payload whose size is not divisible by the data shard count";
         let (_dirs, disks) = call_counter_local_disks(bucket, 4).await;
-        let files = inline_metadata_fanout_fileinfos_with_mode(bucket, &object, payload, true).await;
+        let files = inline_metadata_fanout_fileinfos_with_mode(bucket, object, payload, true).await;
         let distribution = files
             .first()
             .map(|file| file.erasure.distribution.clone())
@@ -6485,11 +6490,13 @@ mod tests {
                     rustfs_utils::http::SUFFIX_PURGESTATUS,
                     "target=PENDING;".to_string(),
                 );
-                file.replication_state_internal = Some(rustfs_filemeta::ReplicationState {
+                let replication_state = crate::bucket::replication::ReplicationState {
                     version_purge_status_internal: Some("target=PENDING;".to_string()),
-                    purge_targets: rustfs_filemeta::version_purge_statuses_map("target=PENDING;"),
+                    purge_targets: crate::bucket::replication::version_purge_statuses_map("target=PENDING;"),
                     ..Default::default()
-                });
+                };
+                file.replication_state_internal =
+                    Some(crate::bucket::replication::replication_state_to_filemeta(&replication_state));
                 file.deleted = true;
                 assert!(
                     !file.is_canonical_delete_marker(),

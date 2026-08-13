@@ -247,8 +247,8 @@ impl SetDisks {
             no_lock: true,
             ..Default::default()
         };
-        let (current, _, _) = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
-        restore_operation_id_from_metadata(&current.metadata)?
+        let current = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
+        restore_operation_id_from_metadata(&current.fi().metadata)?
             .filter(|actual| *actual == expected)
             .ok_or_else(|| Error::other(format!("restore operation id changed before {mode}: expected {expected}")))?;
         Ok(())
@@ -736,41 +736,91 @@ mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 
-pub(in crate::set_disk) enum GetObjectMetadata<T> {
-    Owned(T),
-    Shared(Arc<T>),
+pub(in crate::set_disk) struct GetObjectFileInfo {
+    owned: Option<OwnedGetObjectFileInfo>,
+    shared: Option<Arc<GetObjectMetadataCacheEntry>>,
 }
 
-impl<T> std::ops::Deref for GetObjectMetadata<T> {
-    type Target = T;
+struct OwnedGetObjectFileInfo {
+    fi: FileInfo,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
+}
 
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(value) => value,
-            Self::Shared(value) => value,
+impl GetObjectFileInfo {
+    fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                fi,
+                parts_metadata,
+                online_disks,
+            }),
+            shared: None,
         }
     }
-}
 
-impl<T: Clone> GetObjectMetadata<T> {
-    fn into_owned(self) -> T {
-        match self {
-            Self::Owned(value) => value,
-            Self::Shared(value) => Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
+    fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        Self {
+            owned: None,
+            shared: Some(entry),
         }
     }
-}
 
-type GetObjectFileInfo = (
-    GetObjectMetadata<FileInfo>,
-    GetObjectMetadata<Vec<FileInfo>>,
-    GetObjectMetadata<Vec<Option<DiskStore>>>,
-);
+    fn fi(&self) -> &FileInfo {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.fi,
+            (None, Some(entry)) => &entry.fi,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn parts_metadata(&self) -> &[FileInfo] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.parts_metadata,
+            (None, Some(entry)) => &entry.parts_metadata,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn online_disks(&self) -> &[Option<DiskStore>] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.online_disks,
+            (None, Some(entry)) => &entry.online_disks,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => {
+                let OwnedGetObjectFileInfo {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } = snapshot;
+                (fi, parts_metadata, online_disks)
+            }
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks),
+                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone()),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_valid_representation(&self) -> bool {
+        self.owned.is_some() ^ self.shared.is_some()
+    }
+
+    #[cfg(test)]
+    fn shared_entry(&self) -> Option<&Arc<GetObjectMetadataCacheEntry>> {
+        self.shared.as_ref()
+    }
+}
 
 pub(crate) struct PreparedGetObjectMetadata {
-    fi: GetObjectMetadata<FileInfo>,
-    files: GetObjectMetadata<Vec<FileInfo>>,
-    disks: GetObjectMetadata<Vec<Option<DiskStore>>>,
+    snapshot: GetObjectFileInfo,
     object_info: Option<ObjectInfo>,
 }
 
@@ -788,7 +838,7 @@ impl PreparedGetObjectMetadata {
     }
 
     pub(crate) fn read_semantics_identity(&self) -> [u8; 32] {
-        SetDisks::file_info_quorum_hash(&self.fi)
+        SetDisks::file_info_quorum_hash(self.snapshot.fi())
     }
 }
 
@@ -870,10 +920,11 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
+        let snapshot = GetObjectFileInfo::owned(FileInfo::default(), Vec::new(), Vec::new());
+        assert!(snapshot.has_valid_representation());
+        assert!(snapshot.shared_entry().is_none());
         let metadata = PreparedGetObjectMetadata {
-            fi: GetObjectMetadata::Owned(FileInfo::default()),
-            files: GetObjectMetadata::Owned(Vec::new()),
-            disks: GetObjectMetadata::Owned(Vec::new()),
+            snapshot,
             object_info: None,
         };
 
@@ -883,6 +934,44 @@ mod prepared_get_object_metadata_tests {
         })
         .await;
         assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    #[test]
+    fn cache_hit_consumers_release_snapshot_at_legacy_ownership() {
+        let fi = FileInfo {
+            name: "object".to_owned(),
+            ..Default::default()
+        };
+        let cached = Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            parts_metadata: vec![fi.clone()],
+            fi,
+            online_disks: vec![None],
+            read_quorum: 0,
+        });
+        let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
+
+        assert!(snapshot.has_valid_representation());
+        assert!(std::mem::size_of::<GetObjectFileInfo>() >= std::mem::size_of::<OwnedGetObjectFileInfo>());
+        assert!(
+            std::mem::size_of::<GetObjectFileInfo>()
+                <= std::mem::size_of::<OwnedGetObjectFileInfo>() + 2 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(Arc::strong_count(&cached), 2, "a cache hit must add one snapshot reference");
+        assert_eq!(snapshot.fi().name, "object");
+        assert_eq!(snapshot.parts_metadata().len(), 1);
+        assert_eq!(snapshot.online_disks().len(), 1);
+        assert_eq!(Arc::strong_count(&cached), 2, "borrowing consumers must not clone the snapshot");
+
+        let (owned_fi, owned_parts, disks) = snapshot.into_owned();
+        assert_eq!(owned_fi.name, "object");
+        assert_eq!(owned_parts.len(), 1);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&cached),
+            1,
+            "legacy ownership must release the cache snapshot after cloning its owned inputs"
+        );
     }
 
     #[tokio::test]
@@ -1349,12 +1438,10 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let (fi, files, disks) = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
-        let object_info = build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
-            fi,
-            files,
-            disks,
+            snapshot,
             object_info: Some(object_info),
         })
     }
@@ -1469,24 +1556,6 @@ pub fn is_deadlock_detection_enabled() -> bool {
 // All functions use `OnceLock` for caching. Environment variable changes
 // require process restart to take effect.
 // ============================================================================
-
-/// Check if codec streaming is enabled (base flag).
-///
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
-/// In test mode, bypasses cache to allow per-test env var overrides.
-fn is_get_codec_streaming_enabled() -> bool {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-        })
-    }
-}
 
 /// Check if multipart codec streaming is enabled.
 ///
@@ -1642,22 +1711,6 @@ fn is_multipart_reader_setup_prefetch_enabled() -> bool {
     }
 }
 
-// --- Rollout Percentage Functions ---
-
-fn get_codec_streaming_rollout_pct() -> u32 {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<u32> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-        })
-    }
-}
-
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1692,10 +1745,8 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
     (hash as u32) < rollout_pct
 }
 /// Should this specific request use codec streaming?
-pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
-    let base = is_get_codec_streaming_enabled();
-    let pct = get_codec_streaming_rollout_pct();
-    is_optimization_enabled_for_request(base, pct, bucket, object)
+fn should_use_codec_streaming(config: GetCodecStreamingConfig, bucket: &str, object: &str) -> bool {
+    is_optimization_enabled_for_request(config.enabled, config.rollout_pct, bucket, object)
 }
 
 /// Should this specific request use metadata early-stop?
@@ -1703,20 +1754,6 @@ pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
     let base = is_get_metadata_early_stop_enabled();
     let pct = get_metadata_early_stop_rollout_pct();
     is_optimization_enabled_for_request(base, pct, bucket, object)
-}
-
-fn get_codec_streaming_min_size() -> usize {
-    if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
-        return rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE);
-    }
-
-    match get_codec_streaming_engine() {
-        GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
-            ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-            DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-        ),
-        GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
-    }
 }
 
 fn is_get_codec_streaming_data_blocks_first_enabled() -> bool {
@@ -1821,8 +1858,18 @@ enum GetCodecStreamingEngine {
     Rustfs,
 }
 
-fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
-    let engine = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetCodecStreamingConfig {
+    enabled: bool,
+    rollout: GetCodecStreamingRollout,
+    rollout_pct: u32,
+    body_compat_confirmed: bool,
+    header_compat_confirmed: bool,
+    engine: GetCodecStreamingEngine,
+    min_size: usize,
+}
+
+fn parse_get_codec_streaming_engine(engine: &str) -> GetCodecStreamingEngine {
     match engine.trim() {
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_RUSTFS) => GetCodecStreamingEngine::Rustfs,
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_LEGACY) => GetCodecStreamingEngine::Legacy,
@@ -1830,8 +1877,7 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
     }
 }
 
-fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
-    let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
+fn parse_get_codec_streaming_rollout(rollout: &str) -> GetCodecStreamingRollout {
     match rollout.trim() {
         // Clean production token. `internal`/`benchmark` remain accepted aliases
         // for backward compatibility; all three opt the fast path in.
@@ -1848,20 +1894,58 @@ fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
     }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Body compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_body_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true)
+fn load_get_codec_streaming_config() -> GetCodecStreamingConfig {
+    let engine = parse_get_codec_streaming_engine(&rustfs_utils::get_env_str(
+        ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+        DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+    ));
+    let min_size = if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+    } else {
+        match engine {
+            GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+            ),
+            GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        }
+    };
+
+    GetCodecStreamingConfig {
+        enabled: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE),
+        rollout: parse_get_codec_streaming_rollout(&rustfs_utils::get_env_str(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+        )),
+        rollout_pct: rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+        ),
+        body_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true),
+        header_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true),
+        engine,
+        min_size,
+    }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Header compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_header_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true)
+fn get_codec_streaming_config_cached_core(load: impl FnOnce() -> GetCodecStreamingConfig) -> GetCodecStreamingConfig {
+    static CACHED: OnceLock<GetCodecStreamingConfig> = OnceLock::new();
+    *CACHED.get_or_init(load)
+}
+
+fn get_codec_streaming_config() -> GetCodecStreamingConfig {
+    #[cfg(test)]
+    {
+        load_get_codec_streaming_config()
+    }
+    #[cfg(not(test))]
+    {
+        get_codec_streaming_config_cached_core(load_get_codec_streaming_config)
+    }
+}
+
+fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
+    get_codec_streaming_config().engine
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -2230,43 +2314,43 @@ fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
-    range: &Option<HTTPRangeSpec>,
     part_number: Option<usize>,
+    object_class: GetCodecStreamingObjectClass,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
 ) -> GetCodecStreamingGate {
-    let object_class = classify_get_codec_streaming_object_class(range, object_info, fi);
+    let config = get_codec_streaming_config();
 
-    if !is_get_codec_streaming_enabled() {
+    if !config.enabled {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !get_codec_streaming_rollout().is_opted_in() {
+    if !config.rollout.is_opted_in() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !should_use_codec_streaming(bucket, object) {
+    if !should_use_codec_streaming(config, bucket, object) {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_body_compat_confirmed() {
+    if !config.body_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_header_compat_confirmed() {
+    if !config.header_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed),
@@ -2339,7 +2423,7 @@ fn get_codec_streaming_reader_gate(
             };
         }
     }
-    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+    let Ok(min_size) = i64::try_from(config.min_size) else {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
@@ -2709,6 +2793,7 @@ pub struct SetDisks {
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
     pub lockers: Vec<Arc<dyn LockClient>>,
+    shared_lockers: Arc<[Arc<dyn LockClient>]>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
     /// Per-instance runtime context (Phase 5, backlog#939).
     ///
@@ -2836,9 +2921,9 @@ impl Hash for GetObjectMetadataCacheKey {
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
-    fi: Arc<FileInfo>,
-    parts_metadata: Arc<Vec<FileInfo>>,
-    online_disks: Arc<Vec<Option<DiskStore>>>,
+    fi: FileInfo,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
 }
 
@@ -3105,6 +3190,7 @@ impl SetDisks {
     ) -> Arc<Self> {
         let ctx = instance_ctx;
         let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
+        let shared_lockers = Arc::from(lockers.to_vec());
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -3127,6 +3213,7 @@ impl SetDisks {
                     .collect::<Vec<_>>(),
             ),
             lockers,
+            shared_lockers,
             // Sourced from the instance context so each instance owns its lock
             // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the
             // process lock-manager singleton, so this is unchanged.
@@ -5336,6 +5423,89 @@ mod tests {
         );
         drop(lock);
         assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_shares_clients_without_changing_quorum() {
+        let healthy: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let set = make_test_set_disks_with_ctx(vec![healthy.clone(), failing.clone()], ctx).await;
+
+        assert!(Arc::ptr_eq(&set.lockers[0], &healthy));
+        assert!(Arc::ptr_eq(&set.lockers[1], &failing));
+        let clients_before = Arc::strong_count(&set.shared_lockers);
+        let healthy_before = Arc::strong_count(&healthy);
+        let failing_before = Arc::strong_count(&failing);
+        let write_lock = set
+            .new_ns_lock("bucket", "write-object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.shared_lockers),
+            clients_before + 1,
+            "each object lock should share one client slice allocation"
+        );
+        assert_eq!(
+            Arc::strong_count(&healthy),
+            healthy_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+        assert_eq!(
+            Arc::strong_count(&failing),
+            failing_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+
+        let write_error = write_lock
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect_err("one healthy client must not satisfy the two-client write quorum");
+        assert!(
+            matches!(
+                write_error,
+                LockError::QuorumNotReached {
+                    required: 2,
+                    achieved: 1
+                }
+            ),
+            "the shared client representation must preserve the exact write quorum result: {write_error}"
+        );
+        let read_lock = set
+            .new_ns_lock("bucket", "read-object")
+            .await
+            .expect("second namespace lock should be created");
+        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
+        let read_guard = read_lock
+            .get_read_lock(Duration::from_millis(500))
+            .await
+            .expect("one healthy client should satisfy the two-client read quorum");
+        assert!(matches!(read_guard, NamespaceLockGuard::Standard(_)));
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_uses_the_current_public_client_domain() {
+        let stale_a: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let stale_b: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let healthy_a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let healthy_b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let set = make_test_set_disks_with_ctx(vec![stale_a, stale_b], ctx).await;
+        let mut set = (*set).clone();
+        set.lockers = vec![healthy_a, healthy_b];
+
+        let lock = set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should use the current public clients");
+        let guard = lock
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect("the current healthy clients should satisfy the two-client quorum");
+        assert!(matches!(guard, NamespaceLockGuard::Standard(_)));
     }
 
     struct SetupTypeGuard {
