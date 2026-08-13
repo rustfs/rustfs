@@ -5150,12 +5150,13 @@ mod tests {
     async fn new_ns_lock_uses_the_current_public_client_domain() {
         let stale_a: Arc<dyn LockClient> = Arc::new(FailingClient);
         let stale_b: Arc<dyn LockClient> = Arc::new(FailingClient);
-        let healthy: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let healthy_a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let healthy_b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
         let ctx = Arc::new(InstanceContext::new());
         ctx.update_erasure_type(SetupType::DistErasure).await;
         let set = make_test_set_disks_with_ctx(vec![stale_a, stale_b], ctx).await;
         let mut set = (*set).clone();
-        set.lockers = vec![healthy];
+        set.lockers = vec![healthy_a, healthy_b];
 
         let lock = set
             .new_ns_lock("bucket", "object")
@@ -5164,7 +5165,7 @@ mod tests {
         let guard = lock
             .get_write_lock(Duration::from_millis(500))
             .await
-            .expect("one current healthy client should satisfy the one-client quorum");
+            .expect("the current healthy clients should satisfy the two-client quorum");
         assert!(matches!(guard, NamespaceLockGuard::Standard(_)));
     }
 

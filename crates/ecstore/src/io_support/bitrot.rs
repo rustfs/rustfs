@@ -61,7 +61,7 @@ impl ShardReader {
     pub(crate) fn inline_bytes(&self) -> Option<&Bytes> {
         match self {
             Self::InMemory(cursor) => Some(cursor.get_ref()),
-            Self::Stream(_) => None,
+            Self::Chunked(_) | Self::Stream(_) => None,
         }
     }
 }

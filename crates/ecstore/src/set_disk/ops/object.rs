@@ -6266,9 +6266,9 @@ mod metadata_mutation_generation_tests {
                 false,
             )
             .await
-            .expect("object metadata should be readable before adding the checksum sidecar");
-        let mut fi = fi.into_owned();
-        let disks = disks.into_owned();
+            .expect("object metadata should be readable before adding the checksum sidecar")
+            .into_owned();
+        let mut fi = fi;
         rustfs_utils::http::insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, value.to_string());
         set_disks
             .update_object_meta(bucket, object, fi, &disks)
@@ -6425,9 +6425,9 @@ mod metadata_mutation_generation_tests {
                 false,
             )
             .await
-            .expect("conflicting object metadata should be readable before corruption is injected");
-        let mut fi = fi.into_owned();
-        let disks = disks.into_owned();
+            .expect("conflicting object metadata should be readable before corruption is injected")
+            .into_owned();
+        let mut fi = fi;
         let rustfs_key = format!(
             "{}{}",
             rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
@@ -6590,9 +6590,9 @@ mod transition_commit_failure_tests {
                 false,
             )
             .await
-            .expect("source metadata should be readable before adding the checksum sidecar");
-        let mut source_fi = source_fi.into_owned();
-        let online_disks = online_disks.into_owned();
+            .expect("source metadata should be readable before adding the checksum sidecar")
+            .into_owned();
+        let mut source_fi = source_fi;
         rustfs_utils::http::insert_str(
             &mut source_fi.metadata,
             rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
@@ -8271,7 +8271,8 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("the existing target should remain readable");
+            .expect("the existing target should remain readable")
+            .into_owned();
         assert_ne!(stored.transition_status, TRANSITION_COMPLETE);
         assert!(stored.transition_version.is_none());
     }
@@ -8343,9 +8344,9 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("source metadata should be readable");
-        let mut source_fi = source_fi.into_owned();
-        let online_disks = online_disks.into_owned();
+            .expect("source metadata should be readable")
+            .into_owned();
+        let mut source_fi = source_fi;
         rustfs_utils::http::insert_str(
             &mut source_fi.metadata,
             rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
@@ -10429,9 +10430,9 @@ mod put_object_tags_early_stop_regression_tests {
                         false,
                     )
                     .await
-                    .expect("object metadata should be readable before adding the checksum sidecar");
-                let mut fi = fi.into_owned();
-                let disks = disks.into_owned();
+                    .expect("object metadata should be readable before adding the checksum sidecar")
+                    .into_owned();
+                let mut fi = fi;
                 rustfs_utils::http::insert_str(
                     &mut fi.metadata,
                     rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
