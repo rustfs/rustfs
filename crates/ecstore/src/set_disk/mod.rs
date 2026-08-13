@@ -2792,6 +2792,9 @@ pub struct SetDisks {
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
+    /// GET codecs keyed by every persisted layout dimension that affects
+    /// decoding. Clones of a set share the memoized shells.
+    erasure_cache: Arc<ErasureCache>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     shared_lockers: Arc<[Arc<dyn LockClient>]>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
@@ -2812,6 +2815,137 @@ pub struct SetDisks {
     capacity_dirty_generation: Arc<AtomicU64>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
+}
+
+const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ErasureCacheKey {
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
+    uses_legacy: bool,
+}
+
+struct ErasureCache {
+    entries: parking_lot::RwLock<HashMap<ErasureCacheKey, Arc<coding::Erasure>>>,
+}
+
+impl std::fmt::Debug for ErasureCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ErasureCache")
+            .field("entries", &self.entries.read().len())
+            .finish()
+    }
+}
+
+impl ErasureCache {
+    fn new() -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_try_insert(
+        &self,
+        key: ErasureCacheKey,
+    ) -> std::result::Result<Arc<coding::Erasure>, coding::ErasureConstructionError> {
+        if let Some(erasure) = self.entries.read().get(&key) {
+            return Ok(Arc::clone(erasure));
+        }
+
+        // Serialize first construction for a key so concurrent cold GETs still
+        // create exactly one shell. Codec construction never awaits.
+        let mut entries = self.entries.write();
+        if let Some(erasure) = entries.get(&key) {
+            return Ok(Arc::clone(erasure));
+        }
+        let erasure = Arc::new(coding::Erasure::try_new_with_options(
+            key.data_shards,
+            key.parity_shards,
+            key.block_size,
+            key.uses_legacy,
+        )?);
+        if entries.len() < ERASURE_CACHE_MAX_ENTRIES {
+            entries.insert(key, Arc::clone(&erasure));
+        }
+        Ok(erasure)
+    }
+
+    fn get_for_file_info(&self, fi: &FileInfo) -> Result<Arc<coding::Erasure>> {
+        self.get_or_try_insert(ErasureCacheKey {
+            data_shards: fi.erasure.data_blocks,
+            parity_shards: fi.erasure.parity_blocks,
+            block_size: fi.erasure.block_size,
+            uses_legacy: fi.uses_legacy_checksum,
+        })
+        .map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+mod erasure_cache_tests {
+    use super::*;
+
+    #[test]
+    fn reuses_shells_and_keeps_every_layout_dimension_in_the_key() {
+        let cache = ErasureCache::new();
+        let base = ErasureCacheKey {
+            data_shards: 4,
+            parity_shards: 2,
+            block_size: 1_048_576,
+            uses_legacy: false,
+        };
+        let first = cache.get_or_try_insert(base).expect("modern shell should construct");
+        let reused = cache.get_or_try_insert(base).expect("same modern shell should be cached");
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        for distinct in [
+            ErasureCacheKey { data_shards: 3, ..base },
+            ErasureCacheKey {
+                parity_shards: 1,
+                ..base
+            },
+            ErasureCacheKey {
+                block_size: 524_288,
+                ..base
+            },
+            ErasureCacheKey {
+                uses_legacy: true,
+                ..base
+            },
+        ] {
+            let shell = cache.get_or_try_insert(distinct).expect("distinct shell should construct");
+            assert!(!Arc::ptr_eq(&first, &shell));
+        }
+        assert_eq!(cache.entries.read().len(), 5);
+    }
+
+    #[test]
+    fn does_not_cache_invalid_layouts_or_grow_past_the_bound() {
+        let cache = ErasureCache::new();
+        let invalid = ErasureCacheKey {
+            data_shards: 4,
+            parity_shards: 2,
+            block_size: 0,
+            uses_legacy: false,
+        };
+        assert!(cache.get_or_try_insert(invalid).is_err());
+        assert!(cache.entries.read().is_empty());
+
+        for block_size in 1..=(ERASURE_CACHE_MAX_ENTRIES + 1) {
+            cache
+                .get_or_try_insert(ErasureCacheKey {
+                    data_shards: 4,
+                    parity_shards: 2,
+                    block_size,
+                    uses_legacy: false,
+                })
+                .expect("bounded cache fixture should construct");
+        }
+        assert_eq!(cache.entries.read().len(), ERASURE_CACHE_MAX_ENTRIES);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3212,6 +3346,7 @@ impl SetDisks {
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>(),
             ),
+            erasure_cache: Arc::new(ErasureCache::new()),
             lockers,
             shared_lockers,
             // Sourced from the instance context so each instance owns its lock
@@ -9816,6 +9951,7 @@ mod tests {
         let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
             "bucket",
             "object",
+            Arc::new(ErasureCache::new()),
             &fi,
             &disk_files,
             &disks,
@@ -9879,6 +10015,7 @@ mod tests {
         let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
             "bucket",
             "object",
+            Arc::new(ErasureCache::new()),
             &fi,
             &disk_files,
             &vec![Some(disk); erasure.total_shard_count()],
@@ -9959,6 +10096,7 @@ mod tests {
         let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             &fi,
             &files,
             &disks,
@@ -10044,6 +10182,7 @@ mod tests {
             SetDisks::get_object_with_fileinfo(
                 bucket,
                 object,
+                Arc::new(ErasureCache::new()),
                 range_offset,
                 range_length as i64,
                 &mut writer,
@@ -10155,6 +10294,7 @@ mod tests {
             SetDisks::get_object_with_fileinfo(
                 bucket,
                 object,
+                Arc::new(ErasureCache::new()),
                 0,
                 total_size as i64,
                 &mut writer,
