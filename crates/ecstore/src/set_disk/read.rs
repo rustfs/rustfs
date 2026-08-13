@@ -5647,7 +5647,6 @@ mod tests {
         use std::cell::Cell;
 
         let loads = Cell::new(0);
-        let cache = OnceLock::new();
         let expected = GetCodecStreamingConfig {
             enabled: true,
             rollout: GetCodecStreamingRollout::Off,
@@ -5660,7 +5659,7 @@ mod tests {
 
         for _ in 0..3 {
             assert_eq!(
-                cached_get_codec_streaming_config(&cache, || {
+                get_codec_streaming_config_cached_core(|| {
                     loads.set(loads.get() + 1);
                     expected
                 }),

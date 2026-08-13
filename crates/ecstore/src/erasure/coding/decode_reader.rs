@@ -65,7 +65,7 @@ enum FillPolicy {
 }
 
 impl FillPolicy {
-    fn from_env() -> Self {
+    fn load() -> Self {
         match rustfs_utils::get_env_usize(
             ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
             DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
@@ -73,6 +73,22 @@ impl FillPolicy {
             2 => Self::DualInFlight,
             _ => Self::SingleInFlight,
         }
+    }
+
+    fn from_env() -> Self {
+        #[cfg(test)]
+        {
+            Self::load()
+        }
+        #[cfg(not(test))]
+        {
+            Self::cached_core(Self::load)
+        }
+    }
+
+    fn cached_core(load: impl FnOnce() -> Self) -> Self {
+        static CACHED: std::sync::OnceLock<FillPolicy> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(load)
     }
 
     const fn max_inflight(self) -> usize {
@@ -1118,6 +1134,23 @@ mod tests {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("99"), || {
             assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
         });
+    }
+
+    #[test]
+    fn fill_policy_production_cache_loads_once() {
+        use std::cell::Cell;
+
+        let loads = Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                FillPolicy::cached_core(|| {
+                    loads.set(loads.get() + 1);
+                    FillPolicy::DualInFlight
+                }),
+                FillPolicy::DualInFlight
+            );
+        }
+        assert_eq!(loads.get(), 1, "the production fill policy must not re-read the environment per reader");
     }
 
     #[test]

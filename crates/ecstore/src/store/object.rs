@@ -4833,7 +4833,7 @@ mod tests {
             .expect("snapshot should acquire both lock domains");
         let hashed_set_writer = rustfs_lock::NamespaceLock::with_clients_and_quorum(
             "select-nonzero-set-writer".to_string(),
-            sets.disk_set[1].lockers.to_vec(),
+            sets.disk_set[1].lockers.clone(),
             2,
         );
         let writer_error = hashed_set_writer

@@ -2045,6 +2045,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn codec_reader_returns_shard_allocations_to_the_request_pool() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![Some(create_reader(SHARD_SIZE, 2, 0x5a, &hash_algo, false).await)];
+        let erasure = Erasure::new(1, 0, SHARD_SIZE);
+        let mut reader = ParallelReader::new(readers, erasure, 0, SHARD_SIZE * 2);
+
+        let first = ShardStripeSource::read_next_stripe(&mut reader).await;
+        let first_allocation = first
+            .shard_allocation(0)
+            .expect("the first stripe should own its shard allocation");
+        ShardStripeSource::recycle_stripe(&mut reader, first);
+        assert_eq!(
+            reader.buffers.stored_allocation(0),
+            Some(first_allocation),
+            "recycling a stripe must return its shard allocation to the request pool"
+        );
+
+        let second = ShardStripeSource::read_next_stripe(&mut reader).await;
+        assert_eq!(
+            second.shard_allocation(0),
+            Some(first_allocation),
+            "the next stripe must reuse the pooled shard allocation"
+        );
+    }
+
     /// Counts the raw bytes pulled from a shard stream, to prove which shards
     /// a decode path actually touches (backlog#923 call-count evidence).
     struct CountingShardReader {

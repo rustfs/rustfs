@@ -39,7 +39,11 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
-            NamespaceLock::with_clients_and_quorum_shared(self.set_lock_namespace.clone(), self.lockers.clone(), write_quorum)
+            NamespaceLock::with_clients_and_quorum_shared(
+                self.set_lock_namespace.clone(),
+                self.shared_lockers.clone(),
+                write_quorum,
+            )
         } else {
             NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
         };

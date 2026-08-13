@@ -379,7 +379,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type GetObjectReader = GetObjectReader;
     type PutObjectReader = PutObjReader;
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, h))]
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -5519,7 +5519,39 @@ mod object_encryption_resolver_wiring_tests {
     use super::*;
     use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionRequest};
     use std::io::Cursor;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured logs mutex should not poison").clone())
+                .expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut captured = self.0.lock().expect("captured logs mutex should not poison");
+            std::io::Write::write(&mut *captured, buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
 
     struct CountingResolver {
         calls: AtomicUsize,
@@ -5566,6 +5598,34 @@ mod object_encryption_resolver_wiring_tests {
 
         assert!(result.is_err(), "resolver returning no material must fail closed");
         assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_object_reader_span_never_records_transport_headers() {
+        use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use rustfs_utils::http::headers::SSEC_KEY_HEADER;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_temp_dirs, _disks, set_disks) = hermetic_set_disks_isolated(4).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("credential-must-not-be-logged"));
+        headers.insert(SSEC_KEY_HEADER, HeaderValue::from_static("customer-key-must-not-be-logged"));
+
+        let _ = set_disks
+            .get_object_reader("missing-bucket", "missing-object", None, headers, &ObjectOptions::default())
+            .await;
+
+        let captured = logs.contents();
+        assert!(!captured.contains("credential-must-not-be-logged"));
+        assert!(!captured.contains("customer-key-must-not-be-logged"));
     }
 }
 
@@ -9297,7 +9357,7 @@ mod transition_source_identity_matrix_tests {
             let source = source.fi();
             assert_eq!(source.version_id, Some(source_version_id));
             assert_eq!(
-                transition_source_identity(bucket, &object, &source, &source_opts, &get_raw_etag(&source.metadata))
+                transition_source_identity(bucket, &object, source, &source_opts, &get_raw_etag(&source.metadata))
                     .expect("persisted versioned source identity should build")
                     .version_mode,
                 TransitionSourceVersionMode::Versioned

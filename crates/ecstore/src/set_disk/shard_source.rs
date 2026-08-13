@@ -132,6 +132,13 @@ impl StripeReadState {
     pub(crate) fn scratch_storage(&self) -> (*const Option<Vec<u8>>, *const Option<Error>, bool, bool) {
         (self.shards.as_ptr(), self.errors.as_ptr(), self.shards.spilled(), self.errors.spilled())
     }
+
+    #[cfg(test)]
+    pub(crate) fn shard_allocation(&self, index: usize) -> Option<(*const u8, usize)> {
+        self.shards
+            .get(index)
+            .and_then(|shard| shard.as_ref().map(|shard| (shard.as_ptr(), shard.capacity())))
+    }
 }
 
 #[async_trait::async_trait]
@@ -157,12 +164,13 @@ mod tests {
     }
 
     #[test]
-    fn stripe_read_state_tracks_decode_quorum() {
+    fn stripe_read_state_tracks_decode_quorum_and_slot_access() {
         let state =
             StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![2])], vec![None, Some(Error::FileNotFound), None], 2);
 
         assert_eq!(state.available_shards(), 2);
         assert!(state.can_decode());
+        assert_eq!(state.data_bytes(0), Some(&[1][..]));
         assert_eq!(state.error(1), Some(&Error::FileNotFound));
     }
 
@@ -174,16 +182,6 @@ mod tests {
         let (shards, errors) = state.into_parts();
         assert_eq!(shards.as_slice(), &[Some(vec![1, 2, 3]), None]);
         assert_eq!(errors.as_slice(), &[None, Some(Error::FileCorrupt)]);
-    }
-
-    #[test]
-    fn stripe_read_state_builds_slots_from_parallel_reader_parts() {
-        let state =
-            StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![3])], vec![None, Some(Error::FileNotFound)], 2);
-
-        assert!(state.can_decode());
-        assert_eq!(state.data_bytes(0), Some(&[1][..]));
-        assert_eq!(state.error(1), Some(&Error::FileNotFound));
     }
 
     #[test]
