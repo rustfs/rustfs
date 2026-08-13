@@ -852,7 +852,11 @@ impl RemoteDisk {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let deadline = (!timeout_duration.is_zero()).then(|| time::Instant::now() + timeout_duration);
+        let deadline = (!timeout_duration.is_zero()).then(|| {
+            time::Instant::now()
+                .checked_add(timeout_duration)
+                .unwrap_or_else(|| time::sleep(timeout_duration).deadline())
+        });
         let max_retries = internode_idempotent_read_retries();
         let mut attempt = 0usize;
         loop {
@@ -5364,6 +5368,22 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(started.elapsed(), REMOTE_DISK_READ_RETRY_BASE_BACKOFF);
         remote_disk.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_read_retry)]
+    async fn execute_read_with_retry_accepts_max_metadata_timeout() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some(u64::MAX.to_string()))], async {
+            let remote_disk = new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await;
+
+            remote_disk
+                .execute_read_with_retry("read_version", || async { Ok::<(), Error>(()) }, get_drive_metadata_timeout())
+                .await
+                .expect("the maximum configured metadata timeout must not panic");
+
+            remote_disk.cancel_token.cancel();
+        })
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
