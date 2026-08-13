@@ -556,9 +556,13 @@ pub(super) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
             "Bucket quota check temporarily unavailable, please retry".to_string(),
         ));
     };
-    if current_usage <= quota_limit {
-        let _ = opts.set_quota_admission(current_usage, quota_limit);
+    if current_usage > quota_limit {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        ));
     }
+    let _ = opts.set_quota_admission(current_usage, quota_limit);
     Ok(())
 }
 
@@ -6540,15 +6544,12 @@ impl DefaultObjectUsecase {
         })
     }
 
-    pub fn execute_get_object(
-        &self,
-        req: S3Request<GetObjectInput>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = S3Result<S3Response<GetObjectOutput>>> + Send + '_>> {
-        Box::pin(self.execute_get_object_inner(req))
-    }
-
     #[instrument(level = "trace", skip(self, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
+    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        Box::pin(self.execute_get_object_inner(req)).await
+    }
+
     async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -7003,14 +7004,11 @@ impl DefaultObjectUsecase {
         result
     }
 
-    pub fn execute_copy_object(
-        &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_>> {
-        Box::pin(self.execute_copy_object_inner(req))
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        Box::pin(self.execute_copy_object_inner(req)).await
     }
 
-    #[instrument(level = "debug", skip(self, req))]
     async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -18163,6 +18161,22 @@ mod tests {
     #[test]
     fn quota_admission_rejects_over_limit() {
         let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn legacy_quota_admission_rejects_already_over_limit() {
+        let result = QuotaCheckResult {
+            allowed: true,
+            current_usage: Some(6),
+            quota_limit: Some(5),
+            operation_size: 0,
+            remaining: Some(0),
+            uses_durable_reservations: false,
+        };
+        let mut opts = ObjectOptions::default();
+        let err =
+            apply_quota_admission(&mut opts, &result).expect_err("legacy completion must not bypass an already exceeded quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 

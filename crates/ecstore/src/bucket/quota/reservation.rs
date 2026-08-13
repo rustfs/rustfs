@@ -624,9 +624,11 @@ async fn settle(data: &LedgerReservationData, committed: bool) -> Result<()> {
     let ledger_object = data.ledger_object.clone();
     let operation_id = data.operation_id;
     let reservation = data.reservation.clone();
-    let bucket = data.bucket.clone();
     tokio::spawn(async move {
-        fence_namespace_mutations(&store, &bucket, &reservation.object, reservation.target()).await?;
+        // The commit/abort path releases its own object fence before settlement.
+        // Do not revoke all tokens here: a deferred retry can run after the
+        // object lock is released and would otherwise revoke a later write's
+        // newly acquired fence for the same object.
         let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_object).await?;
         let ledger_guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
         fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &ledger_object, None).await?;
