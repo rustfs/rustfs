@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(normalized.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("minio-key"));
 
         // Existing RustFS-branded keys always win over the MinIO twins.
-        let mut both = metadata.clone();
+        let mut both = metadata;
         both.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "rustfs-key".to_string());
         assert_eq!(
             normalize_managed_metadata(&both, None)
@@ -462,11 +462,7 @@ mod tests {
         // The mapping is a case-sensitive exact match on the TitleCase MinIO
         // names; a lowercased twin must not normalize.
         let lowercased = HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_lowercase(), "minio-key".to_string())]);
-        assert!(
-            normalize_managed_metadata(&lowercased, None)
-                .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-                .is_none()
-        );
+        assert!(!normalize_managed_metadata(&lowercased, None).contains_key(INTERNAL_ENCRYPTION_KEY_ID_HEADER));
     }
 
     #[test]
@@ -474,21 +470,13 @@ mod tests {
         let metadata = HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), "encoded-context".to_string())]);
 
         // Without a codec the context stays unnormalized.
-        assert!(
-            normalize_managed_metadata(&metadata, None)
-                .get(INTERNAL_ENCRYPTION_CONTEXT_HEADER)
-                .is_none()
-        );
+        assert!(!normalize_managed_metadata(&metadata, None).contains_key(INTERNAL_ENCRYPTION_CONTEXT_HEADER));
 
         // A codec that fails to decode also leaves it unnormalized.
         fn reject(_value: &str) -> Option<String> {
             None
         }
-        assert!(
-            normalize_managed_metadata(&metadata, Some(reject))
-                .get(INTERNAL_ENCRYPTION_CONTEXT_HEADER)
-                .is_none()
-        );
+        assert!(!normalize_managed_metadata(&metadata, Some(reject)).contains_key(INTERNAL_ENCRYPTION_CONTEXT_HEADER));
 
         fn recode(value: &str) -> Option<String> {
             Some(format!("recoded:{value}"))
@@ -501,7 +489,7 @@ mod tests {
         );
 
         // A stored RustFS context wins without invoking the codec.
-        let mut both = metadata.clone();
+        let mut both = metadata;
         both.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), "stored-context".to_string());
         assert_eq!(
             normalize_managed_metadata(&both, Some(recode))
@@ -530,7 +518,7 @@ mod tests {
         sse_s3.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
         assert_eq!(stored_managed_encryption_key(&sse_s3), Some((SSEType::SseS3, "default".to_string())));
 
-        let mut sse_kms = envelope_only.clone();
+        let mut sse_kms = envelope_only;
         sse_kms.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
         assert_eq!(stored_managed_encryption_key(&sse_kms), Some((SSEType::SseKms, "default".to_string())));
 
