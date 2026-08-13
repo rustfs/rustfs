@@ -138,6 +138,8 @@ use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
+use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+#[cfg(test)]
 use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -152,9 +154,8 @@ use rustfs_utils::http::{
         AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
         AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-        SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     },
-    insert_str, remove_str,
+    insert_str, project_ssec_transport_headers, remove_str,
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
@@ -2109,18 +2110,6 @@ struct GetObjectResumeContext {
     identity: GetObjectResumeIdentity,
 }
 
-fn get_object_store_headers(request_headers: &HeaderMap) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-        if let Some(value) = request_headers.get(name) {
-            let mut value = value.clone();
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
-    }
-    headers
-}
-
 impl GetObjectResumeContext {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2140,7 +2129,7 @@ impl GetObjectResumeContext {
         }
         // Store spans record their header argument at debug level. Retain only
         // the SSE-C inputs needed to reopen the reader and keep them redacted.
-        let ssec_headers = get_object_store_headers(request_headers);
+        let ssec_headers = project_ssec_transport_headers(request_headers);
         Self {
             store,
             bucket: bucket.to_string(),
@@ -4526,7 +4515,7 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
-        let store_headers = get_object_store_headers(&req.headers);
+        let store_headers = project_ssec_transport_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4541,7 +4530,7 @@ impl DefaultObjectUsecase {
             .await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                store.get_object_reader(bucket, key, rs.clone(), store_headers.clone(), opts),
+                store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4830,12 +4819,10 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader = track_object_read_setup(
-                object_traffic_health.as_deref(),
-                prepared.with_headers(store_headers.clone()).into_reader(),
-            )
-            .await
-            .map_err(map_get_object_reader_error)?;
+            let reader =
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
+                    .await
+                    .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4855,12 +4842,9 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(map_get_object_reader_error)?;
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    prepared.with_headers(store_headers.clone()).into_reader(),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
+                    .await
+                    .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
@@ -13952,11 +13936,12 @@ mod tests {
         request_headers.insert(SSEC_KEY_MD5_HEADER, HeaderValue::from_static("bWQ1"));
         request_headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test"));
         request_headers.insert("x-amz-security-token", HeaderValue::from_static("session-token"));
-        let store_headers = get_object_store_headers(&request_headers);
+        let store_headers = project_ssec_transport_headers(&request_headers);
         assert_eq!(store_headers.len(), 3, "only store-consumed SSE-C headers are forwarded");
         assert!(store_headers.values().all(HeaderValue::is_sensitive));
         assert!(store_headers.get(http::header::AUTHORIZATION).is_none());
         assert!(store_headers.get("x-amz-security-token").is_none());
+        assert!(!format!("{store_headers:?}").contains("dGVzdC1rZXk="));
         let plain_info = ObjectInfo {
             size: 11,
             ..Default::default()

@@ -3171,10 +3171,11 @@ mod heal_result_report_tests {
             .await
             .expect("object should be written");
 
-        let (fi, _, _) = set
+        let snapshot = set
             .get_object_fileinfo(bucket, object, &opts, true, false)
             .await
             .expect("object metadata should resolve");
+        let fi = snapshot.fi();
         assert_eq!(fi.erasure.parity_blocks, 0);
         let data_dir = fi.data_dir.expect("non-inline object should have a data directory");
         let part_path = dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1");

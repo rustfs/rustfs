@@ -125,6 +125,11 @@ where
         self.last_verify_duration
     }
 
+    #[cfg(test)]
+    pub(crate) fn inner_ref(&self) -> &R {
+        &self.inner
+    }
+
     /// Read a single (hash+data) block, verify hash, and copy `out.len()` bytes
     /// into `out`. Returns an error if the shard is short, the hash mismatches,
     /// or `out` is larger than one shard. On error `out`'s contents are

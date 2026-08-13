@@ -380,7 +380,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type GetObjectReader = GetObjectReader;
     type PutObjectReader = PutObjReader;
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, h))]
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -429,11 +429,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
-            (prepared.fi, prepared.files, prepared.disks, prepared.object_info)
+        let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+            (prepared.snapshot, prepared.object_info)
         } else {
             match self.get_object_fileinfo(bucket, object, opts, true, true).await {
-                Ok((fi, files, disks)) => (fi, files, disks, None),
+                Ok(snapshot) => (snapshot, None),
                 Err(err) => {
                     rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
                     let failure_path = if is_meta_bucketname(bucket) {
@@ -446,10 +446,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         };
+        let fi = snapshot.fi();
+        let files = snapshot.parts_metadata();
+        let disks = snapshot.online_disks();
         let object_info_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let object_info = prepared_object_info
-            .unwrap_or_else(|| build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
-        let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
+            .unwrap_or_else(|| build_get_object_info(fi, bucket, object, opts.versioned || opts.version_suspended));
+        let object_class = classify_get_codec_streaming_object_class(&range, &object_info, fi);
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
         let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
@@ -497,7 +500,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
         // in flight.
-        if should_use_inline_fast_path(&range, &object_info, &fi, opts) {
+        if should_use_inline_fast_path(&range, &object_info, fi, opts) {
             let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
 
@@ -513,7 +516,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 };
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
-                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, &fi, data_shards, |index| {
+                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
@@ -581,10 +584,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
-            let erasure = erasure_from_file_info(&fi, fi.uses_legacy_checksum)?;
+            let erasure = erasure_from_file_info(fi, fi.uses_legacy_checksum)?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
-            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
+            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
             // Check if we have enough inline data shards
             let inline_count = files
@@ -663,10 +666,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let codec_streaming_gate = get_codec_streaming_reader_gate(
             bucket,
             object,
-            &range,
             opts.part_number,
+            object_class,
             &object_info,
-            &fi,
+            fi,
             lock_optimization_enabled,
         );
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
@@ -744,15 +747,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, &fi, opts);
+        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, fi, opts);
         record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
         if let GetDirectMemoryDecision::Use { object_size } = direct_memory_decision {
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
                 bucket,
                 object,
-                &fi,
-                &files,
-                &disks,
+                fi,
+                files,
+                disks,
                 opts.skip_verify_bitrot,
                 object_class.as_str(),
                 size_bucket,
@@ -781,14 +784,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let mut output = Vec::with_capacity(object_size);
+            let (fi, files, disks) = snapshot.into_owned();
             Self::get_object_with_fileinfo(
                 bucket,
                 object,
                 0,
                 object_info.size,
                 &mut output,
-                fi.into_owned(),
-                files.into_owned(),
+                fi,
+                files,
                 &disks,
                 self.set_index,
                 self.pool_index,
@@ -827,9 +831,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 match Self::get_object_decode_reader_with_fileinfo(
                     bucket,
                     object,
-                    &fi,
-                    &files,
-                    &disks,
+                    fi,
+                    files,
+                    disks,
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
@@ -891,6 +895,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let (fi, files, disks) = snapshot.into_owned();
         tokio::spawn(async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);
@@ -904,8 +909,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
-                fi.into_owned(),
-                files.into_owned(),
+                fi,
+                files,
                 &disks,
                 set_index,
                 pool_index,
@@ -3526,10 +3531,10 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let mut read_opts = opts.clone();
         read_opts.include_part_checksums = true;
-        let (fi, _, disks) = self
+        let (mut fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
-            .await?;
-        let mut fi = fi.into_owned();
+            .await?
+            .into_owned();
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
         if let Some(eval_metadata) = &opts.eval_metadata {
@@ -4807,12 +4812,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
-        let (fi, _, _) = self
+        let snapshot = self
             .get_object_fileinfo(bucket, object, opts, true, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
     }
@@ -4980,10 +4985,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut transition_read_opts = opts.clone();
         transition_read_opts.include_part_checksums = true;
-        let (fi, meta_arr, online_disks) = self
+        let (mut fi, meta_arr, online_disks) = self
             .get_object_fileinfo(bucket, object, &transition_read_opts, true, false)
-            .await?;
-        let mut fi = fi.into_owned();
+            .await?
+            .into_owned();
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -5098,7 +5103,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 cloned_fi.size,
                 &mut writer,
                 cloned_fi,
-                meta_arr.into_owned(),
+                meta_arr,
                 &online_disks,
                 set_index,
                 pool_index,
@@ -5223,7 +5228,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         let current = self.get_object_fileinfo(bucket, object, &commit_opts, true, false).await;
-        let (current_fi, _, _) = match current {
+        let current = match current {
             Ok(current) => current,
             Err(err) => {
                 drop(transition_lock_guard);
@@ -5234,7 +5239,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Err(err);
             }
         };
-        let mut current_fi = current_fi.into_owned();
+        let (mut current_fi, _, _) = current.into_owned();
         let source_matches = current_fi.version_id == fi.version_id
             && current_fi.data_dir == fi.data_dir
             && current_fi.mod_time == fi.mod_time
@@ -5465,9 +5470,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
-        let (actual_fi, _, _) = fi?;
+        let actual = fi?;
+        let actual_fi = actual.fi();
 
-        oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
@@ -5745,7 +5751,39 @@ mod object_encryption_resolver_wiring_tests {
     use super::*;
     use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionRequest};
     use std::io::Cursor;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured logs mutex should not poison").clone())
+                .expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut captured = self.0.lock().expect("captured logs mutex should not poison");
+            std::io::Write::write(&mut *captured, buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
 
     struct CountingResolver {
         calls: AtomicUsize,
@@ -5792,6 +5830,34 @@ mod object_encryption_resolver_wiring_tests {
 
         assert!(result.is_err(), "resolver returning no material must fail closed");
         assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_object_reader_span_never_records_transport_headers() {
+        use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use rustfs_utils::http::headers::SSEC_KEY_HEADER;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_temp_dirs, _disks, set_disks) = hermetic_set_disks_isolated(4).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("credential-must-not-be-logged"));
+        headers.insert(SSEC_KEY_HEADER, HeaderValue::from_static("customer-key-must-not-be-logged"));
+
+        let _ = set_disks
+            .get_object_reader("missing-bucket", "missing-object", None, headers, &ObjectOptions::default())
+            .await;
+
+        let captured = logs.contents();
+        assert!(!captured.contains("credential-must-not-be-logged"));
+        assert!(!captured.contains("customer-key-must-not-be-logged"));
     }
 }
 
@@ -6550,9 +6616,9 @@ mod metadata_mutation_generation_tests {
                 false,
             )
             .await
-            .expect("object metadata should be readable before adding the checksum sidecar");
-        let mut fi = fi.into_owned();
-        let disks = disks.into_owned();
+            .expect("object metadata should be readable before adding the checksum sidecar")
+            .into_owned();
+        let mut fi = fi;
         rustfs_utils::http::insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, value.to_string());
         set_disks
             .update_object_meta(bucket, object, fi, &disks)
@@ -6709,9 +6775,9 @@ mod metadata_mutation_generation_tests {
                 false,
             )
             .await
-            .expect("conflicting object metadata should be readable before corruption is injected");
-        let mut fi = fi.into_owned();
-        let disks = disks.into_owned();
+            .expect("conflicting object metadata should be readable before corruption is injected")
+            .into_owned();
+        let mut fi = fi;
         let rustfs_key = format!(
             "{}{}",
             rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
@@ -6874,9 +6940,9 @@ mod transition_commit_failure_tests {
                 false,
             )
             .await
-            .expect("source metadata should be readable before adding the checksum sidecar");
-        let mut source_fi = source_fi.into_owned();
-        let online_disks = online_disks.into_owned();
+            .expect("source metadata should be readable before adding the checksum sidecar")
+            .into_owned();
+        let mut source_fi = source_fi;
         rustfs_utils::http::insert_str(
             &mut source_fi.metadata,
             rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
@@ -7150,10 +7216,11 @@ mod transition_commit_failure_tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("source object should be written");
-        let (fi, parts_metadata, online_disks) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
             .await
             .expect("source metadata should resolve");
+        let (fi, parts_metadata, online_disks) = snapshot.into_owned();
         let generation = set_disks
             .get_object_metadata_cache_generation(bucket, object)
             .expect("metadata cache generation should be active");
@@ -7164,9 +7231,9 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: Arc::new((*fi).clone()),
-                    parts_metadata: Arc::new(parts_metadata.into_owned()),
-                    online_disks: Arc::new(online_disks.into_owned()),
+                    fi,
+                    parts_metadata,
+                    online_disks,
                     read_quorum: 2,
                 }),
             )
@@ -7293,7 +7360,7 @@ mod transition_commit_failure_tests {
         let result = transition.await.expect("transition task should not panic");
 
         result.expect_err("partial local commit must fail when only two of four disks are writable");
-        let fi = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -7305,10 +7372,10 @@ mod transition_commit_failure_tests {
                 false,
             )
             .await
-            .expect("rollback should keep the source metadata readable on applied disks")
-            .0;
+            .expect("rollback should keep the source metadata readable on applied disks");
         assert_ne!(
-            fi.transition_status, TRANSITION_COMPLETE,
+            snapshot.fi().transition_status,
+            TRANSITION_COMPLETE,
             "rollback must not leave the applied disks marked as transitioned"
         );
         let mut restored = Vec::new();
@@ -8443,7 +8510,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("local source should drain after failed transition");
         assert_eq!(restored, payload);
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -8457,7 +8524,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("local source metadata should remain available");
-        assert_ne!(fi.transition_status, TRANSITION_COMPLETE);
+        assert_ne!(snapshot.fi().transition_status, TRANSITION_COMPLETE);
     }
 
     async fn write_source(
@@ -8554,7 +8621,8 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("the existing target should remain readable");
+            .expect("the existing target should remain readable")
+            .into_owned();
         assert_ne!(stored.transition_status, TRANSITION_COMPLETE);
         assert!(stored.transition_version.is_none());
     }
@@ -8626,9 +8694,9 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("source metadata should be readable");
-        let mut source_fi = source_fi.into_owned();
-        let online_disks = online_disks.into_owned();
+            .expect("source metadata should be readable")
+            .into_owned();
+        let mut source_fi = source_fi;
         rustfs_utils::http::insert_str(
             &mut source_fi.metadata,
             rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
@@ -8655,7 +8723,7 @@ mod transition_upload_integrity_tests {
             remote_object.starts_with(crate::bucket::lifecycle::transition_transaction::TRANSITION_TRANSACTION_PREFIX),
             "remote object should be transaction-scoped: {remote_object}"
         );
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -8670,6 +8738,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("committed transition metadata should be readable");
+        let fi = snapshot.fi();
         assert_eq!(fi.transition_status, TRANSITION_COMPLETE);
         assert_eq!(fi.transitioned_objname, *remote_object);
         assert_eq!(
@@ -9104,7 +9173,7 @@ mod transition_upload_integrity_tests {
             let object = format!("{}-corrupt.bin", position.label());
             let payload = vec![0x41; 2 * 1024 * 1024];
             let original = write_source(&set_disks, &disk_stores, &bucket, &object, &payload).await;
-            let (source, _, _) = set_disks
+            let source = set_disks
                 .get_object_fileinfo(
                     &bucket,
                     &object,
@@ -9118,6 +9187,7 @@ mod transition_upload_integrity_tests {
                 )
                 .await
                 .expect("source metadata should be available before shard corruption");
+            let source = source.fi();
             let data_dir = source.data_dir.expect("source object should have a data directory");
 
             corrupt_beyond_read_quorum(&temp_dirs, &bucket, &object, data_dir, source.erasure.parity_blocks, position).await;
@@ -9137,7 +9207,7 @@ mod transition_upload_integrity_tests {
                 ),
                 "{position:?}: unexpected transition producer error: {error:?}"
             );
-            let (after, _, _) = set_disks
+            let after = set_disks
                 .get_object_fileinfo(
                     &bucket,
                     &object,
@@ -9151,6 +9221,7 @@ mod transition_upload_integrity_tests {
                 )
                 .await
                 .expect("failed transition must leave metadata readable");
+            let after = after.fi();
             assert_eq!(
                 after.data_dir,
                 Some(data_dir),
@@ -9197,7 +9268,7 @@ mod transition_upload_integrity_tests {
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
             .expect("an unversioned remote version must commit");
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -9211,6 +9282,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("committed unversioned transition metadata should be readable");
+        let fi = snapshot.fi();
         assert_eq!(fi.transition_version_id, None);
         assert_eq!(fi.transition_version, None);
         assert_eq!(fi.transition_version_state, rustfs_filemeta::TransitionVersionState::KnownDisabled);
@@ -9418,7 +9490,7 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected tagging lock-lost error: {error:?}"
         );
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -9433,7 +9505,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("source metadata should remain readable");
         assert!(
-            !fi.metadata.contains_key(AMZ_OBJECT_TAGGING),
+            !snapshot.fi().metadata.contains_key(AMZ_OBJECT_TAGGING),
             "a stale tagging writer must not write metadata after refresh-quorum loss"
         );
     }
@@ -9629,13 +9701,14 @@ mod transition_source_identity_matrix_tests {
                 .put_object(bucket, &object, &mut reader, &source_opts)
                 .await
                 .expect("source object should be written");
-            let (source, _, _) = set_disks
+            let source = set_disks
                 .get_object_fileinfo(bucket, &object, &source_opts, true, false)
                 .await
                 .expect("source metadata should resolve");
+            let source = source.fi();
             assert_eq!(source.version_id, Some(source_version_id));
             assert_eq!(
-                transition_source_identity(bucket, &object, &source, &source_opts, &get_raw_etag(&source.metadata))
+                transition_source_identity(bucket, &object, source, &source_opts, &get_raw_etag(&source.metadata))
                     .expect("persisted versioned source identity should build")
                     .version_mode,
                 TransitionSourceVersionMode::Versioned
@@ -9683,10 +9756,11 @@ mod transition_source_identity_matrix_tests {
                 versioned: true,
                 ..Default::default()
             };
-            let (persisted, _, _) = set_disks
+            let persisted = set_disks
                 .get_object_fileinfo(bucket, &object, &persisted_opts, true, false)
                 .await
                 .expect("drifted source metadata should resolve");
+            let persisted = persisted.fi();
             put_barrier.release();
 
             let result = transition.await.expect("transition task should not panic");
@@ -10706,9 +10780,9 @@ mod put_object_tags_early_stop_regression_tests {
                         false,
                     )
                     .await
-                    .expect("object metadata should be readable before adding the checksum sidecar");
-                let mut fi = fi.into_owned();
-                let disks = disks.into_owned();
+                    .expect("object metadata should be readable before adding the checksum sidecar")
+                    .into_owned();
+                let mut fi = fi;
                 rustfs_utils::http::insert_str(
                     &mut fi.metadata,
                     rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
