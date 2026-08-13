@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::runtime_capabilities::runtime_observability_snapshot;
-use crate::server::{
-    DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
-};
+use crate::server::snapshot_dependency_readiness_report;
+use crate::shared_types::{DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason};
 use crate::storage_api::cluster::EndpointServerPools;
 use crate::storage_api::cluster::contract::observability::ObservabilitySnapshot;
 use crate::storage_api::cluster::contract::topology::TopologySnapshot;

@@ -10001,6 +10001,7 @@ impl DiskAPI for LocalDisk {
             FileInfoOpts {
                 data: read_data,
                 include_free_versions: opts.incl_free_versions,
+                include_part_checksums: false,
             },
         )?;
 

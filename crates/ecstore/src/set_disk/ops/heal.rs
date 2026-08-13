@@ -542,7 +542,8 @@ impl SetDisks {
 
                 let filter_by_etag = quorum_etag.is_some();
                 match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
-                    Ok(latest_meta) => {
+                    Ok(mut latest_meta) => {
+                        Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
                         trace!(
                             event = EVENT_SET_DISK_HEAL,
                             component = LOG_COMPONENT_ECSTORE,
