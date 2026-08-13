@@ -207,6 +207,20 @@ fn validate_multipart_bucket_incarnation(
     Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
 }
 
+fn ensure_data_movement_upload_access(
+    fi: &FileInfo,
+    bucket: &str,
+    object: &str,
+    upload_id: &str,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    if rustfs_utils::http::contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD) && !opts.data_movement
+    {
+        return Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()));
+    }
+    Ok(())
+}
+
 async fn ensure_multipart_bucket_incarnation(
     ctx: &crate::runtime::instance::InstanceContext,
     fi: &FileInfo,
@@ -688,6 +702,12 @@ impl SetDisks {
                         {
                             return Ok(None);
                         }
+                        if rustfs_utils::http::contains_key_str(
+                            &file_info.metadata,
+                            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+                        ) {
+                            return Ok(None);
+                        }
 
                         let object = match (
                             file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
@@ -839,6 +859,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
 
@@ -1091,6 +1112,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 )
             };
             let (commit_fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+            ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
             ensure_multipart_bucket_incarnation(
                 &self.ctx,
                 &commit_fi,
@@ -1173,6 +1195,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_read_lock("list_object_parts", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
 
@@ -1507,6 +1530,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .check_upload_id_exists(bucket, object, upload_id, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
@@ -1529,6 +1553,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
@@ -1583,11 +1608,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-        if rustfs_utils::http::contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD)
-            && !opts.data_movement
-        {
-            return Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()));
-        }
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         let has_layout_candidate = range_seek_rollout_enabled
@@ -2843,7 +2864,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn data_movement_upload_rejects_external_completion() {
+    async fn data_movement_upload_is_hidden_from_external_multipart_operations() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "data-movement-upload-complete-bucket";
         make_bucket_on_all(&disk_stores, bucket).await;
@@ -2904,8 +2925,52 @@ mod tests {
             user_defined: metadata,
             ..Default::default()
         };
-        let (upload_id, parts) =
-            stage_upload_with_create_opts(&set_disks, bucket, object, b"data movement multipart body", &create_opts).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("data movement upload should be created");
+        let upload_id = upload.upload_id;
+        let mut part_reader = PutObjReader::from_vec(b"data movement multipart body".to_vec());
+        let uploaded_part = set_disks
+            .put_object_part(bucket, object, &upload_id, 1, &mut part_reader, &create_opts)
+            .await
+            .expect("data movement part upload should retain ownership of its upload");
+        let parts = vec![CompletePart {
+            part_num: uploaded_part.part_num,
+            etag: uploaded_part.etag,
+            ..Default::default()
+        }];
+
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("external multipart listing should succeed");
+        assert!(!listed.uploads.iter().any(|upload| upload.upload_id == upload_id));
+
+        let get_err = set_disks
+            .get_multipart_info(bucket, object, &upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("external multipart metadata reads must not expose a data movement upload");
+        assert!(matches!(get_err, StorageError::InvalidUploadID(..)));
+
+        let list_parts_err = set_disks
+            .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+            .await
+            .expect_err("external part listings must not expose a data movement upload");
+        assert!(matches!(list_parts_err, StorageError::InvalidUploadID(..)));
+
+        let mut external_part = PutObjReader::from_vec(b"external overwrite".to_vec());
+        let put_err = set_disks
+            .put_object_part(bucket, object, &upload_id, 1, &mut external_part, &ObjectOptions::default())
+            .await
+            .expect_err("external part uploads must not modify a data movement upload");
+        assert!(matches!(put_err, StorageError::InvalidUploadID(..)));
+
+        let abort_err = set_disks
+            .abort_multipart_upload(bucket, object, &upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("external aborts must not remove a data movement upload");
+        assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
 
         let external_err = set_disks
             .clone()
@@ -2913,6 +2978,12 @@ mod tests {
             .await
             .expect_err("external completion must not finalize a data movement upload");
         assert!(matches!(external_err, StorageError::InvalidUploadID(..)));
+
+        let internal_parts = set_disks
+            .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &create_opts)
+            .await
+            .expect("data movement part listing should retain ownership of its upload");
+        assert_eq!(internal_parts.parts.len(), 1);
 
         set_disks
             .clone()
@@ -2957,6 +3028,21 @@ mod tests {
                 .map(String::as_str),
             Some("AAAAAA==")
         );
+
+        let abort_object = "owned-abort-object";
+        let abort_upload = set_disks
+            .new_multipart_upload(bucket, abort_object, &create_opts)
+            .await
+            .expect("data movement abort upload should be created");
+        let abort_err = set_disks
+            .abort_multipart_upload(bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("external abort must not remove the second data movement upload");
+        assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
+        set_disks
+            .abort_multipart_upload(bucket, abort_object, &abort_upload.upload_id, &create_opts)
+            .await
+            .expect("data movement abort should retain ownership of its upload");
     }
 
     #[tokio::test]
