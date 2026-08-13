@@ -36,14 +36,21 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
         // test's transient DistErasure window) would push this set's namespace
         // locking onto its own — possibly empty — dist locker list.
         let set_lock = if self.ctx.is_dist_erasure().await {
-            // Calculate quorum based on lockers count (majority)
-            let lockers_count = self.lockers.len();
+            let lockers = if self.lockers.len() == self.shared_lockers.len()
+                && self
+                    .lockers
+                    .iter()
+                    .zip(self.shared_lockers.iter())
+                    .all(|(current, shared)| Arc::ptr_eq(current, shared))
+            {
+                self.shared_lockers.clone()
+            } else {
+                Arc::from(self.lockers.clone())
+            };
+            // Calculate quorum from the exact client domain used by this lock.
+            let lockers_count = lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
-            NamespaceLock::with_clients_and_quorum_shared(
-                self.set_lock_namespace.clone(),
-                self.shared_lockers.clone(),
-                write_quorum,
-            )
+            NamespaceLock::with_clients_and_quorum_shared(self.set_lock_namespace.clone(), lockers, write_quorum)
         } else {
             NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
         };

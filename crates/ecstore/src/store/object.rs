@@ -1757,7 +1757,7 @@ impl ECStore {
         Self::resolve_decommission_tiered_object_result(result, bucket, &object)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, h))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(
         &self,
