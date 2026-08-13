@@ -2933,16 +2933,19 @@ impl SetDisks {
         let results = fanout.await.map_err(|_| DiskError::Unexpected)?;
 
         for (idx, result) in results.iter().enumerate() {
-            match result.as_ref().map_err(|_| DiskError::Unexpected)? {
-                Ok(res) => {
+            match result {
+                Ok(Ok(res)) => {
                     data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
                     cleanup_data_dirs[idx] = res.cleanup_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
                     old_current_sizes[idx] = res.old_current_size;
                     errs.push(None);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     errs.push(Some(e.clone()));
+                }
+                Err(_) => {
+                    errs.push(Some(DiskError::Unexpected));
                 }
             }
         }
