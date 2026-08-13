@@ -315,6 +315,44 @@ impl Default for AccessTracker {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
+    #[test]
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_ttl_adjustment("test-key", 100, 150);
+            record_ttl_adjustment("test-key", 100, 50);
+            record_ttl_expiration();
+            record_early_eviction("cold");
+            record_early_eviction("low_priority");
+            record_access_pattern_change("sequential", "random");
+            record_access_pattern_change("random", "sequential");
+        });
+
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_cache_ttl_adjustments",
+            "rustfs_cache_ttl_base",
+            "rustfs_cache_ttl_adjusted",
+            "rustfs_cache_ttl_extensions",
+            "rustfs_cache_ttl_reductions",
+            "rustfs_cache_ttl_expirations",
+            "rustfs_cache_evictions_early",
+            "rustfs_cache_access_pattern_changes",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
+    }
+
     #[test]
     fn test_adaptive_ttl_stats() {
         let mut stats = AdaptiveTTLStats::new();
@@ -333,30 +371,6 @@ mod tests {
 
         assert!((stats.extension_rate() - 0.3333333333333333).abs() < 0.01);
         assert!((stats.reduction_rate() - 0.3333333333333333).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_record_ttl_adjustment() {
-        // This test verifies the function compiles and runs
-        record_ttl_adjustment("test-key", 100, 150);
-        record_ttl_adjustment("test-key", 100, 50);
-    }
-
-    #[test]
-    fn test_record_ttl_expiration() {
-        record_ttl_expiration();
-    }
-
-    #[test]
-    fn test_record_early_eviction() {
-        record_early_eviction("cold");
-        record_early_eviction("low_priority");
-    }
-
-    #[test]
-    fn test_record_access_pattern_change() {
-        record_access_pattern_change("sequential", "random");
-        record_access_pattern_change("random", "sequential");
     }
 
     #[test]

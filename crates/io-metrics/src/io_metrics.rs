@@ -169,46 +169,58 @@ impl IoSchedulerStats {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
     #[test]
-    fn test_record_io_scheduler_decision() {
-        record_io_scheduler_decision(128 * 1024, "low", "sequential");
-        record_io_scheduler_decision(64 * 1024, "high", "random");
-    }
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_io_scheduler_decision(128 * 1024, "low", "sequential");
+            record_io_scheduler_decision(64 * 1024, "high", "random");
+            record_io_priority_decision("high", 1024);
+            record_io_priority_decision("normal", 1024 * 1024);
+            record_io_priority_decision("low", 10 * 1024 * 1024);
+            record_load_level_change("low", "medium");
+            record_load_level_change("medium", "high");
+            record_bandwidth_observation(100 * 1024 * 1024);
+            record_bandwidth_observation(500 * 1024 * 1024);
+            record_buffer_size_adjustment(128 * 1024, 64 * 1024, "concurrency");
+            record_buffer_size_adjustment(128 * 1024, 256 * 1024, "sequential");
+            record_queue_operation("enqueue", "high", 10);
+            record_queue_operation("dequeue", "high", 9);
+            record_starvation_event("low");
+        });
 
-    #[test]
-    fn test_record_io_priority_decision() {
-        record_io_priority_decision("high", 1024);
-        record_io_priority_decision("normal", 1024 * 1024);
-        record_io_priority_decision("low", 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_record_load_level_change() {
-        record_load_level_change("low", "medium");
-        record_load_level_change("medium", "high");
-    }
-
-    #[test]
-    fn test_record_bandwidth_observation() {
-        record_bandwidth_observation(100 * 1024 * 1024);
-        record_bandwidth_observation(500 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_record_buffer_size_adjustment() {
-        record_buffer_size_adjustment(128 * 1024, 64 * 1024, "concurrency");
-        record_buffer_size_adjustment(128 * 1024, 256 * 1024, "sequential");
-    }
-
-    #[test]
-    fn test_record_queue_operation() {
-        record_queue_operation("enqueue", "high", 10);
-        record_queue_operation("dequeue", "high", 9);
-    }
-
-    #[test]
-    fn test_record_starvation_event() {
-        record_starvation_event("low");
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_io_scheduler_decisions",
+            "rustfs_io_scheduler_buffer_size",
+            "rustfs_io_scheduler_load",
+            "rustfs_io_scheduler_strategy",
+            "rustfs_io_scheduler_buffer_size_histogram",
+            "rustfs_io_priority_decisions",
+            "rustfs_io_priority_by_level",
+            "rustfs_io_priority_request_size",
+            "rustfs_io_load_changes",
+            "rustfs_io_bandwidth_bps",
+            "rustfs_io_bandwidth_histogram",
+            "rustfs_io_buffer_adjustments",
+            "rustfs_io_buffer_original",
+            "rustfs_io_buffer_adjusted",
+            "rustfs_io_queue_operations",
+            "rustfs_io_queue_size",
+            "rustfs_io_starvation_events",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
     }
 
     #[test]
