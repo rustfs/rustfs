@@ -188,6 +188,74 @@ async fn get_object_reader_with_context(
     GetObjectReader::new_with_resolver(reader, range, object_info, opts, headers, ctx.object_encryption_resolver()).await
 }
 
+fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
+    range.is_none()
+        && opts.part_number.is_none()
+        && opts.version_id.is_none()
+        && !opts.incl_free_versions
+        && !opts.skip_free_version
+        && !opts.raw_data_movement_read
+        && !opts.data_movement
+        && !crate::object_api::restore_request_active(opts)
+}
+
+#[cfg(test)]
+mod data_read_metadata_early_stop_request_shape_tests {
+    use super::*;
+
+    #[test]
+    fn data_read_metadata_early_stop_only_allows_whole_latest_plain_get_shape() {
+        assert!(data_read_metadata_early_stop_request_shape_allowed(&None, &ObjectOptions::default()));
+
+        let range = Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 0,
+        });
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&range, &ObjectOptions::default()));
+
+        let part_opts = ObjectOptions {
+            part_number: Some(1),
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &part_opts));
+
+        let version_opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &version_opts));
+
+        let incl_free_opts = ObjectOptions {
+            incl_free_versions: true,
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &incl_free_opts));
+
+        let skip_free_opts = ObjectOptions {
+            skip_free_version: true,
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &skip_free_opts));
+
+        let data_movement_opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &data_movement_opts));
+
+        let raw_data_movement_opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &raw_data_movement_opts));
+
+        let mut restore_opts = ObjectOptions::default();
+        restore_opts.transition.restore_request.days = Some(1);
+        assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &restore_opts));
+    }
+}
+
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
 /// serve it in place of the erasure read.
@@ -431,7 +499,16 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (fi, files, disks, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
             (prepared.fi, prepared.files, prepared.disks, prepared.object_info)
         } else {
-            match self.get_object_fileinfo(bucket, object, opts, true, true).await {
+            match self
+                .get_object_fileinfo(
+                    bucket,
+                    object,
+                    opts,
+                    true,
+                    data_read_metadata_early_stop_request_shape_allowed(&range, opts),
+                )
+                .await
+            {
                 Ok((fi, files, disks)) => (fi, files, disks, None),
                 Err(err) => {
                     rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
@@ -5967,7 +6044,10 @@ mod inline_put_commit_path_tests {
 mod get_object_downstream_close_accounting_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
-    use crate::diagnostics::get::{GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT, GetObjectFailureReason};
+    use crate::diagnostics::get::{
+        GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT,
+        GetObjectFailureReason,
+    };
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -6086,7 +6166,22 @@ mod get_object_downstream_close_accounting_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (internal_missing, legacy_unknown, internal_fanout, legacy_fanout) = metrics::with_local_recorder(&recorder, || {
+        let (
+            internal_missing,
+            legacy_unknown,
+            internal_fanout,
+            legacy_fanout,
+            internal_scheduled,
+            legacy_scheduled,
+            internal_completed,
+            legacy_completed,
+            internal_cancelled,
+            legacy_cancelled,
+            internal_unsafe_miss,
+            legacy_unsafe_miss,
+            internal_saved,
+            legacy_saved,
+        ) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
                 let options = ObjectOptions {
@@ -6130,6 +6225,54 @@ mod get_object_downstream_close_accounting_tests {
                         "rustfs_io_get_object_metadata_fanout_error_responses",
                         &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
                     ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_scheduled",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_scheduled",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_completed",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_completed",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_cancelled",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_cancelled",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
+                    recorder.counter_value(
+                        "rustfs_io_get_object_metadata_early_stop_total",
+                        &[
+                            ("path", GET_OBJECT_PATH_INTERNAL_META),
+                            ("decision", "miss"),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                        ],
+                    ),
+                    recorder.counter_value(
+                        "rustfs_io_get_object_metadata_early_stop_total",
+                        &[
+                            ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
+                            ("decision", "miss"),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                        ],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_early_stop_saved_responses",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_early_stop_saved_responses",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
                 )
             })
         });
@@ -6142,6 +6285,50 @@ mod get_object_downstream_close_accounting_tests {
         );
         assert_eq!(internal_fanout, vec![4.0], "internal metadata fanout must retain its path label");
         assert!(legacy_fanout.is_empty(), "internal metadata fanout must not leak into legacy_duplex");
+        assert_eq!(
+            internal_scheduled,
+            vec![4.0],
+            "internal metadata lifecycle scheduled count must retain its path label"
+        );
+        assert!(
+            legacy_scheduled.is_empty(),
+            "internal metadata lifecycle scheduled count must not leak into legacy_duplex"
+        );
+        assert_eq!(
+            internal_completed,
+            vec![4.0],
+            "internal metadata lifecycle completed count must retain its path label"
+        );
+        assert!(
+            legacy_completed.is_empty(),
+            "internal metadata lifecycle completed count must not leak into legacy_duplex"
+        );
+        assert_eq!(
+            internal_cancelled,
+            vec![0.0],
+            "internal metadata full-wait lifecycle must record zero cancellations"
+        );
+        assert!(
+            legacy_cancelled.is_empty(),
+            "internal metadata lifecycle cancelled count must not leak into legacy_duplex"
+        );
+        assert_eq!(
+            internal_unsafe_miss, 1,
+            "internal metadata unsafe early-stop miss must retain its path label"
+        );
+        assert_eq!(
+            legacy_unsafe_miss, 0,
+            "internal metadata unsafe early-stop miss must not leak into legacy_duplex"
+        );
+        assert_eq!(
+            internal_saved,
+            vec![0.0],
+            "internal metadata unsafe miss must record zero saved responses on internal_meta"
+        );
+        assert!(
+            legacy_saved.is_empty(),
+            "internal metadata unsafe miss saved responses must not leak into legacy_duplex"
+        );
     }
 }
 

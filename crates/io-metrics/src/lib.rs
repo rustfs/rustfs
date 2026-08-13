@@ -812,6 +812,17 @@ pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize,
         .record(metadata_fanout_count_to_f64(non_valid));
 }
 
+/// Record task lifecycle shape for one GetObject metadata fanout.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_lifecycle(path: &'static str, scheduled: usize, completed: usize, cancelled: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_fanout_scheduled", "path" => path).record(metadata_fanout_count_to_f64(scheduled));
+    histogram!("rustfs_io_get_object_metadata_fanout_completed", "path" => path).record(metadata_fanout_count_to_f64(completed));
+    histogram!("rustfs_io_get_object_metadata_fanout_cancelled", "path" => path).record(metadata_fanout_count_to_f64(cancelled));
+}
+
 /// Record a guarded metadata early-stop hit for GetObject.
 #[inline(always)]
 pub fn record_get_object_metadata_early_stop_hit(path: &'static str, reason: &'static str) {
@@ -2698,6 +2709,7 @@ mod tests {
         record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
         record_get_object_metadata_response("legacy_duplex", "valid");
         record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_fanout_lifecycle("legacy_duplex", 4, 3, 1);
         record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
         record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
         record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
@@ -2766,6 +2778,38 @@ mod tests {
         record_get_object_shard_locality_observe_only("codec_streaming", remote_scheduled, remote_avoid_potential);
 
         assert!(remote_scheduled >= remote_avoid_potential);
+    }
+
+    #[test]
+    fn metadata_fanout_lifecycle_records_named_histograms() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_get_stage_metrics_enabled(true);
+            record_get_object_metadata_fanout_lifecycle("legacy_duplex", 4, 3, 1);
+            set_get_stage_metrics_enabled(false);
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        for (name, expected) in [
+            ("rustfs_io_get_object_metadata_fanout_scheduled", 4.0),
+            ("rustfs_io_get_object_metadata_fanout_completed", 3.0),
+            ("rustfs_io_get_object_metadata_fanout_cancelled", 1.0),
+        ] {
+            let value = metrics.iter().find_map(|(composite, _, _, value)| {
+                let has_path = composite
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "path" && label.value() == "legacy_duplex");
+                (composite.kind() == MetricKind::Histogram && composite.key().name() == name && has_path).then_some(value)
+            });
+            assert!(
+                matches!(value, Some(DebugValue::Histogram(values)) if values.len() == 1 && values[0].0 == expected),
+                "{name} must record the exact fanout lifecycle sample"
+            );
+        }
     }
 
     #[test]
