@@ -984,7 +984,9 @@ trace_hot_spans=(
   "crates/ecstore/src/store/object.rs:handle_get_object_info"
   "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
   "crates/ecstore/src/store/mod.rs:list_objects_v2"
-  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  # The ECStore handle_list_objects_v2 forwarder was folded into the trait impl
+  # above, so store/mod.rs now carries this hot path's TRACE requirement
+  # directly (backlog#1821).
   # The pool-level Sets::list_objects_v2 wrapper was removed with its duplicate
   # pagination pipeline (backlog#1821); the remaining ECStore and SetDisks
   # wrappers below still carry the TRACE requirement.
