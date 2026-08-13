@@ -48,6 +48,23 @@ impl RestoreCleanupIdentity {
     }
 }
 
+fn ensure_restore_metadata_lock_held(bucket: &str, object: &str, opts: &ObjectOptions, mode: &'static str) -> Result<()> {
+    if opts
+        .namespace_lock_fence
+        .as_ref()
+        .is_some_and(NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
 impl SetDisks {
     pub(super) async fn finalize_restore_metadata(
         &self,
@@ -88,6 +105,7 @@ impl SetDisks {
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Err(Error::other("restored object changed before restore metadata finalization"));
         }
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_finalize_metadata")?;
         let restore_expiry =
             lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
         fi.metadata.insert(
@@ -159,6 +177,7 @@ impl SetDisks {
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Ok(());
         }
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_cleanup_metadata")?;
         fi.metadata.remove(X_AMZ_RESTORE.as_str());
         fi.metadata.remove(AMZ_RESTORE_EXPIRY_DAYS);
         fi.metadata.remove(AMZ_RESTORE_REQUEST_DATE);
