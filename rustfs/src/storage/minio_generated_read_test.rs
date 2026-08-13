@@ -103,6 +103,9 @@ fn load_file_info(case_dir: &Path, manifest: &ManifestRecord) -> FileInfo {
         FileInfoOpts {
             data: true,
             include_free_versions: true,
+            // Pre-field behavior: the legacy into_fileinfo path always
+            // included part checksums, and this fixture test read through it.
+            include_part_checksums: true,
         },
     )
     .unwrap_or_else(|err| panic!("decode {}: {err}", xl_meta_path.display()))
