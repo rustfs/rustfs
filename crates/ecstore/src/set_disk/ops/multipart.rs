@@ -3191,7 +3191,7 @@ mod tests {
                     .expect("part reader should be constructed"),
             );
             let part = set_disks
-                .put_object_part(bucket, object, &upload.upload_id, number, &mut reader, &ObjectOptions::default())
+                .put_object_part(bucket, object, &upload.upload_id, number, &mut reader, &create_opts)
                 .await
                 .expect("data movement part should be written");
             completed_parts.push(CompletePart {

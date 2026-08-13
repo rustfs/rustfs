@@ -34,7 +34,7 @@ use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIn
 use rustfs_utils::http::{
     AMZ_OBJECT_TAGGING, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION_SIZE, SUFFIX_CRC, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVEMENT_UPLOAD,
     SUFFIX_PART_CHECKSUMS, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME,
-    SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, has_internal_suffix,
+    SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, strip_internal_prefix_preserving_case,
 };
 use rustfs_utils::path::encode_dir_object;
 use std::collections::{BTreeMap, HashMap};
@@ -198,7 +198,8 @@ fn data_movement_user_defined(object_info: &ObjectInfo) -> HashMap<String, Strin
         .user_defined
         .iter()
         .filter(|(key, _)| {
-            !has_internal_suffix(key, SUFFIX_DATA_MOVEMENT_UPLOAD) && !has_internal_suffix(key, SUFFIX_PART_CHECKSUMS)
+            !is_data_movement_internal_metadata(key, SUFFIX_DATA_MOVEMENT_UPLOAD)
+                && !is_data_movement_internal_metadata(key, SUFFIX_PART_CHECKSUMS)
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<_, _>>();
@@ -226,7 +227,7 @@ fn data_movement_user_defined(object_info: &ObjectInfo) -> HashMap<String, Strin
     if object_info.transitioned_object.version_id.is_empty() {
         let version_is_semantically_empty = user_defined
             .iter()
-            .filter(|(key, _)| has_internal_suffix(key, SUFFIX_TRANSITIONED_VERSION_ID))
+            .filter(|(key, _)| is_data_movement_internal_metadata(key, SUFFIX_TRANSITIONED_VERSION_ID))
             .all(|(_, value)| is_empty_data_movement_transition_version(value));
         if version_is_semantically_empty {
             remove_canonical(&mut user_defined, SUFFIX_TRANSITIONED_VERSION_ID);
@@ -578,6 +579,10 @@ fn are_equivalent_data_movement_parts_for(source: &[ObjectPartInfo], target: &[O
     })
 }
 
+fn is_data_movement_internal_metadata(key: &str, suffix: &str) -> bool {
+    strip_internal_prefix_preserving_case(key).is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
+}
+
 fn is_canonical_data_movement_internal_metadata(key: &str, suffix: &str) -> bool {
     key.strip_prefix(rustfs_utils::http::RUSTFS_INTERNAL_PREFIX) == Some(suffix)
         || key.strip_prefix(rustfs_utils::http::MINIO_INTERNAL_PREFIX) == Some(suffix)
@@ -601,7 +606,7 @@ fn data_movement_layout_marker_presence(object_info: &ObjectInfo) -> Option<bool
 fn data_movement_size_marker_presence(object_info: &ObjectInfo, suffix: &str, expected: i64) -> Option<bool> {
     let mut present = false;
     for (key, value) in object_info.user_defined.iter() {
-        if !has_internal_suffix(key, suffix) {
+        if !is_data_movement_internal_metadata(key, suffix) {
             continue;
         }
         present = true;
@@ -615,7 +620,7 @@ fn data_movement_size_marker_presence(object_info: &ObjectInfo, suffix: &str, ex
 fn data_movement_checksum_marker_presence(object_info: &ObjectInfo) -> Option<bool> {
     let mut present = false;
     for (key, value) in object_info.user_defined.iter() {
-        if !has_internal_suffix(key, SUFFIX_CRC) {
+        if !is_data_movement_internal_metadata(key, SUFFIX_CRC) {
             continue;
         }
         let Some(checksum) = object_info.checksum.as_deref().filter(|checksum| !checksum.is_empty()) else {
@@ -666,7 +671,7 @@ fn is_data_movement_rewritten_transition_metadata(object_info: &ObjectInfo, key:
         canonical && !preserves_unusable_version
             || expected.is_some_and(|expected| {
                 !expected.is_empty()
-                    && has_internal_suffix(key, suffix)
+                    && is_data_movement_internal_metadata(key, suffix)
                     && rustfs_utils::http::get_consistent_str(&object_info.user_defined, suffix) == Some(expected)
             })
     })
@@ -682,11 +687,11 @@ fn is_data_movement_rewritten_metadata(object_info: &ObjectInfo, key: &str, norm
         crate::object_api::ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX,
     ]
     .iter()
-    .any(|suffix| has_internal_suffix(key, suffix))
+    .any(|suffix| is_data_movement_internal_metadata(key, suffix))
         || is_data_movement_rewritten_transition_metadata(object_info, key)
         || key == rustfs_rio::RUSTFS_MULTIPART_CHECKSUM
         || key == rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE
-        || normalize_compression_size && has_internal_suffix(key, SUFFIX_COMPRESSION_SIZE)
+        || normalize_compression_size && is_data_movement_internal_metadata(key, SUFFIX_COMPRESSION_SIZE)
 }
 
 pub(crate) fn is_equivalent_data_movement_metadata(
