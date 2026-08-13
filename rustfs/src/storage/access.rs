@@ -21,7 +21,7 @@ use crate::auth::{
 };
 use crate::error::ApiError;
 use crate::license::license_check;
-use crate::server::RemoteAddr;
+use crate::shared_types::RemoteAddr;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
