@@ -2375,7 +2375,7 @@ pub struct SetDisks {
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
-    pub lockers: Vec<Arc<dyn LockClient>>,
+    pub lockers: Arc<[Arc<dyn LockClient>]>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
     /// Per-instance runtime context (Phase 5, backlog#939).
     ///
@@ -2772,6 +2772,7 @@ impl SetDisks {
     ) -> Arc<Self> {
         let ctx = instance_ctx;
         let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
+        let lockers = Arc::from(lockers);
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -4997,6 +4998,66 @@ mod tests {
         );
         drop(lock);
         assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_shares_clients_without_changing_quorum() {
+        let healthy: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let set = make_test_set_disks_with_ctx(vec![healthy.clone(), failing.clone()], ctx).await;
+
+        assert!(Arc::ptr_eq(&set.lockers[0], &healthy));
+        assert!(Arc::ptr_eq(&set.lockers[1], &failing));
+        let clients_before = Arc::strong_count(&set.lockers);
+        let healthy_before = Arc::strong_count(&healthy);
+        let failing_before = Arc::strong_count(&failing);
+        let write_lock = set
+            .new_ns_lock("bucket", "write-object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.lockers),
+            clients_before + 1,
+            "each object lock should share one client slice allocation"
+        );
+        assert_eq!(
+            Arc::strong_count(&healthy),
+            healthy_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+        assert_eq!(
+            Arc::strong_count(&failing),
+            failing_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+
+        let write_error = write_lock
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect_err("one healthy client must not satisfy the two-client write quorum");
+        assert!(
+            matches!(
+                write_error,
+                LockError::QuorumNotReached {
+                    required: 2,
+                    achieved: 1
+                }
+            ),
+            "the shared client representation must preserve the exact write quorum result: {write_error}"
+        );
+        let read_lock = set
+            .new_ns_lock("bucket", "read-object")
+            .await
+            .expect("second namespace lock should be created");
+        assert_eq!(Arc::strong_count(&set.lockers), clients_before + 2);
+        let read_guard = read_lock
+            .get_read_lock(Duration::from_millis(500))
+            .await
+            .expect("one healthy client should satisfy the two-client read quorum");
+        assert!(matches!(read_guard, NamespaceLockGuard::Standard(_)));
     }
 
     struct SetupTypeGuard {

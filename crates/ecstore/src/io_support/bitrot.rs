@@ -56,6 +56,16 @@ pub enum ShardReader {
     Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
 }
 
+#[cfg(test)]
+impl ShardReader {
+    pub(crate) fn inline_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Self::InMemory(cursor) => Some(cursor.get_ref()),
+            Self::Stream(_) => None,
+        }
+    }
+}
+
 impl AsyncRead for ShardReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
@@ -596,8 +606,42 @@ pub(crate) async fn create_bitrot_reader_with_stage_metrics(
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
-    create_bitrot_reader_from_bytes_with_stage_metrics(
+    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
         inline_data.map(Bytes::copy_from_slice),
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+        stage_metrics,
+    )
+    .await
+}
+
+/// Stage-instrumented bitrot reader construction for metadata-owned inline data.
+///
+/// Unlike [`create_bitrot_reader_with_stage_metrics`], this keeps `Bytes`
+/// ownership shared instead of copying the inline shard into a new buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
+    inline_data: Option<Bytes>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
+    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
+        inline_data,
         disk,
         bucket,
         path,
@@ -629,7 +673,7 @@ pub async fn create_bitrot_reader_from_bytes(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
-    create_bitrot_reader_from_bytes_with_stage_metrics(
+    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
         inline_data,
         disk,
         bucket,
@@ -646,7 +690,7 @@ pub async fn create_bitrot_reader_from_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_bitrot_reader_from_bytes_with_stage_metrics(
+async fn create_bitrot_reader_from_bytes_with_stage_metrics_inner(
     inline_data: Option<Bytes>,
     disk: Option<&DiskStore>,
     bucket: &str,

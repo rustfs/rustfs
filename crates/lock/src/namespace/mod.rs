@@ -200,9 +200,13 @@ impl NamespaceLock {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
     }
 
-    /// Create a namespace lock that shares an existing namespace allocation.
-    pub fn with_clients_and_quorum_shared(namespace: Arc<str>, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
-        Self::Distributed(DistributedLock::new_shared(namespace, clients, quorum))
+    /// Create a namespace lock that shares existing namespace and client allocations.
+    pub fn with_clients_and_quorum_shared(
+        namespace: Arc<str>,
+        clients: impl Into<Arc<[Arc<dyn LockClient>]>>,
+        quorum: usize,
+    ) -> Self {
+        Self::Distributed(DistributedLock::new_shared(namespace, clients.into(), quorum))
     }
 
     /// Get namespace identifier

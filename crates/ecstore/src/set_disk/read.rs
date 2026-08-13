@@ -4850,6 +4850,114 @@ mod tests {
         .await
     }
 
+    async fn encoded_inline_blocks(blocks: &[&[u8]], shard_size: usize, hash_algo: HashAlgorithm) -> Bytes {
+        let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo);
+        for block in blocks {
+            writer.write(block).await.expect("test block should be encoded");
+        }
+        Bytes::from(writer.into_inner().into_inner())
+    }
+
+    fn assert_reader_shares_inline_allocation(reader: &ObjectBitrotReader, source: &Bytes) {
+        let reader_bytes = reader
+            .inner_ref()
+            .inline_bytes()
+            .expect("inline scheduler should retain an in-memory Bytes source");
+        assert_eq!(
+            reader_bytes.as_ptr(),
+            source.as_ptr(),
+            "the scheduler must clone Bytes ownership instead of copying the inline shard payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_range_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let first = [b'a'; SHARD_SIZE];
+        let second = [b'b'; SHARD_SIZE];
+        let mut source = encoded_inline_blocks(&[&first, &second], SHARD_SIZE, hash_algo.clone()).await;
+        let second_payload = hash_algo.size() * 2 + SHARD_SIZE;
+        source = {
+            let mut corrupt = source.to_vec();
+            corrupt[second_payload] ^= 0xff;
+            Bytes::from(corrupt)
+        };
+        let files = vec![encoded_reader_setup_fileinfo(Some(source.to_vec()))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_with_preference(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            1,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("range reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt ranged inline block must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn inline_part_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let block = [b'p'; SHARD_SIZE];
+        let encoded = encoded_inline_blocks(&[&block], SHARD_SIZE, hash_algo.clone()).await;
+        let mut corrupt = encoded.to_vec();
+        corrupt[hash_algo.size()] ^= 0xff;
+        let files = vec![encoded_reader_setup_fileinfo(Some(corrupt))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_all_shards(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            7,
+            0,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("part reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt inline part must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
     async fn decode_codec_data_blocks_first_setup(
         erasure: coding::Erasure,
         data: &[u8],
