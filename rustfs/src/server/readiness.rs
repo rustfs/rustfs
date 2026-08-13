@@ -74,54 +74,7 @@ fn startup_runtime_readiness_max_wait() -> Duration {
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DependencyReadiness {
-    pub storage_ready: bool,
-    pub iam_ready: bool,
-    pub lock_quorum_ready: bool,
-    pub peer_health_ready: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadinessDegradedReason {
-    StorageQuorumUnavailable,
-    IamNotReady,
-    LockQuorumUnavailable,
-    KmsNotReady,
-    ObjectReadStalled,
-    ObjectWriteStalled,
-    ClusterHealthTimeout,
-    PeerHealthUnavailable,
-    StorageAndIamUnavailable,
-    StorageAndLockUnavailable,
-    IamAndLockUnavailable,
-    StorageIamAndLockUnavailable,
-}
-
-impl ReadinessDegradedReason {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReadinessDegradedReason::StorageQuorumUnavailable => "storage_quorum_unavailable",
-            ReadinessDegradedReason::IamNotReady => "iam_not_ready",
-            ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
-            ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
-            ReadinessDegradedReason::ObjectReadStalled => "object_read_stalled",
-            ReadinessDegradedReason::ObjectWriteStalled => "object_write_stalled",
-            ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
-            ReadinessDegradedReason::PeerHealthUnavailable => "peer_health_unavailable",
-            ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
-            ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
-            ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
-            ReadinessDegradedReason::StorageIamAndLockUnavailable => "storage_iam_and_lock_unavailable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DependencyReadinessReport {
-    pub readiness: DependencyReadiness,
-    pub degraded_reasons: Vec<ReadinessDegradedReason>,
-}
+pub use crate::shared_types::{DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason};
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
 /// are fully initialized before allowing any request to proceed.
