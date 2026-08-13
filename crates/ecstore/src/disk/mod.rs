@@ -65,6 +65,7 @@ use error::{Error, Result};
 use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
+use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
@@ -460,6 +461,19 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
             Disk::Remote(remote_disk) => remote_disk.read_file_stream(volume, path, offset, length).await,
+        }
+    }
+
+    async fn read_file_stream_chunks(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.read_file_stream_chunks(volume, path, offset, length).await,
         }
     }
 
@@ -900,6 +914,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
+
+    /// Returns an owned-chunk stream when the backing transport can preserve
+    /// receive-buffer ownership. `None` retains the ordinary reader path.
+    async fn read_file_stream_chunks(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
+        Ok(None)
+    }
 
     /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;

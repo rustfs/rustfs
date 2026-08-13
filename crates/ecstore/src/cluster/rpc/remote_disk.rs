@@ -522,6 +522,33 @@ impl RemoteDisk {
         }
     }
 
+    async fn open_read_chunks_with_retry(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+        let mut attempt = 1;
+        let mut last_retry_classification = None;
+        loop {
+            match self.data_transport.open_read_chunks(request.clone()).await {
+                Ok(reader) => {
+                    if attempt > 1
+                        && let Some(classification) = last_retry_classification
+                    {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_open_read_retry_success(classification);
+                    }
+                    return Ok(reader);
+                }
+                Err(err) if attempt < REMOTE_DISK_OPEN_READ_MAX_ATTEMPTS && Self::is_retryable_open_read_error(&err) => {
+                    if let Some(classification) = err.internode_http_error_kind() {
+                        let classification = classification.metric_label();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_open_read_retry(classification);
+                        last_retry_classification = Some(classification);
+                    }
+                    tokio::time::sleep(REMOTE_DISK_OPEN_READ_RETRY_BACKOFF).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
         self.health.record_capacity_probe(total, used, free);
     }
@@ -2443,6 +2470,30 @@ impl DiskAPI for RemoteDisk {
         let disk = self.disk_ref().await;
         let stall_timeout = get_object_disk_read_timeout();
         self.open_read_with_retry(ReadStreamRequest {
+            endpoint: self.endpoint.grid_host(),
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            offset,
+            length,
+            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
+        })
+        .await
+    }
+
+    async fn read_file_stream_chunks(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+        let stall_timeout = get_object_disk_read_timeout();
+        self.open_read_chunks_with_retry(ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
             volume: volume.to_string(),

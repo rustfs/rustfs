@@ -31,7 +31,7 @@ use rustfs_config::{
     DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
     KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
-use rustfs_rio::{HttpReader, HttpWriter};
+use rustfs_rio::{ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -221,6 +221,11 @@ pub struct NsScannerCapabilityRequest {
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
+    /// Opens an owned-chunk stream when this transport can retain receive-buffer
+    /// ownership. `None` preserves the established `open_read` fallback.
+    async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        Ok(None)
+    }
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
     async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
@@ -245,6 +250,15 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
         Ok(Box::new(
             HttpReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
         ))
+    }
+
+    async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Some(Box::new(
+            HttpChunkReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        )))
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
