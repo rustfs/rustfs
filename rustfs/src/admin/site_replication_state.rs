@@ -18,28 +18,21 @@
 //! `config/site-replication/state.json` is mutated by read-modify-write
 //! sequences spread over many call sites: admin handlers, the retry-event
 //! writers on every hook broadcast path, and the service-side reload driven
-//! over node RPC. Historically only some of them held the process-local
-//! mutex and none held a distributed lock across the whole RMW, so
-//! concurrent writers overwrote each other (single-process for the unlocked
-//! writers, cross-node for everyone).
+//! over node RPC.
 //!
 //! `with_site_replication_state_lock` is the single transaction boundary:
-//! it holds the process-local mutex AND the distributed config-object write
-//! lock (the pattern proven by the repair state,
-//! `update_site_replication_repair_state`) for the duration of the caller's
-//! closure. All IO inside the closure must use the `*_no_lock` config
-//! helpers — the locked variants would self-deadlock on the same object
-//! lock. Do not perform peer network calls or take other config locks
+//! it holds the distributed config-object write lock (the pattern proven by
+//! the repair state, `update_site_replication_repair_state`) for the
+//! duration of the caller's closure. The object lock is the sole mechanism —
+//! it is the only thing that can serialize two nodes of the same site, so a
+//! process-local lock must never be reintroduced in front of it as if it
+//! added protection. All IO inside the closure must use the `*_no_lock`
+//! config helpers — the locked variants would self-deadlock on the same
+//! object lock. Do not perform peer network calls or take other config locks
 //! inside the closure.
 //!
-//! The process-local mutex is transitional: call sites still outside this
-//! primitive serialize against migrated ones through it. Once every RMW
-//! call site goes through here (P1-15 PR2) it will be removed, leaving the
-//! object lock as the only mechanism.
-//!
-//! Lock order (unchanged from the historical comment next to the mutex):
-//! lifecycle -> bucket operation -> repair admission -> state (process
-//! mutex, then state object lock) -> per-bucket metadata.
+//! Lock order: lifecycle -> bucket operation -> repair admission
+//! -> state object lock -> per-bucket metadata.
 
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
@@ -53,24 +46,8 @@ use super::runtime_sources::current_object_store_handle;
 /// byte-level tolerant reload on the service side.
 pub(crate) const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 
-/// Transitional process-local mutex — see the module docs. Stays private to
-/// this module (owner-local static, enforced by
-/// `scripts/check_architecture_migration_rules.sh`); callers go through
-/// [`site_replication_state_process_guard`].
-static SITE_REPLICATION_STATE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-/// Owner helper for the transitional process mutex: the RMW call sites in
-/// `handlers::site_replication` that PR2 has not migrated to
-/// [`with_site_replication_state_lock`] yet hold this guard so they stay
-/// mutually exclusive with the migrated ones. Removed together with the
-/// mutex once every call site runs inside the transaction boundary.
-pub(crate) async fn site_replication_state_process_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    SITE_REPLICATION_STATE_LOCK.lock().await
-}
-
 /// Run `operation` under the site-replication state transaction boundary:
-/// process mutex first, then the distributed state-object write lock.
+/// the distributed state-object write lock.
 pub(crate) async fn with_site_replication_state_lock<T, F, Fut>(operation: F) -> S3Result<T>
 where
     T: Send + 'static,
@@ -83,21 +60,11 @@ where
 
 /// Context-store variant for callers that resolve their store from an
 /// explicit [`AppContext`] (the service-side reload driven over node RPC).
+///
+/// This is the whole boundary: a state-object write lock serializes writers
+/// in *different* processes, which is what two nodes of one site are and
+/// what a process mutex could never cover.
 pub(crate) async fn with_site_replication_state_lock_on<T, F, Fut>(store: Arc<ECStore>, operation: F) -> S3Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
-{
-    let _process_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-    with_site_replication_state_object_lock(store, operation).await
-}
-
-/// The distributed half of the boundary on its own: the state-object write
-/// lock, without the process mutex. This is the only thing that serializes
-/// writers in *different* processes (the mutex cannot), so it is also what
-/// the separate-nodes regression test drives.
-pub(crate) async fn with_site_replication_state_object_lock<T, F, Fut>(store: Arc<ECStore>, operation: F) -> S3Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,
