@@ -56,6 +56,16 @@ pub enum ShardReader {
     Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
 }
 
+#[cfg(test)]
+impl ShardReader {
+    pub(crate) fn inline_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Self::InMemory(cursor) => Some(cursor.get_ref()),
+            Self::Chunked(_) | Self::Stream(_) => None,
+        }
+    }
+}
+
 impl AsyncRead for ShardReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
@@ -646,7 +656,7 @@ pub async fn create_bitrot_reader_from_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_bitrot_reader_from_bytes_with_stage_metrics(
+pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     inline_data: Option<Bytes>,
     disk: Option<&DiskStore>,
     bucket: &str,

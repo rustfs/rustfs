@@ -586,9 +586,9 @@ impl Erasure {
             ));
         }
 
-        let shards = self.encode_data_owned(buf)?;
+        let block = self.encode_data_owned_block(buf)?;
         let mut mw = MultiWriter::new(writers, quorum);
-        mw.write(shards).await?;
+        mw.write_block(&block).await?;
         mw.shutdown().await?;
         Ok((reader, total))
     }
@@ -613,13 +613,13 @@ impl Erasure {
             return Ok((reader, 0, Vec::new()));
         }
 
-        let shards = self.encode_data_owned(buf)?;
-        let mut inline_shards = Vec::with_capacity(shards.len());
-        for shard in shards {
-            let hash = HashAlgorithm::HighwayHash256S.hash_encode(&shard);
+        let block = self.encode_data_owned_block(buf)?;
+        let mut inline_shards = Vec::with_capacity(block.shards().len());
+        for shard in block.shards() {
+            let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
             let mut encoded = BytesMut::with_capacity(hash.as_ref().len() + shard.len());
             encoded.extend_from_slice(hash.as_ref());
-            encoded.extend_from_slice(&shard);
+            encoded.extend_from_slice(shard);
             inline_shards.push(encoded.freeze());
         }
 
@@ -2165,6 +2165,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_inline_small_drops_stalled_write() {
+        const BLOCK_SIZE: usize = 16;
+
+        let (writer_entered_tx, writer_entered) = oneshot::channel();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writers = vec![Some(bitrot_writer_plain(
+            StallOnWriteWithSignal {
+                entered: Some(writer_entered_tx),
+                writes: writes.clone(),
+            },
+            BLOCK_SIZE,
+        ))];
+        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(vec![0xA5; BLOCK_SIZE - 1]));
+        let encode = tokio::spawn(async move { erasure.encode_inline_small(reader, &mut writers, 1).await });
+
+        tokio::time::timeout(Duration::from_secs(1), writer_entered)
+            .await
+            .expect("inline writer should enter before cancellation")
+            .expect("stalling writer should signal entry");
+        encode.abort();
+        assert!(
+            matches!(encode.await, Err(err) if err.is_cancelled()),
+            "inline encode task should be cancelled"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation must drop the stalled write instead of polling it again"
+        );
+    }
+
+    #[tokio::test]
     async fn encode_returns_unexpected_eof_for_truncated_limited_reader() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed);
@@ -2395,27 +2428,33 @@ mod tests {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
         const BLOCK_SIZE: usize = 64;
-        let payload = b"inline commit payload".to_vec();
         let checksum_algo = HashAlgorithm::HighwayHash256S;
-        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
-        let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+        for uses_legacy in [false, true] {
+            let erasure = Arc::new(Erasure::new_with_options(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE, uses_legacy));
+            for payload in [Vec::new(), vec![0xA5], vec![0x5A; BLOCK_SIZE - 1], vec![0xC3; BLOCK_SIZE]] {
+                let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+                let (_reader, total, inline_shards) = erasure
+                    .clone()
+                    .encode_inline_shards_with_size_hint(reader, payload.len())
+                    .await
+                    .expect("inline shards should encode");
 
-        let (_reader, total, inline_shards) = erasure
-            .clone()
-            .encode_inline_shards_with_size_hint(reader, payload.len())
-            .await
-            .expect("inline shards should encode");
-        let raw_shards = erasure
-            .encode_data_owned(payload.clone())
-            .expect("reference shards should encode");
+                assert_eq!(total, payload.len());
+                if payload.is_empty() {
+                    assert!(inline_shards.is_empty());
+                    continue;
+                }
 
-        assert_eq!(total, payload.len());
-        assert_eq!(inline_shards.len(), DATA_SHARDS + PARITY_SHARDS);
-        for (inline, raw) in inline_shards.iter().zip(raw_shards) {
-            let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), raw.len(), checksum_algo.clone());
-            writer.write(&raw).await.expect("reference writer should accept shard");
-            writer.shutdown().await.expect("reference writer should shutdown");
-            assert_eq!(inline.as_ref(), writer.into_inline_data().expect("reference writer should retain bytes"));
+                let raw_shards = erasure.encode_data(&payload).expect("reference shards should encode");
+                assert_eq!(inline_shards.len(), DATA_SHARDS + PARITY_SHARDS);
+                for (inline, raw) in inline_shards.iter().zip(raw_shards) {
+                    let mut writer =
+                        BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), raw.len(), checksum_algo.clone());
+                    writer.write(&raw).await.expect("reference writer should accept shard");
+                    writer.shutdown().await.expect("reference writer should shutdown");
+                    assert_eq!(inline.as_ref(), writer.into_inline_data().expect("reference writer should retain bytes"));
+                }
+            }
         }
     }
 

@@ -77,6 +77,13 @@ impl ShardBufferPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn stored_allocation(&self, index: usize) -> Option<(*const u8, usize)> {
+        self.buffers
+            .get(index)
+            .and_then(|buf| buf.as_ref().map(|buf| (buf.as_ptr(), buf.capacity())))
+    }
+
+    #[cfg(test)]
     fn stored_capacity(&self, index: usize) -> Option<usize> {
         self.buffers.get(index).and_then(|buf| buf.as_ref().map(Vec::capacity))
     }

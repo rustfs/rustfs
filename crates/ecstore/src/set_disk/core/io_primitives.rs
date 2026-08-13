@@ -54,8 +54,9 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params, create_bitrot_reader_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled, object_mmap_read_max_length,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params,
+    create_bitrot_reader_from_bytes_with_stage_metrics, create_deferred_bitrot_reader_with_stripe_handle,
+    object_mmap_read_enabled, object_mmap_read_max_length,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::FutureExt as _;
@@ -1262,13 +1263,13 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
         return;
     }
 
-    let inline_data = files[idx].data.as_deref();
+    let inline_data = files[idx].data.clone();
     let data_dir = files[idx].data_dir.unwrap_or_default();
     let disk = disks[idx].as_ref();
     let path = format!("{object}/{data_dir}/part.{part_number}");
 
     reader_tasks.push(Box::pin(async move {
-        let result = create_bitrot_reader_with_stage_metrics(
+        let result = create_bitrot_reader_from_bytes_with_stage_metrics(
             inline_data,
             disk,
             bucket,
@@ -1560,14 +1561,14 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     for (idx, disk_op) in disks.iter().enumerate() {
         setup.mark_scheduled(idx);
-        let inline_data = files[idx].data.as_deref();
+        let inline_data = files[idx].data.clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let disk = disk_op.as_ref();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
-            let result = create_bitrot_reader_with_stage_metrics(
+            let result = create_bitrot_reader_from_bytes_with_stage_metrics(
                 inline_data,
                 disk,
                 bucket,
