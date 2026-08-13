@@ -880,11 +880,43 @@ mod prepared_get_object_metadata_tests {
     use super::*;
     use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::object_api::{BLOCK_SIZE_V2, PutObjReader};
-    use crate::set_disk::core::io_primitives::disk_call_counters;
+    use crate::set_disk::core::io_primitives::{bounded_metadata_fanout_order, disk_call_counters, rename_fanout_barrier};
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::test_metrics::CapturingRecorder;
     use http::HeaderMap;
     use tokio::io::AsyncReadExt;
+
+    const READ_VERSION_BARRIER_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn object_with_initial_data_shards(bucket: &str, prefix: &str) -> String {
+        (0..1000)
+            .map(|index| format!("{prefix}-{index}.bin"))
+            .find(|name| {
+                let order = bounded_metadata_fanout_order(bucket, name, 4, 2);
+                let distribution = FileInfo::new(&[bucket, name].join("/"), 2, 2).erasure.distribution;
+                let mut seen = [false; 2];
+                for disk_index in order.into_iter().take(3) {
+                    if let Some(block_index @ 1..=2) = distribution.get(disk_index).copied() {
+                        seen[block_index - 1] = true;
+                    }
+                }
+                seen.into_iter().all(|seen| seen)
+            })
+            .expect("test should find an object whose initial fanout covers both data shards")
+    }
+
+    fn bounded_spare_disk_index(bucket: &str, object: &str) -> usize {
+        *bounded_metadata_fanout_order(bucket, object, 4, 2)
+            .get(3)
+            .expect("4-disk test geometry should leave one bounded spare disk")
+    }
+
+    fn bounded_slow_initial_disk_index(bucket: &str, object: &str) -> usize {
+        *bounded_metadata_fanout_order(bucket, object, 4, 2)
+            .get(2)
+            .expect("4-disk test geometry should include a third initial metadata disk")
+    }
 
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
@@ -1002,6 +1034,307 @@ mod prepared_get_object_metadata_tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn inline_data_read_early_stop_reader_returns_exact_body() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "inline-data-read-early-stop-reader";
+        let object = object_with_initial_data_shards(bucket, "inline-data-read-early-stop-reader-object");
+        let payload = b"inline early-stop reader payload".repeat(256);
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (restored, object_size, calls_total) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                let opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                set_disks
+                    .put_object(bucket, &object, &mut put_reader, &opts)
+                    .await
+                    .expect("inline object should be written");
+
+                temp_env::async_with_vars(
+                    [
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                    ],
+                    async {
+                        let slow_initial_disk = bounded_slow_initial_disk_index(bucket, &object);
+                        let barrier =
+                            rename_fanout_barrier::arm(&object, slow_initial_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                        let calls = disk_call_counters::observe(&object);
+                        let set_disks_for_read = Arc::clone(&set_disks);
+                        let opts_for_read = opts.clone();
+                        let object_for_read = object.clone();
+                        let mut open_reader = tokio::spawn(async move {
+                            set_disks_for_read
+                                .get_object_reader(bucket, &object_for_read, None, HeaderMap::new(), &opts_for_read)
+                                .await
+                        });
+
+                        tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+                            .await
+                            .expect("bounded inline GET should pause a slow initial metadata read");
+                        let mut reader = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut open_reader)
+                            .await
+                            .expect("production inline GET should return before the paused metadata response")
+                            .expect("inline GET reader task should not panic")
+                            .expect("inline GET reader should open");
+                        let object_size = reader.object_info.size;
+                        let mut restored = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut restored)
+                            .await
+                            .expect("inline GET body should stream");
+
+                        (restored, object_size, calls.total(disk_call_counters::KIND_READ_VERSION))
+                    },
+                )
+                .await
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(object_size, payload.len() as i64);
+        assert_eq!(restored, payload);
+        assert_eq!(calls_total, 4, "bounded production GET should schedule the initial quorum plus one spare");
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_scheduled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "bounded production GET should record all scheduled metadata tasks"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_completed",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![3.0],
+            "bounded production GET should record only observed metadata responses as completed"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_cancelled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![1.0],
+            "bounded production GET should record the aborted slow metadata task"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn prepared_metadata_uses_full_fanout_even_when_data_read_early_stop_is_enabled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "prepared-metadata-early-stop-enabled";
+        let object = object_with_initial_data_shards(bucket, "prepared-metadata-early-stop-enabled-object");
+        let payload = b"prepared metadata early-stop enabled payload".repeat(16);
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (restored, calls_total) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                let opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                set_disks
+                    .put_object(bucket, &object, &mut put_reader, &opts)
+                    .await
+                    .expect("object should be written");
+
+                temp_env::async_with_vars(
+                    [
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                    ],
+                    async {
+                        let calls = disk_call_counters::observe(&object);
+                        let metadata = set_disks
+                            .prepare_get_object_metadata(bucket, &object, &opts)
+                            .await
+                            .expect("prepared metadata should resolve");
+                        let calls_total = calls.total(disk_call_counters::KIND_READ_VERSION);
+
+                        let mut reader = set_disks
+                            .get_object_reader_with_prepared_metadata(bucket, &object, None, HeaderMap::new(), &opts, metadata)
+                            .await
+                            .expect("prepared body reader should open");
+                        let mut restored = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut restored)
+                            .await
+                            .expect("prepared body should stream");
+                        (restored, calls_total)
+                    },
+                )
+                .await
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            calls_total, 4,
+            "prepared metadata must opt out of data-read early-stop until the read shape is known"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_scheduled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "prepared metadata should schedule the full metadata fanout"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_completed",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "prepared metadata must wait for every scheduled metadata response"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_cancelled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![0.0],
+            "prepared metadata must not cancel metadata responses"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn data_read_early_stop_request_shapes_full_wait_in_production_reader() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "data-read-early-stop-shape-reader";
+        let payload = b"shape-gated inline reader payload".repeat(256);
+
+        for (object_prefix, range, configure_opts, expected_body) in [
+            (
+                "data-read-early-stop-range-reader-object",
+                Some(HTTPRangeSpec {
+                    start: 0,
+                    end: 3,
+                    is_suffix_length: false,
+                }),
+                None,
+                payload[..4].to_vec(),
+            ),
+            ("data-read-early-stop-part-reader-object", None, Some(1), payload.clone()),
+        ] {
+            let recorder = CapturingRecorder::default();
+            let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+            rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+            let (restored, calls_total) = metrics::with_local_recorder(&recorder, || {
+                runtime.block_on(async {
+                    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                    let object = object_with_initial_data_shards(bucket, object_prefix);
+                    let mut opts = ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    };
+                    opts.part_number = configure_opts;
+
+                    set_disks
+                        .make_bucket(bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("bucket should be created");
+                    let mut put_reader = PutObjReader::from_vec(payload.clone());
+                    set_disks
+                        .put_object(bucket, &object, &mut put_reader, &opts)
+                        .await
+                        .expect("inline object should be written");
+
+                    temp_env::async_with_vars(
+                        [
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                        ],
+                        async {
+                            let calls = disk_call_counters::observe(&object);
+                            let mut reader = set_disks
+                                .get_object_reader(bucket, &object, range, HeaderMap::new(), &opts)
+                                .await
+                                .expect("shape-gated GET reader should open");
+                            let mut restored = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut restored)
+                                .await
+                                .expect("shape-gated GET body should stream");
+                            (restored, calls.total(disk_call_counters::KIND_READ_VERSION))
+                        },
+                    )
+                    .await
+                })
+            });
+            rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+            assert_eq!(restored, expected_body);
+            assert_eq!(calls_total, 4, "shape-gated production GET should keep full metadata fanout");
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_scheduled",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![4.0],
+                "shape-gated production GET should schedule the full metadata fanout"
+            );
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_completed",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![4.0],
+                "shape-gated production GET must wait for every scheduled metadata response"
+            );
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_cancelled",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![0.0],
+                "shape-gated production GET must not cancel metadata responses"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
     async fn prepared_reader_rebuilds_object_info_when_precomputed_value_is_absent() {
@@ -1105,7 +1438,7 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
         let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
             snapshot,
@@ -3411,7 +3744,13 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
         if block_index == 0 || block_index > data_shards {
             continue;
         }
+        if file_info.erasure.index != block_index {
+            continue;
+        }
         if !file_info.has_valid_erasure_geometry() {
+            continue;
+        }
+        if !core::io_primitives::metadata_early_stop_candidate_matches(file_info, fi) {
             continue;
         }
         if file_info.data.as_ref().is_none_or(|data| data.is_empty()) {
@@ -9221,6 +9560,9 @@ mod tests {
             HashAlgorithm::HighwayHash256S
         };
         let shards = erasure.encode_data(payload).expect("payload should encode");
+        let version_id = Some(Uuid::new_v4());
+        let data_dir = Some(Uuid::new_v4());
+        let mod_time = Some(OffsetDateTime::now_utc());
         let mut files = Vec::with_capacity(shards.len());
 
         for shard in shards {
@@ -9233,6 +9575,16 @@ mod tests {
             writer.shutdown().await.expect("inline writer should shutdown");
             let data = writer.into_inline_data().expect("inline data should be retained");
             let mut file = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
+            file.volume = "bucket".to_string();
+            file.name = "object".to_string();
+            file.size = i64::try_from(payload.len()).expect("test payload should fit i64");
+            file.is_latest = true;
+            file.version_id = version_id;
+            file.data_dir = data_dir;
+            file.mod_time = mod_time;
+            file.metadata.insert("etag".to_string(), "etag-inline".to_string());
+            file.add_object_part(1, "part-etag-inline".to_string(), payload.len(), file.mod_time, file.size, None, None);
+            file.set_inline_data();
             file.erasure.index = files.len() + 1;
             file.data = Some(Bytes::from(data));
             files.push(file);
@@ -9245,16 +9597,40 @@ mod tests {
         inline_bitrot_files_for_payload_with_mode(payload, false).await
     }
 
+    fn disk_ordered_fileinfos(files: &[FileInfo]) -> Vec<FileInfo> {
+        let distribution = &files
+            .first()
+            .expect("inline data shard fixture should include metadata")
+            .erasure
+            .distribution;
+        distribution
+            .iter()
+            .map(|block_index| {
+                files
+                    .get(block_index.checked_sub(1).expect("erasure block indexes are one-based"))
+                    .expect("inline data shard fixture should include every distributed shard")
+                    .clone()
+            })
+            .collect()
+    }
+
     fn inline_data_shard_fileinfo(
-        name: &str,
         data_blocks: usize,
         parity_blocks: usize,
         erasure_index: usize,
         distribution: &[usize],
         data: Option<&'static [u8]>,
     ) -> FileInfo {
-        let mut fi = FileInfo::new(name, data_blocks, parity_blocks);
-        fi.name = name.to_string();
+        let mut fi = FileInfo::new("object", data_blocks, parity_blocks);
+        fi.name = "object".to_string();
+        fi.volume = "bucket".to_string();
+        fi.size = 4;
+        fi.is_latest = true;
+        fi.data_dir = Some(Uuid::nil());
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        fi.metadata.insert("etag".to_string(), "etag-inline".to_string());
+        fi.add_object_part(1, "part-etag-inline".to_string(), 4, fi.mod_time, 4, None, None);
+        fi.set_inline_data();
         fi.erasure.index = erasure_index;
         fi.erasure.distribution = distribution.to_vec();
         fi.data = data.map(Bytes::from_static);
@@ -9264,36 +9640,41 @@ mod tests {
     #[test]
     fn collect_inline_data_shards_by_index_uses_distribution_order() {
         let distribution = vec![3, 1, 5, 2, 4, 6];
-        let mut fi = FileInfo::new("object", 4, 2);
+        let mut fi = inline_data_shard_fileinfo(4, 2, 1, &distribution, Some(b"x"));
+        fi.erasure.index = 1;
         fi.erasure.distribution = distribution.clone();
         let files = vec![
-            inline_data_shard_fileinfo("block-3", 4, 2, 3, &distribution, Some(b"c")),
-            inline_data_shard_fileinfo("block-1", 4, 2, 1, &distribution, Some(b"a")),
-            inline_data_shard_fileinfo("parity-5", 4, 2, 5, &distribution, Some(b"p")),
-            inline_data_shard_fileinfo("block-2", 4, 2, 2, &distribution, Some(b"b")),
-            inline_data_shard_fileinfo("block-4", 4, 2, 4, &distribution, Some(b"d")),
-            inline_data_shard_fileinfo("parity-6", 4, 2, 6, &distribution, Some(b"q")),
+            inline_data_shard_fileinfo(4, 2, 3, &distribution, Some(b"c")),
+            inline_data_shard_fileinfo(4, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo(4, 2, 5, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo(4, 2, 2, &distribution, Some(b"b")),
+            inline_data_shard_fileinfo(4, 2, 4, &distribution, Some(b"d")),
+            inline_data_shard_fileinfo(4, 2, 6, &distribution, Some(b"q")),
         ];
 
         let data_files =
             collect_inline_data_shard_fileinfos_by_index(&files, &fi, 4, |_| true).expect("all data shards should be collected");
 
         assert_eq!(
-            data_files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
-            ["block-1", "block-2", "block-3", "block-4"]
+            data_files
+                .iter()
+                .map(|file| file.data.as_deref().expect("fixture carries inline bytes"))
+                .collect::<Vec<_>>(),
+            [b"a".as_slice(), b"b".as_slice(), b"c".as_slice(), b"d".as_slice()]
         );
     }
 
     #[test]
     fn collect_inline_data_shards_by_index_rejects_missing_data_shard() {
         let distribution = vec![1, 2, 3, 4];
-        let mut fi = FileInfo::new("object", 2, 2);
+        let mut fi = inline_data_shard_fileinfo(2, 2, 1, &distribution, Some(b"x"));
+        fi.erasure.index = 1;
         fi.erasure.distribution = distribution.clone();
         let files = vec![
-            inline_data_shard_fileinfo("block-1", 2, 2, 1, &distribution, Some(b"a")),
-            inline_data_shard_fileinfo("block-2", 2, 2, 2, &distribution, None),
-            inline_data_shard_fileinfo("parity-3", 2, 2, 3, &distribution, Some(b"p")),
-            inline_data_shard_fileinfo("parity-4", 2, 2, 4, &distribution, Some(b"q")),
+            inline_data_shard_fileinfo(2, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo(2, 2, 2, &distribution, None),
+            inline_data_shard_fileinfo(2, 2, 3, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo(2, 2, 4, &distribution, Some(b"q")),
         ];
 
         assert!(collect_inline_data_shard_fileinfos_by_index(&files, &fi, 2, |_| true).is_none());
@@ -9426,10 +9807,8 @@ mod tests {
 
         let payload = vec![b'i'; 192 * 1024];
         let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
-        let mut fi = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
-        fi.size = payload.len() as i64;
-        fi.data = files[0].data.clone();
-        fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
+        let fi = files[0].clone();
+        let disk_files = disk_ordered_fileinfos(&files);
 
         let disks = vec![Some(disk); erasure.total_shard_count()];
         let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
@@ -9438,7 +9817,7 @@ mod tests {
             "bucket",
             "object",
             &fi,
-            &files,
+            &disk_files,
             &disks,
             true,
             GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
@@ -9469,10 +9848,8 @@ mod tests {
         let payload = vec![b'v'; 64 * 1024];
         let payload_size = i64::try_from(payload.len()).expect("test payload size should fit i64");
         let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
-        let mut fi = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
-        fi.size = payload_size;
-        fi.data = files[0].data.clone();
-        fi.add_object_part(1, String::new(), payload.len(), None, payload_size, None, None);
+        let fi = files[0].clone();
+        let disk_files = disk_ordered_fileinfos(&files);
 
         let mut object_info = ObjectInfo {
             size: payload_size,
@@ -9503,7 +9880,7 @@ mod tests {
             "bucket",
             "object",
             &fi,
-            &files,
+            &disk_files,
             &vec![Some(disk); erasure.total_shard_count()],
             true,
             GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
