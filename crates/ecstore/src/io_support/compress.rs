@@ -34,8 +34,8 @@ pub const ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS: &str = "RUSTFS_ADDED_EXCLUDE_CO
 // Environment variable to additionally enable disk compression for multipart uploads.
 // Default off: nodes from before the resumable decompressor fix fail transient reads of
 // compressed objects, so multipart compression stays dark until the operator confirms the
-// fleet has converged on a fixed build (see docs/architecture/compat-cleanup-register.md,
-// `multipart-compression-default-off-window`, for the default-flip condition).
+// fleet has converged on a fixed build.
+// RUSTFS_COMPAT_TODO(multipart-compression-default-off-window): staged rollout switch for restored multipart compression, flipping the default to enabled on retirement. Remove after the minimum supported direct-upgrade release ships the resumable DecompressReader.
 pub const ENV_DISK_COMPRESSION_MULTIPART_ENABLED: &str = "RUSTFS_COMPRESSION_MULTIPART_ENABLED";
 
 pub const DEFAULT_DISK_COMPRESS_EXTENSIONS: &str = ".txt,.log,.csv,.json,.tar,.xml,.bin";
