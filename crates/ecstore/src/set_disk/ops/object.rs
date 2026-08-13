@@ -44,10 +44,11 @@ use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, VersionPurgeStatusType, replication_state_to_filemeta, version_purge_status_to_filemeta,
 };
 use crate::diagnostics::get::GetObjectFailureReason;
-use crate::disk::OldCurrentSize;
+use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
 use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
@@ -55,6 +56,9 @@ use futures::FutureExt as _;
 use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
+use std::sync::OnceLock;
+
+const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 
 #[inline]
 fn duration_millis_f64(duration: std::time::Duration) -> f64 {
@@ -63,6 +67,133 @@ fn duration_millis_f64(duration: std::time::Duration) -> f64 {
 
 fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_slot: usize) -> usize {
     committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
+}
+
+pub(in crate::set_disk::ops) fn assign_object_transaction_epoch(
+    shuffle_disks: &[Option<DiskStore>],
+    parts_metadatas: &mut [FileInfo],
+) -> Uuid {
+    let epoch = Uuid::new_v4();
+    for (disk, file_info) in shuffle_disks.iter().zip(parts_metadatas.iter_mut()) {
+        if disk.is_some() {
+            file_info.set_object_transaction_epoch(epoch);
+        }
+    }
+    epoch
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OldDataCleanupReceiptRecord {
+    epoch: String,
+    old_data_dir: String,
+    committed_data_dir: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct OldDataCleanupReceipt {
+    epoch: Uuid,
+    old_data_dir: Uuid,
+    committed_data_dir: Option<Uuid>,
+}
+
+impl OldDataCleanupReceipt {
+    fn new(epoch: Uuid, old_data_dir: Uuid, committed_data_dir: Option<Uuid>) -> Self {
+        Self {
+            epoch,
+            old_data_dir,
+            committed_data_dir,
+        }
+    }
+
+    fn encode(self) -> disk::error::Result<Bytes> {
+        let record = OldDataCleanupReceiptRecord {
+            epoch: self.epoch.to_string(),
+            old_data_dir: self.old_data_dir.to_string(),
+            committed_data_dir: self.committed_data_dir.map(|dir| dir.to_string()),
+        };
+        Ok(Bytes::from(serde_json::to_vec(&record)?))
+    }
+
+    fn decode(data: &[u8]) -> disk::error::Result<Self> {
+        let record: OldDataCleanupReceiptRecord = serde_json::from_slice(data)?;
+        let epoch = Uuid::parse_str(&record.epoch).map_err(DiskError::other)?;
+        let old_data_dir = Uuid::parse_str(&record.old_data_dir).map_err(DiskError::other)?;
+        let committed_data_dir = record
+            .committed_data_dir
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(DiskError::other)?;
+        if epoch.is_nil() || old_data_dir.is_nil() || committed_data_dir.is_some_and(|dir| dir.is_nil()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(Self::new(epoch, old_data_dir, committed_data_dir))
+    }
+}
+
+pub(in crate::set_disk::ops) fn old_data_cleanup_receipt_path(object: &str, old_data_dir: Uuid) -> String {
+    path_join_buf(&[object, &old_data_dir.to_string(), OLD_DATA_CLEANUP_RECEIPT_FILE])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::set_disk::ops) enum ObjectTransactionEpochFence {
+    Absent,
+    Present(Uuid),
+}
+
+impl ObjectTransactionEpochFence {
+    fn from_file_info(file_info: &FileInfo) -> Result<Self> {
+        match file_info.object_transaction_epoch() {
+            Ok(Some(epoch)) => Ok(Self::Present(epoch)),
+            Ok(None) => Ok(Self::Absent),
+            Err(_) => Err(StorageError::FileCorrupt),
+        }
+    }
+}
+
+pub(in crate::set_disk::ops) async fn read_object_transaction_epoch_fence(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+) -> Result<ObjectTransactionEpochFence> {
+    let current = set
+        .get_object_fileinfo(
+            bucket,
+            object,
+            &ObjectOptions {
+                no_lock: true,
+                metadata_cache_safe: false,
+                versioned: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+        .await;
+    match current {
+        Ok(snapshot) => ObjectTransactionEpochFence::from_file_info(snapshot.fi()),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(ObjectTransactionEpochFence::Absent),
+        Err(err) => Err(err),
+    }
+}
+
+pub(in crate::set_disk::ops) async fn verify_object_transaction_epoch_fence(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+    expected: ObjectTransactionEpochFence,
+) -> Result<()> {
+    let current = read_object_transaction_epoch_fence(set, bucket, object).await?;
+    if current == expected {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed)
+    }
+}
+
+fn old_data_cleanup_receipt_epoch_matches_current(receipt: OldDataCleanupReceipt, current: ObjectTransactionEpochFence) -> bool {
+    matches!(current, ObjectTransactionEpochFence::Present(epoch) if epoch == receipt.epoch)
 }
 
 #[cfg(test)]
@@ -1080,6 +1211,114 @@ fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileIn
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        old_data_dir: Uuid,
+        committed_data_dir: Option<Uuid>,
+        epoch: Option<Uuid>,
+    ) {
+        let Some(epoch) = epoch else { return };
+        if committed_data_dir == Some(old_data_dir) {
+            return;
+        }
+        let receipt = OldDataCleanupReceipt::new(epoch, old_data_dir, committed_data_dir);
+        let Ok(encoded) = receipt.encode() else {
+            return;
+        };
+        let path = old_data_cleanup_receipt_path(object, old_data_dir);
+        let futures = disks.iter().filter_map(|disk| {
+            disk.as_ref().map(|disk| {
+                let disk = disk.clone();
+                let encoded = encoded.clone();
+                let bucket = bucket.to_owned();
+                let path = path.clone();
+                async move { disk.write_all(&bucket, &path, encoded).await }
+            })
+        });
+        for result in join_all(futures).await {
+            if let Err(err) = result {
+                debug!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    old_dir = %old_data_dir,
+                    error = %err,
+                    state = "cleanup_receipt_persist_failed",
+                    "SetDisk old-data cleanup receipt persist failed"
+                );
+            }
+        }
+    }
+
+    pub(in crate::set_disk) async fn reconcile_old_data_cleanup_receipts(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> disk::error::Result<usize> {
+        if object_transaction_fencing_fleet_proof().is_none() {
+            return Ok(0);
+        }
+        let current = read_object_transaction_epoch_fence(self, bucket, object)
+            .await
+            .map_err(DiskError::from)?;
+        let disks = self.get_disks_internal().await;
+        let mut removed = 0usize;
+
+        for disk in disks.iter().flatten() {
+            let entries = match disk.list_dir("", bucket, object, 0).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => continue,
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                let Some(name) = entry.strip_suffix(SLASH_SEPARATOR) else { continue };
+                let Ok(data_dir) = Uuid::parse_str(name) else { continue };
+                if data_dir.is_nil() {
+                    continue;
+                }
+
+                let receipt_path = old_data_cleanup_receipt_path(object, data_dir);
+                let receipt_bytes = match disk.read_all(bucket, &receipt_path).await {
+                    Ok(bytes) => bytes,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => continue,
+                    Err(err) => return Err(err),
+                };
+                let receipt = OldDataCleanupReceipt::decode(&receipt_bytes)?;
+                if receipt.old_data_dir != data_dir
+                    || receipt.committed_data_dir == Some(receipt.old_data_dir)
+                    || !old_data_cleanup_receipt_epoch_matches_current(receipt, current)
+                {
+                    continue;
+                }
+
+                let old_path = format!("{object}/{}", receipt.old_data_dir);
+                match disk
+                    .delete_data_dir(
+                        bucket,
+                        &old_path,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(DataDirDeleteStatus::Deleted) => removed += 1,
+                    Ok(DataDirDeleteStatus::Deferred) => {}
+                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
     async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid) -> Result<()> {
         let current = metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
         if current != expected {
@@ -1681,6 +1920,18 @@ impl SetDisks {
                 });
             }
 
+            let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
+            if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
+                return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
+            }
+            let transaction_epoch_fence = if transaction_fencing_proof.is_some() {
+                Some(read_object_transaction_epoch_fence(self, bucket, object).await?)
+            } else {
+                None
+            };
+            let transaction_epoch =
+                transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas));
+
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
             let commit_object = object.to_owned();
@@ -1698,6 +1949,39 @@ impl SetDisks {
                 let _object_lock_guard = commit_object_lock_guard;
                 let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let rename_stage_start = Instant::now();
+                let pre_rename_result: Result<()> = async {
+                    if let Some(proof) = transaction_fencing_proof.as_ref()
+                        && !object_transaction_fencing_fleet_proof_matches(proof)
+                    {
+                        return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
+                    }
+                    if let Some(expected) = transaction_epoch_fence {
+                        #[cfg(any(test, feature = "test-util"))]
+                        pause_put_object_commit(
+                            &commit_bucket,
+                            &commit_object,
+                            PutObjectCommitPause::BeforeTransactionEpochVerify,
+                        )
+                        .await;
+                        verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(err) = pre_rename_result {
+                    if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                        warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
+                    } else if issue3031_diag_enabled() {
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            tmp_dir = %commit_tmp_dir,
+                            "issue3031_put_object_tmp_cleanup_done"
+                        );
+                    }
+                    return Err(err);
+                }
                 let rename_result = SetDisks::rename_data(
                     &shuffle_disks,
                     RUSTFS_META_TMP_BUCKET,
@@ -1745,6 +2029,19 @@ impl SetDisks {
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
                 let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+                if let Some(old_dir) = op_old_dir {
+                    commit_set
+                        .persist_old_data_cleanup_receipts(
+                            &cleanup_disks,
+                            &commit_bucket,
+                            &commit_object,
+                            old_dir,
+                            committed_data_dir,
+                            transaction_epoch,
+                        )
+                        .await;
+                }
 
                 commit_set
                     .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
@@ -2842,14 +3139,12 @@ fn remote_version_state_writer_enabled() -> bool {
     remote_version_state_writer_fleet_proof().is_some()
 }
 
-fn remote_version_state_writer_fleet_proof() -> Option<crate::services::notification_sys::RemoteVersionStateFleetProofToken> {
-    remote_version_state_writer_requested()
-        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
-        .flatten()
+fn remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    transaction_fencing_fleet_proof(remote_version_state_writer_requested())
 }
 
 fn remote_version_state_writer_requested() -> bool {
-    remote_version_state_writer_enabled_for(
+    transaction_fencing_gate_requested_for(
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
             rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
@@ -2862,20 +3157,66 @@ fn remote_version_state_writer_requested() -> bool {
     )
 }
 
-fn remote_version_state_writer_fleet_proof_matches(
-    proof: &crate::services::notification_sys::RemoteVersionStateFleetProofToken,
-) -> bool {
-    remote_version_state_writer_fleet_proof_matches_for(
+fn remote_version_state_writer_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
+    transaction_fencing_fleet_proof_matches_for(
         remote_version_state_writer_requested(),
         crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
     )
 }
 
-fn remote_version_state_writer_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
+pub(in crate::set_disk::ops) fn object_transaction_fencing_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    transaction_fencing_fleet_proof(object_transaction_fencing_requested())
+}
+
+pub(in crate::set_disk::ops) fn object_transaction_fencing_requested() -> bool {
+    object_transaction_fencing_requested_cached()
+}
+
+#[cfg(not(test))]
+fn object_transaction_fencing_requested_cached() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(load_object_transaction_fencing_requested)
+}
+
+#[cfg(test)]
+fn object_transaction_fencing_requested_cached() -> bool {
+    load_object_transaction_fencing_requested()
+}
+
+fn load_object_transaction_fencing_requested() -> bool {
+    transaction_fencing_gate_requested_for(
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE,
+            rustfs_config::DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE,
+        ),
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+            rustfs_config::DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+        ),
+        true,
+    )
+}
+
+pub(in crate::set_disk::ops) fn object_transaction_fencing_fleet_proof_matches(
+    proof: &RemoteVersionStateFleetProofToken,
+) -> bool {
+    transaction_fencing_fleet_proof_matches_for(
+        object_transaction_fencing_requested(),
+        crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
+    )
+}
+
+fn transaction_fencing_fleet_proof(requested: bool) -> Option<RemoteVersionStateFleetProofToken> {
+    requested
+        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
+        .flatten()
+}
+
+fn transaction_fencing_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
     requested && fleet_proof_matches
 }
 
-fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
+fn transaction_fencing_gate_requested_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
     requested && fleet_confirmed && fleet_proof_valid
 }
 
@@ -2885,6 +3226,7 @@ pub enum PutObjectCommitPause {
     BeforeNamespace,
     AfterNamespace,
     BeforeMetadata,
+    BeforeTransactionEpochVerify,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -2966,13 +3308,24 @@ impl Drop for PutObjectCommitBarrier {
 
 #[cfg(any(test, feature = "test-util"))]
 async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
-    let barrier = PUT_OBJECT_COMMIT_BARRIER
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .expect("put object commit barrier mutex should not poison")
-        .iter()
-        .find(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
-        .cloned();
+    let barrier = {
+        let mut slot = PUT_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("put object commit barrier mutex should not poison");
+        if let Some(index) = slot
+            .iter()
+            .position(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+        {
+            if pause == PutObjectCommitPause::BeforeTransactionEpochVerify {
+                Some(slot.remove(index))
+            } else {
+                Some(Arc::clone(&slot[index]))
+            }
+        } else {
+            None
+        }
+    };
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
@@ -3332,7 +3685,7 @@ mod transition_upload_completion_tests {
 mod transition_version_id_tests {
     use super::{
         TransitionUploadCandidate, persisted_transition_version, persisted_transition_version_with_gate,
-        remote_version_state_writer_enabled_for, remote_version_state_writer_fleet_proof_matches_for,
+        transaction_fencing_fleet_proof_matches_for, transaction_fencing_gate_requested_for,
     };
     use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
@@ -3385,7 +3738,24 @@ mod transition_version_id_tests {
             ("fully upgraded fleet", true, true, true, true),
         ] {
             assert_eq!(
-                remote_version_state_writer_enabled_for(requested, fleet_confirmed, fleet_proof_valid),
+                transaction_fencing_gate_requested_for(requested, fleet_confirmed, fleet_proof_valid),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_transaction_fencing_gate_requires_request_confirmation_and_live_proof() {
+        for (case, requested, fleet_confirmed, fleet_proof_valid, expected) in [
+            ("old defaults", false, false, false, false),
+            ("missing fleet confirmation", true, false, true, false),
+            ("missing local opt-in", false, true, true, false),
+            ("missing fleet proof", true, true, false, false),
+            ("fully upgraded fleet", true, true, true, true),
+        ] {
+            assert_eq!(
+                transaction_fencing_gate_requested_for(requested, fleet_confirmed, fleet_proof_valid),
                 expected,
                 "{case}"
             );
@@ -3400,7 +3770,7 @@ mod transition_version_id_tests {
             ("current authorization", true, true, true),
         ] {
             assert_eq!(
-                remote_version_state_writer_fleet_proof_matches_for(requested, fleet_proof_matches),
+                transaction_fencing_fleet_proof_matches_for(requested, fleet_proof_matches),
                 expected,
                 "{case}"
             );
@@ -5933,6 +6303,7 @@ mod inline_put_commit_path_tests {
     use crate::disk::{DiskAPI as _, ReadOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use rustfs_config::server_config::KVS;
+    use serial_test::serial;
     use tokio::io::AsyncReadExt;
 
     async fn make_bucket(disks: &[DiskStore], bucket: &str) {
@@ -7840,6 +8211,139 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn no_lock_restore_finalize_requires_live_namespace_fence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-finalize-fence-bucket";
+        let object = "object.bin";
+        let payload = b"restore finalize no_lock fence must fail closed".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_id = Uuid::new_v4();
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore metadata should be installed");
+        let restoring = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should be readable");
+
+        let err = set_disks
+            .finalize_restore_metadata(
+                bucket,
+                object,
+                &restoring,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("lost outer namespace fence must reject no_lock restore finalization");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should remain readable");
+        let restore_status = parse_restore_obj_status(
+            current
+                .user_defined
+                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .expect("restore header must remain pending"),
+        )
+        .expect("restore header should remain parseable");
+        assert!(
+            restore_status.on_going(),
+            "lost no_lock finalization must not publish restored completion metadata"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_lock_restore_cleanup_requires_live_namespace_fence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-fence-bucket";
+        let object = "object.bin";
+        let payload = b"restore cleanup no_lock fence must fail closed".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_id = Uuid::new_v4();
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore metadata should be installed");
+        let restoring = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should be readable");
+
+        let err = set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &restoring,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("lost outer namespace fence must reject no_lock restore cleanup");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should remain readable");
+        assert!(
+            current.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "lost no_lock cleanup must not remove the restore header"
+        );
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_id.to_string().as_str()),
+            "lost no_lock cleanup must not remove the restore operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn restore_worker_propagates_operation_id_to_final_put_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "restore-worker-commit-operation-id-bucket";
@@ -8364,6 +8868,48 @@ mod transition_commit_failure_tests {
             .await
             .expect("the transitioned object body should drain");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn object_transaction_fencing_requires_live_fleet_proof_before_put_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transaction-fencing-no-proof";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let err = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut reader = PutObjReader::from_vec(b"must-not-commit-without-proof".to_vec());
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            },
+        )
+        .await
+        .expect_err("object fencing must fail closed without a live fleet proof");
+
+        assert!(
+            err.to_string()
+                .contains("object transaction fencing requires a live fleet capability proof"),
+            "unexpected error: {err:?}"
+        );
+        for disk in &disk_stores {
+            let missing = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect_err("failed fenced PUT must not publish object metadata");
+            assert!(
+                matches!(missing, DiskError::FileNotFound | DiskError::FileVersionNotFound),
+                "failed fenced PUT left unexpected disk state: {missing:?}"
+            );
+        }
     }
 }
 
@@ -9831,12 +10377,61 @@ mod transition_source_identity_matrix_tests {
 
 #[cfg(test)]
 mod heterogeneous_pool_put_tests {
-    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity;
+    use super::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
+        hermetic_set_disks_isolated as hermetic_set_disks,
+    };
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
+    use serial_test::serial;
     use tokio::io::AsyncReadExt;
+
+    async fn make_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
+        let mut epochs = Vec::with_capacity(disks.len());
+        for (disk_index, disk) in disks.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            epochs.push(
+                file_info
+                    .object_transaction_epoch()
+                    .unwrap_or_else(|err| panic!("disk {disk_index} transaction epoch should decode: {err}")),
+            );
+        }
+        epochs
+    }
+
+    async fn current_data_dir(disk: &DiskStore, bucket: &str, object: &str) -> Uuid {
+        disk.read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("current object metadata should read")
+            .data_dir
+            .expect("test object should be stored out-of-line")
+    }
+
+    async fn data_dir_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+        disk.read_all(bucket, &format!("{object}/{data_dir}/part.1")).await.is_ok()
+    }
+
+    async fn cleanup_receipt_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+        disk.read_all(bucket, &old_data_cleanup_receipt_path(object, data_dir))
+            .await
+            .is_ok()
+    }
+
+    fn large_payload(fill: u8) -> Vec<u8> {
+        vec![fill; 1024 * 1024]
+    }
 
     #[tokio::test]
     async fn second_pool_regular_put_uses_its_own_layout_and_round_trips() {
@@ -9881,6 +10476,317 @@ mod heterogeneous_pool_put_tests {
             .await
             .expect("second-pool regular PUT should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_persists_epoch_only_when_gate_is_enabled() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-object-transaction-epoch";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut default_reader = PutObjReader::from_vec(b"default gate stays epoch-free".to_vec());
+        set_disks
+            .put_object(bucket, "default.bin", &mut default_reader, &ObjectOptions::default())
+            .await
+            .expect("default PUT should commit");
+        assert_eq!(
+            object_transaction_epochs(&disk_stores, bucket, "default.bin").await,
+            vec![None, None, None, None],
+            "live proof alone must not write epoch metadata while the opt-in gate is disabled"
+        );
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut fenced_reader = PutObjReader::from_vec(b"fenced epoch commit".to_vec());
+                set_disks
+                    .put_object(bucket, "fenced.bin", &mut fenced_reader, &ObjectOptions::default())
+                    .await
+                    .expect("fenced PUT should commit with a live proof");
+            },
+        )
+        .await;
+
+        let epochs = object_transaction_epochs(&disk_stores, bucket, "fenced.bin").await;
+        let first = epochs[0].expect("fenced PUT should persist an epoch");
+        assert!(!first.is_nil());
+        assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_reconciles_failed_put_cleanup_idempotently() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-reconcile";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut first_reader = PutObjReader::from_vec(large_payload(0x11));
+                set_disks
+                    .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+                    .await
+                    .expect("first fenced PUT should commit");
+                let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                let fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+                let mut overwrite_reader = PutObjReader::from_vec(large_payload(0x22));
+                set_disks
+                    .put_object(bucket, object, &mut overwrite_reader, &ObjectOptions::default())
+                    .await
+                    .expect("overwrite should commit even when old-data cleanup fails");
+                for disk in &disk_stores {
+                    assert!(
+                        cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                        "fenced failed cleanup should leave a durable receipt"
+                    );
+                    assert!(
+                        data_dir_exists(disk, bucket, object, old_dir).await,
+                        "injected cleanup failure should leave the old data dir for reconciliation"
+                    );
+                }
+                drop(fault);
+
+                let removed = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("receipt reconciliation should succeed");
+                assert_eq!(removed, 4, "all receipt-targeted old dirs should be reclaimed");
+                let repeated = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("receipt reconciliation should be idempotent");
+                assert_eq!(repeated, 0, "a drained receipt must not be counted again");
+                for disk in &disk_stores {
+                    assert!(
+                        !data_dir_exists(disk, bucket, object, old_dir).await,
+                        "reconciled old data dir must be gone"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_noops_after_epoch_mismatch() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-epoch-mismatch";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut first_reader = PutObjReader::from_vec(large_payload(0x31));
+                set_disks
+                    .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+                    .await
+                    .expect("first fenced PUT should commit");
+                let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                let fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+                let mut second_reader = PutObjReader::from_vec(large_payload(0x32));
+                set_disks
+                    .put_object(bucket, object, &mut second_reader, &ObjectOptions::default())
+                    .await
+                    .expect("second fenced PUT should commit and leave a receipt");
+                drop(fault);
+
+                let mut third_reader = PutObjReader::from_vec(large_payload(0x33));
+                set_disks
+                    .put_object(bucket, object, &mut third_reader, &ObjectOptions::default())
+                    .await
+                    .expect("third fenced PUT should advance the current epoch");
+
+                let removed = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("stale receipt reconciliation should succeed");
+                assert_eq!(removed, 0, "stale receipt epoch must not reclaim after a newer commit");
+                for disk in &disk_stores {
+                    assert!(
+                        cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                        "stale receipt should remain as no-op evidence"
+                    );
+                    assert!(
+                        data_dir_exists(disk, bucket, object, old_dir).await,
+                        "epoch mismatch must preserve the old receipt target"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_is_not_persisted_without_epoch_gate() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-gate-off";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut first_reader = PutObjReader::from_vec(large_payload(0x41));
+        set_disks
+            .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("default-gate first PUT should commit");
+        let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+        let _fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+        let mut second_reader = PutObjReader::from_vec(large_payload(0x42));
+        set_disks
+            .put_object(bucket, object, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("default-gate overwrite should commit");
+
+        let removed = set_disks
+            .reconcile_old_data_cleanup_receipts(bucket, object)
+            .await
+            .expect("gate-off receipt reconciliation should be a no-op");
+        assert_eq!(removed, 0, "mixed-version/default gate path must not consume epoch-dependent receipts");
+        for disk in &disk_stores {
+            assert!(
+                !cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                "mixed-version/default gate path must not write epoch-dependent receipts"
+            );
+            assert!(
+                data_dir_exists(disk, bucket, object, old_dir).await,
+                "cleanup fault should leave old dir without receipt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_rejects_stale_no_lock_put_epoch() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-object-transaction-stale-epoch";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut initial_reader = PutObjReader::from_vec(b"initial fenced body".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut initial_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("initial fenced PUT should commit");
+                let initial_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("initial fenced PUT should persist an epoch");
+
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeTransactionEpochVerify);
+                let stale_set = Arc::clone(&set_disks);
+                let stale = tokio::spawn(async move {
+                    let mut stale_reader = PutObjReader::from_vec(b"stale writer body".to_vec());
+                    stale_set
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut stale_reader,
+                            &ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                barrier.wait_until_paused().await;
+
+                let mut winner_reader = PutObjReader::from_vec(b"winning writer body".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut winner_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("concurrent fenced PUT should advance the epoch");
+                let winning_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("winning fenced PUT should persist an epoch");
+                assert_ne!(winning_epoch, initial_epoch);
+
+                barrier.release();
+                let err = stale
+                    .await
+                    .expect("stale PUT task should not panic")
+                    .expect_err("stale epoch PUT must be rejected");
+                assert_eq!(err, StorageError::PreconditionFailed);
+
+                let final_epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+                assert!(final_epochs.into_iter().all(|epoch| epoch == Some(winning_epoch)));
+                let mut reader = set_disks
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("winning object should remain readable");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("winning body should stream");
+                assert_eq!(restored, b"winning writer body");
+            },
+        )
+        .await;
     }
 }
 

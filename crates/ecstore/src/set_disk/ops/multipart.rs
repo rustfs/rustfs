@@ -22,6 +22,11 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::object::{
+    assign_object_transaction_epoch, object_transaction_fencing_fleet_proof, object_transaction_fencing_fleet_proof_matches,
+    object_transaction_fencing_requested, old_data_cleanup_receipt_path, read_object_transaction_epoch_fence,
+    verify_object_transaction_epoch_fence,
+};
 use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
@@ -63,6 +68,7 @@ pub(crate) enum MultipartCommitPause {
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
+    BeforeTransactionEpochVerify,
     AfterRename,
 }
 
@@ -153,13 +159,24 @@ impl Drop for MultipartCommitBarrier {
 
 #[cfg(test)]
 async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
-    let barrier = MULTIPART_COMMIT_BARRIER
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("multipart commit barrier mutex should not poison")
-        .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
-        .cloned();
+    let barrier = {
+        let mut slot = MULTIPART_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("multipart commit barrier mutex should not poison");
+        if slot
+            .as_ref()
+            .is_some_and(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+        {
+            if pause == MultipartCommitPause::BeforeTransactionEpochVerify {
+                slot.take()
+            } else {
+                slot.clone()
+            }
+        } else {
+            None
+        }
+    };
     if let Some(barrier) = barrier
         && let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < barrier.expected_arrivals).then_some(current + 1)
@@ -2296,6 +2313,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
+        let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
+        if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
+            return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
+        }
+        let transaction_epoch_fence = if transaction_fencing_proof.is_some() {
+            Some(read_object_transaction_epoch_fence(self.as_ref(), bucket, object).await?)
+        } else {
+            None
+        };
+        let transaction_epoch =
+            transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas));
+
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
         let commit_object = object.to_owned();
@@ -2323,6 +2352,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // The trailing `_` drops the rename_data old-size backfill
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
+            if let Some(proof) = transaction_fencing_proof.as_ref()
+                && !object_transaction_fencing_fleet_proof_matches(proof)
+            {
+                return Err(Error::other(
+                    "object transaction fencing fleet capability changed during complete_multipart_upload",
+                ));
+            }
+            if let Some(expected) = transaction_epoch_fence {
+                #[cfg(test)]
+                pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeTransactionEpochVerify).await;
+                verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+            }
             let (online_disks, convergence, op_old_dir, cleanup_disks, _) = SetDisks::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_MULTIPART_BUCKET,
@@ -2352,6 +2393,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 tokio::spawn(async move {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
+            }
+
+            if let Some(old_dir) = op_old_dir {
+                commit_set
+                    .persist_old_data_cleanup_receipts(
+                        &cleanup_disks,
+                        &commit_bucket,
+                        &commit_object,
+                        old_dir,
+                        fi.data_dir,
+                        transaction_epoch,
+                    )
+                    .await;
             }
 
             // Crash-consistency injection: hard power loss after the authoritative
@@ -2469,9 +2523,10 @@ fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) 
 mod tests {
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
-    use crate::disk::DiskAPI as _;
+    use crate::disk::{DiskAPI as _, ReadOptions};
     use crate::disk::{endpoint::Endpoint, format::FormatV3};
     use crate::layout::endpoints::SetupType;
+    use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     // No-locker helpers resolve to the isolated-context variants (see
     // `hermetic_set_disks_isolated`); the guard-based tests build through
     // `hermetic_set_disks_with_lockers`, which stays on the bootstrap context
@@ -2880,6 +2935,208 @@ mod tests {
             etag: part.etag,
             ..Default::default()
         }
+    }
+
+    async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
+        let mut epochs = Vec::with_capacity(disks.len());
+        for (disk_index, disk) in disks.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            epochs.push(
+                file_info
+                    .object_transaction_epoch()
+                    .unwrap_or_else(|err| panic!("disk {disk_index} transaction epoch should decode: {err}")),
+            );
+        }
+        epochs
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_requires_live_fleet_proof_before_multipart_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-transaction-fencing-no-proof";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let (upload_id, parts) = stage_upload_with_create_opts(
+            &set_disks,
+            bucket,
+            object,
+            b"must-not-complete-without-proof",
+            &ObjectOptions::default(),
+        )
+        .await;
+
+        let err = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                set_disks
+                    .clone()
+                    .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
+                    .await
+            },
+        )
+        .await
+        .expect_err("multipart completion must fail closed without a live fleet proof");
+
+        assert!(
+            err.to_string()
+                .contains("object transaction fencing requires a live fleet capability proof"),
+            "unexpected error: {err:?}"
+        );
+        set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("failed fenced completion must not publish object metadata");
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_persists_epoch_on_multipart_commit() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-object-transaction-epoch";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, b"multipart fenced epoch", &ObjectOptions::default()).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                set_disks
+                    .clone()
+                    .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
+                    .await
+                    .expect("fenced multipart completion should commit with a live proof");
+            },
+        )
+        .await;
+
+        let epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+        let first = epochs[0].expect("fenced multipart completion should persist an epoch");
+        assert!(!first.is_nil());
+        assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_rejects_stale_multipart_epoch() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-object-transaction-stale-epoch";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut initial_reader = PutObjReader::from_vec(b"initial fenced object".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut initial_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("initial fenced PUT should commit");
+                let initial_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("initial fenced PUT should persist an epoch");
+
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, b"stale multipart body", &ObjectOptions::default())
+                        .await;
+                let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeTransactionEpochVerify);
+                let stale_set = Arc::clone(&set_disks);
+                let stale = tokio::spawn(async move {
+                    stale_set
+                        .clone()
+                        .complete_multipart_upload(
+                            bucket,
+                            object,
+                            &upload_id,
+                            parts,
+                            &ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                barrier.wait_until_paused().await;
+
+                let mut winner_reader = PutObjReader::from_vec(b"winning put body".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut winner_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("concurrent fenced PUT should advance the epoch");
+                let winning_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("winning fenced PUT should persist an epoch");
+                assert_ne!(winning_epoch, initial_epoch);
+
+                barrier.release();
+                let err = stale
+                    .await
+                    .expect("stale multipart task should not panic")
+                    .expect_err("stale epoch multipart completion must be rejected");
+                assert_eq!(err, StorageError::PreconditionFailed);
+
+                let final_epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+                assert!(final_epochs.into_iter().all(|epoch| epoch == Some(winning_epoch)));
+                let mut reader = set_disks
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("winning object should remain readable");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("winning body should stream");
+                assert_eq!(restored, b"winning put body");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -6193,6 +6450,24 @@ mod tests {
             (body, etag)
         }
 
+        async fn current_data_dir(disk: &DiskStore, bucket: &str, object: &str) -> Uuid {
+            disk.read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("current object metadata should read")
+                .data_dir
+                .expect("test object should be stored out-of-line")
+        }
+
+        async fn data_dir_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+            disk.read_all(bucket, &format!("{object}/{data_dir}/part.1")).await.is_ok()
+        }
+
+        async fn cleanup_receipt_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+            disk.read_all(bucket, &old_data_cleanup_receipt_path(object, data_dir))
+                .await
+                .is_ok()
+        }
+
         async fn upload_is_listed(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> bool {
             let page = set_disks
                 .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, None)
@@ -6312,6 +6587,106 @@ mod tests {
             );
             let (body_after, _) = read_object(&set_disks, bucket, object).await;
             assert_eq!(body_after, new, "reclaiming the leftover upload must not disturb the committed object");
+        }
+
+        #[tokio::test]
+        #[serial(storage_class_env)]
+        async fn post_commit_crash_receipt_reclaims_old_data_after_restart() {
+            let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-crash-old-data-receipt";
+            let object = "crash-old-data-object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                    (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                ],
+                async {
+                    let old = payload(0x51);
+                    let (u_old, parts_old) = stage_upload(&set_disks, bucket, object, &old).await;
+                    complete(&set_disks, bucket, object, &u_old, parts_old)
+                        .await
+                        .expect("the old version should commit");
+                    let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                    let new = payload(0x52);
+                    let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
+                    crash_inject::arm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+                    let crashed = complete(&set_disks, bucket, object, &u_new, parts_new).await;
+                    assert!(
+                        matches!(crashed, Err(StorageError::Unexpected)),
+                        "the post-commit crash point must surface as unexpected, got {crashed:?}"
+                    );
+                    crash_inject::disarm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+
+                    let (body, _) = read_object(&set_disks, bucket, object).await;
+                    assert_eq!(body, new, "the committed replacement must remain readable after the crash");
+                    for disk in &disk_stores {
+                        assert!(
+                            cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                            "post-commit crash must leave a durable old-data cleanup receipt"
+                        );
+                        assert!(
+                            data_dir_exists(disk, bucket, object, old_dir).await,
+                            "post-commit crash must leave old data for restart reconciliation"
+                        );
+                    }
+
+                    let restarted_endpoints = temp_dirs
+                        .iter()
+                        .enumerate()
+                        .map(|(disk_idx, dir)| {
+                            let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8"))
+                                .expect("endpoint should parse");
+                            endpoint.set_pool_index(0);
+                            endpoint.set_set_index(0);
+                            endpoint.set_disk_index(disk_idx);
+                            endpoint
+                        })
+                        .collect::<Vec<_>>();
+                    let mut reloaded = Vec::with_capacity(restarted_endpoints.len());
+                    for endpoint in &restarted_endpoints {
+                        reloaded.push(
+                            new_disk(
+                                endpoint,
+                                &DiskOption {
+                                    cleanup: false,
+                                    health_check: false,
+                                },
+                            )
+                            .await
+                            .expect("disk should restart"),
+                        );
+                    }
+                    let restarted_set = SetDisks::new_with_instance_ctx(
+                        "restart-cleanup-receipt-test-owner".to_string(),
+                        Arc::new(RwLock::new(reloaded.iter().cloned().map(Some).collect())),
+                        4,
+                        2,
+                        0,
+                        0,
+                        restarted_endpoints,
+                        set_disks.format.clone(),
+                        Vec::new(),
+                        Arc::new(crate::runtime::instance::InstanceContext::new()),
+                    )
+                    .await;
+                    let removed = restarted_set
+                        .reconcile_old_data_cleanup_receipts(bucket, object)
+                        .await
+                        .expect("restart receipt reconciliation should succeed");
+                    assert_eq!(removed, 4, "restart reconciler should delete all receipt targets");
+                    for disk in &reloaded {
+                        assert!(
+                            !data_dir_exists(disk, bucket, object, old_dir).await,
+                            "restart reconciler must reclaim the old data dir"
+                        );
+                    }
+                },
+            )
+            .await;
         }
     }
 
