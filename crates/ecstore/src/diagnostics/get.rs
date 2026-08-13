@@ -84,6 +84,10 @@ pub(crate) const GET_STAGE_READER_STREAM_FIRST_READ: &str = "reader_stream_first
 pub(crate) const GET_STAGE_READER_TASK_BITROT_READER_INIT: &str = "reader_task_bitrot_reader_init";
 pub(crate) const GET_STAGE_READER_TASK_FILE_OPEN: &str = "reader_task_file_open";
 pub(crate) const GET_STAGE_READER_TASK_READER_CONSTRUCTION: &str = "reader_task_reader_construction";
+pub(crate) const GET_STAGE_READ_VERSION_DECODE: &str = "read_version_decode";
+pub(crate) const GET_STAGE_READ_VERSION_PATH_CHECK: &str = "read_version_path_check";
+pub(crate) const GET_STAGE_READ_VERSION_PATH_RESOLVE: &str = "read_version_path_resolve";
+pub(crate) const GET_STAGE_READ_VERSION_XLMETA_READ: &str = "read_version_xlmeta_read";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
 pub(crate) const GET_STAGE_RESPONSE_HANDOFF: &str = "response_handoff";
 pub(crate) const GET_STAGE_SLOWEST_METADATA_RESPONSE: &str = "slowest_metadata_response";
@@ -442,6 +446,10 @@ mod tests {
         assert_eq!(GET_STAGE_QUORUM_REACHED, "quorum_reached");
         assert_eq!(GET_STAGE_RANGE, "range");
         assert_eq!(GET_STAGE_READER_SETUP, "reader_setup");
+        assert_eq!(GET_STAGE_READ_VERSION_DECODE, "read_version_decode");
+        assert_eq!(GET_STAGE_READ_VERSION_PATH_CHECK, "read_version_path_check");
+        assert_eq!(GET_STAGE_READ_VERSION_PATH_RESOLVE, "read_version_path_resolve");
+        assert_eq!(GET_STAGE_READ_VERSION_XLMETA_READ, "read_version_xlmeta_read");
         assert_eq!(GET_STAGE_RECONSTRUCT, "reconstruct");
         assert_eq!(GET_STAGE_RESPONSE_HANDOFF, "response_handoff");
         assert_eq!(GET_STAGE_SLOWEST_METADATA_RESPONSE, "slowest_metadata_response");
