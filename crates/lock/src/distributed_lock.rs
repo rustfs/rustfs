@@ -477,7 +477,7 @@ impl Drop for DistributedLockGuard {
 #[derive(Debug)]
 pub struct DistributedLock {
     /// Lock clients for this namespace
-    clients: Vec<Arc<dyn LockClient>>,
+    clients: Arc<[Arc<dyn LockClient>]>,
     /// Namespace identifier
     namespace: Arc<str>,
     /// Quorum size for exclusive/write operations
@@ -496,11 +496,11 @@ struct LockAcquireQuorumResult {
 impl DistributedLock {
     /// Create new distributed lock
     pub fn new(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
-        Self::new_shared(namespace.into(), clients, quorum)
+        Self::new_shared(namespace.into(), clients.into(), quorum)
     }
 
-    /// Create a distributed lock that shares an existing namespace allocation.
-    pub(crate) fn new_shared(namespace: Arc<str>, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
+    /// Create a distributed lock that shares existing namespace and client allocations.
+    pub(crate) fn new_shared(namespace: Arc<str>, clients: Arc<[Arc<dyn LockClient>]>, quorum: usize) -> Self {
         let q = if clients.len() <= 1 {
             1
         } else {
@@ -777,7 +777,7 @@ impl DistributedLock {
 
     fn spawn_pending_cleanup(
         mut pending: JoinSet<LockAcquireTaskResult>,
-        clients: Vec<Arc<dyn LockClient>>,
+        clients: Arc<[Arc<dyn LockClient>]>,
         fallback_lock_id: LockId,
         context: &'static str,
     ) {
