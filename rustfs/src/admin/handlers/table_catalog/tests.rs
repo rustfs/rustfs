@@ -2166,8 +2166,8 @@ async fn create_table_holds_bucket_fence_from_metadata_write_through_registratio
 
 #[tokio::test]
 async fn create_table_response_recreates_dropped_identifier_without_overwriting_retained_metadata() {
-    let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let first_entry = store
@@ -2182,6 +2182,7 @@ async fn create_table_response_recreates_dropped_identifier_without_overwriting_
         .expect("first metadata should exist");
 
     let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+        "commit-id": "11111111-1111-4111-8111-111111111111",
         "updates": [
             {
                 "action": "set-properties",
@@ -2279,6 +2280,24 @@ async fn create_table_response_recreates_dropped_identifier_without_overwriting_
             .await
             .expect("recreated metadata lookup should succeed")
     );
+
+    let second_commit = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        standard_property_commit_request("11111111-1111-4111-8111-111111111111", &second_entry.table_uuid, "second-table"),
+    )
+    .await
+    .expect("recreated table should use a scoped metadata path when retained metadata occupies the normal path");
+    assert!(second_commit.metadata_location.ends_with(&table_scoped_metadata_file_name(
+        2,
+        &second_entry.table_id,
+        "11111111-1111-4111-8111-111111111111"
+    )));
+    assert_eq!(second_commit.metadata["table-uuid"], second_entry.table_uuid);
+    assert_eq!(second_commit.metadata["properties"]["owner"], "second-table");
 }
 
 #[tokio::test]
@@ -2477,13 +2496,44 @@ async fn standard_commit_applies_updates_and_writes_next_metadata() {
     );
 }
 
+#[test]
+fn table_metadata_file_name_scoping_is_bounded_and_identity_sensitive() {
+    let metadata_file_token = "a".repeat(64);
+    let table_id = "11111111-1111-4111-8111-111111111111";
+    let first = table_scoped_metadata_file_name(u64::MAX, table_id, &metadata_file_token);
+    let second = table_scoped_metadata_file_name(u64::MAX, "22222222-2222-4222-8222-222222222222", &metadata_file_token);
+    let third = table_scoped_metadata_file_name(u64::MAX, table_id, &"b".repeat(64));
+    let alias_commit_id = format!("table-metadata:{}:{table_id}{metadata_file_token}", table_id.len());
+    let (_, alias_token) = standard_commit_ids(Some(alias_commit_id));
+    let normal_alias = next_metadata_file_name(u64::MAX, &alias_token);
+
+    assert_eq!(
+        table_scoped_metadata_file_name(2, table_id, &metadata_file_token),
+        "00002-table-accc41bda78e38e3814a0d4a09a66e47256c24d88dde9b8c1ea57db0e434c599.metadata.json"
+    );
+    assert_ne!(first, second);
+    assert_ne!(first, third);
+    assert_ne!(first, normal_alias);
+    assert!(first.len() <= crate::table_catalog::TABLE_METADATA_FILE_NAME_MAX_LEN);
+    let scoped_token = first
+        .strip_prefix(&format!("{}-table-", u64::MAX))
+        .and_then(|file_name| file_name.strip_suffix(".metadata.json"))
+        .expect("scoped metadata file should use the generated file name shape");
+    assert_eq!(scoped_token.len(), 64);
+    assert!(
+        scoped_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
+}
+
 #[tokio::test]
-async fn standard_commit_after_table_rename_keeps_the_original_metadata_root() {
+async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metadata_files() {
     let metadata_backend = TestTableCatalogObjectBackend::default();
     let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
     let source_namespace = crate::table_catalog::Namespace::parse("analytics").expect("source namespace should parse");
     let destination_namespace = crate::table_catalog::Namespace::parse("curated").expect("destination namespace should parse");
-    let created = create_standard_events_table(&store, &metadata_backend, &source_namespace).await;
+    create_standard_events_table(&store, &metadata_backend, &source_namespace).await;
     create_namespace_response(
         &store,
         "warehouse",
@@ -2500,32 +2550,637 @@ async fn standard_commit_after_table_rename_keeps_the_original_metadata_root() {
         .await
         .expect("table should rename");
 
-    let request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
-        "requirements": [{"type": "assert-table-uuid", "uuid": created.metadata["table-uuid"]}],
-        "updates": [{"action": "set-properties", "updates": {"owner": "curated"}}]
+    let recreate_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {"type": "struct", "schema-id": 0, "fields": []}
     }))
-    .expect("commit request should parse");
-    let committed = standard_commit_table_response(
+    .expect("recreate table request should parse");
+    create_table_response(
+        &store,
+        &TableCommitObjectBackend::trusted(metadata_backend.clone()),
+        "warehouse",
+        &source_namespace,
+        recreate_request,
+        true,
+    )
+    .await
+    .expect("source identifier should be reusable");
+
+    let renamed = store
+        .load_table("warehouse", "curated", "events_v2")
+        .await
+        .expect("renamed table lookup should succeed")
+        .expect("renamed table should exist");
+    let recreated = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("recreated table lookup should succeed")
+        .expect("recreated table should exist");
+    assert_ne!(renamed.table_id, recreated.table_id);
+
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let renamed_commit = standard_commit_table_response(
         &store,
         &trusted_table_commit_backend(&metadata_backend),
         "warehouse",
         &destination_namespace,
         "events_v2",
-        request,
+        standard_property_commit_request(commit_id, &renamed.table_uuid, "curated"),
     )
     .await
-    .expect("renamed table should accept a standard commit");
+    .expect("renamed table commit should succeed");
+    let recreated_commit = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &source_namespace,
+        "events",
+        standard_property_commit_request(commit_id, &recreated.table_uuid, "analytics"),
+    )
+    .await
+    .expect("recreated table commit should succeed");
 
+    assert_ne!(renamed_commit.metadata_location, recreated_commit.metadata_location);
+    assert!(
+        renamed_commit
+            .metadata_location
+            .ends_with(&next_metadata_file_name(2, commit_id))
+    );
     let original_metadata_root = crate::table_catalog::default_table_metadata_dir_path(
         &source_namespace,
         &crate::table_catalog::IdentifierSegment::parse("events").expect("source table should parse"),
     );
     assert!(
-        committed
+        renamed_commit
             .metadata_location
             .starts_with(&format!("s3://warehouse/{original_metadata_root}/"))
     );
-    assert!(!committed.metadata_location.contains("/namespaces/curated/tables/events_v2/"));
+    assert!(
+        !renamed_commit
+            .metadata_location
+            .contains("/namespaces/curated/tables/events_v2/")
+    );
+    assert!(
+        recreated_commit
+            .metadata_location
+            .ends_with(&table_scoped_metadata_file_name(2, &recreated.table_id, commit_id))
+    );
+    assert_eq!(recreated_commit.metadata["table-uuid"], recreated.table_uuid);
+    assert_eq!(recreated_commit.metadata["properties"]["owner"], "analytics");
+    for metadata_location in [renamed_commit.metadata_location, recreated_commit.metadata_location] {
+        let object_key = test_snapshot_object_key("warehouse", &metadata_location);
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &object_key)
+                .await
+                .expect("metadata lookup should succeed")
+        );
+    }
+}
+
+#[tokio::test]
+async fn standard_commit_reuses_matching_normal_metadata_orphan() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+
+    let committed = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect("matching prewritten metadata should be reusable");
+
+    assert_eq!(
+        committed.metadata_location,
+        table_metadata_location_for_client("warehouse", &primary_location)
+    );
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+    let committed_entry = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    assert_eq!(committed_entry.generation, current.generation + 1);
+    let persisted = read_table_metadata_json(&metadata_backend, "warehouse", &primary_location)
+        .await
+        .expect("persisted metadata should load");
+    assert_eq!(committed.metadata, persisted);
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_mutated_retry_after_normal_metadata_orphan() {
+    let (store, metadata_backend, namespace, current, request, _primary_location, fallback_location) =
+        standard_commit_primary_fixture("original", "mutated").await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("a reused commit id must not accept a different payload");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_malformed_normal_metadata_orphan() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+    metadata_backend
+        .put_json("warehouse", &primary_location, serde_json::json!({}))
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("malformed prewritten metadata must fail closed");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_same_uuid_metadata_without_timestamp_as_server_state() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+    let mut persisted = read_table_metadata_json(&metadata_backend, "warehouse", &primary_location)
+        .await
+        .expect("persisted metadata should load");
+    persisted
+        .as_object_mut()
+        .expect("metadata should be an object")
+        .remove("last-updated-ms");
+    metadata_backend.put_json("warehouse", &primary_location, persisted).await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("same-uuid metadata without a timestamp must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_eq!(error.message(), Some("existing generated metadata is invalid"));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_same_uuid_unsupported_metadata_as_server_state() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+    let mut persisted = read_table_metadata_json(&metadata_backend, "warehouse", &primary_location)
+        .await
+        .expect("persisted metadata should load");
+    persisted["format-version"] = serde_json::json!(3);
+    metadata_backend.put_json("warehouse", &primary_location, persisted).await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("same-uuid unsupported metadata must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_eq!(error.message(), Some("existing generated metadata is invalid"));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_unparseable_normal_metadata_orphan_as_server_state() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+    metadata_backend
+        .put_bytes("warehouse", &primary_location, b"{".to_vec())
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("unparseable prewritten metadata must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_unsupported_normal_metadata_orphan_as_server_state() {
+    let (store, metadata_backend, namespace, current, mut current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    current_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    current_metadata["format-version"] = serde_json::json!(3);
+    let primary_location = crate::table_catalog::table_metadata_file_path_for_entry(
+        &current,
+        &next_metadata_file_name(2, "11111111-1111-4111-8111-111111111111"),
+    )
+    .expect("primary metadata path should be valid");
+    metadata_backend
+        .put_json("warehouse", &primary_location, current_metadata)
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("unsupported generated metadata must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_same_uuid_metadata_from_different_lineage() {
+    let (store, metadata_backend, namespace, current, request, primary_location, fallback_location) =
+        standard_commit_primary_fixture("target", "target").await;
+    let mut persisted_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &primary_location)
+        .await
+        .expect("persisted metadata should load");
+    persisted_metadata["metadata-log"][0]["metadata-file"] =
+        serde_json::json!("s3://warehouse/foreign/metadata/00001.metadata.json");
+    metadata_backend
+        .put_json("warehouse", &primary_location, persisted_metadata)
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("same-uuid metadata from another lineage must fail closed");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_recovers_matching_table_scoped_metadata_orphan() {
+    let (store, metadata_backend, namespace, current, current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    let previous_metadata_location = table_metadata_location_for_client("warehouse", &current.metadata_location);
+    let timestamp_ms = current_metadata["last-updated-ms"]
+        .as_i64()
+        .expect("current metadata should include last-updated-ms")
+        .saturating_add(1);
+    let matching_metadata =
+        apply_table_commit_updates_at(current_metadata, &request.updates, &previous_metadata_location, timestamp_ms)
+            .expect("matching fallback metadata should build");
+    metadata_backend
+        .put_json("warehouse", &fallback_location, matching_metadata)
+        .await;
+
+    let committed = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect("a matching fallback orphan should be recoverable");
+
+    assert_eq!(
+        committed.metadata_location,
+        table_metadata_location_for_client("warehouse", &fallback_location)
+    );
+    assert_eq!(committed.metadata["properties"]["owner"], "target");
+    let committed_entry = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    assert_eq!(committed_entry.generation, current.generation + 1);
+}
+
+#[tokio::test]
+async fn concurrent_identical_commits_reuse_table_scoped_metadata_winner() {
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let current = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let mut foreign_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &current.metadata_location)
+        .await
+        .expect("current metadata should load");
+    foreign_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let primary_location =
+        crate::table_catalog::table_metadata_file_path_for_entry(&current, &next_metadata_file_name(2, commit_id))
+            .expect("primary metadata path should be valid");
+    metadata_backend
+        .put_json("warehouse", &primary_location, foreign_metadata)
+        .await;
+
+    let barrier_backend = TestTableCatalogObjectBackend {
+        put_object_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        ..metadata_backend.clone()
+    };
+    let first_backend = trusted_table_commit_backend(&barrier_backend);
+    let second_backend = trusted_table_commit_backend(&barrier_backend);
+    let (first, second) = tokio::join!(
+        standard_commit_table_response(
+            &store,
+            &first_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
+        ),
+        standard_commit_table_response(
+            &store,
+            &second_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
+        )
+    );
+    let first = first.expect("first identical commit should succeed");
+    let second = second.expect("second identical commit should replay the winner");
+
+    assert_eq!(first.commit_id, second.commit_id);
+    assert_eq!(first.metadata_location, second.metadata_location);
+    assert_eq!(first.metadata, second.metadata);
+    assert!(
+        first
+            .metadata_location
+            .ends_with(&table_scoped_metadata_file_name(2, &current.table_id, commit_id))
+    );
+    let committed = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    assert_eq!(committed.generation, current.generation + 1);
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_mismatched_table_scoped_metadata_orphan() {
+    let (store, metadata_backend, namespace, current, current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    let previous_metadata_location = table_metadata_location_for_client("warehouse", &current.metadata_location);
+    let timestamp_ms = current_metadata["last-updated-ms"]
+        .as_i64()
+        .expect("current metadata should include last-updated-ms")
+        .saturating_add(1);
+    let mismatched_request =
+        standard_property_commit_request("11111111-1111-4111-8111-111111111111", &current.table_uuid, "different");
+    let mismatched_metadata =
+        apply_table_commit_updates_at(current_metadata, &mismatched_request.updates, &previous_metadata_location, timestamp_ms)
+            .expect("mismatched fallback metadata should build");
+    metadata_backend
+        .put_json("warehouse", &fallback_location, mismatched_metadata)
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("a fallback orphan for another payload must fail closed");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+    assert_events_table_entry_unchanged(&store, &current).await;
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_foreign_table_scoped_metadata_as_server_state() {
+    let (store, metadata_backend, namespace, current, mut current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    current_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    metadata_backend
+        .put_json("warehouse", &fallback_location, current_metadata)
+        .await;
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("a table-scoped path owned by another table must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_events_table_entry_unchanged(&store, &current).await;
+}
+
+#[tokio::test]
+async fn standard_commit_reports_missing_generated_metadata_as_server_state() {
+    let (store, metadata_backend, namespace, current, current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    let previous_metadata_location = table_metadata_location_for_client("warehouse", &current.metadata_location);
+    let timestamp_ms = current_metadata["last-updated-ms"]
+        .as_i64()
+        .expect("current metadata should include last-updated-ms")
+        .saturating_add(1);
+    let matching_metadata =
+        apply_table_commit_updates_at(current_metadata, &request.updates, &previous_metadata_location, timestamp_ms)
+            .expect("matching fallback metadata should build");
+    metadata_backend
+        .put_json("warehouse", &fallback_location, matching_metadata)
+        .await;
+    *metadata_backend.missing_read_object_path.lock().await = Some(fallback_location.clone());
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("a generated object that disappears before readback must fail as server state");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_eq!(error.message(), Some("generated metadata object is missing"));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_redacts_generated_metadata_read_failures() {
+    let (store, metadata_backend, namespace, current, _current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    *metadata_backend.fail_read_object_path.lock().await = Some(fallback_location);
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("generated metadata read failures must be redacted");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_eq!(error.message(), Some("existing generated metadata is invalid"));
+    assert!(!error.message().is_some_and(|message| message.contains("private")));
+    assert_events_table_entry_unchanged(&store, &current).await;
+}
+
+#[tokio::test]
+async fn standard_commit_propagates_fallback_write_failure() {
+    let (store, metadata_backend, namespace, current, _current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    *metadata_backend.fail_put_object_path.lock().await = Some(fallback_location.clone());
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("fallback write failures must be propagated");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert_events_table_entry_unchanged(&store, &current).await;
+    assert!(
+        !metadata_backend
+            .object_exists("warehouse", &fallback_location)
+            .await
+            .expect("fallback metadata lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn standard_commit_rejects_fallback_readback_mismatch() {
+    let (store, metadata_backend, namespace, current, _current_metadata, request, fallback_location) =
+        standard_commit_foreign_primary_fixture().await;
+    *metadata_backend.corrupt_put_object_path.lock().await = Some(fallback_location);
+
+    let error = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &namespace,
+        "events",
+        request,
+    )
+    .await
+    .expect_err("fallback readback changes must prevent catalog publication");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+    assert_events_table_entry_unchanged(&store, &current).await;
 }
 
 #[tokio::test]
@@ -7294,6 +7949,10 @@ type TestTableCatalogObjectLocks = Arc<tokio::sync::Mutex<BTreeMap<(String, Stri
 struct TestTableCatalogObjectBackend {
     objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
     put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
+    fail_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    corrupt_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    missing_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    fail_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
     locks: TestTableCatalogObjectLocks,
     lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
 }
@@ -7731,6 +8390,122 @@ where
         .expect("table should be created")
 }
 
+fn standard_property_commit_request(commit_id: &str, table_uuid: &str, owner: &str) -> RestCommitTableRequest {
+    serde_json::from_value(serde_json::json!({
+        "commit-id": commit_id,
+        "requirements": [{"type": "assert-table-uuid", "uuid": table_uuid}],
+        "updates": [{"action": "set-properties", "updates": {"owner": owner}}]
+    }))
+    .expect("property commit request should parse")
+}
+
+async fn standard_commit_foreign_primary_fixture() -> (
+    TestTableCatalogStore,
+    TestTableCatalogObjectBackend,
+    crate::table_catalog::Namespace,
+    crate::table_catalog::TableEntry,
+    serde_json::Value,
+    RestCommitTableRequest,
+    String,
+) {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let current = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let current_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &current.metadata_location)
+        .await
+        .expect("current metadata should load");
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let request = standard_property_commit_request(commit_id, &current.table_uuid, "target");
+    let primary_location =
+        crate::table_catalog::table_metadata_file_path_for_entry(&current, &next_metadata_file_name(2, commit_id))
+            .expect("primary metadata path should be valid");
+    let mut foreign_metadata = current_metadata.clone();
+    foreign_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    metadata_backend
+        .put_json("warehouse", &primary_location, foreign_metadata)
+        .await;
+    let fallback_location = crate::table_catalog::table_metadata_file_path_for_entry(
+        &current,
+        &table_scoped_metadata_file_name(2, &current.table_id, commit_id),
+    )
+    .expect("fallback metadata path should be valid");
+    (store, metadata_backend, namespace, current, current_metadata, request, fallback_location)
+}
+
+async fn standard_commit_primary_fixture(
+    persisted_owner: &str,
+    requested_owner: &str,
+) -> (
+    TestTableCatalogStore,
+    TestTableCatalogObjectBackend,
+    crate::table_catalog::Namespace,
+    crate::table_catalog::TableEntry,
+    RestCommitTableRequest,
+    String,
+    String,
+) {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let current = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let current_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &current.metadata_location)
+        .await
+        .expect("current metadata should load");
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let persisted_request = standard_property_commit_request(commit_id, &current.table_uuid, persisted_owner);
+    let requested = standard_property_commit_request(commit_id, &current.table_uuid, requested_owner);
+    let previous_metadata_location = table_metadata_location_for_client("warehouse", &current.metadata_location);
+    let timestamp_ms = current_metadata["last-updated-ms"]
+        .as_i64()
+        .expect("current metadata should include last-updated-ms")
+        .saturating_add(1);
+    let persisted_metadata =
+        apply_table_commit_updates_at(current_metadata, &persisted_request.updates, &previous_metadata_location, timestamp_ms)
+            .expect("persisted metadata should build");
+    let primary_location =
+        crate::table_catalog::table_metadata_file_path_for_entry(&current, &next_metadata_file_name(2, commit_id))
+            .expect("primary metadata path should be valid");
+    metadata_backend
+        .put_json("warehouse", &primary_location, persisted_metadata)
+        .await;
+    let fallback_location = crate::table_catalog::table_metadata_file_path_for_entry(
+        &current,
+        &table_scoped_metadata_file_name(2, &current.table_id, commit_id),
+    )
+    .expect("fallback metadata path should be valid");
+    (
+        store,
+        metadata_backend,
+        namespace,
+        current,
+        requested,
+        primary_location,
+        fallback_location,
+    )
+}
+
+async fn assert_events_table_entry_unchanged(store: &TestTableCatalogStore, expected: &crate::table_catalog::TableEntry) {
+    let actual = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    assert_eq!(actual.metadata_location, expected.metadata_location);
+    assert_eq!(actual.generation, expected.generation);
+    assert_eq!(actual.version_token, expected.version_token);
+}
+
 async fn seed_events_registration_target<S>(
     store: &S,
     metadata_backend: &TestTableCatalogObjectBackend,
@@ -7832,6 +8607,22 @@ impl crate::table_catalog::TableCatalogObjectBackend for TestTableCatalogObjectB
         bucket: &str,
         object: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
+        let mut missing_read_object_path = self.missing_read_object_path.lock().await;
+        if missing_read_object_path.as_deref() == Some(object) {
+            missing_read_object_path.take();
+            return Ok(None);
+        }
+        drop(missing_read_object_path);
+
+        let mut fail_read_object_path = self.fail_read_object_path.lock().await;
+        if fail_read_object_path.as_deref() == Some(object) {
+            fail_read_object_path.take();
+            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                "private generated metadata read failure".to_string(),
+            ));
+        }
+        drop(fail_read_object_path);
+
         Ok(self
             .objects
             .lock()
@@ -7855,6 +8646,24 @@ impl crate::table_catalog::TableCatalogObjectBackend for TestTableCatalogObjectB
         data: Vec<u8>,
         precondition: crate::table_catalog::TableCatalogPutPrecondition,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let mut fail_put_object_path = self.fail_put_object_path.lock().await;
+        if fail_put_object_path.as_deref() == Some(object) {
+            fail_put_object_path.take();
+            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                "injected metadata write failure".to_string(),
+            ));
+        }
+        drop(fail_put_object_path);
+
+        let mut corrupt_put_object_path = self.corrupt_put_object_path.lock().await;
+        let data = if corrupt_put_object_path.as_deref() == Some(object) {
+            corrupt_put_object_path.take();
+            b"{}".to_vec()
+        } else {
+            data
+        };
+        drop(corrupt_put_object_path);
+
         let key = (bucket.to_string(), object.to_string());
         let mut objects = self.objects.lock().await;
         let result = if matches!(precondition, crate::table_catalog::TableCatalogPutPrecondition::IfAbsent)
