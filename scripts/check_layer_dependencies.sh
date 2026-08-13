@@ -267,6 +267,12 @@ write_baseline_file() {
   cat >"$BASELINE_FILE" <<'EOF'
 # Layer dependency baseline for the rustfs binary crate.
 #
+# RATCHET RULE (backlog#1834): this file only shrinks. A PR may delete lines
+# (after migrating the violation) via --update-baseline; a PR that ADDS a line
+# is baselining a brand-new layering violation and must carry an explicit
+# exemption rationale in its description — the baseline is a migration ledger,
+# not an amnesty list.
+#
 # The guard models production imports as:
 #   composition -> interface -> app -> infra
 #
@@ -397,6 +403,8 @@ comm -23 "${TMP_DIR}/baseline_sorted.txt" "$CURRENT_BASELINE" >"$STALE_ITEMS"
 
 if [[ -s "$NEW_ITEMS" ]]; then
   echo "Layer dependency guard failed: new reverse dependencies or cycles detected"
+  echo "Fix the layering instead of baselining it. The baseline is a shrink-only migration ledger (backlog#1834):"
+  echo "re-running with --update-baseline to ADD these entries requires an explicit exemption rationale in the PR description."
   cat "$NEW_ITEMS"
   exit 1
 fi

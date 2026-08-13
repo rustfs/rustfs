@@ -72,39 +72,48 @@ pub fn record_wait_edge_removed() {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
     #[test]
-    fn test_record_deadlock_detected() {
-        record_deadlock_detected(3);
-        record_deadlock_detected(5);
-    }
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_deadlock_detected(3);
+            record_deadlock_detected(5);
+            record_long_held_lock(1, Duration::from_secs(30));
+            record_long_held_lock(2, Duration::from_secs(60));
+            record_lock_acquisition("mutex");
+            record_lock_acquisition("rwlock");
+            record_lock_release("mutex", Duration::from_millis(10));
+            record_lock_release("rwlock", Duration::from_millis(5));
+            record_lock_contention("mutex");
+            record_lock_contention("rwlock");
+            record_wait_edge_added();
+            record_wait_edge_removed();
+        });
 
-    #[test]
-    fn test_record_long_held_lock() {
-        record_long_held_lock(1, Duration::from_secs(30));
-        record_long_held_lock(2, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn test_record_lock_acquisition() {
-        record_lock_acquisition("mutex");
-        record_lock_acquisition("rwlock");
-    }
-
-    #[test]
-    fn test_record_lock_release() {
-        record_lock_release("mutex", Duration::from_millis(10));
-        record_lock_release("rwlock", Duration::from_millis(5));
-    }
-
-    #[test]
-    fn test_record_lock_contention() {
-        record_lock_contention("mutex");
-        record_lock_contention("rwlock");
-    }
-
-    #[test]
-    fn test_record_wait_edge() {
-        record_wait_edge_added();
-        record_wait_edge_removed();
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_deadlock_detected_total",
+            "rustfs_deadlock_cycle_length",
+            "rustfs_deadlock_long_held",
+            "rustfs_deadlock_hold_time_secs",
+            "rustfs_lock_acquisitions",
+            "rustfs_lock_releases",
+            "rustfs_lock_hold_time_secs",
+            "rustfs_lock_contentions",
+            "rustfs_deadlock_wait_edges_added",
+            "rustfs_deadlock_wait_edges_removed",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
     }
 }

@@ -512,7 +512,7 @@ async fn run_bench(settings: &ToolSettings, client: &Client) -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "manual >1GiB GET benchmark: requires a running RustFS server configured via env vars"]
 async fn gt1g_get_benchmark_tool() -> Result<()> {
     let settings = ToolSettings::from_env()?;
     let client = build_client(&settings).await?;
