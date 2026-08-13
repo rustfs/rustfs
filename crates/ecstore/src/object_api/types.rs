@@ -260,6 +260,9 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Materialize the data-movement per-part checksum sidecar for APIs that
+    /// return part checksums. Ordinary object reads leave it encoded.
+    pub include_part_checksums: bool,
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,

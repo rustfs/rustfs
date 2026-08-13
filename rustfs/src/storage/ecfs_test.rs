@@ -193,9 +193,27 @@ mod tests {
         assert_eq!(gz_format.extension(), "gz");
     }
 
+    /// Premise guard for the `*_returns_internal_error_when_store_uninitialized`
+    /// tests (backlog#1830): they assert the error path taken while the global
+    /// object layer is absent. Under nextest — the authoritative runner — every
+    /// test owns its process, so the premise always holds and the assertion
+    /// always runs. Under the documented shared-process `cargo test` fallback a
+    /// sibling test may have initialized the store first; the premise is then
+    /// unattainable, so the test skips instead of asserting against a scenario
+    /// it does not describe.
+    fn store_uninitialized_premise_holds() -> bool {
+        if crate::runtime_sources::current_object_store_handle().is_some() {
+            eprintln!("skipping store-uninitialized assertion: a sibling test already initialized the global object layer");
+            return false;
+        }
+        true
+    }
+
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_acl_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = GetObjectAclInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -208,8 +226,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = GetBucketAclInput::builder()
             .bucket("test-bucket".to_string())
             .build()
@@ -221,8 +241,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = GetObjectLegalHoldInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -235,7 +257,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_retention_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectRetentionInput::builder()
             .bucket("test-bucket".to_string())
@@ -249,8 +270,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = PutObjectLegalHoldInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -263,8 +286,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = PutBucketAclInput::builder()
             .bucket("test-bucket".to_string())
             .build()
@@ -276,8 +301,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_acl_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = PutObjectAclInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -290,7 +317,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_retention_returns_internal_error_when_store_uninitialized() {
         let input = PutObjectRetentionInput::builder()
             .bucket("test-bucket".to_string())
@@ -304,8 +330,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = PutObjectLockConfigurationInput::builder()
             .bucket("test-bucket".to_string())
             .object_lock_configuration(Some(ObjectLockConfiguration {
@@ -614,8 +642,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_tagging_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = GetObjectTaggingInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -669,8 +699,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = PutObjectTaggingInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -689,8 +721,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
+        if !store_uninitialized_premise_holds() {
+            return;
+        }
         let input = DeleteObjectTaggingInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -1905,7 +1939,6 @@ mod tests {
     /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
     /// returns Ok(empty map) so authorization can proceed without tag conditions.
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
         let fs = FS::new();
         let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
@@ -1914,7 +1947,6 @@ mod tests {
 
     /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
         let fs = FS::new();
         let out = fs

@@ -928,7 +928,7 @@ mod tests {
         ClusterListingDiagnosticsSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
         ClusterUsageFreshnessSnapshot,
     };
-    use crate::server::{DependencyReadiness, ReadinessDegradedReason};
+    use crate::shared_types::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 
     #[test]

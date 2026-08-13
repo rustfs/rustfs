@@ -389,7 +389,7 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     type GetObjectReader = GetObjectReader;
     type PutObjectReader = PutObjReader;
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, h))]
     async fn get_object_reader(
         &self,
         bucket: &str,

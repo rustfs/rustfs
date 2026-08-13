@@ -113,9 +113,9 @@ use crate::app::runtime_sources::{
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
-use crate::server::convert_ecstore_object_info;
+use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
@@ -134,6 +134,8 @@ use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_fo
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
+#[cfg(test)]
+use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP,
@@ -147,9 +149,8 @@ use rustfs_utils::http::{
         AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
         AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-        SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     },
-    insert_str, remove_str,
+    insert_str, project_ssec_transport_headers, remove_str,
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
@@ -2045,18 +2046,6 @@ struct GetObjectResumeContext {
     identity: GetObjectResumeIdentity,
 }
 
-fn get_object_store_headers(request_headers: &HeaderMap) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-        if let Some(value) = request_headers.get(name) {
-            let mut value = value.clone();
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
-    }
-    headers
-}
-
 impl GetObjectResumeContext {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2076,7 +2065,7 @@ impl GetObjectResumeContext {
         }
         // Store spans record their header argument at debug level. Retain only
         // the SSE-C inputs needed to reopen the reader and keep them redacted.
-        let ssec_headers = get_object_store_headers(request_headers);
+        let ssec_headers = project_ssec_transport_headers(request_headers);
         Self {
             store,
             bucket: bucket.to_string(),
@@ -2621,16 +2610,16 @@ fn should_use_small_eager_put_path(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
 where
     R: AsyncRead + Unpin,
+    B: bytes::BufMut,
 {
-    let mut buf = pool.acquire_buffer(size).await;
-    buf.resize(size, 0);
     let mut filled = 0;
 
     while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+        let mut remaining = (&mut *buf).limit(size - filled);
+        let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
             .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
         if read == 0 {
@@ -2640,13 +2629,22 @@ where
     }
 
     let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+    let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
         .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
 
+    Ok(())
+}
+
+async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = pool.acquire_buffer(size).await;
+    read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
 
@@ -2657,27 +2655,8 @@ async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Resu
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; size];
-    let mut filled = 0;
-
-    while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
-            .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-        if read == 0 {
-            return Err(s3_error!(IncompleteBody));
-        }
-        filled += read;
-    }
-
-    let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
-        .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-    if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
+    let mut buf = Vec::with_capacity(size);
+    read_small_put_body_into(&mut body, &mut buf, size).await?;
     Ok(std::io::Cursor::new(buf))
 }
 
@@ -4479,7 +4458,7 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
-        let store_headers = get_object_store_headers(&req.headers);
+        let store_headers = project_ssec_transport_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4494,7 +4473,7 @@ impl DefaultObjectUsecase {
             .await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                store.get_object_reader(bucket, key, rs.clone(), store_headers.clone(), opts),
+                store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -4783,12 +4762,10 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader = track_object_read_setup(
-                object_traffic_health.as_deref(),
-                prepared.with_headers(store_headers.clone()).into_reader(),
-            )
-            .await
-            .map_err(map_get_object_reader_error)?;
+            let reader =
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
+                    .await
+                    .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4808,12 +4785,9 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(map_get_object_reader_error)?;
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    prepared.with_headers(store_headers.clone()).into_reader(),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
+                    .await
+                    .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
@@ -6747,9 +6721,10 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        opts.include_part_checksums = object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS);
 
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -13832,11 +13807,12 @@ mod tests {
         request_headers.insert(SSEC_KEY_MD5_HEADER, HeaderValue::from_static("bWQ1"));
         request_headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test"));
         request_headers.insert("x-amz-security-token", HeaderValue::from_static("session-token"));
-        let store_headers = get_object_store_headers(&request_headers);
+        let store_headers = project_ssec_transport_headers(&request_headers);
         assert_eq!(store_headers.len(), 3, "only store-consumed SSE-C headers are forwarded");
         assert!(store_headers.values().all(HeaderValue::is_sensitive));
         assert!(store_headers.get(http::header::AUTHORIZATION).is_none());
         assert!(store_headers.get("x-amz-security-token").is_none());
+        assert!(!format!("{store_headers:?}").contains("dGVzdC1rZXk="));
         let plain_info = ObjectInfo {
             size: 11,
             ..Default::default()
@@ -15253,16 +15229,65 @@ mod tests {
         );
     }
 
+    struct FragmentedBody {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for FragmentedBody {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining()).min(2);
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InitializedLengthProbe {
+        data: std::io::Cursor<Vec<u8>>,
+        initialized_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for InitializedLengthProbe {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")
+                .push(buf.initialized().len());
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
-    async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
+    async fn read_small_put_body_exact_pooled_reads_exact_bytes_without_prefill() {
         let pool = get_concurrency_manager().bytes_pool();
-        let body = std::io::Cursor::new(b"hello".to_vec());
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
 
         let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
             .await
             .expect("pooled exact read should succeed");
 
         assert_eq!(&buffer[..5], b"hello");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first pooled body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -15276,6 +15301,131 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_rejects_extra_body() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello!".to_vec());
+
+        let err = match read_small_put_body_exact_pooled(body, 5, pool.as_ref()).await {
+            Ok(_) => panic!("extra pooled body should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_exact_bytes_without_prefill() {
+        let body = std::io::Cursor::new(b"hello".to_vec());
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(reader.get_ref().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_short_and_extra_bodies() {
+        let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
+            .await
+            .expect_err("short direct body should fail");
+        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
+            .await
+            .expect_err("extra direct body should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_handles_empty_body_boundary() {
+        let empty = read_small_put_body_exact_direct(std::io::Cursor::new(Vec::<u8>::new()), 0)
+            .await
+            .expect("empty direct body should succeed");
+        assert!(empty.get_ref().is_empty());
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
+            .await
+            .expect_err("non-empty body declared as empty should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_error_after_partial_read() {
+        struct PartialThenError {
+            delivered_prefix: bool,
+        }
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.delivered_prefix {
+                    return Poll::Ready(Err(std::io::Error::other("body read failed")));
+                }
+
+                self.delivered_prefix = true;
+                buf.put_slice(b"he");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let err = read_small_put_body_exact_direct(PartialThenError { delivered_prefix: false }, 5)
+            .await
+            .expect_err("a partial body followed by an I/O error must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_accepts_fragmented_body() {
+        let reader = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect("a fragmented exact-length body should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_fragmented_extra_body() {
+        let err = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello!".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect_err("a fragmented body longer than declared must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_into_uninitialized_spare_capacity() {
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
+
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
