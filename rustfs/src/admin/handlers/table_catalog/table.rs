@@ -125,7 +125,9 @@ impl Operation for RestLoadTableHandler {
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        let snapshot_selection = rest_table_snapshot_selection_from_query(&req.uri)?;
+        let mut response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -158,7 +160,7 @@ impl Operation for RestCommitTableHandler {
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
         install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<RestCommitTableRequest>(std::mem::take(&mut req.input)).await?;
+        let request = read_rest_commit_table_request(std::mem::take(&mut req.input)).await?;
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
@@ -178,6 +180,14 @@ impl Operation for RestDropTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
+        let purge_requested = rest_purge_requested_from_query(&req.uri)?;
+        if purge_requested {
+            return Err(iceberg_rest_error(
+                ICEBERG_ERROR_UNSUPPORTED_OPERATION,
+                StatusCode::NOT_ACCEPTABLE,
+                "purgeRequested=true is not supported",
+            ));
+        }
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;

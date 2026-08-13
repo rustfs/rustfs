@@ -554,7 +554,7 @@ where
 
     // Ordinary mutations hold the global migration read lock before the local write lock; migration takes the
     // write side before invoking its dedicated snapshot mutation methods.
-    async fn acquire_snapshot_write_permit(&self) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_snapshot_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock_path = TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path();
         self.object_backend.acquire_read_lock(RUSTFS_META_BUCKET, &lock_path).await
     }
@@ -1775,7 +1775,7 @@ where
         request: &TableCommitRequest,
         namespace: &Namespace,
         table: &IdentifierSegment,
-        next_warehouse_location: Option<String>,
+        next_metadata_state: TableMetadataCommitState,
     ) -> TableCatalogStoreResult<TableCommitResult> {
         let key = Self::table_key(&request.table_bucket, namespace, table);
         let current = Self::validate_new_table_commit_locked(state, &key, request)?;
@@ -1802,8 +1802,11 @@ where
 
         let mut next = current;
         next.metadata_location = commit_log.new_metadata_location.clone();
-        if let Some(warehouse_location) = next_warehouse_location {
+        if let Some(warehouse_location) = next_metadata_state.warehouse_location {
             next.warehouse_location = warehouse_location;
+        }
+        if let Some(format_version) = next_metadata_state.format_version {
+            next.format_version = format_version;
         }
         Self::ensure_table_warehouse_prefix_available_locked(state, &next, &key)?;
         next.version_token = commit_log.new_version_token.clone();
@@ -2170,6 +2173,7 @@ where
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
+        let publication_identity = (entry.table_bucket.clone(), entry.namespace.clone(), entry.table.clone());
         let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
@@ -2198,6 +2202,13 @@ where
                 StrongSnapshotWritePostcondition::TablePresent(entry),
             )
         };
+        if !publication.holds_table_bucket(&publication_identity.0)
+            || !publication.holds_table(&publication_identity.0, &publication_identity.1, &publication_identity.2)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "table registration publication fence was lost before snapshot update".to_string(),
+            ));
+        }
         self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
@@ -2479,9 +2490,15 @@ where
             let result = match prepared_result {
                 Ok((result, Some((snapshot, precondition)))) => {
                     let postcondition = Self::commit_write_postcondition(&request.table_bucket, &result.commit_log);
-                    self.finalize_snapshot_write(snapshot, precondition, postcondition)
-                        .await
-                        .map(|_| result)
+                    if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+                        Err(TableCatalogStoreError::Internal(
+                            "table commit publication fence was lost before snapshot update".to_string(),
+                        ))
+                    } else {
+                        self.finalize_snapshot_write(snapshot, precondition, postcondition)
+                            .await
+                            .map(|_| result)
+                    }
                 }
                 Ok((result, None)) => Ok(result),
                 Err(err) => Err(err),
@@ -2519,8 +2536,8 @@ where
         validate_commit_metadata_digest(&request, &new_metadata_object)?;
         let table_bucket = request.table_bucket.clone();
         let metadata_location = request.new_metadata_location.clone();
-        let next_warehouse_location = tokio::task::spawn_blocking(move || {
-            table_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        let next_metadata_state = tokio::task::spawn_blocking(move || {
+            table_metadata_commit_state(&table_bucket, &metadata_location, &new_metadata_object)
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
@@ -2539,7 +2556,8 @@ where
                     ))
                 })?
         };
-        if next_warehouse_location
+        if next_metadata_state
+            .warehouse_location
             .as_ref()
             .is_some_and(|warehouse_location| warehouse_location != &current_warehouse_location)
             && !publication.holds_table_bucket(&request.table_bucket)
@@ -2561,7 +2579,7 @@ where
         let prepared_result = {
             let state = self.state.lock().await;
             let (precondition, mut draft_state) = Self::snapshot_draft_context_locked(&state);
-            match Self::apply_commit_locked(&mut draft_state, &request, &namespace, &table, next_warehouse_location) {
+            match Self::apply_commit_locked(&mut draft_state, &request, &namespace, &table, next_metadata_state) {
                 Ok(result) => Self::snapshot_from_mutated_state_locked(&mut draft_state, self.snapshot_write_version)
                     .map(|snapshot| (result, snapshot, precondition)),
                 Err(err) => Err(err),
@@ -2570,7 +2588,14 @@ where
         let result = match prepared_result {
             Ok((result, snapshot, precondition)) => {
                 let postcondition = Self::commit_write_postcondition(&request.table_bucket, &result.commit_log);
-                match self.finalize_snapshot_write(snapshot, precondition, postcondition).await {
+                let snapshot_result = if publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+                    self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+                } else {
+                    Err(TableCatalogStoreError::Internal(
+                        "table commit publication fence was lost before snapshot update".to_string(),
+                    ))
+                };
+                match snapshot_result {
                     Ok(()) => Ok(result),
                     Err(err) => {
                         let replay = {
@@ -2647,13 +2672,26 @@ where
                 },
             )
         };
+        if !publication.holds_table_bucket(table_bucket)
+            || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "table drop publication fence was lost before snapshot update".to_string(),
+            ));
+        }
         self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
-        let _migration_guard = self.acquire_snapshot_write_permit().await?;
-        let _write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        self.create_view_with_publication(entry, &publication).await
+    }
+
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
         validate_view_entry_version_and_id(&entry)?;
         validate_view_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
@@ -2663,7 +2701,26 @@ where
                 "view metadata location must be inside the view metadata directory".to_string(),
             ));
         }
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        let _migration_guard = self.acquire_snapshot_write_permit().await?;
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.view)
+            .await?;
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a table publication fence".to_string(),
+            ));
+        }
+        let _write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &view);
+        let publication_identity = (entry.table_bucket.clone(), entry.namespace.clone(), entry.view.clone());
         let (snapshot, precondition, postcondition) = {
             let state = self.state.lock().await;
             Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
@@ -2682,6 +2739,13 @@ where
                 StrongSnapshotWritePostcondition::ViewPresent(entry),
             )
         };
+        if !publication.holds_table_bucket(&publication_identity.0)
+            || !publication.holds_table(&publication_identity.0, &publication_identity.1, &publication_identity.2)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation publication fence was lost before snapshot update".to_string(),
+            ));
+        }
         self.finalize_snapshot_write(snapshot, precondition, postcondition).await
     }
 
@@ -2751,11 +2815,38 @@ where
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+        let publication = TableCommitLockPublication::new(&self.object_backend);
+        self.replace_view_with_publication(request, true, &publication).await
+    }
+
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
+        if table_bucket_fence_required {
+            publication.begin_table_bucket(&request.table_bucket).await?;
+            if !publication.holds_table_bucket(&request.table_bucket) {
+                return Err(TableCatalogStoreError::Internal(
+                    "view replacement requires a table-bucket publication fence".to_string(),
+                ));
+            }
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let _migration_guard = self.acquire_snapshot_write_permit().await?;
-        let write_guard = self.write_lock.lock().await;
-        self.hydrate_state().await?;
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.view)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement requires a table publication fence".to_string(),
+            ));
+        }
+        let write_guard = self.write_lock.lock().await;
+        self.hydrate_state().await?;
         let key = Self::table_key(&request.table_bucket, &namespace, &view);
         let expected_view_id = {
             let state = self.state.lock().await;
@@ -2798,7 +2889,7 @@ where
 
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
-        let (snapshot, precondition, next, postcondition) = {
+        let (snapshot, precondition, next, postcondition, warehouse_relocation) = {
             let state = self.state.lock().await;
             Self::ensure_identifier_is_unambiguous_locked(&state, &key)?;
             let Some(current) = state.views.get(&key).cloned() else {
@@ -2828,6 +2919,14 @@ where
                     "current view metadata location does not match expected location".to_string(),
                 ));
             }
+            let warehouse_relocation = next_warehouse_location
+                .as_deref()
+                .is_some_and(|location| location != current.warehouse_location);
+            if warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket) {
+                return Err(TableCatalogStoreError::Internal(
+                    "view warehouse relocation requires a table-bucket publication fence".to_string(),
+                ));
+            }
 
             let mut next = current;
             next.metadata_location = request.new_metadata_location;
@@ -2843,8 +2942,16 @@ where
                 precondition,
                 next.clone(),
                 StrongSnapshotWritePostcondition::ViewPresent(next),
+                warehouse_relocation,
             )
         };
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view)
+            || ((table_bucket_fence_required || warehouse_relocation) && !publication.holds_table_bucket(&request.table_bucket))
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement publication fence was lost before snapshot update".to_string(),
+            ));
+        }
         self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
         Ok(ViewCommitResult { view: next })
     }

@@ -278,6 +278,7 @@ checksum = "312c1ea69e5fe9966e0029fb95aca8790100b85aff4f0d3b00a9337c74069a9c"
 dependencies = [
  "bigdecimal",
  "bon",
+ "crc32fast",
  "digest 0.11.3",
  "log",
  "miniz_oxide 0.9.1",
@@ -289,9 +290,11 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "snap",
  "strum",
  "thiserror 2.0.20",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -9200,6 +9203,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "shadow-rs",
+ "snap",
  "socket2",
  "subtle",
  "sysinfo",

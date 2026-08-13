@@ -55,23 +55,25 @@ pub(crate) fn table_metadata_json(table_uuid: &str, location: &str) -> serde_jso
     })
 }
 
-pub(crate) fn manifest_list_avro_bytes(manifest_paths: &[&str], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
-    let manifests = manifest_paths
-        .iter()
-        .map(|manifest_path| (*manifest_path, 0, sequence_number, snapshot_id))
-        .collect::<Vec<_>>();
-    manifest_list_avro_entries_with_partition_specs(&manifests)
-}
-
-pub(crate) fn manifest_list_avro_entries(manifests: &[(&str, i64, i64)]) -> Vec<u8> {
+pub(crate) fn manifest_list_avro_bytes(manifests: &[(&str, usize)], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
     let manifests = manifests
         .iter()
-        .map(|(manifest_path, sequence_number, snapshot_id)| (*manifest_path, 0, *sequence_number, *snapshot_id))
+        .map(|(manifest_path, manifest_length)| (*manifest_path, *manifest_length, 0, sequence_number, snapshot_id))
         .collect::<Vec<_>>();
     manifest_list_avro_entries_with_partition_specs(&manifests)
 }
 
-pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, i32, i64, i64)]) -> Vec<u8> {
+pub(crate) fn manifest_list_avro_entries(manifests: &[(&str, usize, i64, i64)]) -> Vec<u8> {
+    let manifests = manifests
+        .iter()
+        .map(|(manifest_path, manifest_length, sequence_number, snapshot_id)| {
+            (*manifest_path, *manifest_length, 0, *sequence_number, *snapshot_id)
+        })
+        .collect::<Vec<_>>();
+    manifest_list_avro_entries_with_partition_specs(&manifests)
+}
+
+pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, usize, i32, i64, i64)]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -97,14 +99,17 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
     )
     .expect("manifest list avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
-    for (manifest_path, partition_spec_id, sequence_number, snapshot_id) in manifests {
+    for (manifest_path, manifest_length, partition_spec_id, sequence_number, snapshot_id) in manifests {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
                 (
                     "manifest_path".to_string(),
                     apache_avro::types::Value::String((*manifest_path).to_string()),
                 ),
-                ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
+                (
+                    "manifest_length".to_string(),
+                    apache_avro::types::Value::Long(i64::try_from(*manifest_length).expect("test manifest length should fit")),
+                ),
                 ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
                 ("content".to_string(), apache_avro::types::Value::Int(0)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
@@ -122,7 +127,86 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
     writer.into_inner().expect("manifest list avro bytes should flush")
 }
 
+pub(crate) fn manifest_list_avro_entries_with_nullable_counts(manifests: &[(&str, usize, i32, i64, i64)]) -> Vec<u8> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+            {
+              "type": "record",
+              "name": "manifest_file",
+              "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": ["null", "int"], "default": null},
+                {"name": "existing_files_count", "type": ["null", "int"], "default": null},
+                {"name": "deleted_files_count", "type": ["null", "int"], "default": null},
+                {"name": "added_rows_count", "type": ["null", "long"], "default": null},
+                {"name": "existing_rows_count", "type": ["null", "long"], "default": null},
+                {"name": "deleted_rows_count", "type": ["null", "long"], "default": null}
+              ]
+            }
+            "#,
+    )
+    .expect("manifest list avro schema should parse");
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
+    for (manifest_path, manifest_length, partition_spec_id, sequence_number, snapshot_id) in manifests {
+        writer
+            .append_value(apache_avro::types::Value::Record(vec![
+                (
+                    "manifest_path".to_string(),
+                    apache_avro::types::Value::String((*manifest_path).to_string()),
+                ),
+                (
+                    "manifest_length".to_string(),
+                    apache_avro::types::Value::Long(i64::try_from(*manifest_length).expect("test manifest length should fit")),
+                ),
+                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
+                ("content".to_string(), apache_avro::types::Value::Int(0)),
+                ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
+                (
+                    "added_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "existing_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "deleted_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "added_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "existing_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "deleted_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+            ]))
+            .expect("manifest list record should append");
+    }
+    writer.into_inner().expect("manifest list avro bytes should flush")
+}
+
 pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u8> {
+    manifest_avro_bytes_with_partition_spec(files, None)
+}
+
+pub(crate) fn manifest_avro_bytes_with_partition_spec(
+    files: &[(&str, i32, i32, i64, i64)],
+    partition_spec_id: Option<i32>,
+) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -152,6 +236,11 @@ pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u
     )
     .expect("manifest avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
+    if let Some(partition_spec_id) = partition_spec_id {
+        writer
+            .add_user_metadata("partition-spec-id".to_string(), partition_spec_id.to_string())
+            .expect("manifest partition spec metadata should write");
+    }
     for (file_path, content, status, snapshot_id, sequence_number) in files {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
