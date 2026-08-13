@@ -24,7 +24,8 @@ use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::object::{
     assign_object_transaction_epoch, object_transaction_fencing_fleet_proof, object_transaction_fencing_fleet_proof_matches,
-    object_transaction_fencing_requested, read_object_transaction_epoch_fence, verify_object_transaction_epoch_fence,
+    object_transaction_fencing_requested, old_data_cleanup_receipt_path, read_object_transaction_epoch_fence,
+    verify_object_transaction_epoch_fence,
 };
 use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
@@ -2321,9 +2322,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         } else {
             None
         };
-        if transaction_epoch_fence.is_some() {
-            assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas);
-        }
+        let transaction_epoch =
+            transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas));
 
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
@@ -2393,6 +2393,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 tokio::spawn(async move {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
+            }
+
+            if let Some(old_dir) = op_old_dir {
+                commit_set
+                    .persist_old_data_cleanup_receipts(
+                        &cleanup_disks,
+                        &commit_bucket,
+                        &commit_object,
+                        old_dir,
+                        fi.data_dir,
+                        transaction_epoch,
+                    )
+                    .await;
             }
 
             // Crash-consistency injection: hard power loss after the authoritative
@@ -6437,6 +6450,24 @@ mod tests {
             (body, etag)
         }
 
+        async fn current_data_dir(disk: &DiskStore, bucket: &str, object: &str) -> Uuid {
+            disk.read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("current object metadata should read")
+                .data_dir
+                .expect("test object should be stored out-of-line")
+        }
+
+        async fn data_dir_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+            disk.read_all(bucket, &format!("{object}/{data_dir}/part.1")).await.is_ok()
+        }
+
+        async fn cleanup_receipt_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+            disk.read_all(bucket, &old_data_cleanup_receipt_path(object, data_dir))
+                .await
+                .is_ok()
+        }
+
         async fn upload_is_listed(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> bool {
             let page = set_disks
                 .list_multipart_uploads_for_incarnation(bucket, object, None, None, None, 1000, None)
@@ -6556,6 +6587,106 @@ mod tests {
             );
             let (body_after, _) = read_object(&set_disks, bucket, object).await;
             assert_eq!(body_after, new, "reclaiming the leftover upload must not disturb the committed object");
+        }
+
+        #[tokio::test]
+        #[serial(storage_class_env)]
+        async fn post_commit_crash_receipt_reclaims_old_data_after_restart() {
+            let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-crash-old-data-receipt";
+            let object = "crash-old-data-object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                    (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                ],
+                async {
+                    let old = payload(0x51);
+                    let (u_old, parts_old) = stage_upload(&set_disks, bucket, object, &old).await;
+                    complete(&set_disks, bucket, object, &u_old, parts_old)
+                        .await
+                        .expect("the old version should commit");
+                    let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                    let new = payload(0x52);
+                    let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
+                    crash_inject::arm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+                    let crashed = complete(&set_disks, bucket, object, &u_new, parts_new).await;
+                    assert!(
+                        matches!(crashed, Err(StorageError::Unexpected)),
+                        "the post-commit crash point must surface as unexpected, got {crashed:?}"
+                    );
+                    crash_inject::disarm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+
+                    let (body, _) = read_object(&set_disks, bucket, object).await;
+                    assert_eq!(body, new, "the committed replacement must remain readable after the crash");
+                    for disk in &disk_stores {
+                        assert!(
+                            cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                            "post-commit crash must leave a durable old-data cleanup receipt"
+                        );
+                        assert!(
+                            data_dir_exists(disk, bucket, object, old_dir).await,
+                            "post-commit crash must leave old data for restart reconciliation"
+                        );
+                    }
+
+                    let restarted_endpoints = temp_dirs
+                        .iter()
+                        .enumerate()
+                        .map(|(disk_idx, dir)| {
+                            let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8"))
+                                .expect("endpoint should parse");
+                            endpoint.set_pool_index(0);
+                            endpoint.set_set_index(0);
+                            endpoint.set_disk_index(disk_idx);
+                            endpoint
+                        })
+                        .collect::<Vec<_>>();
+                    let mut reloaded = Vec::with_capacity(restarted_endpoints.len());
+                    for endpoint in &restarted_endpoints {
+                        reloaded.push(
+                            new_disk(
+                                endpoint,
+                                &DiskOption {
+                                    cleanup: false,
+                                    health_check: false,
+                                },
+                            )
+                            .await
+                            .expect("disk should restart"),
+                        );
+                    }
+                    let restarted_set = SetDisks::new_with_instance_ctx(
+                        "restart-cleanup-receipt-test-owner".to_string(),
+                        Arc::new(RwLock::new(reloaded.iter().cloned().map(Some).collect())),
+                        4,
+                        2,
+                        0,
+                        0,
+                        restarted_endpoints,
+                        set_disks.format.clone(),
+                        Vec::new(),
+                        Arc::new(crate::runtime::instance::InstanceContext::new()),
+                    )
+                    .await;
+                    let removed = restarted_set
+                        .reconcile_old_data_cleanup_receipts(bucket, object)
+                        .await
+                        .expect("restart receipt reconciliation should succeed");
+                    assert_eq!(removed, 4, "restart reconciler should delete all receipt targets");
+                    for disk in &reloaded {
+                        assert!(
+                            !data_dir_exists(disk, bucket, object, old_dir).await,
+                            "restart reconciler must reclaim the old data dir"
+                        );
+                    }
+                },
+            )
+            .await;
         }
     }
 

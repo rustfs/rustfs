@@ -44,7 +44,7 @@ use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, VersionPurgeStatusType, replication_state_to_filemeta, version_purge_status_to_filemeta,
 };
 use crate::diagnostics::get::GetObjectFailureReason;
-use crate::disk::OldCurrentSize;
+use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
 use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
@@ -57,6 +57,8 @@ use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
 use std::sync::OnceLock;
+
+const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 
 #[inline]
 fn duration_millis_f64(duration: std::time::Duration) -> f64 {
@@ -78,6 +80,60 @@ pub(in crate::set_disk::ops) fn assign_object_transaction_epoch(
         }
     }
     epoch
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OldDataCleanupReceiptRecord {
+    epoch: String,
+    old_data_dir: String,
+    committed_data_dir: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct OldDataCleanupReceipt {
+    epoch: Uuid,
+    old_data_dir: Uuid,
+    committed_data_dir: Option<Uuid>,
+}
+
+impl OldDataCleanupReceipt {
+    fn new(epoch: Uuid, old_data_dir: Uuid, committed_data_dir: Option<Uuid>) -> Self {
+        Self {
+            epoch,
+            old_data_dir,
+            committed_data_dir,
+        }
+    }
+
+    fn encode(self) -> disk::error::Result<Bytes> {
+        let record = OldDataCleanupReceiptRecord {
+            epoch: self.epoch.to_string(),
+            old_data_dir: self.old_data_dir.to_string(),
+            committed_data_dir: self.committed_data_dir.map(|dir| dir.to_string()),
+        };
+        Ok(Bytes::from(serde_json::to_vec(&record)?))
+    }
+
+    fn decode(data: &[u8]) -> disk::error::Result<Self> {
+        let record: OldDataCleanupReceiptRecord = serde_json::from_slice(data)?;
+        let epoch = Uuid::parse_str(&record.epoch).map_err(DiskError::other)?;
+        let old_data_dir = Uuid::parse_str(&record.old_data_dir).map_err(DiskError::other)?;
+        let committed_data_dir = record
+            .committed_data_dir
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(DiskError::other)?;
+        if epoch.is_nil() || old_data_dir.is_nil() || committed_data_dir.is_some_and(|dir| dir.is_nil()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        Ok(Self::new(epoch, old_data_dir, committed_data_dir))
+    }
+}
+
+pub(in crate::set_disk::ops) fn old_data_cleanup_receipt_path(object: &str, old_data_dir: Uuid) -> String {
+    path_join_buf(&[object, &old_data_dir.to_string(), OLD_DATA_CLEANUP_RECEIPT_FILE])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +190,10 @@ pub(in crate::set_disk::ops) async fn verify_object_transaction_epoch_fence(
     } else {
         Err(StorageError::PreconditionFailed)
     }
+}
+
+fn old_data_cleanup_receipt_epoch_matches_current(receipt: OldDataCleanupReceipt, current: ObjectTransactionEpochFence) -> bool {
+    matches!(current, ObjectTransactionEpochFence::Present(epoch) if epoch == receipt.epoch)
 }
 
 #[cfg(test)]
@@ -1146,6 +1206,114 @@ fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileIn
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        old_data_dir: Uuid,
+        committed_data_dir: Option<Uuid>,
+        epoch: Option<Uuid>,
+    ) {
+        let Some(epoch) = epoch else { return };
+        if committed_data_dir == Some(old_data_dir) {
+            return;
+        }
+        let receipt = OldDataCleanupReceipt::new(epoch, old_data_dir, committed_data_dir);
+        let Ok(encoded) = receipt.encode() else {
+            return;
+        };
+        let path = old_data_cleanup_receipt_path(object, old_data_dir);
+        let futures = disks.iter().filter_map(|disk| {
+            disk.as_ref().map(|disk| {
+                let disk = disk.clone();
+                let encoded = encoded.clone();
+                let bucket = bucket.to_owned();
+                let path = path.clone();
+                async move { disk.write_all(&bucket, &path, encoded).await }
+            })
+        });
+        for result in join_all(futures).await {
+            if let Err(err) = result {
+                debug!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    old_dir = %old_data_dir,
+                    error = %err,
+                    state = "cleanup_receipt_persist_failed",
+                    "SetDisk old-data cleanup receipt persist failed"
+                );
+            }
+        }
+    }
+
+    pub(in crate::set_disk) async fn reconcile_old_data_cleanup_receipts(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> disk::error::Result<usize> {
+        if object_transaction_fencing_fleet_proof().is_none() {
+            return Ok(0);
+        }
+        let current = read_object_transaction_epoch_fence(self, bucket, object)
+            .await
+            .map_err(DiskError::from)?;
+        let disks = self.get_disks_internal().await;
+        let mut removed = 0usize;
+
+        for disk in disks.iter().flatten() {
+            let entries = match disk.list_dir("", bucket, object, 0).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => continue,
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                let Some(name) = entry.strip_suffix(SLASH_SEPARATOR) else { continue };
+                let Ok(data_dir) = Uuid::parse_str(name) else { continue };
+                if data_dir.is_nil() {
+                    continue;
+                }
+
+                let receipt_path = old_data_cleanup_receipt_path(object, data_dir);
+                let receipt_bytes = match disk.read_all(bucket, &receipt_path).await {
+                    Ok(bytes) => bytes,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => continue,
+                    Err(err) => return Err(err),
+                };
+                let receipt = OldDataCleanupReceipt::decode(&receipt_bytes)?;
+                if receipt.old_data_dir != data_dir
+                    || receipt.committed_data_dir == Some(receipt.old_data_dir)
+                    || !old_data_cleanup_receipt_epoch_matches_current(receipt, current)
+                {
+                    continue;
+                }
+
+                let old_path = format!("{object}/{}", receipt.old_data_dir);
+                match disk
+                    .delete_data_dir(
+                        bucket,
+                        &old_path,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(DataDirDeleteStatus::Deleted) => removed += 1,
+                    Ok(DataDirDeleteStatus::Deferred) => {}
+                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
     async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid) -> Result<()> {
         let current = metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await?;
         if current != expected {
@@ -1756,9 +1924,8 @@ impl SetDisks {
             } else {
                 None
             };
-            if transaction_epoch_fence.is_some() {
-                assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas);
-            }
+            let transaction_epoch =
+                transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas));
 
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
@@ -1857,6 +2024,19 @@ impl SetDisks {
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
                 let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+                if let Some(old_dir) = op_old_dir {
+                    commit_set
+                        .persist_old_data_cleanup_receipts(
+                            &cleanup_disks,
+                            &commit_bucket,
+                            &commit_object,
+                            old_dir,
+                            committed_data_dir,
+                            transaction_epoch,
+                        )
+                        .await;
+                }
 
                 commit_set
                     .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
@@ -10193,6 +10373,28 @@ mod heterogeneous_pool_put_tests {
         epochs
     }
 
+    async fn current_data_dir(disk: &DiskStore, bucket: &str, object: &str) -> Uuid {
+        disk.read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("current object metadata should read")
+            .data_dir
+            .expect("test object should be stored out-of-line")
+    }
+
+    async fn data_dir_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+        disk.read_all(bucket, &format!("{object}/{data_dir}/part.1")).await.is_ok()
+    }
+
+    async fn cleanup_receipt_exists(disk: &DiskStore, bucket: &str, object: &str, data_dir: Uuid) -> bool {
+        disk.read_all(bucket, &old_data_cleanup_receipt_path(object, data_dir))
+            .await
+            .is_ok()
+    }
+
+    fn large_payload(fill: u8) -> Vec<u8> {
+        vec![fill; 1024 * 1024]
+    }
+
     #[tokio::test]
     async fn second_pool_regular_put_uses_its_own_layout_and_round_trips() {
         // Deliberately inject the first pool's invalid scalar fallback. The
@@ -10276,6 +10478,169 @@ mod heterogeneous_pool_put_tests {
         let first = epochs[0].expect("fenced PUT should persist an epoch");
         assert!(!first.is_nil());
         assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_reconciles_failed_put_cleanup_idempotently() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-reconcile";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut first_reader = PutObjReader::from_vec(large_payload(0x11));
+                set_disks
+                    .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+                    .await
+                    .expect("first fenced PUT should commit");
+                let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                let fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+                let mut overwrite_reader = PutObjReader::from_vec(large_payload(0x22));
+                set_disks
+                    .put_object(bucket, object, &mut overwrite_reader, &ObjectOptions::default())
+                    .await
+                    .expect("overwrite should commit even when old-data cleanup fails");
+                for disk in &disk_stores {
+                    assert!(
+                        cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                        "fenced failed cleanup should leave a durable receipt"
+                    );
+                    assert!(
+                        data_dir_exists(disk, bucket, object, old_dir).await,
+                        "injected cleanup failure should leave the old data dir for reconciliation"
+                    );
+                }
+                drop(fault);
+
+                let removed = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("receipt reconciliation should succeed");
+                assert_eq!(removed, 4, "all receipt-targeted old dirs should be reclaimed");
+                let repeated = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("receipt reconciliation should be idempotent");
+                assert_eq!(repeated, 0, "a drained receipt must not be counted again");
+                for disk in &disk_stores {
+                    assert!(
+                        !data_dir_exists(disk, bucket, object, old_dir).await,
+                        "reconciled old data dir must be gone"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_noops_after_epoch_mismatch() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-epoch-mismatch";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut first_reader = PutObjReader::from_vec(large_payload(0x31));
+                set_disks
+                    .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+                    .await
+                    .expect("first fenced PUT should commit");
+                let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+                let fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+                let mut second_reader = PutObjReader::from_vec(large_payload(0x32));
+                set_disks
+                    .put_object(bucket, object, &mut second_reader, &ObjectOptions::default())
+                    .await
+                    .expect("second fenced PUT should commit and leave a receipt");
+                drop(fault);
+
+                let mut third_reader = PutObjReader::from_vec(large_payload(0x33));
+                set_disks
+                    .put_object(bucket, object, &mut third_reader, &ObjectOptions::default())
+                    .await
+                    .expect("third fenced PUT should advance the current epoch");
+
+                let removed = set_disks
+                    .reconcile_old_data_cleanup_receipts(bucket, object)
+                    .await
+                    .expect("stale receipt reconciliation should succeed");
+                assert_eq!(removed, 0, "stale receipt epoch must not reclaim after a newer commit");
+                for disk in &disk_stores {
+                    assert!(
+                        cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                        "stale receipt should remain as no-op evidence"
+                    );
+                    assert!(
+                        data_dir_exists(disk, bucket, object, old_dir).await,
+                        "epoch mismatch must preserve the old receipt target"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn old_data_cleanup_receipt_is_not_persisted_without_epoch_gate() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-cleanup-receipt-gate-off";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut first_reader = PutObjReader::from_vec(large_payload(0x41));
+        set_disks
+            .put_object(bucket, object, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("default-gate first PUT should commit");
+        let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
+
+        let _fault = cleanup_fault_injection::fail_cleanup_on(object, &[0, 1, 2, 3]);
+        let mut second_reader = PutObjReader::from_vec(large_payload(0x42));
+        set_disks
+            .put_object(bucket, object, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("default-gate overwrite should commit");
+
+        let removed = set_disks
+            .reconcile_old_data_cleanup_receipts(bucket, object)
+            .await
+            .expect("gate-off receipt reconciliation should be a no-op");
+        assert_eq!(removed, 0, "mixed-version/default gate path must not consume epoch-dependent receipts");
+        for disk in &disk_stores {
+            assert!(
+                !cleanup_receipt_exists(disk, bucket, object, old_dir).await,
+                "mixed-version/default gate path must not write epoch-dependent receipts"
+            );
+            assert!(
+                data_dir_exists(disk, bucket, object, old_dir).await,
+                "cleanup fault should leave old dir without receipt"
+            );
+        }
     }
 
     #[tokio::test]
