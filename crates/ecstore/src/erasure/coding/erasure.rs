@@ -1454,25 +1454,22 @@ mod tests {
         let payloads = [vec![0x35; 257], vec![0xca; 1025]];
 
         std::thread::scope(|scope| {
-            let handles = payloads
-                .iter()
-                .map(|payload| {
-                    let barrier = Arc::clone(&barrier);
-                    scope.spawn(move || {
-                        let erasure = Erasure::new_with_options(6, 3, 2048, true);
-                        barrier.wait();
-                        let encoded = erasure.encode_data(payload).expect("concurrent legacy encode should succeed");
-                        barrier.wait();
+            let handles = payloads.each_ref().map(|payload| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let erasure = Erasure::new_with_options(6, 3, 2048, true);
+                    barrier.wait();
+                    let encoded = erasure.encode_data(payload).expect("concurrent legacy encode should succeed");
+                    barrier.wait();
 
-                        let mut shards = optional_shards(&encoded);
-                        shards[0] = None;
-                        erasure
-                            .decode_data(&mut shards)
-                            .expect("concurrent legacy decode should reconstruct the missing shard");
-                        recover_data(&shards, erasure.data_shards, payload.len())
-                    })
+                    let mut shards = optional_shards(&encoded);
+                    shards[0] = None;
+                    erasure
+                        .decode_data(&mut shards)
+                        .expect("concurrent legacy decode should reconstruct the missing shard");
+                    recover_data(&shards, erasure.data_shards, payload.len())
                 })
-                .collect::<Vec<_>>();
+            });
 
             for (handle, payload) in handles.into_iter().zip(payloads.iter()) {
                 assert_eq!(handle.join().expect("concurrent legacy codec worker should not panic"), *payload);
