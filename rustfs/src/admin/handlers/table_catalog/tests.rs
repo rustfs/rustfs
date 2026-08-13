@@ -7321,7 +7321,8 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
     .await
     .expect_err("stale row-level delete should conflict");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(error.code(), &s3s::S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
