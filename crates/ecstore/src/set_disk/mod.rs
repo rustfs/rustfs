@@ -2741,12 +2741,12 @@ mod write_layout_tests {
 
         let held_layout = resolve_write_layout(&held, 0, 4, 2, None, false).expect("held snapshot should remain valid");
         assert_eq!(held_layout.parity_drives, 2);
-        assert!(held.should_inline(512, false));
+        assert!(held.should_inline(512, held_layout.data_drives, false));
 
         let current = published.load_full();
         let current_layout = resolve_write_layout(&current, 0, 4, 2, None, false).expect("new snapshot should resolve");
         assert_eq!(current_layout.parity_drives, 1);
-        assert!(!current.should_inline(512, false));
+        assert!(!current.should_inline(512, current_layout.data_drives, false));
     }
 }
 

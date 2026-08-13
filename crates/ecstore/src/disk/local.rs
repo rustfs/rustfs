@@ -15,6 +15,11 @@
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_READ_VERSION_DECODE,
+    GET_STAGE_READ_VERSION_PATH_CHECK, GET_STAGE_READ_VERSION_PATH_RESOLVE, GET_STAGE_READ_VERSION_XLMETA_READ,
+    get_stage_timer_if_enabled, record_get_stage_duration_if_enabled,
+};
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
@@ -9840,6 +9845,12 @@ impl DiskAPI for LocalDisk {
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
         crate::hp_guard!("LocalDisk::read_version");
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let metrics_path = if stage_metrics_enabled && crate::bucket::utils::is_meta_bucketname(volume) {
+            GET_OBJECT_PATH_INTERNAL_META
+        } else {
+            GET_OBJECT_PATH_LEGACY_DUPLEX
+        };
         if !org_volume.is_empty() {
             let org_volume_path = self.io_get_bucket_path(org_volume)?;
             if !skip_access_checks(org_volume) {
@@ -9849,37 +9860,46 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        let path_resolve_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let file_path = self.io_get_object_path(volume, path)?;
         let volume_dir = self.io_get_bucket_path(volume)?;
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_RESOLVE, path_resolve_start);
 
+        let path_check_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         check_path_length(file_path.to_string_lossy().as_ref())?;
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_CHECK, path_check_start);
 
         let read_data = opts.read_data;
 
-        let (data, _) = self
-            .read_raw(volume, volume_dir.clone(), file_path, read_data)
-            .await
-            .map_err(|e| {
-                if e == DiskError::FileNotFound && !version_id.is_empty() {
-                    DiskError::FileVersionNotFound
-                } else {
-                    e
-                }
-            })?;
+        let xlmeta_read_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let raw_read_result = self.read_raw(volume, volume_dir.clone(), file_path, read_data).await;
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_XLMETA_READ, xlmeta_read_start);
+        let (data, _) = raw_read_result.map_err(|e| {
+            if e == DiskError::FileNotFound && !version_id.is_empty() {
+                DiskError::FileVersionNotFound
+            } else {
+                e
+            }
+        })?;
 
-        let mut fi = get_file_info(
-            &data,
-            volume,
-            path,
-            version_id,
-            FileInfoOpts {
-                data: read_data,
-                include_free_versions: opts.incl_free_versions,
-                include_part_checksums: false,
-            },
-        )?;
-
-        fi.validate_for_metadata_read()?;
+        let decode_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let file_info_result: Result<FileInfo> = (|| {
+            let fi = get_file_info(
+                &data,
+                volume,
+                path,
+                version_id,
+                FileInfoOpts {
+                    data: read_data,
+                    include_free_versions: opts.incl_free_versions,
+                    include_part_checksums: false,
+                },
+            )?;
+            fi.validate_for_metadata_read()?;
+            Ok(fi)
+        })();
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_DECODE, decode_start);
+        let mut fi = file_info_result?;
         if fi.is_canonical_delete_marker() {
             return Ok(fi);
         }
@@ -10560,6 +10580,108 @@ mod test {
         let mut meta = FileMeta::default();
         meta.add_version(fi).expect("test metadata should accept file info");
         meta.marshal_msg().expect("test metadata should encode")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_version_records_local_metadata_stage_breakdown() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().expect("temp dir should be created");
+                let endpoint =
+                    Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+                let bucket = "bucket";
+                let object = "stage-breakdown";
+                ensure_test_volume(&disk, bucket).await;
+
+                let object_dir = dir.path().join(bucket).join(object);
+                fs::create_dir_all(&object_dir)
+                    .await
+                    .expect("object directory should be created");
+                fs::write(
+                    object_dir.join(STORAGE_FORMAT_FILE),
+                    test_meta(test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"inline")))),
+                )
+                .await
+                .expect("object metadata should be written");
+
+                disk.read_version(
+                    "",
+                    bucket,
+                    object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read_version should succeed");
+
+                let meta_object = "stage-breakdown-meta";
+                let meta_object_dir = dir.path().join(RUSTFS_META_BUCKET).join(meta_object);
+                fs::create_dir_all(&meta_object_dir)
+                    .await
+                    .expect("internal metadata object directory should be created");
+                fs::write(
+                    meta_object_dir.join(STORAGE_FORMAT_FILE),
+                    test_meta(test_file_info(meta_object, Uuid::new_v4(), None, Some(Bytes::from_static(b"meta")))),
+                )
+                .await
+                .expect("internal metadata should be written");
+
+                disk.read_version(
+                    "",
+                    RUSTFS_META_BUCKET,
+                    meta_object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("internal metadata read_version should succeed");
+            });
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        for stage in [
+            GET_STAGE_READ_VERSION_PATH_RESOLVE,
+            GET_STAGE_READ_VERSION_PATH_CHECK,
+            GET_STAGE_READ_VERSION_XLMETA_READ,
+            GET_STAGE_READ_VERSION_DECODE,
+        ] {
+            assert_eq!(
+                recorder
+                    .histogram_values(
+                        "rustfs_io_get_object_stage_duration_seconds",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX), ("stage", stage)]
+                    )
+                    .len(),
+                1,
+                "{stage} should be recorded once for user-bucket LocalDisk::read_version"
+            );
+            assert_eq!(
+                recorder
+                    .histogram_values(
+                        "rustfs_io_get_object_stage_duration_seconds",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META), ("stage", stage)]
+                    )
+                    .len(),
+                1,
+                "{stage} should be recorded once for internal-meta LocalDisk::read_version"
+            );
+        }
     }
 
     #[test]

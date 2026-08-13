@@ -1193,7 +1193,8 @@ impl SetDisks {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
-            let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
+            let is_inline_buffer =
+                storage_class_config.should_inline(erasure.shard_file_size(put_object_size), erasure.data_shards, opts.versioned);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = erasure.shard_file_size(put_object_size);
@@ -5928,8 +5929,10 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
 mod inline_put_commit_path_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
+    use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::disk::{DiskAPI as _, ReadOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use rustfs_config::server_config::KVS;
     use tokio::io::AsyncReadExt;
 
     async fn make_bucket(disks: &[DiskStore], bucket: &str) {
@@ -6022,6 +6025,91 @@ mod inline_put_commit_path_tests {
             assert_eq!(restored, payload);
             assert_eq!(set_disks.erasure_cache.entries.read().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn ec_8_4_default_budget_keeps_large_inline_candidate_out_of_xl_meta() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[12]).expect("EC8+4 storage class should resolve"),
+        );
+        let bucket = "ec-8-4-inline-budget";
+        let object = "object.bin";
+        let payload = vec![0x5c; 300 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("EC8+4 PUT should commit through the non-inline path");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist EC8+4 metadata: {err}"));
+            assert_eq!(file_info.erasure.data_blocks, 8);
+            assert_eq!(file_info.erasure.parity_blocks, 4);
+            assert!(!file_info.inline_data(), "disk {disk_index} must keep the shard outside xl.meta");
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("non-inline EC8+4 object should remain readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("non-inline EC8+4 object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn ec_8_4_versioned_budget_reaches_put_placement_decision() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[12]).expect("EC8+4 storage class should resolve"),
+        );
+        let bucket = "ec-8-4-versioned-inline-budget";
+        let object = "object.bin";
+        let payload = vec![0x73; 64 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        let options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &options)
+            .await
+            .expect("versioned EC8+4 PUT should use the reduced inline budget");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist versioned EC8+4 metadata: {err}"));
+            assert!(
+                !file_info.inline_data(),
+                "disk {disk_index} must keep the versioned shard outside xl.meta"
+            );
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &options)
+            .await
+            .expect("versioned non-inline EC8+4 object should remain readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("versioned non-inline EC8+4 object should stream");
+        assert_eq!(restored, payload);
     }
 
     #[tokio::test]

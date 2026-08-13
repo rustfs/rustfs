@@ -2703,6 +2703,10 @@ mod tests {
         record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
         record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_path_resolve", 0.0001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_path_check", 0.0001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_xlmeta_read", 0.0005);
+        record_get_object_stage_duration("legacy_duplex", "read_version_decode", 0.0002);
         record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
         record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
         record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
