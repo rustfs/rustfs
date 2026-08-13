@@ -113,7 +113,7 @@ use crate::app::runtime_sources::{
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
-use crate::server::convert_ecstore_object_info;
+use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};

@@ -74,7 +74,7 @@ use crate::app::runtime_sources::{
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::server::RemoteAddr;
+use crate::shared_types::RemoteAddr;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;

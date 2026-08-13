@@ -5420,6 +5420,36 @@ require_source_contains \
   "fn set_disks_implements_storage_heal_operations_contract()" \
   "SetDisks storage-api HealOperations compile-time coverage test"
 
+# --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
+# ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
+# and madmin as leaf crates that depend only on external crates. Allowlist:
+# io-metrics -> rustfs-s3-ops (contract crate; leaf-allowance adjudication is
+# tracked as backlog#1834 PR2). Adding any other rustfs-* dependency to a leaf
+# crate needs a maintainer decision, not a quiet Cargo.toml edit.
+LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
+: >"$LEAF_CRATE_DEP_HITS_FILE"
+(
+  cd "$ROOT_DIR"
+  for leaf in config credentials crypto io-metrics madmin; do
+    manifest="crates/${leaf}/Cargo.toml"
+    [[ -f "$manifest" ]] || continue
+    leaf_dep_status=0
+    rg -n --with-filename '^rustfs-[a-z0-9-]+ *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
+    if [[ "$leaf_dep_status" -ne 0 && "$leaf_dep_status" -ne 1 ]]; then
+      exit "$leaf_dep_status"
+    fi
+    if [[ "$leaf" == "io-metrics" ]]; then
+      rg -v '^[^:]*:[0-9]+:rustfs-s3-ops *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+    else
+      cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
+    fi
+  done
+)
+
+if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
+  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+fi
+
 if (( FAILURES > 0 )); then
   exit 1
 fi
