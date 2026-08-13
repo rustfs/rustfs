@@ -985,7 +985,9 @@ trace_hot_spans=(
   "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
   "crates/ecstore/src/store/mod.rs:list_objects_v2"
   "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
-  "crates/ecstore/src/core/sets.rs:list_objects_v2"
+  # The pool-level Sets::list_objects_v2 wrapper was removed with its duplicate
+  # pagination pipeline (backlog#1821); the remaining ECStore and SetDisks
+  # wrappers below still carry the TRACE requirement.
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
   "rustfs/src/app/object_usecase.rs:execute_get_object"
