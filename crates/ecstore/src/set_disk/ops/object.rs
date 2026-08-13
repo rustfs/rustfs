@@ -1106,6 +1106,7 @@ impl SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
+        let mut tmp_cleanup_owned = false;
         let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
@@ -1597,169 +1598,236 @@ impl SetDisks {
                 });
             }
 
-            let rename_stage_start = Instant::now();
-            let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
-                &shuffle_disks,
-                RUSTFS_META_TMP_BUCKET,
-                tmp_dir.as_str(),
-                &parts_metadatas,
-                bucket,
-                object,
-                write_quorum,
-            )
-            .await?;
-            // Do this before any post-commit await so request cancellation cannot
-            // bypass best-effort admission. A process crash before admission
-            // remains subject to the existing scanner reconciliation path.
-            if convergence.needs_heal() {
-                let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
-                    bucket.to_string(),
-                    Some(object.to_string()),
-                    false,
-                    Some(HealChannelPriority::Normal),
-                    Some(self.pool_index),
-                    Some(self.set_index),
-                );
-                request.object_version_id = committed_version_id.map(|version_id| version_id.to_string());
-                tokio::spawn(async move {
-                    let _ = rustfs_common::heal_channel::send_heal_request(request).await;
-                });
-            }
+            let commit_set = self.clone();
+            let commit_bucket = bucket.to_owned();
+            let commit_object = object.to_owned();
+            let commit_tmp_dir = tmp_dir.clone();
+            let commit_object_lock_guard = object_lock_guard.take();
+            let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
+            let detach_commit_owner = commit_object_lock_guard.is_some() || commit_bucket_lifecycle_guard.is_some();
+            let commit_write_path_label = write_path.metric_label();
+            let commit_is_versioned = opts.versioned || opts.version_suspended;
+            let commit_capacity_scope_token = opts.capacity_scope_token;
+            let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
+            tmp_cleanup_owned = true;
 
-            let rename_stage_elapsed = rename_stage_start.elapsed();
-            let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
-
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
-
-            // `rename_data` has completed the authoritative quorum commit. The
-            // exact old-data-dir reclamation below is best-effort space cleanup;
-            // it must not serialize the next operation on this object.
-            drop(object_lock_guard);
-
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
-            if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
-                warn!(
-                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    stage = "rename_data",
-                    bucket = %bucket,
-                    object = %object,
-                    tmp_dir = %tmp_dir,
-                    duration_ms = { rename_stage_ms },
+            let commit = async move {
+                let _object_lock_guard = commit_object_lock_guard;
+                let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                let rename_stage_start = Instant::now();
+                let rename_result = SetDisks::rename_data(
+                    &shuffle_disks,
+                    RUSTFS_META_TMP_BUCKET,
+                    commit_tmp_dir.as_str(),
+                    &parts_metadatas,
+                    &commit_bucket,
+                    &commit_object,
                     write_quorum,
-                    state = "slow",
-                    "SetDisk commit tail stage is slow"
-                );
-            }
+                )
+                .await;
+                let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = match rename_result {
+                    Ok(commit) => commit,
+                    Err(err) => {
+                        if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                            warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
+                        } else if issue3031_diag_enabled() {
+                            warn!(
+                                target: "rustfs_ecstore::set_disk",
+                                bucket = %commit_bucket,
+                                object = %commit_object,
+                                tmp_dir = %commit_tmp_dir,
+                                "issue3031_put_object_tmp_cleanup_done"
+                            );
+                        }
+                        return Err(err.into());
+                    }
+                };
+                // Do this before any post-commit await so request cancellation cannot
+                // bypass best-effort admission. A process crash before admission
+                // remains subject to the existing scanner reconciliation path.
+                if convergence.needs_heal() {
+                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                        commit_bucket.clone(),
+                        Some(commit_object.clone()),
+                        false,
+                        Some(HealChannelPriority::Normal),
+                        Some(commit_set.pool_index),
+                        Some(commit_set.set_index),
+                    );
+                    request.object_version_id = committed_version_id.map(|version_id| version_id.to_string());
+                    tokio::spawn(async move {
+                        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                    });
+                }
 
-            let mut cleanup_stage_ms: Option<u64> = None;
-            if let Some(old_dir) = op_old_dir {
-                let committed_dir = committed_data_dir.unwrap_or_default().to_string();
-                let cleanup_stage_start = Instant::now();
-                // backlog#898: reclaiming the dereferenced old data dir is
-                // best-effort and returns a receipt (never `Err`). A failed GC
-                // here must not negate an already-committed, durable write, so we
-                // deliberately do NOT `?`-propagate it into a 503. On residue the
-                // report path emits the leak metric and enqueues a heal.
-                let cleanup = self
-                    .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
+                let rename_stage_elapsed = rename_stage_start.elapsed();
+                let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+                commit_set
+                    .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                     .await;
-                let cleanup_elapsed = cleanup_stage_start.elapsed();
-                let cleanup_ms = cleanup_elapsed.as_millis() as u64;
-                cleanup_stage_ms = Some(cleanup_ms);
-                rustfs_io_metrics::record_put_object_stage_duration(
-                    "set_disk_old_data_cleanup",
-                    duration_millis_f64(cleanup_elapsed),
-                );
-                self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
-                    .await;
-                if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+
+                // `rename_data` has completed the authoritative quorum commit. The
+                // exact old-data-dir reclamation below is best-effort space cleanup;
+                // it must not serialize the next operation on this object.
+                drop(_object_lock_guard);
+                drop(_bucket_lifecycle_guard);
+
+                rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
+                if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                     warn!(
                         event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        stage = "commit_rename_data_dir",
-                        bucket = %bucket,
-                        object = %object,
-                        tmp_dir = %tmp_dir,
-                        old_dir = %old_dir,
-                        duration_ms = cleanup_ms,
+                        stage = "rename_data",
+                        bucket = %commit_bucket,
+                        object = %commit_object,
+                        tmp_dir = %commit_tmp_dir,
+                        duration_ms = { rename_stage_ms },
                         write_quorum,
                         state = "slow",
                         "SetDisk commit tail stage is slow"
                     );
                 }
+
+                let mut cleanup_stage_ms: Option<u64> = None;
+                if let Some(old_dir) = op_old_dir {
+                    let committed_dir = committed_data_dir.unwrap_or_default().to_string();
+                    let cleanup_stage_start = Instant::now();
+                    // backlog#898: reclaiming the dereferenced old data dir is
+                    // best-effort and returns a receipt (never `Err`). A failed GC
+                    // here must not negate an already-committed, durable write, so we
+                    // deliberately do NOT `?`-propagate it into a 503. On residue the
+                    // report path emits the leak metric and enqueues a heal.
+                    let cleanup = commit_set
+                        .commit_rename_data_dir(
+                            &cleanup_disks,
+                            &commit_bucket,
+                            &commit_object,
+                            &old_dir.to_string(),
+                            &committed_dir,
+                            write_quorum,
+                        )
+                        .await;
+                    let cleanup_elapsed = cleanup_stage_start.elapsed();
+                    let cleanup_ms = cleanup_elapsed.as_millis() as u64;
+                    cleanup_stage_ms = Some(cleanup_ms);
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        "set_disk_old_data_cleanup",
+                        duration_millis_f64(cleanup_elapsed),
+                    );
+                    commit_set
+                        .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
+                        .await;
+                    if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                        warn!(
+                            event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            stage = "commit_rename_data_dir",
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            tmp_dir = %commit_tmp_dir,
+                            old_dir = %old_dir,
+                            duration_ms = cleanup_ms,
+                            write_quorum,
+                            state = "slow",
+                            "SetDisk commit tail stage is slow"
+                        );
+                    }
+                }
+
+                let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
+                let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
+
+                if is_compressed {
+                    record_compression_total_memory(actual_size as u64, w_size as u64).await;
+                }
+                commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
+
+                fi.replication_state_internal = Some(commit_replication_state);
+
+                fi.is_latest = true;
+
+                if issue3031_diag_enabled() {
+                    let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket = %commit_bucket,
+                        object = %commit_object,
+                        tmp_dir = %commit_tmp_dir,
+                        data_dir = ?fi.data_dir,
+                        write_quorum,
+                        online_success_count,
+                        op_old_dir = ?op_old_dir,
+                        "issue3031_put_object_commit_succeeded"
+                    );
+                }
+
+                let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
+                if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                    warn!(
+                        event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        stage = "put_object_commit_tail",
+                        bucket = %commit_bucket,
+                        object = %commit_object,
+                        tmp_dir = %commit_tmp_dir,
+                        duration_ms = total_commit_tail_ms as u64,
+                        write_quorum,
+                        state = "slow",
+                        "SetDisk commit tail is slow"
+                    );
+                }
+
+                if issue3031_diag_enabled() {
+                    warn!(
+                        event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket = %commit_bucket,
+                        object = %commit_object,
+                        write_quorum,
+                        write_path = commit_write_path_label,
+                        writer_setup_ms,
+                        encode_ms,
+                        rename_ms = rename_stage_ms,
+                        cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
+                        cleanup_present = cleanup_stage_ms.is_some(),
+                        commit_tail_ms = total_commit_tail_ms as u64,
+                        result = "success",
+                        "SetDisk put_object stage summary"
+                    );
+                }
+
+                let cleanup_set = commit_set.clone();
+                let cleanup_tmp_dir = commit_tmp_dir.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
+                        warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                    } else if issue3031_diag_enabled() {
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            tmp_dir = %cleanup_tmp_dir,
+                            "issue3031_put_object_tmp_cleanup_done"
+                        );
+                    }
+                });
+
+                Ok((
+                    ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned),
+                    old_current_size,
+                ))
+            };
+
+            if detach_commit_owner {
+                tokio::spawn(commit)
+                    .await
+                    .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?
+            } else {
+                commit.await
             }
-
-            let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
-            let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
-
-            if is_compressed {
-                record_compression_total_memory(actual_size as u64, w_size as u64).await;
-            }
-            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
-
-            fi.replication_state_internal = Some(replication_state_to_filemeta(&opts.put_replication_state()));
-
-            fi.is_latest = true;
-
-            if issue3031_diag_enabled() {
-                let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
-                warn!(
-                    target: "rustfs_ecstore::set_disk",
-                    bucket = %bucket,
-                    object = %object,
-                    tmp_dir = %tmp_dir,
-                    data_dir = ?fi.data_dir,
-                    write_quorum,
-                    online_success_count,
-                    op_old_dir = ?op_old_dir,
-                    "issue3031_put_object_commit_succeeded"
-                );
-            }
-
-            let total_commit_tail_ms = rename_stage_start.elapsed().as_millis();
-            if total_commit_tail_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
-                warn!(
-                    event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    stage = "put_object_commit_tail",
-                    bucket = %bucket,
-                    object = %object,
-                    tmp_dir = %tmp_dir,
-                    duration_ms = total_commit_tail_ms as u64,
-                    write_quorum,
-                    state = "slow",
-                    "SetDisk commit tail is slow"
-                );
-            }
-
-            if issue3031_diag_enabled() {
-                warn!(
-                    event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    bucket = %bucket,
-                    object = %object,
-                    write_quorum,
-                    write_path = write_path.metric_label(),
-                    writer_setup_ms,
-                    encode_ms,
-                    rename_ms = rename_stage_ms,
-                    cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
-                    cleanup_present = cleanup_stage_ms.is_some(),
-                    commit_tail_ms = total_commit_tail_ms as u64,
-                    result = "success",
-                    "SetDisk put_object stage summary"
-                );
-            }
-
-            Ok((
-                ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended),
-                old_current_size,
-            ))
         }
         .await;
 
@@ -1795,7 +1863,8 @@ impl SetDisks {
             );
         }
 
-        if result.is_ok() {
+        if tmp_cleanup_owned && result.is_ok() {
+        } else if result.is_ok() {
             // Success path: `rename_data` has already moved the data dir out of
             // the tmp workspace and removed the (empty) tmp dir where it could,
             // so this delete_all is a speculative safety net that normally hits
@@ -9752,6 +9821,74 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("second overwrite task should join")
             .expect("second overwrite should survive the earlier request cancellation");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the latest overwrite should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_rename_keeps_namespace_lock_until_publication() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-commit-lock-cancelled-rename";
+        let object = "commit-lock-cancelled-rename-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+        let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let first_store = Arc::clone(&set_disks);
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+            .await
+            .expect("first PUT should pause during the authoritative rename");
+
+        let second_namespace_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+        let second_store = Arc::clone(&set_disks);
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            second_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        second_namespace_barrier.release_and_wait_until_namespace_pending().await;
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("the first request should be cancelled while rename is parked")
+                .is_cancelled()
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "the second writer must remain blocked by the cancelled commit owner"
+        );
+
+        rename_barrier.release();
+        drop(rename_barrier);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while rename_tasks.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled owner's rename fanout should drain");
+        second
+            .await
+            .expect("second overwrite task should join")
+            .expect("second overwrite should commit after the cancelled owner reaches publication");
 
         let mut reader = set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
