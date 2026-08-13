@@ -667,18 +667,6 @@ impl SelectObjectSnapshotLockLossWake {
     }
 }
 
-fn select_object_ssec_headers(headers: &HeaderMap) -> HeaderMap {
-    use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-
-    let mut selected = HeaderMap::new();
-    for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-        if let Some(value) = headers.get(name) {
-            selected.insert(name, value.clone());
-        }
-    }
-    selected
-}
-
 // LockRegistry clones its canonical client Arc for each endpoint host, so an
 // exact Arc set identifies one distributed namespace-lock quorum domain.
 fn same_distributed_lock_domain(left: &[Arc<dyn rustfs_lock::LockClient>], right: &[Arc<dyn rustfs_lock::LockClient>]) -> bool {
@@ -1296,7 +1284,7 @@ impl ECStore {
             pool,
             bucket: bucket.to_owned(),
             object,
-            headers: select_object_ssec_headers(headers),
+            headers: rustfs_utils::http::project_ssec_transport_headers(headers),
             opts,
             object_info,
             logical_size,
@@ -1769,7 +1757,7 @@ impl ECStore {
         Self::resolve_decommission_tiered_object_result(result, bucket, &object)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, h))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(
         &self,
@@ -3361,25 +3349,6 @@ mod tests {
     }
 
     #[test]
-    fn select_snapshot_retains_only_ssec_headers() {
-        use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-
-        let mut headers = HeaderMap::new();
-        headers.insert(SSEC_ALGORITHM_HEADER, "AES256".parse().expect("valid SSE-C algorithm header"));
-        headers.insert(SSEC_KEY_HEADER, "secret-key".parse().expect("valid SSE-C key header"));
-        headers.insert(SSEC_KEY_MD5_HEADER, "key-md5".parse().expect("valid SSE-C key digest header"));
-        headers.insert("authorization", "credential".parse().expect("valid authorization header"));
-
-        let selected = select_object_ssec_headers(&headers);
-
-        assert_eq!(selected.len(), 3);
-        assert_eq!(selected.get(SSEC_ALGORITHM_HEADER), headers.get(SSEC_ALGORITHM_HEADER));
-        assert_eq!(selected.get(SSEC_KEY_HEADER), headers.get(SSEC_KEY_HEADER));
-        assert_eq!(selected.get(SSEC_KEY_MD5_HEADER), headers.get(SSEC_KEY_MD5_HEADER));
-        assert!(selected.get("authorization").is_none());
-    }
-
-    #[test]
     fn tier_delete_entry_is_prepared_and_bound_to_source_generation() {
         let identity = [9_u8; 32];
         let mut metadata = HashMap::new();
@@ -4608,6 +4577,8 @@ mod tests {
             assert_eq!(snapshot.headers.get(SSEC_KEY_HEADER), request_headers.get(SSEC_KEY_HEADER));
             assert_eq!(snapshot.headers.get(SSEC_KEY_MD5_HEADER), request_headers.get(SSEC_KEY_MD5_HEADER));
             assert!(snapshot.headers.get("authorization").is_none());
+            assert!(snapshot.headers.values().all(http::HeaderValue::is_sensitive));
+            assert!(!format!("{:?}", snapshot.headers).contains("secret-key"));
             assert_eq!(
                 snapshot.logical_size(),
                 u64::try_from(payload.len()).expect("test payload length should fit in u64")

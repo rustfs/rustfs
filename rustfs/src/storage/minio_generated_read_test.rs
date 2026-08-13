@@ -103,6 +103,7 @@ fn load_file_info(case_dir: &Path, manifest: &ManifestRecord) -> FileInfo {
         FileInfoOpts {
             data: true,
             include_free_versions: true,
+            include_part_checksums: false,
         },
     )
     .unwrap_or_else(|err| panic!("decode {}: {err}", xl_meta_path.display()))
