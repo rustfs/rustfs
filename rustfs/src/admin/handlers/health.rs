@@ -195,14 +195,14 @@ mod tests {
 
     #[test]
     fn test_build_health_response_readiness_returns_503_when_deps_not_ready() {
-        let readiness_report = crate::server::DependencyReadinessReport {
-            readiness: crate::server::DependencyReadiness {
+        let readiness_report = crate::shared_types::DependencyReadinessReport {
+            readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
                 peer_health_ready: true,
             },
-            degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
+            degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageQuorumUnavailable],
         };
         let parts = build_health_response_parts(
             Method::GET,
@@ -217,8 +217,8 @@ mod tests {
 
     #[test]
     fn test_build_health_response_readiness_returns_200_when_deps_ready() {
-        let readiness_report = crate::server::DependencyReadinessReport {
-            readiness: crate::server::DependencyReadiness {
+        let readiness_report = crate::shared_types::DependencyReadinessReport {
+            readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
@@ -239,14 +239,14 @@ mod tests {
 
     #[test]
     fn test_build_health_response_liveness_returns_200_when_deps_not_ready() {
-        let readiness_report = crate::server::DependencyReadinessReport {
-            readiness: crate::server::DependencyReadiness {
+        let readiness_report = crate::shared_types::DependencyReadinessReport {
+            readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
                 peer_health_ready: true,
             },
-            degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
+            degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
         let parts = build_health_response_parts(
             Method::GET,
@@ -266,14 +266,14 @@ mod tests {
 
     #[test]
     fn test_build_health_response_head_returns_empty_body() {
-        let readiness_report = crate::server::DependencyReadinessReport {
-            readiness: crate::server::DependencyReadiness {
+        let readiness_report = crate::shared_types::DependencyReadinessReport {
+            readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
                 peer_health_ready: true,
             },
-            degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
+            degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
         let parts = build_health_response_parts(
             Method::HEAD,
@@ -297,7 +297,7 @@ mod tests {
                 storage_ready: true,
                 iam_ready: false,
                 lock_quorum_ready: true,
-                degraded_reasons: &[crate::server::ReadinessDegradedReason::IamNotReady],
+                degraded_reasons: &[crate::shared_types::ReadinessDegradedReason::IamNotReady],
                 service: "rustfs-endpoint",
                 uptime: Some(123),
                 kms_ready: None,
@@ -322,7 +322,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
-                degraded_reasons: &[crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
+                degraded_reasons: &[crate::shared_types::ReadinessDegradedReason::StorageAndIamUnavailable],
                 service: "rustfs-endpoint",
                 uptime: None,
                 kms_ready: None,
@@ -334,8 +334,8 @@ mod tests {
 
     #[test]
     fn test_build_health_response_parts_head_has_no_payload() {
-        let report = crate::server::DependencyReadinessReport {
-            readiness: crate::server::DependencyReadiness {
+        let report = crate::shared_types::DependencyReadinessReport {
+            readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
@@ -353,14 +353,14 @@ mod tests {
     #[serial]
     fn test_build_health_response_parts_get_includes_payload() {
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
-            let report = crate::server::DependencyReadinessReport {
-                readiness: crate::server::DependencyReadiness {
+            let report = crate::shared_types::DependencyReadinessReport {
+                readiness: crate::shared_types::DependencyReadiness {
                     storage_ready: false,
                     iam_ready: true,
                     lock_quorum_ready: true,
                     peer_health_ready: true,
                 },
-                degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
+                degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::StorageQuorumUnavailable],
             };
             let parts =
                 build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
@@ -376,8 +376,8 @@ mod tests {
     #[serial]
     fn test_build_health_response_parts_readiness_marks_kms_not_ready() {
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
-            let report = crate::server::DependencyReadinessReport {
-                readiness: crate::server::DependencyReadiness {
+            let report = crate::shared_types::DependencyReadinessReport {
+                readiness: crate::shared_types::DependencyReadiness {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: true,
