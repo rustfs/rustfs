@@ -22,7 +22,7 @@ use crate::diagnostics::get::{
 #[cfg(feature = "hotpath")]
 use crate::disk::FileWriter;
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, MmapCopyStageMetrics, error::DiskError};
-use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
+use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter, ShardChunkRead};
 use bytes::Bytes;
 use rustfs_config::{
     DEFAULT_OBJECT_MMAP_READ_ENABLE, DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH, ENV_OBJECT_MMAP_READ_ENABLE,
@@ -52,7 +52,7 @@ tokio::task_local! {
 /// (rustfs/backlog#1159). Everything else is a stream and keeps the old path.
 pub enum ShardReader {
     InMemory(Cursor<Bytes>),
-    Chunked { reader: ChunkReaderBox, received: usize },
+    Chunked(ChunkReaderBox),
     Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
 }
 
@@ -60,7 +60,7 @@ impl AsyncRead for ShardReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::InMemory(cursor) => Pin::new(cursor).poll_read(cx, buf),
-            Self::Chunked { reader, .. } => Pin::new(&mut **reader).poll_read(cx, buf),
+            Self::Chunked(reader) => Pin::new(&mut **reader).poll_read(cx, buf),
             Self::Stream(reader) => Pin::new(reader).poll_read(cx, buf),
         }
     }
@@ -70,67 +70,20 @@ impl crate::erasure::coding::ShardSource for ShardReader {
     fn try_take_block(&mut self, n: usize) -> Option<Bytes> {
         match self {
             Self::InMemory(cursor) => cursor.try_take_block(n),
-            Self::Chunked { .. } | Self::Stream(_) => None,
+            Self::Chunked(_) | Self::Stream(_) => None,
         }
     }
 
-    fn poll_take_block(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        n: usize,
-        chunks: &mut Vec<Bytes>,
-    ) -> Poll<io::Result<bool>> {
-        if let Self::InMemory(cursor) = self.as_mut().get_mut() {
-            return Pin::new(cursor).poll_take_block(cx, n, chunks);
-        }
-        if matches!(self.as_ref().get_ref(), Self::Stream(_)) {
-            return Poll::Ready(Ok(false));
-        }
-
-        let Self::Chunked { reader, received } = self.as_mut().get_mut() else {
-            return Poll::Ready(Ok(false));
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<ShardChunkRead>> {
+        let Self::Chunked(reader) = self.get_mut() else {
+            return Poll::Ready(Ok(ShardChunkRead::Unsupported));
         };
-        if chunks.is_empty() {
-            *received = 0;
+        match Pin::new(&mut **reader).poll_read_chunk(cx, max) {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Ok(ShardChunkRead::Chunk(chunk))),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(ShardChunkRead::Eof)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
-        for _ in 0..64 {
-            if *received == n {
-                *received = 0;
-                return Poll::Ready(Ok(true));
-            }
-            match Pin::new(&mut **reader).poll_read_chunks(cx, n - *received, chunks) {
-                Poll::Ready(Ok(0)) => {
-                    *received = 0;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "remote shard ended before its bitrot block",
-                    )));
-                }
-                Poll::Ready(Ok(read)) => {
-                    *received = match received.checked_add(read) {
-                        Some(received) => received,
-                        None => {
-                            *received = 0;
-                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "bitrot chunk length overflow")));
-                        }
-                    };
-                    if *received > n {
-                        *received = 0;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "remote chunk reader exceeded its requested boundary",
-                        )));
-                    }
-                }
-                Poll::Ready(Err(err)) => {
-                    *received = 0;
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 
@@ -415,7 +368,7 @@ async fn open_disk_reader(
         && !cfg!(feature = "hotpath")
         && let Some(reader) = disk.read_file_stream_chunks(bucket, path, offset, length).await?
     {
-        return Ok(ShardReader::Chunked { reader, received: 0 });
+        return Ok(ShardReader::Chunked(reader));
     }
 
     // Mmap-copy materializes the whole `offset..offset+length` range as one
@@ -885,22 +838,16 @@ mod tests {
     }
 
     impl ChunkReader for TestChunkReader {
-        fn poll_read_chunks(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            max: usize,
-            output: &mut Vec<Bytes>,
-        ) -> Poll<io::Result<usize>> {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
             let Some(mut chunk) = self.chunks.pop_front() else {
-                return Poll::Ready(Ok(0));
+                return Poll::Ready(Ok(None));
             };
             let take = chunk.len().min(max);
             if take < chunk.len() {
                 self.chunks.push_front(chunk.split_off(take));
             }
             chunk.truncate(take);
-            output.push(chunk);
-            Poll::Ready(Ok(take))
+            Poll::Ready(Ok(Some(chunk)))
         }
     }
 
@@ -1805,15 +1752,7 @@ mod tests {
             .expect("test shard should encode");
 
         let source = TestChunkReader::new(Bytes::from(encoded), &[3, 7, 17, 31]);
-        let mut reader = BitrotReader::new(
-            ShardReader::Chunked {
-                reader: Box::new(source),
-                received: 0,
-            },
-            SHARD_SIZE,
-            algo,
-            false,
-        );
+        let mut reader = BitrotReader::new(ShardReader::Chunked(Box::new(source)), SHARD_SIZE, algo, false);
         let mut output = Vec::with_capacity(SHARD_SIZE);
         reader
             .read_appending(&mut output, SHARD_SIZE)
@@ -1836,15 +1775,7 @@ mod tests {
 
         let fragment_sizes = vec![1; encoded.len()];
         let source = TestChunkReader::new(Bytes::from(encoded), &fragment_sizes);
-        let mut reader = BitrotReader::new(
-            ShardReader::Chunked {
-                reader: Box::new(source),
-                received: 0,
-            },
-            SHARD_SIZE,
-            algo,
-            false,
-        );
+        let mut reader = BitrotReader::new(ShardReader::Chunked(Box::new(source)), SHARD_SIZE, algo, false);
         let mut output = Vec::with_capacity(SHARD_SIZE);
         reader
             .read_appending(&mut output, SHARD_SIZE)

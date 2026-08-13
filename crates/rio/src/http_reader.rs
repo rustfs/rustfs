@@ -52,6 +52,8 @@ const HTTP_VERSION_10_LABEL: &str = "http/1.0";
 const HTTP_VERSION_11_LABEL: &str = "http/1.1";
 const HTTP_VERSION_2_LABEL: &str = "h2";
 const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
+const MAX_EMPTY_CHUNKS_PER_POLL: usize = 64;
+const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty chunks";
 pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
 pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
 pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
@@ -888,13 +890,9 @@ type HttpByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send +
 /// An async reader that can also transfer received HTTP body chunks without
 /// copying their contents into an intermediate caller buffer.
 pub trait ChunkReader: AsyncRead + Send + Sync + Unpin {
-    /// Appends at most `max` bytes as owned chunks. A zero result is EOF.
-    fn poll_read_chunks(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        max: usize,
-        chunks: &mut Vec<Bytes>,
-    ) -> Poll<io::Result<usize>>;
+    /// Returns the next non-empty owned chunk, limited to `max` bytes.
+    /// `None` is EOF.
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>>;
 }
 
 pub type ChunkReaderBox = Box<dyn ChunkReader>;
@@ -931,6 +929,7 @@ pin_project! {
         stall_timer: Option<Pin<Box<Sleep>>>,
         request_started: Instant,
         duration_recorded: bool,
+        empty_chunk_limit_exceeded: bool,
         #[pin]
         inner: HttpByteStream,
         current: Option<Bytes>,
@@ -1125,102 +1124,64 @@ impl HttpChunkReader {
             stall_timeout: init.stall_timeout,
             request_started: init.request_started,
             duration_recorded: false,
+            empty_chunk_limit_exceeded: false,
         })
     }
 }
 
+fn excessive_empty_chunks_error() -> Error {
+    Error::new(io::ErrorKind::InvalidData, EXCESSIVE_EMPTY_CHUNKS_ERROR)
+}
+
 impl AsyncRead for HttpChunkReader {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let mut this = self.project();
-        loop {
-            if let Some(mut current) = this.current.take() {
-                let take = current.len().min(buf.remaining());
-                buf.put_slice(&current.split_to(take));
-                if !current.is_empty() {
-                    *this.current = Some(current);
-                }
-                record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, take);
-                *this.stall_timer = None;
-                return Poll::Ready(Ok(()));
+        match ChunkReader::poll_read_chunk(self.as_mut(), cx, buf.remaining()) {
+            Poll::Ready(Ok(Some(chunk))) => {
+                buf.put_slice(&chunk);
+                Poll::Ready(Ok(()))
             }
-
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
-                Poll::Ready(Some(Ok(bytes))) => *this.current = Some(bytes),
-                Poll::Ready(Some(Err(err))) => {
-                    record_internode_operation_duration_once(
-                        *this.track_internode_metrics,
-                        *this.internode_operation,
-                        *this.request_started,
-                        this.duration_recorded,
-                    );
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Ready(None) => {
-                    record_internode_operation_duration_once(
-                        *this.track_internode_metrics,
-                        *this.internode_operation,
-                        *this.request_started,
-                        this.duration_recorded,
-                    );
-                    *this.stall_timer = None;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => {
-                    let Some(stall_timeout) = *this.stall_timeout else {
-                        return Poll::Pending;
-                    };
-                    let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
-                    if timer.as_mut().poll(cx).is_ready() {
-                        record_internode_operation_duration_once(
-                            *this.track_internode_metrics,
-                            *this.internode_operation,
-                            *this.request_started,
-                            this.duration_recorded,
-                        );
-                        record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
-                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
-                        return Poll::Ready(Err(Error::new(
-                            io::ErrorKind::TimedOut,
-                            "HttpReader stall timeout: no data received before deadline",
-                        )));
-                    }
-                    return Poll::Pending;
-                }
-            }
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl ChunkReader for HttpChunkReader {
-    fn poll_read_chunks(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        max: usize,
-        chunks: &mut Vec<Bytes>,
-    ) -> Poll<io::Result<usize>> {
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
         if max == 0 {
             return Poll::Ready(Err(Error::new(io::ErrorKind::InvalidInput, "chunk read limit must be non-zero")));
         }
 
         let mut this = self.project();
+        if *this.empty_chunk_limit_exceeded {
+            return Poll::Ready(Err(excessive_empty_chunks_error()));
+        }
+        let mut empty_chunks = 0;
         loop {
             if let Some(mut current) = this.current.take() {
                 let take = current.len().min(max);
-                chunks.push(current.split_to(take));
+                let chunk = current.split_to(take);
                 if !current.is_empty() {
                     *this.current = Some(current);
                 }
                 record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, take);
                 *this.stall_timer = None;
-                return Poll::Ready(Ok(take));
+                return Poll::Ready(Ok(Some(chunk)));
             }
 
             match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => {
+                    empty_chunks += 1;
+                    if empty_chunks == MAX_EMPTY_CHUNKS_PER_POLL {
+                        *this.empty_chunk_limit_exceeded = true;
+                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                        return Poll::Ready(Err(excessive_empty_chunks_error()));
+                    }
+                }
                 Poll::Ready(Some(Ok(bytes))) => *this.current = Some(bytes),
                 Poll::Ready(Some(Err(err))) => {
                     record_internode_operation_duration_once(
@@ -1239,7 +1200,7 @@ impl ChunkReader for HttpChunkReader {
                         this.duration_recorded,
                     );
                     *this.stall_timer = None;
-                    return Poll::Ready(Ok(0));
+                    return Poll::Ready(Ok(None));
                 }
                 Poll::Pending => {
                     let Some(stall_timeout) = *this.stall_timeout else {
@@ -2235,31 +2196,87 @@ mod tests {
         let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
             .await
             .expect("reader should open");
-        let mut chunks = Vec::new();
-
-        let zero = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 0, &mut chunks))
+        let zero = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 0))
             .await
             .expect_err("zero chunk bound is invalid");
         assert_eq!(zero.kind(), io::ErrorKind::InvalidInput);
 
-        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 2, &mut chunks))
+        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 2))
             .await
-            .expect("first chunk read should succeed");
-        assert_eq!(first, 2);
-        assert_eq!(chunks.concat(), b"he");
+            .expect("first chunk read should succeed")
+            .expect("first chunk should not be EOF");
+        assert_eq!(first, b"he"[..]);
 
-        let second = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 8, &mut chunks))
+        let second = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 8))
             .await
-            .expect("second chunk read should succeed");
-        assert_eq!(second, 3);
-        assert_eq!(chunks.concat(), b"hello");
+            .expect("second chunk read should succeed")
+            .expect("second chunk should not be EOF");
+        assert_eq!(second, b"llo"[..]);
 
-        let eof = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 8, &mut chunks))
+        let eof = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 8))
             .await
             .expect("EOF should not be an error");
-        assert_eq!(eof, 0);
+        assert!(eof.is_none());
         assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
         handle.abort();
+    }
+
+    #[test]
+    fn http_chunk_reader_rejects_excessive_empty_chunks_on_both_interfaces() {
+        let make_reader = |empty_chunks| {
+            let items = (0..empty_chunks)
+                .map(|_| Ok(Bytes::new()))
+                .chain(std::iter::once(Ok(Bytes::from_static(b"data"))));
+            HttpChunkReader {
+                track_internode_metrics: false,
+                internode_operation: None,
+                stall_timeout: None,
+                stall_timer: None,
+                request_started: Instant::now(),
+                duration_recorded: false,
+                empty_chunk_limit_exceeded: false,
+                inner: Box::pin(stream::iter(items)),
+                current: None,
+            }
+        };
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut chunk_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL - 1);
+        let Poll::Ready(Ok(Some(chunk))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("data after fewer than the maximum empty chunks should be returned");
+        };
+        assert_eq!(chunk, b"data"[..]);
+
+        let mut async_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL - 1);
+        let mut storage = [0; 4];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Ok(())) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("AsyncRead should return data after fewer than the maximum empty chunks");
+        };
+        assert_eq!(read_buf.filled(), b"data");
+
+        let mut chunk_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL);
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("excessive empty chunks should fail closed");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("empty chunk limit failure should remain sticky");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut async_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL);
+        let mut storage = [0; 4];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Err(err)) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("excessive empty chunks should fail closed through AsyncRead");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Err(err)) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("AsyncRead empty chunk limit failure should remain sticky");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -2607,17 +2624,15 @@ mod tests {
         let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
             .await
             .expect("chunk reader should accept the successful response headers");
-        let mut chunks = Vec::new();
-
-        let read = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 64, &mut chunks))
+        let chunk = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
             .await
-            .expect("partial response bytes should arrive before the terminal error");
-        let err = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunks(cx, 64, &mut chunks))
+            .expect("partial response bytes should arrive before the terminal error")
+            .expect("partial response should not be EOF");
+        let err = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
             .await
             .expect_err("terminal body errors must not become clean EOF");
 
-        assert_eq!(read, 7);
-        assert_eq!(chunks.concat(), b"partial");
+        assert_eq!(chunk, b"partial"[..]);
         let source = err
             .get_ref()
             .and_then(|source| source.downcast_ref::<InternodeHttpError>())
