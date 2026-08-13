@@ -6950,7 +6950,7 @@ mod transition_commit_failure_tests {
         let result = transition.await.expect("transition task should not panic");
 
         result.expect_err("partial local commit must fail when only two of four disks are writable");
-        let fi = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -6962,10 +6962,10 @@ mod transition_commit_failure_tests {
                 false,
             )
             .await
-            .expect("rollback should keep the source metadata readable on applied disks")
-            .0;
+            .expect("rollback should keep the source metadata readable on applied disks");
         assert_ne!(
-            fi.transition_status, TRANSITION_COMPLETE,
+            snapshot.fi().transition_status,
+            TRANSITION_COMPLETE,
             "rollback must not leave the applied disks marked as transitioned"
         );
         let mut restored = Vec::new();
@@ -8100,7 +8100,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("local source should drain after failed transition");
         assert_eq!(restored, payload);
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -8114,7 +8114,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("local source metadata should remain available");
-        assert_ne!(fi.transition_status, TRANSITION_COMPLETE);
+        assert_ne!(snapshot.fi().transition_status, TRANSITION_COMPLETE);
     }
 
     async fn write_source(
@@ -8312,7 +8312,7 @@ mod transition_upload_integrity_tests {
             remote_object.starts_with(crate::bucket::lifecycle::transition_transaction::TRANSITION_TRANSACTION_PREFIX),
             "remote object should be transaction-scoped: {remote_object}"
         );
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -8327,6 +8327,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("committed transition metadata should be readable");
+        let fi = snapshot.fi();
         assert_eq!(fi.transition_status, TRANSITION_COMPLETE);
         assert_eq!(fi.transitioned_objname, *remote_object);
         assert_eq!(
@@ -8761,7 +8762,7 @@ mod transition_upload_integrity_tests {
             let object = format!("{}-corrupt.bin", position.label());
             let payload = vec![0x41; 2 * 1024 * 1024];
             let original = write_source(&set_disks, &disk_stores, &bucket, &object, &payload).await;
-            let (source, _, _) = set_disks
+            let source = set_disks
                 .get_object_fileinfo(
                     &bucket,
                     &object,
@@ -8775,6 +8776,7 @@ mod transition_upload_integrity_tests {
                 )
                 .await
                 .expect("source metadata should be available before shard corruption");
+            let source = source.fi();
             let data_dir = source.data_dir.expect("source object should have a data directory");
 
             corrupt_beyond_read_quorum(&temp_dirs, &bucket, &object, data_dir, source.erasure.parity_blocks, position).await;
@@ -8794,7 +8796,7 @@ mod transition_upload_integrity_tests {
                 ),
                 "{position:?}: unexpected transition producer error: {error:?}"
             );
-            let (after, _, _) = set_disks
+            let after = set_disks
                 .get_object_fileinfo(
                     &bucket,
                     &object,
@@ -8808,6 +8810,7 @@ mod transition_upload_integrity_tests {
                 )
                 .await
                 .expect("failed transition must leave metadata readable");
+            let after = after.fi();
             assert_eq!(
                 after.data_dir,
                 Some(data_dir),
@@ -8854,7 +8857,7 @@ mod transition_upload_integrity_tests {
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
             .expect("an unversioned remote version must commit");
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -8868,6 +8871,7 @@ mod transition_upload_integrity_tests {
             )
             .await
             .expect("committed unversioned transition metadata should be readable");
+        let fi = snapshot.fi();
         assert_eq!(fi.transition_version_id, None);
         assert_eq!(fi.transition_version, None);
         assert_eq!(fi.transition_version_state, rustfs_filemeta::TransitionVersionState::KnownDisabled);
@@ -9075,7 +9079,7 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected tagging lock-lost error: {error:?}"
         );
-        let (fi, _, _) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(
                 bucket,
                 object,
@@ -9090,7 +9094,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("source metadata should remain readable");
         assert!(
-            !fi.metadata.contains_key(AMZ_OBJECT_TAGGING),
+            !snapshot.fi().metadata.contains_key(AMZ_OBJECT_TAGGING),
             "a stale tagging writer must not write metadata after refresh-quorum loss"
         );
     }
@@ -9286,10 +9290,11 @@ mod transition_source_identity_matrix_tests {
                 .put_object(bucket, &object, &mut reader, &source_opts)
                 .await
                 .expect("source object should be written");
-            let (source, _, _) = set_disks
+            let source = set_disks
                 .get_object_fileinfo(bucket, &object, &source_opts, true, false)
                 .await
                 .expect("source metadata should resolve");
+            let source = source.fi();
             assert_eq!(source.version_id, Some(source_version_id));
             assert_eq!(
                 transition_source_identity(bucket, &object, &source, &source_opts, &get_raw_etag(&source.metadata))
@@ -9340,10 +9345,11 @@ mod transition_source_identity_matrix_tests {
                 versioned: true,
                 ..Default::default()
             };
-            let (persisted, _, _) = set_disks
+            let persisted = set_disks
                 .get_object_fileinfo(bucket, &object, &persisted_opts, true, false)
                 .await
                 .expect("drifted source metadata should resolve");
+            let persisted = persisted.fi();
             put_barrier.release();
 
             let result = transition.await.expect("transition task should not panic");
