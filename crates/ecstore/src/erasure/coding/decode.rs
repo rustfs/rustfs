@@ -25,7 +25,9 @@ use crate::disk::error_reduce::reduce_errs;
 use crate::erasure::codec::workspace::ShardBufferPool;
 use crate::erasure::coding::{BitrotReader, Erasure};
 use crate::io_support::bitrot::DeferredReaderStripeHandle;
-use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeReadState};
+use crate::set_disk::shard_source::{
+    INLINE_SHARD_SLOTS, ShardBuffers, ShardErrors, ShardReadCost, ShardStripeSource, StripeReadState,
+};
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
@@ -41,9 +43,6 @@ use tracing::{debug, error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
-const INLINE_SHARD_SLOTS: usize = 32;
-type ShardBuffers = SmallVec<[Option<Vec<u8>>; INLINE_SHARD_SLOTS]>;
-type ShardErrors = SmallVec<[Option<Error>; INLINE_SHARD_SLOTS]>;
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
 type ActiveReaders = SmallVec<[bool; INLINE_SHARD_SLOTS]>;
 
@@ -392,6 +391,7 @@ pub(crate) struct ParallelReader<R> {
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
+    stripe_state: Option<Box<StripeReadState>>,
     // Lockstep-path state (verify_reconstruction == true). `engaged[i]` marks
     // readers that participate in each stripe read: all data slots from the
     // start, parity slots only once a data shard is missing/dead. Unengaged
@@ -596,6 +596,7 @@ where
             verify_reconstruction,
             locality_preference_enabled: get_shard_locality_preference_enabled(),
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
+            stripe_state: None,
             engaged,
             deferred_handles: Vec::new(),
             stripe_index: 0,
@@ -700,6 +701,12 @@ where
 {
     #[hotpath::measure(impl_type = "ParallelReader")]
     pub async fn read(&mut self) -> StripeReadOutput {
+        let mut state = StripeReadState::with_slot_count(self.readers.len(), self.data_shards);
+        self.read_into_state(&mut state).await;
+        state.into_parts()
+    }
+
+    async fn read_into_state(&mut self, state: &mut StripeReadState) {
         // On the reconstruction-verifying GET path, read every live shard reader
         // in lockstep so all readers advance one block per stripe and stay
         // mutually aligned. The adaptive data-first path below only reads
@@ -709,12 +716,14 @@ where
         // than the data shards, producing "inconsistent read source shards" and
         // truncating large-object GETs under concurrency (backlog#832).
         if self.verify_reconstruction {
-            return self.read_lockstep().await;
+            self.read_lockstep(state).await;
+            return;
         }
         // if self.readers.len() != self.total_shards {
         //     return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
         // }
         let num_readers = self.readers.len();
+        state.reset(num_readers, self.data_shards);
 
         let shard_size = if self.offset + self.shard_size > self.shard_file_size {
             self.shard_file_size - self.offset
@@ -723,7 +732,7 @@ where
         };
 
         if shard_size == 0 {
-            return (smallvec![None; num_readers], smallvec![None; num_readers]);
+            return;
         }
 
         // Advance to the next stripe so the following read() computes the correct
@@ -734,8 +743,7 @@ where
         // is only read above to derive `shard_size`, so advancing here is safe.
         self.offset += shard_size;
 
-        let mut shards: ShardBuffers = smallvec![None; num_readers];
-        let mut errs: ShardErrors = smallvec![None; num_readers];
+        let (shards, errs) = state.parts_mut();
         let read_costs = self.read_costs.as_slice();
         let locality_preference_enabled = self.locality_preference_enabled;
         let low_cost_available = self
@@ -882,8 +890,8 @@ where
                 }
 
                 let result_is_err = record_shard_read_result(
-                    &mut shards,
-                    &mut errs,
+                    shards,
+                    errs,
                     &mut retire_readers,
                     &mut success,
                     &mut successful_costs,
@@ -944,8 +952,8 @@ where
                     active_readers[i] = false;
                     completed += 1;
                     if record_shard_read_result(
-                        &mut shards,
-                        &mut errs,
+                        shards,
+                        errs,
                         &mut retire_readers,
                         &mut success,
                         &mut successful_costs,
@@ -957,7 +965,7 @@ where
                         failed += 1;
                     }
                 }
-                retire_abandoned_readers(&mut errs, &mut retire_readers, &active_readers);
+                retire_abandoned_readers(errs, &mut retire_readers, &active_readers);
             }
 
             if let Some(path) = self.metrics_path {
@@ -1001,8 +1009,6 @@ where
         for i in retire_readers {
             self.readers[i] = None;
         }
-
-        (shards, errs)
     }
 
     /// Lockstep stripe read for the reconstruction-verifying GET path.
@@ -1030,18 +1036,18 @@ where
     /// stripe would reintroduce the desync. A parity reader that cannot be
     /// realigned (no pending deferred handle) is likewise retired instead of
     /// being read out of position.
-    async fn read_lockstep(&mut self) -> StripeReadOutput {
+    async fn read_lockstep(&mut self, state: &mut StripeReadState) {
         let num_readers = self.readers.len();
+        state.reset(num_readers, self.data_shards);
         let shard_size = if self.offset + self.shard_size > self.shard_file_size {
             self.shard_file_size - self.offset
         } else {
             self.shard_size
         };
 
-        let mut shards: ShardBuffers = smallvec![None; num_readers];
-        let mut errs: ShardErrors = smallvec![None; num_readers];
+        let (shards, errs) = state.parts_mut();
         if shard_size == 0 {
-            return (shards, errs);
+            return;
         }
 
         // Advance to the next stripe (see the matching note in `read`); the
@@ -1279,8 +1285,6 @@ where
         for i in retire_readers {
             self.readers[i] = None;
         }
-
-        (shards, errs)
     }
 
     /// Attempt to bring an as-yet-unread parity reader into the lockstep read
@@ -1335,12 +1339,22 @@ where
 #[async_trait::async_trait]
 impl<R> ShardStripeSource for ParallelReader<R>
 where
-    R: crate::erasure::coding::ShardSource,
+    R: crate::erasure::coding::ShardSource + 'static,
 {
-    async fn read_next_stripe(&mut self) -> StripeReadState {
-        let read_quorum = self.data_shards;
-        let (shards, errors) = ParallelReader::read(self).await;
-        StripeReadState::from_parts_with_read_costs(shards, errors, &self.read_costs, read_quorum)
+    async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
+        let mut state = self
+            .stripe_state
+            .take()
+            .unwrap_or_else(|| Box::new(StripeReadState::with_slot_count(self.readers.len(), self.data_shards)));
+        self.read_into_state(&mut state).await;
+        state
+    }
+
+    fn recycle_stripe(&mut self, mut state: Box<StripeReadState>) {
+        self.recycle_shards(state.shards_mut());
+        state.reset(0, self.data_shards);
+        debug_assert!(self.stripe_state.is_none(), "a stripe cannot be recycled twice");
+        self.stripe_state = Some(state);
     }
 }
 
@@ -1981,6 +1995,25 @@ mod tests {
         assert_eq!(spilled.len(), INLINE_SHARD_SLOTS + 1);
     }
 
+    #[test]
+    fn parallel_reader_keeps_stripe_scratch_out_of_line() {
+        eprintln!(
+            "parallel_reader={} stripe_state={} cached_state={}",
+            std::mem::size_of::<ParallelReader<Cursor<Vec<u8>>>>(),
+            std::mem::size_of::<StripeReadState>(),
+            std::mem::size_of::<Option<Box<StripeReadState>>>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<Box<StripeReadState>>>(),
+            std::mem::size_of::<usize>(),
+            "the request-scoped cache must remain pointer-sized",
+        );
+        assert!(
+            std::mem::size_of::<ParallelReader<Cursor<Vec<u8>>>>() < std::mem::size_of::<StripeReadState>(),
+            "the reader must not inline the stripe scratch into every async decode task",
+        );
+    }
+
     #[tokio::test]
     async fn parallel_reader_preserves_slot_count_above_inline_capacity() {
         const DATA_SHARDS: usize = INLINE_SHARD_SLOTS;
@@ -1995,6 +2028,35 @@ mod tests {
         assert!(errors.spilled());
         assert_eq!(shards.len(), TOTAL_SHARDS);
         assert_eq!(errors.len(), TOTAL_SHARDS);
+    }
+
+    #[tokio::test]
+    async fn codec_reader_reuses_inline_and_spilled_stripe_scratch_between_reads() {
+        for total_shards in [INLINE_SHARD_SLOTS, INLINE_SHARD_SLOTS + 1] {
+            let data_shards = total_shards - 1;
+            let readers = std::iter::repeat_with(|| None).take(total_shards).collect();
+            let erasure = Erasure::new(data_shards, 1, data_shards * 2);
+            let mut reader: ParallelReader<Cursor<Vec<u8>>> = ParallelReader::new(readers, erasure, 0, data_shards * 2);
+
+            let first = ShardStripeSource::read_next_stripe(&mut reader).await;
+            let first_state = (&*first) as *const StripeReadState;
+            let first_storage = first.scratch_storage();
+            assert_eq!(first_storage.2, total_shards > INLINE_SHARD_SLOTS);
+            assert_eq!(first_storage.3, total_shards > INLINE_SHARD_SLOTS);
+            ShardStripeSource::recycle_stripe(&mut reader, first);
+
+            let second = ShardStripeSource::read_next_stripe(&mut reader).await;
+            let second_storage = second.scratch_storage();
+
+            assert_eq!(
+                (&*second) as *const StripeReadState,
+                first_state,
+                "the request-scoped state must be reused"
+            );
+            assert_eq!(second_storage.0, first_storage.0, "shard slots must reuse their allocation");
+            assert_eq!(second_storage.1, first_storage.1, "error slots must reuse their allocation");
+            assert_eq!(second.into_parts().0.len(), total_shards);
+        }
     }
 
     /// Counts the raw bytes pulled from a shard stream, to prove which shards
