@@ -2916,6 +2916,10 @@ async fn stale_upload_lifecycle_due(
     upload_dir: &str,
     no_lock: bool,
 ) -> Option<OffsetDateTime> {
+    if rustfs_utils::http::contains_key_str(metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD) {
+        return None;
+    }
+
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
@@ -12185,6 +12189,58 @@ mod tests {
             .await
             .expect_err("multipart upload should be removed by zero-day lifecycle abort rule");
         assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_excludes_data_movement_from_abort_lifecycle() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-internal-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "logs/internal/object.bin";
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "lifecycle-exclusion-test".to_string(),
+        );
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    data_movement: true,
+                    mod_time: Some(initiated),
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("data movement multipart upload should be created");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        assert_eq!(deleted, 0, "bucket lifecycle must not remove active data movement uploads");
+
+        ecstore
+            .get_multipart_info(
+                &bucket,
+                object,
+                &upload.upload_id,
+                &ObjectOptions {
+                    data_movement: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("active data movement upload should remain available");
     }
 
     #[tokio::test]

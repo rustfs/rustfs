@@ -1736,6 +1736,13 @@ mod tests {
                         .expect("read compatible multipart target metadata");
                     assert_eq!(compatible_target.checksum, retry_source_info.checksum);
                     assert!(compatible_target.parts.iter().all(|part| part.checksums.is_none()));
+                    assert_eq!(
+                        rustfs_utils::http::get_consistent_str(
+                            &compatible_target.user_defined,
+                            rustfs_utils::http::SUFFIX_DATA_MOVED
+                        ),
+                        Some("true")
+                    );
                     assert!(!rustfs_utils::http::contains_key_str(
                         &compatible_target.user_defined,
                         rustfs_utils::http::SUFFIX_PART_CHECKSUMS
@@ -1768,8 +1775,8 @@ mod tests {
                     compatible_retry_reader.object_info = retry_source_info.clone();
                     temp_env::async_with_vars(
                         [
-                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, None::<&str>),
-                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED, None::<&str>),
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, Some("true")),
+                            (rustfs_config::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED, Some("true")),
                         ],
                         crate::data_movement::migrate_object(
                             store.clone(),
@@ -1781,7 +1788,20 @@ mod tests {
                         ),
                     )
                     .await
-                    .expect("compatible multipart migration retry should converge");
+                    .expect("pre-gate multipart target should converge after enabling checksum persistence");
+                    let compatible_target_after_retry = store.pools[1]
+                        .get_object_info(
+                            &bucket,
+                            retry_object,
+                            &ObjectOptions {
+                                include_part_checksums: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read pre-gate target after fleet-confirmed retry");
+                    assert_eq!(compatible_target_after_retry.data_dir, compatible_target.data_dir);
+                    assert_eq!(compatible_target_after_retry.parts, compatible_target.parts);
                     let compatible_uploads = store.pools[1]
                         .list_multipart_uploads(&bucket, retry_object, None, None, None, 100)
                         .await

@@ -393,6 +393,24 @@ pub(crate) fn data_movement_target_precondition() -> HTTPPreconditions {
     }
 }
 
+fn is_owned_data_movement_target(target: &ObjectInfo) -> bool {
+    let rustfs_marker = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED);
+    let minio_marker = format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+    if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED) != Some("true")
+        || target.user_defined.get(&rustfs_marker).map(String::as_str) != Some("true")
+        || target.user_defined.get(&minio_marker).map(String::as_str) != Some("true")
+    {
+        return false;
+    }
+
+    let tags_proof = format!("v1:{}", target.user_tags);
+    let rustfs_tags_proof = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED_TAGS);
+    let minio_tags_proof = format!("{}{SUFFIX_DATA_MOVED_TAGS}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+    rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED_TAGS) == Some(tags_proof.as_str())
+        && target.user_defined.get(&rustfs_tags_proof).map(String::as_str) == Some(tags_proof.as_str())
+        && target.user_defined.get(&minio_tags_proof).map(String::as_str) == Some(tags_proof.as_str())
+}
+
 pub(crate) fn can_replace_stale_data_movement_target(target: &ObjectInfo, opts: &ObjectOptions) -> bool {
     let Some(preconditions) = opts.http_preconditions.as_ref() else {
         return false;
@@ -405,21 +423,7 @@ pub(crate) fn can_replace_stale_data_movement_target(target: &ObjectInfo, opts: 
         return false;
     }
 
-    let rustfs_marker = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED);
-    let minio_marker = format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
-    if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED) != Some("true")
-        || target.user_defined.get(&rustfs_marker).map(String::as_str) != Some("true")
-        || target.user_defined.get(&minio_marker).map(String::as_str) != Some("true")
-    {
-        return false;
-    }
-    let tags_proof = format!("v1:{}", target.user_tags);
-    let rustfs_tags_proof = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED_TAGS);
-    let minio_tags_proof = format!("{}{SUFFIX_DATA_MOVED_TAGS}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
-    if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED_TAGS) != Some(tags_proof.as_str())
-        || target.user_defined.get(&rustfs_tags_proof).map(String::as_str) != Some(tags_proof.as_str())
-        || target.user_defined.get(&minio_tags_proof).map(String::as_str) != Some(tags_proof.as_str())
-    {
+    if !is_owned_data_movement_target(target) {
         return false;
     }
 
@@ -815,6 +819,15 @@ fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectI
         && is_equivalent_data_movement_object_identity(source, target, false, compare_part_checksums)
 }
 
+fn is_legacy_data_movement_checksum_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    let has_checksums = |part: &ObjectPartInfo| part.checksums.as_ref().is_some_and(|checksums| !checksums.is_empty());
+    source.parts.iter().any(has_checksums)
+        && target.parts.iter().all(|part| part.checksums.is_none())
+        && !rustfs_utils::http::contains_key_str(&target.user_defined, SUFFIX_PART_CHECKSUMS)
+        && is_owned_data_movement_target(target)
+        && is_equivalent_data_movement_object_identity(source, target, true, false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceCleanupPartIdentity {
     number: usize,
@@ -1189,6 +1202,10 @@ fn resolve_data_movement_overwrite_resume_result_for(
     };
 
     if is_equivalent_data_movement_object_identity(source, &target, true, compare_part_checksums) {
+        return Ok(true);
+    }
+
+    if compare_part_checksums && is_legacy_data_movement_checksum_target(source, &target) {
         return Ok(true);
     }
 
@@ -3218,8 +3235,18 @@ mod tests {
     }
 
     #[test]
-    fn test_overwrite_resume_omits_part_checksums_only_in_compatible_mode() {
-        let source = overwrite_equivalence_source();
+    fn test_overwrite_resume_accepts_owned_target_without_legacy_checksum_sidecar() {
+        let mut source = overwrite_equivalence_source();
+        let mut source_parts = source.parts.as_ref().clone();
+        source_parts.push(ObjectPartInfo {
+            number: 2,
+            etag: "second-part-etag".to_string(),
+            size: 64,
+            actual_size: 64,
+            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "second-part-checksum".to_string())])),
+            ..Default::default()
+        });
+        source.parts = Arc::new(source_parts);
         let mut target = source.clone();
         let mut target_parts = target.parts.as_ref().clone();
         for part in &mut target_parts {
@@ -3234,7 +3261,52 @@ mod tests {
         );
         assert!(
             !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target)), &source, 0, 1, true)
-                .expect("fleet-confirmed migration should compare persisted part checksums")
+                .expect("an unowned target must not bypass fleet-confirmed checksum comparison")
+        );
+
+        let mut owned_target = source.clone();
+        let mut owned_target_parts = owned_target.parts.as_ref().clone();
+        for part in &mut owned_target_parts {
+            part.checksums = None;
+        }
+        owned_target.parts = Arc::new(owned_target_parts);
+        rustfs_utils::http::insert_str(Arc::make_mut(&mut owned_target.user_defined), SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut owned_target.user_defined),
+            SUFFIX_DATA_MOVED_TAGS,
+            "v1:tag=value".to_string(),
+        );
+        assert!(
+            resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(owned_target.clone())), &source, 0, 1, true,)
+                .expect("an owned pre-gate target should remain compatible after enabling checksum persistence")
+        );
+
+        let mut partial_target = owned_target.clone();
+        let mut partial_target_parts = partial_target.parts.as_ref().clone();
+        partial_target_parts[0].checksums.clone_from(&source.parts[0].checksums);
+        partial_target.parts = Arc::new(partial_target_parts);
+        assert!(
+            !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(partial_target)), &source, 0, 1, true)
+                .expect("a partially missing checksum sidecar must fail closed")
+        );
+
+        let mut corrupt_target = owned_target.clone();
+        rustfs_utils::http::insert_str(Arc::make_mut(&mut corrupt_target.user_defined), SUFFIX_PART_CHECKSUMS, String::new());
+        assert!(
+            !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(corrupt_target)), &source, 0, 1, true)
+                .expect("a present but empty checksum sidecar must fail closed")
+        );
+
+        let mut conflicting_target = owned_target;
+        let mut conflicting_target_parts = conflicting_target.parts.as_ref().clone();
+        conflicting_target_parts[0].checksums = Some(HashMap::from([(
+            ChecksumType::CRC32C.to_string(),
+            "conflicting-part-checksum".to_string(),
+        )]));
+        conflicting_target.parts = Arc::new(conflicting_target_parts);
+        assert!(
+            !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(conflicting_target)), &source, 0, 1, true)
+                .expect("a conflicting checksum sidecar must fail closed")
         );
     }
 
