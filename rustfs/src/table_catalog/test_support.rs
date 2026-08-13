@@ -245,6 +245,21 @@ pub(crate) struct TestCatalogObjectBackend {
     pub(crate) state: Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
     pub(crate) locks: TestCatalogObjectLocks,
     pub(crate) strong_runtime: Option<StrongTableCatalogRuntime>,
+    // One-shot, path-keyed injection knobs from the admin handler tests'
+    // former TestTableCatalogObjectBackend (backlog#1837 PR2): each fires
+    // once for the named object and clears itself, mirroring the original
+    // semantics exactly. They compose with (and run before) the store tests'
+    // attempt-indexed injection maps above.
+    pub(crate) put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
+    pub(crate) fail_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub(crate) corrupt_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub(crate) missing_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub(crate) fail_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub(crate) lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// Content-addressed (sha256) etags instead of the store fake's counter.
+    /// The admin handler tests observe an object's etag and expect rewriting
+    /// identical bytes to reproduce it, so their fixtures set this.
+    pub(crate) content_addressed_etags: bool,
 }
 
 pub(crate) type TestCatalogObjectLockKey = (String, String);
@@ -559,6 +574,20 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     }
 
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let mut missing_read_object_path = self.missing_read_object_path.lock().await;
+        if missing_read_object_path.as_deref() == Some(object) {
+            missing_read_object_path.take();
+            return Ok(None);
+        }
+        drop(missing_read_object_path);
+
+        let mut fail_read_object_path = self.fail_read_object_path.lock().await;
+        if fail_read_object_path.as_deref() == Some(object) {
+            fail_read_object_path.take();
+            return Err(TableCatalogStoreError::Internal("private generated metadata read failure".to_string()));
+        }
+        drop(fail_read_object_path);
+
         let key = (bucket.to_string(), object.to_string());
         let (attempt, pause_before) = {
             let mut state = self.state.lock().await;
@@ -651,6 +680,22 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()> {
+        let mut fail_put_object_path = self.fail_put_object_path.lock().await;
+        if fail_put_object_path.as_deref() == Some(object) {
+            fail_put_object_path.take();
+            return Err(TableCatalogStoreError::Internal("injected metadata write failure".to_string()));
+        }
+        drop(fail_put_object_path);
+
+        let mut corrupt_put_object_path = self.corrupt_put_object_path.lock().await;
+        let data = if corrupt_put_object_path.as_deref() == Some(object) {
+            corrupt_put_object_path.take();
+            b"{}".to_vec()
+        } else {
+            data
+        };
+        drop(corrupt_put_object_path);
+
         let key = (bucket.to_string(), object.to_string());
         let (attempt, pause) = {
             let mut state = self.state.lock().await;
@@ -679,41 +724,54 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             pause.release.notified().await;
         }
 
-        let mut state = self.state.lock().await;
-        match precondition {
-            TableCatalogPutPrecondition::IfAbsent if state.objects.contains_key(&key) => {
-                return Err(TableCatalogStoreError::Conflict(format!("object already exists: {object}")));
-            }
-            TableCatalogPutPrecondition::IfMatch(expected) => {
-                let Some(current) = state.objects.get(&key) else {
-                    return Err(TableCatalogStoreError::Conflict(format!("object is missing: {object}")));
+        let result = {
+            let mut state = self.state.lock().await;
+            let precondition_failure = match &precondition {
+                TableCatalogPutPrecondition::IfAbsent if state.objects.contains_key(&key) => {
+                    Some(TableCatalogStoreError::Conflict(format!("object already exists: {object}")))
+                }
+                TableCatalogPutPrecondition::IfMatch(expected) => match state.objects.get(&key) {
+                    None => Some(TableCatalogStoreError::Conflict(format!("object is missing: {object}"))),
+                    Some(current) if &current.etag != expected => {
+                        Some(TableCatalogStoreError::Conflict(format!("object changed: {object}")))
+                    }
+                    Some(_) => None,
+                },
+                _ => None,
+            };
+            if let Some(err) = precondition_failure {
+                Err(err)
+            } else {
+                let etag = if self.content_addressed_etags {
+                    content_etag(&data)
+                } else {
+                    state.next_etag()
                 };
-                if current.etag != expected {
-                    return Err(TableCatalogStoreError::Conflict(format!("object changed: {object}")));
+                state.objects.insert(
+                    key.clone(),
+                    TestCatalogObjectRecord {
+                        data,
+                        etag,
+                        mod_time: Some(OffsetDateTime::now_utc()),
+                    },
+                );
+                if state
+                    .fail_after_put_attempts
+                    .get(&key)
+                    .is_some_and(|attempts| attempts.contains(&attempt))
+                {
+                    Err(TableCatalogStoreError::Internal(format!(
+                        "injected post-commit put failure for {object} attempt {attempt}"
+                    )))
+                } else {
+                    Ok(())
                 }
             }
-            _ => {}
+        };
+        if let Some(barrier) = &self.put_object_barrier {
+            barrier.wait().await;
         }
-
-        let etag = state.next_etag();
-        state.objects.insert(
-            key.clone(),
-            TestCatalogObjectRecord {
-                data,
-                etag,
-                mod_time: Some(OffsetDateTime::now_utc()),
-            },
-        );
-        if state
-            .fail_after_put_attempts
-            .get(&key)
-            .is_some_and(|attempts| attempts.contains(&attempt))
-        {
-            return Err(TableCatalogStoreError::Internal(format!(
-                "injected post-commit put failure for {object} attempt {attempt}"
-            )));
-        }
-        Ok(())
+        result
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
@@ -758,6 +816,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+        self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
         {
             let mut state = self.state.lock().await;
             *state
@@ -776,6 +835,10 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     }
 
     async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+        // The admin fake implemented only acquire_write_lock, so the trait's
+        // default read->write delegation made read acquisitions observable in
+        // lock_attempts as well; keep that (backlog#1837 PR2).
+        self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
         {
             let mut state = self.state.lock().await;
             *state
@@ -791,5 +854,88 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .clone()
         };
         Ok(Box::new(lock.read_owned().await))
+    }
+}
+
+fn content_etag(data: &[u8]) -> String {
+    use sha2::Digest;
+    hex_simd::encode_to_string(sha2::Sha256::digest(data), hex_simd::AsciiCase::Lower)
+}
+
+/// Admin-handler-test conveniences carried over from the former
+/// TestTableCatalogObjectBackend (backlog#1837 PR2): content-addressed etags
+/// (sha256), direct record insertion, and lock observability.
+impl TestCatalogObjectBackend {
+    /// Fake with the admin fixtures' content-addressed etag semantics.
+    pub(crate) fn content_addressed() -> Self {
+        Self {
+            content_addressed_etags: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) async fn put_bytes(&self, bucket: &str, object: &str, data: Vec<u8>) {
+        let etag = content_etag(&data);
+        self.state.lock().await.objects.insert(
+            (bucket.to_string(), object.to_string()),
+            TestCatalogObjectRecord {
+                data,
+                etag,
+                mod_time: None,
+            },
+        );
+    }
+
+    pub(crate) async fn put_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
+        self.put_json_with_mod_time(bucket, object, value, None).await;
+    }
+
+    pub(crate) async fn put_gzip_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
+        use std::io::Write;
+
+        let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&data).expect("metadata JSON should compress");
+        self.put_bytes(bucket, object, encoder.finish().expect("metadata gzip stream should finish"))
+            .await;
+    }
+
+    pub(crate) async fn put_json_with_mod_time(
+        &self,
+        bucket: &str,
+        object: &str,
+        value: serde_json::Value,
+        mod_time: Option<OffsetDateTime>,
+    ) {
+        let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
+        let etag = content_etag(&data);
+        self.state
+            .lock()
+            .await
+            .objects
+            .insert((bucket.to_string(), object.to_string()), TestCatalogObjectRecord { data, etag, mod_time });
+    }
+
+    pub(crate) async fn write_lock_is_held(&self, bucket: &str, object: &str) -> bool {
+        let lock = self
+            .locks
+            .lock()
+            .await
+            .get(&(bucket.to_string(), object.to_string()))
+            .cloned();
+        lock.is_some_and(|lock| lock.try_write_owned().is_err())
+    }
+
+    pub(crate) async fn wait_for_lock_attempts(&self, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if self.lock_attempts.lock().await.len() >= count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lock acquisition attempts should be observable");
     }
 }
