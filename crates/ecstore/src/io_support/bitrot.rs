@@ -606,42 +606,8 @@ pub(crate) async fn create_bitrot_reader_with_stage_metrics(
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
-    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
+    create_bitrot_reader_from_bytes_with_stage_metrics(
         inline_data.map(Bytes::copy_from_slice),
-        disk,
-        bucket,
-        path,
-        offset,
-        length,
-        shard_size,
-        checksum_algo,
-        skip_verify,
-        use_mmap_read,
-        stage_metrics,
-    )
-    .await
-}
-
-/// Stage-instrumented bitrot reader construction for metadata-owned inline data.
-///
-/// Unlike [`create_bitrot_reader_with_stage_metrics`], this keeps `Bytes`
-/// ownership shared instead of copying the inline shard into a new buffer.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
-    inline_data: Option<Bytes>,
-    disk: Option<&DiskStore>,
-    bucket: &str,
-    path: &str,
-    offset: usize,
-    length: usize,
-    shard_size: usize,
-    checksum_algo: HashAlgorithm,
-    skip_verify: bool,
-    use_mmap_read: bool,
-    stage_metrics: Option<BitrotReaderStageMetrics>,
-) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
-    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
-        inline_data,
         disk,
         bucket,
         path,
@@ -673,7 +639,7 @@ pub async fn create_bitrot_reader_from_bytes(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
-    create_bitrot_reader_from_bytes_with_stage_metrics_inner(
+    create_bitrot_reader_from_bytes_with_stage_metrics(
         inline_data,
         disk,
         bucket,
@@ -690,7 +656,7 @@ pub async fn create_bitrot_reader_from_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_bitrot_reader_from_bytes_with_stage_metrics_inner(
+pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     inline_data: Option<Bytes>,
     disk: Option<&DiskStore>,
     bucket: &str,

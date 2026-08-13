@@ -662,8 +662,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let codec_streaming_gate = get_codec_streaming_reader_gate(
             bucket,
             object,
-            &range,
             opts.part_number,
+            object_class,
             &object_info,
             &fi,
             lock_optimization_enabled,

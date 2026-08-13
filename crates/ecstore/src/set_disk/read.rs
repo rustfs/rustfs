@@ -4105,8 +4105,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             None,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4123,8 +4123,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             part_number,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -5656,6 +5656,64 @@ mod tests {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some("unknown"), || {
             assert_eq!(get_codec_streaming_engine(), GetCodecStreamingEngine::Legacy);
         });
+    }
+
+    #[test]
+    fn codec_streaming_config_cache_loads_once() {
+        use std::cell::Cell;
+
+        let loads = Cell::new(0);
+        let cache = OnceLock::new();
+        let expected = GetCodecStreamingConfig {
+            enabled: true,
+            rollout: GetCodecStreamingRollout::Off,
+            rollout_pct: 100,
+            body_compat_confirmed: true,
+            header_compat_confirmed: true,
+            engine: GetCodecStreamingEngine::Legacy,
+            min_size: DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        };
+
+        for _ in 0..3 {
+            assert_eq!(
+                cached_get_codec_streaming_config(&cache, || {
+                    loads.set(loads.get() + 1);
+                    expected
+                }),
+                expected
+            );
+        }
+        assert_eq!(loads.get(), 1, "production config cache must not reload env per GET");
+    }
+
+    #[test]
+    fn codec_streaming_config_loader_preserves_all_gate_env_overrides() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("production")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("37")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, Some("262144")),
+            ],
+            || {
+                assert_eq!(
+                    load_get_codec_streaming_config(),
+                    GetCodecStreamingConfig {
+                        enabled: false,
+                        rollout: GetCodecStreamingRollout::On,
+                        rollout_pct: 37,
+                        body_compat_confirmed: false,
+                        header_compat_confirmed: false,
+                        engine: GetCodecStreamingEngine::Rustfs,
+                        min_size: 262144,
+                    }
+                );
+            },
+        );
     }
 
     #[test]

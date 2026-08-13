@@ -1137,24 +1137,6 @@ pub fn is_deadlock_detection_enabled() -> bool {
 // require process restart to take effect.
 // ============================================================================
 
-/// Check if codec streaming is enabled (base flag).
-///
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
-/// In test mode, bypasses cache to allow per-test env var overrides.
-fn is_get_codec_streaming_enabled() -> bool {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-        })
-    }
-}
-
 /// Check if multipart codec streaming is enabled.
 ///
 /// When enabled, multipart objects use per-part codec streaming
@@ -1309,22 +1291,6 @@ fn is_multipart_reader_setup_prefetch_enabled() -> bool {
     }
 }
 
-// --- Rollout Percentage Functions ---
-
-fn get_codec_streaming_rollout_pct() -> u32 {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<u32> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-        })
-    }
-}
-
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1359,10 +1325,8 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
     (hash as u32) < rollout_pct
 }
 /// Should this specific request use codec streaming?
-pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
-    let base = is_get_codec_streaming_enabled();
-    let pct = get_codec_streaming_rollout_pct();
-    is_optimization_enabled_for_request(base, pct, bucket, object)
+fn should_use_codec_streaming(config: GetCodecStreamingConfig, bucket: &str, object: &str) -> bool {
+    is_optimization_enabled_for_request(config.enabled, config.rollout_pct, bucket, object)
 }
 
 /// Should this specific request use metadata early-stop?
@@ -1370,20 +1334,6 @@ pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
     let base = is_get_metadata_early_stop_enabled();
     let pct = get_metadata_early_stop_rollout_pct();
     is_optimization_enabled_for_request(base, pct, bucket, object)
-}
-
-fn get_codec_streaming_min_size() -> usize {
-    if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
-        return rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE);
-    }
-
-    match get_codec_streaming_engine() {
-        GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
-            ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-            DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-        ),
-        GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
-    }
 }
 
 fn is_get_codec_streaming_data_blocks_first_enabled() -> bool {
@@ -1488,8 +1438,18 @@ enum GetCodecStreamingEngine {
     Rustfs,
 }
 
-fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
-    let engine = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetCodecStreamingConfig {
+    enabled: bool,
+    rollout: GetCodecStreamingRollout,
+    rollout_pct: u32,
+    body_compat_confirmed: bool,
+    header_compat_confirmed: bool,
+    engine: GetCodecStreamingEngine,
+    min_size: usize,
+}
+
+fn parse_get_codec_streaming_engine(engine: &str) -> GetCodecStreamingEngine {
     match engine.trim() {
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_RUSTFS) => GetCodecStreamingEngine::Rustfs,
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_LEGACY) => GetCodecStreamingEngine::Legacy,
@@ -1497,8 +1457,7 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
     }
 }
 
-fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
-    let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
+fn parse_get_codec_streaming_rollout(rollout: &str) -> GetCodecStreamingRollout {
     match rollout.trim() {
         // Clean production token. `internal`/`benchmark` remain accepted aliases
         // for backward compatibility; all three opt the fast path in.
@@ -1515,20 +1474,61 @@ fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
     }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Body compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_body_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true)
+fn load_get_codec_streaming_config() -> GetCodecStreamingConfig {
+    let engine = parse_get_codec_streaming_engine(&rustfs_utils::get_env_str(
+        ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+        DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+    ));
+    let min_size = if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+    } else {
+        match engine {
+            GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+            ),
+            GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        }
+    };
+
+    GetCodecStreamingConfig {
+        enabled: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE),
+        rollout: parse_get_codec_streaming_rollout(&rustfs_utils::get_env_str(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+        )),
+        rollout_pct: rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+        ),
+        body_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true),
+        header_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true),
+        engine,
+        min_size,
+    }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Header compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_header_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true)
+fn cached_get_codec_streaming_config(
+    cache: &OnceLock<GetCodecStreamingConfig>,
+    load: impl FnOnce() -> GetCodecStreamingConfig,
+) -> GetCodecStreamingConfig {
+    *cache.get_or_init(load)
+}
+
+fn get_codec_streaming_config() -> GetCodecStreamingConfig {
+    #[cfg(test)]
+    {
+        load_get_codec_streaming_config()
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<GetCodecStreamingConfig> = OnceLock::new();
+        cached_get_codec_streaming_config(&CACHED, load_get_codec_streaming_config)
+    }
+}
+
+fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
+    get_codec_streaming_config().engine
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -1897,43 +1897,43 @@ fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
-    range: &Option<HTTPRangeSpec>,
     part_number: Option<usize>,
+    object_class: GetCodecStreamingObjectClass,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
 ) -> GetCodecStreamingGate {
-    let object_class = classify_get_codec_streaming_object_class(range, object_info, fi);
+    let config = get_codec_streaming_config();
 
-    if !is_get_codec_streaming_enabled() {
+    if !config.enabled {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !get_codec_streaming_rollout().is_opted_in() {
+    if !config.rollout.is_opted_in() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !should_use_codec_streaming(bucket, object) {
+    if !should_use_codec_streaming(config, bucket, object) {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_body_compat_confirmed() {
+    if !config.body_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_header_compat_confirmed() {
+    if !config.header_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed),
@@ -2006,7 +2006,7 @@ fn get_codec_streaming_reader_gate(
             };
         }
     }
-    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+    let Ok(min_size) = i64::try_from(config.min_size) else {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
