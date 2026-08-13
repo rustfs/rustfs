@@ -180,9 +180,9 @@ impl SetDisks {
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: Arc::new(fi.clone()),
-            parts_metadata: Arc::new(parts_metadata.to_vec()),
-            online_disks: Arc::new(online_disks.to_vec()),
+            fi: fi.clone(),
+            parts_metadata: parts_metadata.to_vec(),
+            online_disks: online_disks.to_vec(),
             read_quorum,
         });
         self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
@@ -300,11 +300,7 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok((
-                        GetObjectMetadata::Shared(Arc::clone(&cached.fi)),
-                        GetObjectMetadata::Shared(Arc::clone(&cached.parts_metadata)),
-                        GetObjectMetadata::Shared(Arc::clone(&cached.online_disks)),
-                    ));
+                    return Ok(GetObjectFileInfo::shared(cached));
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -436,11 +432,7 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        Ok((
-            GetObjectMetadata::Owned(fi),
-            GetObjectMetadata::Owned(parts_metadata),
-            GetObjectMetadata::Owned(op_online_disks),
-        ))
+        Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -450,14 +442,15 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, usize, Option<StorageError>) {
-        let fi = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
-            Ok((fi, _, _)) => fi,
+        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
+            Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), 0, Some(e)),
         };
+        let fi = snapshot.fi();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
@@ -2723,22 +2716,14 @@ mod metadata_cache_tests {
             .await
             .expect("fresh cache entry should be returned");
 
-        let (returned_fi, returned_parts_metadata, returned_online_disks) = set
+        let returned = set
             .get_object_fileinfo("bucket", "object", &ObjectOptions::default(), true, false)
             .await
             .expect("cache-backed metadata lookup should succeed");
 
         assert!(
-            matches!(returned_fi, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.fi)),
-            "cache hits must share FileInfo ownership"
-        );
-        assert!(
-            matches!(returned_parts_metadata, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.parts_metadata)),
-            "cache hits must share the metadata vector"
-        );
-        assert!(
-            matches!(returned_online_disks, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.online_disks)),
-            "cache hits must share the online-disk vector"
+            returned.shared_entry().is_some_and(|value| Arc::ptr_eq(value, &cached)),
+            "cache hits must share the complete metadata snapshot"
         );
     }
 
@@ -2781,9 +2766,9 @@ mod metadata_cache_tests {
                 ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: Arc::new(fi.clone()),
-                    parts_metadata: Arc::new(vec![fi]),
-                    online_disks: Arc::new(vec![None]),
+                    fi: fi.clone(),
+                    parts_metadata: vec![fi],
+                    online_disks: vec![None],
                     read_quorum: 1,
                 }),
             )
@@ -2877,13 +2862,12 @@ mod metadata_cache_tests {
         barrier.wait_until_paused().await;
         set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
-        let (fi, parts_metadata, online_disks) = read
+        let snapshot = read
             .await
             .expect("metadata read task should not panic")
             .expect("metadata fanout should still return its selected FileInfo");
-        assert!(matches!(fi, GetObjectMetadata::Owned(_)));
-        assert!(matches!(parts_metadata, GetObjectMetadata::Owned(_)));
-        assert!(matches!(online_disks, GetObjectMetadata::Owned(_)));
+        assert!(snapshot.owned.is_some());
+        assert!(snapshot.has_valid_representation());
 
         assert!(
             set.get_object_metadata_cache
@@ -2930,9 +2914,9 @@ mod metadata_cache_tests {
         let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: Arc::new(fi.clone()),
-            parts_metadata: Arc::new(vec![fi]),
-            online_disks: Arc::new(Vec::new()),
+            fi: fi.clone(),
+            parts_metadata: vec![fi],
+            online_disks: Vec::new(),
             read_quorum: 0,
         });
 
@@ -3040,9 +3024,9 @@ mod metadata_cache_tests {
         let entry = |fi: FileInfo| {
             Arc::new(GetObjectMetadataCacheEntry {
                 created_at: Instant::now(),
-                parts_metadata: Arc::new(vec![fi.clone()]),
-                fi: Arc::new(fi),
-                online_disks: Arc::new(Vec::new()),
+                parts_metadata: vec![fi.clone()],
+                fi,
+                online_disks: Vec::new(),
                 read_quorum: 0,
             })
         };
@@ -4105,8 +4089,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             None,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4123,8 +4107,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             part_number,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4850,6 +4834,114 @@ mod tests {
         .await
     }
 
+    async fn encoded_inline_blocks(blocks: &[&[u8]], shard_size: usize, hash_algo: HashAlgorithm) -> Bytes {
+        let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo);
+        for block in blocks {
+            writer.write(block).await.expect("test block should be encoded");
+        }
+        Bytes::from(writer.into_inner().into_inner())
+    }
+
+    fn assert_reader_shares_inline_allocation(reader: &ObjectBitrotReader, source: &Bytes) {
+        let reader_bytes = reader
+            .inner_ref()
+            .inline_bytes()
+            .expect("inline scheduler should retain an in-memory Bytes source");
+        assert_eq!(
+            reader_bytes.as_ptr(),
+            source.as_ptr(),
+            "the scheduler must clone Bytes ownership instead of copying the inline shard payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_range_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let first = [b'a'; SHARD_SIZE];
+        let second = [b'b'; SHARD_SIZE];
+        let mut source = encoded_inline_blocks(&[&first, &second], SHARD_SIZE, hash_algo.clone()).await;
+        let second_payload = hash_algo.size() * 2 + SHARD_SIZE;
+        source = {
+            let mut corrupt = source.to_vec();
+            corrupt[second_payload] ^= 0xff;
+            Bytes::from(corrupt)
+        };
+        let files = vec![encoded_reader_setup_fileinfo(Some(source.to_vec()))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_with_preference(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            1,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("range reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt ranged inline block must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn inline_part_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let block = [b'p'; SHARD_SIZE];
+        let encoded = encoded_inline_blocks(&[&block], SHARD_SIZE, hash_algo.clone()).await;
+        let mut corrupt = encoded.to_vec();
+        corrupt[hash_algo.size()] ^= 0xff;
+        let files = vec![encoded_reader_setup_fileinfo(Some(corrupt))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_all_shards(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            7,
+            0,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("part reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt inline part must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
     async fn decode_codec_data_blocks_first_setup(
         erasure: coding::Erasure,
         data: &[u8],
@@ -5548,6 +5640,63 @@ mod tests {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some("unknown"), || {
             assert_eq!(get_codec_streaming_engine(), GetCodecStreamingEngine::Legacy);
         });
+    }
+
+    #[test]
+    fn codec_streaming_config_cache_loads_once() {
+        use std::cell::Cell;
+
+        let loads = Cell::new(0);
+        let expected = GetCodecStreamingConfig {
+            enabled: true,
+            rollout: GetCodecStreamingRollout::Off,
+            rollout_pct: 100,
+            body_compat_confirmed: true,
+            header_compat_confirmed: true,
+            engine: GetCodecStreamingEngine::Legacy,
+            min_size: DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        };
+
+        for _ in 0..3 {
+            assert_eq!(
+                get_codec_streaming_config_cached_core(|| {
+                    loads.set(loads.get() + 1);
+                    expected
+                }),
+                expected
+            );
+        }
+        assert_eq!(loads.get(), 1, "production config cache must not reload env per GET");
+    }
+
+    #[test]
+    fn codec_streaming_config_loader_preserves_all_gate_env_overrides() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("production")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("37")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, Some("262144")),
+            ],
+            || {
+                assert_eq!(
+                    load_get_codec_streaming_config(),
+                    GetCodecStreamingConfig {
+                        enabled: false,
+                        rollout: GetCodecStreamingRollout::On,
+                        rollout_pct: 37,
+                        body_compat_confirmed: false,
+                        header_compat_confirmed: false,
+                        engine: GetCodecStreamingEngine::Rustfs,
+                        min_size: 262144,
+                    }
+                );
+            },
+        );
     }
 
     #[test]
