@@ -156,7 +156,11 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const AMZ_REQUEST_ID: &str = "x-amz-request-id";
 pub const AMZ_REQUEST_HOST_ID: &str = "x-amz-id-2";
 
-// Content Checksums
+// Content Checksums. The standard five x-amz-checksum-* names also exist in
+// the zero-internal-dependency rustfs-checksums leaf crate
+// (crates/checksums/src/http.rs, which additionally owns the RustFS
+// extension names); values are pinned by the S3 wire protocol — keep both
+// sides in sync (backlog#1833).
 pub const AMZ_CHECKSUM_ALGO: &str = "x-amz-checksum-algorithm";
 pub const AMZ_CHECKSUM_CRC32: &str = "x-amz-checksum-crc32";
 pub const AMZ_CHECKSUM_CRC32C: &str = "x-amz-checksum-crc32c";
