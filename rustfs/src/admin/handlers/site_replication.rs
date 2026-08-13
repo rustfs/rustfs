@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_deployment_id, current_endpoints_handle, current_federated_identity_service, current_iam_handle,
@@ -41,10 +41,10 @@ use crate::admin::storage_api::contract::bucket::{
 use crate::admin::storage_api::error::Error as StorageError;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
-use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
+use crate::auth::constant_time_eq;
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::{
     delete_config_no_lock, lock_bucket_targets_metadata, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
     with_config_object_write_lock,
@@ -916,17 +916,7 @@ async fn validate_site_replication_admin_request(
     req: &S3Request<Body>,
     action: AdminAction,
 ) -> S3Result<rustfs_credentials::Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
-    };
-
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
-
-    Ok(cred)
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
 }
 
 fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
