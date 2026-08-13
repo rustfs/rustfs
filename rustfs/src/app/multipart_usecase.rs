@@ -46,6 +46,7 @@ use super::storage_api::multipart_usecase::options::{
     get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
     put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
+use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
@@ -61,7 +62,6 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
-use super::storage_api::request_context::spawn_traced_join;
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
