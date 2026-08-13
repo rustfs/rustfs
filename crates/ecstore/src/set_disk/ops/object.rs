@@ -7802,6 +7802,139 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn no_lock_restore_finalize_requires_live_namespace_fence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-finalize-fence-bucket";
+        let object = "object.bin";
+        let payload = b"restore finalize no_lock fence must fail closed".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_id = Uuid::new_v4();
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore metadata should be installed");
+        let restoring = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should be readable");
+
+        let err = set_disks
+            .finalize_restore_metadata(
+                bucket,
+                object,
+                &restoring,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("lost outer namespace fence must reject no_lock restore finalization");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should remain readable");
+        let restore_status = parse_restore_obj_status(
+            current
+                .user_defined
+                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .expect("restore header must remain pending"),
+        )
+        .expect("restore header should remain parseable");
+        assert!(
+            restore_status.on_going(),
+            "lost no_lock finalization must not publish restored completion metadata"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_lock_restore_cleanup_requires_live_namespace_fence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-fence-bucket";
+        let object = "object.bin";
+        let payload = b"restore cleanup no_lock fence must fail closed".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_id = Uuid::new_v4();
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore metadata should be installed");
+        let restoring = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should be readable");
+
+        let err = set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &restoring,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("lost outer namespace fence must reject no_lock restore cleanup");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restore metadata should remain readable");
+        assert!(
+            current.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "lost no_lock cleanup must not remove the restore header"
+        );
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_id.to_string().as_str()),
+            "lost no_lock cleanup must not remove the restore operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn restore_worker_propagates_operation_id_to_final_put_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "restore-worker-commit-operation-id-bucket";
