@@ -57,6 +57,17 @@ impl ScriptedResponse {
         }
     }
 
+    /// The 404 Vault answers a LIST of an empty path with: something routed the
+    /// request and found nothing under it, so the `errors` array comes back
+    /// empty. [`ScriptedResponse::error`] cannot stand in — it always fills
+    /// `errors`, which is what marks a 404 as an unrouted path instead.
+    pub(crate) fn empty_list_404() -> Self {
+        Self::Http {
+            status: 404,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }
+    }
+
     /// Close the connection after consuming a request without sending an HTTP response.
     pub(crate) fn close() -> Self {
         Self::Close

@@ -107,7 +107,7 @@ async fn drop_table(dsn: &str, table: &str) {
         .await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn direct_write_and_read() {
     let dsn = test_dsn();
@@ -131,7 +131,7 @@ async fn direct_write_and_read() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn delete_appends_row_does_not_remove_old() {
     let dsn = test_dsn();
@@ -155,7 +155,7 @@ async fn delete_appends_row_does_not_remove_old() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn queue_store_saves_entry_and_replays() {
     let dsn = test_dsn();
@@ -195,7 +195,7 @@ async fn queue_store_saves_entry_and_replays() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn duplicate_replay_produces_duplicate_rows() {
     let dsn = test_dsn();
@@ -236,7 +236,7 @@ async fn duplicate_replay_produces_duplicate_rows() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn incompatible_schema_init_fails() {
     let dsn = test_dsn();
@@ -267,7 +267,7 @@ async fn incompatible_schema_init_fails() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn check_mysql_server_available_succeeds_against_existing_table() {
     let dsn = test_dsn();

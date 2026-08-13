@@ -271,6 +271,7 @@ impl StaticKmsBackend {
             created_by: None,
             rotation_due: false,
             rotation_due_reason: None,
+            wrap_budget_reserved: None,
         })
     }
 

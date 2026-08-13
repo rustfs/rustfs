@@ -309,9 +309,17 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+// The chaos machinery below is compiled only for tests and the opt-in
+// `list-chaos` feature (backlog#1832): a production binary without the
+// feature carries no chaos symbols, so the two env vars cannot silently
+// rewrite a bucket's namespace-journal state.
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
@@ -552,7 +560,9 @@ static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SCANNER_NAMESPACE_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG: OnceCell<Option<NamespaceMutationJournalChaosConfig>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
@@ -579,6 +589,7 @@ async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<Ha
         .await
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_config() -> Option<&'static NamespaceMutationJournalChaosConfig> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG
         .get_or_init(|| async { namespace_mutation_journal_chaos_config_from_env() })
@@ -586,6 +597,7 @@ async fn list_objects_namespace_journal_chaos_config() -> Option<&'static Namesp
         .as_ref()
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_applied() -> &'static RwLock<HashSet<String>> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED
         .get_or_init(|| async { RwLock::new(HashSet::new()) })
@@ -681,6 +693,7 @@ enum NamespaceMutationJournalStatus {
 }
 
 impl NamespaceMutationJournalStatus {
+    #[cfg(any(test, feature = "list-chaos"))]
     fn from_env_value(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY) {
             Some(Self::Healthy)
@@ -691,6 +704,7 @@ impl NamespaceMutationJournalStatus {
         }
     }
 
+    #[cfg(any(test, feature = "list-chaos"))]
     fn env_value(self) -> &'static str {
         match self {
             Self::Healthy => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY,
@@ -712,6 +726,7 @@ struct NamespaceMutationJournalSnapshot {
     degraded: bool,
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceMutationJournalChaosConfig {
     bucket: String,
@@ -795,30 +810,35 @@ fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_enabled_from_env() -> bool {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_bucket_from_env() -> Option<String> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET)
         .ok()
         .filter(|bucket| !bucket.is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_sequence_from_env() -> Option<u64> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_status_from_env() -> Option<NamespaceMutationJournalStatus> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS)
         .ok()
         .and_then(|value| NamespaceMutationJournalStatus::from_env_value(&value))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutationJournalChaosConfig> {
     if !namespace_mutation_journal_chaos_enabled_from_env() {
         return None;
@@ -846,6 +866,7 @@ fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutatio
     })
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceMutationJournalStatus) -> String {
     let mut key = String::with_capacity(bucket.len() + 1 + status.env_value().len());
     key.push_str(bucket);
@@ -854,6 +875,13 @@ fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceM
     key
 }
 
+/// Production no-op twin of the chaos injector: without `list-chaos` the
+/// injection point compiles to nothing (backlog#1832).
+#[cfg(not(any(test, feature = "list-chaos")))]
+#[inline]
+async fn maybe_apply_system_namespace_mutation_journal_chaos(_store: &ECStore, _bucket: &str, _default_sequence: u64) {}
+
+#[cfg(any(test, feature = "list-chaos"))]
 async fn maybe_apply_system_namespace_mutation_journal_chaos(store: &ECStore, bucket: &str, default_sequence: u64) {
     let Some(config) = list_objects_namespace_journal_chaos_config().await else {
         return;

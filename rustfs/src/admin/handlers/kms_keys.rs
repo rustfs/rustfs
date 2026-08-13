@@ -976,6 +976,9 @@ mod tests {
             // default, and only a populated one fixes the wire names.
             rotation_due: true,
             rotation_due_reason: Some(RotationDueReason::Age),
+            // `#[serde(skip)]`: populated on purpose so the snapshot proves the
+            // wrap counter stays off the admin wire even when a backend set it.
+            wrap_budget_reserved: Some(1_000_000),
         }
     }
 

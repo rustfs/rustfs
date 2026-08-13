@@ -27,7 +27,6 @@
 - **Metrics Collection**: Unified metrics recording and reporting
 - **Bandwidth Monitoring**: Real-time bandwidth observation and analysis
 - **Performance Metrics**: I/O performance metrics collection
-- **Unified Configuration**: Centralized configuration management
 - **Exporter Boundary**: Emit via `metrics`, export via `rustfs-obs`, no Prometheus HTTP endpoint
 
 ## Features
@@ -203,30 +202,6 @@ path and include:
 deltas with `operation` and `backend` columns, so the TCP baseline can attribute
 bytes and request/error counts to `tcp-http` transport operations.
 
-### Unified Configuration
-
-Centralized configuration management:
-
-```rust
-use rustfs_io_metrics::{
-    IoConfig, CacheSettings, IoSchedulerSettings,
-    BackpressureSettings, TimeoutSettings,
-};
-
-let config = IoConfig::new()
-    .with_cache(CacheSettings::new()
-        .with_max_capacity(10_000)
-        .with_ttl(std::time::Duration::from_secs(300)))
-    .with_scheduler(IoSchedulerSettings::new()
-        .with_max_concurrent_reads(64))
-    .with_backpressure(BackpressureSettings::new())
-    .with_timeout(TimeoutSettings::new());
-
-// Access configuration
-println!("Cache capacity: {}", config.cache.max_capacity);
-println!("Max concurrent reads: {}", config.scheduler.max_concurrent_reads);
-```
-
 ## Module Structure
 
 ```
@@ -235,7 +210,6 @@ rustfs-io-metrics/
 │   ├── lib.rs               # Module entry
 │   ├── cache_config.rs      # Cache configuration
 │   ├── adaptive_ttl.rs      # Adaptive TTL
-│   ├── config.rs            # Unified configuration
 │   ├── io_metrics.rs        # I/O metrics
 │   ├── backpressure_metrics.rs # Backpressure metrics
 │   ├── deadlock_metrics.rs  # Deadlock metrics
@@ -278,7 +252,6 @@ Useful source references:
 
 - [Crate API overview](./src/lib.rs)
 - [Metrics example](./examples/metrics_example.rs)
-- [Configuration module](./src/config.rs)
 - [Adaptive TTL module](./src/adaptive_ttl.rs)
 
 ## Related Modules

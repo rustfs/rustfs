@@ -27,12 +27,24 @@ use crate::client::utils::base64_decode;
 use crate::client::utils::base64_encode;
 use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
 use crate::{disk::DiskAPI, object_api::GetObjectReader};
+// s3s::header has no CRC64NVME constant yet; the canonical RustFS copy lives
+// in rustfs-utils' headers module.
+use rustfs_utils::http::headers::AMZ_CHECKSUM_CRC64NVME;
 use s3s::header::{
     X_AMZ_CHECKSUM_ALGORITHM, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_CRC32C, X_AMZ_CHECKSUM_SHA1, X_AMZ_CHECKSUM_SHA256,
 };
 
 use enumset::{EnumSet, EnumSetType, enum_set};
 
+/// One of three deliberately separate checksum registries (backlog#1833):
+/// this enum is the MinIO-port client's wire vocabulary and stops at the
+/// standard S3 set (CRC64NVME is its newest member; the RustFS extensions do
+/// not exist on this client path). The streaming-hash registry lives in
+/// `rustfs_checksums::ChecksumAlgorithm` (crates/checksums/src/lib.rs) and
+/// the on-disk xl.meta bitset in `rustfs_rio::ChecksumType`
+/// (crates/rio/src/checksum.rs, varint bits are append-only). When adding an
+/// algorithm, extend all three (or record why not) — they do not derive from
+/// each other.
 #[derive(Debug, EnumSetType, Default)]
 #[enumset(repr = "u8")]
 pub enum ChecksumMode {
@@ -57,8 +69,6 @@ lazy_static! {
     static ref C_ChecksumFullObjectCRC32C: EnumSet<ChecksumMode> =
         enum_set!(ChecksumMode::ChecksumCRC32C | ChecksumMode::ChecksumFullObject);
 }
-const AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
-
 impl ChecksumMode {
     //pub const CRC64_NVME_POLYNOMIAL: i64 = 0xad93d23594c93659;
 

@@ -179,7 +179,7 @@ impl Oss {
 
 #[tokio::test]
 #[serial]
-#[ignore]
+#[ignore = "requires a running RustFS server at TEST_RUSTFS_SERVER (default http://localhost:9000)"]
 async fn test_lifecycle_minio_sdk() -> Result<()> {
     let settings = Settings::new();
     let oss = Oss::new(&settings).await?;
