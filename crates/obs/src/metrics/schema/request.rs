@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 /// name label
@@ -32,6 +30,13 @@ const API_SERVER_NAME_TYPE_LE_LABELS: [&str; 4] = [SERVER_LABEL, NAME_LABEL, TYP
 const API_TYPE_LABELS: [&str; 1] = [TYPE_LABEL];
 const API_SERVER_TYPE_LABELS: [&str; 2] = [SERVER_LABEL, TYPE_LABEL];
 
+// Declared for MinIO metric parity but never emitted: no collector passes these
+// descriptors to `PrometheusMetric::from_descriptor`, so the wire names
+// (`rejected_auth_total`, `rejected_header_total`, `rejected_timestamp_total`,
+// `rejected_invalid_total`, `waiting_total`, `incoming_total`) never appear in a
+// scrape. Kept so the gap stays greppable rather than silently disappearing with
+// their `MetricName` variants; wiring an emitter is what retires these allows.
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REJECTED_AUTH_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiRejectedAuthTotal,
@@ -41,6 +46,7 @@ pub static API_REJECTED_AUTH_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::ne
     )
 });
 
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REJECTED_HEADER_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiRejectedHeaderTotal,
@@ -50,6 +56,7 @@ pub static API_REJECTED_HEADER_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::
     )
 });
 
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REJECTED_TIMESTAMP_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiRejectedTimestampTotal,
@@ -59,6 +66,7 @@ pub static API_REJECTED_TIMESTAMP_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLoc
     )
 });
 
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REJECTED_INVALID_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiRejectedInvalidTotal,
@@ -68,6 +76,7 @@ pub static API_REJECTED_INVALID_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock:
     )
 });
 
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REQUESTS_WAITING_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ApiRequestsWaitingTotal,
@@ -77,6 +86,7 @@ pub static API_REQUESTS_WAITING_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock:
     )
 });
 
+#[allow(dead_code, reason = "declared metric with no emitter; see note above (backlog#1823)")]
 pub static API_REQUESTS_INCOMING_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ApiRequestsIncomingTotal,
