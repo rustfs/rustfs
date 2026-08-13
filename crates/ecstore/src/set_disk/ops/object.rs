@@ -660,7 +660,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
-            let erasure = erasure_from_file_info(fi, fi.uses_legacy_checksum)?;
+            let erasure = self.erasure_cache.get_for_file_info(fi)?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
             let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
@@ -829,6 +829,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
                 bucket,
                 object,
+                Arc::clone(&self.erasure_cache),
                 fi,
                 files,
                 disks,
@@ -864,6 +865,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             Self::get_object_with_fileinfo(
                 bucket,
                 object,
+                Arc::clone(&self.erasure_cache),
                 0,
                 object_info.size,
                 &mut output,
@@ -907,6 +909,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 match Self::get_object_decode_reader_with_fileinfo(
                     bucket,
                     object,
+                    Arc::clone(&self.erasure_cache),
                     fi,
                     files,
                     disks,
@@ -971,6 +974,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
         tokio::spawn(async move {
             let _guard = read_lock_guard;
@@ -982,6 +986,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
+                erasure_cache,
                 offset,
                 length,
                 &mut writer,
@@ -5009,11 +5014,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
         let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(cloned_fi.size);
+        let erasure_cache = Arc::clone(&self.erasure_cache);
         let producer = async move {
             let mut writer = TransitionUploadWriter::new(pw);
             Self::get_object_with_fileinfo(
                 &cloned_bucket,
                 &cloned_object,
+                erasure_cache,
                 0,
                 cloned_fi.size,
                 &mut writer,
@@ -5987,6 +5994,37 @@ mod inline_put_commit_path_tests {
             .await
             .expect("inline object should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn repeated_gets_reuse_the_set_erasure_shell() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "get-erasure-shell-cache";
+        let object = "object.bin";
+        let payload = vec![0x4d; 1024 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("non-inline object should commit");
+        assert!(set_disks.erasure_cache.entries.read().is_empty());
+
+        for _ in 0..2 {
+            let mut object_reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("cached-shell GET should succeed");
+            let mut restored = Vec::new();
+            object_reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("cached-shell GET should stream");
+            assert_eq!(restored, payload);
+            assert_eq!(set_disks.erasure_cache.entries.read().len(), 1);
+        }
     }
 
     #[tokio::test]

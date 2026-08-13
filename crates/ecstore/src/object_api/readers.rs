@@ -15,6 +15,7 @@
 use super::*;
 
 use crate::io_support::rio::Index;
+use std::mem::MaybeUninit;
 
 #[cfg(feature = "rio-v2")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
@@ -922,7 +923,7 @@ struct SkipReader<R> {
     inner: R,
     bytes_to_skip: usize,
     bytes_skipped: usize,
-    scratch: Vec<u8>,
+    scratch: Box<[MaybeUninit<u8>]>,
 }
 
 impl<R: AsyncRead + Unpin + Send + Sync> SkipReader<R> {
@@ -931,7 +932,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> SkipReader<R> {
             inner,
             bytes_to_skip,
             bytes_skipped: 0,
-            scratch: vec![0u8; 8192],
+            scratch: Box::<[u8]>::new_uninit_slice(8192),
         }
     }
 }
@@ -943,7 +944,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for SkipReader<R> {
         while this.bytes_skipped < this.bytes_to_skip {
             let remaining = this.bytes_to_skip - this.bytes_skipped;
             let scratch_len = remaining.min(this.scratch.len());
-            let mut scratch_buf = ReadBuf::new(&mut this.scratch[..scratch_len]);
+            let mut scratch_buf = ReadBuf::uninit(&mut this.scratch[..scratch_len]);
             match Pin::new(&mut this.inner).poll_read(cx, &mut scratch_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -974,7 +975,7 @@ pub struct RangedDecompressReader<R: AsyncRead + Unpin + Send + Sync + 'static> 
     target_length: usize,
     current_offset: usize,
     bytes_returned: usize,
-    scratch: Vec<u8>,
+    scratch: Box<[MaybeUninit<u8>]>,
     drain_on_done: bool,
     drain_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1012,7 +1013,7 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> RangedDecompressReader<R> {
             target_length: actual_length,
             current_offset: 0,
             bytes_returned: 0,
-            scratch: vec![0u8; 8192],
+            scratch: Box::<[u8]>::new_uninit_slice(8192),
             drain_on_done,
             drain_task: None,
         })
@@ -1062,7 +1063,7 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompres
             }
 
             let scratch_len = std::cmp::min(this.scratch.len(), std::cmp::max(buf_capacity, 1));
-            let mut temp_read_buf = ReadBuf::new(&mut this.scratch[..scratch_len]);
+            let mut temp_read_buf = ReadBuf::uninit(&mut this.scratch[..scratch_len]);
 
             let Some(inner) = this.inner.as_mut() else {
                 return Poll::Ready(Ok(()));
@@ -1114,7 +1115,8 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompres
                             );
 
                             if bytes_to_return > 0 {
-                                let data_slice = &this.scratch[data_start_in_buffer..data_start_in_buffer + bytes_to_return];
+                                let data_slice =
+                                    &temp_read_buf.filled()[data_start_in_buffer..data_start_in_buffer + bytes_to_return];
                                 buf.put_slice(data_slice);
                                 this.bytes_returned += bytes_to_return;
 
@@ -1133,7 +1135,7 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompres
                             std::cmp::min(n, std::cmp::min(buf.remaining(), this.target_length - this.bytes_returned));
 
                         if bytes_to_return > 0 {
-                            buf.put_slice(&this.scratch[..bytes_to_return]);
+                            buf.put_slice(&temp_read_buf.filled()[..bytes_to_return]);
                             this.bytes_returned += bytes_to_return;
 
                             tracing::trace!("Returned {} bytes at offset {}", bytes_to_return, old_offset);
@@ -1262,6 +1264,43 @@ mod tests {
     use std::io::Cursor;
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
+
+    #[derive(Debug)]
+    struct PendingPartialReader {
+        data: &'static [u8],
+        position: usize,
+        pending: bool,
+    }
+
+    impl PendingPartialReader {
+        fn new(data: &'static [u8]) -> Self {
+            Self {
+                data,
+                position: 0,
+                pending: true,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingPartialReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if self.position == self.data.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let length = buf.remaining().min(3).min(self.data.len() - self.position);
+            let end = self.position + length;
+            buf.put_slice(&self.data[self.position..end]);
+            self.position = end;
+            self.pending = true;
+            Poll::Ready(Ok(()))
+        }
+    }
 
     const TEST_DIRECT_KEY_HEADER: &str = "x-rustfs-test-direct-key";
     const TEST_OBJECT_KEY_HEADER: &str = "x-rustfs-test-object-key";
@@ -1398,6 +1437,36 @@ mod tests {
 
         // Should read "World" (5 bytes starting from position 7)
         assert_eq!(result, b"World");
+    }
+
+    #[tokio::test]
+    async fn uninitialized_scratch_preserves_partial_pending_and_eof_reads() {
+        let mut skipped = SkipReader::new(PendingPartialReader::new(b"0123456789abcdef"), 5);
+        let mut skipped_output = Vec::new();
+        skipped
+            .read_to_end(&mut skipped_output)
+            .await
+            .expect("skip reader should survive partial pending reads through EOF");
+        assert_eq!(skipped_output, b"56789abcdef");
+
+        let mut ranged = RangedDecompressReader::new(PendingPartialReader::new(b"0123456789abcdef"), 5, 7, 16)
+            .expect("valid range should construct");
+        let mut ranged_output = Vec::new();
+        ranged
+            .read_to_end(&mut ranged_output)
+            .await
+            .expect("range reader should survive partial pending reads through EOF");
+        assert_eq!(ranged_output, b"56789ab");
+    }
+
+    #[tokio::test]
+    async fn uninitialized_skip_scratch_reports_early_eof() {
+        let mut reader = SkipReader::new(PendingPartialReader::new(b"short"), 6);
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("EOF before the skip boundary must remain visible");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
