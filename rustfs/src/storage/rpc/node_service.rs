@@ -4492,9 +4492,27 @@ mod tests {
         assert!(refresh_response.error_info.is_some());
     }
 
+    /// Premise guard for the no-object-layer RPC tests (backlog#1830): they
+    /// assert the error surface returned while the global object layer is
+    /// absent. Under nextest — the authoritative runner — every test owns its
+    /// process, so the premise always holds and the assertion always runs.
+    /// Under the documented shared-process `cargo test` fallback a sibling test
+    /// may have initialized the store first; the premise is then unattainable,
+    /// so the test skips instead of asserting against a scenario it does not
+    /// describe.
+    fn no_object_layer_premise_holds() -> bool {
+        if crate::runtime_sources::current_object_store_handle().is_some() {
+            eprintln!("skipping no-object-layer assertion: a sibling test already initialized the global object layer");
+            return false;
+        }
+        true
+    }
+
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_local_storage_info() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LocalStorageInfoRequest { metrics: false });
@@ -4799,8 +4817,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_pool_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadPoolMetaRequest {});
@@ -4815,8 +4835,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_stop_rebalance() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(StopRebalanceRequest {
@@ -4833,8 +4855,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_rebalance_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance: false });
@@ -4929,8 +4953,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadBucketMetadataRequest {
@@ -4948,8 +4974,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_transition_tier_config_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let response = service
@@ -5169,8 +5197,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_site_replication_config() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadSiteReplicationConfigRequest {});
@@ -5630,7 +5660,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_refresh_config_requires_object_layer() {
         let service = create_test_node_service();
@@ -5652,7 +5681,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_reload_dynamic_requires_object_layer() {
         let service = create_test_node_service();

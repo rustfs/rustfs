@@ -3099,6 +3099,62 @@ fn next_metadata_file_name(generation: u64, metadata_file_token: &str) -> String
     format!("{generation:05}-{metadata_file_token}.metadata.json")
 }
 
+fn table_scoped_metadata_file_name(generation: u64, table_id: &str, metadata_file_token: &str) -> String {
+    let scoped_token = table_catalog_path_hash(&format!("table-metadata:{}:{table_id}{metadata_file_token}", table_id.len()));
+    format!("{generation:05}-table-{scoped_token}.metadata.json")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedMetadataComparison {
+    MatchingCommit,
+    DifferentTable,
+}
+
+fn generated_metadata_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    match err {
+        err @ crate::table_catalog::TableCatalogStoreError::Conflict(_) => catalog_store_error(err),
+        _ => iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "existing generated metadata is invalid",
+        ),
+    }
+}
+
+fn compare_generated_metadata_with_standard_commit(
+    metadata: &serde_json::Value,
+    expected_metadata: &serde_json::Value,
+    updates: &[serde_json::Value],
+    previous_metadata_location: &str,
+) -> S3Result<GeneratedMetadataComparison> {
+    let table_uuid = crate::table_catalog::table_metadata_uuid(metadata).map_err(generated_metadata_error)?;
+    if metadata_table_uuid(expected_metadata)? != table_uuid {
+        crate::table_catalog::validate_supported_table_metadata(metadata).map_err(generated_metadata_error)?;
+        return Ok(GeneratedMetadataComparison::DifferentTable);
+    }
+    let timestamp_ms = metadata
+        .get("last-updated-ms")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            iceberg_rest_error(
+                ICEBERG_ERROR_REST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "existing generated metadata is invalid",
+            )
+        })?;
+    let rebuilt_metadata =
+        apply_table_commit_updates_at(expected_metadata.clone(), updates, previous_metadata_location, timestamp_ms)?;
+    if &rebuilt_metadata == metadata {
+        return Ok(GeneratedMetadataComparison::MatchingCommit);
+    }
+    crate::table_catalog::validate_supported_table_metadata(metadata).map_err(generated_metadata_error)?;
+    Err(iceberg_rest_error(
+        ICEBERG_ERROR_COMMIT_FAILED,
+        StatusCode::CONFLICT,
+        "generated metadata location already contains a different commit",
+    ))
+}
+
 fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
     for requirement in requirements {
         let requirement_type = requirement
@@ -4663,6 +4719,24 @@ async fn read_table_metadata_json(
     Ok(metadata)
 }
 
+async fn read_generated_table_metadata_json(
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    metadata_location: &str,
+) -> S3Result<serde_json::Value> {
+    let Some(metadata) = crate::table_catalog::read_table_metadata_value(metadata_backend, bucket, metadata_location)
+        .await
+        .map_err(generated_metadata_error)?
+    else {
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generated metadata object is missing",
+        ));
+    };
+    Ok(metadata)
+}
+
 async fn validate_table_metadata_snapshot_graph<B>(
     metadata_backend: &B,
     bucket: &str,
@@ -5152,54 +5226,68 @@ where
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     let (commit_id, metadata_file_token) = standard_commit_ids(request.commit_id.or_else(|| request.idempotency_key.clone()));
     let next_generation = current.generation.saturating_add(1);
-    let next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
+    let mut next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
         &current,
         &next_metadata_file_name(next_generation, &metadata_file_token),
     )
     .map_err(catalog_store_error)?;
-    let next_metadata_data = serde_json::to_vec(&next_metadata)
-        .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
-    let put_result = metadata_backend
-        .put_object(
-            bucket,
-            &next_metadata_location,
-            next_metadata_data,
-            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
-        )
-        .await;
-    match put_result {
-        Ok(()) => {
-            let persisted_metadata = read_table_metadata_json(metadata_backend, bucket, &next_metadata_location).await?;
-            if persisted_metadata != next_metadata {
-                return Err(iceberg_rest_error(
-                    ICEBERG_ERROR_COMMIT_FAILED,
-                    StatusCode::CONFLICT,
-                    "generated metadata changed before catalog publication",
-                ));
+    let mut using_table_scoped_location = false;
+    loop {
+        let metadata_data = serde_json::to_vec(&next_metadata)
+            .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
+        match metadata_backend
+            .put_object(
+                bucket,
+                &next_metadata_location,
+                metadata_data,
+                crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+            )
+            .await
+        {
+            Ok(()) => {
+                let persisted_metadata =
+                    read_generated_table_metadata_json(metadata_backend, bucket, &next_metadata_location).await?;
+                if persisted_metadata != next_metadata {
+                    return Err(iceberg_rest_error(
+                        ICEBERG_ERROR_COMMIT_FAILED,
+                        StatusCode::CONFLICT,
+                        "generated metadata changed before catalog publication",
+                    ));
+                }
+                break;
             }
-        }
-        Err(crate::table_catalog::TableCatalogStoreError::Conflict(_)) => {
-            let existing_metadata = read_table_metadata_json(metadata_backend, bucket, &next_metadata_location).await?;
-            let persisted_timestamp = existing_metadata
-                .get("last-updated-ms")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| s3_error!(InvalidRequest, "existing generated metadata is missing last-updated-ms"))?;
-            let rebuilt_metadata = apply_table_commit_updates_at(
-                expected_metadata.clone(),
-                &request.updates,
-                &previous_metadata_location,
-                persisted_timestamp,
-            )?;
-            if existing_metadata != rebuilt_metadata {
-                return Err(iceberg_rest_error(
-                    ICEBERG_ERROR_COMMIT_FAILED,
-                    StatusCode::CONFLICT,
-                    "generated metadata location already contains a different commit",
-                ));
+            Err(crate::table_catalog::TableCatalogStoreError::Conflict(_)) => {
+                let persisted_metadata =
+                    read_generated_table_metadata_json(metadata_backend, bucket, &next_metadata_location).await?;
+                match compare_generated_metadata_with_standard_commit(
+                    &persisted_metadata,
+                    &expected_metadata,
+                    &request.updates,
+                    &previous_metadata_location,
+                )? {
+                    GeneratedMetadataComparison::MatchingCommit => {
+                        next_metadata = persisted_metadata;
+                        break;
+                    }
+                    GeneratedMetadataComparison::DifferentTable if using_table_scoped_location => {
+                        return Err(iceberg_rest_error(
+                            ICEBERG_ERROR_REST,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "table-scoped metadata location contains another table",
+                        ));
+                    }
+                    GeneratedMetadataComparison::DifferentTable => {
+                        next_metadata_location = crate::table_catalog::table_metadata_file_path_for_entry(
+                            &current,
+                            &table_scoped_metadata_file_name(next_generation, &current.table_id, &metadata_file_token),
+                        )
+                        .map_err(catalog_store_error)?;
+                        using_table_scoped_location = true;
+                    }
+                }
             }
-            next_metadata = existing_metadata;
+            Err(err) => return Err(catalog_store_error(err)),
         }
-        Err(err) => return Err(catalog_store_error(err)),
     }
     let table_bucket_fence_required = table_warehouse_location_changes(&current, &next_metadata)?;
 

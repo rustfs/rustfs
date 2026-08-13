@@ -74,7 +74,7 @@ use crate::app::runtime_sources::{
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::server::RemoteAddr;
+use crate::shared_types::RemoteAddr;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
@@ -737,6 +737,22 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConf
         }
         Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(ApiError::from(err).into()),
+    }
+    // AWS S3 and MinIO both refuse to suspend versioning while a replication
+    // configuration exists: suspension would start minting null versions that
+    // the replication engine (versioned by contract) can never converge.
+    if config.suspended() {
+        match metadata_sys::get_replication_config(bucket).await {
+            Ok(_) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidBucketState,
+                    "A replication configuration is present on this bucket, bucket wide versioning cannot be suspended."
+                        .to_string(),
+                ));
+            }
+            Err(StorageError::ConfigNotFound) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
     }
 
     Ok(())

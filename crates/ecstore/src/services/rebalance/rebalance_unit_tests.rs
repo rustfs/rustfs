@@ -113,6 +113,8 @@ struct LegacyRebalanceMeta {
 struct MigrationBackendSpy {
     get_object_reader: Mutex<Option<core::result::Result<GetObjectReader, Error>>>,
     move_remote: Mutex<Option<core::result::Result<(), Error>>>,
+    get_opts: Mutex<Vec<ObjectOptions>>,
+    move_remote_opts: Mutex<Vec<ObjectOptions>>,
     get_calls: AtomicUsize,
     move_remote_calls: AtomicUsize,
 }
@@ -125,6 +127,8 @@ impl MigrationBackendSpy {
         Self {
             get_object_reader: Mutex::new(get_object_reader),
             move_remote: Mutex::new(move_remote),
+            get_opts: Mutex::new(Vec::new()),
+            move_remote_opts: Mutex::new(Vec::new()),
             get_calls: AtomicUsize::new(0),
             move_remote_calls: AtomicUsize::new(0),
         }
@@ -136,6 +140,24 @@ impl MigrationBackendSpy {
 
     fn move_remote_calls(&self) -> usize {
         self.move_remote_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_get_opts(&self) -> ObjectOptions {
+        self.get_opts
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("reader opts should be captured")
+    }
+
+    fn last_move_remote_opts(&self) -> ObjectOptions {
+        self.move_remote_opts
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("remote opts should be captured")
     }
 
     fn make_reader() -> GetObjectReader {
@@ -156,9 +178,10 @@ impl MigrationBackend for MigrationBackendSpy {
         _object: &str,
         _range: Option<HTTPRangeSpec>,
         _h: http::HeaderMap,
-        _opts: &ObjectOptions,
+        opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.get_opts.lock().unwrap().push(opts.clone());
         if let Some(result) = self.get_object_reader.lock().unwrap().take() {
             return result;
         }
@@ -171,9 +194,10 @@ impl MigrationBackend for MigrationBackendSpy {
         _bucket: &str,
         _object: &str,
         _fi: &FileInfo,
-        _opts: &ObjectOptions,
+        opts: &ObjectOptions,
     ) -> Result<()> {
         self.move_remote_calls.fetch_add(1, Ordering::SeqCst);
+        self.move_remote_opts.lock().unwrap().push(opts.clone());
         if let Some(result) = self.move_remote.lock().unwrap().take() {
             return result;
         }
@@ -217,7 +241,8 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
         ..version_deleted()
     };
 
-    let opts = rebalance_delete_marker_opts(&version, Some("version-id".to_string()), 7);
+    let incarnation = uuid::Uuid::new_v4();
+    let opts = rebalance_delete_marker_opts(&version, Some("version-id".to_string()), 7, Some(incarnation));
     let replication = opts.delete_replication.expect("replication state should be preserved");
 
     assert!(opts.versioned);
@@ -227,9 +252,20 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
     assert_eq!(opts.src_pool_idx, 7);
     assert_eq!(opts.version_id.as_deref(), Some("version-id"));
     assert_eq!(opts.mod_time, Some(mod_time));
+    assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
     assert_eq!(replication.replica_status, ReplicationStatusType::Replica);
     assert!(replication.delete_marker);
     assert_eq!(replication.replicate_decision_str, "existing");
+}
+
+#[test]
+fn test_rebalance_delete_marker_opts_preserves_suspended_null_version() {
+    let version = version_deleted();
+    let opts = rebalance_delete_marker_opts(&version, None, 7, None);
+
+    assert!(!opts.versioned);
+    assert!(opts.version_suspended);
+    assert_eq!(opts.version_id.as_deref(), Some(uuid::Uuid::nil().to_string().as_str()));
 }
 
 #[tokio::test]
@@ -248,12 +284,14 @@ async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
         }
     };
 
+    let incarnation = uuid::Uuid::new_v4();
     let result = migrate_entry_version(
         &backend,
         "bucket".to_string(),
         0,
         &version,
         version.version_id.map(|v| v.to_string()),
+        Some(incarnation),
         3,
         false,
         &mut transfer,
@@ -269,6 +307,10 @@ async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     assert_eq!(backend.move_remote_calls(), 1);
     assert_eq!(backend.get_calls(), 0);
+    let remote_opts = backend.last_move_remote_opts();
+    assert!(remote_opts.include_part_checksums);
+    assert!(remote_opts.http_preconditions.is_some());
+    assert_eq!(remote_opts.expected_bucket_incarnation_id, Some(incarnation));
 }
 
 #[tokio::test]
@@ -294,6 +336,7 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
         0,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -330,6 +373,7 @@ async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
         0,
         &version,
         Some("vid-1".to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -368,6 +412,7 @@ async fn test_migrate_entry_version_remote_failure_is_reported() {
         0,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -410,6 +455,7 @@ async fn test_migrate_entry_version_deleted_version_routes_delete_through_store_
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -449,6 +495,7 @@ async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -491,6 +538,7 @@ async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
         1,
         &version,
         Some("vid-1".to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -520,6 +568,7 @@ async fn test_migrate_entry_version_reader_not_found_is_ignored() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -647,6 +696,7 @@ async fn test_migrate_entry_version_reader_fails_after_retries() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -685,6 +735,7 @@ async fn test_migrate_entry_version_zero_max_attempts_still_attempts_once() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         0,
         false,
         &mut transfer,
@@ -750,6 +801,13 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
     assert_eq!(backend.get_calls(), 2);
     assert_eq!(transfer_count.load(Ordering::SeqCst), 2);
     assert_eq!(wait_count.load(Ordering::SeqCst), 1);
+    let read_opts = backend.last_get_opts();
+    assert_eq!(read_opts.version_id.as_deref(), version.version_id.map(|id| id.to_string()).as_deref());
+    assert!(read_opts.no_lock);
+    assert!(read_opts.data_movement);
+    assert!(read_opts.raw_data_movement_read);
+    assert!(read_opts.skip_decommissioned);
+    assert!(read_opts.skip_rebalancing);
 }
 
 #[tokio::test]
@@ -822,6 +880,7 @@ async fn test_migrate_entry_version_transfer_fails_after_retries() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         2,
         false,
         &mut transfer,
@@ -860,6 +919,7 @@ async fn test_migrate_entry_version_transfer_not_found_is_ignored() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -901,6 +961,7 @@ async fn test_migrate_entry_version_transfer_overwrite_is_not_ignored() {
         1,
         &version,
         Some("vid-1".to_string()),
+        None,
         3,
         false,
         &mut transfer,
@@ -943,6 +1004,7 @@ async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         2,
         true,
         &mut transfer,
@@ -985,6 +1047,7 @@ async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled(
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         2,
         false,
         &mut transfer,
@@ -2026,6 +2089,7 @@ async fn test_migrate_entry_version_transfer_failure_reports_write_target_stage(
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         1,
         false,
         &mut transfer,
@@ -2050,6 +2114,7 @@ async fn test_migrate_entry_version_reader_failure_reports_read_source_stage() {
         1,
         &version,
         version.version_id.map(|v| v.to_string()),
+        None,
         1,
         false,
         &mut transfer,

@@ -9174,7 +9174,7 @@ impl DiskAPI for LocalDisk {
 
             if let Some(src_file_path_parent) = src_file_path.parent() {
                 if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
-                    let _ = remove_std(src_file_path_parent);
+                    let _ = std::fs::remove_dir(src_file_path_parent);
                 } else {
                     let _ = self
                         .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
@@ -9499,7 +9499,7 @@ impl DiskAPI for LocalDisk {
             if let Some(ref cleanup) = cleanup_path {
                 let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
             } else if let Some(parent) = src_file_path.parent() {
-                let _ = remove_std(parent);
+                let _ = std::fs::remove_dir(parent);
             }
 
             // Heal reuses a version's `data_dir` and lands the rebuilt shard on
@@ -9875,6 +9875,7 @@ impl DiskAPI for LocalDisk {
             FileInfoOpts {
                 data: read_data,
                 include_free_versions: opts.incl_free_versions,
+                include_part_checksums: false,
             },
         )?;
 
@@ -12439,6 +12440,10 @@ mod test {
             .join(RUSTFS_META_TMP_BUCKET)
             .join(tmp_object)
             .join(new_data_dir.to_string());
+        let tmp_parent = tmp_data_dir
+            .parent()
+            .expect("tmp data dir should have a parent")
+            .to_path_buf();
         fs::create_dir_all(&tmp_data_dir)
             .await
             .expect("new tmp data dir should be created");
@@ -12450,6 +12455,10 @@ mod test {
         disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
             .await
             .expect("rename_data should commit");
+        assert!(
+            !tmp_parent.exists(),
+            "successful non-inline commit should remove the empty staging parent"
+        );
 
         // The tmp xl.meta write point uses SyncMode::FileOnly: its parent dir
         // ({tmp}/{tmp_object}) must not be fsynced.
@@ -12654,6 +12663,9 @@ mod test {
         let tmp_object = "tmp-new-inline";
         ensure_test_volume(&disk, bucket).await;
         ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let tmp_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, tmp_object)
+            .expect("tmp parent should resolve");
 
         let _mode = durability_mode_override::set(DurabilityMode::Strict);
         let version_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("version id should parse");
@@ -12662,6 +12674,7 @@ mod test {
         disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
             .await
             .expect("inline rename_data should commit the new object");
+        assert!(!tmp_parent.exists(), "successful inline commit should remove the empty staging parent");
 
         let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
         let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
@@ -12683,6 +12696,34 @@ mod test {
             cfg!(unix),
             "only Unix inline bucket fsyncs should use the disk file-sync limit"
         );
+    }
+
+    #[tokio::test]
+    async fn rename_data_inline_preserves_non_empty_staging_parent() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "inline-staging-sentinel-bucket";
+        let object = "inline-object";
+        let tmp_object = "inline-stage-with-sentinel";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, tmp_object)
+            .expect("tmp parent should resolve");
+        fs::create_dir_all(&tmp_parent).await.expect("tmp parent should be created");
+        let sentinel = tmp_parent.join("sentinel");
+        fs::write(&sentinel, b"keep").await.expect("sentinel should be written");
+
+        let fi = test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-payload")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+            .await
+            .expect("non-empty staging cleanup must not negate the committed object");
+
+        assert_eq!(fs::read(&sentinel).await.expect("sentinel should remain"), b"keep");
     }
 
     #[cfg(unix)]
@@ -12859,7 +12900,10 @@ mod test {
             .expect("non-inline rename_data should commit");
 
         assert!(!replacement_dir.exists(), "the destination object directory must not be replaced");
-        assert!(staging_parent.exists(), "the guarded staging parent must retain its identity");
+        assert!(
+            !staging_parent.exists(),
+            "successful commit should remove the empty staging parent after releasing its guard"
+        );
         assert!(
             !replacement_staging_parent.exists(),
             "the staging parent must not be replaced between data and metadata publication"

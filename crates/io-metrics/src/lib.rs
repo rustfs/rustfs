@@ -58,7 +58,7 @@ use std::sync::{
 /// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
 /// become no-ops, and callers can skip the `Instant::now()` syscalls entirely.
 ///
-/// Set to `true` during startup when OTEL metric export is enabled.
+/// Enabled only through an explicit runtime opt-in.
 static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static GET_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -78,7 +78,7 @@ static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable detailed per-stage PUT metrics.
 ///
-/// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+/// Called once during startup after applying the detailed PUT attribution opt-in.
 pub fn set_put_stage_metrics_enabled(enabled: bool) {
     PUT_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -101,6 +101,12 @@ pub fn set_metrics_enabled(enabled: bool) {
 #[inline(always)]
 pub fn put_stage_metrics_enabled() -> bool {
     PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Start a PUT-stage timer only when detailed PUT attribution is enabled.
+#[inline(always)]
+pub fn put_stage_timer() -> Option<std::time::Instant> {
+    put_stage_metrics_enabled().then(std::time::Instant::now)
 }
 
 #[inline(always)]
@@ -173,7 +179,6 @@ pub mod backpressure_metrics;
 pub mod cache_config;
 pub mod capacity_metrics;
 pub mod collector;
-pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
@@ -258,13 +263,6 @@ pub use system_path_metrics::record_system_path_failure;
 pub use timeout_metrics::{
     TimeoutMetricsSummary, record_dynamic_timeout, record_operation_completion, record_operation_duration,
     record_operation_progress, record_stalled_operation, record_timeout_event,
-};
-
-// Config exports
-pub use config::{
-    BackpressureSettings, CacheSettings, DEFAULT_BASE_BUFFER_SIZE, DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_CACHE_MAX_MEMORY,
-    DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_CONCURRENT_READS, DEFAULT_MIN_BUFFER_SIZE,
-    DeadlockDetectionSettings, IoConfig, IoSchedulerSettings, TimeoutSettings,
 };
 
 // Re-exports for convenience
@@ -442,7 +440,7 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
 /// Record PutObject request start.
 #[inline(always)]
 pub fn record_put_object_request_start(concurrent_requests: usize) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_io_put_object_requests_total").increment(1);
@@ -452,7 +450,7 @@ pub fn record_put_object_request_start(concurrent_requests: usize) {
 /// Record PutObject request result.
 #[inline(always)]
 pub fn record_put_object_request_result(status: &str, duration_secs: f64) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_io_put_object_request_results_total", "status" => status.to_string()).increment(1);
@@ -1913,7 +1911,7 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
 /// * `zero_copy_eligible` - Whether the request was eligible for a zero-copy path
 #[inline(always)]
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_eligible: bool) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_s3_put_object_total").increment(1);
@@ -2010,6 +2008,13 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
         return;
     }
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
+}
+
+#[inline(always)]
+pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Option<std::time::Instant>) {
+    if let Some(started_at) = started_at {
+        record_put_object_stage_duration(stage, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
 }
 
 /// Record generic internal operation stage duration (non-PUT paths).
@@ -2825,6 +2830,56 @@ mod tests {
         record_put_object_stage_duration("set_disk_encode", 5.0);
         // Still disabled
         assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn put_stage_gate_does_not_disable_basic_put_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            set_put_stage_metrics_enabled(false);
+            record_put_object_request_start(1);
+            record_put_object_request_result("ok", 0.001);
+            record_put_object(1.0, 1024, false);
+            record_put_object_stage_duration("disabled_stage", 0.5);
+
+            set_put_stage_metrics_enabled(true);
+            record_put_object_stage_duration("enabled_stage", 0.5);
+
+            set_put_stage_metrics_enabled(false);
+            set_metrics_enabled(false);
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        assert!(metrics.iter().any(|(composite, _, _, _)| {
+            composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_s3_put_object_total"
+        }));
+        assert!(metrics.iter().any(|(composite, _, _, _)| {
+            composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_io_put_object_requests_total"
+        }));
+
+        let stages = metrics
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
+            })
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(stages, ["enabled_stage"]);
+    }
+
+    #[test]
+    fn test_put_stage_timer_follows_metrics_switch() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        assert!(put_stage_timer().is_none());
+
+        set_put_stage_metrics_enabled(true);
+        assert!(put_stage_timer().is_some());
+        set_put_stage_metrics_enabled(false);
     }
 
     #[test]

@@ -53,30 +53,38 @@ pub fn record_backpressure_deactivation() {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
     #[test]
-    fn test_record_backpressure_state_change() {
-        record_backpressure_state_change("normal", "warning");
-        record_backpressure_state_change("warning", "critical");
-    }
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_backpressure_state_change("normal", "warning");
+            record_backpressure_state_change("warning", "critical");
+            record_backpressure_rejection();
+            record_concurrent_operations(10);
+            record_concurrent_operations(32);
+            record_backpressure_activation();
+            record_backpressure_deactivation();
+        });
 
-    #[test]
-    fn test_record_backpressure_rejection() {
-        record_backpressure_rejection();
-    }
-
-    #[test]
-    fn test_record_concurrent_operations() {
-        record_concurrent_operations(10);
-        record_concurrent_operations(32);
-    }
-
-    #[test]
-    fn test_record_backpressure_activation() {
-        record_backpressure_activation();
-    }
-
-    #[test]
-    fn test_record_backpressure_deactivation() {
-        record_backpressure_deactivation();
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_backpressure_state_changes",
+            "rustfs_backpressure_rejections",
+            "rustfs_backpressure_concurrent",
+            "rustfs_backpressure_activations",
+            "rustfs_backpressure_deactivations",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
     }
 }

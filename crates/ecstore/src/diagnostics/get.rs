@@ -137,6 +137,7 @@ pub(crate) const GET_METADATA_CACHE_REASON_NO_LOCK: &str = "no_lock";
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED: &str = "not_found_or_expired";
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_READ_DATA: &str = "not_read_data";
 pub(crate) const GET_METADATA_CACHE_REASON_PART_NUMBER: &str = "part_number";
+pub(crate) const GET_METADATA_CACHE_REASON_PART_CHECKSUMS: &str = "part_checksums";
 pub(crate) const GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ: &str = "raw_data_movement_read";
 pub(crate) const GET_METADATA_CACHE_REASON_STALE_PUBLICATION: &str = "stale_publication";
 pub(crate) const GET_METADATA_CACHE_REASON_USABLE: &str = "usable";
@@ -480,6 +481,7 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_NO_LOCK, "no_lock");
         assert_eq!(GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED, "not_found_or_expired");
         assert_eq!(GET_METADATA_CACHE_REASON_NOT_READ_DATA, "not_read_data");
+        assert_eq!(GET_METADATA_CACHE_REASON_PART_CHECKSUMS, "part_checksums");
         assert_eq!(GET_METADATA_CACHE_REASON_PART_NUMBER, "part_number");
         assert_eq!(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, "raw_data_movement_read");
         assert_eq!(GET_METADATA_CACHE_REASON_STALE_PUBLICATION, "stale_publication");

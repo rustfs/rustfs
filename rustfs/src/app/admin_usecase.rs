@@ -32,7 +32,8 @@ use crate::cluster_snapshot::{
     collect_cluster_read_only_snapshot,
 };
 use crate::error::ApiError;
-use crate::server::{DependencyReadiness, collect_dependency_readiness_report as collect_runtime_dependency_readiness_report};
+use crate::server::collect_dependency_readiness_report as collect_runtime_dependency_readiness_report;
+use crate::shared_types::DependencyReadiness;
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;

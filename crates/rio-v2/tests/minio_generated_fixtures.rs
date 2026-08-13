@@ -85,6 +85,7 @@ fn load_file_info(case_id: &str) -> FileInfo {
         FileInfoOpts {
             data: false,
             include_free_versions: true,
+            include_part_checksums: true,
         },
     )
     .unwrap_or_else(|err| panic!("decode {}: {err}", xl_meta.display()))

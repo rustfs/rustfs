@@ -41,6 +41,14 @@ pub const XXHASH_64_NAME: &str = "xxhash64";
 pub const XXHASH_128_NAME: &str = "xxhash128";
 pub const MD5_NAME: &str = "md5";
 
+/// One of three deliberately separate checksum registries (backlog#1833):
+/// this enum owns the **streaming-hash algorithm registry**, including the
+/// RustFS extensions (sha512, xxhash3/64/128). The on-disk xl.meta bitset
+/// lives in `rustfs_rio::ChecksumType` (crates/rio/src/checksum.rs, varint
+/// bits are append-only), and the MinIO-port client keeps its own
+/// `ChecksumMode` (crates/ecstore/src/client/checksum.rs). When adding an
+/// algorithm, extend all three (or record why not) — they do not derive from
+/// each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChecksumAlgorithm {

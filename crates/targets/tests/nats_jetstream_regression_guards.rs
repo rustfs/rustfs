@@ -181,7 +181,7 @@ fn jetstream_args(subject: &str, stream_name: &str, queue_dir: &str) -> NATSArgs
 ///
 /// Ignored by default because it needs a running NATS server with JetStream.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live NATS JetStream server (see module docs; RUSTFS_TEST_NATS_URL overrides)"]
 async fn end_to_end_publish_is_acked_on_the_stream() {
     use rustfs_targets::EventName;
     use rustfs_targets::Target;

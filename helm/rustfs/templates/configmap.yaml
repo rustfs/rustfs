@@ -142,6 +142,11 @@ data:
   RUSTFS_KMS_DEFAULT_KEY_ID: {{ .default_key | quote }}
         {{- if eq .vault_backend "vault-transit" }}
   RUSTFS_KMS_VAULT_MOUNT_PATH: {{ .vault_mount_path | quote }}
+        {{- else if .vault_mount_path }}
+  {{- /* The KV2 backend never calls the Transit engine: its mount is the KV2
+         one, under a different variable. Emitted only when set, so an unset
+         value keeps falling back to the "secret" default. */}}
+  RUSTFS_KMS_VAULT_KV_MOUNT: {{ .vault_mount_path | quote }}
         {{- end }}
       {{- end }}
     {{- end }}

@@ -75,6 +75,7 @@ impl SetDisks {
             version_id,
             versioned: opts.versioned,
             version_suspended: opts.version_suspended,
+            include_part_checksums: true,
             ..Default::default()
         };
         let (fi, _, disks) = self
@@ -142,6 +143,7 @@ impl SetDisks {
             version_id,
             versioned: opts.versioned,
             version_suspended: opts.version_suspended,
+            include_part_checksums: true,
             ..Default::default()
         };
         let (fi, _, disks) = self
