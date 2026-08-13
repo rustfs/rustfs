@@ -67,6 +67,75 @@ fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_s
     committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
 }
 
+pub(in crate::set_disk::ops) fn assign_object_transaction_epoch(
+    shuffle_disks: &[Option<DiskStore>],
+    parts_metadatas: &mut [FileInfo],
+) -> Uuid {
+    let epoch = Uuid::new_v4();
+    for (disk, file_info) in shuffle_disks.iter().zip(parts_metadatas.iter_mut()) {
+        if disk.is_some() {
+            file_info.set_object_transaction_epoch(epoch);
+        }
+    }
+    epoch
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::set_disk::ops) enum ObjectTransactionEpochFence {
+    Absent,
+    Present(Uuid),
+}
+
+impl ObjectTransactionEpochFence {
+    fn from_file_info(file_info: &FileInfo) -> Result<Self> {
+        match file_info.object_transaction_epoch() {
+            Ok(Some(epoch)) => Ok(Self::Present(epoch)),
+            Ok(None) => Ok(Self::Absent),
+            Err(_) => Err(StorageError::FileCorrupt),
+        }
+    }
+}
+
+pub(in crate::set_disk::ops) async fn read_object_transaction_epoch_fence(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+) -> Result<ObjectTransactionEpochFence> {
+    let current = set
+        .get_object_fileinfo(
+            bucket,
+            object,
+            &ObjectOptions {
+                no_lock: true,
+                metadata_cache_safe: false,
+                versioned: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+        .await;
+    match current {
+        Ok(snapshot) => ObjectTransactionEpochFence::from_file_info(snapshot.fi()),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(ObjectTransactionEpochFence::Absent),
+        Err(err) => Err(err),
+    }
+}
+
+pub(in crate::set_disk::ops) async fn verify_object_transaction_epoch_fence(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+    expected: ObjectTransactionEpochFence,
+) -> Result<()> {
+    let current = read_object_transaction_epoch_fence(set, bucket, object).await?;
+    if current == expected {
+        Ok(())
+    } else {
+        Err(StorageError::PreconditionFailed)
+    }
+}
+
 #[cfg(test)]
 mod duration_metrics_tests {
     use super::duration_millis_f64;
@@ -1682,6 +1751,14 @@ impl SetDisks {
             if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
                 return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
             }
+            let transaction_epoch_fence = if transaction_fencing_proof.is_some() {
+                Some(read_object_transaction_epoch_fence(self, bucket, object).await?)
+            } else {
+                None
+            };
+            if transaction_epoch_fence.is_some() {
+                assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas);
+            }
 
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
@@ -1700,10 +1777,38 @@ impl SetDisks {
                 let _object_lock_guard = commit_object_lock_guard;
                 let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let rename_stage_start = Instant::now();
-                if let Some(proof) = transaction_fencing_proof.as_ref()
-                    && !object_transaction_fencing_fleet_proof_matches(proof)
-                {
-                    return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
+                let pre_rename_result: Result<()> = async {
+                    if let Some(proof) = transaction_fencing_proof.as_ref()
+                        && !object_transaction_fencing_fleet_proof_matches(proof)
+                    {
+                        return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
+                    }
+                    if let Some(expected) = transaction_epoch_fence {
+                        #[cfg(any(test, feature = "test-util"))]
+                        pause_put_object_commit(
+                            &commit_bucket,
+                            &commit_object,
+                            PutObjectCommitPause::BeforeTransactionEpochVerify,
+                        )
+                        .await;
+                        verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(err) = pre_rename_result {
+                    if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                        warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
+                    } else if issue3031_diag_enabled() {
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            tmp_dir = %commit_tmp_dir,
+                            "issue3031_put_object_tmp_cleanup_done"
+                        );
+                    }
+                    return Err(err);
                 }
                 let rename_result = SetDisks::rename_data(
                     &shuffle_disks,
@@ -2936,6 +3041,7 @@ pub enum PutObjectCommitPause {
     BeforeNamespace,
     AfterNamespace,
     BeforeMetadata,
+    BeforeTransactionEpochVerify,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -3017,13 +3123,24 @@ impl Drop for PutObjectCommitBarrier {
 
 #[cfg(any(test, feature = "test-util"))]
 async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
-    let barrier = PUT_OBJECT_COMMIT_BARRIER
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .expect("put object commit barrier mutex should not poison")
-        .iter()
-        .find(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
-        .cloned();
+    let barrier = {
+        let mut slot = PUT_OBJECT_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("put object commit barrier mutex should not poison");
+        if let Some(index) = slot
+            .iter()
+            .position(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+        {
+            if pause == PutObjectCommitPause::BeforeTransactionEpochVerify {
+                Some(slot.remove(index))
+            } else {
+                Some(Arc::clone(&slot[index]))
+            }
+        } else {
+            None
+        }
+    };
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
@@ -10042,12 +10159,39 @@ mod transition_source_identity_matrix_tests {
 
 #[cfg(test)]
 mod heterogeneous_pool_put_tests {
-    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity;
+    use super::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
+        hermetic_set_disks_isolated as hermetic_set_disks,
+    };
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
+    use serial_test::serial;
     use tokio::io::AsyncReadExt;
+
+    async fn make_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
+        let mut epochs = Vec::with_capacity(disks.len());
+        for (disk_index, disk) in disks.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            epochs.push(
+                file_info
+                    .object_transaction_epoch()
+                    .unwrap_or_else(|err| panic!("disk {disk_index} transaction epoch should decode: {err}")),
+            );
+        }
+        epochs
+    }
 
     #[tokio::test]
     async fn second_pool_regular_put_uses_its_own_layout_and_round_trips() {
@@ -10092,6 +10236,154 @@ mod heterogeneous_pool_put_tests {
             .await
             .expect("second-pool regular PUT should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_persists_epoch_only_when_gate_is_enabled() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-object-transaction-epoch";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut default_reader = PutObjReader::from_vec(b"default gate stays epoch-free".to_vec());
+        set_disks
+            .put_object(bucket, "default.bin", &mut default_reader, &ObjectOptions::default())
+            .await
+            .expect("default PUT should commit");
+        assert_eq!(
+            object_transaction_epochs(&disk_stores, bucket, "default.bin").await,
+            vec![None, None, None, None],
+            "live proof alone must not write epoch metadata while the opt-in gate is disabled"
+        );
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut fenced_reader = PutObjReader::from_vec(b"fenced epoch commit".to_vec());
+                set_disks
+                    .put_object(bucket, "fenced.bin", &mut fenced_reader, &ObjectOptions::default())
+                    .await
+                    .expect("fenced PUT should commit with a live proof");
+            },
+        )
+        .await;
+
+        let epochs = object_transaction_epochs(&disk_stores, bucket, "fenced.bin").await;
+        let first = epochs[0].expect("fenced PUT should persist an epoch");
+        assert!(!first.is_nil());
+        assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_rejects_stale_no_lock_put_epoch() {
+        let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-object-transaction-stale-epoch";
+        let object = "object.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut initial_reader = PutObjReader::from_vec(b"initial fenced body".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut initial_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("initial fenced PUT should commit");
+                let initial_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("initial fenced PUT should persist an epoch");
+
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeTransactionEpochVerify);
+                let stale_set = Arc::clone(&set_disks);
+                let stale = tokio::spawn(async move {
+                    let mut stale_reader = PutObjReader::from_vec(b"stale writer body".to_vec());
+                    stale_set
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut stale_reader,
+                            &ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                barrier.wait_until_paused().await;
+
+                let mut winner_reader = PutObjReader::from_vec(b"winning writer body".to_vec());
+                set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut winner_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("concurrent fenced PUT should advance the epoch");
+                let winning_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .expect("winning fenced PUT should persist an epoch");
+                assert_ne!(winning_epoch, initial_epoch);
+
+                barrier.release();
+                let err = stale
+                    .await
+                    .expect("stale PUT task should not panic")
+                    .expect_err("stale epoch PUT must be rejected");
+                assert_eq!(err, StorageError::PreconditionFailed);
+
+                let final_epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+                assert!(final_epochs.into_iter().all(|epoch| epoch == Some(winning_epoch)));
+                let mut reader = set_disks
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("winning object should remain readable");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("winning body should stream");
+                assert_eq!(restored, b"winning writer body");
+            },
+        )
+        .await;
     }
 }
 

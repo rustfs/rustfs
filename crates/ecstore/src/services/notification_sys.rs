@@ -206,6 +206,38 @@ pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStat
     })
 }
 
+#[cfg(test)]
+pub(crate) struct RemoteVersionStateFleetProofGuard;
+
+#[cfg(test)]
+impl Drop for RemoteVersionStateFleetProofGuard {
+    fn drop(&mut self) {
+        replace_remote_version_state_fleet_proof(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerprint: &str) -> RemoteVersionStateFleetProofGuard {
+    match REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string()) {
+        Ok(()) => {}
+        Err(_)
+            if REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+                .get()
+                .is_some_and(|current| current == topology_fingerprint) => {}
+        Err(_) => panic!("remote version state test topology is already bound to another fingerprint"),
+    }
+    let peer_epochs = BTreeMap::new();
+    if let Some(err) = publish_remote_version_state_probe_result(
+        remote_version_state_fleet_proof_slot(),
+        topology_fingerprint,
+        Ok(peer_epochs),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    RemoteVersionStateFleetProofGuard
+}
+
 fn remote_version_state_fleet_proof_valid_at(
     proof: Option<&RemoteVersionStateFleetProof>,
     expected_topology: &str,
