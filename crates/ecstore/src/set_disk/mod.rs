@@ -288,6 +288,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+pub(crate) const DATA_MOVEMENT_MULTIPART_PREFIX: &str = "data-movement";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 /// Validate disk metadata at a boundary that may legitimately return a delete

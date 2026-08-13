@@ -17,9 +17,9 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID,
-    SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
-    is_encryption_metadata_key, starts_with_ignore_ascii_case,
+    AMZ_OBJECT_TAGGING, SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVED_TAGS, SUFFIX_FREE_VERSION, SUFFIX_HEALING,
+    SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str,
+    has_internal_suffix, insert_str, is_encryption_metadata_key, starts_with_ignore_ascii_case,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
@@ -1162,7 +1162,14 @@ impl FileInfo {
     }
 
     pub fn set_data_moved(&mut self) {
+        let tags_proof = format!("v1:{}", self.metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str).unwrap_or_default());
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED_TAGS, tags_proof);
         insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, "true".to_string());
+    }
+
+    pub fn acknowledge_data_movement(&mut self) {
+        // Keep both empty aliases so mixed-version disks retain one metadata identity.
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, String::new());
     }
 
     pub fn inline_data(&self) -> bool {

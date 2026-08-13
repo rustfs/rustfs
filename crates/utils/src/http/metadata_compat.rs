@@ -30,6 +30,8 @@ pub const MINIO_INTERNAL_PREFIX: &str = "x-minio-internal-";
 // Key suffixes (lowercase, no prefix)
 pub const SUFFIX_INLINE_DATA: &str = "inline-data";
 pub const SUFFIX_DATA_MOVED: &str = "data-moved";
+/// Tags snapshot bound to a data-movement-owned target.
+pub const SUFFIX_DATA_MOVED_TAGS: &str = "data-moved-tags";
 /// Internal ownership marker for a data-movement multipart upload.
 pub const SUFFIX_DATA_MOVEMENT_UPLOAD: &str = "data-movement-upload";
 /// Transient flag for data movement

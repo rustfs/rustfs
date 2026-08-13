@@ -32,9 +32,10 @@ use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use rustfs_utils::http::{
-    AMZ_OBJECT_TAGGING, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION_SIZE, SUFFIX_CRC, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVEMENT_UPLOAD,
-    SUFFIX_PART_CHECKSUMS, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME,
-    SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, strip_internal_prefix_preserving_case,
+    AMZ_OBJECT_TAGGING, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION_SIZE, SUFFIX_CRC, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVED_TAGS,
+    SUFFIX_DATA_MOVEMENT_UPLOAD, SUFFIX_PART_CHECKSUMS, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
+    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE,
+    strip_internal_prefix_preserving_case,
 };
 use rustfs_utils::path::encode_dir_object;
 use std::collections::{BTreeMap, HashMap};
@@ -412,6 +413,15 @@ pub(crate) fn can_replace_stale_data_movement_target(target: &ObjectInfo, opts: 
     {
         return false;
     }
+    let tags_proof = format!("v1:{}", target.user_tags);
+    let rustfs_tags_proof = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED_TAGS);
+    let minio_tags_proof = format!("{}{SUFFIX_DATA_MOVED_TAGS}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+    if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED_TAGS) != Some(tags_proof.as_str())
+        || target.user_defined.get(&rustfs_tags_proof).map(String::as_str) != Some(tags_proof.as_str())
+        || target.user_defined.get(&minio_tags_proof).map(String::as_str) != Some(tags_proof.as_str())
+    {
+        return false;
+    }
 
     let version_matches = match (opts.version_id.as_deref(), target.version_id) {
         (None, None) => true,
@@ -683,6 +693,7 @@ fn is_data_movement_rewritten_transition_metadata(object_info: &ObjectInfo, key:
 fn is_data_movement_rewritten_metadata(object_info: &ObjectInfo, key: &str, normalize_compression_size: bool) -> bool {
     [
         SUFFIX_DATA_MOVED,
+        SUFFIX_DATA_MOVED_TAGS,
         SUFFIX_DATA_MOVEMENT_UPLOAD,
         SUFFIX_ACTUAL_SIZE,
         SUFFIX_CRC,
@@ -2525,6 +2536,7 @@ mod tests {
         };
         let mut metadata = HashMap::new();
         rustfs_utils::http::insert_str(&mut metadata, SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(&mut metadata, SUFFIX_DATA_MOVED_TAGS, "v1:".to_string());
         let target = ObjectInfo {
             version_id: Some(version_id),
             mod_time: Some(source_time - time::Duration::SECOND),
@@ -2549,6 +2561,18 @@ mod tests {
             "false".to_string(),
         );
         assert!(!can_replace_stale_data_movement_target(&conflicting_marker, &opts));
+
+        let mut retagged_target = target.clone();
+        retagged_target.user_tags = Arc::new("acknowledged=true".to_string());
+        assert!(!can_replace_stale_data_movement_target(&retagged_target, &opts));
+
+        let mut retagged_owned_target = retagged_target;
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut retagged_owned_target.user_defined),
+            SUFFIX_DATA_MOVED_TAGS,
+            "v1:acknowledged=true".to_string(),
+        );
+        assert!(can_replace_stale_data_movement_target(&retagged_owned_target, &opts));
 
         let mut different_version = target.clone();
         different_version.version_id = Some(Uuid::from_u128(42));

@@ -33,6 +33,29 @@ use tokio::task::JoinSet;
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
+pub(crate) struct StaleMultipartCleanupGuard {
+    file_info: FileInfo,
+    upload_path: String,
+    write_quorum: usize,
+    lock_guard: ObjectLockDiagGuard,
+}
+
+impl StaleMultipartCleanupGuard {
+    pub(crate) fn file_info(&self) -> &FileInfo {
+        &self.file_info
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.lock_guard.is_lock_lost()
+    }
+
+    pub(crate) async fn delete(self, set: &SetDisks) -> Result<()> {
+        fence_commit_on_lock_loss(Some(&self.lock_guard), "stale_multipart_cleanup", &self.upload_path)?;
+        set.delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &self.upload_path, self.write_quorum)
+            .await
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MultipartCommitPause {
@@ -459,7 +482,7 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
         self.acquire_read_lock_diag(op, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
             .await
             .map(Some)
@@ -477,7 +500,7 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
         self.acquire_write_lock_diag(op, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
             .await
             .map(Some)
@@ -525,13 +548,49 @@ impl SetDisks {
         upload_id: &str,
         write: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        self.check_upload_id_exists_for_data_movement(bucket, object, upload_id, write, false)
+            .await
+    }
+
+    async fn check_upload_id_exists_with_opts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        write: bool,
+        opts: &ObjectOptions,
+    ) -> Result<(FileInfo, Vec<FileInfo>)> {
+        self.check_upload_id_exists_for_data_movement(bucket, object, upload_id, write, opts.data_movement)
+            .await
+    }
+
+    async fn check_upload_id_exists_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        write: bool,
+        data_movement: bool,
+    ) -> Result<(FileInfo, Vec<FileInfo>)> {
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, data_movement);
+        self.check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, write)
+            .await
+    }
+
+    async fn check_multipart_upload_path_exists(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        upload_id_path: &str,
+        write: bool,
+    ) -> Result<(FileInfo, Vec<FileInfo>)> {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
 
         let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false, false)
+            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, upload_id_path, "", false, false, false)
                 .await?;
 
         let (read_quorum, write_quorum) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
@@ -574,6 +633,20 @@ impl SetDisks {
         let fi = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, quorum)?;
 
         Ok((fi, parts_metadata))
+    }
+
+    pub(crate) async fn lock_stale_multipart_cleanup(&self, upload_path: &str) -> Result<StaleMultipartCleanupGuard> {
+        let lock_guard = self
+            .acquire_write_lock_diag("stale_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, upload_path)
+            .await?;
+        let (file_info, _) = self.check_multipart_upload_path_exists("", "", "", upload_path, true).await?;
+        let write_quorum = file_info.write_quorum(self.default_write_quorum());
+        Ok(StaleMultipartCleanupGuard {
+            file_info,
+            upload_path: upload_path.to_string(),
+            write_quorum,
+            lock_guard,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -872,9 +945,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         crate::hp_guard!("SetDisks::put_object_part");
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
 
-        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (fi, _) = self
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
+            .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
@@ -1141,7 +1216,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .await?;
                 (Some(upload_guard), Some(part_guard))
             };
-            let (commit_fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+            let (commit_fi, _) = self
+                .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
+                .await?;
             ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
             ensure_multipart_bucket_incarnation(
                 &self.ctx,
@@ -1218,12 +1295,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let _upload_guard = self
             .acquire_multipart_upload_read_lock("list_object_parts", bucket, object, upload_id, opts)
             .await?;
-        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+        let (fi, _) = self
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
+            .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
 
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
 
         if max_parts > MAX_PARTS_COUNT {
             max_parts = MAX_PARTS_COUNT;
@@ -1516,7 +1595,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
-        let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
+        let upload_path = Self::get_multipart_upload_dir(bucket, object, upload_uuid.as_str(), opts.data_movement);
 
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         Self::write_unique_file_info(
@@ -1551,7 +1630,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .acquire_multipart_upload_read_lock("get_multipart_info", bucket, object, upload_id, opts)
             .await?;
         let (mut fi, _) = self
-            .check_upload_id_exists(bucket, object, upload_id, false)
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
@@ -1576,12 +1655,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let _upload_guard = self
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
-        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (fi, _) = self
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
+            .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
 
         self.delete_all_with_quorum(
             RUSTFS_META_MULTIPART_BUCKET,
@@ -1603,7 +1684,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         crate::hp_guard!("SetDisks::complete_multipart_upload");
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+        let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
         let range_seek_rollout_enabled = crate::object_api::legacy_encrypted_range_seek_enabled() && !opts.no_lock;
         let mut object_lock_guard = None;
 
@@ -1631,7 +1712,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await?;
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
-        let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (mut fi, files_metas) = self
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
+            .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
@@ -2733,8 +2816,29 @@ mod tests {
             .new_multipart_upload(bucket, object, create_opts)
             .await
             .expect("multipart upload should be created");
-        let part = put_test_part(set_disks, bucket, object, &upload.upload_id, 1, content, content.len() as i64).await;
-        (upload.upload_id, vec![part])
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(
+                Cursor::new(content.to_vec()),
+                content.len() as i64,
+                content.len() as i64,
+                None,
+                None,
+                false,
+            )
+            .expect("hash reader should be constructed"),
+        );
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, create_opts)
+            .await
+            .expect("uploading the part should succeed");
+        (
+            upload.upload_id,
+            vec![CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            }],
+        )
     }
 
     async fn put_test_part(
@@ -2954,6 +3058,17 @@ mod tests {
             .await
             .expect("data movement upload should be created");
         let upload_id = upload.upload_id;
+        let ordinary_upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        let data_movement_upload_path = SetDisks::get_multipart_upload_dir(bucket, object, &upload_id, true);
+        assert_eq!(data_movement_upload_path, format!("data-movement/{ordinary_upload_path}"));
+        assert!(matches!(
+            set_disks.check_upload_id_exists(bucket, object, &upload_id, false).await,
+            Err(StorageError::InvalidUploadID(..))
+        ));
+        set_disks
+            .check_upload_id_exists_with_opts(bucket, object, &upload_id, false, &create_opts)
+            .await
+            .expect("data movement lookup should find the isolated upload");
         let mut part_reader = PutObjReader::from_vec(b"data movement multipart body".to_vec());
         let uploaded_part = set_disks
             .put_object_part(bucket, object, &upload_id, 1, &mut part_reader, &create_opts)
@@ -3149,7 +3264,7 @@ mod tests {
                 .expect("drain target after rejected replacement");
             assert_eq!(preserved_body, old_body);
             set_disks
-                .check_upload_id_exists(bucket, object, &upload_id, true)
+                .check_upload_id_exists_with_opts(bucket, object, &upload_id, true, &complete_opts)
                 .await
                 .expect("fence loss must leave replacement staging retryable");
         }

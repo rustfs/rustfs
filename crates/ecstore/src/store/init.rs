@@ -2243,6 +2243,151 @@ mod tests {
                         .expect("drain preserved client target");
                     assert_eq!(preserved_body, client_body);
 
+                    let acknowledged_target = "acknowledged-target.bin";
+                    crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            acknowledged_target,
+                            old_body.clone(),
+                            old_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
+                        ),
+                        None,
+                        "test_acknowledged_target_seed",
+                    )
+                    .await
+                    .expect("seed migrated target before tag acknowledgement");
+                    let target_version_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    };
+                    store
+                        .put_object_tags(&bucket, acknowledged_target, "acknowledged=true", &target_version_opts)
+                        .await
+                        .expect("tag update should acknowledge the migrated target");
+                    let acknowledged = store.pools[1]
+                        .get_object_info(&bucket, acknowledged_target, &target_version_opts)
+                        .await
+                        .expect("read acknowledged migrated target");
+                    let rustfs_data_moved_key = rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_DATA_MOVED);
+                    let minio_data_moved_key =
+                        format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, rustfs_utils::http::SUFFIX_DATA_MOVED);
+                    assert_eq!(acknowledged.user_defined.get(&rustfs_data_moved_key).map(String::as_str), Some(""));
+                    assert_eq!(acknowledged.user_defined.get(&minio_data_moved_key).map(String::as_str), Some(""));
+                    assert_eq!(
+                        rustfs_utils::http::get_consistent_str(&acknowledged.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
+                        None
+                    );
+
+                    let err = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            acknowledged_target,
+                            new_body.clone(),
+                            new_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
+                        ),
+                        None,
+                        "test_acknowledged_target_reject",
+                    )
+                    .await
+                    .expect_err("data movement must not replace a target acknowledged by a tag update");
+                    assert!(err.to_string().contains("complete_multipart_upload"), "unexpected migration error: {err}");
+
+                    let acknowledged_tags = store.pools[1]
+                        .get_object_tags(&bucket, acknowledged_target, &target_version_opts)
+                        .await
+                        .expect("read preserved acknowledged target tags");
+                    assert_eq!(acknowledged_tags, "acknowledged=true");
+                    let mut acknowledged_reader = store.pools[1]
+                        .get_object_reader(&bucket, acknowledged_target, None, HeaderMap::new(), &target_version_opts)
+                        .await
+                        .expect("read preserved acknowledged target body");
+                    let mut acknowledged_body = Vec::new();
+                    acknowledged_reader
+                        .stream
+                        .read_to_end(&mut acknowledged_body)
+                        .await
+                        .expect("drain preserved acknowledged target body");
+                    assert_eq!(acknowledged_body, old_body);
+
+                    let metadata_acknowledged_target = "metadata-acknowledged-target.bin";
+                    crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            metadata_acknowledged_target,
+                            old_body.clone(),
+                            old_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
+                        ),
+                        None,
+                        "test_metadata_acknowledged_target_seed",
+                    )
+                    .await
+                    .expect("seed migrated target before metadata acknowledgement");
+                    store
+                        .put_object_metadata(
+                            &bucket,
+                            metadata_acknowledged_target,
+                            &ObjectOptions {
+                                eval_metadata: Some(HashMap::from([(
+                                    s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                                    s3s::dto::ObjectLockLegalHoldStatus::OFF.to_string(),
+                                )])),
+                                ..target_version_opts.clone()
+                            },
+                        )
+                        .await
+                        .expect("legal hold metadata update should acknowledge the migrated target");
+                    let metadata_acknowledged = store.pools[1]
+                        .get_object_info(&bucket, metadata_acknowledged_target, &target_version_opts)
+                        .await
+                        .expect("read metadata-acknowledged migrated target");
+                    assert_eq!(
+                        metadata_acknowledged
+                            .user_defined
+                            .get(&rustfs_data_moved_key)
+                            .map(String::as_str),
+                        Some("")
+                    );
+                    assert_eq!(
+                        metadata_acknowledged
+                            .user_defined
+                            .get(&minio_data_moved_key)
+                            .map(String::as_str),
+                        Some("")
+                    );
+                    assert_eq!(
+                        metadata_acknowledged
+                            .user_defined
+                            .get(s3s::header::X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str())
+                            .map(String::as_str),
+                        Some("OFF")
+                    );
+                    let err = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader(
+                            metadata_acknowledged_target,
+                            new_body.clone(),
+                            new_time,
+                            HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
+                        ),
+                        None,
+                        "test_metadata_acknowledged_target_reject",
+                    )
+                    .await
+                    .expect_err("data movement must not replace a target acknowledged by a metadata update");
+                    assert!(err.to_string().contains("complete_multipart_upload"), "unexpected migration error: {err}");
+
                     let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(1))
                         .format(&time::format_description::well_known::Rfc3339)
                         .expect("retain-until date should format");
@@ -2302,7 +2447,14 @@ mod tests {
                         assert_eq!(retained_body, old_body);
                     }
 
-                    for object in [replaceable, client_target, "compliance-target.bin", "governance-target.bin"] {
+                    for object in [
+                        replaceable,
+                        client_target,
+                        acknowledged_target,
+                        metadata_acknowledged_target,
+                        "compliance-target.bin",
+                        "governance-target.bin",
+                    ] {
                         let uploads = store.pools[1]
                             .list_multipart_uploads(&bucket, object, None, None, None, 100)
                             .await

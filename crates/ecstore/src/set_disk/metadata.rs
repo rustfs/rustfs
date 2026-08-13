@@ -85,6 +85,15 @@ impl SetDisks {
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
     }
 
+    pub(super) fn get_multipart_upload_dir(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> String {
+        let upload_dir = Self::get_upload_id_dir(bucket, object, upload_id);
+        if data_movement {
+            format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{upload_dir}")
+        } else {
+            upload_dir
+        }
+    }
+
     pub(super) fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
         let path = format!("{bucket}/{object}");
         let mut hasher = Sha256::new();

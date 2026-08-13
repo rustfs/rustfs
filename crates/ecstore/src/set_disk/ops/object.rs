@@ -3305,6 +3305,7 @@ impl SetDisks {
                 fi.metadata.insert(key.clone(), value.clone());
             }
         }
+        fi.acknowledge_data_movement();
 
         #[cfg(test)]
         pause_object_tagging_commit(bucket, object).await;
@@ -4676,6 +4677,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 fi.metadata.insert(k.clone(), v.clone());
             }
         }
+
+        fi.acknowledge_data_movement();
 
         if opts.mod_time.is_some() {
             fi.mod_time = opts.mod_time;
