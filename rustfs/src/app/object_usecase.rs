@@ -6551,8 +6551,11 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_get_object_inner(req))
     }
 
-    #[instrument(name = "DefaultObjectUsecase::execute_get_object", level = "trace", skip(self, req))]
-    #[hotpath::measure(label = "DefaultObjectUsecase::execute_get_object", impl_type = "DefaultObjectUsecase")]
+    #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
+    #[hotpath::measure(
+        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_get_object",
+        impl_type = "DefaultObjectUsecase"
+    )]
     async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -7014,7 +7017,7 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_copy_object_inner(req))
     }
 
-    #[instrument(name = "DefaultObjectUsecase::execute_copy_object", level = "debug", skip(self, req))]
+    #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
     async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
