@@ -6556,9 +6556,16 @@ impl DefaultObjectUsecase {
         })
     }
 
+    pub fn execute_get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = S3Result<S3Response<GetObjectOutput>>> + Send + '_>> {
+        Box::pin(self.execute_get_object_inner(req))
+    }
+
     #[instrument(level = "trace", skip(self, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
-    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -7012,8 +7019,15 @@ impl DefaultObjectUsecase {
         result
     }
 
+    pub fn execute_copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_>> {
+        Box::pin(self.execute_copy_object_inner(req))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -16423,8 +16437,12 @@ mod tests {
             .expect("create self-copy test bucket");
         let payload = b"object whose key equals its bucket".to_vec();
         let mut reader = PutObjReader::from_vec(payload.clone());
+        let setup_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
         store
-            .put_object(&bucket, &bucket, &mut reader, &ObjectOptions::default())
+            .put_object(&bucket, &bucket, &mut reader, &setup_opts)
             .await
             .expect("put object whose key equals its bucket");
 
