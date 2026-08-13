@@ -2266,15 +2266,19 @@ fn decommission_delete_marker_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
     src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
 ) -> ObjectOptions {
+    let version_suspended = version.version_id.is_none() && version_id.is_none();
     ObjectOptions {
-        versioned: true,
-        version_id,
+        versioned: !version_suspended,
+        version_suspended,
+        version_id: version_id.or_else(|| version_suspended.then(|| uuid::Uuid::nil().to_string())),
         mod_time: version.mod_time,
         src_pool_idx,
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
+        expected_bucket_incarnation_id,
         delete_replication: version
             .replication_state_internal
             .as_ref()
@@ -2299,6 +2303,7 @@ fn decommission_remote_tiered_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
     src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
 ) -> ObjectOptions {
     ObjectOptions {
         versioned: version_id.is_some(),
@@ -2307,6 +2312,9 @@ fn decommission_remote_tiered_opts(
         user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
+        include_part_checksums: true,
+        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        expected_bucket_incarnation_id,
         ..Default::default()
     }
 }
@@ -2805,6 +2813,7 @@ impl ECStore {
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
     ) -> Result<()> {
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
@@ -2833,6 +2842,11 @@ impl ECStore {
             rx.cancel();
         }
         decommission_cancel_signal_result(rx.is_cancelled())?;
+
+        let bucket_incarnation_fence = match expected_bucket_incarnation_id {
+            Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
+            None => None,
+        };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
 
@@ -2894,7 +2908,7 @@ impl ECStore {
                     .delete_object(
                         bucket.as_str(),
                         &version.name,
-                        decommission_delete_marker_opts(version, version_id.clone(), idx),
+                        decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
                     )
                     .await
                 {
@@ -2984,7 +2998,7 @@ impl ECStore {
                             bucket.as_str(),
                             &version.name,
                             version,
-                            &decommission_remote_tiered_opts(version, version_id.clone(), idx),
+                            &decommission_remote_tiered_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
                         )
                         .await
                     {
@@ -3056,7 +3070,11 @@ impl ECStore {
                 )
                 .await?;
 
-                if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
+                if let Err(err) = self
+                    .clone()
+                    .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id)
+                    .await
+                {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
                         cleanup_ignored = true;
@@ -3133,6 +3151,9 @@ impl ECStore {
         }
 
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+            if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                return Err(Error::other("decommission bucket incarnation fence was lost before source cleanup"));
+            }
             decommission_cancel_signal_result(rx.is_cancelled())?;
 
             self.save_decommission_entry_progress_stage(
@@ -3157,6 +3178,12 @@ impl ECStore {
                 entry.name.as_str(),
                 &fivs,
                 &cleanup_preflight_allowed_missing,
+                data_movement::SourceCleanupBucketFence {
+                    expected_incarnation_id: expected_bucket_incarnation_id,
+                    lifecycle_guard: bucket_incarnation_fence
+                        .as_ref()
+                        .and_then(|guard| guard.namespace_lock_guard()),
+                },
                 "decommission",
             )
             .await
@@ -3268,6 +3295,11 @@ impl ECStore {
         let mut lifecycle_config = None;
         let mut object_lock_config = None;
         let mut replication_config = None;
+        let expected_bucket_incarnation_id = if bi.name == RUSTFS_META_BUCKET {
+            None
+        } else {
+            Some(self.bucket_incarnation_id_from_disk(&bi.name).await?)
+        };
 
         if bi.name != RUSTFS_META_BUCKET {
             let _ = resolve_decommission_optional_bucket_config_result(
@@ -3321,6 +3353,7 @@ impl ECStore {
                     let lifecycle_config = lifecycle_config.clone();
                     let object_lock_config = object_lock_config.clone();
                     let replication_config = replication_config.clone();
+                    let expected_bucket_incarnation_id = expected_bucket_incarnation_id;
                     let entry_error = entry_error.clone();
                     let callback_rx = callback_rx.clone();
 
@@ -3383,6 +3416,7 @@ impl ECStore {
                                 lifecycle_config,
                                 object_lock_config,
                                 replication_config,
+                                expected_bucket_incarnation_id,
                             )
                             .await
                         {
@@ -4168,10 +4202,24 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rd))]
-    async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+    async fn decommission_object(
+        self: Arc<Self>,
+        pool_idx: usize,
+        bucket: String,
+        rd: GetObjectReader,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+    ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
-        let result = data_movement::migrate_object(self, pool_idx, bucket.clone(), rd, "decommission_object").await;
+        let result = data_movement::migrate_object(
+            self,
+            pool_idx,
+            bucket.clone(),
+            rd,
+            expected_bucket_incarnation_id,
+            "decommission_object",
+        )
+        .await;
         if result.is_ok() {
             warn!("decommission_object: migrated {} {}", &bucket, &object_name);
         }
@@ -4347,7 +4395,8 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = decommission_delete_marker_opts(&version, Some("version-id".to_string()), 7);
+        let incarnation = uuid::Uuid::new_v4();
+        let opts = decommission_delete_marker_opts(&version, Some("version-id".to_string()), 7, Some(incarnation));
         let replication = opts.delete_replication.expect("replication state should be preserved");
 
         assert!(opts.versioned);
@@ -4357,9 +4406,23 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 7);
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
         assert_eq!(replication.replica_status, ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn decommission_delete_marker_opts_preserves_suspended_null_version() {
+        let version = rustfs_filemeta::FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+        let opts = decommission_delete_marker_opts(&version, None, 7, None);
+
+        assert!(!opts.versioned);
+        assert!(opts.version_suspended);
+        assert_eq!(opts.version_id.as_deref(), Some(uuid::Uuid::nil().to_string().as_str()));
     }
 
     #[test]
@@ -4383,7 +4446,8 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = decommission_remote_tiered_opts(&version, Some("version-id".to_string()), 9);
+        let incarnation = uuid::Uuid::new_v4();
+        let opts = decommission_remote_tiered_opts(&version, Some("version-id".to_string()), 9, Some(incarnation));
 
         assert!(opts.versioned);
         assert!(opts.data_movement);
@@ -4391,6 +4455,9 @@ mod tests {
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));
         assert_eq!(opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
+        assert!(opts.include_part_checksums);
+        assert!(opts.http_preconditions.is_some());
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
     }
 
     #[test]

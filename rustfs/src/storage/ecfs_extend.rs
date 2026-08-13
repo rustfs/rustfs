@@ -765,76 +765,44 @@ where
 
 /// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
 ///
-/// **Adaptive strategy** (selected once at startup via env var):
-///
-/// | Backend | Env var | Best for |
-/// |---------|---------|----------|
-/// | `RwLock<HashMap>` | default | < 100 buckets — lower per-op overhead |
-/// | `starshard::ShardedHashMap` | `RUSTFS_BUCKET_CACHE_STARSHARD=1` | >= 100 buckets — sharded locks reduce contention |
+/// Backend: `RwLock<HashMap>`. A parallel opt-in starshard backend
+/// (`RUSTFS_BUCKET_CACHE_STARSHARD`) used to double-write every operation
+/// here; no deployment ever set the variable and the branch was removed in
+/// backlog#1832.
 ///
 /// Entries expire after `BUCKET_VALIDATION_TTL` (checked on read).
 /// Write operations (delete/make bucket) invalidate the cache explicitly.
 const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
 
-/// Tracks which backend is active: `false` = HashMap, `true` = starshard.
-static USE_STARSHARD_CACHE: OnceLock<bool> = OnceLock::new();
-
-fn use_starshard() -> bool {
-    *USE_STARSHARD_CACHE.get_or_init(|| {
-        std::env::var("RUSTFS_BUCKET_CACHE_STARSHARD")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false)
-    })
-}
-
-/// --- HashMap backend (default) ---
 static BUCKET_CACHE_SMALL: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
 
 fn small_cache() -> &'static RwLock<HashMap<String, Instant>> {
     BUCKET_CACHE_SMALL.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// --- starshard backend (opt-in) ---
-static BUCKET_CACHE_LARGE: OnceLock<starshard::ShardedHashMap<String, Instant>> = OnceLock::new();
-
-fn large_cache() -> &'static starshard::ShardedHashMap<String, Instant> {
-    BUCKET_CACHE_LARGE.get_or_init(|| starshard::ShardedHashMap::new(128))
-}
-
-/// Get a value from the active cache backend.
+/// Get a value from the cache.
 fn cache_get(bucket: &str) -> Option<Instant> {
-    if use_starshard() {
-        large_cache().get(&bucket.to_string())
-    } else {
-        small_cache().read().ok()?.get(bucket).copied()
-    }
+    small_cache().read().ok()?.get(bucket).copied()
 }
 
-/// Insert a value into the active cache backend.
+/// Insert a value into the cache.
 fn cache_insert(bucket: String, ts: Instant) {
-    if use_starshard() {
-        large_cache().insert(bucket, ts);
-    } else if let Ok(mut map) = small_cache().write() {
+    if let Ok(mut map) = small_cache().write() {
         map.insert(bucket, ts);
     }
 }
 
-/// Remove a value from the active cache backend.
+/// Remove a value from the cache.
 fn cache_remove(bucket: &str) {
-    if use_starshard() {
-        large_cache().remove(&bucket.to_string());
-    } else if let Ok(mut map) = small_cache().write() {
+    if let Ok(mut map) = small_cache().write() {
         map.remove(bucket);
     }
 }
 
-/// Clear all entries in the active cache backend.
+/// Clear all entries in the cache.
 #[allow(dead_code)]
 fn cache_clear() {
-    if use_starshard() {
-        large_cache().clear();
-    } else if let Ok(mut map) = small_cache().write() {
+    if let Ok(mut map) = small_cache().write() {
         map.clear();
     }
 }

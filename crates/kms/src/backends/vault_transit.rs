@@ -101,6 +101,23 @@ fn is_cas_conflict(error: &ClientError) -> bool {
     )
 }
 
+/// Whether a transit LIST failed with the 404 Vault uses for "mounted, but no
+/// keys yet".
+///
+/// Vault answers a LIST on a mounted transit engine that holds no keys with a
+/// 404 whose `errors` array is empty — the mount routed and answered the
+/// request, so the engine is reachable. A 404 for a path with no mount behind
+/// it instead carries a "no handler for route" message, so the empty `errors`
+/// array is what separates "engine reachable but empty" from "engine missing".
+///
+/// An empty non-transit engine (e.g. KV v1) at the configured path answers
+/// with byte-identical 404s, so this probe cannot detect that misconfiguration
+/// — no LIST-based probe can. The data path still fails hard on the first real
+/// transit operation against such a mount.
+fn is_empty_transit_list(error: &ClientError) -> bool {
+    matches!(error, ClientError::APIError { code: 404, errors } if errors.is_empty())
+}
+
 #[derive(Debug, Clone)]
 struct TransitKeyMetadata {
     key_usage: KeyUsage,
@@ -1243,12 +1260,17 @@ impl VaultTransitKmsClient {
         let mut all_keys = self
             .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
-                key::list(&vault.client, &self.config.mount_path).await.map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}")))
-                })
+                match key::list(&vault.client, &self.config.mount_path).await {
+                    Ok(response) => Ok(response.keys),
+                    // An empty transit engine answers LIST with a bare 404;
+                    // that is an empty listing, not a backend failure.
+                    Err(error) if is_empty_transit_list(&error) => Ok(Vec::new()),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}"))
+                    })),
+                }
             })
-            .await?
-            .keys;
+            .await?;
         // Vault's own LIST ordering is not part of its contract, so the sort is
         // what makes the marker a stable cursor across calls.
         all_keys.sort_unstable();
@@ -1421,12 +1443,17 @@ impl VaultTransitKmsClient {
     pub(crate) async fn health_check(&self) -> Result<()> {
         self.run("vault_transit_health_check", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
-            key::list(&vault.client, &self.config.mount_path)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Vault Transit health check failed: {e}")))
-                })
+            match key::list(&vault.client, &self.config.mount_path).await {
+                Ok(_) => Ok(()),
+                // A brand-new transit mount holds no keys until something
+                // creates one, and this check gates startup before the service
+                // creates its own probe key — treating "empty" as unhealthy
+                // would keep a first-ever deployment from ever starting.
+                Err(error) if is_empty_transit_list(&error) => Ok(()),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Vault Transit health check failed: {e}"))
+                })),
+            }
         })
         .await
     }
@@ -2083,6 +2110,107 @@ mod tests {
             requests.iter().all(|line| line.starts_with("GET ")),
             "the rejected create must not write anything: {requests:?}"
         );
+    }
+
+    /// Regression test for the first-boot chicken-and-egg on a fresh transit
+    /// mount (rustfs/backlog#1774).
+    ///
+    /// Vault answers a LIST on a mounted-but-empty transit engine with a 404
+    /// carrying an empty `errors` array. The health check gates startup before
+    /// the service creates its probe key, so this 404 must count as healthy —
+    /// failing it means a first-ever deployment on a fresh mount can never
+    /// start until an operator creates some transit key out-of-band.
+    #[tokio::test]
+    async fn health_check_passes_on_an_empty_transit_engine() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 404,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        client
+            .health_check()
+            .await
+            .expect("an empty transit engine is reachable and must pass the health check");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec!["LIST /v1/transit/keys".to_string()],
+            "the empty-list 404 must be accepted on the first attempt, not retried"
+        );
+    }
+
+    /// A 404 whose body says "no handler for route" means no transit engine is
+    /// mounted at the configured path at all; that must keep failing the
+    /// health check instead of riding the empty-engine allowance.
+    #[tokio::test]
+    async fn health_check_fails_when_the_transit_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::error(
+            404,
+            "no handler for route \"transit/keys\". route entry not found.",
+        )])
+        .await;
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("a missing transit mount must fail the health check");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The empty-engine allowance is scoped to 404 alone: any other status
+    /// whose body happens to carry an empty `errors` array (an intermediary
+    /// answering for Vault, for instance) must keep failing the health check.
+    #[tokio::test]
+    async fn health_check_fails_on_a_non_404_error_with_an_empty_errors_body() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 403,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("only a 404 may ride the empty-engine allowance");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The listing's own copy of the discriminator must not widen into "every
+    /// LIST failure is an empty listing" — a missing mount still fails loudly.
+    #[tokio::test]
+    async fn list_fails_when_the_transit_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::error(
+            404,
+            "no handler for route \"transit/keys\". route entry not found.",
+        )])
+        .await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a missing transit mount must fail the listing, not empty it");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The same empty-engine 404 on the listing path is an empty result set,
+    /// not a backend failure.
+    #[tokio::test]
+    async fn list_keys_returns_an_empty_page_on_an_empty_transit_engine() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 404,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("an empty transit engine must list as empty, not fail");
+        assert!(response.keys.is_empty(), "got {:?}", response.keys);
+        assert!(!response.truncated, "an empty listing has nothing left to page through");
+        assert_eq!(response.next_marker, None);
     }
 
     fn test_vault_transit_config() -> VaultTransitConfig {
