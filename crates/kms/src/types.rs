@@ -217,6 +217,12 @@ pub enum RotationDueReason {
     /// The key has never been rotated and has existed longer than the
     /// configured maximum age.
     NeverRotated,
+    /// The key has wrapped more data keys than the configured maximum.
+    ///
+    /// Counted per key-material version, so a rotation restarts the budget.
+    /// The count is an over-estimate by construction (see the backend's
+    /// reservation accounting), so this verdict errs toward rotating early.
+    Wraps,
     /// The backend cannot rotate keys at all, so no age makes one due.
     Unsupported,
 }
