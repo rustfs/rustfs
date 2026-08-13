@@ -46,7 +46,6 @@ use rustfs_config::{
     SCANNER_SUB_SYS,
 };
 use rustfs_filemeta::FileInfo;
-use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -199,8 +198,6 @@ fn is_server_config_decrypt_error(err: &Error) -> bool {
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
 pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
-
-static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
 
 type ServerConfigDecryptFn = crate::bucket::migration::LegacyBlobDecryptFn;
 

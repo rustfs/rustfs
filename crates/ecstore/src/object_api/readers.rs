@@ -449,10 +449,16 @@ impl GetObjectReader {
 }
 
 enum ReadTransform {
-    Plain {
-        visible_offset: usize,
-        visible_length: i64,
-    },
+    // Written but never read by production code: the enclosing struct already
+    // carries the same pair as `storage_offset`/`storage_length`. They survive
+    // as the read plan's test-visible record — four tests assert them by
+    // literal pattern (`Plain { visible_offset: 6, visible_length: 4 }`), which
+    // rustc does not count as a read.
+    #[allow(
+        dead_code,
+        reason = "asserted by literal pattern in this file's read-plan tests (backlog#1823)"
+    )]
+    Plain { visible_offset: usize, visible_length: i64 },
     Compressed {
         algorithm: CompressionAlgorithm,
         backend: crate::io_support::rio::ReadCompressionBackend,
@@ -1205,20 +1211,7 @@ impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for StreamConsumer<R> {
 
 impl<R: AsyncRead + Unpin + Send + 'static> Drop for StreamConsumer<R> {
     fn drop(&mut self) {
-        if self.consumer_task.is_none() && self.inner.is_some() {
-            let mut inner = self.inner.take().unwrap();
-            let task = tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match inner.read(&mut buf).await {
-                        Ok(0) => break,    // EOF
-                        Ok(_) => continue, // Keep consuming
-                        Err(_) => break,   // Error, stop consuming
-                    }
-                }
-            });
-            self.consumer_task = Some(task);
-        }
+        self.ensure_consumer_started();
     }
 }
 
