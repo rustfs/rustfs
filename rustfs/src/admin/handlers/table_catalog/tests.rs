@@ -12,8 +12,8 @@ use datafusion::{
 use std::sync::Arc;
 
 use crate::table_catalog::test_support::{
-    TestCatalogObjectBackend as TestTableCatalogObjectBackend, TestCatalogObjectRecord,
-    manifest_avro_bytes as test_manifest_avro_bytes,
+    TestCatalogObjectBackend as TestTableCatalogObjectBackend, TestCatalogObjectRecord, TestCatalogPublishPause,
+    TestTableCatalogStore, manifest_avro_bytes as test_manifest_avro_bytes,
     manifest_avro_bytes_with_nullable_sequences as test_manifest_avro_bytes_with_nullable_sequences,
     manifest_list_avro_bytes as test_manifest_list_avro_bytes, manifest_list_avro_entries as test_manifest_list_avro_entries,
     table_metadata_json as test_table_metadata_json,
@@ -6328,181 +6328,96 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     assert_eq!(unchanged.generation, current.generation);
 }
 
+/// Table-driven fold of the three commit-rejection cases whose bodies were
+/// identical apart from four literals (backlog#1837 PR3). Each row keeps its
+/// original manifest-list sequence, data-file name, manifest-entry snapshot
+/// id, and failure message, so no poison combination is lost.
 #[tokio::test]
-async fn row_level_conflict_rejects_stale_new_manifest_sequence() {
-    let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-    let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
-    let table_location = created.metadata["location"]
-        .as_str()
-        .expect("created metadata should have table location");
-    let current = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should exist");
-    let manifest_list = format!("{table_location}/metadata/snap-11.avro");
-    let manifest = format!("{table_location}/metadata/manifest-11.avro");
-    let data_file = format!("{table_location}/data/part-11.parquet");
-    seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 1, 11).await;
-    seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 11, 1)]).await;
-    let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
-        "updates": [
-            {
-                "action": "add-snapshot",
-                "snapshot": {
-                    "snapshot-id": 11,
-                    "sequence-number": 2,
-                    "timestamp-ms": 2234,
-                    "manifest-list": manifest_list,
-                    "summary": {
-                        "operation": "append"
+async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
+    // (case, manifest-list sequence, data-file suffix, manifest-entry snapshot id, expected failure)
+    let cases: &[(&str, i64, &str, i64, &str)] = &[
+        (
+            "stale-new-manifest-sequence",
+            1,
+            "11",
+            11,
+            "new manifest sequence must match the committed snapshot",
+        ),
+        (
+            "stale-added-entry-sequence",
+            2,
+            "11",
+            11,
+            "added file sequence must match the new manifest",
+        ),
+        (
+            "historical-change-in-new-manifest",
+            2,
+            "10",
+            10,
+            "new manifest must not claim a historical changed entry",
+        ),
+    ];
+
+    for (case, manifest_list_sequence, data_file_suffix, entry_snapshot_id, failure) in cases {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let data_file = format!("{table_location}/data/part-{data_file_suffix}.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], *manifest_list_sequence, 11).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, *entry_snapshot_id, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
                     }
                 }
-            }
-        ]
-    }))
-    .expect("append request should parse");
+            ]
+        }))
+        .expect("append request should parse");
 
-    let error = commit_table_response(
-        &store,
-        &trusted_table_commit_backend(&metadata_backend),
-        "warehouse",
-        &namespace,
-        "events",
-        append_request,
-    )
-    .await
-    .expect_err("new manifest sequence must match the committed snapshot");
-
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
-    let unchanged = store
-        .load_table("warehouse", "analytics", "events")
+        let Err(error) = commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&metadata_backend),
+            "warehouse",
+            &namespace,
+            "events",
+            append_request,
+        )
         .await
-        .expect("table lookup should succeed")
-        .expect("table should still exist");
-    assert_eq!(unchanged.metadata_location, current.metadata_location);
-    assert_eq!(unchanged.version_token, current.version_token);
-    assert_eq!(unchanged.generation, current.generation);
-}
+        else {
+            panic!("[{case}] {failure}");
+        };
 
-#[tokio::test]
-async fn row_level_conflict_rejects_stale_added_entry_sequence() {
-    let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-    let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
-    let table_location = created.metadata["location"]
-        .as_str()
-        .expect("created metadata should have table location");
-    let current = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should exist");
-    let manifest_list = format!("{table_location}/metadata/snap-11.avro");
-    let manifest = format!("{table_location}/metadata/manifest-11.avro");
-    let data_file = format!("{table_location}/data/part-11.parquet");
-    seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 2, 11).await;
-    seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 11, 1)]).await;
-    let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
-        "updates": [
-            {
-                "action": "add-snapshot",
-                "snapshot": {
-                    "snapshot-id": 11,
-                    "sequence-number": 2,
-                    "timestamp-ms": 2234,
-                    "manifest-list": manifest_list,
-                    "summary": {
-                        "operation": "append"
-                    }
-                }
-            }
-        ]
-    }))
-    .expect("append request should parse");
-
-    let error = commit_table_response(
-        &store,
-        &trusted_table_commit_backend(&metadata_backend),
-        "warehouse",
-        &namespace,
-        "events",
-        append_request,
-    )
-    .await
-    .expect_err("added file sequence must match the new manifest");
-
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
-    let unchanged = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should still exist");
-    assert_eq!(unchanged.metadata_location, current.metadata_location);
-    assert_eq!(unchanged.version_token, current.version_token);
-    assert_eq!(unchanged.generation, current.generation);
-}
-
-#[tokio::test]
-async fn row_level_conflict_rejects_historical_change_in_new_manifest() {
-    let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-    let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
-    let table_location = created.metadata["location"]
-        .as_str()
-        .expect("created metadata should have table location");
-    let current = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should exist");
-    let manifest_list = format!("{table_location}/metadata/snap-11.avro");
-    let manifest = format!("{table_location}/metadata/manifest-11.avro");
-    let data_file = format!("{table_location}/data/part-10.parquet");
-    seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 2, 11).await;
-    seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 10, 1)]).await;
-    let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
-        "updates": [
-            {
-                "action": "add-snapshot",
-                "snapshot": {
-                    "snapshot-id": 11,
-                    "sequence-number": 2,
-                    "timestamp-ms": 2234,
-                    "manifest-list": manifest_list,
-                    "summary": {
-                        "operation": "append"
-                    }
-                }
-            }
-        ]
-    }))
-    .expect("append request should parse");
-
-    let error = commit_table_response(
-        &store,
-        &trusted_table_commit_backend(&metadata_backend),
-        "warehouse",
-        &namespace,
-        "events",
-        append_request,
-    )
-    .await
-    .expect_err("new manifest must not claim a historical changed entry");
-
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
-    let unchanged = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should still exist");
-    assert_eq!(unchanged.metadata_location, current.metadata_location);
-    assert_eq!(unchanged.version_token, current.version_token);
-    assert_eq!(unchanged.generation, current.generation);
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest, "[{case}] {failure}");
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location, "[{case}] {failure}");
+        assert_eq!(unchanged.version_token, current.version_token, "[{case}] {failure}");
+        assert_eq!(unchanged.generation, current.generation, "[{case}] {failure}");
+    }
 }
 
 #[tokio::test]
@@ -7922,34 +7837,6 @@ fn commit_table_request_uses_rest_commit_fields() {
     assert_eq!(request.writer.as_deref(), Some("pyiceberg"));
 }
 
-#[derive(Default)]
-struct TestTableCatalogStore {
-    table_buckets: tokio::sync::Mutex<Vec<crate::table_catalog::TableBucketEntry>>,
-    namespaces: tokio::sync::Mutex<Vec<crate::table_catalog::NamespaceEntry>>,
-    tables: tokio::sync::Mutex<Vec<crate::table_catalog::TableEntry>>,
-    views: tokio::sync::Mutex<Vec<crate::table_catalog::ViewEntry>>,
-    commits: tokio::sync::Mutex<Vec<crate::table_catalog::CommitLogEntry>>,
-    fail_put_table_bucket: tokio::sync::Mutex<bool>,
-    register_table_pause: Option<TestCatalogPublishPause>,
-    commit_table_pause: Option<TestCatalogPublishPause>,
-}
-
-#[derive(Clone, Default)]
-struct TestCatalogPublishPause {
-    started: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-impl TestCatalogPublishPause {
-    async fn wait_started(&self) {
-        self.started.notified().await;
-    }
-
-    fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
 fn trusted_table_commit_backend(
     backend: &TestTableCatalogObjectBackend,
 ) -> TableCommitObjectBackend<TestTableCatalogObjectBackend> {
@@ -8316,410 +8203,6 @@ async fn seed_object_table_for_metadata_maintenance(
     backend
         .put_json(bucket, "unrelated/ignored.json", serde_json::json!({}))
         .await;
-}
-
-#[async_trait::async_trait]
-impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
-    async fn get_table_bucket(
-        &self,
-        table_bucket: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableBucketEntry>> {
-        Ok(self
-            .table_buckets
-            .lock()
-            .await
-            .iter()
-            .find(|entry| entry.table_bucket == table_bucket)
-            .cloned())
-    }
-
-    async fn put_table_bucket(
-        &self,
-        entry: crate::table_catalog::TableBucketEntry,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        let mut fail_put_table_bucket = self.fail_put_table_bucket.lock().await;
-        if *fail_put_table_bucket {
-            *fail_put_table_bucket = false;
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "injected table bucket write failure".to_string(),
-            ));
-        }
-        drop(fail_put_table_bucket);
-
-        let mut table_buckets = self.table_buckets.lock().await;
-        table_buckets.retain(|existing| existing.table_bucket != entry.table_bucket);
-        table_buckets.push(entry);
-        Ok(())
-    }
-
-    async fn create_namespace(
-        &self,
-        entry: crate::table_catalog::NamespaceEntry,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table bucket {}",
-                entry.table_bucket
-            )));
-        }
-        self.namespaces.lock().await.push(entry);
-        Ok(())
-    }
-
-    async fn list_namespaces(
-        &self,
-        table_bucket: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::NamespaceEntry>> {
-        Ok(self
-            .namespaces
-            .lock()
-            .await
-            .iter()
-            .filter(|entry| entry.table_bucket == table_bucket)
-            .cloned()
-            .collect())
-    }
-
-    async fn get_namespace(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::NamespaceEntry>> {
-        Ok(self
-            .namespaces
-            .lock()
-            .await
-            .iter()
-            .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
-            .cloned())
-    }
-
-    async fn update_namespace_properties(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        update: crate::table_catalog::NamespacePropertiesUpdate,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::NamespacePropertiesUpdateResult> {
-        let mut namespaces = self.namespaces.lock().await;
-        let entry = namespaces
-            .iter_mut()
-            .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
-            .ok_or_else(|| {
-                crate::table_catalog::TableCatalogStoreError::NotFound(format!("namespace {table_bucket}/{namespace}"))
-            })?;
-        Ok(update.apply_to(entry))
-    }
-
-    async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.namespaces
-            .lock()
-            .await
-            .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace));
-        Ok(())
-    }
-
-    async fn create_table(&self, entry: crate::table_catalog::TableEntry) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table bucket {}",
-                entry.table_bucket
-            )));
-        }
-        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                entry.table_bucket, entry.namespace
-            )));
-        }
-        self.tables.lock().await.push(entry);
-        Ok(())
-    }
-
-    async fn register_table(&self, entry: crate::table_catalog::TableEntry) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table bucket {}",
-                entry.table_bucket
-            )));
-        }
-        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                entry.table_bucket, entry.namespace
-            )));
-        }
-        if let Some(pause) = &self.register_table_pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
-        self.tables.lock().await.push(entry);
-        Ok(())
-    }
-
-    async fn register_table_with_publication(
-        &self,
-        entry: crate::table_catalog::TableEntry,
-        publication: &(dyn crate::table_catalog::TableCommitPublication + Sync),
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        publication.begin_table_bucket(&entry.table_bucket).await?;
-        if !publication.holds_table_bucket(&entry.table_bucket) {
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "table registration requires a table-bucket publication fence".to_string(),
-            ));
-        }
-        let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
-        publication
-            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
-            .await?;
-        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table) {
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "table registration requires a table publication fence".to_string(),
-            ));
-        }
-        self.register_table(entry).await
-    }
-
-    async fn list_tables(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableEntry>> {
-        Ok(self
-            .tables
-            .lock()
-            .await
-            .iter()
-            .filter(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_all_tables(
-        &self,
-        table_bucket: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableEntry>> {
-        Ok(self
-            .tables
-            .lock()
-            .await
-            .iter()
-            .filter(|entry| entry.table_bucket == table_bucket)
-            .cloned()
-            .collect())
-    }
-
-    async fn load_table(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableEntry>> {
-        Ok(self
-            .tables
-            .lock()
-            .await
-            .iter()
-            .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace && entry.table == table)
-            .cloned())
-    }
-
-    async fn commit_table(
-        &self,
-        request: crate::table_catalog::TableCommitRequest,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
-        let mut tables = self.tables.lock().await;
-        let Some(index) = tables.iter().position(|entry| {
-            entry.table_bucket == request.table_bucket && entry.namespace == request.namespace && entry.table == request.table
-        }) else {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                request.table_bucket, request.namespace, request.table
-            )));
-        };
-
-        let current = tables[index].clone();
-        if current.version_token != request.expected_version_token {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current table version token does not match expected token".to_string(),
-            ));
-        }
-        if current.metadata_location != request.expected_metadata_location {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current table metadata location does not match expected location".to_string(),
-            ));
-        }
-        if let Some(pause) = &self.commit_table_pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
-
-        let mut next = current.clone();
-        next.metadata_location = request.new_metadata_location.clone();
-        next.version_token = "token-committed".to_string();
-        next.generation = next.generation.saturating_add(1);
-        tables[index] = next.clone();
-        drop(tables);
-
-        let commit_log = crate::table_catalog::CommitLogEntry {
-            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
-            commit_id: request.commit_id,
-            idempotency_key: request.idempotency_key,
-            table_id: current.table_id,
-            operation: request.operation,
-            expected_version_token: request.expected_version_token,
-            new_version_token: next.version_token.clone(),
-            previous_metadata_location: request.expected_metadata_location,
-            new_metadata_location: request.new_metadata_location,
-            requirements: request.requirements,
-            status: crate::table_catalog::CommitLogStatus::Committed,
-            writer: request.writer,
-            created_at: None,
-            updated_at: None,
-        };
-        self.commits.lock().await.push(commit_log.clone());
-
-        Ok(crate::table_catalog::TableCommitResult { table: next, commit_log })
-    }
-
-    async fn commit_table_with_publication(
-        &self,
-        request: crate::table_catalog::TableCommitRequest,
-        publication: &(dyn crate::table_catalog::TableCommitPublication + Sync),
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
-        publication
-            .prepare(&request.table_bucket, &request.namespace, &request.table)
-            .await?;
-        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "table commit requires a table publication fence".to_string(),
-            ));
-        }
-        let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
-        self.commit_table(request).await
-    }
-
-    async fn drop_table(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.tables
-            .lock()
-            .await
-            .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace && entry.table == table));
-        Ok(())
-    }
-
-    async fn create_view(&self, entry: crate::table_catalog::ViewEntry) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table bucket {}",
-                entry.table_bucket
-            )));
-        }
-        if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                entry.table_bucket, entry.namespace
-            )));
-        }
-        self.views.lock().await.push(entry);
-        Ok(())
-    }
-
-    async fn list_views(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::ViewEntry>> {
-        Ok(self
-            .views
-            .lock()
-            .await
-            .iter()
-            .filter(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
-            .cloned()
-            .collect())
-    }
-
-    async fn load_view(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        view: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::ViewEntry>> {
-        Ok(self
-            .views
-            .lock()
-            .await
-            .iter()
-            .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace && entry.view == view)
-            .cloned())
-    }
-
-    async fn replace_view(
-        &self,
-        request: crate::table_catalog::ViewCommitRequest,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::ViewCommitResult> {
-        let mut views = self.views.lock().await;
-        let Some(index) = views.iter().position(|entry| {
-            entry.table_bucket == request.table_bucket && entry.namespace == request.namespace && entry.view == request.view
-        }) else {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "view {}/{}/{}",
-                request.table_bucket, request.namespace, request.view
-            )));
-        };
-        let current = views[index].clone();
-        if current.version_token != request.expected_version_token {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current view version token does not match expected token".to_string(),
-            ));
-        }
-        if current.metadata_location != request.expected_metadata_location {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current view metadata location does not match expected location".to_string(),
-            ));
-        }
-        let mut next = current;
-        next.metadata_location = request.new_metadata_location;
-        next.version_token = "token-view-committed".to_string();
-        next.generation = next.generation.saturating_add(1);
-        views[index] = next.clone();
-        Ok(crate::table_catalog::ViewCommitResult { view: next })
-    }
-
-    async fn drop_view(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        view: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.views
-            .lock()
-            .await
-            .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace && entry.view == view));
-        Ok(())
-    }
-
-    async fn get_commit_by_id(
-        &self,
-        _table_bucket: &str,
-        _table_id: &str,
-        _commit_id: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
-        Ok(None)
-    }
-
-    async fn get_commit_by_idempotency_key(
-        &self,
-        _table_bucket: &str,
-        _table_id: &str,
-        _idempotency_key: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
-        Ok(None)
-    }
 }
 
 #[tokio::test]
