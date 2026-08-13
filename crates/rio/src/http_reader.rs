@@ -52,7 +52,7 @@ const HTTP_VERSION_10_LABEL: &str = "http/1.0";
 const HTTP_VERSION_11_LABEL: &str = "http/1.1";
 const HTTP_VERSION_2_LABEL: &str = "h2";
 const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
-const MAX_EMPTY_CHUNKS_PER_POLL: usize = 64;
+const MAX_CONSECUTIVE_EMPTY_CHUNKS: usize = 64;
 const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty chunks";
 pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
 pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
@@ -929,7 +929,7 @@ pin_project! {
         stall_timer: Option<Pin<Box<Sleep>>>,
         request_started: Instant,
         duration_recorded: bool,
-        empty_chunk_limit_exceeded: bool,
+        consecutive_empty_chunks: usize,
         #[pin]
         inner: HttpByteStream,
         current: Option<Bytes>,
@@ -1124,7 +1124,7 @@ impl HttpChunkReader {
             stall_timeout: init.stall_timeout,
             request_started: init.request_started,
             duration_recorded: false,
-            empty_chunk_limit_exceeded: false,
+            consecutive_empty_chunks: 0,
         })
     }
 }
@@ -1157,10 +1157,9 @@ impl ChunkReader for HttpChunkReader {
         }
 
         let mut this = self.project();
-        if *this.empty_chunk_limit_exceeded {
+        if *this.consecutive_empty_chunks >= MAX_CONSECUTIVE_EMPTY_CHUNKS {
             return Poll::Ready(Err(excessive_empty_chunks_error()));
         }
-        let mut empty_chunks = 0;
         loop {
             if let Some(mut current) = this.current.take() {
                 let take = current.len().min(max);
@@ -1175,14 +1174,16 @@ impl ChunkReader for HttpChunkReader {
 
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => {
-                    empty_chunks += 1;
-                    if empty_chunks == MAX_EMPTY_CHUNKS_PER_POLL {
-                        *this.empty_chunk_limit_exceeded = true;
+                    *this.consecutive_empty_chunks += 1;
+                    if *this.consecutive_empty_chunks == MAX_CONSECUTIVE_EMPTY_CHUNKS {
                         record_internode_error(*this.track_internode_metrics, *this.internode_operation);
                         return Poll::Ready(Err(excessive_empty_chunks_error()));
                     }
                 }
-                Poll::Ready(Some(Ok(bytes))) => *this.current = Some(bytes),
+                Poll::Ready(Some(Ok(bytes))) => {
+                    *this.consecutive_empty_chunks = 0;
+                    *this.current = Some(bytes);
+                }
                 Poll::Ready(Some(Err(err))) => {
                     record_internode_operation_duration_once(
                         *this.track_internode_metrics,
@@ -2196,6 +2197,7 @@ mod tests {
         let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
             .await
             .expect("reader should open");
+        assert_eq!(reader.consecutive_empty_chunks, 0);
         let zero = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 0))
             .await
             .expect_err("zero chunk bound is invalid");
@@ -2223,31 +2225,32 @@ mod tests {
 
     #[test]
     fn http_chunk_reader_rejects_excessive_empty_chunks_on_both_interfaces() {
-        let make_reader = |empty_chunks| {
+        let make_reader = |inner: HttpByteStream| HttpChunkReader {
+            track_internode_metrics: false,
+            internode_operation: None,
+            stall_timeout: None,
+            stall_timer: None,
+            request_started: Instant::now(),
+            duration_recorded: false,
+            consecutive_empty_chunks: 0,
+            inner,
+            current: None,
+        };
+        let empty_chunks_then_data = |empty_chunks| {
             let items = (0..empty_chunks)
                 .map(|_| Ok(Bytes::new()))
                 .chain(std::iter::once(Ok(Bytes::from_static(b"data"))));
-            HttpChunkReader {
-                track_internode_metrics: false,
-                internode_operation: None,
-                stall_timeout: None,
-                stall_timer: None,
-                request_started: Instant::now(),
-                duration_recorded: false,
-                empty_chunk_limit_exceeded: false,
-                inner: Box::pin(stream::iter(items)),
-                current: None,
-            }
+            make_reader(Box::pin(stream::iter(items)))
         };
 
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut chunk_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL - 1);
+        let mut chunk_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS - 1);
         let Poll::Ready(Ok(Some(chunk))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
             panic!("data after fewer than the maximum empty chunks should be returned");
         };
         assert_eq!(chunk, b"data"[..]);
 
-        let mut async_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL - 1);
+        let mut async_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS - 1);
         let mut storage = [0; 4];
         let mut read_buf = ReadBuf::new(&mut storage);
         let Poll::Ready(Ok(())) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
@@ -2255,7 +2258,7 @@ mod tests {
         };
         assert_eq!(read_buf.filled(), b"data");
 
-        let mut chunk_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL);
+        let mut chunk_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS);
         let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
             panic!("excessive empty chunks should fail closed");
         };
@@ -2265,7 +2268,7 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-        let mut async_reader = make_reader(MAX_EMPTY_CHUNKS_PER_POLL);
+        let mut async_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS);
         let mut storage = [0; 4];
         let mut read_buf = ReadBuf::new(&mut storage);
         let Poll::Ready(Err(err)) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
@@ -2277,6 +2280,50 @@ mod tests {
             panic!("AsyncRead empty chunk limit failure should remain sticky");
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let make_pending_reader = || {
+            let mut empty_chunks = 0;
+            let mut returned_pending = false;
+            let items = stream::poll_fn(move |cx| {
+                if empty_chunks < MAX_CONSECUTIVE_EMPTY_CHUNKS - 1 {
+                    empty_chunks += 1;
+                    return Poll::Ready(Some(Ok(Bytes::new())));
+                }
+                if !returned_pending {
+                    returned_pending = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                if empty_chunks < MAX_CONSECUTIVE_EMPTY_CHUNKS {
+                    empty_chunks += 1;
+                    return Poll::Ready(Some(Ok(Bytes::new())));
+                }
+                Poll::Ready(None)
+            });
+            make_reader(Box::pin(items))
+        };
+
+        let mut chunk_reader = make_pending_reader();
+        assert!(Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4).is_pending());
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("the consecutive empty chunk limit must survive Pending");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let items = (0..MAX_CONSECUTIVE_EMPTY_CHUNKS - 1)
+            .map(|_| Ok(Bytes::new()))
+            .chain(std::iter::once(Ok(Bytes::from_static(b"one"))))
+            .chain((0..MAX_CONSECUTIVE_EMPTY_CHUNKS - 1).map(|_| Ok(Bytes::new())))
+            .chain(std::iter::once(Ok(Bytes::from_static(b"two"))));
+        let mut chunk_reader = make_reader(Box::pin(stream::iter(items)));
+        let Poll::Ready(Ok(Some(first))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 3) else {
+            panic!("data should reset the consecutive empty chunk count");
+        };
+        assert_eq!(first, b"one"[..]);
+        let Poll::Ready(Ok(Some(second))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 3) else {
+            panic!("empty chunks after data should start a new sequence");
+        };
+        assert_eq!(second, b"two"[..]);
     }
 
     #[tokio::test]
