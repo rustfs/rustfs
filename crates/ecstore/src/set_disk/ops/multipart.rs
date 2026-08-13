@@ -162,6 +162,22 @@ fn map_upload_id_metadata_error(bucket: &str, object: &str, upload_id: &str, err
     err.into()
 }
 
+/// Abort a multipart commit when the guard's refresh heartbeat has observed a
+/// refresh-quorum loss (backlog#899 Phase 2): a stale holder must not race a
+/// concurrent committer past its fenced commit point.
+fn fence_commit_on_lock_loss(guard: Option<&ObjectLockDiagGuard>, mode: &'static str, lock_path: &str) -> Result<()> {
+    if guard.is_some_and(|guard| guard.is_lock_lost()) {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: RUSTFS_META_MULTIPART_BUCKET.to_string(),
+            object: lock_path.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
 fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) {
@@ -975,12 +991,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.multipart_metric_label());
+            let small_size_hint = if matches!(write_path, SmallWritePath::SingleBlockNonInline) {
+                usize::try_from(multipart_part_size).map_err(Error::other)?
+            } else {
+                0
+            };
             let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
             let (reader, w_size) = match write_path {
                 SmallWritePath::SingleBlockNonInline => {
                     Arc::clone(&erasure)
-                        .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                        .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                         .await?
                 }
                 SmallWritePath::PipelineBatchedLarge => {
@@ -1087,29 +1108,38 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
+            let part_lock_path = format!("{upload_id_path}/{part_suffix}");
 
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire).await;
-            // Serialize only the commit (rename_part), not the whole upload. Each
-            // concurrent stream writes to its own unique temp dir (see `tmp_part`
-            // above), so the encode/stream phase never conflicts and must stay
-            // lock-free — holding a lock across it would serialize slow re-transmits
-            // of the same part and defeat the S3 "last finisher wins" semantics
-            // (it also caused UploadPart lock-acquire timeouts). The mixed-generation
-            // hazard is confined to rename_part, where two temp parts are moved
-            // cross-disk onto the SAME final part_path: interleaving there can leave
-            // shards from two generations, each individually bitrot-valid, that only
-            // surface as silent corruption at read time (backlog#853). A write lock
-            // scoped to the uploadId namespace makes each commit atomic across disks,
-            // so the last committer wins consistently. A guarded completion takes
-            // the object lock before this upload lock to preserve global ordering.
-            let _upload_commit_guard = if opts.no_lock {
-                None
+            // Serialize only same-part commits (rename_part), not the whole upload.
+            // Each concurrent stream writes to its own unique temp dir (see
+            // `tmp_part` above), so the encode/stream phase never conflicts and must
+            // stay lock-free — holding a lock across it would serialize slow
+            // re-transmits of the same part and defeat the S3 "last finisher wins"
+            // semantics. The mixed-generation hazard is confined to rename_part,
+            // where two temp parts are moved cross-disk onto the SAME final
+            // part_path: interleaving there can leave shards from two generations,
+            // each individually bitrot-valid, that only surface as silent corruption
+            // at read time (backlog#853). A write lock scoped to this part number
+            // makes each same-part commit atomic across disks, so the last committer
+            // wins consistently, while different part numbers commit onto disjoint
+            // part paths and stay concurrent (issue#5961 — an uploadId-wide write
+            // lock serialized them into 503 lock-acquire timeouts). The shared
+            // uploadId read lock keeps completion/abort (which take the uploadId
+            // write lock) from racing any in-flight part commit; a guarded
+            // completion takes the object lock before the upload lock to preserve
+            // global ordering.
+            let (_upload_commit_guard, _part_commit_guard) = if opts.no_lock {
+                (None, None)
             } else {
-                Some(
-                    self.acquire_write_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
-                        .await?,
-                )
+                let upload_guard = self
+                    .acquire_read_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
+                    .await?;
+                let part_guard = self
+                    .acquire_write_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &part_lock_path)
+                    .await?;
+                (Some(upload_guard), Some(part_guard))
             };
             let (commit_fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
             ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
@@ -1124,15 +1154,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await?;
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
-            if _upload_commit_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
-                return Err(StorageError::NamespaceLockQuorumUnavailable {
-                    mode: "put_object_part_commit",
-                    bucket: RUSTFS_META_MULTIPART_BUCKET.to_string(),
-                    object: upload_id_path.clone(),
-                    required: 1,
-                    achieved: 0,
-                });
-            }
+            fence_commit_on_lock_loss(_upload_commit_guard.as_ref(), "put_object_part_commit", &upload_id_path)?;
+            fence_commit_on_lock_loss(_part_commit_guard.as_ref(), "put_object_part_commit", &part_lock_path)?;
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
             let _ = self
@@ -1156,6 +1179,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterRename).await;
+            drop(_part_commit_guard);
             drop(_upload_commit_guard);
 
             let ret: PartInfo = PartInfo {
@@ -3986,6 +4010,268 @@ mod tests {
             .await
             .expect("abort task should not panic")
             .expect("abort should delete the upload after UploadPart releases the lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn put_object_part_different_part_numbers_commit_concurrently() {
+        use tokio::io::AsyncReadExt as _;
+
+        const PART1_SIZE: usize = 5 * 1024 * 1024; // non-final parts must be >= 5MiB to complete
+        const PART2_SIZE: usize = 4096;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let locker: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, vec![locker]).await;
+        let bucket = "multipart-concurrent-part-numbers-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let upload_id = upload.upload_id;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        // issue#5961: the barrier releases only once BOTH commits are paused
+        // inside their commit sections, so reaching wait_until_paused proves the
+        // two part numbers held their commit locks concurrently. Under an
+        // uploadId-wide exclusive commit lock the second put errors at the 5s
+        // lock-acquire timeout instead of arriving, and wait_until_paused fails
+        // deterministically. No wall-clock bound on the success path.
+        let barrier = MultipartCommitBarrier::install_for_arrivals(bucket, object, MultipartCommitPause::PutPartAfterRename, 2);
+
+        let put1_store = set_disks.clone();
+        let put1_upload_id = upload_id.clone();
+        let put1 = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x51; PART1_SIZE]);
+            put1_store
+                .put_object_part(bucket, object, &put1_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        let put2_store = set_disks.clone();
+        let put2_upload_id = upload_id.clone();
+        let put2 = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x52; PART2_SIZE]);
+            put2_store
+                .put_object_part(bucket, object, &put2_upload_id, 2, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        barrier.release();
+        let part1 = put1
+            .await
+            .expect("part 1 task should not panic")
+            .expect("part 1 should commit after the barrier is released");
+        let part2 = put2
+            .await
+            .expect("part 2 task should not panic")
+            .expect("part 2 should commit after the barrier is released");
+        assert_eq!(part1.part_num, 1);
+        assert_eq!(part2.part_num, 2);
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload_id,
+                vec![
+                    CompletePart {
+                        part_num: part1.part_num,
+                        etag: part1.etag.clone(),
+                        ..Default::default()
+                    },
+                    CompletePart {
+                        part_num: part2.part_num,
+                        etag: part2.etag.clone(),
+                        ..Default::default()
+                    },
+                ],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("completion should succeed with both concurrently committed parts");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should open");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("completed object should stream fully");
+        assert_eq!(body.len(), PART1_SIZE + PART2_SIZE);
+        assert!(body[..PART1_SIZE].iter().all(|b| *b == 0x51), "part 1 bytes must round-trip");
+        assert!(body[PART1_SIZE..].iter().all(|b| *b == 0x52), "part 2 bytes must round-trip");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn put_object_part_same_part_retries_serialize_on_part_lock() {
+        use tokio::io::AsyncReadExt as _;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+        let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "multipart-same-part-retry-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let upload_id = upload.upload_id;
+        let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        let part_lock_path = format!("{upload_id_path}/part.1");
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartAfterRename);
+
+        let first_store = set_disks.clone();
+        let first_upload_id = upload_id.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+            first_store
+                .put_object_part(bucket, object, &first_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        // The paused commit must hold its part lock EXCLUSIVELY: even a shared
+        // probe on the part key has to time out. This pins the write-ness of the
+        // part lock — a shared part lock would let two same-part rename_part
+        // calls interleave into mixed-generation shards (backlog#853).
+        let probe = set_disks
+            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &part_lock_path)
+            .await
+            .expect("part namespace lock should be created")
+            .get_read_lock(Duration::from_secs(1))
+            .await;
+        assert!(
+            probe.is_err(),
+            "the in-flight part commit must hold an exclusive write lock on its part key"
+        );
+
+        signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, part_lock_path));
+        let retry_store = set_disks.clone();
+        let retry_upload_id = upload_id.clone();
+        let retry = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x54; 4096]);
+            retry_store
+                .put_object_part(bucket, object, &retry_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        signaling.wait_for_attempts(1).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "a retry of the same part number must wait for the in-flight commit (backlog#853)"
+        );
+
+        barrier.release();
+        first
+            .await
+            .expect("first attempt task should not panic")
+            .expect("first attempt should commit after the barrier is released");
+        let retry_part = retry
+            .await
+            .expect("retry task should not panic")
+            .expect("the retry should commit after the first attempt releases the part lock");
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload_id,
+                vec![CompletePart {
+                    part_num: retry_part.part_num,
+                    etag: retry_part.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("the last committed retry must win the final part generation");
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should open");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("completed object should stream fully");
+        assert_eq!(body, vec![0x54; 4096], "the retry's generation must be the one served");
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn put_object_part_fences_part_lock_loss_before_rename() {
+        let target = Arc::new(std::sync::RwLock::new(None));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| {
+                Arc::new(SelectiveLockLossClient::new(Arc::clone(&target), Arc::clone(&refresh_calls))) as Arc<dyn LockClient>
+            })
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "multipart-put-part-part-lock-loss-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let upload_id = upload.upload_id;
+        let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        let part_lock_path = format!("{upload_id_path}/part.1");
+        *target.write().expect("lock-loss target should be writable") =
+            Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, part_lock_path.clone()));
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
+
+        let put_store = set_disks.clone();
+        let put_upload_id = upload_id.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x47; 4096]);
+            put_store
+                .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::Acquire) > 0,
+            "part lock heartbeat should reach the test client"
+        );
+        barrier.release();
+
+        let err = put
+            .await
+            .expect("UploadPart task should not panic")
+            .expect_err("UploadPart must fail after losing the part lock");
+        match err {
+            StorageError::NamespaceLockQuorumUnavailable {
+                bucket: lock_bucket,
+                object: lock_object,
+                ..
+            } => {
+                assert_eq!(lock_bucket, RUSTFS_META_MULTIPART_BUCKET);
+                assert_eq!(lock_object, part_lock_path);
+            }
+            other => panic!("unexpected lock-loss error: {other:?}"),
+        }
+        let listed = set_disks
+            .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+            .await
+            .expect("part lock loss before rename must leave the upload readable");
+        assert!(listed.parts.is_empty(), "part lock loss before rename must not publish the part");
     }
 
     #[tokio::test(start_paused = true)]

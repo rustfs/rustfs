@@ -74,8 +74,9 @@ pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key}
 pub(crate) use identifier::{
     default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
     default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
-    default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_view_metadata_location,
-    metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
+    default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_table_metadata_location_for_entry,
+    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, table_metadata_dir_path_for_entry,
+    table_metadata_file_path_for_entry, validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;

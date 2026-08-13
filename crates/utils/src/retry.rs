@@ -101,6 +101,56 @@ impl Stream for RetryTimer {
     }
 }
 
+/// Drives `operation` with capped, jittered exponential backoff, returning the
+/// first success or the last error once `max_attempts` attempts are exhausted.
+///
+/// The sleep before retry `n` (1-based) is `min(base_delay * 2^(n-1), max_delay)`,
+/// reduced by up to half through a cheap clock-derived jitter so concurrent
+/// retriers decorrelate — the same backoff shape as [`RetryTimer`] without
+/// needing a caller-supplied random seed or the Stream API. `max_attempts` is
+/// clamped to at least 1.
+pub async fn retry_with_backoff<F, Fut, T, E>(
+    mut operation: F,
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let max_attempts = max_attempts.max(1);
+    let mut last_err = None;
+
+    for attempt in 0..max_attempts {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < max_attempts {
+                    // Cap the shift so the multiplier cannot overflow; the cap
+                    // below bounds the result anyway.
+                    let exp = base_delay.saturating_mul(1u32 << attempt.min(16));
+                    let mut sleep_duration = exp.min(max_delay);
+                    // Up to 50% reduction, derived from the clock's sub-second
+                    // nanoseconds — cheap decorrelation without a rand dependency.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0);
+                    let reduction_percent = u64::from(nanos % 50);
+                    let sleep_ms = sleep_duration.as_millis() as u64;
+                    let jittered_ms = sleep_ms.saturating_sub(sleep_ms * reduction_percent / 100).max(1);
+                    sleep_duration = Duration::from_millis(jittered_ms);
+                    tokio::time::sleep(sleep_duration).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err.expect("max_attempts is clamped to at least 1, so at least one attempt ran"))
+}
+
 static RETRYABLE_S3CODES: LazyLock<Vec<String>> = LazyLock::new(|| {
     vec![
         "RequestError".to_string(),
@@ -239,6 +289,87 @@ mod tests {
     #[test]
     fn is_s3code_in_message_retryable_rejects_empty_string() {
         assert!(!is_s3code_in_message_retryable(""));
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_returns_first_success_without_retrying() {
+        let mut calls = 0;
+        let result: Result<i32, std::io::Error> = retry_with_backoff(
+            || {
+                calls += 1;
+                async { Ok(42) }
+            },
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+
+        assert_eq!(result.expect("first attempt succeeds"), 42);
+        assert_eq!(calls, 1, "a success must not trigger further attempts");
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_retries_until_success() {
+        let mut calls = 0;
+        let result: Result<i32, std::io::Error> = retry_with_backoff(
+            || {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt < 3 {
+                        Err(std::io::Error::other("transient"))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+            5,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+
+        assert_eq!(result.expect("third attempt succeeds"), 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_exhausts_attempts_and_returns_last_error() {
+        let mut calls = 0;
+        let result: Result<(), std::io::Error> = retry_with_backoff(
+            || {
+                calls += 1;
+                let attempt = calls;
+                async move { Err(std::io::Error::other(format!("attempt {attempt}"))) }
+            },
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+
+        let err = result.expect_err("all attempts fail");
+        assert_eq!(err.to_string(), "attempt 3", "the LAST error must be returned");
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_clamps_zero_attempts_to_one() {
+        let mut calls = 0;
+        let result: Result<(), std::io::Error> = retry_with_backoff(
+            || {
+                calls += 1;
+                async { Err(std::io::Error::other("always")) }
+            },
+            0,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "zero attempts clamps to a single attempt instead of panicking");
     }
 
     #[test]

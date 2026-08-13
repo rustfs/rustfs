@@ -17,14 +17,21 @@
 //!
 //! Use suffix-based API: `get_header(headers, SUFFIX_FORCE_DELETE)` queries both
 //! x-rustfs-force-delete and x-minio-force-delete.
+//!
+//! This module is the canonical owner of these interop values. One deliberate
+//! copy exists: `crates/replication/src/http.rs` re-declares the subset it
+//! needs because the wire-contract crate must stay free of internal
+//! dependencies (arch guard in `scripts/check_architecture_migration_rules.sh`
+//! bans replication -> rustfs-utils). When changing a value here, check the
+//! pinned copy there; its tests pin the shared wire values byte-for-byte.
 
 use http::{HeaderMap, HeaderValue};
 use std::borrow::Cow;
 
 const RUSTFS_PREFIX: &str = "x-rustfs-";
 const MINIO_PREFIX: &str = "x-minio-";
-const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
-const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+pub const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+pub const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 const MINIO_INTERNAL_ENCRYPTION_PREFIX: &str = "x-minio-internal-server-side-encryption-";
 const MINIO_INTERNAL_ENCRYPTED_MULTIPART: &str = "x-minio-internal-encrypted-multipart";
 const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = super::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER;

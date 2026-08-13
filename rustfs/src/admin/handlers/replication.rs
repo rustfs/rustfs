@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -35,9 +35,8 @@ use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::PeerRestClient;
 use crate::admin::utils::read_compatible_admin_body;
-use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
@@ -454,17 +453,7 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
 }
 
 async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
-    };
-
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
-
-    Ok(cred)
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
 }
 
 #[allow(dead_code)]

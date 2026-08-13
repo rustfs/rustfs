@@ -29,6 +29,7 @@ use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeRead
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
+use smallvec::{SmallVec, smallvec};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
@@ -40,9 +41,15 @@ use tracing::{debug, error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
+const INLINE_SHARD_SLOTS: usize = 32;
+type ShardBuffers = SmallVec<[Option<Vec<u8>>; INLINE_SHARD_SLOTS]>;
+type ShardErrors = SmallVec<[Option<Error>; INLINE_SHARD_SLOTS]>;
+type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
+type ActiveReaders = SmallVec<[bool; INLINE_SHARD_SLOTS]>;
+
 /// One stripe's worth of shard buffers plus the per-shard read errors, as
 /// returned by `ParallelReader::read` / `read_stripe_timed`.
-type StripeReadOutput = (Vec<Option<Vec<u8>>>, Vec<Option<Error>>);
+type StripeReadOutput = (ShardBuffers, ShardErrors);
 
 const ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING: &str = "RUSTFS_SHARD_LOCALITY_SCHEDULING";
 const ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: &str = "RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE";
@@ -390,7 +397,7 @@ pub(crate) struct ParallelReader<R> {
     // start, parity slots only once a data shard is missing/dead. Unengaged
     // parity stays an unopened deferred reader; `deferred_handles[i]` realigns
     // it to the current stripe when it is engaged mid-object (backlog#923).
-    engaged: Vec<bool>,
+    engaged: SmallVec<[bool; INLINE_SHARD_SLOTS]>,
     deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
     stripe_index: usize,
 }
@@ -573,7 +580,7 @@ where
         // behavior. With the gate on, only data slots start engaged; parity is
         // engaged on demand, stripe-aligned through its deferred handle.
         let data_shards_only = get_lockstep_data_shards_only_enabled();
-        let engaged = (0..readers.len())
+        let engaged: SmallVec<_> = (0..readers.len())
             .map(|index| !data_shards_only || index < e.data_shards)
             .collect();
         ParallelReader {
@@ -612,7 +619,7 @@ where
 fn record_shard_read_result(
     shards: &mut [Option<Vec<u8>>],
     errs: &mut [Option<Error>],
-    retire_readers: &mut Vec<usize>,
+    retire_readers: &mut ShardIndexes,
     success: &mut usize,
     successful_costs: &mut ShardReadCostCounts,
     i: usize,
@@ -637,7 +644,7 @@ fn record_shard_read_result(
     }
 }
 
-fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Vec<usize>, active_readers: &[bool]) {
+fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut ShardIndexes, active_readers: &[bool]) {
     for (i, active) in active_readers.iter().enumerate() {
         if !*active {
             continue;
@@ -692,7 +699,7 @@ where
     R: crate::erasure::coding::ShardSource,
 {
     #[hotpath::measure(impl_type = "ParallelReader")]
-    pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
+    pub async fn read(&mut self) -> StripeReadOutput {
         // On the reconstruction-verifying GET path, read every live shard reader
         // in lockstep so all readers advance one block per stripe and stay
         // mutually aligned. The adaptive data-first path below only reads
@@ -716,7 +723,7 @@ where
         };
 
         if shard_size == 0 {
-            return (vec![None; num_readers], vec![None; num_readers]);
+            return (smallvec![None; num_readers], smallvec![None; num_readers]);
         }
 
         // Advance to the next stripe so the following read() computes the correct
@@ -727,8 +734,8 @@ where
         // is only read above to derive `shard_size`, so advancing here is safe.
         self.offset += shard_size;
 
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
-        let mut errs = vec![None; num_readers];
+        let mut shards: ShardBuffers = smallvec![None; num_readers];
+        let mut errs: ShardErrors = smallvec![None; num_readers];
         let read_costs = self.read_costs.as_slice();
         let locality_preference_enabled = self.locality_preference_enabled;
         let low_cost_available = self
@@ -759,11 +766,11 @@ where
 
         self.buffers.ensure_slots(num_readers);
 
-        let mut retire_readers = Vec::new();
+        let mut retire_readers = ShardIndexes::new();
         if num_readers >= self.data_shards {
             let mut reader_iter = ReaderLaunchIter::new(&mut self.readers, read_costs, locality_preference_enabled);
             let mut sets = FuturesUnordered::new();
-            let mut active_readers = vec![false; num_readers];
+            let mut active_readers: ActiveReaders = smallvec![false; num_readers];
             let stripe_read_start = self.metrics_path.map(|_| Instant::now());
             let mut scheduled = 0usize;
             for _ in 0..self.data_shards {
@@ -1023,7 +1030,7 @@ where
     /// stripe would reintroduce the desync. A parity reader that cannot be
     /// realigned (no pending deferred handle) is likewise retired instead of
     /// being read out of position.
-    async fn read_lockstep(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
+    async fn read_lockstep(&mut self) -> StripeReadOutput {
         let num_readers = self.readers.len();
         let shard_size = if self.offset + self.shard_size > self.shard_file_size {
             self.shard_file_size - self.offset
@@ -1031,8 +1038,8 @@ where
             self.shard_size
         };
 
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
-        let mut errs: Vec<Option<Error>> = vec![None; num_readers];
+        let mut shards: ShardBuffers = smallvec![None; num_readers];
+        let mut errs: ShardErrors = smallvec![None; num_readers];
         if shard_size == 0 {
             return (shards, errs);
         }
@@ -1071,7 +1078,7 @@ where
         // Pre-claim per-slot buffers so the `self.readers` borrow below stays
         // disjoint from `self.buffers`; `Some(buffer)` also records which slots
         // participate, avoiding a per-stripe sidecar allocation.
-        let mut bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_readers);
+        let mut bufs: ShardBuffers = SmallVec::with_capacity(num_readers);
         for i in 0..num_readers {
             bufs.push(if self.engaged[i] && self.readers[i].is_some() {
                 Some(self.buffers.take(i, shard_size))
@@ -1086,7 +1093,7 @@ where
         let locality_preference_enabled = self.locality_preference_enabled;
         let stripe_read_start = metrics_path.map(|_| Instant::now());
 
-        let mut retire_readers = Vec::new();
+        let mut retire_readers = ShardIndexes::new();
         let mut scheduled = 0usize;
         let mut success = 0usize;
         let mut completed = 0usize;
@@ -1351,10 +1358,7 @@ fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
 /// stripe-read stage timer. Factored out so the depth-1 prefetch loop and the
 /// serial loop time reads identically. A free `async fn` (rather than a closure)
 /// so the returned future's borrow of `reader` is correctly tied to the call.
-async fn read_stripe_timed<R>(
-    reader: &mut ParallelReader<R>,
-    stage_metrics_enabled: bool,
-) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>)
+async fn read_stripe_timed<R>(reader: &mut ParallelReader<R>, stage_metrics_enabled: bool) -> StripeReadOutput
 where
     R: crate::erasure::coding::ShardSource,
 {
@@ -1967,6 +1971,32 @@ mod tests {
 
     type BoxedShardReader = crate::io_support::bitrot::ShardReader;
 
+    #[test]
+    fn shard_scratch_stays_inline_through_the_common_limit_and_spills_safely() {
+        let inline: ShardBuffers = smallvec![None; INLINE_SHARD_SLOTS];
+        assert!(!inline.spilled(), "the common shard-count boundary must not allocate");
+
+        let spilled: ShardBuffers = smallvec![None; INLINE_SHARD_SLOTS + 1];
+        assert!(spilled.spilled(), "larger supported shard counts must fall back to the heap");
+        assert_eq!(spilled.len(), INLINE_SHARD_SLOTS + 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_reader_preserves_slot_count_above_inline_capacity() {
+        const DATA_SHARDS: usize = INLINE_SHARD_SLOTS;
+        const TOTAL_SHARDS: usize = INLINE_SHARD_SLOTS + 1;
+        let readers = std::iter::repeat_with(|| None).take(TOTAL_SHARDS).collect();
+        let erasure = Erasure::new(DATA_SHARDS, 1, DATA_SHARDS);
+        let mut reader: ParallelReader<Cursor<Vec<u8>>> = ParallelReader::new(readers, erasure, 0, DATA_SHARDS);
+
+        let (shards, errors) = reader.read().await;
+
+        assert!(shards.spilled());
+        assert!(errors.spilled());
+        assert_eq!(shards.len(), TOTAL_SHARDS);
+        assert_eq!(errors.len(), TOTAL_SHARDS);
+    }
+
     /// Counts the raw bytes pulled from a shard stream, to prove which shards
     /// a decode path actually touches (backlog#923 call-count evidence).
     struct CountingShardReader {
@@ -2341,6 +2371,19 @@ mod tests {
         let (written, err) = erasure.decode(&mut output, readers, 2, 8, 9).await;
         assert_eq!(written, 0);
         assert_eq!(err.expect("range beyond total length should fail").kind(), ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn test_erasure_decode_zero_length_does_not_read_or_emit() {
+        let erasure = Erasure::new(2, 1, 64);
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = vec![None, None, None];
+        let mut output = Vec::new();
+
+        let (written, err) = erasure.decode(&mut output, readers, 0, 0, 0).await;
+
+        assert_eq!(written, 0);
+        assert!(err.is_none());
+        assert!(output.is_empty());
     }
 
     #[tokio::test]

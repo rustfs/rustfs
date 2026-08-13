@@ -78,9 +78,10 @@ impl SetDisks {
             include_part_checksums: true,
             ..Default::default()
         };
-        let (mut fi, _, disks) = self
+        let (fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?;
+        let mut fi = fi.into_owned();
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(&fi.metadata, expected_operation_id)?;
         }
@@ -102,7 +103,7 @@ impl SetDisks {
             bucket,
             object,
             fi.clone(),
-            disks.as_slice(),
+            &disks,
             &UpdateMetadataOpts {
                 replace_user_metadata: true,
                 ..Default::default()
@@ -145,9 +146,10 @@ impl SetDisks {
             include_part_checksums: true,
             ..Default::default()
         };
-        let (mut fi, _, disks) = self
+        let (fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?;
+        let mut fi = fi.into_owned();
         if let Some(expected_operation_id) = expected_operation_id {
             match restore_operation_id_from_metadata(&fi.metadata)? {
                 Some(actual_operation_id) if actual_operation_id == expected_operation_id => {}
@@ -172,7 +174,7 @@ impl SetDisks {
             bucket,
             object,
             fi,
-            disks.as_slice(),
+            &disks,
             &UpdateMetadataOpts {
                 replace_user_metadata: true,
                 ..Default::default()

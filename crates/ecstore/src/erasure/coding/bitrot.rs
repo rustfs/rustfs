@@ -18,7 +18,11 @@ use std::io::IoSlice;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
-use uuid::Uuid;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
+const EVENT_BITROT_SHORT_SHARD_READ: &str = "bitrot_short_shard_read";
+const EVENT_BITROT_HASH_MISMATCH: &str = "bitrot_hash_mismatch";
 
 /// A shard source that may already hold its bytes in memory.
 ///
@@ -73,7 +77,6 @@ pin_project! {
         buf: Vec<u8>,
         skip_verify: bool,
         last_verify_duration: Duration,
-        id: Uuid,
     }
 }
 
@@ -90,7 +93,6 @@ where
             buf: Vec::new(),
             skip_verify,
             last_verify_duration: Duration::ZERO,
-            id: Uuid::new_v4(),
         }
     }
 
@@ -118,7 +120,7 @@ where
 
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.copy_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)
@@ -157,7 +159,7 @@ where
         }
         let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
         if filled < need {
-            return Err(short_shard_read(&self.id, filled.saturating_sub(self.hash_algo.size()), want));
+            return Err(short_shard_read(filled.saturating_sub(self.hash_algo.size()), want));
         }
         Ok(())
     }
@@ -166,15 +168,23 @@ where
     /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
     fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
         if data_len < want {
-            return Err(short_shard_read(&self.id, data_len, want));
+            return Err(short_shard_read(data_len, want));
         }
         Ok(data_len)
     }
 }
 
 /// A truncated shard is `UnexpectedEof`, not a short success (backlog#799 B2).
-fn short_shard_read(id: &Uuid, got: usize, want: usize) -> std::io::Error {
-    error!("bitrot reader short shard read: id={id} got {got} of {want} bytes");
+fn short_shard_read(got: usize, want: usize) -> std::io::Error {
+    error!(
+        event = EVENT_BITROT_SHORT_SHARD_READ,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_ERASURE,
+        state = "failed",
+        got,
+        want,
+        "short shard read: got {got} of {want} bytes"
+    );
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("short shard read: got {got} of {want} bytes"))
 }
 
@@ -184,12 +194,7 @@ fn short_shard_read(id: &Uuid, got: usize, want: usize) -> std::io::Error {
 /// hash never reaches the caller's buffer. The verify duration is returned
 /// rather than stored so this stays a free function usable while `self` is
 /// borrowed for the block.
-fn split_and_verify<'a>(
-    hash_algo: &HashAlgorithm,
-    skip_verify: bool,
-    block: &'a [u8],
-    id: &Uuid,
-) -> std::io::Result<(&'a [u8], Duration)> {
+fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a [u8]) -> std::io::Result<(&'a [u8], Duration)> {
     let (hash, data) = block.split_at(hash_algo.size());
     if skip_verify {
         return Ok((data, Duration::ZERO));
@@ -198,7 +203,14 @@ fn split_and_verify<'a>(
     let actual_hash = hash_algo.hash_encode(data);
     let verify = verify_start.elapsed();
     if actual_hash.as_ref() != hash {
-        error!("bitrot reader hash mismatch, id={id} data_len={}", data.len());
+        error!(
+            event = EVENT_BITROT_HASH_MISMATCH,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ERASURE,
+            state = "failed",
+            data_len = data.len(),
+            "bitrot hash mismatch"
+        );
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
     }
     Ok((data, verify))
@@ -254,7 +266,7 @@ where
         // `need` bytes returns `None` and falls through to the scratch path,
         // keeping the short-read contract.
         if let Some(block) = self.inner.try_take_block(need) {
-            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block, &self.id)?;
+            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
             out.extend_from_slice(data);
             self.last_verify_duration = verify;
             return Ok(want);
@@ -264,7 +276,7 @@ where
         // the sink differs (`extend_from_slice` into `out` instead of
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.extend_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)

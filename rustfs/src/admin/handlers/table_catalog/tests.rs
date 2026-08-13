@@ -155,6 +155,7 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
             .endpoints
             .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
     );
+    assert!(!response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
     assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
     assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
     assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
@@ -279,6 +280,7 @@ fn catalog_config_response_reports_durable_strong_backing_override() {
             .endpoints
             .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
     );
+    assert!(response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
 }
 
 #[test]
@@ -329,6 +331,28 @@ fn catalog_conflicts_use_operation_specific_iceberg_errors() {
     ));
     assert_eq!(unsupported.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_UNSUPPORTED_OPERATION.into()));
     assert_eq!(unsupported.status_code(), Some(StatusCode::NOT_ACCEPTABLE));
+
+    for (error, expected_code, expected_status) in [
+        (
+            crate::table_catalog::TableCatalogStoreError::NamespaceNotFound("namespace not found".to_string()),
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            crate::table_catalog::TableCatalogStoreError::TableNotFound("table not found".to_string()),
+            ICEBERG_ERROR_NO_SUCH_TABLE,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            crate::table_catalog::TableCatalogStoreError::AlreadyExists("destination exists".to_string()),
+            ICEBERG_ERROR_ALREADY_EXISTS,
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let mapped = catalog_store_error(error);
+        assert_eq!(mapped.code(), &S3ErrorCode::Custom(expected_code.into()));
+        assert_eq!(mapped.status_code(), Some(expected_status));
+    }
 }
 
 #[test]
@@ -422,6 +446,16 @@ fn table_catalog_handlers_require_table_admin_actions() {
         sync_bridge_block.contains(".load_table(&warehouse, &namespace.public_name(), &table)"),
         "external catalog sync should branch authorization on current table existence"
     );
+
+    let rename_block = operation_block(&src, "RestRenameTableHandler");
+    assert_eq!(rename_block.matches("table_catalog_request_principal(&req).await?;").count(), 1);
+    assert_eq!(
+        rename_block
+            .matches("authorize_table_catalog_resource_for_principal(")
+            .count(),
+        2
+    );
+    assert_eq!(rename_block.matches("AdminAction::SetTableAction").count(), 2);
 
     let migration_block = operation_block(&src, "GetTableCatalogMigrationHandler");
     assert!(
@@ -572,6 +606,7 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
         "RestNamespaceExistsHandler",
         "RestUpdateNamespacePropertiesHandler",
         "RestDropNamespaceHandler",
+        "RestRenameTableHandler",
         "RestListTablesHandler",
         "RestCreateTableHandler",
         "RestRegisterTableHandler",
@@ -717,6 +752,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &RestLoadCredentialsHandler = &LOAD_CREDENTIALS_HANDLER;
     let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
     let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+    let _: &RestRenameTableHandler = &RENAME_TABLE_HANDLER;
     let _: &RestLoadViewHandler = &LOAD_VIEW_HANDLER;
     let _: &RestReplaceViewHandler = &REPLACE_VIEW_HANDLER;
     let _: &RestDropViewHandler = &DROP_VIEW_HANDLER;
@@ -760,6 +796,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<RestLoadCredentialsHandler>();
     assert_operation::<RestCommitTableHandler>();
     assert_operation::<RestDropTableHandler>();
+    assert_operation::<RestRenameTableHandler>();
     assert_operation::<RestLoadViewHandler>();
     assert_operation::<RestReplaceViewHandler>();
     assert_operation::<RestDropViewHandler>();
@@ -940,6 +977,14 @@ fn table_catalog_ingress_requests_reject_unknown_fields() {
             "unexpected": true
         }),
     );
+    assert_rejects_unknown_field::<RenameTableRequest>(
+        "RenameTableRequest",
+        serde_json::json!({
+            "source": {"namespace": ["analytics"], "name": "events"},
+            "destination": {"namespace": ["curated"], "name": "events_v2"},
+            "unexpected": true
+        }),
+    );
     assert_rejects_unknown_field::<RegisterTableRequest>(
         "RegisterTableRequest",
         serde_json::json!({
@@ -1018,6 +1063,57 @@ fn table_catalog_ingress_requests_reject_unknown_fields() {
             "unexpected": true
         }),
     );
+}
+
+#[test]
+fn rename_table_request_uses_standard_identifiers_and_strict_serde() {
+    let request: RenameTableRequest = serde_json::from_value(serde_json::json!({
+        "source": {"namespace": ["analytics", "raw"], "name": "events"},
+        "destination": {"namespace": ["analytics", "curated"], "name": "events_v2"}
+    }))
+    .expect("rename request should parse");
+    assert_eq!(request.source.namespace, vec!["analytics", "raw"]);
+    assert_eq!(request.source.name, "events");
+    assert_eq!(request.destination.namespace, vec!["analytics", "curated"]);
+    assert_eq!(request.destination.name, "events_v2");
+
+    assert_rejects_unknown_field::<RenameTableRequest>(
+        "RenameTableRequest.source",
+        serde_json::json!({
+            "source": {"namespace": ["analytics"], "name": "events", "unexpected": true},
+            "destination": {"namespace": ["curated"], "name": "events_v2"}
+        }),
+    );
+}
+
+#[tokio::test]
+async fn rename_table_body_rejects_declared_and_streamed_oversize_payloads() {
+    let mut oversized_headers = HeaderMap::new();
+    oversized_headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&(RENAME_TABLE_BODY_MAX_SIZE + 1).to_string()).expect("content length should parse"),
+    );
+    let declared = read_bounded_json_body::<RenameTableRequest>(
+        &oversized_headers,
+        Body::empty(),
+        RENAME_TABLE_BODY_MAX_SIZE,
+        RENAME_TABLE_BODY_TIMEOUT,
+        "rename table",
+    )
+    .await
+    .expect_err("oversized declared body should fail before reading");
+    assert_eq!(declared.code(), &S3ErrorCode::InvalidRequest);
+
+    let streamed = read_bounded_json_body::<RenameTableRequest>(
+        &HeaderMap::new(),
+        Body::from(vec![b' '; RENAME_TABLE_BODY_MAX_SIZE + 1]),
+        RENAME_TABLE_BODY_MAX_SIZE,
+        RENAME_TABLE_BODY_TIMEOUT,
+        "rename table",
+    )
+    .await
+    .expect_err("oversized streamed body should fail");
+    assert_eq!(streamed.code(), &S3ErrorCode::InvalidRequest);
 }
 
 fn assert_rejects_unknown_field<T>(target: &str, value: serde_json::Value)
@@ -2379,6 +2475,57 @@ async fn standard_commit_applies_updates_and_writes_next_metadata() {
             .await
             .expect("committed metadata lookup should succeed")
     );
+}
+
+#[tokio::test]
+async fn standard_commit_after_table_rename_keeps_the_original_metadata_root() {
+    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
+    let source_namespace = crate::table_catalog::Namespace::parse("analytics").expect("source namespace should parse");
+    let destination_namespace = crate::table_catalog::Namespace::parse("curated").expect("destination namespace should parse");
+    let created = create_standard_events_table(&store, &metadata_backend, &source_namespace).await;
+    create_namespace_response(
+        &store,
+        "warehouse",
+        CreateNamespaceRequest {
+            namespace: vec!["curated".to_string()],
+            properties: BTreeMap::new(),
+        },
+        true,
+    )
+    .await
+    .expect("destination namespace should be created");
+    store
+        .rename_table("warehouse", "analytics", "events", "curated", "events_v2")
+        .await
+        .expect("table should rename");
+
+    let request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+        "requirements": [{"type": "assert-table-uuid", "uuid": created.metadata["table-uuid"]}],
+        "updates": [{"action": "set-properties", "updates": {"owner": "curated"}}]
+    }))
+    .expect("commit request should parse");
+    let committed = standard_commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&metadata_backend),
+        "warehouse",
+        &destination_namespace,
+        "events_v2",
+        request,
+    )
+    .await
+    .expect("renamed table should accept a standard commit");
+
+    let original_metadata_root = crate::table_catalog::default_table_metadata_dir_path(
+        &source_namespace,
+        &crate::table_catalog::IdentifierSegment::parse("events").expect("source table should parse"),
+    );
+    assert!(
+        committed
+            .metadata_location
+            .starts_with(&format!("s3://warehouse/{original_metadata_root}/"))
+    );
+    assert!(!committed.metadata_location.contains("/namespaces/curated/tables/events_v2/"));
 }
 
 #[tokio::test]

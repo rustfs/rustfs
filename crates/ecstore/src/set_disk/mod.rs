@@ -639,9 +639,11 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+// Meet the direct-memory path at its default ceiling. Codec streaming remains
+// rollout-gated and starts where the eager small-object path ends.
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD;
 const ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = MI_B;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
@@ -733,10 +735,41 @@ mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 
+pub(in crate::set_disk) enum GetObjectMetadata<T> {
+    Owned(T),
+    Shared(Arc<T>),
+}
+
+impl<T> std::ops::Deref for GetObjectMetadata<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl<T: Clone> GetObjectMetadata<T> {
+    fn into_owned(self) -> T {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
+        }
+    }
+}
+
+type GetObjectFileInfo = (
+    GetObjectMetadata<FileInfo>,
+    GetObjectMetadata<Vec<FileInfo>>,
+    GetObjectMetadata<Vec<Option<DiskStore>>>,
+);
+
 pub(crate) struct PreparedGetObjectMetadata {
-    fi: FileInfo,
-    files: Vec<FileInfo>,
-    disks: Vec<Option<DiskStore>>,
+    fi: GetObjectMetadata<FileInfo>,
+    files: GetObjectMetadata<Vec<FileInfo>>,
+    disks: GetObjectMetadata<Vec<Option<DiskStore>>>,
     object_info: Option<ObjectInfo>,
 }
 
@@ -805,9 +838,9 @@ mod prepared_get_object_metadata_tests {
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
         let metadata = PreparedGetObjectMetadata {
-            fi: FileInfo::default(),
-            files: Vec::new(),
-            disks: Vec::new(),
+            fi: GetObjectMetadata::Owned(FileInfo::default()),
+            files: GetObjectMetadata::Owned(Vec::new()),
+            disks: GetObjectMetadata::Owned(Vec::new()),
             object_info: None,
         };
 
@@ -2334,6 +2367,8 @@ pub struct SetDisks {
     pub default_parity_count: usize,
     pub set_index: usize,
     pub pool_index: usize,
+    /// Stable namespace shared by every object lock created for this set.
+    set_lock_namespace: Arc<str>,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
@@ -2463,13 +2498,13 @@ impl Hash for GetObjectMetadataCacheKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
-    fi: FileInfo,
-    parts_metadata: Vec<FileInfo>,
-    online_disks: Vec<Option<DiskStore>>,
+    fi: Arc<FileInfo>,
+    parts_metadata: Arc<Vec<FileInfo>>,
+    online_disks: Arc<Vec<Option<DiskStore>>>,
     read_quorum: usize,
 }
 
@@ -2735,6 +2770,7 @@ impl SetDisks {
         instance_ctx: Arc<InstanceContext>,
     ) -> Arc<Self> {
         let ctx = instance_ctx;
+        let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -2742,6 +2778,7 @@ impl SetDisks {
             default_parity_count,
             set_index,
             pool_index,
+            set_lock_namespace,
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
@@ -3190,23 +3227,28 @@ async fn try_read_inline_data_shards_direct(
         return None;
     }
 
-    let mut body = Vec::with_capacity(object_size);
-    let mut remaining = object_size;
-    for reader in readers.iter_mut().take(data_shards) {
+    let shards_needed = object_size.div_ceil(read_length);
+    if shards_needed > data_shards {
+        return None;
+    }
+    let encoded_capacity = read_length.checked_mul(shards_needed)?;
+    let mut body = Vec::with_capacity(encoded_capacity);
+    for reader in readers.iter_mut().take(shards_needed) {
         let reader = reader.as_mut()?;
-        let mut shard = vec![0u8; read_length];
-        let Ok(read) = reader.read(&mut shard).await else {
+        let Ok(read) = reader.read_appending(&mut body, read_length).await else {
             return None;
         };
         if read != read_length {
             return None;
         }
 
-        let take = remaining.min(shard.len());
-        body.extend_from_slice(&shard[..take]);
-        remaining -= take;
-        if remaining == 0 {
-            return Some(Bytes::from(body));
+        if body.len() >= object_size {
+            let body = Bytes::from(body);
+            return Some(if body.len() == object_size {
+                body
+            } else {
+                body.slice(..object_size)
+            });
         }
     }
 
@@ -4932,6 +4974,28 @@ mod tests {
             matches!(local_guard, NamespaceLockGuard::Fast(_)),
             "a plain-erasure instance context must select the local lock strategy"
         );
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_reuses_the_set_namespace_allocation() {
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+
+        assert_eq!(&*set.set_lock_namespace, "set-0-0");
+        let before = Arc::strong_count(&set.set_lock_namespace);
+        let lock = set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.set_lock_namespace),
+            before + 1,
+            "each lock should share the set namespace instead of formatting a new String"
+        );
+        drop(lock);
+        assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
     }
 
     struct SetupTypeGuard {
@@ -8974,10 +9038,17 @@ mod tests {
         ));
     }
 
-    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
-        let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+    async fn inline_bitrot_files_for_payload_with_mode(
+        payload: &[u8],
+        uses_legacy: bool,
+    ) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        let erasure = coding::Erasure::new_with_options(4, 2, 1024 * 1024, uses_legacy);
         let read_length = erasure.shard_file_offset(0, payload.len(), payload.len());
-        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let checksum_algo = if uses_legacy {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            HashAlgorithm::HighwayHash256S
+        };
         let shards = erasure.encode_data(payload).expect("payload should encode");
         let mut files = Vec::with_capacity(shards.len());
 
@@ -8997,6 +9068,10 @@ mod tests {
         }
 
         (erasure, files, read_length, checksum_algo)
+    }
+
+    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        inline_bitrot_files_for_payload_with_mode(payload, false).await
     }
 
     fn inline_data_shard_fileinfo(
@@ -9079,14 +9154,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_data_shards_direct_read_reassembles_legacy_payload_with_padding() {
+        let payload = b"legacy inline payload whose size is not divisible by the data shard count";
+        let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload_with_mode(payload, true).await;
+        assert_ne!(payload.len() % erasure.data_shards, 0, "test payload must exercise EC padding");
+        let mut readers = build_inline_bitrot_readers(
+            &files,
+            erasure.data_shards,
+            "bucket",
+            "object",
+            read_length,
+            erasure.shard_size(),
+            &checksum_algo,
+            false,
+        )
+        .await
+        .expect("legacy inline bitrot readers should build");
+
+        let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, payload.len())
+            .await
+            .expect("legacy data shard direct read should succeed");
+
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
     async fn inline_data_shards_direct_read_rejects_corrupt_shard() {
         let payload = b"small inline object payload that will be corrupted";
         let (erasure, mut files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
-        let first = files[0].data.as_mut().expect("first shard should exist");
-        let mut corrupted = first.to_vec();
+        let second = files[1].data.as_mut().expect("second shard should exist");
+        let mut corrupted = second.to_vec();
         let last = corrupted.last_mut().expect("encoded shard should not be empty");
         *last ^= 0xff;
-        *first = Bytes::from(corrupted);
+        *second = Bytes::from(corrupted);
 
         let mut readers = build_inline_bitrot_readers(
             &files,
@@ -9103,7 +9204,7 @@ mod tests {
 
         let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len()).await;
 
-        assert!(body.is_none());
+        assert!(body.is_none(), "a later corrupt shard must discard the already-appended body prefix");
     }
 
     #[test]

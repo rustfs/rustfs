@@ -55,3 +55,142 @@ jobs:
 
       - name: Build RustFS
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p rustfs --bins
+
+  # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
+  #
+  # RUSTFS_KMS_VAULT_TOKEN is the single switch that adds the Vault KV2 and
+  # Vault Transit backends to every for_each_backend spec in
+  # crates/kms/tests/behavior_*.rs (see crates/kms/AGENTS.md). rotate and
+  # versioning are advertised only by the Vault backends, so without this lane
+  # no CI run ever asserts the working half of behavior_rotation.rs — a
+  # rotation that silently dropped historical key versions would stay green.
+  # The same lane runs the dev-Vault #[ignore] tests and the two self-hosting
+  # live scripts (AppRole login, three-node Raft leader failover).
+  #
+  # GitHub-hosted ubuntu-latest, deliberately not the self-hosted sm-standard
+  # fleet: the HA failover script needs a working Docker daemon, and the
+  # self-hosted fleet is heterogeneous — a docker-dependent workflow has been
+  # burned by it before (see the banner in e2e-s3tests.yml, rustfs/backlog#1149).
+  kms-vault-lane:
+    name: KMS live Vault lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      # Root token of the ephemeral loopback dev server. Not a secret: the
+      # server lives only for this job, listens on 127.0.0.1, and holds only
+      # keys the tests create. The literal value matters — the dev-Vault
+      # #[ignore] fixtures in crates/kms/src/backends/vault.rs hardcode it.
+      VAULT_LANE_TOKEN: dev-only-token
+      VAULT_LANE_ADDR: http://127.0.0.1:8200
+      # Keeps a runner-level proxy from swallowing the loopback dev-server
+      # traffic (see crates/kms/AGENTS.md). Actions env keys are
+      # case-insensitive, so only the uppercase form is set; reqwest reads
+      # either casing.
+      NO_PROXY: 127.0.0.1,localhost
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          # Dedicated key: rust-cache cannot tell runner images apart, so
+          # sharing a key with an sm-standard lane would let two different
+          # system images overwrite each other's artifacts (same reasoning as
+          # ci.yml's ci-uring lane). Saved from this nightly job itself so the
+          # next night starts warm.
+          cache-shared-key: kms-vault-lane
+          cache-save-if: 'true'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Install Vault CLI
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq vault
+          vault version
+
+      - name: Start Vault dev server with KV2 and Transit engines
+        run: |
+          set -euo pipefail
+          nohup vault server -dev \
+            -dev-root-token-id="${VAULT_LANE_TOKEN}" \
+            -dev-listen-address=127.0.0.1:8200 >/tmp/vault-dev.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS "${VAULT_LANE_ADDR}/v1/sys/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "${VAULT_LANE_ADDR}/v1/sys/health"
+          export VAULT_ADDR="${VAULT_LANE_ADDR}" VAULT_TOKEN="${VAULT_LANE_TOKEN}"
+          # Dev mode mounts KV v2 at secret/ by default; Transit is explicit.
+          # Prove both engines actually work rather than assuming the defaults.
+          vault secrets enable transit
+          vault kv put secret/rustfs-ci-lane-probe value=ok >/dev/null
+          vault kv get secret/rustfs-ci-lane-probe >/dev/null
+          vault write -f transit/keys/rustfs-ci-lane-probe >/dev/null
+
+      - name: Run rustfs-kms suite with the Vault lane on
+        env:
+          RUSTFS_KMS_VAULT_TOKEN: ${{ env.VAULT_LANE_TOKEN }}
+          RUSTFS_KMS_VAULT_ADDR: ${{ env.VAULT_LANE_ADDR }}
+        run: cargo test -p rustfs-kms --locked
+
+      - name: Run dev-Vault ignored tests
+        env:
+          RUSTFS_KMS_VAULT_TOKEN: ${{ env.VAULT_LANE_TOKEN }}
+          RUSTFS_KMS_VAULT_ADDR: ${{ env.VAULT_LANE_ADDR }}
+        # Filters select the dev-Vault-only #[ignore] tests. The AWS #[ignore]
+        # tests (backends::aws, service_manager) stay excluded — they need real
+        # AWS credentials and create billable keys. The AppRole and HA #[ignore]
+        # tests are excluded here because their own scripts below provision the
+        # Vault topology they need.
+        run: |
+          set -euo pipefail
+          cargo test -p rustfs-kms --locked --lib backends::contract_tests -- --ignored
+          cargo test -p rustfs-kms --locked --lib backends::vault -- --ignored
+          cargo test -p rustfs-kms --locked --test vault_fault_injection -- --ignored
+
+      - name: Run AppRole live checks (self-hosting ephemeral Vault)
+        run: bash scripts/test/vault_approle_kms_live.sh
+
+      - name: Show Vault dev server log on failure
+        if: failure()
+        run: tail -n 200 /tmp/vault-dev.log || true
+
+  # Three-node Raft leader failover (crates/kms/tests/vault_ha_failover_live.rs,
+  # first validated by rustfs/rustfs#5653). Its own job so an election-timing
+  # flake cannot mask the main lane's verdict, and vice versa. The script
+  # provisions and tears down its own Docker cluster.
+  kms-vault-ha-failover:
+    name: KMS Vault HA failover lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NO_PROXY: 127.0.0.1,localhost
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: kms-vault-lane
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Run HA leader failover live checks (three-node Raft cluster in Docker)
+        run: bash scripts/test/vault_ha_kms_live.sh

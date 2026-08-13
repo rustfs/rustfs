@@ -27,6 +27,10 @@ use base64::Engine;
 use jiff::Zoned;
 use md5::{Digest as Md5Digest, Md5};
 use rand::random;
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_CONTEXT_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+    INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_TAG_HEADER,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -80,17 +84,6 @@ fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<Stri
         .or_insert_with(|| canonical_bucket_path(&context.bucket, &context.object_key));
     enc_context
 }
-
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
-
-/// Carries the AEAD algorithm the object was sealed with.
-///
-/// The S3 `x-amz-server-side-encryption` header records the *SSE mode*
-/// (`AES256` / `aws:kms`), not the cipher, so it cannot round-trip
-/// `ChaCha20Poly1305`. Without this header a ChaCha-sealed object comes back
-/// from the projection claiming `aws:kms` and is then opened with the wrong
-/// cipher.
-const INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "x-rustfs-encryption-algorithm";
 
 /// Result of object encryption
 #[derive(Debug, Clone)]
@@ -807,19 +800,19 @@ impl ObjectEncryptionService {
 
         // Internal headers for decryption
         headers.insert(
-            "x-rustfs-encryption-iv".to_string(),
+            INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
             base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
         );
 
         if let Some(ref tag) = metadata.tag {
             headers.insert(
-                "x-rustfs-encryption-tag".to_string(),
+                INTERNAL_ENCRYPTION_TAG_HEADER.to_string(),
                 base64::engine::general_purpose::STANDARD.encode(tag),
             );
         }
 
         headers.insert(
-            "x-rustfs-encryption-key".to_string(),
+            INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
             base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
         );
 
@@ -831,7 +824,7 @@ impl ObjectEncryptionService {
             None => context_aad(&metadata.encryption_context).unwrap_or_default(),
         };
         headers.insert(
-            "x-rustfs-encryption-context".to_string(),
+            INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(),
             String::from_utf8_lossy(&context_bytes).into_owned(),
         );
 
@@ -876,13 +869,13 @@ impl ObjectEncryptionService {
         };
 
         let iv = headers
-            .get("x-rustfs-encryption-iv")
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
         let iv = base64::engine::general_purpose::STANDARD
             .decode(iv)
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
-        let tag = if let Some(tag_str) = headers.get("x-rustfs-encryption-tag") {
+        let tag = if let Some(tag_str) = headers.get(INTERNAL_ENCRYPTION_TAG_HEADER) {
             Some(
                 base64::engine::general_purpose::STANDARD
                     .decode(tag_str)
@@ -892,7 +885,7 @@ impl ObjectEncryptionService {
             None
         };
 
-        let encrypted_data_key = if let Some(key_str) = headers.get("x-rustfs-encryption-key") {
+        let encrypted_data_key = if let Some(key_str) = headers.get(INTERNAL_ENCRYPTION_KEY_HEADER) {
             base64::engine::general_purpose::STANDARD
                 .decode(key_str)
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
@@ -904,7 +897,7 @@ impl ObjectEncryptionService {
         // callers that inspect the context, but the bytes are carried through
         // untouched: re-serializing the parsed map is exactly how the original
         // ordering — and with it the ability to open the object — was lost.
-        let (encryption_context, context_aad) = match headers.get("x-rustfs-encryption-context") {
+        let (encryption_context, context_aad) = match headers.get(INTERNAL_ENCRYPTION_CONTEXT_HEADER) {
             Some(context_str) => (
                 serde_json::from_str(context_str)
                     .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?,

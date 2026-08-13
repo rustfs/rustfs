@@ -173,7 +173,6 @@ pub mod backpressure_metrics;
 pub mod cache_config;
 pub mod capacity_metrics;
 pub mod collector;
-pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
@@ -258,13 +257,6 @@ pub use system_path_metrics::record_system_path_failure;
 pub use timeout_metrics::{
     TimeoutMetricsSummary, record_dynamic_timeout, record_operation_completion, record_operation_duration,
     record_operation_progress, record_stalled_operation, record_timeout_event,
-};
-
-// Config exports
-pub use config::{
-    BackpressureSettings, CacheSettings, DEFAULT_BASE_BUFFER_SIZE, DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_CACHE_MAX_MEMORY,
-    DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_CONCURRENT_READS, DEFAULT_MIN_BUFFER_SIZE,
-    DeadlockDetectionSettings, IoConfig, IoSchedulerSettings, TimeoutSettings,
 };
 
 // Re-exports for convenience
@@ -795,8 +787,12 @@ pub fn record_get_object_metadata_cache_decision(path: &'static str, decision: &
 }
 
 /// Record aggregate metadata fanout shape for one GetObject metadata read.
+///
+/// The legacy `metadata_fanout_error_responses` series records every non-valid
+/// response, including not-found and ignored outcomes. Use
+/// `metadata_response_total` outcome labels for failure attribution.
 #[inline(always)]
-pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
+pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, non_valid: usize) {
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -807,7 +803,7 @@ pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize,
     histogram!("rustfs_io_get_object_metadata_fanout_ignored_responses", "path" => path)
         .record(metadata_fanout_count_to_f64(ignored));
     histogram!("rustfs_io_get_object_metadata_fanout_error_responses", "path" => path)
-        .record(metadata_fanout_count_to_f64(errors));
+        .record(metadata_fanout_count_to_f64(non_valid));
 }
 
 /// Record a guarded metadata early-stop hit for GetObject.

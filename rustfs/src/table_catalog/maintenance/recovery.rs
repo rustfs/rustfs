@@ -471,6 +471,57 @@ pub(crate) fn table_maintenance_object_kind(
     None
 }
 
+pub(crate) fn table_maintenance_object_kind_for_entry(
+    entry: &TableEntry,
+    warehouse_object_prefix: Option<&str>,
+    object_location: &str,
+) -> Option<TableMetadataMaintenanceObjectKind> {
+    let metadata_dir = table_metadata_dir_path_for_entry(entry).ok()?;
+    let metadata_prefix = format!("{metadata_dir}/");
+    if let Some(kind) = table_maintenance_metadata_object_kind(&metadata_prefix, object_location) {
+        return Some(kind);
+    }
+
+    let table_root = metadata_dir.strip_suffix(&format!("/{METADATA_DIR}"))?;
+    let data_prefix = format!("{table_root}/{DATA_DIR}/");
+    if object_location
+        .strip_prefix(&data_prefix)
+        .is_some_and(is_valid_table_maintenance_nested_object)
+    {
+        return Some(TableMetadataMaintenanceObjectKind::DataFile);
+    }
+    let delete_prefix = format!("{table_root}/{DELETE_DIR}/");
+    if object_location
+        .strip_prefix(&delete_prefix)
+        .is_some_and(is_valid_table_maintenance_nested_object)
+    {
+        return Some(TableMetadataMaintenanceObjectKind::DeleteFile);
+    }
+
+    if let Some(warehouse_object_prefix) = warehouse_object_prefix {
+        let metadata_prefix = format!("{warehouse_object_prefix}{METADATA_DIR}/");
+        if let Some(kind) = table_maintenance_metadata_object_kind(&metadata_prefix, object_location) {
+            return Some(kind);
+        }
+        let data_prefix = format!("{warehouse_object_prefix}{DATA_DIR}/");
+        if object_location
+            .strip_prefix(&data_prefix)
+            .is_some_and(is_valid_table_maintenance_nested_object)
+        {
+            return Some(TableMetadataMaintenanceObjectKind::DataFile);
+        }
+        let delete_prefix = format!("{warehouse_object_prefix}{DELETE_DIR}/");
+        if object_location
+            .strip_prefix(&delete_prefix)
+            .is_some_and(is_valid_table_maintenance_nested_object)
+        {
+            return Some(TableMetadataMaintenanceObjectKind::DeleteFile);
+        }
+    }
+
+    None
+}
+
 pub(crate) fn table_maintenance_object_kind_matches_reference(
     actual: &TableMetadataMaintenanceObjectKind,
     referenced: &TableMetadataMaintenanceObjectKind,

@@ -53,6 +53,7 @@ const LOG_SUBSYSTEM_HEAL_ADMIN: &str = "heal_admin";
 const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const LEGACY_ROOT_HEAL_RESPONSE_ID: &str = ".";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
 const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
@@ -148,6 +149,26 @@ fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
     }
 
     Ok(())
+}
+
+fn encode_heal_control_path(bucket: &str, obj_prefix: &str) -> String {
+    if bucket.is_empty() && obj_prefix.is_empty() {
+        return String::new();
+    }
+
+    path_join(&[PathBuf::from(bucket), PathBuf::from(obj_prefix)])
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
+    if !client_token.is_empty() {
+        return client_token.to_string();
+    }
+    if heal_path.is_empty() {
+        return LEGACY_ROOT_HEAL_RESPONSE_ID.to_string();
+    }
+    heal_path.to_string()
 }
 
 pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -1368,9 +1389,8 @@ impl Operation for HealHandler {
             "start_heal"
         };
 
-        let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
+        let heal_path = encode_heal_control_path(&hip.bucket, &hip.obj_prefix);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1380,7 +1400,7 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::query(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path,
                 client_token.clone(),
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
@@ -1412,7 +1432,6 @@ impl Operation for HealHandler {
             );
             return Ok(json_response(StatusCode::OK, body));
         } else if hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1422,22 +1441,12 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::cancel(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path.clone(),
                 client_token.clone(),
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control cancel failed: {err}"))?;
-            let response = submit_cluster_heal_channel_command(
-                context,
-                route,
-                envelope,
-                &request_id,
-                if client_token.is_empty() {
-                    heal_path.to_string_lossy().into_owned()
-                } else {
-                    client_token.clone()
-                },
-            )
-            .await?;
+            let response_id = heal_control_response_id(&heal_path, &client_token);
+            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, response_id).await?;
             if !response.success {
                 return Err(s3_error!(
                     InternalError,
@@ -1579,11 +1588,12 @@ mod tests {
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
         aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
-        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
-        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
-        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status,
-        reject_heal_admission, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
+        encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
+        map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        query_peer_replacement_recovery_status, reject_heal_admission, should_handle_root_heal_directly,
+        validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use crate::storage::rpc::node_service::heal::{
@@ -2110,6 +2120,20 @@ mod tests {
             ..Default::default()
         })
         .expect("root heal cancel should be accepted");
+    }
+
+    #[test]
+    fn test_encode_heal_control_path_keeps_root_empty() {
+        assert_eq!(encode_heal_control_path("", ""), "");
+        assert_eq!(encode_heal_control_path("bucket", ""), "bucket");
+        assert_eq!(encode_heal_control_path("bucket", "prefix"), "bucket/prefix");
+    }
+
+    #[test]
+    fn test_heal_control_response_id_preserves_existing_contract() {
+        assert_eq!(heal_control_response_id("", ""), ".");
+        assert_eq!(heal_control_response_id("bucket", ""), "bucket");
+        assert_eq!(heal_control_response_id("", "task-id"), "task-id");
     }
 
     #[test]

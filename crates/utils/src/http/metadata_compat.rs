@@ -14,6 +14,13 @@
 
 //! System metadata compatibility: write both x-rustfs-internal-* and x-minio-internal-*
 //! for MinIO interoperability. Read prefers RustFS, fallback to MinIO.
+//!
+//! This module is the canonical owner of these interop values. One deliberate
+//! copy exists: `crates/replication/src/http.rs` re-declares the subset it
+//! needs because the wire-contract crate must stay free of internal
+//! dependencies (arch guard in `scripts/check_architecture_migration_rules.sh`
+//! bans replication -> rustfs-utils). When changing a value here, check the
+//! pinned copy there; its tests pin the shared wire values byte-for-byte.
 
 use std::collections::{BTreeMap, HashMap};
 

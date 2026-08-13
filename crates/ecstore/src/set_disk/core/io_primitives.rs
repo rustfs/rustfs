@@ -58,6 +58,7 @@ use crate::io_support::bitrot::{
     create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled, object_mmap_read_max_length,
 };
 use crate::set_disk::shard_source::ShardReadCost;
+use futures::FutureExt as _;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
 use std::{
@@ -221,7 +222,7 @@ impl MetadataFanoutDiagnostics {
         self.observations.iter().filter(|observation| observation.ignored).count()
     }
 
-    pub(in crate::set_disk) fn error_responses(&self) -> usize {
+    pub(in crate::set_disk) fn non_valid_responses(&self) -> usize {
         self.total_responses().saturating_sub(self.valid_responses())
     }
 
@@ -272,7 +273,7 @@ impl MetadataFanoutDiagnostics {
             self.total_responses(),
             self.valid_responses(),
             self.ignored_responses(),
-            self.error_responses(),
+            self.non_valid_responses(),
         );
         for observation in &self.observations {
             rustfs_io_metrics::record_get_object_metadata_response(path, observation.outcome);
@@ -2863,8 +2864,6 @@ impl SetDisks {
                 file_info.validate_for_erasure_write()?;
             }
         }
-        let mut futures = Vec::with_capacity(disks.len());
-
         let mut errs = Vec::with_capacity(disks.len());
 
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -2872,48 +2871,65 @@ impl SetDisks {
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
 
-        for (i, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
-            let mut file_info = file_info.clone();
-            let disk = disk.clone();
-            let src_bucket = src_bucket.clone();
-            let src_object = src_object.clone();
-            let dst_object = dst_object.clone();
-            let dst_bucket = dst_bucket.clone();
+        let disk_count = disks.len();
+        let fanout_disks = disks.to_vec();
+        let fanout_file_infos = file_infos.to_vec();
+        let fanout_src_bucket = src_bucket.clone();
+        let fanout_src_object = src_object.clone();
+        let fanout_dst_bucket = dst_bucket.clone();
+        let fanout_dst_object = dst_object.clone();
+        // Keep one coordinator task so a cancelled caller cannot drop partially
+        // completed disk mutations. Per-disk futures stay ordered in `join_all`,
+        // preserving slot-indexed quorum and convergence accounting without a
+        // scheduler task for every disk.
+        let fanout = tokio::spawn(async move {
+            let futures = fanout_disks
+                .into_iter()
+                .zip(fanout_file_infos)
+                .enumerate()
+                .map(|(i, (disk, mut file_info))| {
+                    let src_bucket = fanout_src_bucket.clone();
+                    let src_object = fanout_src_object.clone();
+                    let dst_object = fanout_dst_object.clone();
+                    let dst_bucket = fanout_dst_bucket.clone();
 
-            futures.push(tokio::spawn(async move {
-                // Test-only introspection guard: counts this task as in-flight for
-                // the whole body. Compiles to `()` in production (no behavior).
-                #[allow(clippy::let_unit_value)]
-                let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+                    std::panic::AssertUnwindSafe(async move {
+                        // Test-only introspection guard: counts this operation as
+                        // in-flight for the whole body. Compiles to `()` in production.
+                        #[allow(clippy::let_unit_value)]
+                        let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
 
-                let Some(disk) = disk else {
-                    return Err(DiskError::DiskNotFound);
-                };
+                        let Some(disk) = disk else {
+                            return Err(DiskError::DiskNotFound);
+                        };
 
-                let is_delete_marker = file_info.is_canonical_delete_marker();
-                if file_info.erasure.index == 0 {
-                    file_info.erasure.index = i + 1;
-                }
+                        let is_delete_marker = file_info.is_canonical_delete_marker();
+                        if file_info.erasure.index == 0 {
+                            file_info.erasure.index = i + 1;
+                        }
 
-                if !is_delete_marker && !file_info.has_valid_erasure_geometry() {
-                    return Err(DiskError::FileCorrupt);
-                }
+                        if !is_delete_marker && !file_info.has_valid_erasure_geometry() {
+                            return Err(DiskError::FileCorrupt);
+                        }
 
-                // Test-only awaitable pause point right before the disk rename.
-                // A no-op immediately-ready future in production.
-                Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
+                        // Test-only awaitable pause point right before the disk rename.
+                        // A no-op immediately-ready future in production.
+                        Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
-                    .await
-            }));
-        }
+                        disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                            .await
+                    })
+                    .catch_unwind()
+                });
+            join_all(futures).await
+        });
 
-        let mut disk_versions = vec![None; disks.len()];
-        let mut data_dirs = vec![None; disks.len()];
-        let mut cleanup_data_dirs = vec![None; disks.len()];
-        let mut old_current_sizes = vec![None; disks.len()];
+        let mut disk_versions = vec![None; disk_count];
+        let mut data_dirs = vec![None; disk_count];
+        let mut cleanup_data_dirs = vec![None; disk_count];
+        let mut old_current_sizes = vec![None; disk_count];
 
-        let results = join_all(futures).await;
+        let results = fanout.await.map_err(|_| DiskError::Unexpected)?;
 
         for (idx, result) in results.iter().enumerate() {
             match result.as_ref().map_err(|_| DiskError::Unexpected)? {
@@ -5877,6 +5893,51 @@ mod tests {
         drop(dirs);
     }
 
+    #[tokio::test]
+    async fn rename_fanout_drains_after_caller_cancellation() {
+        const DISKS: usize = 4;
+        let bucket = "rename-cancel-bucket";
+        let object = "rename-cancel-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let marker = metadata_test_delete_marker(object, Uuid::new_v4(), OffsetDateTime::now_utc());
+        let file_infos = vec![marker; DISKS];
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        let rename =
+            tokio::spawn(
+                async move { SetDisks::rename_data(&disks, bucket, object, &file_infos, bucket, object, DISKS - 1).await },
+            );
+        tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+            .await
+            .expect("rename fan-out must reach the armed barrier");
+        rename.abort();
+        assert!(
+            rename
+                .await
+                .expect_err("aborted caller should report cancellation")
+                .is_cancelled(),
+            "caller task should be cancelled, not panic"
+        );
+        assert!(tracker.running() >= 1, "the coordinator must retain in-flight disk mutations");
+
+        barrier.release();
+        tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+            while tracker.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled caller's disk mutations must drain");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            assert!(
+                dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+                "disk {idx} must finish the rename after caller cancellation"
+            );
+        }
+    }
+
     /// Demo / regression guard for the barrier on the commit (old-data-dir)
     /// cleanup fan-out. Serves the same #1312/#1319 "no background disk write
     /// after release" shape, on the reclamation path that runs *after* a write is
@@ -6047,7 +6108,7 @@ mod tests {
         assert_eq!(diagnostics.total_responses(), 3);
         assert_eq!(diagnostics.valid_responses(), 1);
         assert_eq!(diagnostics.ignored_responses(), 1);
-        assert_eq!(diagnostics.error_responses(), 2);
+        assert_eq!(diagnostics.non_valid_responses(), 2);
         assert_eq!(diagnostics.first_response_latency(), Some(Duration::from_millis(10)));
         assert_eq!(diagnostics.first_valid_response_latency(), Some(Duration::from_millis(30)));
         assert_eq!(diagnostics.slowest_response_latency(), Some(Duration::from_millis(30)));

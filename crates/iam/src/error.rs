@@ -14,19 +14,23 @@
 
 use crate::IamStorageError;
 use rustfs_policy::policy::Error as PolicyError;
+use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    PolicyError(#[from] PolicyError),
+    // Arc payloads keep Clone variant-preserving for the non-cloneable inner
+    // errors (backlog#1831 PR2). Display is unchanged; the source() chain is
+    // not forwarded (Arc<E> does not implement std::error::Error).
+    #[error("{0}")]
+    PolicyError(Arc<PolicyError>),
 
     #[error("{0}")]
     StringError(String),
 
     #[error("crypto: {0}")]
-    CryptoError(#[from] rustfs_crypto::Error),
+    CryptoError(Arc<rustfs_crypto::Error>),
 
     #[error("user '{0}' does not exist")]
     NoSuchUser(String),
@@ -58,15 +62,6 @@ pub enum Error {
     #[error("not initialized")]
     IamSysNotInitialized,
 
-    #[error("invalid service type: {0}")]
-    InvalidServiceType(String),
-
-    #[error("malformed credential")]
-    ErrCredMalformed,
-
-    #[error("CredNotInitialized")]
-    CredNotInitialized,
-
     #[error("invalid access key length")]
     InvalidAccessKeyLength,
 
@@ -79,26 +74,11 @@ pub enum Error {
     #[error("group name contains reserved characters =,")]
     GroupNameContainsReservedChars,
 
-    #[error("jwt err {0}")]
-    JWTError(jsonwebtoken::errors::Error),
-
-    #[error("no access key")]
-    NoAccessKey,
-
-    #[error("invalid token")]
-    InvalidToken,
-
-    #[error("invalid access_key")]
-    InvalidAccessKey,
-
     #[error("access key is already in use")]
     AccessKeyAlreadyExists,
 
     #[error("action not allowed")]
     IAMActionNotAllowed,
-
-    #[error("invalid expiration")]
-    InvalidExpiration,
 
     #[error("no secret key with access key")]
     NoSecretKeyWithAccessKey,
@@ -128,9 +108,8 @@ impl PartialEq for Error {
             (Error::NoSuchServiceAccount(a), Error::NoSuchServiceAccount(b)) => a == b,
             (Error::NoSuchTempAccount(a), Error::NoSuchTempAccount(b)) => a == b,
             (Error::NoSuchGroup(a), Error::NoSuchGroup(b)) => a == b,
-            (Error::InvalidServiceType(a), Error::InvalidServiceType(b)) => a == b,
             (Error::Io(a), Error::Io(b)) => a.kind() == b.kind() && a.to_string() == b.to_string(),
-            // For complex types like PolicyError, CryptoError, JWTError, compare string representations
+            // For complex types like PolicyError and CryptoError, compare string representations
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b) && a.to_string() == b.to_string(),
         }
     }
@@ -139,9 +118,9 @@ impl PartialEq for Error {
 impl Clone for Error {
     fn clone(&self) -> Self {
         match self {
-            Error::PolicyError(e) => Error::StringError(e.to_string()), // Convert to string since PolicyError may not be cloneable
+            Error::PolicyError(e) => Error::PolicyError(Arc::clone(e)),
             Error::StringError(s) => Error::StringError(s.clone()),
-            Error::CryptoError(e) => Error::StringError(format!("crypto: {e}")), // Convert to string
+            Error::CryptoError(e) => Error::CryptoError(Arc::clone(e)),
             Error::NoSuchUser(s) => Error::NoSuchUser(s.clone()),
             Error::NoSuchAccount(s) => Error::NoSuchAccount(s.clone()),
             Error::NoSuchServiceAccount(s) => Error::NoSuchServiceAccount(s.clone()),
@@ -152,20 +131,12 @@ impl Clone for Error {
             Error::GroupNotEmpty => Error::GroupNotEmpty,
             Error::InvalidArgument => Error::InvalidArgument,
             Error::IamSysNotInitialized => Error::IamSysNotInitialized,
-            Error::InvalidServiceType(s) => Error::InvalidServiceType(s.clone()),
-            Error::ErrCredMalformed => Error::ErrCredMalformed,
-            Error::CredNotInitialized => Error::CredNotInitialized,
             Error::InvalidAccessKeyLength => Error::InvalidAccessKeyLength,
             Error::InvalidSecretKeyLength => Error::InvalidSecretKeyLength,
             Error::ContainsReservedChars => Error::ContainsReservedChars,
             Error::GroupNameContainsReservedChars => Error::GroupNameContainsReservedChars,
-            Error::JWTError(e) => Error::StringError(format!("jwt err {e}")), // Convert to string
-            Error::NoAccessKey => Error::NoAccessKey,
-            Error::InvalidToken => Error::InvalidToken,
-            Error::InvalidAccessKey => Error::InvalidAccessKey,
             Error::AccessKeyAlreadyExists => Error::AccessKeyAlreadyExists,
             Error::IAMActionNotAllowed => Error::IAMActionNotAllowed,
-            Error::InvalidExpiration => Error::InvalidExpiration,
             Error::NoSecretKeyWithAccessKey => Error::NoSecretKeyWithAccessKey,
             Error::NoAccessKeyWithSecretKey => Error::NoAccessKeyWithSecretKey,
             Error::PolicyTooLarge => Error::PolicyTooLarge,
@@ -173,6 +144,18 @@ impl Clone for Error {
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
             Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
         }
+    }
+}
+
+impl From<PolicyError> for Error {
+    fn from(e: PolicyError) -> Self {
+        Error::PolicyError(Arc::new(e))
+    }
+}
+
+impl From<rustfs_crypto::Error> for Error {
+    fn from(e: rustfs_crypto::Error) -> Self {
+        Error::CryptoError(Arc::new(e))
     }
 }
 
@@ -208,16 +191,10 @@ impl From<rustfs_policy::error::Error> for Error {
         match e {
             rustfs_policy::error::Error::PolicyTooLarge => Error::PolicyTooLarge,
             rustfs_policy::error::Error::InvalidArgument => Error::InvalidArgument,
-            rustfs_policy::error::Error::InvalidServiceType(s) => Error::InvalidServiceType(s),
             rustfs_policy::error::Error::IAMActionNotAllowed => Error::IAMActionNotAllowed,
-            rustfs_policy::error::Error::InvalidExpiration => Error::InvalidExpiration,
-            rustfs_policy::error::Error::NoAccessKey => Error::NoAccessKey,
-            rustfs_policy::error::Error::InvalidToken => Error::InvalidToken,
-            rustfs_policy::error::Error::InvalidAccessKey => Error::InvalidAccessKey,
             rustfs_policy::error::Error::NoSecretKeyWithAccessKey => Error::NoSecretKeyWithAccessKey,
             rustfs_policy::error::Error::NoAccessKeyWithSecretKey => Error::NoAccessKeyWithSecretKey,
             rustfs_policy::error::Error::Io(e) => Error::Io(e),
-            rustfs_policy::error::Error::JWTError(e) => Error::JWTError(e),
             rustfs_policy::error::Error::NoSuchUser(s) => Error::NoSuchUser(s),
             rustfs_policy::error::Error::NoSuchAccount(s) => Error::NoSuchAccount(s),
             rustfs_policy::error::Error::NoSuchServiceAccount(s) => Error::NoSuchServiceAccount(s),
@@ -230,13 +207,22 @@ impl From<rustfs_policy::error::Error> for Error {
             rustfs_policy::error::Error::InvalidSecretKeyLength => Error::InvalidSecretKeyLength,
             rustfs_policy::error::Error::ContainsReservedChars => Error::ContainsReservedChars,
             rustfs_policy::error::Error::GroupNameContainsReservedChars => Error::GroupNameContainsReservedChars,
-            rustfs_policy::error::Error::CredNotInitialized => Error::CredNotInitialized,
             rustfs_policy::error::Error::IamSysNotInitialized => Error::IamSysNotInitialized,
-            rustfs_policy::error::Error::PolicyError(e) => Error::PolicyError(e),
+            rustfs_policy::error::Error::PolicyError(e) => Error::PolicyError(Arc::new(e)),
             rustfs_policy::error::Error::StringError(s) => Error::StringError(s),
-            rustfs_policy::error::Error::CryptoError(e) => Error::CryptoError(e),
-            rustfs_policy::error::Error::ErrCredMalformed => Error::ErrCredMalformed,
+            rustfs_policy::error::Error::CryptoError(e) => Error::CryptoError(Arc::new(e)),
             rustfs_policy::error::Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
+            // These policy variants had dead same-name twins on iam::Error (zero
+            // construction and zero match sites, removed in backlog#1831); the
+            // message is preserved through StringError instead.
+            err @ (rustfs_policy::error::Error::InvalidServiceType(_)
+            | rustfs_policy::error::Error::InvalidExpiration
+            | rustfs_policy::error::Error::NoAccessKey
+            | rustfs_policy::error::Error::InvalidToken
+            | rustfs_policy::error::Error::InvalidAccessKey
+            | rustfs_policy::error::Error::JWTError(_)
+            | rustfs_policy::error::Error::CredNotInitialized
+            | rustfs_policy::error::Error::ErrCredMalformed) => Error::StringError(err.to_string()),
         }
     }
 }
@@ -413,6 +399,31 @@ mod tests {
         // but it becomes ErrorKind::Other when cloned
         assert_eq!(converted_io.kind(), ErrorKind::Other);
         assert!(converted_io.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn clone_preserves_variant_identity_and_message() {
+        // backlog#1831 PR2: cloning must never demote a variant to a different
+        // one (the old Clone stringified PolicyError/CryptoError into
+        // StringError). Pin discriminant and rendered message across clone.
+        let errors = vec![
+            Error::PolicyError(Arc::new(PolicyError::NonAction)),
+            Error::CryptoError(Arc::new(rustfs_crypto::Error::ErrInvalidKeyLength)),
+            Error::Io(std::io::Error::other("io payload")),
+            Error::StringError("plain".to_string()),
+            Error::NoSuchUser("u".to_string()),
+            Error::ConfigNotFound,
+        ];
+
+        for error in errors {
+            let cloned = error.clone();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&cloned),
+                "clone must keep the variant of {error:?}"
+            );
+            assert_eq!(error.to_string(), cloned.to_string(), "clone must keep the rendered message");
+        }
     }
 
     #[test]

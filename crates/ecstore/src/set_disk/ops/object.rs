@@ -56,6 +56,22 @@ use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
 
+#[inline]
+fn duration_millis_f64(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod duration_metrics_tests {
+    use super::duration_millis_f64;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_millis_preserves_sub_millisecond_precision() {
+        assert_eq!(duration_millis_f64(Duration::from_micros(125)), 0.125);
+    }
+}
+
 fn is_restore_control_metadata(key: &str) -> bool {
     key.eq_ignore_ascii_case(X_AMZ_RESTORE.as_str())
         || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS)
@@ -734,8 +750,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 0,
                 object_info.size,
                 &mut output,
-                fi,
-                files,
+                fi.into_owned(),
+                files.into_owned(),
                 &disks,
                 self.set_index,
                 self.pool_index,
@@ -851,8 +867,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
-                fi,
-                files,
+                fi.into_owned(),
+                files.into_owned(),
                 &disks,
                 set_index,
                 pool_index,
@@ -1107,8 +1123,12 @@ impl SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
-            let writer_setup_ms = writer_setup_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_writer_setup", writer_setup_ms as f64);
+            let writer_setup_elapsed = writer_setup_stage_start.elapsed();
+            let writer_setup_ms = writer_setup_elapsed.as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "set_disk_writer_setup",
+                duration_millis_f64(writer_setup_elapsed),
+            );
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1138,11 +1158,16 @@ impl SetDisks {
 
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
+            let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
+                usize::try_from(put_object_size).map_err(Error::other)?
+            } else {
+                0
+            };
 
             let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
@@ -1152,7 +1177,7 @@ impl SetDisks {
                     }
                 },
                 SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
-                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .encode_single_block_non_inline_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
                     .await
                 {
                     Ok((r, w)) => (r, w),
@@ -1178,8 +1203,9 @@ impl SetDisks {
                     }
                 },
             };
-            let encode_ms = encode_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", encode_ms as f64);
+            let encode_elapsed = encode_stage_start.elapsed();
+            let encode_ms = encode_elapsed.as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1497,8 +1523,18 @@ impl SetDisks {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
             }
-            let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
+
+            let rename_stage_elapsed = rename_stage_start.elapsed();
+            let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
+
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+
+            // `rename_data` has completed the authoritative quorum commit. The
+            // exact old-data-dir reclamation below is best-effort space cleanup;
+            // it must not serialize the next operation on this object.
+            drop(object_lock_guard);
+
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
             if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                 warn!(
                     event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
@@ -1527,9 +1563,13 @@ impl SetDisks {
                 let cleanup = self
                     .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
                     .await;
-                let cleanup_ms = cleanup_stage_start.elapsed().as_millis() as u64;
+                let cleanup_elapsed = cleanup_stage_start.elapsed();
+                let cleanup_ms = cleanup_elapsed.as_millis() as u64;
                 cleanup_stage_ms = Some(cleanup_ms);
-                rustfs_io_metrics::record_put_object_stage_duration("set_disk_old_data_cleanup", cleanup_ms as f64);
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_old_data_cleanup",
+                    duration_millis_f64(cleanup_elapsed),
+                );
                 self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
                     .await;
                 if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -1549,8 +1589,6 @@ impl SetDisks {
                     );
                 }
             }
-
-            drop(object_lock_guard); // drop object lock guard to release the lock
 
             for (i, op_disk) in online_disks.iter().enumerate() {
                 if let Some(disk) = op_disk
@@ -1648,10 +1686,6 @@ impl SetDisks {
                 error = %err,
                 "SetDisk put_object stage summary"
             );
-        }
-
-        if result.is_ok() {
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
         }
 
         if issue3031_diag_enabled() {
@@ -3169,9 +3203,10 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let mut read_opts = opts.clone();
         read_opts.include_part_checksums = true;
-        let (mut fi, _, disks) = self
+        let (fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?;
+        let mut fi = fi.into_owned();
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
         if let Some(eval_metadata) = &opts.eval_metadata {
@@ -3194,7 +3229,7 @@ impl SetDisks {
             });
         }
 
-        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
+        self.update_object_meta(bucket, object, fi.clone(), &disks).await?;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
@@ -4619,9 +4654,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut transition_read_opts = opts.clone();
         transition_read_opts.include_part_checksums = true;
-        let (mut fi, meta_arr, online_disks) = self
+        let (fi, meta_arr, online_disks) = self
             .get_object_fileinfo(bucket, object, &transition_read_opts, true, false)
             .await?;
+        let mut fi = fi.into_owned();
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -4736,7 +4772,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 cloned_fi.size,
                 &mut writer,
                 cloned_fi,
-                meta_arr,
+                meta_arr.into_owned(),
                 &online_disks,
                 set_index,
                 pool_index,
@@ -4861,7 +4897,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         let current = self.get_object_fileinfo(bucket, object, &commit_opts, true, false).await;
-        let (mut current_fi, _, _) = match current {
+        let (current_fi, _, _) = match current {
             Ok(current) => current,
             Err(err) => {
                 drop(transition_lock_guard);
@@ -4872,6 +4908,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Err(err);
             }
         };
+        let mut current_fi = current_fi.into_owned();
         let source_matches = current_fi.version_id == fi.version_id
             && current_fi.data_dir == fi.data_dir
             && current_fi.mod_time == fi.mod_time
@@ -5596,7 +5633,7 @@ mod get_object_downstream_close_accounting_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (decode_failures, emit_failures) = metrics::with_local_recorder(&recorder, || {
+        let (decode_failures, emit_failures, legacy_fanout, internal_fanout) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
                 let bucket = "get-downstream-close-accounting";
@@ -5664,6 +5701,14 @@ mod get_object_downstream_close_accounting_tests {
                             ("reason", GetObjectFailureReason::DownstreamClosed.as_str()),
                         ],
                     ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_total_responses",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_total_responses",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
                 )
             })
         });
@@ -5671,6 +5716,11 @@ mod get_object_downstream_close_accounting_tests {
 
         assert!(decode_failures > 0, "the producer must expose the downstream close at decode");
         assert_eq!(emit_failures, 0, "downstream closure must not be counted as an emit failure");
+        assert_eq!(legacy_fanout, vec![4.0], "ordinary object fanout must retain the legacy_duplex path");
+        assert!(
+            internal_fanout.is_empty(),
+            "ordinary object fanout must not be attributed to internal_meta"
+        );
     }
 
     #[test]
@@ -5684,7 +5734,7 @@ mod get_object_downstream_close_accounting_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (internal_missing, legacy_unknown) = metrics::with_local_recorder(&recorder, || {
+        let (internal_missing, legacy_unknown, internal_fanout, legacy_fanout) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
                 let options = ObjectOptions {
@@ -5720,6 +5770,14 @@ mod get_object_downstream_close_accounting_tests {
                             ("reason", GetObjectFailureReason::Unknown.as_str()),
                         ],
                     ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_error_responses",
+                        &[("path", GET_OBJECT_PATH_INTERNAL_META)],
+                    ),
+                    recorder.histogram_values(
+                        "rustfs_io_get_object_metadata_fanout_error_responses",
+                        &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+                    ),
                 )
             })
         });
@@ -5730,6 +5788,8 @@ mod get_object_downstream_close_accounting_tests {
             legacy_unknown, 0,
             "internal metadata miss must not be attributed to legacy_duplex/unknown"
         );
+        assert_eq!(internal_fanout, vec![4.0], "internal metadata fanout must retain its path label");
+        assert!(legacy_fanout.is_empty(), "internal metadata fanout must not leak into legacy_duplex");
     }
 }
 
@@ -6396,9 +6456,9 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: fi.clone(),
-                    parts_metadata,
-                    online_disks,
+                    fi: Arc::new((*fi).clone()),
+                    parts_metadata: Arc::new(parts_metadata.into_owned()),
+                    online_disks: Arc::new(online_disks.into_owned()),
                     read_quorum: 2,
                 }),
             )
@@ -9018,8 +9078,10 @@ mod put_object_tmp_cleanup_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
+    use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     /// Large enough that the erasure shards are written as real tmp files
     /// (never inlined into xl.meta), so both tests exercise actual cleanup.
@@ -9102,6 +9164,168 @@ mod put_object_tmp_cleanup_tests {
         );
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn committed_put_releases_namespace_lock_before_old_data_cleanup() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-commit-lock-window";
+        let object = "commit-lock-window-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be committed");
+        let mut initial = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("initial object should populate the metadata cache");
+        let mut initial_body = Vec::new();
+        initial
+            .stream
+            .read_to_end(&mut initial_body)
+            .await
+            .expect("initial body should drain");
+        assert_eq!(initial_body, vec![b'0'; TEST_OBJECT_SIZE]);
+
+        let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+        let first_store = Arc::clone(&set_disks);
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+            .await
+            .expect("first overwrite should reach old-data cleanup");
+
+        let mut committed = tokio::time::timeout(
+            Duration::from_secs(30),
+            set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await
+        .expect("GET should not wait for old-data cleanup")
+        .expect("committed overwrite should be readable during old-data cleanup");
+        let mut committed_body = Vec::new();
+        committed
+            .stream
+            .read_to_end(&mut committed_body)
+            .await
+            .expect("committed overwrite body should drain");
+        assert_eq!(committed_body, vec![b'1'; TEST_OBJECT_SIZE]);
+
+        let second_commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let second_store = Arc::clone(&set_disks);
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            second_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), second_commit_barrier.wait_until_paused())
+            .await
+            .expect("second overwrite should acquire the namespace lock during cleanup");
+
+        cleanup_barrier.release();
+        first
+            .await
+            .expect("first overwrite task should join")
+            .expect("first overwrite should remain successful after cleanup");
+        drop(cleanup_barrier);
+        second_commit_barrier.release();
+        second
+            .await
+            .expect("second overwrite task should join")
+            .expect("second overwrite should commit after acquiring the released namespace lock");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the latest overwrite should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_commit_cleanup_does_not_retain_namespace_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-commit-lock-cancelled-cleanup";
+        let object = "commit-lock-cancelled-cleanup-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be committed");
+
+        let cleanup_tasks = rename_fanout_barrier::observe_tasks(object);
+        let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+        let first_store = Arc::clone(&set_disks);
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+            .await
+            .expect("first overwrite should reach old-data cleanup");
+
+        let second_commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let second_store = Arc::clone(&set_disks);
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            second_store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), second_commit_barrier.wait_until_paused())
+            .await
+            .expect("second overwrite should acquire the namespace lock before cancellation");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("the first request should be cancelled during cleanup")
+                .is_cancelled()
+        );
+        assert!(
+            cleanup_tasks.running() >= 1,
+            "cancelled cleanup must remain observable until its disk task drains"
+        );
+        cleanup_barrier.release();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while cleanup_tasks.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled cleanup disk tasks should drain");
+        drop(cleanup_barrier);
+
+        second_commit_barrier.release();
+        second
+            .await
+            .expect("second overwrite task should join")
+            .expect("second overwrite should survive the earlier request cancellation");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the latest overwrite should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+        assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
     }
 
     #[tokio::test]

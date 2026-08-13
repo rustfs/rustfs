@@ -12,6 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! DELIBERATE DUPLICATION — do not merge these declarations into the
+//! rustfs-utils http module without a maintainer decision on the crate
+//! boundary.
+//!
+//! The canonical owners of these interop-contract values live in the
+//! rustfs-utils crate: `crates/utils/src/http/metadata_compat.rs` (dual
+//! x-rustfs-internal-/x-minio-internal- metadata keys),
+//! `crates/utils/src/http/header_compat.rs` (x-rustfs-/x-minio- header pairs),
+//! and `crates/utils/src/http/headers.rs` (standard S3 header names). This
+//! crate keeps a local copy because
+//! `rustfs-replication` is a wire-contract crate that must stay free of
+//! internal dependencies: `scripts/check_architecture_migration_rules.sh`
+//! rejects any `rustfs-utils` import or dependency here ("replication crate
+//! HTTP/helper contracts must not import or depend on rustfs-utils"), and the
+//! same rule bans `rustfs-filemeta` and `rustfs-storage-api`.
+//!
+//! Drift protection lives in the test module below: every constant's literal
+//! wire value is pinned, so a change on either side that breaks interop fails
+//! this crate's tests rather than silently forking the contract.
+
 use std::collections::HashMap;
 
 const RUSTFS_INTERNAL_PREFIX: &str = "x-rustfs-internal-";
@@ -144,5 +164,32 @@ mod tests {
         assert_eq!(trim_etag("\"abc\""), "abc");
         assert!(has_prefix_fold("X-Amz-Meta-Foo", "x-amz-meta-"));
         assert!(!has_prefix_fold("X-Amz-Meta-Foo", "amz-meta"));
+    }
+
+    /// Pins every duplicated interop constant to its literal wire value. The
+    /// canonical owner lives in the rustfs-utils crate (see the module doc);
+    /// an arch guard forbids depending on it from this crate, so byte-for-byte
+    /// pinning here is what keeps the two copies from drifting apart.
+    #[test]
+    fn duplicated_interop_constants_pin_canonical_wire_values() {
+        use super::*;
+
+        assert_eq!(AMZ_BUCKET_REPLICATION_STATUS, "X-Amz-Replication-Status");
+        assert_eq!(AMZ_OBJECT_LOCK_LEGAL_HOLD, "X-Amz-Object-Lock-Legal-Hold");
+        assert_eq!(AMZ_OBJECT_LOCK_MODE, "X-Amz-Object-Lock-Mode");
+        assert_eq!(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, "X-Amz-Object-Lock-Retain-Until-Date");
+        assert_eq!(AMZ_OBJECT_TAGGING, "X-Amz-Tagging");
+        assert_eq!(AMZ_WEBSITE_REDIRECT_LOCATION, "x-amz-website-redirect-location");
+        assert_eq!(CACHE_CONTROL, "Cache-Control");
+        assert_eq!(CONTENT_DISPOSITION, "Content-Disposition");
+        assert_eq!(CONTENT_ENCODING, "Content-Encoding");
+        assert_eq!(CONTENT_LANGUAGE, "Content-Language");
+        assert_eq!(EXPIRES, "Expires");
+        assert_eq!(SSEC_ALGORITHM_HEADER, "x-amz-server-side-encryption-customer-algorithm");
+        assert_eq!(SSEC_KEY_HEADER, "x-amz-server-side-encryption-customer-key");
+        assert_eq!(SSEC_KEY_MD5_HEADER, "x-amz-server-side-encryption-customer-key-md5");
+        assert_eq!(SUFFIX_ACTUAL_SIZE, "actual-size");
+        assert_eq!(SUFFIX_REPLICATION_STATUS, "replication-status");
+        assert_eq!(SUFFIX_REPLICATION_RESET_STATUS, "replication-reset-status");
     }
 }

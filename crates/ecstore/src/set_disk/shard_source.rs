@@ -117,16 +117,17 @@ impl StripeReadState {
         Self::from_parts_with_read_costs(shards, errors, &[], read_quorum)
     }
 
-    pub(crate) fn from_parts_with_read_costs(
-        shards: Vec<Option<Vec<u8>>>,
-        errors: Vec<Option<Error>>,
-        read_costs: &[ShardReadCost],
-        read_quorum: usize,
-    ) -> Self {
-        let slot_count = shards.len().max(errors.len());
-        let mut slots = Vec::with_capacity(slot_count);
+    pub(crate) fn from_parts_with_read_costs<S, E>(shards: S, errors: E, read_costs: &[ShardReadCost], read_quorum: usize) -> Self
+    where
+        S: IntoIterator<Item = Option<Vec<u8>>>,
+        S::IntoIter: ExactSizeIterator,
+        E: IntoIterator<Item = Option<Error>>,
+        E::IntoIter: ExactSizeIterator,
+    {
         let mut shards = shards.into_iter();
         let mut errors = errors.into_iter();
+        let slot_count = shards.len().max(errors.len());
+        let mut slots = Vec::with_capacity(slot_count);
         for index in 0..slot_count {
             let read_cost = read_costs.get(index).copied().unwrap_or(ShardReadCost::Unknown);
             slots.push(ShardSlot::with_read_cost(

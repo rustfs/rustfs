@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::cluster::rpc::{
+    ScannerBucketListing, TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client,
+};
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend_cached};
 use crate::error::{Error, Result};
 use crate::{
@@ -23,6 +25,7 @@ use crate::{
 
 use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
+use crate::storage_api_contracts::bucket::BucketOptions;
 use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, InfoMessage, MemStats,
@@ -71,6 +74,19 @@ fn apply_data_usage_result(
             delete_markers.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
             usage.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
         }
+    }
+}
+
+fn apply_bucket_namespace_count(result: Result<ScannerBucketListing>, buckets: &mut rustfs_madmin::Buckets) {
+    if let Ok(listing) = result
+        && listing.topology_complete
+    {
+        let count = listing.buckets.iter().filter(|bucket| !bucket.name.starts_with('.')).count();
+        let Ok(count) = u64::try_from(count) else {
+            return;
+        };
+        buckets.count = count;
+        buckets.error = None;
     }
 }
 
@@ -285,6 +301,18 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             &mut delete_markers,
             &mut usage,
         );
+        if buckets.error.is_some() {
+            apply_bucket_namespace_count(
+                store
+                    .list_bucket_for_scanner(&BucketOptions {
+                        cached: true,
+                        no_metadata: true,
+                        ..Default::default()
+                    })
+                    .await,
+                &mut buckets,
+            );
+        }
 
         let after3 = OffsetDateTime::now_utc();
 
@@ -705,12 +733,13 @@ mod tests {
         endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use crate::runtime::sources as runtime_sources;
+    use crate::storage_api_contracts::bucket::BucketInfo;
     use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, ServerProperties};
 
     use super::{
-        DATA_USAGE_ROOT, DATA_USAGE_UNAVAILABLE_ERROR, apply_data_usage_result, apply_erasure_set_usage,
-        get_local_server_property, get_online_offline_disks_stats, get_server_info, reconcile_servers_with_endpoint_topology,
-        server_topology_completeness_report,
+        DATA_USAGE_ROOT, DATA_USAGE_UNAVAILABLE_ERROR, apply_bucket_namespace_count, apply_data_usage_result,
+        apply_erasure_set_usage, get_local_server_property, get_online_offline_disks_stats, get_server_info,
+        reconcile_servers_with_endpoint_topology, server_topology_completeness_report,
     };
 
     fn disk_with_state(endpoint: &str, state: &str) -> Disk {
@@ -958,6 +987,75 @@ mod tests {
         assert_eq!(versions.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
         assert_eq!(delete_markers.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
         assert_eq!(usage.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn live_bucket_namespace_count_survives_unavailable_data_usage() {
+        let mut buckets = rustfs_madmin::Buckets {
+            count: 0,
+            error: Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
+        };
+
+        apply_bucket_namespace_count(
+            Ok(crate::cluster::rpc::ScannerBucketListing {
+                buckets: vec![
+                    BucketInfo {
+                        name: "bucket-a".to_string(),
+                        ..Default::default()
+                    },
+                    BucketInfo {
+                        name: ".rustfs.sys".to_string(),
+                        ..Default::default()
+                    },
+                    BucketInfo {
+                        name: "bucket-b".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                set_buckets: Vec::new(),
+                topology_complete: true,
+            }),
+            &mut buckets,
+        );
+
+        assert_eq!(buckets.count, 2);
+        assert_eq!(buckets.error, None);
+    }
+
+    #[test]
+    fn incomplete_bucket_namespace_lookup_preserves_usage_state() {
+        let mut buckets = rustfs_madmin::Buckets {
+            count: 7,
+            error: Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
+        };
+
+        apply_bucket_namespace_count(
+            Ok(crate::cluster::rpc::ScannerBucketListing {
+                buckets: vec![BucketInfo {
+                    name: "bucket-a".to_string(),
+                    ..Default::default()
+                }],
+                set_buckets: Vec::new(),
+                topology_complete: false,
+            }),
+            &mut buckets,
+        );
+
+        assert_eq!(buckets.count, 7);
+        assert_eq!(buckets.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn failed_bucket_namespace_lookup_preserves_usage_state() {
+        let mut buckets = rustfs_madmin::Buckets {
+            count: 7,
+            error: Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
+        };
+
+        apply_bucket_namespace_count(Err(crate::error::Error::DiskNotFound), &mut buckets);
+
+        assert_eq!(buckets.count, 7);
+        assert_eq!(buckets.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
     }
 
     #[test]

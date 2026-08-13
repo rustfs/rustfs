@@ -19,7 +19,9 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
-    SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
+    SUFFIX_SOURCE_VERSION_ID, get_header,
+    header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
+    insert_header_map,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
@@ -646,8 +648,6 @@ fn archive_content_encoding_strict_mode() -> bool {
 
 const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
 const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
-const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
-const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 
 /// Keys a client must not be able to materialize as bare stored metadata.
 ///

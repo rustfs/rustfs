@@ -61,9 +61,11 @@ pub mod bucket {
                 delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
                 load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
                 manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
-                manual_transition_scope_key, persist_manual_transition_job_progress, renew_manual_transition_job_lease,
-                request_manual_transition_job_cancel, save_manual_transition_job_record,
-                save_manual_transition_job_record_if_current, save_manual_transition_scope_admission_if_absent,
+                manual_transition_scope_key, persist_manual_transition_job_progress,
+                persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease,
+                renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel,
+                save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+                save_manual_transition_scope_admission_if_absent, update_manual_transition_job_record,
             };
         }
 
@@ -344,7 +346,7 @@ pub mod disk {
     }
 
     pub mod error {
-        pub use crate::disk::error::{BitrotErrorType, DiskError, Error, FileAccessDeniedWithContext, Result};
+        pub use crate::disk::error::{DiskError, Error, FileAccessDeniedWithContext, Result};
     }
 
     pub mod error_reduce {
