@@ -69,6 +69,8 @@ pub(crate) enum MultipartCommitPause {
     PutPartAfterRename,
     BeforeLockLost,
     BeforeTransactionEpochVerify,
+    BeforeObjectPublication,
+    AfterObjectPublication,
     AfterRename,
 }
 
@@ -2418,6 +2420,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 return Err(StorageError::Unexpected);
             }
 
+            if let Some(committed_slot) = online_disks.iter().position(Option::is_some) {
+                fi = parts_metadatas[committed_slot].clone();
+            }
+            let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+
+            commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
+
+            fi.is_latest = true;
+
+            #[cfg(test)]
+            pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeObjectPublication).await;
+
+            commit_set
+                .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
+                .await;
+
+            drop(_object_lock_guard); // release the object lock before multipart cleanup tail IO.
+
+            #[cfg(test)]
+            pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterObjectPublication).await;
+
             // backlog#946: reclaim the stale per-part metadata (and any superfluous
             // part.N data files no longer in the completed set) only *after* the
             // authoritative rename_data commit above has succeeded. If rename_data
@@ -2429,7 +2452,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             commit_set.cleanup_multipart_path(&parts).await;
 
             if let Some(old_dir) = op_old_dir {
-                let committed_dir = fi.data_dir.unwrap_or_default().to_string();
                 // backlog#898: best-effort reclaim of the dereferenced old data dir.
                 // Returns a receipt (never `Err`); a failed GC must not turn an
                 // already-committed multipart completion into a 503.
@@ -2471,24 +2493,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 );
             }
 
-            for (i, op_disk) in online_disks.iter().enumerate() {
-                if let Some(disk) = op_disk
-                    && disk.is_online().await
-                {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
-            }
-
-            commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
-
-            fi.is_latest = true;
-
-            commit_set
-                .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
-                .await;
-
-            drop(_object_lock_guard); // drop object lock guard to release the lock
             drop(_upload_guard);
 
             Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
@@ -2535,6 +2539,7 @@ mod tests {
         hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
         hermetic_set_disks_isolated as hermetic_set_disks, hermetic_set_disks_with_lockers,
     };
+    use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use rustfs_config::server_config::KVS;
@@ -5220,6 +5225,182 @@ mod tests {
                     matches!(abort_err, StorageError::InvalidUploadID(..)),
                     "abort should return InvalidUploadID after the detached completion tail, got {abort_err:?}"
                 );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn complete_releases_object_lock_before_cleanup_and_keeps_upload_lock() {
+        temp_env::async_with_vars(
+            [
+                (crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60")),
+            ],
+            async {
+                let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+                let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+                let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+                let bucket = "multipart-object-lock-short-tail-bucket";
+                let object = "object";
+                make_bucket_on_all(&disk_stores, bucket).await;
+                let completed_body = vec![0x63; 4096];
+                let replacement_body = vec![0x64; 4096];
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &completed_body, &ObjectOptions::default()).await;
+                let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+                signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
+                signaling.clear_observed();
+                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let completion_barrier =
+                    MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterObjectPublication);
+
+                let complete_store = set_disks.clone();
+                let complete_upload_id = upload_id.clone();
+                let complete = tokio::spawn(async move {
+                    complete_store
+                        .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                        .await
+                });
+                completion_barrier.wait_until_paused().await;
+
+                let mut reader = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+                )
+                .await
+                .expect("GET should not wait for multipart cleanup after object publication")
+                .expect("completed object should be readable while the upload tail is paused");
+                let mut observed_body = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), reader.stream.read_to_end(&mut observed_body))
+                    .await
+                    .expect("completed object body should stream while the upload tail is paused")
+                    .expect("completed object body should read successfully");
+                assert_eq!(observed_body, completed_body);
+
+                let put_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+                let put_store = set_disks.clone();
+                let put_payload = replacement_body.clone();
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(put_payload);
+                    put_store
+                        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                });
+                put_barrier.wait_until_paused().await;
+
+                let abort_store = set_disks.clone();
+                let abort_upload_id = upload_id.clone();
+                let abort = tokio::spawn(async move {
+                    abort_store
+                        .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
+                        .await
+                });
+                signaling.wait_for_attempts(2).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    !abort.is_finished(),
+                    "abort must still wait while the completion tail owns the upload lock"
+                );
+
+                complete.abort();
+                assert!(
+                    complete
+                        .await
+                        .expect_err("the completion waiter should remain cancellable after object publication")
+                        .is_cancelled()
+                );
+                tokio::task::yield_now().await;
+                assert!(!abort.is_finished(), "cancelling the waiter must not release the upload lock");
+
+                completion_barrier.release();
+                let abort_err = abort
+                    .await
+                    .expect("abort task should not panic")
+                    .expect_err("the committed upload should no longer exist after the detached tail drains");
+                assert!(
+                    matches!(abort_err, StorageError::InvalidUploadID(..)),
+                    "abort should return InvalidUploadID after the completion tail, got {abort_err:?}"
+                );
+
+                put_barrier.release();
+                put.await
+                    .expect("same-key PUT task should not panic")
+                    .expect("same-key PUT should commit after the object lock is released early");
+
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("final object should be readable");
+                let mut final_body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut final_body)
+                    .await
+                    .expect("final object should stream fully");
+                assert_eq!(final_body, replacement_body);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn complete_keeps_object_lock_until_publication_fence() {
+        temp_env::async_with_vars(
+            [
+                (crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60")),
+            ],
+            async {
+                let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+                let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+                let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+                let bucket = "multipart-publication-fence-lock-bucket";
+                let object = "object";
+                make_bucket_on_all(&disk_stores, bucket).await;
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &[0x65; 4096], &ObjectOptions::default()).await;
+                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let completion_barrier =
+                    MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeObjectPublication);
+
+                let complete_store = set_disks.clone();
+                let complete_upload_id = upload_id.clone();
+                let complete = tokio::spawn(async move {
+                    complete_store
+                        .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                        .await
+                });
+                completion_barrier.wait_until_paused().await;
+
+                let before_namespace_barrier =
+                    PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let after_namespace_barrier =
+                    PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+                let put_store = set_disks.clone();
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![0x66; 4096]);
+                    put_store
+                        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                });
+                before_namespace_barrier.wait_until_paused().await;
+                before_namespace_barrier.release_and_wait_until_namespace_pending().await;
+
+                completion_barrier.release();
+                after_namespace_barrier.wait_until_paused().await;
+                after_namespace_barrier.release();
+                complete
+                    .await
+                    .expect("completion task should not panic")
+                    .expect("completion should commit after publication fence");
+                put.await
+                    .expect("same-key PUT task should not panic")
+                    .expect("same-key PUT should commit after completion publishes and releases the object lock");
             },
         )
         .await;
