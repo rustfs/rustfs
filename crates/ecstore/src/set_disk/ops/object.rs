@@ -783,7 +783,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let mut output = Vec::with_capacity(object_size);
-            let (fi, files, disks) = snapshot.into_legacy_parts();
+            let (fi, files, disks) = snapshot.into_owned();
             Self::get_object_with_fileinfo(
                 bucket,
                 object,
@@ -894,7 +894,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        let (fi, files, disks) = snapshot.into_legacy_parts();
+        let (fi, files, disks) = snapshot.into_owned();
         tokio::spawn(async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);

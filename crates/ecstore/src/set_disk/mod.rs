@@ -808,24 +808,6 @@ impl GetObjectFileInfo {
         }
     }
 
-    fn into_legacy_parts(self) -> (FileInfo, Vec<FileInfo>, GetObjectOnlineDisks) {
-        match (self.owned, self.shared) {
-            (Some(snapshot), None) => {
-                let OwnedGetObjectFileInfo {
-                    fi,
-                    parts_metadata,
-                    online_disks,
-                } = snapshot;
-                (fi, parts_metadata, GetObjectOnlineDisks::Owned(online_disks))
-            }
-            (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => (entry.fi, entry.parts_metadata, GetObjectOnlineDisks::Owned(entry.online_disks)),
-                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), GetObjectOnlineDisks::Shared(entry)),
-            },
-            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
-        }
-    }
-
     #[cfg(test)]
     fn has_valid_representation(&self) -> bool {
         self.owned.is_some() ^ self.shared.is_some()
@@ -834,22 +816,6 @@ impl GetObjectFileInfo {
     #[cfg(test)]
     fn shared_entry(&self) -> Option<&Arc<GetObjectMetadataCacheEntry>> {
         self.shared.as_ref()
-    }
-}
-
-enum GetObjectOnlineDisks {
-    Owned(Vec<Option<DiskStore>>),
-    Shared(Arc<GetObjectMetadataCacheEntry>),
-}
-
-impl std::ops::Deref for GetObjectOnlineDisks {
-    type Target = [Option<DiskStore>];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(disks) => disks,
-            Self::Shared(entry) => &entry.online_disks,
-        }
     }
 }
 
@@ -939,7 +905,7 @@ mod prepared_get_object_metadata_tests {
     }
 
     #[test]
-    fn cache_hit_consumers_share_one_snapshot_until_legacy_ownership() {
+    fn cache_hit_consumers_release_snapshot_at_legacy_ownership() {
         let fi = FileInfo {
             name: "object".to_owned(),
             ..Default::default()
@@ -965,14 +931,14 @@ mod prepared_get_object_metadata_tests {
         assert_eq!(snapshot.online_disks().len(), 1);
         assert_eq!(Arc::strong_count(&cached), 2, "borrowing consumers must not clone the snapshot");
 
-        let (owned_fi, owned_parts, disks) = snapshot.into_legacy_parts();
+        let (owned_fi, owned_parts, disks) = snapshot.into_owned();
         assert_eq!(owned_fi.name, "object");
         assert_eq!(owned_parts.len(), 1);
         assert_eq!(disks.len(), 1);
         assert_eq!(
             Arc::strong_count(&cached),
-            2,
-            "legacy ownership must retain the same snapshot for borrowed disks"
+            1,
+            "legacy ownership must release the cache snapshot after cloning its owned inputs"
         );
     }
 
