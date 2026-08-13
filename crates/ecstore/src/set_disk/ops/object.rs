@@ -61,6 +61,10 @@ fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_slot: usize) -> usize {
+    committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
+}
+
 #[cfg(test)]
 mod duration_metrics_tests {
     use super::duration_millis_f64;
@@ -69,6 +73,38 @@ mod duration_metrics_tests {
     #[test]
     fn duration_millis_preserves_sub_millisecond_precision() {
         assert_eq!(duration_millis_f64(Duration::from_micros(125)), 0.125);
+    }
+}
+
+#[cfg(test)]
+mod put_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn committed_file_info_follows_exact_quorum_success_slot() {
+        let mut first_success = FileInfo::new("bucket/object", 2, 2);
+        first_success.name = "first-success".to_string();
+        let mut second_success = first_success.clone();
+        second_success.name = "second-success".to_string();
+        let mut parts_metadata = [FileInfo::default(), first_success, second_success, FileInfo::default()];
+        let committed_disks = [None, Some(()), Some(()), None];
+
+        assert_eq!(
+            committed_disks.iter().filter(|disk| disk.is_some()).count(),
+            2,
+            "fixture must meet exact quorum"
+        );
+        let selected_slot = committed_response_metadata_slot(&committed_disks, 3);
+        let selected = std::mem::take(&mut parts_metadata[selected_slot]);
+
+        assert_eq!(selected.name, "first-success");
+        assert_eq!(parts_metadata[1], FileInfo::default(), "selected metadata should move without cloning");
+        assert_eq!(parts_metadata[2].name, "second-success", "other committed metadata must remain available");
+        assert_eq!(
+            committed_response_metadata_slot::<()>(&[None, None, None, None], 3),
+            3,
+            "a violated post-commit success-mask invariant must not turn a durable PUT into an error"
+        );
     }
 }
 
@@ -1059,10 +1095,7 @@ impl SetDisks {
         }
 
         fi.data_dir = Some(Uuid::new_v4());
-
-        let parts_metadata = vec![fi.clone(); disks.len()];
-
-        let (mut shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+        let mut shuffle_disks = Self::shuffle_disks_owned(disks, &fi.erasure.distribution);
 
         let tmp_dir = Uuid::new_v4().to_string();
 
@@ -1074,61 +1107,91 @@ impl SetDisks {
             let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
+            let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
-            let writer_setup_stage_start = Instant::now();
-            let writer_futs: Vec<_> = shuffle_disks
-                .iter()
-                .map(|disk_op| {
-                    let tmp_obj = tmp_object.clone();
-                    async move {
-                        if let Some(disk) = disk_op
-                            && disk.is_online().await
-                        {
-                            match create_bitrot_writer(
-                                is_inline_buffer,
-                                Some(disk),
-                                RUSTFS_META_TMP_BUCKET,
-                                &tmp_obj,
-                                shard_file_size,
-                                shard_size,
-                                HashAlgorithm::HighwayHash256S,
-                            )
-                            .await
-                            {
-                                Ok(writer) => (Some(writer), None),
-                                Err(err) => {
-                                    warn!(
-                                        event = EVENT_SET_DISK_WRITE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                        disk = ?disk,
-                                        state = "bitrot_writer_skipped",
-                                        error = ?err,
-                                        "Set disk bitrot writer skipped"
-                                    );
-                                    (None, Some(err))
-                                }
-                            }
-                        } else {
-                            (None, Some(DiskError::DiskNotFound))
-                        }
+            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
+            let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
+            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
+            let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
+            let (mut writers, errors) = if direct_inline_commit {
+                let online = join_all(shuffle_disks.iter().map(|disk| async move {
+                    if let Some(disk) = disk {
+                        disk.is_online().await
+                    } else {
+                        false
                     }
-                })
-                .collect();
-            let writer_results = join_all(writer_futs).await;
-            let mut writers = Vec::with_capacity(writer_results.len());
-            let mut errors = Vec::with_capacity(writer_results.len());
-            for (w, e) in writer_results {
-                writers.push(w);
-                errors.push(e);
+                }))
+                .await;
+                let mut errors = Vec::with_capacity(online.len());
+                for (disk, is_online) in shuffle_disks.iter_mut().zip(online) {
+                    if is_online {
+                        errors.push(None);
+                    } else {
+                        *disk = None;
+                        errors.push(Some(DiskError::DiskNotFound));
+                    }
+                }
+                (std::iter::repeat_with(|| None).take(shuffle_disks.len()).collect(), errors)
+            } else {
+                let writer_futs: Vec<_> = shuffle_disks
+                    .iter()
+                    .map(|disk_op| {
+                        let tmp_obj = tmp_object.clone();
+                        async move {
+                            if let Some(disk) = disk_op
+                                && disk.is_online().await
+                            {
+                                match create_bitrot_writer(
+                                    is_inline_buffer,
+                                    Some(disk),
+                                    RUSTFS_META_TMP_BUCKET,
+                                    &tmp_obj,
+                                    shard_file_size,
+                                    shard_size,
+                                    HashAlgorithm::HighwayHash256S,
+                                )
+                                .await
+                                {
+                                    Ok(writer) => (Some(writer), None),
+                                    Err(err) => {
+                                        warn!(
+                                            event = EVENT_SET_DISK_WRITE,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                            disk = ?disk,
+                                            state = "bitrot_writer_skipped",
+                                            error = ?err,
+                                            "Set disk bitrot writer skipped"
+                                        );
+                                        (None, Some(err))
+                                    }
+                                }
+                            } else {
+                                (None, Some(DiskError::DiskNotFound))
+                            }
+                        }
+                    })
+                    .collect();
+                let writer_results = join_all(writer_futs).await;
+                let mut writers = Vec::with_capacity(writer_results.len());
+                let mut errors = Vec::with_capacity(writer_results.len());
+                for (writer, error) in writer_results {
+                    writers.push(writer);
+                    errors.push(error);
+                }
+                (writers, errors)
+            };
+            let writer_setup_elapsed = writer_setup_stage_start.map(|stage_start| stage_start.elapsed());
+            let writer_setup_ms = writer_setup_elapsed
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default();
+            if let Some(writer_setup_elapsed) = writer_setup_elapsed {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    "set_disk_writer_setup",
+                    duration_millis_f64(writer_setup_elapsed),
+                );
             }
-            let writer_setup_elapsed = writer_setup_stage_start.elapsed();
-            let writer_setup_ms = writer_setup_elapsed.as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_writer_setup",
-                duration_millis_f64(writer_setup_elapsed),
-            );
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1156,21 +1219,23 @@ impl SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
-            rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
                 usize::try_from(put_object_size).map_err(Error::other)?
             } else {
                 0
             };
 
-            let encode_stage_start = Instant::now();
+            let encode_stage_start = collect_stage_timing.then(Instant::now);
+            let mut inline_shards = None;
             let (reader, w_size) = match write_path {
                 SmallWritePath::Inline => match Arc::clone(&erasure)
-                    .encode_inline_small_with_size_hint(stream, &mut writers, write_quorum, small_size_hint)
+                    .encode_inline_shards_with_size_hint(stream, small_size_hint)
                     .await
                 {
-                    Ok((r, w)) => (r, w),
+                    Ok((r, w, shards)) => {
+                        inline_shards = Some(shards);
+                        (r, w)
+                    }
                     Err(e) => {
                         error!("encode_inline_small err {:?}", e);
                         return Err(e.into());
@@ -1203,9 +1268,11 @@ impl SetDisks {
                     }
                 },
             };
-            let encode_elapsed = encode_stage_start.elapsed();
-            let encode_ms = encode_elapsed.as_millis() as u64;
-            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
+            let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
+            let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();
+            if let Some(encode_elapsed) = encode_elapsed {
+                rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", duration_millis_f64(encode_elapsed));
+            }
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1291,37 +1358,67 @@ impl SetDisks {
             // drop it below reconstructable quorum (backlog#852 / #799 B3).
             // `rename_data` re-checks write quorum over the surviving disks and
             // rolls back if too few remain.
-            let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+            let committed_shards = if matches!(write_path, SmallWritePath::Inline) {
+                shuffle_disks.iter().filter(|disk| disk.is_some()).count()
+            } else {
+                drop_failed_writer_disks(&mut shuffle_disks, &writers)
+            };
             if committed_shards < write_quorum {
                 return Err(Error::other(format!(
                     "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
                 )));
             }
 
-            for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
-                pfi.metadata = user_defined.clone();
+            fi.metadata = user_defined;
+            fi.mod_time = mod_time;
+            fi.size = w_size as i64;
+            fi.versioned = opts.versioned || opts.version_suspended;
+            fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
+            if opts.data_movement {
+                fi.set_data_moved();
+            }
+            let parity_blocks = fi.erasure.parity_blocks;
+
+            let response_metadata_slot = shuffle_disks
+                .iter()
+                .rposition(Option::is_some)
+                .ok_or_else(|| Error::other("put_object write quorum unavailable after encode"))?;
+            let mut base_file_info = fi;
+            let mut parts_metadatas = Vec::with_capacity(shuffle_disks.len());
+            for (i, disk) in shuffle_disks.iter().enumerate() {
+                if disk.is_none() {
+                    parts_metadatas.push(FileInfo::default());
+                    continue;
+                }
+
+                let mut pfi = if i == response_metadata_slot {
+                    std::mem::take(&mut base_file_info)
+                } else {
+                    base_file_info.clone()
+                };
                 if is_inline_buffer {
-                    if let Some(writer) = writers[i].take() {
+                    if let Some(shards) = inline_shards.as_ref() {
+                        pfi.data = Some(
+                            shards
+                                .get(i)
+                                .cloned()
+                                .ok_or_else(|| Error::other(format!("inline encoder omitted disk shard {i}")))?,
+                        );
+                    } else if let Some(writer) = writers[i].take() {
                         pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
                     }
 
                     pfi.set_inline_data();
                 }
-
-                pfi.mod_time = mod_time;
-                pfi.size = w_size as i64;
-                pfi.versioned = opts.versioned || opts.version_suspended;
-                pfi.add_object_part(1, etag.clone(), w_size, mod_time, actual_size, index_op.clone(), None);
-                pfi.checksum = fi.checksum.clone();
-
-                if opts.data_movement {
-                    pfi.set_data_moved();
-                }
+                parts_metadatas.push(pfi);
             }
+            let committed_version_id = parts_metadatas[response_metadata_slot].version_id;
+            let committed_data_dir = parts_metadatas[response_metadata_slot].data_dir;
+            let is_compressed = parts_metadatas[response_metadata_slot].is_compressed();
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
-            if fi.erasure.parity_blocks == 0 {
+            if parity_blocks == 0 {
                 let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
                 let logical_shard_size = usize::try_from(erasure.shard_file_size(written_size))
                     .map_err(|_| Error::other("put_object shard size overflows usize"))?;
@@ -1518,7 +1615,7 @@ impl SetDisks {
                     Some(self.pool_index),
                     Some(self.set_index),
                 );
-                request.object_version_id = fi.version_id.map(|version_id| version_id.to_string());
+                request.object_version_id = committed_version_id.map(|version_id| version_id.to_string());
                 tokio::spawn(async move {
                     let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                 });
@@ -1553,7 +1650,7 @@ impl SetDisks {
 
             let mut cleanup_stage_ms: Option<u64> = None;
             if let Some(old_dir) = op_old_dir {
-                let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+                let committed_dir = committed_data_dir.unwrap_or_default().to_string();
                 let cleanup_stage_start = Instant::now();
                 // backlog#898: reclaiming the dereferenced old data dir is
                 // best-effort and returns a receipt (never `Err`). A failed GC
@@ -1590,16 +1687,10 @@ impl SetDisks {
                 }
             }
 
-            for (i, op_disk) in online_disks.iter().enumerate() {
-                if let Some(disk) = op_disk
-                    && disk.is_online().await
-                {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
-            }
+            let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
+            let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
 
-            if fi.is_compressed() {
+            if is_compressed {
                 record_compression_total_memory(actual_size as u64, w_size as u64).await;
             }
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
@@ -5565,6 +5656,264 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         .await;
 
         (temp_dirs, disk_stores, set_disks)
+    }
+}
+
+#[cfg(test)]
+mod inline_put_commit_path_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use tokio::io::AsyncReadExt;
+
+    async fn make_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_put_direct_commit_round_trips_verified_bitrot_shards() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-commit";
+        let object = "object.bin";
+        let payload: Vec<u8> = (0..16 * 1024).map(|index| (index % 251) as u8).collect();
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("inline PUT should commit");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist inline metadata: {err}"));
+            assert!(file_info.inline_data(), "disk {disk_index} should mark the shard inline");
+            let inline_data = file_info
+                .data
+                .as_ref()
+                .unwrap_or_else(|| panic!("disk {disk_index} should persist inline bitrot bytes"));
+            let erasure = erasure_from_file_info(&file_info, false).expect("persisted erasure layout should be valid");
+            let logical_shard_size =
+                usize::try_from(erasure.shard_file_size(payload.len() as i64)).expect("logical shard size should fit usize");
+            coding::bitrot_verify(
+                Cursor::new(inline_data.clone()),
+                inline_data.len(),
+                logical_shard_size,
+                HashAlgorithm::HighwayHash256S,
+                erasure.shard_size(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("disk {disk_index} inline shard should pass bitrot verification: {err}"));
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed inline object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("inline object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-quorum";
+        let exact_quorum_object = "exact-quorum.bin";
+        let below_quorum_object = "below-quorum.bin";
+        make_bucket(&disk_stores, bucket).await;
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[3] = None;
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![0x5a; 4 * 1024]);
+        set_disks
+            .put_object(bucket, exact_quorum_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("three online disks should satisfy the four-disk write quorum");
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let persisted = disk
+                .read_version("", bucket, exact_quorum_object, "", &ReadOptions::default())
+                .await;
+            assert_eq!(
+                persisted.is_ok(),
+                disk_index < 3,
+                "exact-quorum commit should publish only on the three online disks"
+            );
+        }
+
+        set_disks.disks.write().await[2] = None;
+        let mut reader = PutObjReader::from_vec(vec![0xa5; 4 * 1024]);
+        set_disks
+            .put_object(bucket, below_quorum_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("two online disks are one below the four-disk write quorum");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            assert!(
+                disk.read_version("", bucket, below_quorum_object, "", &ReadOptions::default())
+                    .await
+                    .is_err(),
+                "disk {disk_index} must not expose an object after pre-commit quorum failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_put_direct_commit_handles_post_encode_rename_failures() {
+        use crate::disk::health_state::RuntimeDriveHealthState;
+
+        let payload = vec![0x5a; 4 * 1024];
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-post-encode-quorum";
+        let object = "exact-quorum.bin";
+        make_bucket(&disk_stores, bucket).await;
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let put = {
+            let set_disks = Arc::clone(&set_disks);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(payload);
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            })
+        };
+        barrier.wait_until_paused().await;
+        disk_stores[3].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        barrier.release();
+        put.await
+            .expect("exact-quorum PUT task should complete")
+            .expect("one post-encode rename failure should preserve write quorum");
+        disk_stores[3].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let persisted = disk.read_version("", bucket, object, "", &ReadOptions::default()).await;
+            assert_eq!(
+                persisted.is_ok(),
+                disk_index < 3,
+                "only disks that completed rename_data may publish the exact-quorum object"
+            );
+        }
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "inline-direct-post-encode-rollback";
+        let object = "rollback.bin";
+        let old_payload = vec![0x31; 4 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+        let mut old_reader = PutObjReader::from_vec(old_payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut old_reader, &ObjectOptions::default())
+            .await
+            .expect("old inline object should commit");
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let mut old_disk_data = Vec::with_capacity(disk_stores.len());
+        for disk in &disk_stores {
+            old_disk_data.push(
+                disk.read_version("", bucket, object, "", &read_data)
+                    .await
+                    .expect("old inline shard should be readable before overwrite")
+                    .data,
+            );
+        }
+
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let put = {
+            let set_disks = Arc::clone(&set_disks);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(payload);
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            })
+        };
+        barrier.wait_until_paused().await;
+        for disk in &disk_stores[2..] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        }
+        barrier.release();
+        put.await
+            .expect("quorum-minus-one PUT task should complete")
+            .expect_err("two post-encode rename failures must fail write quorum");
+        for disk in &disk_stores[2..] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        }
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let restored = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should retain the old inline object: {err}"));
+            assert_eq!(restored.data, old_disk_data[disk_index]);
+        }
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("old object should remain readable after quorum rollback");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("old object should stream after quorum rollback");
+        assert_eq!(restored, old_payload);
+    }
+
+    #[tokio::test]
+    async fn zero_length_put_keeps_existing_pipeline_layout_and_round_trips() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "zero-length-put";
+        let object = "empty.bin";
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut reader = PutObjReader::from_vec(Vec::new());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("zero-length PUT should commit through the existing pipeline");
+
+        let read_data = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &read_data)
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist empty-object metadata: {err}"));
+            assert_eq!(file_info.size, 0);
+            assert_eq!(file_info.data.as_deref(), Some(&[][..]));
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("empty object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("empty object should stream");
+        assert!(restored.is_empty());
     }
 }
 

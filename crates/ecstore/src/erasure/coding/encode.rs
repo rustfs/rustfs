@@ -23,6 +23,7 @@ use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use rustfs_utils::HashAlgorithm;
 use std::sync::Arc;
 use std::time::Instant;
 use std::vec;
@@ -590,6 +591,39 @@ impl Erasure {
         mw.write(shards).await?;
         mw.shutdown().await?;
         Ok((reader, total))
+    }
+
+    /// Encode a small inline object directly into its per-disk bitrot payloads.
+    /// The returned bytes are the same `[hash][shard]` representation produced
+    /// by `BitrotWriter`, ready to be embedded in each disk's staged `xl.meta`.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub(crate) async fn encode_inline_shards_with_size_hint<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize, Vec<Bytes>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(small_ingest_capacity(&self, size_hint));
+        let total = reader.read_to_end(&mut buf).await?;
+        if total == 0 {
+            return Ok((reader, 0, Vec::new()));
+        }
+
+        let shards = self.encode_data_owned(buf)?;
+        let mut inline_shards = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let hash = HashAlgorithm::HighwayHash256S.hash_encode(&shard);
+            let mut encoded = BytesMut::with_capacity(hash.as_ref().len() + shard.len());
+            encoded.extend_from_slice(hash.as_ref());
+            encoded.extend_from_slice(&shard);
+            inline_shards.push(encoded.freeze());
+        }
+
+        Ok((reader, total, inline_shards))
     }
 
     #[hotpath::measure(impl_type = "Erasure")]
@@ -2354,6 +2388,35 @@ mod tests {
         assert_eq!(total, 0);
         // No shutdown was called, so nothing should be committed
         assert!(committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_inline_shards_matches_writer_bitrot_layout() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let payload = b"inline commit payload".to_vec();
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+
+        let (_reader, total, inline_shards) = erasure
+            .clone()
+            .encode_inline_shards_with_size_hint(reader, payload.len())
+            .await
+            .expect("inline shards should encode");
+        let raw_shards = erasure
+            .encode_data_owned(payload.clone())
+            .expect("reference shards should encode");
+
+        assert_eq!(total, payload.len());
+        assert_eq!(inline_shards.len(), DATA_SHARDS + PARITY_SHARDS);
+        for (inline, raw) in inline_shards.iter().zip(raw_shards) {
+            let mut writer = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), raw.len(), checksum_algo.clone());
+            writer.write(&raw).await.expect("reference writer should accept shard");
+            writer.shutdown().await.expect("reference writer should shutdown");
+            assert_eq!(inline.as_ref(), writer.into_inline_data().expect("reference writer should retain bytes"));
+        }
     }
 
     /// encode_inline_small: small payload is encoded into the correct number of shards
