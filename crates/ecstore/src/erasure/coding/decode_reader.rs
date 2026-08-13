@@ -831,7 +831,7 @@ mod tests {
     };
     use crate::erasure::coding::decode::ParallelReader;
     use crate::erasure::coding::{BitrotReader, BitrotWriter, Erasure};
-    use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
+    use crate::set_disk::shard_source::StripeReadState;
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
     use std::future::{pending, poll_fn};
@@ -848,6 +848,13 @@ mod tests {
         stripes: VecDeque<StripeReadState>,
         read_quorum: usize,
         read_count: Option<Arc<AtomicUsize>>,
+    }
+
+    struct RecordingStripeSource {
+        stripes: VecDeque<StripeReadState>,
+        read_quorum: usize,
+        reads: usize,
+        recycles: usize,
     }
 
     struct BlockingSource {
@@ -911,8 +918,24 @@ mod tests {
             Box::new(
                 self.stripes
                     .pop_front()
-                    .unwrap_or_else(|| StripeReadState::new(Vec::new(), self.read_quorum)),
+                    .unwrap_or_else(|| StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum)),
             )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ShardStripeSource for RecordingStripeSource {
+        async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
+            self.reads += 1;
+            Box::new(
+                self.stripes
+                    .pop_front()
+                    .unwrap_or_else(|| StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum)),
+            )
+        }
+
+        fn recycle_stripe(&mut self, _state: Box<StripeReadState>) {
+            self.recycles += 1;
         }
     }
 
@@ -924,7 +947,7 @@ mod tests {
             };
             self.started.notify_one();
             pending::<()>().await;
-            Box::new(StripeReadState::new(Vec::new(), self.read_quorum))
+            Box::new(StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum))
         }
     }
 
@@ -1696,7 +1719,10 @@ mod tests {
             .pop_front()
             .expect("first stripe should exist");
         let mut source = VecStripeSource {
-            stripes: VecDeque::from([first_state, StripeReadState::new(Vec::new(), erasure.data_shards)]),
+            stripes: VecDeque::from([
+                first_state,
+                StripeReadState::from_parts(Vec::new(), Vec::new(), erasure.data_shards),
+            ]),
             read_quorum: erasure.data_shards,
             read_count: None,
         };
@@ -1731,13 +1757,14 @@ mod tests {
             .stripes
             .pop_front()
             .expect("first stripe should exist");
-        let mut source = VecStripeSource {
+        let mut source = RecordingStripeSource {
             stripes: VecDeque::from([
                 first_state,
-                StripeReadState::new(vec![ShardSlot::data(0, vec![1])], erasure.data_shards),
+                StripeReadState::from_parts(vec![Some(vec![1])], Vec::new(), erasure.data_shards),
             ]),
             read_quorum: erasure.data_shards,
-            read_count: None,
+            reads: 0,
+            recycles: 0,
         };
         let engine = LegacyEcDecodeEngine::new(erasure);
         let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
@@ -1763,6 +1790,8 @@ mod tests {
                 .kind(),
             ErrorKind::Other
         );
+        assert_eq!(source.reads, 2, "the fill must read the primary and queued stripe");
+        assert_eq!(source.recycles, source.reads, "every completed stripe read must be recycled");
     }
 
     #[tokio::test]
@@ -1775,7 +1804,7 @@ mod tests {
                     .stripes
                     .pop_front()
                     .expect("first stripe should exist"),
-                StripeReadState::new(Vec::new(), erasure.data_shards),
+                StripeReadState::from_parts(Vec::new(), Vec::new(), erasure.data_shards),
             ]),
             read_quorum: erasure.data_shards,
             read_count: None,
@@ -2035,17 +2064,11 @@ mod tests {
     }
 
     #[test]
-    fn emit_data_shards_preserves_output_order_for_out_of_order_slots() {
-        let state = StripeReadState::new(
-            vec![
-                ShardSlot::data(1, b"cd".to_vec()),
-                ShardSlot::data(0, b"ab".to_vec()),
-                ShardSlot::data(2, b"ef".to_vec()),
-            ],
-            2,
-        );
+    fn emit_data_shards_preserves_output_order() {
+        let state =
+            StripeReadState::from_parts(vec![Some(b"ab".to_vec()), Some(b"cd".to_vec()), Some(b"ef".to_vec())], Vec::new(), 2);
 
-        let output = emit_data_shards(&state, 3, 6, 5).expect("out-of-order data slots should emit by shard index");
+        let output = emit_data_shards(&state, 3, 6, 5).expect("data slots should emit by shard index");
 
         assert_eq!(output, b"abcde");
     }
@@ -2058,7 +2081,7 @@ mod tests {
         };
         let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
         let mut output = Vec::with_capacity(1);
-        let mut short_state = StripeReadState::new(vec![ShardSlot::data(0, vec![1, 2, 3, 4])], 1);
+        let mut short_state = StripeReadState::from_parts(vec![Some(vec![1, 2, 3, 4])], Vec::new(), 1);
 
         let err = decode_stripe_into(
             GET_OBJECT_PATH_CODEC_STREAMING,

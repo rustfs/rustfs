@@ -51,45 +51,6 @@ impl ShardReadCost {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShardSlot {
-    index: usize,
-    data: Option<Vec<u8>>,
-    error: Option<Error>,
-}
-
-#[cfg(test)]
-impl ShardSlot {
-    pub(crate) fn new(index: usize, data: Option<Vec<u8>>, error: Option<Error>) -> Self {
-        Self { index, data, error }
-    }
-
-    pub(crate) fn data(index: usize, data: Vec<u8>) -> Self {
-        Self::new(index, Some(data), None)
-    }
-
-    pub(crate) fn missing(index: usize, error: Error) -> Self {
-        Self::new(index, None, Some(error))
-    }
-
-    pub(crate) fn index(&self) -> usize {
-        self.index
-    }
-
-    pub(crate) fn has_data(&self) -> bool {
-        self.data.is_some()
-    }
-
-    pub(crate) fn data_bytes(&self) -> Option<&[u8]> {
-        self.data.as_deref()
-    }
-
-    pub(crate) fn error(&self) -> Option<&Error> {
-        self.error.as_ref()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StripeReadState {
     shards: ShardBuffers,
@@ -99,23 +60,9 @@ pub(crate) struct StripeReadState {
 
 impl StripeReadState {
     #[cfg(test)]
-    pub(crate) fn new(slots: Vec<ShardSlot>, read_quorum: usize) -> Self {
-        let slot_count = slots.iter().map(ShardSlot::index).max().map_or(0, |index| index + 1);
-        let mut state = Self::with_slot_count(slot_count, read_quorum);
-        for slot in slots {
-            state.shards[slot.index] = slot.data;
-            state.errors[slot.index] = slot.error;
-        }
-        state
-    }
-
-    #[cfg(test)]
     pub(crate) fn from_parts(shards: Vec<Option<Vec<u8>>>, errors: Vec<Option<Error>>, read_quorum: usize) -> Self {
-        Self::from_scratch(SmallVec::from_vec(shards), SmallVec::from_vec(errors), read_quorum)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_scratch(mut shards: ShardBuffers, mut errors: ShardErrors, read_quorum: usize) -> Self {
+        let mut shards = SmallVec::from_vec(shards);
+        let mut errors = SmallVec::from_vec(errors);
         let slot_count = shards.len().max(errors.len());
         shards.resize_with(slot_count, || None);
         errors.resize_with(slot_count, || None);
@@ -188,7 +135,7 @@ impl StripeReadState {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait ShardStripeSource: Send + 'static {
+pub(crate) trait ShardStripeSource: Send {
     async fn read_next_stripe(&mut self) -> Box<StripeReadState>;
 
     fn recycle_stripe(&mut self, _state: Box<StripeReadState>) {}
@@ -211,14 +158,8 @@ mod tests {
 
     #[test]
     fn stripe_read_state_tracks_decode_quorum() {
-        let state = StripeReadState::new(
-            vec![
-                ShardSlot::data(0, vec![1]),
-                ShardSlot::missing(1, Error::FileNotFound),
-                ShardSlot::data(2, vec![2]),
-            ],
-            2,
-        );
+        let state =
+            StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![2])], vec![None, Some(Error::FileNotFound), None], 2);
 
         assert_eq!(state.available_shards(), 2);
         assert!(state.can_decode());
@@ -227,7 +168,7 @@ mod tests {
 
     #[test]
     fn stripe_read_state_preserves_shards_and_errors() {
-        let state = StripeReadState::new(vec![ShardSlot::missing(1, Error::FileCorrupt), ShardSlot::data(0, vec![1, 2, 3])], 2);
+        let state = StripeReadState::from_parts(vec![Some(vec![1, 2, 3]), None], vec![None, Some(Error::FileCorrupt)], 2);
 
         assert!(!state.can_decode());
         let (shards, errors) = state.into_parts();
@@ -271,13 +212,5 @@ mod tests {
         let state = StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![3])], Vec::new(), 2);
 
         assert!(!state.data_shards_complete(2));
-    }
-
-    #[test]
-    fn stripe_read_state_finds_out_of_order_slots_by_index() {
-        let state = StripeReadState::new(vec![ShardSlot::data(2, vec![3]), ShardSlot::data(0, vec![1])], 2);
-
-        assert_eq!(state.data_bytes(0), Some(&[1][..]));
-        assert!(state.data_bytes(1).is_none());
     }
 }

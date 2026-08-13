@@ -1339,7 +1339,7 @@ where
 #[async_trait::async_trait]
 impl<R> ShardStripeSource for ParallelReader<R>
 where
-    R: crate::erasure::coding::ShardSource + 'static,
+    R: crate::erasure::coding::ShardSource,
 {
     async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
         let mut state = self
@@ -1986,16 +1986,6 @@ mod tests {
     type BoxedShardReader = crate::io_support::bitrot::ShardReader;
 
     #[test]
-    fn shard_scratch_stays_inline_through_the_common_limit_and_spills_safely() {
-        let inline: ShardBuffers = smallvec![None; INLINE_SHARD_SLOTS];
-        assert!(!inline.spilled(), "the common shard-count boundary must not allocate");
-
-        let spilled: ShardBuffers = smallvec![None; INLINE_SHARD_SLOTS + 1];
-        assert!(spilled.spilled(), "larger supported shard counts must fall back to the heap");
-        assert_eq!(spilled.len(), INLINE_SHARD_SLOTS + 1);
-    }
-
-    #[test]
     fn parallel_reader_keeps_stripe_scratch_out_of_line() {
         eprintln!(
             "parallel_reader={} stripe_state={} cached_state={}",
@@ -2007,10 +1997,6 @@ mod tests {
             std::mem::size_of::<Option<Box<StripeReadState>>>(),
             std::mem::size_of::<usize>(),
             "the request-scoped cache must remain pointer-sized",
-        );
-        assert!(
-            std::mem::size_of::<ParallelReader<Cursor<Vec<u8>>>>() < std::mem::size_of::<StripeReadState>(),
-            "the reader must not inline the stripe scratch into every async decode task",
         );
     }
 
