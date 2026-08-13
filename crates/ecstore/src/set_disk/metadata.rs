@@ -85,6 +85,15 @@ impl SetDisks {
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
     }
 
+    pub(super) fn get_multipart_upload_dir(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> String {
+        let upload_dir = Self::get_upload_id_dir(bucket, object, upload_id);
+        if data_movement {
+            format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{upload_dir}")
+        } else {
+            upload_dir
+        }
+    }
+
     pub(super) fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
         let path = format!("{bucket}/{object}");
         let mut hasher = Sha256::new();
@@ -464,6 +473,28 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
+    }
+
+    pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
+        for part in &fi.parts {
+            let Some(checksums) = part.checksums.as_ref() else {
+                continue;
+            };
+            let mut algorithms = HashSet::with_capacity(checksums.len());
+            for (name, value) in checksums {
+                let Some(checksum) = rustfs_rio::Checksum::new_from_string(name, value) else {
+                    return Err(DiskError::FileCorrupt);
+                };
+                if checksum.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !algorithms.insert(checksum.checksum_type.base().0) {
+                    return Err(DiskError::FileCorrupt);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {

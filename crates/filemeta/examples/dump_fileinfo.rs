@@ -52,6 +52,7 @@ fn main() {
         FileInfoOpts {
             data: false,
             include_free_versions: true,
+            include_part_checksums: true,
         },
     )
     .expect("decode file info");
