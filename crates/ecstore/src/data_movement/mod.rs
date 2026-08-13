@@ -50,6 +50,9 @@ use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tracing::{error, info};
 
 type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DATA_MOVEMENT: &str = "data_movement";
+const EVENT_DATA_MOVEMENT_MULTIPART_ABORT_FAILED: &str = "data_movement_multipart_abort_failed";
 const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_ATTEMPTS: usize = 3;
 const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_DELAY_SECS: u64 = 60;
 
@@ -1441,9 +1444,9 @@ pub(crate) async fn migrate_object(
                 }
                 Err(abort_err) => {
                     error!(
-                        event = "data_movement_multipart_abort_failed",
-                        component = "ecstore",
-                        subsystem = "data_movement",
+                        event = EVENT_DATA_MOVEMENT_MULTIPART_ABORT_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DATA_MOVEMENT,
                         result = "error",
                         operation = op_label,
                         error = ?abort_err,
