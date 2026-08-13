@@ -485,6 +485,8 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
         CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
@@ -548,7 +550,8 @@ pub(crate) mod ecstore_test_support {
 pub(crate) mod ecstore_set_disk {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
-        PutObjectCommitBarrier, PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
+        MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+        fail_next_quota_ledger_save_for_test,
     };
     pub(crate) use rustfs_ecstore::api::set_disk::{
         DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,

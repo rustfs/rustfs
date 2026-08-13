@@ -27,24 +27,25 @@ use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
 use std::future::Future;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultipartCommitPause {
+pub enum MultipartCommitPause {
     PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
+    BeforeQuotaRename,
     AfterRename,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct MultipartCommitBarrierState {
     bucket: String,
     object: String,
@@ -55,27 +56,22 @@ struct MultipartCommitBarrierState {
     release: tokio::sync::Semaphore,
 }
 
-#[cfg(test)]
-pub(crate) struct MultipartCommitBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct MultipartCommitBarrier {
     state: Arc<MultipartCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static MULTIPART_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<MultipartCommitBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl MultipartCommitBarrier {
-    pub(crate) fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
+    pub fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
         Self::install_for_arrivals(bucket, object, pause, 1)
     }
 
-    pub(crate) fn install_for_arrivals(
-        bucket: &str,
-        object: &str,
-        pause: MultipartCommitPause,
-        expected_arrivals: usize,
-    ) -> Self {
+    pub fn install_for_arrivals(bucket: &str, object: &str, pause: MultipartCommitPause, expected_arrivals: usize) -> Self {
         assert!(expected_arrivals > 0, "multipart commit barrier must wait for at least one arrival");
         let state = Arc::new(MultipartCommitBarrierState {
             bucket: bucket.to_string(),
@@ -96,7 +92,7 @@ impl MultipartCommitBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let arrived = self.state.arrived.notified();
@@ -110,12 +106,12 @@ impl MultipartCommitBarrier {
         .expect("multipart completion should reach the deterministic commit barrier");
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.add_permits(self.state.expected_arrivals);
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for MultipartCommitBarrier {
     fn drop(&mut self) {
         self.release();
@@ -129,7 +125,7 @@ impl Drop for MultipartCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
     let barrier = MULTIPART_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1761,8 +1757,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
-        let quota_context =
-            reservation::begin(&self.ctx, bucket, object, opts.quota_admission, self.pool_index, self.set_index).await?;
+        let quota_context = reservation::begin(
+            &self.ctx,
+            bucket,
+            object,
+            opts.quota_admission,
+            opts.data_movement,
+            self.pool_index,
+            self.set_index,
+        )
+        .await?;
         let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
         let preserve_replication_ciphertext = opts.replication_request
             && contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
@@ -2125,7 +2129,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         let quota_old_size = if quota_context.is_enforced() {
-            reservation::replaced_logical_size(&self, bucket, object, opts).await?
+            if opts.data_movement {
+                quota_new_size
+            } else {
+                reservation::replaced_logical_size(&self, bucket, object, opts).await?
+            }
         } else {
             0
         };
@@ -2228,7 +2236,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await;
             return Err(err);
         }
+        #[cfg(any(test, feature = "test-util"))]
+        pause_multipart_commit(bucket, object, MultipartCommitPause::BeforeQuotaRename).await;
         if quota_reservation.is_lock_lost()
+            || !quota_reservation.capability_proof_matches()
             || object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || opts

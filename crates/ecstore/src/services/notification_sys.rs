@@ -210,6 +210,22 @@ pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToke
     fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(current) = state.proof.as_ref() else {
+        return false;
+    };
+    state.proof = Some(FleetCapabilityProof {
+        topology_fingerprint: current.topology_fingerprint.clone(),
+        peer_epochs: Arc::new(current.peer_epochs.as_ref().clone()),
+        expires_at: current.expires_at,
+    });
+    true
+}
+
 fn fleet_capability_proof_matches(
     slot: &std::sync::RwLock<FleetCapabilityProofState>,
     proof: &FleetCapabilityProofToken,

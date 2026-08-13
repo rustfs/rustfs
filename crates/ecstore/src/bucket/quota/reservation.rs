@@ -209,6 +209,7 @@ pub(crate) struct QuotaContext {
     quota_limit: Option<u64>,
     capability_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     snapshot_admission: Option<QuotaAdmission>,
+    legacy_data_movement: bool,
     metadata_guard: Option<NamespaceLockGuard>,
     pool_index: Option<usize>,
     set_index: Option<usize>,
@@ -230,6 +231,12 @@ impl QuotaContext {
                     current: admission.current_usage(),
                     limit: admission.quota_limit(),
                 });
+            }
+            return Ok(QuotaReservation::unlimited(self.metadata_guard));
+        }
+        if self.legacy_data_movement {
+            if new_size > old_size {
+                return Err(StorageError::PartMissingOrCorrupt);
             }
             return Ok(QuotaReservation::unlimited(self.metadata_guard));
         }
@@ -431,7 +438,8 @@ pub(crate) async fn begin(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     object: &str,
-    _snapshot_admission: Option<QuotaAdmission>,
+    snapshot_admission: Option<QuotaAdmission>,
+    data_movement: bool,
     pool_index: usize,
     set_index: usize,
 ) -> Result<QuotaContext> {
@@ -446,13 +454,14 @@ pub(crate) async fn begin(
             quota_limit: None,
             capability_proof: None,
             snapshot_admission: None,
+            legacy_data_movement: false,
             metadata_guard: None,
             pool_index: None,
             set_index: None,
         });
     }
     #[cfg(test)]
-    if let Some(snapshot_admission) = _snapshot_admission {
+    if let Some(snapshot_admission) = snapshot_admission {
         return Ok(QuotaContext {
             store: None,
             bucket: bucket.to_string(),
@@ -463,6 +472,7 @@ pub(crate) async fn begin(
             quota_limit: Some(snapshot_admission.quota_limit()),
             capability_proof: None,
             snapshot_admission: Some(snapshot_admission),
+            legacy_data_movement: false,
             metadata_guard: None,
             pool_index: Some(pool_index),
             set_index: Some(set_index),
@@ -480,6 +490,7 @@ pub(crate) async fn begin(
             quota_limit: None,
             capability_proof: None,
             snapshot_admission: None,
+            legacy_data_movement: false,
             metadata_guard: None,
             pool_index: None,
             set_index: None,
@@ -504,7 +515,8 @@ pub(crate) async fn begin(
     {
         return Err(StorageError::PartMissingOrCorrupt);
     }
-    let capability_proof = if quota.as_ref().is_some_and(|quota| quota.uses_durable_reservations()) {
+    let durable_quota = quota.as_ref().filter(|quota| quota.uses_durable_reservations());
+    let capability_proof = if durable_quota.is_some() {
         Some(
             crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
                 .ok_or_else(|| quota_capability_error(bucket, &ledger_object(bucket)))?,
@@ -512,10 +524,28 @@ pub(crate) async fn begin(
     } else {
         None
     };
-    let quota_limit = quota
-        .filter(crate::bucket::quota::BucketQuota::uses_durable_reservations)
-        .and_then(|quota| quota.quota);
-    let store = if quota_limit.is_some() {
+    let durable_quota_limit = durable_quota.and_then(|quota| quota.quota);
+    let snapshot_admission = match quota.as_ref().filter(|quota| !quota.uses_durable_reservations()) {
+        Some(quota) => match (quota.quota, snapshot_admission) {
+            (Some(limit), Some(admission)) if admission.quota_limit() == limit => Some(admission),
+            (Some(_), None) if data_movement => None,
+            (Some(_), _) => return Err(StorageError::PartMissingOrCorrupt),
+            (None, _) => None,
+        },
+        None => None,
+    };
+    let legacy_data_movement = durable_quota_limit.is_none()
+        && quota.as_ref().and_then(|quota| quota.quota).is_some()
+        && snapshot_admission.is_none()
+        && data_movement;
+    let quota_limit = durable_quota_limit
+        .or_else(|| snapshot_admission.map(QuotaAdmission::quota_limit))
+        .or_else(|| {
+            legacy_data_movement
+                .then(|| quota.as_ref().and_then(|quota| quota.quota))
+                .flatten()
+        });
+    let store = if durable_quota_limit.is_some() {
         Some(metadata_sys::object_store_in(ctx).await?)
     } else {
         None
@@ -529,7 +559,8 @@ pub(crate) async fn begin(
         quota_revision: Some(quota_revision),
         quota_limit,
         capability_proof,
-        snapshot_admission: None,
+        snapshot_admission,
+        legacy_data_movement,
         metadata_guard: Some(metadata_guard),
         pool_index: Some(pool_index),
         set_index: Some(set_index),

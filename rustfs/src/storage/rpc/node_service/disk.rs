@@ -1521,8 +1521,8 @@ mod tests {
         encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
     use crate::storage::storage_api::ReadMultipleResp;
+    use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
-    use crate::storage::storage_api::{DiskError, RenameDataResp};
     use rustfs_filemeta::FileInfo;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use serde::{Deserialize, Serialize};

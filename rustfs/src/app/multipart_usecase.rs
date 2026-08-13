@@ -2168,6 +2168,101 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn multipart_completion_rejects_rotated_quota_capability_before_rename() {
+        use crate::app::storage_api::test::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-mpu-quota", 4096).await;
+        let object = "object";
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create multipart upload");
+        let mut reader = PutObjReader::from_vec(vec![0x78; 4096]);
+        let part = store
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part");
+        let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::BeforeQuotaRename);
+        let complete_store = Arc::clone(&store);
+        let complete_bucket = bucket.clone();
+        let upload_id = upload.upload_id.clone();
+        let complete = tokio::spawn(async move {
+            complete_store
+                .complete_multipart_upload(
+                    &complete_bucket,
+                    object,
+                    &upload_id,
+                    vec![CompletePart {
+                        part_num: 1,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert!(
+            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
+            "the gating environment must have a current fleet proof"
+        );
+        barrier.release();
+
+        let err = complete
+            .await
+            .expect("completion task should not panic")
+            .expect_err("a replaced fleet proof must fence multipart rename");
+        assert!(matches!(
+            err,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "quota_reservation",
+                ..
+            }
+        ));
+        store
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("proof rotation must preserve the multipart upload for retry");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_multipart_completion_has_zero_quota_growth() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("data-movement-mpu-quota", 0).await;
+        let object = "object";
+        let mut movement_opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        let upload = store
+            .new_multipart_upload(&bucket, object, &movement_opts)
+            .await
+            .expect("create data-movement multipart upload");
+        let mut reader = PutObjReader::from_vec(vec![0x7a; 4096]);
+        let part = store
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut reader, &movement_opts)
+            .await
+            .expect("stage data-movement multipart part");
+        movement_opts.preserve_etag = Some("movement-etag".to_string());
+        let completed = store
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: 1,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &movement_opts,
+            )
+            .await
+            .expect("moving an already-accounted multipart object between pools must have zero quota growth");
+        assert_eq!(completed.size, 4096);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn rejected_empty_parts_preserve_existing_object_and_staging() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 

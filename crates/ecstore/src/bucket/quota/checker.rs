@@ -52,6 +52,7 @@ impl QuotaChecker {
     ) -> Result<QuotaCheckResult, QuotaError> {
         let start_time = Instant::now();
         let quota_config = self.get_quota_config(bucket).await?;
+        let uses_durable_reservations = quota_config.uses_durable_reservations();
 
         // If no quota limit is set, allow operation
         let quota_limit = match quota_config.quota {
@@ -67,6 +68,7 @@ impl QuotaChecker {
                     quota_limit: None,
                     operation_size,
                     remaining: None,
+                    uses_durable_reservations,
                 });
             }
             Some(q) => q,
@@ -74,14 +76,17 @@ impl QuotaChecker {
 
         let current_usage = self.get_real_time_usage(bucket).await?;
 
+        let admission_size = if uses_durable_reservations { 0 } else { operation_size };
         let expected_usage = match operation {
-            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => current_usage + operation_size,
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
+                current_usage.saturating_add(admission_size)
+            }
             QuotaOperation::DeleteObject => current_usage.saturating_sub(operation_size),
         };
 
         let allowed = match operation {
             QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
-                quota_config.check_operation_allowed(current_usage, operation_size)
+                quota_config.check_operation_allowed(current_usage, admission_size)
             }
             QuotaOperation::DeleteObject => true,
         };
@@ -105,6 +110,7 @@ impl QuotaChecker {
             quota_limit: Some(quota_limit),
             operation_size,
             remaining,
+            uses_durable_reservations,
         };
 
         let duration = start_time.elapsed();
@@ -375,6 +381,7 @@ mod tests {
             quota_limit: None,
             operation_size: 1024,
             remaining: None,
+            uses_durable_reservations: false,
         };
 
         assert!(result.allowed);
@@ -397,5 +404,14 @@ mod tests {
         // Current usage 512, trying to add 1024
         let allowed = quota.check_operation_allowed(512, 1024);
         assert!(!allowed);
+    }
+
+    #[test]
+    fn legacy_quota_rejects_full_operation_while_v1_defers_net_growth() {
+        let legacy: BucketQuota = serde_json::from_str(r#"{"quota":5}"#).expect("legacy quota should parse");
+        let durable = BucketQuota::new(Some(5));
+
+        assert!(!legacy.check_operation_allowed(4, 2));
+        assert!(durable.uses_durable_reservations());
     }
 }

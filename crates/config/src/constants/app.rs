@@ -353,6 +353,11 @@ pub const DEFAULT_OBS_TRACES_EXPORT_ENABLED: bool = true;
 /// Environment variable: RUSTFS_OBS_METRICS_EXPORT_ENABLED
 pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
 
+/// Default detailed PUT stage metrics enabled
+/// Default value: false
+/// Environment variable: RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED
+pub const DEFAULT_OBS_PUT_STAGE_METRICS_ENABLED: bool = false;
+
 /// Default logs export enabled
 /// It is used to enable or disable exporting logs
 /// Default value: true

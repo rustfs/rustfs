@@ -153,7 +153,9 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
+// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise unsupported during predeployment. Remove after composite acquisition,
+// activation fencing, fleet proof, commit-time proof revalidation, and fail-closed revocation ship together.
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -2205,7 +2207,7 @@ mod tests {
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
-        Endpoint, RUSTFS_META_BUCKET, SnapshotLeaseToken,
+        Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use bytes::Bytes;
@@ -2943,22 +2945,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
-    async fn snapshot_lease_handlers_forward_to_local_disk() {
-        let temp_dir = tempfile::tempdir().expect("snapshot lease RPC test directory");
-        let env = rustfs_test_utils::TestECStoreEnv::builder()
-            .base_dir(temp_dir.path())
-            .init_bucket_metadata(false)
-            .build()
-            .await;
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
         let service = make_server();
-        let disk = env.disk_paths[0].to_string_lossy().into_owned();
-        let fence_path = format!("tmp/quota-mutation-fences/{}", "0".repeat(64));
+        let disk = "http://node-a:9000/data/rustfs0".to_string();
 
         let mut acquire = Request::new(SnapshotLeaseRequest {
             disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
+            volume: "v".into(),
+            path: "p".into(),
             ttl_ms: 60_000,
         });
         let acquire_body =
@@ -2968,18 +2962,14 @@ mod tests {
         let acquire = service
             .acquire_snapshot_lease(acquire)
             .await
-            .expect("acquire should return a protocol response")
+            .expect("disabled acquire should return a protocol response")
             .into_inner();
-        assert!(acquire.success, "local disk should acquire the mutation fence");
-        assert_eq!(acquire.protocol_version, 1);
-        assert!(acquire.error.is_none());
-        let token = SnapshotLeaseToken::from_slice(&acquire.token).expect("acquire should return a valid token");
 
         let mut renew = Request::new(SnapshotLeaseRenewRequest {
-            disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
-            token: token.as_bytes().to_vec().into(),
+            disk,
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
             ttl_ms: 60_000,
         });
         let renew_body = rustfs_protos::canonical_snapshot_lease_renew_request_body(renew.get_ref())
@@ -2989,103 +2979,15 @@ mod tests {
         let renew = service
             .renew_snapshot_lease(renew)
             .await
-            .expect("renew should return a protocol response")
+            .expect("disabled renew should return a protocol response")
             .into_inner();
-        assert!(renew.success, "local disk should renew the mutation fence");
-        assert_eq!(renew.protocol_version, 1);
-        assert!(renew.error.is_none());
-        let renewed = SnapshotLeaseToken::from_slice(&renew.token).expect("renew should return a valid token");
-        assert_ne!(renewed, token);
 
-        let mut release = Request::new(SnapshotLeaseReleaseRequest {
-            disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
-            token: renewed.as_bytes().to_vec().into(),
-        });
-        let release_body = rustfs_protos::canonical_snapshot_lease_release_request_body(release.get_ref())
-            .expect("release request body should encode");
-        set_tonic_canonical_body_digest(&mut release, &release_body).expect("release digest metadata should encode");
-        mark_v2_authenticated(&mut release);
-        let release = service
-            .release_snapshot_lease(release)
-            .await
-            .expect("release should return a protocol response")
-            .into_inner();
-        assert!(release.success, "local disk should release the renewed token");
-        assert!(release.error.is_none());
-
-        let mut acquire = Request::new(SnapshotLeaseRequest {
-            disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
-            ttl_ms: 60_000,
-        });
-        let acquire_body =
-            rustfs_protos::canonical_snapshot_lease_request_body(acquire.get_ref()).expect("acquire request body should encode");
-        set_tonic_canonical_body_digest(&mut acquire, &acquire_body).expect("acquire digest metadata should encode");
-        mark_v2_authenticated(&mut acquire);
-        let active_token = service
-            .acquire_snapshot_lease(acquire)
-            .await
-            .expect("second acquire should return a protocol response")
-            .into_inner();
-        assert!(active_token.success);
-
-        let mut revoke = Request::new(SnapshotLeaseReleaseRequest {
-            disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
-            token: SnapshotLeaseToken::revoke_all().as_bytes().to_vec().into(),
-        });
-        let revoke_body = rustfs_protos::canonical_snapshot_lease_release_request_body(revoke.get_ref())
-            .expect("revoke-all request body should encode");
-        set_tonic_canonical_body_digest(&mut revoke, &revoke_body).expect("revoke-all digest metadata should encode");
-        mark_v2_authenticated(&mut revoke);
-        let revoke = service
-            .release_snapshot_lease(revoke)
-            .await
-            .expect("revoke-all should return a protocol response")
-            .into_inner();
-        assert!(revoke.success, "nil revoke-all sentinel must reach the local disk");
-        assert!(revoke.error.is_none());
-
-        let mut stale_renew = Request::new(SnapshotLeaseRenewRequest {
-            disk: disk.clone(),
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path.clone(),
-            token: active_token.token,
-            ttl_ms: 60_000,
-        });
-        let stale_renew_body = rustfs_protos::canonical_snapshot_lease_renew_request_body(stale_renew.get_ref())
-            .expect("stale renew request body should encode");
-        set_tonic_canonical_body_digest(&mut stale_renew, &stale_renew_body).expect("stale renew digest metadata should encode");
-        mark_v2_authenticated(&mut stale_renew);
-        let stale_renew = service
-            .renew_snapshot_lease(stale_renew)
-            .await
-            .expect("stale renew should return a protocol response")
-            .into_inner();
-        assert!(!stale_renew.success, "revoke-all must invalidate active tokens");
-        assert!(stale_renew.token.is_empty());
-        assert!(stale_renew.error.is_some());
-
-        let mut malformed = Request::new(SnapshotLeaseRenewRequest {
-            disk,
-            volume: RUSTFS_META_BUCKET.into(),
-            path: fence_path,
-            token: vec![1; 15].into(),
-            ttl_ms: 60_000,
-        });
-        let malformed_body = rustfs_protos::canonical_snapshot_lease_renew_request_body(malformed.get_ref())
-            .expect("malformed renew request body should encode");
-        set_tonic_canonical_body_digest(&mut malformed, &malformed_body).expect("malformed renew digest metadata should encode");
-        mark_v2_authenticated(&mut malformed);
-        let malformed = service
-            .renew_snapshot_lease(malformed)
-            .await
-            .expect_err("a malformed non-nil token must be rejected");
-        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+        for response in [acquire, renew] {
+            assert!(!response.success);
+            assert!(response.token.is_empty());
+            assert_eq!(response.protocol_version, 1);
+            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+        }
     }
 
     #[tokio::test]
@@ -3440,7 +3342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
+    async fn cross_pool_fence_probe_authenticates_unsupported_rollout_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3505,7 +3407,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &super::CROSS_POOL_FENCE_SUPPORTED_VERSION.to_be_bytes());
+        assert_eq!(&response.result[..4], &0_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");

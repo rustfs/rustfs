@@ -84,6 +84,24 @@ fn stored_swift_user_metadata_key(key: &str) -> String {
     }
 }
 
+pub(super) fn swift_response_user_metadata_key(key: &str) -> Option<&str> {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        return None;
+    }
+    if let Some(unescaped) = key.strip_prefix(USER_METADATA_PREFIX)
+        && (rustfs_utils::http::is_internal_key(unescaped)
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-amz-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-rustfs-encryption-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-minio-encryption-"))
+    {
+        return Some(unescaped);
+    }
+    Some(key)
+}
+
 fn swift_user_metadata(headers: &HeaderMap) -> Option<HashMap<String, String>> {
     let mut metadata = HashMap::new();
     let mut present = false;
@@ -1140,6 +1158,19 @@ mod tests {
             "x-amz-meta-x-minio-encryption-original-size"
         );
         assert_eq!(stored_swift_user_metadata_key("description"), "description");
+    }
+
+    #[test]
+    fn swift_user_metadata_response_mapping_is_reversible_and_filters_internal_keys() {
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-internal-actual-size"),
+            Some("x-rustfs-internal-actual-size")
+        );
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-x-amz-checksum"), Some("x-amz-checksum"));
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-description"), Some("x-amz-meta-description"));
+        assert_eq!(swift_response_user_metadata_key("description"), Some("description"));
+        assert_eq!(swift_response_user_metadata_key("x-rustfs-internal-actual-size"), None);
+        assert_eq!(swift_response_user_metadata_key("x-minio-internal-actual-size"), None);
     }
 
     #[test]

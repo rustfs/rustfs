@@ -20,7 +20,7 @@ use rustfs_config::{
     QUOTA_API_PATH, QUOTA_EXCEEDED_ERROR_CODE, QUOTA_INTERNAL_ERROR_CODE, QUOTA_INVALID_CONFIG_ERROR_CODE,
     QUOTA_NOT_FOUND_ERROR_CODE,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -90,7 +90,10 @@ impl<'de> Deserialize<'de> for BucketQuota {
     {
         let wire = BucketQuotaWire::deserialize(deserializer)?;
         let quota = if wire.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1) {
-            wire.reservation_quota
+            Some(
+                wire.reservation_quota
+                    .ok_or_else(|| D::Error::custom("reservation_quota is required for reservation protocol v1"))?,
+            )
         } else {
             wire.quota
         };
@@ -164,6 +167,7 @@ pub struct QuotaCheckResult {
     pub quota_limit: Option<u64>,
     pub operation_size: u64,
     pub remaining: Option<u64>,
+    pub uses_durable_reservations: bool,
 }
 
 #[derive(Debug)]
@@ -325,6 +329,14 @@ mod tests {
 
         assert!(!quota.uses_durable_reservations());
         assert!(quota.has_unsupported_reservation_protocol());
+    }
+
+    #[test]
+    fn reservation_protocol_v1_requires_reservation_quota() {
+        let err = serde_json::from_str::<BucketQuota>(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":1}"#)
+            .expect_err("v1 without its authoritative quota must fail closed");
+
+        assert!(err.to_string().contains("reservation_quota is required"));
     }
 
     /// unmarshal accepts format without quota_type

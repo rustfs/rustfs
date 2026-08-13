@@ -405,6 +405,8 @@ pub mod metrics {
 }
 
 pub mod notification {
+    #[cfg(any(test, feature = "test-util"))]
+    pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
         CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
@@ -468,7 +470,7 @@ pub mod set_disk {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
-        pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
     }
 }
 
