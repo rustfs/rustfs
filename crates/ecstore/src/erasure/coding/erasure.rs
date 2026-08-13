@@ -72,7 +72,9 @@ impl EncodedBlock {
 const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
 const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 16;
-const LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES: usize = 1024 * 1024;
+// Vec growth may retain twice the requested logical length. Keeping the logical
+// workspace at half the budget bounds each cached workspace's shard allocation to 1 MiB.
+const LEGACY_REED_SOLOMON_CACHE_MAX_LOGICAL_SHARD_BYTES_PER_WORKSPACE: usize = 512 * 1024;
 
 type ModernReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<ReedSolomon>>>;
 type LegacyReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<LegacyReedSolomonEncoder>>>;
@@ -145,24 +147,46 @@ pub fn calc_shard_size_legacy(block_size: usize, data_shards: usize) -> usize {
 struct LegacyReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
+    cache_workspaces: bool,
     encoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
     decoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
 }
 
 impl LegacyReedSolomonEncoder {
     fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
+        Self::with_workspace_cache(data_shards, parity_shards, false)
+    }
+
+    fn with_workspace_cache(data_shards: usize, parity_shards: usize, cache_workspaces: bool) -> io::Result<Self> {
         Ok(Self {
             data_shards,
             parity_shards,
+            cache_workspaces,
             encoder_cache: RwLock::new(None),
             decoder_cache: RwLock::new(None),
         })
     }
 
+    fn logical_shard_bytes_upper_bound(&self, shard_len: usize) -> Option<usize> {
+        let aligned_shard_len = shard_len.checked_add(63)?.checked_div(64)?.checked_mul(64)?;
+        let high_rate_decoder_work_count = self
+            .parity_shards
+            .checked_next_power_of_two()?
+            .checked_add(self.data_shards)?
+            .checked_next_power_of_two()?;
+        let low_rate_decoder_work_count = self
+            .data_shards
+            .checked_next_power_of_two()?
+            .checked_add(self.parity_shards)?
+            .checked_next_power_of_two()?;
+        aligned_shard_len.checked_mul(high_rate_decoder_work_count.max(low_rate_decoder_work_count))
+    }
+
     fn should_cache_workspace(&self, shard_len: usize) -> bool {
-        shard_len
-            .checked_mul(self.data_shards + self.parity_shards)
-            .is_some_and(|bytes| bytes <= LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES)
+        self.cache_workspaces
+            && self
+                .logical_shard_bytes_upper_bound(shard_len)
+                .is_some_and(|bytes| bytes <= LEGACY_REED_SOLOMON_CACHE_MAX_LOGICAL_SHARD_BYTES_PER_WORKSPACE)
     }
 
     fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
@@ -446,9 +470,16 @@ fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Resul
 }
 
 fn cached_legacy_reed_solomon(data_shards: usize, parity_shards: usize) -> io::Result<Arc<LegacyReedSolomonEncoder>> {
-    let key = (data_shards, parity_shards);
     let cache = LEGACY_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    cached_legacy_reed_solomon_in(cache, data_shards, parity_shards)
+}
 
+fn cached_legacy_reed_solomon_in(
+    cache: &LegacyReedSolomonCache,
+    data_shards: usize,
+    parity_shards: usize,
+) -> io::Result<Arc<LegacyReedSolomonEncoder>> {
+    let key = (data_shards, parity_shards);
     if let Some(encoder) = cache
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -458,15 +489,17 @@ fn cached_legacy_reed_solomon(data_shards: usize, parity_shards: usize) -> io::R
         return Ok(encoder);
     }
 
-    let encoder = Arc::new(LegacyReedSolomonEncoder::new(data_shards, parity_shards)?);
     let mut cache = cache.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = cache.get(&key) {
         return Ok(Arc::clone(existing));
     }
     if cache.len() < LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES {
+        let encoder = Arc::new(LegacyReedSolomonEncoder::with_workspace_cache(data_shards, parity_shards, true)?);
         cache.insert(key, Arc::clone(&encoder));
+        return Ok(encoder);
     }
-    Ok(encoder)
+    drop(cache);
+    Ok(Arc::new(LegacyReedSolomonEncoder::new(data_shards, parity_shards)?))
 }
 
 fn encode_parity_shards<F>(shards: &mut [Option<Vec<u8>>], data_shards: usize, parity_shards: usize, encode: F) -> io::Result<()>
@@ -1473,8 +1506,36 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&four_plus_two, &four_plus_one));
         assert!(!Arc::ptr_eq(&four_plus_two, &three_plus_two));
-        assert!(four_plus_two.should_cache_workspace(LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES / 6));
-        assert!(!four_plus_two.should_cache_workspace(LEGACY_REED_SOLOMON_CACHE_MAX_WORKSPACE_BYTES / 6 + 1));
+        assert_eq!(four_plus_two.logical_shard_bytes_upper_bound(64 * 1024), Some(512 * 1024));
+        assert!(four_plus_two.should_cache_workspace(64 * 1024));
+        assert!(!four_plus_two.should_cache_workspace(64 * 1024 + 1));
+
+        let nine_plus_seven =
+            LegacyReedSolomonEncoder::with_workspace_cache(9, 7, true).expect("9+7 legacy codec should construct");
+        assert_eq!(nine_plus_seven.logical_shard_bytes_upper_bound(16 * 1024), Some(512 * 1024));
+        assert!(nine_plus_seven.should_cache_workspace(16 * 1024));
+        assert!(!nine_plus_seven.should_cache_workspace(16 * 1024 + 1));
+
+        let uncached = LegacyReedSolomonEncoder::new(4, 2).expect("uncached legacy codec should construct");
+        assert!(!uncached.should_cache_workspace(64));
+    }
+
+    #[test]
+    fn saturated_legacy_codec_cache_does_not_retain_more_workspaces() {
+        let cache = RwLock::new(HashMap::new());
+        for parity_shards in 1..=LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES {
+            let cached =
+                cached_legacy_reed_solomon_in(&cache, 32, parity_shards).expect("cacheable legacy codec should construct");
+            assert!(cached.cache_workspaces);
+        }
+
+        let uncached =
+            cached_legacy_reed_solomon_in(&cache, 31, 1).expect("uncached legacy codec should construct after saturation");
+        assert!(!uncached.cache_workspaces);
+        assert_eq!(
+            cache.read().expect("cache lock should remain healthy").len(),
+            LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES
+        );
     }
 
     #[test]
