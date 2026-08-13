@@ -22,6 +22,9 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::object::{
+    object_transaction_fencing_fleet_proof, object_transaction_fencing_fleet_proof_matches, object_transaction_fencing_requested,
+};
 use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
@@ -2296,6 +2299,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
+        let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
+        if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
+            return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
+        }
+
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
         let commit_object = object.to_owned();
@@ -2323,6 +2331,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // The trailing `_` drops the rename_data old-size backfill
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
+            if let Some(proof) = transaction_fencing_proof.as_ref()
+                && !object_transaction_fencing_fleet_proof_matches(proof)
+            {
+                return Err(Error::other(
+                    "object transaction fencing fleet capability changed during complete_multipart_upload",
+                ));
+            }
             let (online_disks, convergence, op_old_dir, cleanup_disks, _) = SetDisks::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_MULTIPART_BUCKET,
@@ -2880,6 +2895,48 @@ mod tests {
             etag: part.etag,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn object_transaction_fencing_requires_live_fleet_proof_before_multipart_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-transaction-fencing-no-proof";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let (upload_id, parts) = stage_upload_with_create_opts(
+            &set_disks,
+            bucket,
+            object,
+            b"must-not-complete-without-proof",
+            &ObjectOptions::default(),
+        )
+        .await;
+
+        let err = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                set_disks
+                    .clone()
+                    .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
+                    .await
+            },
+        )
+        .await
+        .expect_err("multipart completion must fail closed without a live fleet proof");
+
+        assert!(
+            err.to_string()
+                .contains("object transaction fencing requires a live fleet capability proof"),
+            "unexpected error: {err:?}"
+        );
+        set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("failed fenced completion must not publish object metadata");
     }
 
     #[tokio::test]

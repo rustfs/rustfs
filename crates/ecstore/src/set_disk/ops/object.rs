@@ -48,6 +48,7 @@ use crate::disk::OldCurrentSize;
 use crate::error::is_err_invalid_upload_id;
 use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
@@ -55,6 +56,7 @@ use futures::FutureExt as _;
 use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
+use std::sync::OnceLock;
 
 #[inline]
 fn duration_millis_f64(duration: std::time::Duration) -> f64 {
@@ -1676,6 +1678,11 @@ impl SetDisks {
                 });
             }
 
+            let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
+            if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
+                return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
+            }
+
             let commit_set = self.clone();
             let commit_bucket = bucket.to_owned();
             let commit_object = object.to_owned();
@@ -1693,6 +1700,11 @@ impl SetDisks {
                 let _object_lock_guard = commit_object_lock_guard;
                 let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let rename_stage_start = Instant::now();
+                if let Some(proof) = transaction_fencing_proof.as_ref()
+                    && !object_transaction_fencing_fleet_proof_matches(proof)
+                {
+                    return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
+                }
                 let rename_result = SetDisks::rename_data(
                     &shuffle_disks,
                     RUSTFS_META_TMP_BUCKET,
@@ -2837,14 +2849,12 @@ fn remote_version_state_writer_enabled() -> bool {
     remote_version_state_writer_fleet_proof().is_some()
 }
 
-fn remote_version_state_writer_fleet_proof() -> Option<crate::services::notification_sys::RemoteVersionStateFleetProofToken> {
-    remote_version_state_writer_requested()
-        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
-        .flatten()
+fn remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    transaction_fencing_fleet_proof(remote_version_state_writer_requested())
 }
 
 fn remote_version_state_writer_requested() -> bool {
-    remote_version_state_writer_enabled_for(
+    transaction_fencing_gate_requested_for(
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
             rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
@@ -2857,20 +2867,66 @@ fn remote_version_state_writer_requested() -> bool {
     )
 }
 
-fn remote_version_state_writer_fleet_proof_matches(
-    proof: &crate::services::notification_sys::RemoteVersionStateFleetProofToken,
-) -> bool {
-    remote_version_state_writer_fleet_proof_matches_for(
+fn remote_version_state_writer_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
+    transaction_fencing_fleet_proof_matches_for(
         remote_version_state_writer_requested(),
         crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
     )
 }
 
-fn remote_version_state_writer_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
+pub(in crate::set_disk::ops) fn object_transaction_fencing_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    transaction_fencing_fleet_proof(object_transaction_fencing_requested())
+}
+
+pub(in crate::set_disk::ops) fn object_transaction_fencing_requested() -> bool {
+    object_transaction_fencing_requested_cached()
+}
+
+#[cfg(not(test))]
+fn object_transaction_fencing_requested_cached() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(load_object_transaction_fencing_requested)
+}
+
+#[cfg(test)]
+fn object_transaction_fencing_requested_cached() -> bool {
+    load_object_transaction_fencing_requested()
+}
+
+fn load_object_transaction_fencing_requested() -> bool {
+    transaction_fencing_gate_requested_for(
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE,
+            rustfs_config::DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE,
+        ),
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+            rustfs_config::DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+        ),
+        true,
+    )
+}
+
+pub(in crate::set_disk::ops) fn object_transaction_fencing_fleet_proof_matches(
+    proof: &RemoteVersionStateFleetProofToken,
+) -> bool {
+    transaction_fencing_fleet_proof_matches_for(
+        object_transaction_fencing_requested(),
+        crate::services::notification_sys::remote_version_state_fleet_proof_matches(proof),
+    )
+}
+
+fn transaction_fencing_fleet_proof(requested: bool) -> Option<RemoteVersionStateFleetProofToken> {
+    requested
+        .then(crate::services::notification_sys::acquire_remote_version_state_fleet_proof)
+        .flatten()
+}
+
+fn transaction_fencing_fleet_proof_matches_for(requested: bool, fleet_proof_matches: bool) -> bool {
     requested && fleet_proof_matches
 }
 
-fn remote_version_state_writer_enabled_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
+fn transaction_fencing_gate_requested_for(requested: bool, fleet_confirmed: bool, fleet_proof_valid: bool) -> bool {
     requested && fleet_confirmed && fleet_proof_valid
 }
 
@@ -3327,7 +3383,7 @@ mod transition_upload_completion_tests {
 mod transition_version_id_tests {
     use super::{
         TransitionUploadCandidate, persisted_transition_version, persisted_transition_version_with_gate,
-        remote_version_state_writer_enabled_for, remote_version_state_writer_fleet_proof_matches_for,
+        transaction_fencing_fleet_proof_matches_for, transaction_fencing_gate_requested_for,
     };
     use rustfs_filemeta::TransitionVersionState;
     use uuid::Uuid;
@@ -3380,7 +3436,24 @@ mod transition_version_id_tests {
             ("fully upgraded fleet", true, true, true, true),
         ] {
             assert_eq!(
-                remote_version_state_writer_enabled_for(requested, fleet_confirmed, fleet_proof_valid),
+                transaction_fencing_gate_requested_for(requested, fleet_confirmed, fleet_proof_valid),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_transaction_fencing_gate_requires_request_confirmation_and_live_proof() {
+        for (case, requested, fleet_confirmed, fleet_proof_valid, expected) in [
+            ("old defaults", false, false, false, false),
+            ("missing fleet confirmation", true, false, true, false),
+            ("missing local opt-in", false, true, true, false),
+            ("missing fleet proof", true, true, false, false),
+            ("fully upgraded fleet", true, true, true, true),
+        ] {
+            assert_eq!(
+                transaction_fencing_gate_requested_for(requested, fleet_confirmed, fleet_proof_valid),
                 expected,
                 "{case}"
             );
@@ -3395,7 +3468,7 @@ mod transition_version_id_tests {
             ("current authorization", true, true, true),
         ] {
             assert_eq!(
-                remote_version_state_writer_fleet_proof_matches_for(requested, fleet_proof_matches),
+                transaction_fencing_fleet_proof_matches_for(requested, fleet_proof_matches),
                 expected,
                 "{case}"
             );
@@ -5926,6 +5999,7 @@ mod inline_put_commit_path_tests {
     use crate::disk::{DiskAPI as _, ReadOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use rustfs_config::server_config::KVS;
+    use serial_test::serial;
     use tokio::io::AsyncReadExt;
 
     async fn make_bucket(disks: &[DiskStore], bucket: &str) {
@@ -8459,6 +8533,48 @@ mod transition_commit_failure_tests {
             .await
             .expect("the transitioned object body should drain");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn object_transaction_fencing_requires_live_fleet_proof_before_put_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transaction-fencing-no-proof";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let err = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
+                (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+            ],
+            async {
+                let mut reader = PutObjReader::from_vec(b"must-not-commit-without-proof".to_vec());
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            },
+        )
+        .await
+        .expect_err("object fencing must fail closed without a live fleet proof");
+
+        assert!(
+            err.to_string()
+                .contains("object transaction fencing requires a live fleet capability proof"),
+            "unexpected error: {err:?}"
+        );
+        for disk in &disk_stores {
+            let missing = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect_err("failed fenced PUT must not publish object metadata");
+            assert!(
+                matches!(missing, DiskError::FileNotFound | DiskError::FileVersionNotFound),
+                "failed fenced PUT left unexpected disk state: {missing:?}"
+            );
+        }
     }
 }
 
