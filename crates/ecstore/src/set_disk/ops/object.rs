@@ -86,7 +86,7 @@ mod put_metadata_tests {
         first_success.name = "first-success".to_string();
         let mut second_success = first_success.clone();
         second_success.name = "second-success".to_string();
-        let mut parts_metadata = vec![FileInfo::default(), first_success, second_success, FileInfo::default()];
+        let mut parts_metadata = [FileInfo::default(), first_success, second_success, FileInfo::default()];
         let committed_disks = [None, Some(()), Some(()), None];
 
         assert_eq!(
