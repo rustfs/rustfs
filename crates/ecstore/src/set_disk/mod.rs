@@ -247,8 +247,8 @@ impl SetDisks {
             no_lock: true,
             ..Default::default()
         };
-        let (current, _, _) = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
-        restore_operation_id_from_metadata(&current.metadata)?
+        let current = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
+        restore_operation_id_from_metadata(&current.fi().metadata)?
             .filter(|actual| *actual == expected)
             .ok_or_else(|| Error::other(format!("restore operation id changed before {mode}: expected {expected}")))?;
         Ok(())
@@ -736,41 +736,125 @@ mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 
-pub(in crate::set_disk) enum GetObjectMetadata<T> {
-    Owned(T),
-    Shared(Arc<T>),
+pub(in crate::set_disk) struct GetObjectFileInfo {
+    owned: Option<OwnedGetObjectFileInfo>,
+    shared: Option<Arc<GetObjectMetadataCacheEntry>>,
 }
 
-impl<T> std::ops::Deref for GetObjectMetadata<T> {
-    type Target = T;
+struct OwnedGetObjectFileInfo {
+    fi: FileInfo,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
+}
+
+impl GetObjectFileInfo {
+    fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                fi,
+                parts_metadata,
+                online_disks,
+            }),
+            shared: None,
+        }
+    }
+
+    fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        Self {
+            owned: None,
+            shared: Some(entry),
+        }
+    }
+
+    fn fi(&self) -> &FileInfo {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.fi,
+            (None, Some(entry)) => &entry.fi,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn parts_metadata(&self) -> &[FileInfo] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.parts_metadata,
+            (None, Some(entry)) => &entry.parts_metadata,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn online_disks(&self) -> &[Option<DiskStore>] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.online_disks,
+            (None, Some(entry)) => &entry.online_disks,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => {
+                let OwnedGetObjectFileInfo {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } = snapshot;
+                (fi, parts_metadata, online_disks)
+            }
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks),
+                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone()),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_legacy_parts(self) -> (FileInfo, Vec<FileInfo>, GetObjectOnlineDisks) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => {
+                let OwnedGetObjectFileInfo {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } = snapshot;
+                (fi, parts_metadata, GetObjectOnlineDisks::Owned(online_disks))
+            }
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => (entry.fi, entry.parts_metadata, GetObjectOnlineDisks::Owned(entry.online_disks)),
+                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), GetObjectOnlineDisks::Shared(entry)),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_valid_representation(&self) -> bool {
+        self.owned.is_some() ^ self.shared.is_some()
+    }
+
+    #[cfg(test)]
+    fn shared_entry(&self) -> Option<&Arc<GetObjectMetadataCacheEntry>> {
+        self.shared.as_ref()
+    }
+}
+
+enum GetObjectOnlineDisks {
+    Owned(Vec<Option<DiskStore>>),
+    Shared(Arc<GetObjectMetadataCacheEntry>),
+}
+
+impl std::ops::Deref for GetObjectOnlineDisks {
+    type Target = [Option<DiskStore>];
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Owned(value) => value,
-            Self::Shared(value) => value,
+            Self::Owned(disks) => disks,
+            Self::Shared(entry) => &entry.online_disks,
         }
     }
 }
-
-impl<T: Clone> GetObjectMetadata<T> {
-    fn into_owned(self) -> T {
-        match self {
-            Self::Owned(value) => value,
-            Self::Shared(value) => Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
-        }
-    }
-}
-
-type GetObjectFileInfo = (
-    GetObjectMetadata<FileInfo>,
-    GetObjectMetadata<Vec<FileInfo>>,
-    GetObjectMetadata<Vec<Option<DiskStore>>>,
-);
 
 pub(crate) struct PreparedGetObjectMetadata {
-    fi: GetObjectMetadata<FileInfo>,
-    files: GetObjectMetadata<Vec<FileInfo>>,
-    disks: GetObjectMetadata<Vec<Option<DiskStore>>>,
+    snapshot: GetObjectFileInfo,
     object_info: Option<ObjectInfo>,
 }
 
@@ -788,7 +872,7 @@ impl PreparedGetObjectMetadata {
     }
 
     pub(crate) fn read_semantics_identity(&self) -> [u8; 32] {
-        SetDisks::file_info_quorum_hash(&self.fi)
+        SetDisks::file_info_quorum_hash(self.snapshot.fi())
     }
 }
 
@@ -838,10 +922,11 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
+        let snapshot = GetObjectFileInfo::owned(FileInfo::default(), Vec::new(), Vec::new());
+        assert!(snapshot.has_valid_representation());
+        assert!(snapshot.shared_entry().is_none());
         let metadata = PreparedGetObjectMetadata {
-            fi: GetObjectMetadata::Owned(FileInfo::default()),
-            files: GetObjectMetadata::Owned(Vec::new()),
-            disks: GetObjectMetadata::Owned(Vec::new()),
+            snapshot,
             object_info: None,
         };
 
@@ -851,6 +936,44 @@ mod prepared_get_object_metadata_tests {
         })
         .await;
         assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    #[test]
+    fn cache_hit_consumers_share_one_snapshot_until_legacy_ownership() {
+        let fi = FileInfo {
+            name: "object".to_owned(),
+            ..Default::default()
+        };
+        let cached = Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            parts_metadata: vec![fi.clone()],
+            fi,
+            online_disks: vec![None],
+            read_quorum: 0,
+        });
+        let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
+
+        assert!(snapshot.has_valid_representation());
+        assert!(std::mem::size_of::<GetObjectFileInfo>() >= std::mem::size_of::<OwnedGetObjectFileInfo>());
+        assert!(
+            std::mem::size_of::<GetObjectFileInfo>()
+                <= std::mem::size_of::<OwnedGetObjectFileInfo>() + 2 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(Arc::strong_count(&cached), 2, "a cache hit must add one snapshot reference");
+        assert_eq!(snapshot.fi().name, "object");
+        assert_eq!(snapshot.parts_metadata().len(), 1);
+        assert_eq!(snapshot.online_disks().len(), 1);
+        assert_eq!(Arc::strong_count(&cached), 2, "borrowing consumers must not clone the snapshot");
+
+        let (owned_fi, owned_parts, disks) = snapshot.into_legacy_parts();
+        assert_eq!(owned_fi.name, "object");
+        assert_eq!(owned_parts.len(), 1);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&cached),
+            2,
+            "legacy ownership must retain the same snapshot for borrowed disks"
+        );
     }
 
     #[tokio::test]
@@ -1016,12 +1139,10 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let (fi, files, disks) = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
-        let object_info = build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
+        let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
-            fi,
-            files,
-            disks,
+            snapshot,
             object_info: Some(object_info),
         })
     }
@@ -2503,9 +2624,9 @@ impl Hash for GetObjectMetadataCacheKey {
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
-    fi: Arc<FileInfo>,
-    parts_metadata: Arc<Vec<FileInfo>>,
-    online_disks: Arc<Vec<Option<DiskStore>>>,
+    fi: FileInfo,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
 }
 

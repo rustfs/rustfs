@@ -180,9 +180,9 @@ impl SetDisks {
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: Arc::new(fi.clone()),
-            parts_metadata: Arc::new(parts_metadata.to_vec()),
-            online_disks: Arc::new(online_disks.to_vec()),
+            fi: fi.clone(),
+            parts_metadata: parts_metadata.to_vec(),
+            online_disks: online_disks.to_vec(),
             read_quorum,
         });
         self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
@@ -300,11 +300,7 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok((
-                        GetObjectMetadata::Shared(Arc::clone(&cached.fi)),
-                        GetObjectMetadata::Shared(Arc::clone(&cached.parts_metadata)),
-                        GetObjectMetadata::Shared(Arc::clone(&cached.online_disks)),
-                    ));
+                    return Ok(GetObjectFileInfo::shared(cached));
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -436,11 +432,7 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        Ok((
-            GetObjectMetadata::Owned(fi),
-            GetObjectMetadata::Owned(parts_metadata),
-            GetObjectMetadata::Owned(op_online_disks),
-        ))
+        Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -450,14 +442,15 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, usize, Option<StorageError>) {
-        let fi = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
-            Ok((fi, _, _)) => fi,
+        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
+            Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), 0, Some(e)),
         };
+        let fi = snapshot.fi();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
@@ -2723,22 +2716,14 @@ mod metadata_cache_tests {
             .await
             .expect("fresh cache entry should be returned");
 
-        let (returned_fi, returned_parts_metadata, returned_online_disks) = set
+        let returned = set
             .get_object_fileinfo("bucket", "object", &ObjectOptions::default(), true, false)
             .await
             .expect("cache-backed metadata lookup should succeed");
 
         assert!(
-            matches!(returned_fi, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.fi)),
-            "cache hits must share FileInfo ownership"
-        );
-        assert!(
-            matches!(returned_parts_metadata, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.parts_metadata)),
-            "cache hits must share the metadata vector"
-        );
-        assert!(
-            matches!(returned_online_disks, GetObjectMetadata::Shared(ref value) if Arc::ptr_eq(value, &cached.online_disks)),
-            "cache hits must share the online-disk vector"
+            returned.shared_entry().is_some_and(|value| Arc::ptr_eq(value, &cached)),
+            "cache hits must share the complete metadata snapshot"
         );
     }
 
@@ -2781,9 +2766,9 @@ mod metadata_cache_tests {
                 ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: Arc::new(fi.clone()),
-                    parts_metadata: Arc::new(vec![fi]),
-                    online_disks: Arc::new(vec![None]),
+                    fi: fi.clone(),
+                    parts_metadata: vec![fi],
+                    online_disks: vec![None],
                     read_quorum: 1,
                 }),
             )
@@ -2877,13 +2862,12 @@ mod metadata_cache_tests {
         barrier.wait_until_paused().await;
         set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
-        let (fi, parts_metadata, online_disks) = read
+        let snapshot = read
             .await
             .expect("metadata read task should not panic")
             .expect("metadata fanout should still return its selected FileInfo");
-        assert!(matches!(fi, GetObjectMetadata::Owned(_)));
-        assert!(matches!(parts_metadata, GetObjectMetadata::Owned(_)));
-        assert!(matches!(online_disks, GetObjectMetadata::Owned(_)));
+        assert!(snapshot.owned.is_some());
+        assert!(snapshot.has_valid_representation());
 
         assert!(
             set.get_object_metadata_cache
@@ -2930,9 +2914,9 @@ mod metadata_cache_tests {
         let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: Arc::new(fi.clone()),
-            parts_metadata: Arc::new(vec![fi]),
-            online_disks: Arc::new(Vec::new()),
+            fi: fi.clone(),
+            parts_metadata: vec![fi],
+            online_disks: Vec::new(),
             read_quorum: 0,
         });
 
@@ -3040,9 +3024,9 @@ mod metadata_cache_tests {
         let entry = |fi: FileInfo| {
             Arc::new(GetObjectMetadataCacheEntry {
                 created_at: Instant::now(),
-                parts_metadata: Arc::new(vec![fi.clone()]),
-                fi: Arc::new(fi),
-                online_disks: Arc::new(Vec::new()),
+                parts_metadata: vec![fi.clone()],
+                fi,
+                online_disks: Vec::new(),
                 read_quorum: 0,
             })
         };

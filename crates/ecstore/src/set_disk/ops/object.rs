@@ -428,11 +428,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
-            (prepared.fi, prepared.files, prepared.disks, prepared.object_info)
+        let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+            (prepared.snapshot, prepared.object_info)
         } else {
             match self.get_object_fileinfo(bucket, object, opts, true, true).await {
-                Ok((fi, files, disks)) => (fi, files, disks, None),
+                Ok(snapshot) => (snapshot, None),
                 Err(err) => {
                     rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
                     let failure_path = if is_meta_bucketname(bucket) {
@@ -445,10 +445,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         };
+        let fi = snapshot.fi();
+        let files = snapshot.parts_metadata();
+        let disks = snapshot.online_disks();
         let object_info_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let object_info = prepared_object_info
-            .unwrap_or_else(|| build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
-        let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
+            .unwrap_or_else(|| build_get_object_info(fi, bucket, object, opts.versioned || opts.version_suspended));
+        let object_class = classify_get_codec_streaming_object_class(&range, &object_info, fi);
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
         let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
@@ -496,7 +499,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
         // in flight.
-        if should_use_inline_fast_path(&range, &object_info, &fi, opts) {
+        if should_use_inline_fast_path(&range, &object_info, fi, opts) {
             let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
 
@@ -512,7 +515,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 };
 
             if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
-                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, &fi, data_shards, |index| {
+                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
@@ -580,10 +583,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
-            let erasure = erasure_from_file_info(&fi, fi.uses_legacy_checksum)?;
+            let erasure = erasure_from_file_info(fi, fi.uses_legacy_checksum)?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
-            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
+            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
             // Check if we have enough inline data shards
             let inline_count = files
@@ -665,7 +668,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             opts.part_number,
             object_class,
             &object_info,
-            &fi,
+            fi,
             lock_optimization_enabled,
         );
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
@@ -743,15 +746,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, &fi, opts);
+        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, fi, opts);
         record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
         if let GetDirectMemoryDecision::Use { object_size } = direct_memory_decision {
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
                 bucket,
                 object,
-                &fi,
-                &files,
-                &disks,
+                fi,
+                files,
+                disks,
                 opts.skip_verify_bitrot,
                 object_class.as_str(),
                 size_bucket,
@@ -780,14 +783,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let mut output = Vec::with_capacity(object_size);
+            let (fi, files, disks) = snapshot.into_legacy_parts();
             Self::get_object_with_fileinfo(
                 bucket,
                 object,
                 0,
                 object_info.size,
                 &mut output,
-                fi.into_owned(),
-                files.into_owned(),
+                fi,
+                files,
                 &disks,
                 self.set_index,
                 self.pool_index,
@@ -826,9 +830,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 match Self::get_object_decode_reader_with_fileinfo(
                     bucket,
                     object,
-                    &fi,
-                    &files,
-                    &disks,
+                    fi,
+                    files,
+                    disks,
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
@@ -890,6 +894,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let (fi, files, disks) = snapshot.into_legacy_parts();
         tokio::spawn(async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);
@@ -903,8 +908,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
-                fi.into_owned(),
-                files.into_owned(),
+                fi,
+                files,
                 &disks,
                 set_index,
                 pool_index,
@@ -3294,10 +3299,10 @@ impl SetDisks {
         // quorum, failing write quorum on update_object_meta (backlog#872).
         let mut read_opts = opts.clone();
         read_opts.include_part_checksums = true;
-        let (fi, _, disks) = self
+        let (mut fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
-            .await?;
-        let mut fi = fi.into_owned();
+            .await?
+            .into_owned();
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
         if let Some(eval_metadata) = &opts.eval_metadata {
@@ -4575,12 +4580,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
-        let (fi, _, _) = self
+        let snapshot = self
             .get_object_fileinfo(bucket, object, opts, true, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
     }
@@ -4748,10 +4753,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut transition_read_opts = opts.clone();
         transition_read_opts.include_part_checksums = true;
-        let (fi, meta_arr, online_disks) = self
+        let (mut fi, meta_arr, online_disks) = self
             .get_object_fileinfo(bucket, object, &transition_read_opts, true, false)
-            .await?;
-        let mut fi = fi.into_owned();
+            .await?
+            .into_owned();
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -4866,7 +4871,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 cloned_fi.size,
                 &mut writer,
                 cloned_fi,
-                meta_arr.into_owned(),
+                meta_arr,
                 &online_disks,
                 set_index,
                 pool_index,
@@ -4991,7 +4996,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         let current = self.get_object_fileinfo(bucket, object, &commit_opts, true, false).await;
-        let (current_fi, _, _) = match current {
+        let current = match current {
             Ok(current) => current,
             Err(err) => {
                 drop(transition_lock_guard);
@@ -5002,7 +5007,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Err(err);
             }
         };
-        let mut current_fi = current_fi.into_owned();
+        let (mut current_fi, _, _) = current.into_owned();
         let source_matches = current_fi.version_id == fi.version_id
             && current_fi.data_dir == fi.data_dir
             && current_fi.mod_time == fi.mod_time
@@ -5233,9 +5238,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
-        let (actual_fi, _, _) = fi?;
+        let actual = fi?;
+        let actual_fi = actual.fi();
 
-        oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
@@ -6800,10 +6806,11 @@ mod transition_commit_failure_tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("source object should be written");
-        let (fi, parts_metadata, online_disks) = set_disks
+        let snapshot = set_disks
             .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
             .await
             .expect("source metadata should resolve");
+        let (fi, parts_metadata, online_disks) = snapshot.into_owned();
         let generation = set_disks
             .get_object_metadata_cache_generation(bucket, object)
             .expect("metadata cache generation should be active");
@@ -6814,9 +6821,9 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
-                    fi: Arc::new((*fi).clone()),
-                    parts_metadata: Arc::new(parts_metadata.into_owned()),
-                    online_disks: Arc::new(online_disks.into_owned()),
+                    fi,
+                    parts_metadata,
+                    online_disks,
                     read_quorum: 2,
                 }),
             )
