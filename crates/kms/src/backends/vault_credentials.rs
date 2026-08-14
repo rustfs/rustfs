@@ -690,15 +690,25 @@ pub(crate) struct VaultClientHandle {
 
 impl VaultClientHandle {
     /// Absolute expiry of this generation's token.
+    ///
+    /// `lease.ttl` is built from the `lease_duration` the Vault server sent, so
+    /// a value too large to add to `issued_at` would panic on the bare `+`. A
+    /// TTL that cannot be represented is indistinguishable from no expiry, so it
+    /// collapses to `None` — the same answer already given for the zero-lease
+    /// tokens Vault issues, which keeps the token in use and still fully
+    /// validated by Vault on every call.
     fn expires_at(&self) -> Option<Instant> {
-        self.lease.map(|lease| self.issued_at + lease.ttl)
+        self.lease.and_then(|lease| self.issued_at.checked_add(lease.ttl))
     }
 
     /// When the renewal task should refresh this generation: half the TTL,
     /// leaving the second half as budget for retries before the fail-closed
     /// window is reached.
+    ///
+    /// Unrepresentable TTLs collapse to `None` as in [`Self::expires_at`],
+    /// leaving a token that never expires with nothing to renew.
     fn renew_at(&self) -> Option<Instant> {
-        self.lease.map(|lease| self.issued_at + lease.ttl / 2)
+        self.lease.and_then(|lease| self.issued_at.checked_add(lease.ttl / 2))
     }
 }
 
@@ -768,7 +778,7 @@ impl VaultCredentialProvider {
         let handle = self.current.load_full();
         if let Some(expires_at) = handle.expires_at() {
             let now = Instant::now();
-            if now + self.policy.safety_window >= expires_at {
+            if self.inside_safety_window(now, expires_at) {
                 return Err(KmsError::credentials_unavailable(format!(
                     "Vault token (generation {}) is within {:?} of expiry and has not been refreshed; refusing to use it",
                     handle.generation, self.policy.safety_window
@@ -776,6 +786,18 @@ impl VaultCredentialProvider {
             }
         }
         Ok(handle)
+    }
+
+    /// Whether the token expiring at `expires_at` is close enough to refuse.
+    ///
+    /// `safety_window` reaches here from persisted configuration, so it is not
+    /// guaranteed to have passed this version's validation: a window too large
+    /// to add to the current instant would panic on the bare `+`. Such a window
+    /// means every token is always inside it, so saturating to "refuse" is both
+    /// the fail-closed answer and the one the arithmetic was reaching for.
+    fn inside_safety_window(&self, now: Instant, expires_at: Instant) -> bool {
+        now.checked_add(self.policy.safety_window)
+            .is_none_or(|deadline| deadline >= expires_at)
     }
 
     /// Publish the credential gauges for the generation currently installed.
@@ -789,7 +811,7 @@ impl VaultCredentialProvider {
         let fail_closed = match handle.expires_at() {
             Some(expires_at) => {
                 metrics::gauge!(METRIC_TOKEN_TTL_SECONDS).set(expires_at.saturating_duration_since(now).as_secs_f64());
-                now + self.policy.safety_window >= expires_at
+                self.inside_safety_window(now, expires_at)
             }
             // A generation without an expiry has no remaining TTL to report
             // and can never lapse, so it can never fail closed either.
@@ -1171,6 +1193,47 @@ mod tests {
             .expect("kubernetes auth must map to a login source");
 
         assert!(format!("{source:?}").contains("KubernetesLogin"));
+    }
+
+    /// `refresh_safety_window_secs` is operator-supplied and reaches the request
+    /// path from persisted configuration, so the fail-closed comparison must
+    /// survive a window too large to add to the current instant. Before the
+    /// checked arithmetic this panicked with "overflow when adding duration to
+    /// instant" on the first request after a lease-bearing login.
+    #[tokio::test]
+    async fn test_current_refuses_rather_than_panics_on_an_unrepresentable_safety_window() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(u64::MAX), Duration::from_secs(5)),
+        )
+        .await;
+
+        let error = provider
+            .current()
+            .expect_err("a window wider than any lease must refuse the token");
+        assert!(
+            matches!(error, KmsError::CredentialsUnavailable { .. }),
+            "expected CredentialsUnavailable, got {error:?}"
+        );
+    }
+
+    /// `lease_duration` is a bare u64 straight off the Vault response and forms
+    /// the other side of the same comparison, so an absurd one must not panic
+    /// either. It is indistinguishable from a non-expiring token, which is how
+    /// the zero-lease case already behaves.
+    #[tokio::test]
+    async fn test_an_unrepresentable_lease_is_treated_as_non_expiring() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(u64::MAX),
+            true,
+            test_policy(Duration::from_secs(30), Duration::from_secs(5)),
+        )
+        .await;
+
+        provider
+            .current()
+            .expect("a token whose expiry cannot be represented must stay usable");
     }
 
     /// The configured flag has to reach the HTTP client, not just the config
