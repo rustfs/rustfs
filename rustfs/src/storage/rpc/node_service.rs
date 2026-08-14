@@ -2943,7 +2943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed_for_missing_disk() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
 
@@ -2960,7 +2960,7 @@ mod tests {
         let acquire = service
             .acquire_snapshot_lease(acquire)
             .await
-            .expect("disabled acquire should return a protocol response")
+            .expect("missing-disk acquire should return a protocol response")
             .into_inner();
 
         let mut renew = Request::new(SnapshotLeaseRenewRequest {
@@ -2977,14 +2977,14 @@ mod tests {
         let renew = service
             .renew_snapshot_lease(renew)
             .await
-            .expect("disabled renew should return a protocol response")
+            .expect("missing-disk renew should return a protocol response")
             .into_inner();
 
         for response in [acquire, renew] {
             assert!(!response.success);
             assert!(response.token.is_empty());
             assert_eq!(response.protocol_version, 1);
-            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+            assert_eq!(response.error, Some(DiskError::other("cannot find disk").into()));
         }
     }
 
