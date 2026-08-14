@@ -882,6 +882,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
+        let (producer_terminal_tx, producer_terminal_rx) = tokio::sync::oneshot::channel();
+        let rd = LegacyDuplexProducerReader::new(rd, producer_terminal_rx);
         let (mut reader, offset, length) =
             get_object_reader_with_context(&self.ctx, Box::new(rd), range, &object_info, opts, &h).await?;
         // Carry the hook probe result so the app layer skips its now-redundant
@@ -902,7 +904,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
             // Disk read timeouts must be enforced at the actual disk I/O operations.
-            if let Err(e) = Self::get_object_with_fileinfo(
+            let producer_result = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
                 offset,
@@ -919,9 +921,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 object_class.as_str(),
                 size_bucket,
             )
-            .await
-            {
-                let reason = classify_storage_error(&e);
+            .await;
+            if let Err(e) = &producer_result {
+                let reason = classify_storage_error(e);
                 if reason == GetObjectFailureReason::DownstreamClosed {
                     debug!(
                         event = EVENT_SET_DISK_WRITE,
@@ -960,6 +962,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
             };
+            let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
         });
 
         Ok(reader)
@@ -1866,6 +1869,159 @@ impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
             }
             other => other,
         }
+    }
+}
+
+struct LegacyDuplexProducerReader<R> {
+    inner: R,
+    terminal: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    inner_eof: bool,
+}
+
+impl<R> LegacyDuplexProducerReader<R> {
+    fn new(inner: R, terminal: tokio::sync::oneshot::Receiver<Result<()>>) -> Self {
+        Self {
+            inner,
+            terminal: Some(terminal),
+            inner_eof: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LegacyDuplexProducerReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if !self.inner_eof {
+            let before = buf.filled().len();
+            match Pin::new(&mut self.inner).poll_read(cx, buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) if buf.filled().len() > before => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(())) => {
+                    self.inner_eof = true;
+                }
+            }
+        }
+
+        let Some(terminal) = self.terminal.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(terminal).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(()))) => {
+                self.terminal = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(err))) => {
+                self.terminal = None;
+                Poll::Ready(Err(std::io::Error::other(err)))
+            }
+            Poll::Ready(Err(_)) => {
+                self.terminal = None;
+                Poll::Ready(Err(std::io::Error::other(StorageError::Unexpected)))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_duplex_producer_reader_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn storage_error_source(error: &std::io::Error) -> &StorageError {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("legacy duplex terminal error should retain StorageError source")
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_allows_clean_completion() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer
+            .write_all(b"complete")
+            .await
+            .expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx.send(Ok(())).expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("clean producer completion should surface clean EOF");
+
+        assert_eq!(out, b"complete");
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_surfaces_terminal_error_after_partial_data() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"partial").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::FileCorrupt))
+            .expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("terminal producer error must not become clean EOF");
+
+        assert_eq!(out, b"partial");
+        assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_surfaces_terminal_error_after_declared_length() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"exact").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "remote body reset after final byte",
+            ))))
+            .expect("terminal receiver should remain installed");
+
+        let reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut reader =
+            HashReader::from_stream(reader, 5, 5, None, None, false).expect("hash reader should accept exact declared length");
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("producer terminal error after the declared length must still fail");
+
+        assert_eq!(out, b"exact");
+        assert!(
+            matches!(storage_error_source(&err), StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_fails_closed_when_terminal_channel_closes() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+        writer.write_all(b"body").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        drop(terminal_tx);
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("producer disappearance must fail closed");
+
+        assert_eq!(out, b"body");
+        assert!(matches!(storage_error_source(&err), StorageError::Unexpected));
     }
 }
 

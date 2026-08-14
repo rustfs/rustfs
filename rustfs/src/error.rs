@@ -670,6 +670,23 @@ mod tests {
     }
 
     #[test]
+    fn test_api_error_from_storage_io_copy_object_terminal_error_stays_internal() {
+        let io_error = IoError::other(StorageError::FileCorrupt);
+        let storage_error: StorageError = io_error.into();
+        assert!(matches!(storage_error, StorageError::FileCorrupt));
+
+        let api_error: ApiError = storage_error.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::FileCorrupt));
+    }
+
+    #[test]
     fn test_api_error_from_iam_error() {
         let iam_error = rustfs_iam::error::Error::other("IAM test error");
         let api_error: ApiError = iam_error.into();
