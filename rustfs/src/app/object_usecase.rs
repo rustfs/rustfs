@@ -9194,6 +9194,17 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        self.execute_put_object_extract_boxed(req).await
+    }
+
+    fn execute_put_object_extract_boxed(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + '_ {
+        Box::pin(self.execute_put_object_extract_inner(req))
+    }
+
+    async fn execute_put_object_extract_inner(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
         let auth_method = req.method.clone();

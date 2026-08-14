@@ -2089,113 +2089,114 @@ impl SetDisks {
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
             tmp_cleanup_owned = true;
 
-            let commit = async move {
-                let _object_lock_guard = commit_object_lock_guard;
-                let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
-                let mut quota_reservation = quota_reservation;
-                let rename_stage_start = Instant::now();
-                let pre_rename_result: Result<()> = async {
-                    #[cfg(any(test, feature = "test-util"))]
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterQuotaReservation).await;
-                    quota_reservation.mark_commit_started().await?;
-                    #[cfg(any(test, feature = "test-util"))]
-                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
-                    if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
-                        || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || commit_namespace_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || commit_bucket_lifecycle_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                    {
-                        return Err(StorageError::NamespaceLockQuorumUnavailable {
-                            mode: "quota_reservation",
-                            bucket: commit_bucket.clone(),
-                            object: commit_object.clone(),
-                            required: 1,
-                            achieved: 0,
-                        });
-                    }
-                    let restore_opts = ObjectOptions {
-                        version_id: commit_version_id.clone(),
-                        versioned: commit_versioned,
-                        version_suspended: commit_version_suspended,
-                        no_lock: true,
-                        ..Default::default()
-                    };
-                    commit_set
-                        .require_current_restore_operation_id(
-                            &commit_bucket,
-                            &commit_object,
-                            &restore_opts,
-                            expected_restore_operation_id,
-                            "put_object_quota_reservation",
-                        )
-                        .await?;
-                    if let Some(proof) = transaction_fencing_proof.as_ref()
-                        && !object_transaction_fencing_fleet_proof_matches(proof)
-                    {
-                        return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
-                    }
-                    if let Some(expected) = transaction_epoch_fence {
-                        #[cfg(any(test, feature = "test-util"))]
-                        pause_put_object_commit(
-                            &commit_bucket,
-                            &commit_object,
-                            PutObjectCommitPause::BeforeTransactionEpochVerify,
-                        )
-                        .await;
-                        verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
-                    }
-                    if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
-                        || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                        || commit_namespace_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || commit_bucket_lifecycle_lock_fence
-                            .as_ref()
-                            .is_some_and(NamespaceLockFence::is_lock_lost)
-                        || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                    {
-                        return Err(StorageError::NamespaceLockQuorumUnavailable {
-                            mode: "quota_reservation",
-                            bucket: commit_bucket.clone(),
-                            object: commit_object.clone(),
-                            required: 1,
-                            achieved: 0,
-                        });
-                    }
-                    Ok(())
+            let mut quota_reservation = quota_reservation;
+            let rename_stage_start = Instant::now();
+            let pre_rename_result: Result<()> = async {
+                #[cfg(any(test, feature = "test-util"))]
+                pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterQuotaReservation).await;
+                quota_reservation.mark_commit_started().await?;
+                #[cfg(any(test, feature = "test-util"))]
+                pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
+                if quota_reservation.is_lock_lost()
+                    || !quota_reservation.capability_proof_matches()
+                    || commit_object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || commit_namespace_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.is_lock_lost())
+                {
+                    return Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "quota_reservation",
+                        bucket: commit_bucket.clone(),
+                        object: commit_object.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
                 }
-                .await;
-                if let Err(err) = pre_rename_result {
-                    SetDisks::abort_quota_reservation_after_fence(
-                        quota_reservation,
-                        &commit_disks,
-                        &quota_fence_tokens,
+                let restore_opts = ObjectOptions {
+                    version_id: commit_version_id.clone(),
+                    versioned: commit_versioned,
+                    version_suspended: commit_version_suspended,
+                    no_lock: true,
+                    ..Default::default()
+                };
+                commit_set
+                    .require_current_restore_operation_id(
                         &commit_bucket,
                         &commit_object,
-                        write_quorum,
-                        quota_mutation_fence,
+                        &restore_opts,
+                        expected_restore_operation_id,
+                        "put_object_quota_reservation",
                     )
-                    .await;
-                    if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
-                        warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
-                    } else if issue3031_diag_enabled() {
-                        warn!(
-                            target: "rustfs_ecstore::set_disk",
-                            bucket = %commit_bucket,
-                            object = %commit_object,
-                            tmp_dir = %commit_tmp_dir,
-                            "issue3031_put_object_tmp_cleanup_done"
-                        );
-                    }
-                    return Err(err);
+                    .await?;
+                if let Some(proof) = transaction_fencing_proof.as_ref()
+                    && !object_transaction_fencing_fleet_proof_matches(proof)
+                {
+                    return Err(Error::other("object transaction fencing fleet capability changed during put_object"));
                 }
+                if let Some(expected) = transaction_epoch_fence {
+                    #[cfg(any(test, feature = "test-util"))]
+                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeTransactionEpochVerify)
+                        .await;
+                    verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                }
+                if quota_reservation.is_lock_lost()
+                    || !quota_reservation.capability_proof_matches()
+                    || commit_object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || commit_namespace_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.is_lock_lost())
+                {
+                    return Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "quota_reservation",
+                        bucket: commit_bucket.clone(),
+                        object: commit_object.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = pre_rename_result {
+                SetDisks::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    &commit_bucket,
+                    &commit_object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                    warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
+                } else if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket = %commit_bucket,
+                        object = %commit_object,
+                        tmp_dir = %commit_tmp_dir,
+                        "issue3031_put_object_tmp_cleanup_done"
+                    );
+                }
+                return Err(err);
+            }
+
+            let commit = move || async move {
+                let _object_lock_guard = commit_object_lock_guard;
+                let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let rename_result = SetDisks::rename_data(
                     &commit_disks,
                     RUSTFS_META_TMP_BUCKET,
@@ -2429,11 +2430,11 @@ impl SetDisks {
             };
 
             if detach_commit_owner {
-                tokio::spawn(commit)
+                tokio::spawn(async move { Box::pin(commit()).await })
                     .await
                     .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?
             } else {
-                commit.await
+                Box::pin(commit()).await
             }
         }
         .await;
