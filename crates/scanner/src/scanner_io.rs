@@ -3849,17 +3849,6 @@ impl ScannerIODisk for Disk {
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
-                error!(
-                    target: "rustfs::scanner::io",
-                    event = EVENT_SCANNER_DISK_BUCKET_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_IO,
-                    bucket = %item.bucket,
-                    object = %item.object_path(),
-                    state = "file_info_versions_failed",
-                    error = %e,
-                    "Scanner disk bucket failed to resolve file info versions"
-                );
                 return Err(scanner_metadata_corrupt_error(
                     format!("failed to resolve file info versions: {e}"),
                     &item.bucket,

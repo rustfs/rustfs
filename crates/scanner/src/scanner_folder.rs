@@ -65,6 +65,7 @@ const LOG_SUBSYSTEM_FOLDER: &str = "folder";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_SCANNER_FOLDER_STATE: &str = "scanner_folder_state";
+const EVENT_SCANNER_METADATA_CORRUPT: &str = "scanner_metadata_corrupt";
 const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
 const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
@@ -2154,17 +2155,34 @@ impl FolderScanner {
                             self.record_failed(&item.path);
 
                             if should_log_failed_object(into.failed_objects) {
-                                warn!(
-                                    target: "rustfs::scanner::folder",
-                                    event = EVENT_SCANNER_FOLDER_STATE,
-                                    component = LOG_COMPONENT_SCANNER,
-                                    subsystem = LOG_SUBSYSTEM_FOLDER,
-                                    path = %item.path,
-                                    failed_objects = into.failed_objects,
-                                    state = "get_size_failed",
-                                    error = %e,
-                                    "Scanner folder failed to get object size"
-                                );
+                                if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_METADATA_CORRUPT,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        drive = %self.local_disk.path().display(),
+                                        bucket = %item.bucket,
+                                        object = %object,
+                                        metadata_path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "metadata_corrupt",
+                                        error = %e,
+                                        "Scanner detected corrupt object metadata"
+                                    );
+                                } else {
+                                    warn!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "get_size_failed",
+                                        error = %e,
+                                        "Scanner folder failed to get object size"
+                                    );
+                                }
                             }
                         }
 
@@ -3054,11 +3072,58 @@ mod tests {
     use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
     use rustfs_filemeta::{FileInfo, FileMeta};
     use serial_test::serial;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
+    use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     #[test]
     fn scanner_size_summary_application_saturates_usage_counters() {
@@ -4542,9 +4607,19 @@ mod tests {
         assert!(budget.entries_visited() >= 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
         let (mut scanner, temp_dir) = build_test_scanner().await;
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
 
@@ -4595,6 +4670,30 @@ mod tests {
         );
         assert!(!budget.budget_elapsed());
         assert_eq!(budget.reason(), None);
+
+        let captured = logs.contents();
+        assert!(
+            !captured.contains("failed to check XL2 v1 format"),
+            "the context-free filemeta parser error must not be emitted"
+        );
+        let events = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("captured scanner log should be valid JSON"))
+            .filter(|line| line["fields"]["event"] == EVENT_SCANNER_METADATA_CORRUPT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "one corrupt metadata observation must emit one scanner-owned diagnostic event"
+        );
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["component"], LOG_COMPONENT_SCANNER);
+        assert_eq!(fields["subsystem"], LOG_SUBSYSTEM_FOLDER);
+        assert_eq!(fields["drive"], temp_dir.to_string_lossy().as_ref());
+        assert_eq!(fields["bucket"], "bucket");
+        assert_eq!(fields["object"], "object");
+        assert_eq!(fields["metadata_path"], metadata_path.to_string_lossy().as_ref());
+        assert_eq!(fields["state"], "metadata_corrupt");
 
         let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
             &parent,
