@@ -248,7 +248,6 @@ where
             return Poll::Ready(Ok(()));
         }
         if *this.poisoned {
-            *this.poisoned = true;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "decompress reader previously failed")));
         }
 
@@ -289,6 +288,9 @@ where
                 (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
             *this.header_read = 0;
 
+            // `CompressReader` never emits an end block — a stream terminates on
+            // inner EOF, which is what lets concatenated per-part streams decode as
+            // one. This branch is kept for streams that do carry the marker.
             if typ == COMPRESS_TYPE_END {
                 *this.compressed_read = 0;
                 *this.compressed_len = 0;
