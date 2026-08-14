@@ -306,12 +306,20 @@ fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
 pub(crate) struct NamespaceMutationLease {
     _namespace_guard: OwnedMutexGuard<()>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
+    external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
+}
+
+impl NamespaceMutationLease {
+    pub(crate) fn attach_external_guard(&self, guard: Arc<dyn Send + Sync>) {
+        *self.external_guard.lock() = Some(guard);
+    }
 }
 
 async fn acquire_namespace_mutation_lease(path: &Path) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _volume_guard: None,
+        external_guard: Mutex::new(None),
     })
 }
 
@@ -327,6 +335,7 @@ pub(crate) async fn acquire_rename_data_mutation_lease(
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _volume_guard: Some(volume_guard),
+        external_guard: Mutex::new(None),
     })
 }
 
