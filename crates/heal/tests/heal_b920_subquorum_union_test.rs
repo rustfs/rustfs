@@ -21,6 +21,8 @@
 //! These drive the REAL `ECStoreHealStorage` + `ECStore` against real disks.
 //! Every test is `#[serial]`; under `cargo nextest` each runs in its own process.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::storage::{

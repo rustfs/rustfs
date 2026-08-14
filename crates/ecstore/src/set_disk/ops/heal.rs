@@ -1425,6 +1425,33 @@ impl SetDisks {
     /// post-heal tail — reclaim identically. Never fails the heal: delete errors
     /// are logged and swallowed. Callers must gate this on `!opts.dry_run`.
     async fn reclaim_orphan_data_dirs_best_effort(&self, bucket: &str, object: &str) {
+        match self.reconcile_old_data_cleanup_receipts(bucket, object).await {
+            Ok(removed) if removed > 0 => {
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    removed,
+                    state = "old_data_cleanup_receipt_reconciled",
+                    "Set disk old-data cleanup receipts reconciled"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    error = %e,
+                    state = "old_data_cleanup_receipt_reconcile_failed",
+                    "Set disk old-data cleanup receipt reconcile failed"
+                );
+            }
+        }
         match self.reclaim_orphan_data_dirs(bucket, object).await {
             Ok(removed) if removed > 0 => {
                 debug!(

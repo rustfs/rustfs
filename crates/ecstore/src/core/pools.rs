@@ -226,6 +226,7 @@ fn ensure_decommission_start_rebalance_meta_allowed(meta: Option<&RebalanceMeta>
     ensure_decommission_not_rebalancing(meta.is_some_and(is_rebalance_conflicting_with_decommission))
 }
 
+#[allow(dead_code, reason = "leader precondition asserted by this file's tests (backlog#1823)")]
 fn ensure_local_decommission_pool_leaders(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
     for idx in indices {
         ensure_local_decommission_pool_leader(endpoints, *idx)?;
@@ -1058,11 +1059,19 @@ fn should_cleanup_decommission_source_entry(decommissioned: usize, total_version
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "terminal-state classification asserted by this file's tests (backlog#1823)"
+)]
 enum DecommissionTerminalState {
     Completed,
     Failed,
 }
 
+#[allow(
+    dead_code,
+    reason = "terminal-state classification asserted by this file's tests (backlog#1823)"
+)]
 fn classify_decommission_terminal_state(failed_items_present: bool) -> DecommissionTerminalState {
     if failed_items_present {
         DecommissionTerminalState::Failed

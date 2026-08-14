@@ -672,7 +672,6 @@ impl Operation for RemoveTier {
     }
 }
 
-#[allow(dead_code)]
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
@@ -776,7 +775,6 @@ fn filter_tier_stats(daily_stats: DailyAllTierStats, tier_name: Option<&str>) ->
         .collect()
 }
 
-#[allow(dead_code)]
 fn map_tier_verify_error(err: std::io::Error) -> S3Error {
     if let Some(admin_err) = err.get_ref().and_then(|inner| inner.downcast_ref::<AdminError>()) {
         return match admin_err.code.as_str() {

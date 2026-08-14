@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: set-layout contracts are staged while ECStore ownership boundaries shrink.
-#![allow(dead_code)]
 
 //! Static ECStore layout boundaries.
 //!

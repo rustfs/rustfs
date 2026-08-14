@@ -597,7 +597,7 @@ impl HealTask {
                 | EcstoreError::ObjectNotFound(_, _)
                 | EcstoreError::VersionNotFound(_, _, _),
             ) => true,
-            Error::Other(message) | Error::IO(message) => {
+            Error::Other(message) => {
                 message.contains("File not found")
                     || message.contains("file not found")
                     || message.contains("File version not found")

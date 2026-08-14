@@ -24,6 +24,7 @@ impl RustfsCodecDecodeWorkspace {
     }
 
     #[inline]
+    #[allow(dead_code, reason = "workspace width asserted by decode_reader tests (backlog#1823)")]
     pub(crate) fn shard_len(&self) -> usize {
         self.shard_len
     }

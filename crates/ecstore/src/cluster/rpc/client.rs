@@ -256,6 +256,7 @@ impl<S> ReplayScopeChannel<S> {
     }
 }
 
+#[allow(dead_code, reason = "replay-state probe asserted by this file's tests (backlog#1823)")]
 fn peer_replay_state(audience: &str) -> PeerReplayState {
     PEER_REPLAY_STATES
         .lock()
