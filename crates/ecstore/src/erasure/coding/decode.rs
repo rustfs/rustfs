@@ -213,6 +213,7 @@ fn shard_read_launch_rank(cost: ShardReadCost) -> u8 {
     }
 }
 
+#[allow(dead_code, reason = "launch ordering asserted by this file's tests (backlog#1823)")]
 fn shard_read_launch_order(read_costs: &[ShardReadCost], num_readers: usize, locality_preference_enabled: bool) -> Vec<usize> {
     let mut order: Vec<usize> = (0..num_readers).collect();
     if locality_preference_enabled {
@@ -408,6 +409,10 @@ where
     R: crate::erasure::coding::ShardSource,
 {
     // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
+    #[allow(
+        dead_code,
+        reason = "ParallelReader constructor used only by this file's tests (backlog#1823)"
+    )]
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
         Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
             readers,
@@ -420,6 +425,7 @@ where
         )
     }
 
+    #[allow(dead_code, reason = "constructor used only by this file's tests (backlog#1823)")]
     pub fn new_with_metrics_path(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
@@ -438,6 +444,7 @@ where
         )
     }
 
+    #[allow(dead_code, reason = "constructor used only by this file's tests (backlog#1823)")]
     pub fn new_with_metrics_path_and_read_costs(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
@@ -514,6 +521,7 @@ where
         )
     }
 
+    #[allow(dead_code, reason = "constructor used only by this file's tests (backlog#1823)")]
     fn new_with_read_timeout(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
@@ -1330,10 +1338,6 @@ where
             }
         }
     }
-
-    pub fn can_decode(&self, shards: &[Option<Vec<u8>>]) -> bool {
-        shards.iter().filter(|s| s.is_some()).count() >= self.data_shards
-    }
 }
 
 #[async_trait::async_trait]
@@ -1539,6 +1543,7 @@ impl Erasure {
             .await
     }
 
+    #[allow(dead_code, reason = "read-cost decode path asserted by this file's tests (backlog#1823)")]
     pub(crate) async fn decode_with_read_costs<W, R>(
         &self,
         writer: &mut W,
@@ -1609,9 +1614,9 @@ impl Erasure {
             *ret_err = Some(err.into());
         }
 
-        // Equivalent to `ParallelReader::can_decode`; inlined so this helper does
-        // not need to borrow the reader, leaving the reader free for the
-        // concurrent next-stripe read under prefetch.
+        // Shard-availability check, written out here rather than called on the
+        // reader so this helper does not need to borrow it, leaving the reader
+        // free for the concurrent next-stripe read under prefetch.
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
         if available_shards < self.data_shards {
             let reason = GetObjectFailureReason::ReadQuorum;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::super::*;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use tracing::trace;
@@ -1164,10 +1165,10 @@ impl SetDisks {
                                 let rename_result = if should_fail_heal_rename(bucket, object, index) {
                                     Err(DiskError::Unexpected)
                                 } else {
-                                    disk.rename_data(
+                                    disk.rename_data_borrowed(
                                         RUSTFS_META_TMP_BUCKET,
                                         &tmp_id,
-                                        parts_metadata[index].clone(),
+                                        &parts_metadata[index],
                                         bucket,
                                         object,
                                     )

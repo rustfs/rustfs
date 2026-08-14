@@ -1110,6 +1110,10 @@ impl Erasure {
     ///
     /// # Errors
     /// Returns error if reading from reader fails or if callback returns error
+    #[allow(
+        dead_code,
+        reason = "callback encode path exercised only by this file's tests (backlog#1823)"
+    )]
     pub(crate) async fn encode_stream_callback_async<F, Fut, E, R>(
         self: std::sync::Arc<Self>,
         reader: &mut R,
