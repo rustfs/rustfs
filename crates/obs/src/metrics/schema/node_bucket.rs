@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_gauge_md};
 use std::sync::LazyLock;
 
