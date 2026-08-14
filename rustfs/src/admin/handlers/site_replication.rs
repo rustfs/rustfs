@@ -116,6 +116,10 @@ const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
 use crate::admin::site_replication_state::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock};
 const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
 const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
+// Serializes peer-join admission (staleness check -> IAM upsert -> state
+// commit) across every node of this site; see admit_peer_join. Never an
+// actual object — only a namespace-lock key, like the repair execution lock.
+const SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH: &str = "config/site-replication/join-admission.lock";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
 const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from cluster replication successfully.";
@@ -8817,20 +8821,26 @@ enum PeerJoinOutcome {
 /// The serialized half of an accepted peer join: staleness check, IAM apply,
 /// state commit.
 ///
-/// The whole sequence runs under the lifecycle guard, and the staleness check
-/// runs BEFORE `apply_iam`, against a load taken under that guard. Both
-/// halves matter: the IAM write and the state commit cannot share a
-/// transaction, so without the guard two joins accepted by this node can
-/// interleave as "A checks a stale snapshot, B applies secret B and commits,
-/// A overwrites IAM with secret A, A's commit is refused as superseded" —
-/// leaving the persisted state advertising B's contract while IAM only
-/// accepts A's secret, and every peer control-plane call failing auth. The
-/// closing transaction still re-checks staleness: another NODE of this site
-/// can accept a join concurrently (the guard is process-local, exactly as
-/// far as the pre-P1-15 process mutex reached), and the state-object lock is
-/// what arbitrates that.
+/// Two locks, two scopes. The lifecycle guard (process-local) keeps the
+/// admission mutually exclusive with this node's add / remove / rotate /
+/// reconciler. The distributed join-admission lock then serializes the
+/// admission CLUSTER-WIDE — the IAM write and the state commit cannot share
+/// a transaction, so without it two joins accepted by different nodes of
+/// this site interleave as "A checks for older T1, B applies secret B and
+/// commits newer T2, A overwrites IAM with secret A, A's commit is refused
+/// as superseded" — leaving the persisted state advertising B's contract
+/// while IAM only accepts A's secret. Under the admission lock the
+/// staleness check runs against a load taken INSIDE the lock, before
+/// `apply_iam` changes anything, so a superseded join exits without
+/// touching IAM at all. Crash safety is the lock subsystem's lease expiry
+/// (same pattern as the repair execution lock); the closing transaction
+/// still re-checks staleness for defence in depth and for old-version nodes
+/// that do not take the admission lock during a rolling upgrade.
 ///
-/// `apply_iam` is injected so the interleaving regression test can gate it
+/// Lock order: lifecycle -> join admission -> state object lock (the repair
+/// path nests config-object locks the same way: repair execution -> state).
+///
+/// `apply_iam` is injected so the interleaving regression tests can gate it
 /// mid-flight; production passes the real service-account upsert.
 async fn admit_peer_join<F, Fut>(
     local_endpoint: String,
@@ -8839,35 +8849,58 @@ async fn admit_peer_join<F, Fut>(
     apply_iam: F,
 ) -> S3Result<PeerJoinOutcome>
 where
-    F: FnOnce(SRPeerJoinReq) -> Fut,
-    Fut: std::future::Future<Output = S3Result<()>>,
+    F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
 {
     let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+    admit_peer_join_across_nodes(local_endpoint, join_req, defer_sync_state_enable, apply_iam).await
+}
 
-    let fresh = load_site_replication_state().await?;
-    let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
-    if join_request_is_superseded(&fresh, join_req.updated_at) {
-        let peer = fresh
-            .peers
-            .get(&fresh_local_peer.deployment_id)
-            .cloned()
-            .unwrap_or(fresh_local_peer);
-        return Ok(PeerJoinOutcome::Superseded(peer));
-    }
-
-    apply_iam(join_req.clone()).await?;
-
-    let incoming_updated_at = join_req.updated_at;
-    update_site_replication_state_when_changed(move |state| {
-        let local_peer = local_peer_at_endpoint(local_endpoint, state);
-        if join_request_is_superseded(state, incoming_updated_at) {
-            let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
-            return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+/// [`admit_peer_join`] minus the process-local lifecycle guard: the
+/// distributed admission lock plus the fenced sequence under it. This is
+/// exactly what a second node of this site runs concurrently — the lifecycle
+/// guard cannot reach it — so the separate-nodes regression test drives this
+/// function directly, and removing the admission lock breaks it.
+async fn admit_peer_join_across_nodes<F, Fut>(
+    local_endpoint: String,
+    join_req: SRPeerJoinReq,
+    defer_sync_state_enable: bool,
+    apply_iam: F,
+) -> S3Result<PeerJoinOutcome>
+where
+    F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
+{
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    with_config_object_write_lock(store, SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(), move || async move {
+        let fresh = load_site_replication_state().await?;
+        let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+        if join_request_is_superseded(&fresh, join_req.updated_at) {
+            let peer = fresh
+                .peers
+                .get(&fresh_local_peer.deployment_id)
+                .cloned()
+                .unwrap_or(fresh_local_peer);
+            return Ok(PeerJoinOutcome::Superseded(peer));
         }
-        apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
-        Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+
+        apply_iam(join_req.clone()).await?;
+
+        let incoming_updated_at = join_req.updated_at;
+        update_site_replication_state_when_changed(move |state| {
+            let local_peer = local_peer_at_endpoint(local_endpoint, state);
+            if join_request_is_superseded(state, incoming_updated_at) {
+                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+            }
+            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+        })
+        .await
     })
     .await
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication join admission failed: {e}")))?
 }
 
 /// Upsert the replication service account a peer join carries. No-op when the
@@ -15694,6 +15727,107 @@ mod tests {
         let outcome_a = join_a.await.expect("join A task").expect("join A admission");
         let outcome_b = join_b.await.expect("join B task").expect("join B admission");
         assert!(matches!(outcome_a, PeerJoinOutcome::Applied(..)), "join A must commit first");
+        assert!(
+            matches!(outcome_b, PeerJoinOutcome::Applied(..)),
+            "the newer join B must still apply after A"
+        );
+        assert_eq!(
+            *iam_log.lock().expect("iam log"),
+            vec!["iam-a", "iam-b"],
+            "IAM writes must land in admission order, ending on the committed join's secret"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").updated_at,
+            Some(now),
+            "the persisted state must end on join B, matching the last IAM write"
+        );
+    }
+
+    /// Review follow-up on P1-15 PR2 (overtrue, round 2): the same
+    /// interleaving driven by two SEPARATE NODES, which the process-local
+    /// lifecycle guard cannot reach. Both admissions run
+    /// `admit_peer_join_across_nodes` — the production path minus the
+    /// process-local guard, exactly what a second node executes — so only
+    /// the distributed join-admission lock keeps join B out while join A is
+    /// gated mid-IAM. Remove that lock and B's IAM write lands during A's
+    /// admission: the assertion on the empty IAM log turns red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_join_admission_serializes_across_separate_nodes() {
+        publish_ready_iam_context().await;
+
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
+        let local = PeerInfo {
+            deployment_id: "site-local".to_string(),
+            ..peer("site-local", "https://local.example:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-remote".to_string(),
+            ..peer("site-remote", "https://remote.example:9000")
+        };
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            updated_at: Some(now - Duration::from_secs(60)),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        let join_peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote.clone()),
+        ]);
+        let join_req = |updated_at: OffsetDateTime, secret: &str| SRPeerJoinReq {
+            svc_acct_access_key: "svc-join".to_string(),
+            svc_acct_secret_key: secret.to_string(),
+            svc_acct_parent: "root".to_string(),
+            peers: join_peers.clone(),
+            updated_at: Some(updated_at),
+        };
+
+        let iam_log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (a_entered_tx, a_entered_rx) = tokio::sync::oneshot::channel();
+        let (a_gate_tx, a_gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Node A (older join, T1) pauses inside its IAM step while holding
+        // only the distributed admission lock.
+        let log_a = iam_log.clone();
+        let req_a = join_req(now - Duration::from_secs(30), "secret-a");
+        let join_a = tokio::spawn(async move {
+            admit_peer_join_across_nodes("https://local.example:9000".to_string(), req_a, true, move |_req| async move {
+                let _ = a_entered_tx.send(());
+                let _ = a_gate_rx.await;
+                log_a.lock().expect("iam log").push("iam-a");
+                Ok(())
+            })
+            .await
+        });
+        a_entered_rx.await.expect("node A reached its IAM step");
+
+        // Node B (newer join, T2) arrives on "another node": no process-local
+        // guard applies. The distributed admission lock must hold it.
+        let log_b = iam_log.clone();
+        let req_b = join_req(now, "secret-b");
+        let join_b = tokio::spawn(async move {
+            admit_peer_join_across_nodes("https://local.example:9000".to_string(), req_b, true, move |_req| async move {
+                log_b.lock().expect("iam log").push("iam-b");
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            iam_log.lock().expect("iam log").is_empty(),
+            "node B ran its IAM step while node A was still mid-admission: {:?}",
+            iam_log.lock().expect("iam log")
+        );
+
+        a_gate_tx.send(()).expect("release node A");
+        let outcome_a = join_a.await.expect("node A task").expect("node A admission");
+        let outcome_b = join_b.await.expect("node B task").expect("node B admission");
+        assert!(matches!(outcome_a, PeerJoinOutcome::Applied(..)), "node A must commit first");
         assert!(
             matches!(outcome_b, PeerJoinOutcome::Applied(..)),
             "the newer join B must still apply after A"
