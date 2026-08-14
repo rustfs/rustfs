@@ -326,6 +326,97 @@ impl fmt::Debug for AppRoleLogin {
     }
 }
 
+/// Token source for [`VaultAuthMethod::Kubernetes`]: exchanges the pod's
+/// projected ServiceAccount token for a lease-bound Vault token.
+///
+/// The JWT is re-read on every login because the kubelet rotates a projected
+/// token well inside the pod's lifetime; caching it would strand the source on
+/// an expired assertion once the current Vault token can no longer be renewed.
+///
+/// Unlike [`TokenFileSource`], the file mode is not checked: the kubelet owns
+/// the projected token and mounts it world-readable by default, so rejecting
+/// group/other bits would refuse every standard pod rather than catch a
+/// deployment error.
+pub(crate) struct KubernetesLogin {
+    /// Unauthenticated client used only for the login exchange.
+    login_client: VaultClient,
+    mount: String,
+    role: String,
+    jwt_path: PathBuf,
+}
+
+impl KubernetesLogin {
+    pub(crate) fn new(settings: &VaultConnectionSettings, mount: String, role: String, jwt_path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            login_client: settings.build_login_client()?,
+            mount,
+            role,
+            jwt_path,
+        })
+    }
+
+    /// Read the ServiceAccount token for one login attempt.
+    ///
+    /// Mirrors [`AppRoleLogin::resolve_secret_id`]: a read failure is fatal for
+    /// the attempt but the refresh loop keeps retrying, so a token the kubelet
+    /// has not projected yet heals the source without a restart.
+    async fn resolve_jwt(&self) -> AttemptResult<SecretString> {
+        let mut raw = tokio::fs::read_to_string(&self.jwt_path)
+            .await
+            .map_err(|error| AttemptError {
+                class: ErrorClass::Fatal,
+                error: KmsError::configuration_error(format!(
+                    "Failed to read Kubernetes ServiceAccount token {}: {error}",
+                    self.jwt_path.display()
+                )),
+            })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            raw.zeroize();
+            return Err(AttemptError {
+                class: ErrorClass::Fatal,
+                error: KmsError::configuration_error(format!(
+                    "Kubernetes ServiceAccount token {} is empty",
+                    self.jwt_path.display()
+                )),
+            });
+        }
+        let jwt = SecretString::new(trimmed.to_string());
+        raw.zeroize();
+        Ok(jwt)
+    }
+}
+
+#[async_trait]
+impl TokenSource for KubernetesLogin {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
+        let jwt = self.resolve_jwt().await?;
+        let auth = vaultrs::auth::kubernetes::login(&self.login_client, &self.mount, &self.role, jwt.expose())
+            .await
+            .map_err(|error| attempt_error("Kubernetes login", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+
+    async fn renew(&self, client: &VaultClient) -> AttemptResult<TokenLease> {
+        let auth = vaultrs::token::renew_self(client, None)
+            .await
+            .map_err(|error| attempt_error("token renewal", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+}
+
+impl fmt::Debug for KubernetesLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The login client embeds Vault client settings and must stay out of
+        // Debug output; the role name is not a secret, and the JWT is never held.
+        f.debug_struct("KubernetesLogin")
+            .field("mount", &self.mount)
+            .field("role", &self.role)
+            .field("jwt_path", &self.jwt_path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Token source for [`VaultAuthMethod::TokenFile`]: reads an agent-managed
 /// token file (for example a Vault Agent auto-auth sink).
 ///
@@ -464,6 +555,9 @@ pub(crate) fn token_source_for(
             secret_id.clone(),
             secret_id_file.clone(),
         )?)),
+        VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } => Ok(Box::new(KubernetesLogin::new(settings, mount.clone(), role.clone(), jwt_path.clone())?)),
         VaultAuthMethod::TokenFile {
             path,
             poll_interval_secs,
@@ -548,6 +642,10 @@ impl VaultCredentialPolicy {
         let retry = RetryPolicy::for_credentials(config, backend, endpoint, namespace, "credentials-login");
         let safety_window = match auth_method {
             VaultAuthMethod::AppRole {
+                refresh_safety_window_secs: Some(secs),
+                ..
+            }
+            | VaultAuthMethod::Kubernetes {
                 refresh_safety_window_secs: Some(secs),
                 ..
             }
@@ -860,7 +958,7 @@ impl Drop for CredentialTaskHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::REDACTED_SECRET;
+    use crate::config::{DEFAULT_VAULT_KUBERNETES_MOUNT, REDACTED_SECRET};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     const TEST_TOKEN: &str = "vault-token-debug-leak-canary";
@@ -1055,6 +1153,66 @@ mod tests {
             .expect("approle auth must map to a login source");
 
         assert!(format!("{source:?}").contains("AppRoleLogin"));
+    }
+
+    #[tokio::test]
+    async fn test_kubernetes_auth_method_maps_to_login_source() {
+        let settings = test_settings();
+        let source = token_source_for(&VaultAuthMethod::kubernetes("rustfs".to_string()), &settings)
+            .expect("kubernetes auth must map to a login source");
+
+        assert!(format!("{source:?}").contains("KubernetesLogin"));
+    }
+
+    /// The projected token is read fresh per login attempt and trimmed, so a
+    /// kubelet rotation is picked up without a restart and a trailing newline
+    /// does not corrupt the assertion sent to Vault.
+    #[tokio::test]
+    async fn test_kubernetes_login_rereads_and_trims_the_service_account_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        tokio::fs::write(&path, "  first-jwt\n").await.expect("write token");
+
+        let login = KubernetesLogin::new(
+            &test_settings(),
+            DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(),
+            "rustfs".to_string(),
+            path.clone(),
+        )
+        .expect("login source must build");
+
+        assert_eq!(login.resolve_jwt().await.expect("first read").expose(), "first-jwt");
+
+        tokio::fs::write(&path, "rotated-jwt").await.expect("rotate token");
+        assert_eq!(
+            login.resolve_jwt().await.expect("second read").expose(),
+            "rotated-jwt",
+            "a rotated projected token must be picked up without a restart"
+        );
+    }
+
+    /// The ServiceAccount token is re-read per attempt, so an unreadable or
+    /// empty one fails that attempt without reaching Vault; the refresh loop
+    /// keeps retrying, which is what lets a late projection heal the source.
+    #[tokio::test]
+    async fn test_kubernetes_login_rejects_an_unusable_service_account_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent-token");
+        let empty = dir.path().join("empty-token");
+        tokio::fs::write(&empty, "  \n").await.expect("write empty token");
+
+        for (path, expected) in [(missing, "Failed to read"), (empty, "is empty")] {
+            let login =
+                KubernetesLogin::new(&test_settings(), DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(), "rustfs".to_string(), path)
+                    .expect("login source must build");
+
+            let error = login
+                .acquire()
+                .await
+                .expect_err("an unusable ServiceAccount token must fail the attempt");
+            assert!(matches!(error.class, ErrorClass::Fatal));
+            assert!(error.error.to_string().contains(expected), "got {}", error.error);
+        }
     }
 
     #[tokio::test(start_paused = true)]
