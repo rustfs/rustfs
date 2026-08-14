@@ -2028,14 +2028,17 @@ static RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT: std::sync::Mutex<Option<(Strin
 #[cfg(test)]
 type InlinePreparationHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
+type RenameDataPublicationHookKey = (PathBuf, String, String);
+#[cfg(test)]
 static INLINE_PREPARATION_BEFORE_BACKUP: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
 static INLINE_BEFORE_FILE_SYNC_ADMISSION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
-static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<RenameDataPublicationHookKey, InlinePreparationHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
 static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -2107,11 +2110,11 @@ fn set_inline_before_file_sync_admission(dst_path: &str, hook: impl FnOnce() + S
 }
 
 #[cfg(test)]
-fn set_rename_data_after_first_publication(dst_path: &str, hook: impl FnOnce() + Send + 'static) {
+fn set_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_path: &str, hook: impl FnOnce() + Send + 'static) {
     RENAME_DATA_AFTER_FIRST_PUBLICATION
         .lock()
         .expect("test publication hook lock should not be poisoned")
-        .insert(dst_path.to_string(), Box::new(hook));
+        .insert((root.to_path_buf(), dst_volume.to_string(), dst_path.to_string()), Box::new(hook));
 }
 
 #[cfg(test)]
@@ -2263,11 +2266,11 @@ fn run_inline_before_file_sync_admission(dst_path: &str) {
 }
 
 #[cfg(test)]
-fn run_rename_data_after_first_publication(dst_path: &str) {
+fn run_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_path: &str) {
     let hook = RENAME_DATA_AFTER_FIRST_PUBLICATION
         .lock()
         .expect("test publication hook lock should not be poisoned")
-        .remove(dst_path);
+        .remove(&(root.to_path_buf(), dst_volume.to_string(), dst_path.to_string()));
     if let Some(hook) = hook {
         hook();
     }
@@ -2364,9 +2367,6 @@ async fn remove_dst_base_before_commit(
 
 #[cfg(not(test))]
 fn run_inline_preparation_before_backup(_dst_path: &str) {}
-
-#[cfg(not(test))]
-fn run_rename_data_after_first_publication(_dst_path: &str) {}
 
 #[cfg(not(test))]
 fn should_fail_after_delete_data_staged(_path: &str) -> bool {
@@ -9016,8 +9016,9 @@ impl DiskAPI for LocalDisk {
                 .await?;
                 return Err(err);
             }
+            #[cfg(test)]
             if has_data_dir_path.is_some() {
-                run_rename_data_after_first_publication(dst_path);
+                run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
             }
 
             // Crash-consistency injection: hard power loss after the data dir
@@ -9450,7 +9451,8 @@ impl DiskAPI for LocalDisk {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
                 }
-                run_rename_data_after_first_publication(dst_path);
+                #[cfg(test)]
+                run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
                 if sync {
                     file_sync_admission = Some(
                         os::acquire_file_sync_admission(self.file_sync_permits.clone())
@@ -13147,7 +13149,7 @@ mod test {
         let replacement_staging_parent_for_hook = replacement_staging_parent.clone();
         let staged_metadata_for_hook = staged_metadata.clone();
         let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned until xl.meta commits");
             std::fs::rename(&staging_parent_for_hook, &replacement_staging_parent_for_hook)
@@ -13414,7 +13416,7 @@ mod test {
         let replacement_dir_for_hook = replacement_dir.clone();
         let staged_metadata_for_hook = staged_metadata.clone();
         let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned after publishing its rollback backup");
             std::fs::rename(&staged_metadata_for_hook, &replacement_staged_metadata_for_hook)
@@ -13780,7 +13782,7 @@ mod test {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             entered_tx.send(()).expect("signal first publication");
             release_rx.recv().expect("wait while delete_volume is blocked");
         });
@@ -14374,7 +14376,7 @@ mod test {
 
         let (published_tx, published_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             published_tx.send(()).expect("signal backup publication");
             release_rx.recv().expect("wait for lock-order assertion");
         });
