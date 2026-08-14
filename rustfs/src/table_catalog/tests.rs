@@ -2762,18 +2762,19 @@ async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
     let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
     let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
     let manifest_bytes = manifest_avro_bytes_with_status_and_partition_spec(&[(data_file, 0, 1)], 0);
+    let manifest_length = manifest_bytes.len();
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/list-10.avro",
-            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
+            manifest_list_avro_bytes(&[(manifest, manifest_length)]),
         )
         .await;
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/list-11.avro",
-            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len() + 1)]),
+            manifest_list_avro_bytes(&[(manifest, manifest_length + 1)]),
         )
         .await;
     backend
@@ -2817,7 +2818,7 @@ async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/list-11.avro",
-            manifest_list_avro_bytes_with_spec(&[(manifest, manifest_bytes.len())], 1),
+            manifest_list_avro_bytes_with_spec(&[(manifest, manifest_length)], 1),
         )
         .await;
     metadata["partition-specs"]
