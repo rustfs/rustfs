@@ -319,6 +319,41 @@ async fn get_object_reader_with_context(
     GetObjectReader::new_with_resolver(reader, range, object_info, opts, headers, ctx.object_encryption_resolver()).await
 }
 
+async fn get_legacy_object_reader_with_context<R>(
+    ctx: &InstanceContext,
+    reader: R,
+    terminal: tokio::sync::oneshot::Receiver<Result<()>>,
+    range: Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<(GetObjectReader, usize, i64)>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    // ReadPlan validates this size below; failure here only keeps the terminal
+    // guard inside the transform until that validation returns its typed error.
+    let full_plaintext_size = object_info.get_actual_size().ok();
+    let whole_object = opts.part_number.is_none()
+        && match (&range, full_plaintext_size) {
+            (None, _) => true,
+            (Some(range), Some(size)) => range
+                .get_offset_length(size)
+                .is_ok_and(|(offset, length)| offset == 0 && length == size),
+            (Some(_), None) => false,
+        };
+    let (source, terminal): (Box<dyn AsyncRead + Unpin + Send + Sync>, _) = if whole_object {
+        (Box::new(reader), Some(terminal))
+    } else {
+        (Box::new(LegacyDuplexProducerReader::new(reader, terminal)), None)
+    };
+    let (mut reader, offset, length) = get_object_reader_with_context(ctx, source, range, object_info, opts, headers).await?;
+    if let Some(terminal) = terminal {
+        reader.stream = Box::new(LegacyDuplexProducerReader::new(reader.stream, terminal));
+    }
+    Ok((reader, offset, length))
+}
+
 fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
     range.is_none()
         && opts.part_number.is_none()
@@ -1094,9 +1129,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
         let (producer_terminal_tx, producer_terminal_rx) = tokio::sync::oneshot::channel();
-        let rd = LegacyDuplexProducerReader::new(rd, producer_terminal_rx);
         let (mut reader, offset, length) =
-            get_object_reader_with_context(&self.ctx, Box::new(rd), range, &object_info, opts, &h).await?;
+            get_legacy_object_reader_with_context(&self.ctx, rd, producer_terminal_rx, range, &object_info, opts, &h).await?;
         // Carry the hook probe result so the app layer skips its now-redundant
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
@@ -2322,7 +2356,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
 }
 
 struct LegacyDuplexProducerReader<R> {
-    inner: R,
+    inner: Option<R>,
     terminal: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
     inner_eof: bool,
 }
@@ -2330,7 +2364,7 @@ struct LegacyDuplexProducerReader<R> {
 impl<R> LegacyDuplexProducerReader<R> {
     fn new(inner: R, terminal: tokio::sync::oneshot::Receiver<Result<()>>) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             terminal: Some(terminal),
             inner_eof: false,
         }
@@ -2339,15 +2373,23 @@ impl<R> LegacyDuplexProducerReader<R> {
 
 impl<R: AsyncRead + Unpin> AsyncRead for LegacyDuplexProducerReader<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if !self.inner_eof {
             let before = buf.filled().len();
-            match Pin::new(&mut self.inner).poll_read(cx, buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Ready(Ok(())) if buf.filled().len() > before => return Poll::Ready(Ok(())),
-                Poll::Ready(Ok(())) => {
-                    self.inner_eof = true;
+            if let Some(inner) = self.inner.as_mut() {
+                match Pin::new(inner).poll_read(cx, buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) if buf.filled().len() > before => return Poll::Ready(Ok(())),
+                    Poll::Ready(Ok(())) => {
+                        self.inner_eof = true;
+                        self.inner = None;
+                    }
                 }
+            } else {
+                self.inner_eof = true;
             }
         }
 
@@ -2375,13 +2417,42 @@ impl<R: AsyncRead + Unpin> AsyncRead for LegacyDuplexProducerReader<R> {
 #[cfg(test)]
 mod legacy_duplex_producer_reader_tests {
     use super::*;
+    use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionMode};
+    use rustfs_utils::CompressionAlgorithm;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_DUPLEX_CAPACITY: usize = 64 * 1024;
 
     fn storage_error_source(error: &std::io::Error) -> &StorageError {
         error
             .get_ref()
             .and_then(|source| source.downcast_ref::<StorageError>())
             .expect("legacy duplex terminal error should retain StorageError source")
+    }
+
+    async fn compressed_fixture(plaintext: Vec<u8>, recorded_size: usize) -> (Vec<u8>, ObjectInfo) {
+        let mut compressor = rustfs_rio::CompressReader::new(std::io::Cursor::new(plaintext), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        compressor
+            .read_to_end(&mut compressed)
+            .await
+            .expect("compress test plaintext");
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            CompressionAlgorithm::default().to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, recorded_size.to_string());
+        let object_info = ObjectInfo {
+            size: i64::try_from(compressed.len()).expect("compressed fixture length should fit in i64"),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        (compressed, object_info)
     }
 
     #[tokio::test]
@@ -2403,6 +2474,36 @@ mod legacy_duplex_producer_reader_tests {
             .expect("clean producer completion should surface clean EOF");
 
         assert_eq!(out, b"complete");
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_ignores_zero_capacity_read_buf() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"body").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::FileCorrupt))
+            .expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut empty = [];
+        std::future::poll_fn(|cx| {
+            let mut read_buf = ReadBuf::new(&mut empty);
+            Pin::new(&mut reader).poll_read(cx, &mut read_buf)
+        })
+        .await
+        .expect("zero-capacity reads should complete without observing EOF or terminal state");
+        assert!(!reader.inner_eof);
+        assert!(reader.terminal.is_some());
+
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("subsequent reads must still receive data and the terminal error");
+        assert_eq!(out, b"body");
+        assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
     }
 
     #[tokio::test]
@@ -2452,6 +2553,200 @@ mod legacy_duplex_producer_reader_tests {
         assert!(
             matches!(storage_error_source(&err), StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::ConnectionReset)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_compressed_reader_surfaces_terminal_error_after_complete_plaintext() {
+        let plaintext = b"compressed terminal result must survive the plaintext limit".repeat(16);
+        let (compressed, object_info) = compressed_fixture(plaintext.clone(), plaintext.len()).await;
+        let full_range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: i64::try_from(plaintext.len()).expect("plaintext fixture length should fit in i64") - 1,
+        };
+        for range in [None, Some(full_range)] {
+            let (mut writer, reader) = tokio::io::duplex(compressed.len().max(1));
+            writer
+                .write_all(&compressed)
+                .await
+                .expect("compressed body should fit in duplex buffer");
+            drop(writer);
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            terminal_tx
+                .send(Err(StorageError::FileCorrupt))
+                .expect("terminal receiver should remain installed");
+
+            let (mut reader, _, _) = get_legacy_object_reader_with_context(
+                &InstanceContext::new(),
+                reader,
+                terminal_rx,
+                range,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("compressed read plan should build");
+            let mut out = Vec::new();
+            let err = reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("terminal error after complete decompression must not become clean EOF");
+
+            assert_eq!(out, plaintext);
+            assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_reader_rejects_extra_data_without_backpressure_deadlock() {
+        let payload = vec![0x5a; TEST_DUPLEX_CAPACITY * 2];
+        let (mut writer, reader) = tokio::io::duplex(TEST_DUPLEX_CAPACITY);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let result = writer.write_all(&payload).await;
+            drop(writer);
+            let terminal_result = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| StorageError::Io(std::io::Error::new(err.kind(), err.to_string())));
+            let _ = terminal_tx.send(terminal_result);
+            result
+        });
+        let reader = crate::io_support::rio::HardLimitReader::new(reader, 1);
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+
+        let mut out = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_to_end(&mut out))
+            .await
+            .expect("extra data beyond the declared size must not deadlock")
+            .expect_err("extra data beyond the declared size must fail closed");
+        assert_eq!(out, [0x5a]);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+            .await
+            .expect("producer must unblock after the read fails")
+            .expect("producer task should not panic");
+    }
+
+    #[tokio::test]
+    async fn legacy_terminal_reader_releases_unconsumed_source_before_waiting() {
+        let payload = vec![0x5a; TEST_DUPLEX_CAPACITY * 2];
+        let (mut writer, reader) = tokio::io::duplex(TEST_DUPLEX_CAPACITY);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let result = writer.write_all(&payload).await;
+            drop(writer);
+            let terminal_result = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| StorageError::Io(std::io::Error::new(err.kind(), err.to_string())));
+            let _ = terminal_tx.send(terminal_result);
+            result
+        });
+        let reader = rustfs_rio::LimitReader::new(reader, 1);
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+
+        let mut out = Vec::new();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_to_end(&mut out))
+            .await
+            .expect("terminal wait must not deadlock behind unconsumed source data")
+            .expect_err("unconsumed source data must fail the producer terminal result");
+        assert_eq!(out, [0x5a]);
+        assert!(
+            matches!(storage_error_source(&err), StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        producer
+            .await
+            .expect("producer task should not panic")
+            .expect_err("source should close early");
+    }
+
+    struct FixedEncryptionResolver {
+        key_bytes: [u8; 32],
+        base_nonce: [u8; 12],
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for FixedEncryptionResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: crate::object_api::ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            Ok(Some(ReadEncryptionMaterial {
+                key_bytes: self.key_bytes,
+                mode: ReadEncryptionMode::Direct {
+                    base_nonce: self.base_nonce,
+                },
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_encrypted_reader_surfaces_terminal_error_after_complete_plaintext() {
+        let plaintext = b"encrypted terminal result must survive the plaintext limit".repeat(16);
+        let key_bytes = [0x31; 32];
+        let base_nonce = [0x42; 12];
+        let mut encryptor = rustfs_rio::EncryptReader::new(std::io::Cursor::new(plaintext.clone()), key_bytes, base_nonce);
+        let mut encrypted = Vec::new();
+        encryptor.read_to_end(&mut encrypted).await.expect("encrypt test plaintext");
+
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "encrypted-object".to_string(),
+            size: i64::try_from(encrypted.len()).expect("encrypted fixture length should fit in i64"),
+            user_defined: Arc::new(HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let ctx = InstanceContext::new();
+        assert!(
+            ctx.set_object_encryption_resolver(Arc::new(FixedEncryptionResolver { key_bytes, base_nonce }))
+                .is_ok(),
+            "fresh context should accept resolver"
+        );
+        let full_range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: i64::try_from(plaintext.len()).expect("plaintext fixture length should fit in i64") - 1,
+        };
+        for range in [None, Some(full_range)] {
+            let (mut writer, reader) = tokio::io::duplex(encrypted.len().max(1));
+            writer
+                .write_all(&encrypted)
+                .await
+                .expect("encrypted body should fit in duplex buffer");
+            drop(writer);
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            terminal_tx
+                .send(Err(StorageError::FileCorrupt))
+                .expect("terminal receiver should remain installed");
+
+            let (mut reader, _, _) = get_legacy_object_reader_with_context(
+                &ctx,
+                reader,
+                terminal_rx,
+                range,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("encrypted read plan should build");
+            let mut out = Vec::new();
+            let err = reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("terminal error after complete decryption must not become clean EOF");
+
+            assert_eq!(out, plaintext);
+            assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+        }
     }
 
     #[tokio::test]
