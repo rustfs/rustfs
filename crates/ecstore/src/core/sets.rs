@@ -19,7 +19,6 @@ use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
@@ -62,11 +61,6 @@ use tokio::time::Duration;
 use tracing::warn;
 use tracing::{error, info};
 use uuid::Uuid;
-
-type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
-type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
-type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
