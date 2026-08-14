@@ -6014,6 +6014,63 @@ fn peer_edit_fence(queries: &HashMap<String, String>) -> Option<(String, u64)> {
     Some((origin.clone(), generation))
 }
 
+/// The largest generation an incoming fence may carry: this site's clock in
+/// unix nanoseconds plus a day of cross-site skew. Every site authenticates
+/// peer traffic with the shared site-replicator service account, so the
+/// receiver cannot tell WHICH site stamped a fence — a compromised peer can
+/// claim any origin, and a u64::MAX-scale generation would raise that
+/// origin's high-water mark past anything the genuine site ever allocates,
+/// silently fencing out its every future edit. A genuine generation is the
+/// hybrid clock of [`next_peer_edit_generation`], floored by the sender's
+/// wall time, so it exceeds this site's clock only by cross-site skew — and
+/// the mark a ceiling-level forgery can still plant decays as real time
+/// passes it, within the allowance. Only an origin still allocating with the
+/// pre-hybrid plain counter cannot outrun such a mark until it upgrades: its
+/// genuine generations never approach nanosecond scale.
+fn peer_edit_fence_generation_ceiling(now_unix_nanos: u64) -> u64 {
+    const CROSS_SITE_SKEW_ALLOWANCE_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+    now_unix_nanos.saturating_add(CROSS_SITE_SKEW_ALLOWANCE_NANOS)
+}
+
+/// Whether an incoming fence may be honoured, as far as this site can vouch
+/// for it. The sender's identity is unverifiable (shared service account),
+/// so the check runs over what the receiving state knows: the claimed origin
+/// must be a site this state currently replicates with — the same membership
+/// rule the load-time mark pruning applies, so every mark recorded behind
+/// this check is one a reload would keep — and not this site itself, which
+/// never delivers edits to itself; and the generation must sit under
+/// [`peer_edit_fence_generation_ceiling`]. The caller IGNORES an
+/// inadmissible fence rather than failing the request: the delivery applies
+/// exactly as an unstamped (pre-fence) delivery would, no high-water mark is
+/// read or written, and the worst a forged fence achieves is forfeiting an
+/// ordering guarantee its sender was never owed.
+fn peer_edit_fence_is_admissible(
+    state: &SiteReplicationState,
+    local_deployment_id: &str,
+    fence: &(String, u64),
+    generation_ceiling: u64,
+) -> bool {
+    let (origin, generation) = fence;
+    let result = if origin == local_deployment_id || !state.peers.contains_key(origin) {
+        "fence_origin_not_a_remote_peer"
+    } else if *generation > generation_ceiling {
+        "fence_generation_beyond_ceiling"
+    } else {
+        return true;
+    };
+    warn!(
+        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+        result,
+        origin = %origin,
+        generation = *generation,
+        generation_ceiling,
+        "ignoring inadmissible peer-edit fence"
+    );
+    false
+}
+
 /// True when a strictly newer edit from the same origin site already landed
 /// here. No lock on the sending side can order deliveries issued by two
 /// nodes of that site, so ordering is decided here, on the generation the
@@ -9559,6 +9616,7 @@ impl Operation for SRPeerEditHandler {
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
         let commit_fence = peer_edit_fence(&queries);
+        let fence_generation_ceiling = peer_edit_fence_generation_ceiling(edit_generation_wall_clock());
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let (refresh_id, incoming) = if endpoint_refresh_requested {
             let refresh: EndpointRefreshRequest = read_site_replication_json(req, "", false).await?;
@@ -9576,6 +9634,11 @@ impl Operation for SRPeerEditHandler {
         let outcome = update_site_replication_state_when_changed(move |state| {
             let mut incoming = incoming;
             let local_peer = local_peer_at_endpoint(commit_endpoint, state);
+            // The fence is self-reported — the shared service account means
+            // the sender cannot be identified — so it is honoured only after
+            // the admissibility check, against the same state it will gate.
+            let commit_fence = commit_fence
+                .filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence, fence_generation_ceiling));
             // Ordering fence: the sending site allocates the generation under
             // its state-object lock, so a delivery that lost the race carries
             // a generation this site has already passed. Applying it would
@@ -11957,6 +12020,17 @@ mod tests {
             handler_block.contains("record_applied_peer_edit_generation(state, origin, *generation);"),
             "SRPeerEditHandler must record the applied generation so later stale deliveries are recognised"
         );
+        // Fence hardening: origin and generation are self-reported by a
+        // caller the shared service account cannot identify, so the handler
+        // must pass the fence through the admissibility check — against the
+        // same state the fence gates, i.e. inside the transaction — before
+        // reading or raising any high-water mark.
+        assert!(
+            handler_block.contains(
+                ".filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence, fence_generation_ceiling))"
+            ),
+            "SRPeerEditHandler must admit a fence only through peer_edit_fence_is_admissible inside the state transaction"
+        );
         // P1-15 PR2: both halves of the fence and the edit they fence share
         // ONE transaction. Checking the fence against a state read outside the
         // lock would let the check pass on one snapshot and the write land on
@@ -13249,6 +13323,94 @@ mod tests {
             state.peers
         );
         assert!(peer_edit_delivery_is_stale(&state, origin, generation - 1));
+    }
+
+    /// A fence is self-reported: every site authenticates peer traffic with
+    /// the same site-replicator credential, so a compromised peer can stamp
+    /// ANY origin with ANY generation. The receiver must refuse to let such
+    /// a stamp touch the high-water marks — an origin it does not replicate
+    /// with, its own deployment id, and a generation no genuine counter
+    /// could have reached are all ignored, and ignoring one plants no mark.
+    #[test]
+    fn forged_peer_edit_fences_cannot_poison_the_high_water_marks() {
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([
+                (
+                    "site-local".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-local".to_string(),
+                        ..peer("local", "https://local.example:9000")
+                    },
+                ),
+                (
+                    "site-victim".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-victim".to_string(),
+                        ..peer("victim", "https://victim.example:9000")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let ceiling = peer_edit_fence_generation_ceiling(edit_generation_wall_clock());
+
+        // An origin outside the current membership is refused outright...
+        let unknown = ("site-unknown".to_string(), 4u64);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &unknown, ceiling));
+
+        // No site delivers edits to itself: a fence claiming the receiver as
+        // its origin is forged by construction, current peer or not.
+        let own = ("site-local".to_string(), 4u64);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &own, ceiling));
+
+        // A generation past the ceiling (the u64::MAX poisoning) is refused
+        // even when it names a current peer.
+        let poisoned = ("site-victim".to_string(), u64::MAX);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &poisoned, ceiling));
+        let barely_over = ("site-victim".to_string(), ceiling + 1);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &barely_over, ceiling));
+
+        // With no mark planted, the victim's genuine deliveries keep
+        // applying, and its admitted fence works end to end.
+        let genuine = ("site-victim".to_string(), 1u64);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &genuine, ceiling));
+        assert!(!peer_edit_delivery_is_stale(&state, &genuine.0, genuine.1));
+        record_applied_peer_edit_generation(&mut state, &genuine.0, genuine.1);
+        assert_eq!(state.applied_edit_generations.get("site-victim"), Some(&1));
+    }
+
+    /// The generation ceiling must admit both live generation shapes: the
+    /// small plain counter pre-hybrid sites still allocate, and the
+    /// wall-clock-floored hybrid of `next_peer_edit_generation` — including
+    /// one running AHEAD of the receiver's clock by cross-site skew, which
+    /// is the whole reason the allowance exists, and the ceiling itself,
+    /// the last admissible value.
+    #[test]
+    fn peer_edit_fence_ceiling_admits_counter_and_clock_seeded_generations() {
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([(
+                "site-origin".to_string(),
+                PeerInfo {
+                    deployment_id: "site-origin".to_string(),
+                    ..peer("origin", "https://origin.example:9000")
+                },
+            )]),
+            ..Default::default()
+        };
+        let now = edit_generation_wall_clock();
+        let ceiling = peer_edit_fence_generation_ceiling(now);
+
+        let counter = ("site-origin".to_string(), 42u64);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &counter, ceiling));
+
+        // One hour ahead of the receiver's clock: within the skew allowance.
+        // Shrinking the allowance to zero must turn this fence away.
+        let clock_ahead = ("site-origin".to_string(), now + 60 * 60 * 1_000_000_000);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &clock_ahead, ceiling));
+
+        // The boundary is inclusive: rejection starts strictly past it.
+        let at_ceiling = ("site-origin".to_string(), ceiling);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &at_ceiling, ceiling));
     }
 
     /// P1-15 review follow-up: a site that leaves the mesh drops below two
