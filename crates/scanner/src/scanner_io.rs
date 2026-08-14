@@ -4262,6 +4262,7 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("bucket should be removed from the first pool only");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
