@@ -348,9 +348,99 @@ pub(crate) fn table_metadata_format_version(metadata: &serde_json::Value) -> Tab
     Ok(version)
 }
 
+fn normalize_v1_table_metadata_update_fields(metadata: &mut serde_json::Value) -> TableCatalogStoreResult<()> {
+    if metadata.get("schemas").is_none() {
+        let mut schema = metadata
+            .get("schema")
+            .cloned()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 table metadata is missing schema".to_string()))?;
+        schema
+            .as_object_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 schema must be an object".to_string()))?
+            .entry("schema-id".to_string())
+            .or_insert_with(|| serde_json::Value::from(0));
+        let schema_id = schema
+            .get("schema-id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 schema-id must be an integer".to_string()))?;
+        let object = metadata_object_mut(metadata)?;
+        object.insert("schemas".to_string(), serde_json::json!([schema]));
+        object.insert("current-schema-id".to_string(), serde_json::Value::from(schema_id));
+    } else if metadata.get("current-schema-id").is_none() {
+        let schema_id = metadata
+            .get("schema")
+            .and_then(|schema| schema.get("schema-id"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if !require_metadata_array(metadata, "schemas")?
+            .iter()
+            .any(|schema| schema.get("schema-id").and_then(serde_json::Value::as_i64) == Some(schema_id))
+        {
+            return Err(TableCatalogStoreError::Invalid("Iceberg v1 current schema does not exist".to_string()));
+        }
+        metadata_object_mut(metadata)?.insert("current-schema-id".to_string(), serde_json::Value::from(schema_id));
+    }
+
+    if metadata.get("partition-specs").is_none() {
+        let mut fields = metadata
+            .get("partition-spec")
+            .cloned()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 table metadata is missing partition-spec".to_string()))?;
+        let fields = fields
+            .as_array_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 partition-spec must be an array".to_string()))?;
+        for (index, field) in fields.iter_mut().enumerate() {
+            let field_id = i32::try_from(index)
+                .ok()
+                .and_then(|index| 1000_i32.checked_add(index))
+                .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 partition spec has too many fields".to_string()))?;
+            field
+                .as_object_mut()
+                .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 partition spec fields must be objects".to_string()))?
+                .entry("field-id".to_string())
+                .or_insert_with(|| serde_json::Value::from(field_id));
+        }
+        let object = metadata_object_mut(metadata)?;
+        object.insert("partition-specs".to_string(), serde_json::json!([{"spec-id": 0, "fields": fields}]));
+        object.insert("default-spec-id".to_string(), serde_json::Value::from(0));
+    } else if metadata.get("default-spec-id").is_none() {
+        let default_spec_id = require_metadata_array(metadata, "partition-specs")?
+            .last()
+            .and_then(|spec| spec.get("spec-id"))
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 default partition spec does not exist".to_string()))?;
+        metadata_object_mut(metadata)?.insert("default-spec-id".to_string(), serde_json::Value::from(default_spec_id));
+    }
+
+    if metadata.get("sort-orders").is_none() {
+        let object = metadata_object_mut(metadata)?;
+        object.insert("sort-orders".to_string(), serde_json::json!([{"order-id": 0, "fields": []}]));
+        object.insert("default-sort-order-id".to_string(), serde_json::Value::from(0));
+    } else if metadata.get("default-sort-order-id").is_none() {
+        let default_sort_order_id = require_metadata_array(metadata, "sort-orders")?
+            .last()
+            .and_then(|order| order.get("order-id"))
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 default sort order does not exist".to_string()))?;
+        metadata_object_mut(metadata)?
+            .insert("default-sort-order-id".to_string(), serde_json::Value::from(default_sort_order_id));
+    }
+
+    if metadata.get("last-partition-id").is_none() {
+        let last_partition_id = require_metadata_array(metadata, "partition-specs")?
+            .iter()
+            .map(max_partition_field_id)
+            .max()
+            .unwrap_or(999);
+        metadata_object_mut(metadata)?.insert("last-partition-id".to_string(), serde_json::Value::from(last_partition_id));
+    }
+    Ok(())
+}
+
 pub(crate) fn synchronize_table_metadata_version_fields(metadata: &mut serde_json::Value) -> TableCatalogStoreResult<()> {
     match table_metadata_format_version(metadata)? {
         1 => {
+            normalize_v1_table_metadata_update_fields(metadata)?;
             if let Some(schemas) = metadata.get("schemas").and_then(serde_json::Value::as_array)
                 && !schemas.is_empty()
             {
@@ -1015,6 +1105,7 @@ fn validate_supported_table_metadata_fields(metadata: &serde_json::Value) -> Tab
 pub(crate) fn validate_table_metadata_references(metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
     let format_version = table_metadata_format_version(metadata)?;
     let schema_fields = validate_table_schemas(metadata, format_version)?;
+    let current_schema_fields = current_table_schema_fields(metadata, format_version)?;
     let last_column_id = require_metadata_i32(metadata, "last-column-id")?;
     if last_column_id < 0
         || schema_fields
@@ -1049,10 +1140,10 @@ pub(crate) fn validate_table_metadata_references(metadata: &serde_json::Value) -
         schema_ids.insert(schema_id);
     }
     validate_metadata_id_reference(metadata, "current-schema-id", &schema_ids, "schema")?;
-    validate_partition_specs(metadata, format_version, &schema_fields)?;
+    validate_partition_specs(metadata, format_version, &schema_fields, &current_schema_fields)?;
     let spec_ids = metadata_array_i32_ids(metadata, "partition-specs", "spec-id", "partition spec")?;
     validate_metadata_id_reference(metadata, "default-spec-id", &spec_ids, "partition spec")?;
-    validate_sort_orders(metadata, &schema_fields)?;
+    validate_sort_orders(metadata, &schema_fields, &current_schema_fields)?;
     let sort_order_ids = metadata_array_i32_ids(metadata, "sort-orders", "order-id", "sort order")?;
     validate_metadata_id_reference(metadata, "default-sort-order-id", &sort_order_ids, "sort order")?;
     let snapshot_ids = metadata_array_ids(metadata, "snapshots", "snapshot-id", "snapshot")?;
@@ -1173,6 +1264,93 @@ fn validate_table_schemas(metadata: &serde_json::Value, format_version: u16) -> 
         all_fields.descriptors.extend(schema_fields.descriptors);
     }
     Ok(all_fields)
+}
+
+fn current_table_schema_fields(
+    metadata: &serde_json::Value,
+    format_version: u16,
+) -> TableCatalogStoreResult<IcebergSchemaFields> {
+    if metadata.get("schemas").is_some() {
+        let current_schema_id = require_metadata_i32(metadata, "current-schema-id")?;
+        let schema = require_metadata_array(metadata, "schemas")?
+            .iter()
+            .find(|schema| schema.get("schema-id").and_then(serde_json::Value::as_i64) == Some(i64::from(current_schema_id)))
+            .ok_or_else(|| {
+                TableCatalogStoreError::Invalid(format!(
+                    "current-schema-id targets schema {current_schema_id}, which does not exist"
+                ))
+            })?;
+        return validate_iceberg_schema_fields(schema, "current schema");
+    }
+    if format_version == 1 {
+        let schema = metadata
+            .get("schema")
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Iceberg v1 table metadata is missing schema".to_string()))?;
+        return validate_iceberg_schema_fields(schema, "schema");
+    }
+    Err(TableCatalogStoreError::Invalid("schemas must be an array".to_string()))
+}
+
+pub(crate) fn validate_partition_spec_sources_against_current_schema(
+    metadata: &serde_json::Value,
+    spec: &serde_json::Value,
+) -> TableCatalogStoreResult<()> {
+    let current_schema_fields = current_table_schema_fields(metadata, table_metadata_format_version(metadata)?)?;
+    let fields = spec
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("partition spec fields must be an array".to_string()))?;
+    for field in fields {
+        let field = field
+            .as_object()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("partition spec fields must be JSON objects".to_string()))?;
+        let source_id = required_positive_i32_value(field, "source-id", "partition source-id")?;
+        let transform = field
+            .get("transform")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| TableCatalogStoreError::Invalid("partition field transform must be a non-empty string".to_string()))?;
+        if transform == "void" {
+            continue;
+        }
+        let source_type = current_schema_fields.descriptors.get(&source_id).ok_or_else(|| {
+            TableCatalogStoreError::Invalid(format!("partition source-id {source_id} does not reference the current schema"))
+        })?;
+        if source_type.inside_collection {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "partition source-id {source_id} must not be nested in a list or map"
+            )));
+        }
+        validate_transform_for_source(transform, source_type, "partition field")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_sort_order_sources_against_current_schema(
+    metadata: &serde_json::Value,
+    sort_order: &serde_json::Value,
+) -> TableCatalogStoreResult<()> {
+    let current_schema_fields = current_table_schema_fields(metadata, table_metadata_format_version(metadata)?)?;
+    let fields = sort_order
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("sort order fields must be an array".to_string()))?;
+    for field in fields {
+        let field = field
+            .as_object()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("sort order fields must be JSON objects".to_string()))?;
+        let source_id = required_positive_i32_value(field, "source-id", "sort field source-id")?;
+        let source_type = current_schema_fields.descriptors.get(&source_id).ok_or_else(|| {
+            TableCatalogStoreError::Invalid(format!("sort field source-id {source_id} does not reference the current schema"))
+        })?;
+        let transform = field
+            .get("transform")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| TableCatalogStoreError::Invalid("sort field transform must be a non-empty string".to_string()))?;
+        validate_transform_for_source(transform, source_type, "sort field")?;
+    }
+    Ok(())
 }
 
 fn validate_iceberg_schema(schema: &serde_json::Value, label: &str) -> TableCatalogStoreResult<BTreeSet<i32>> {
@@ -1495,9 +1673,10 @@ fn validate_partition_specs(
     metadata: &serde_json::Value,
     format_version: u16,
     schema_fields: &IcebergSchemaFields,
+    current_schema_fields: &IcebergSchemaFields,
 ) -> TableCatalogStoreResult<()> {
     let spec_fields = if format_version == 1 {
-        vec![require_metadata_array(metadata, "partition-spec")?]
+        vec![(0, require_metadata_array(metadata, "partition-spec")?)]
     } else {
         metadata
             .get("partition-specs")
@@ -1505,11 +1684,24 @@ fn validate_partition_specs(
             .ok_or_else(|| TableCatalogStoreError::Invalid("partition-specs must be an array".to_string()))?
             .iter()
             .map(|spec| {
-                spec.get("fields")
+                let spec_id = required_i32_value(
+                    spec.as_object()
+                        .ok_or_else(|| TableCatalogStoreError::Invalid("partition specs must be JSON objects".to_string()))?,
+                    "spec-id",
+                    "partition spec-id",
+                )?;
+                let fields = spec
+                    .get("fields")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| TableCatalogStoreError::Invalid("partition spec fields must be an array".to_string()))
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("partition spec fields must be an array".to_string()))?;
+                Ok((spec_id, fields))
             })
             .collect::<TableCatalogStoreResult<Vec<_>>>()?
+    };
+    let default_spec_id = if format_version == 1 {
+        Some(0)
+    } else {
+        Some(require_metadata_i32(metadata, "default-spec-id")?)
     };
     let last_partition_id = (format_version != 1)
         .then(|| require_metadata_i32(metadata, "last-partition-id"))
@@ -1518,21 +1710,38 @@ fn validate_partition_specs(
         return Err(TableCatalogStoreError::Invalid("last-partition-id must not be negative".to_string()));
     }
     let mut assigned_fields = BTreeMap::new();
-    for fields in spec_fields {
+    for (spec_id, fields) in spec_fields {
         let mut field_ids = BTreeSet::new();
         for (field_index, field) in fields.iter().enumerate() {
             let field = field
                 .as_object()
                 .ok_or_else(|| TableCatalogStoreError::Invalid("partition spec fields must be JSON objects".to_string()))?;
             let source_id = required_positive_i32_value(field, "source-id", "partition source-id")?;
-            let source_type = schema_fields.descriptors.get(&source_id).ok_or_else(|| {
-                TableCatalogStoreError::Invalid(format!("partition source-id {source_id} does not reference a schema field"))
-            })?;
-            if source_type.inside_collection {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "partition source-id {source_id} must not be nested in a list or map"
-                )));
-            }
+            let transform = field
+                .get("transform")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Invalid("partition field transform must be a non-empty string".to_string())
+                })?;
+            let source_fields = if default_spec_id == Some(spec_id) {
+                current_schema_fields
+            } else {
+                schema_fields
+            };
+            let source_type = if transform == "void" {
+                None
+            } else {
+                let source_type = source_fields.descriptors.get(&source_id).ok_or_else(|| {
+                    TableCatalogStoreError::Invalid(format!("partition source-id {source_id} does not reference a schema field"))
+                })?;
+                if source_type.inside_collection {
+                    return Err(TableCatalogStoreError::Invalid(format!(
+                        "partition source-id {source_id} must not be nested in a list or map"
+                    )));
+                }
+                Some(source_type)
+            };
             let field_id = if format_version == 1 {
                 let expected_field_id = i32::try_from(field_index)
                     .ok()
@@ -1569,14 +1778,9 @@ fn validate_partition_specs(
                     "partition field name must be a non-empty string".to_string(),
                 ));
             }
-            let transform = field
-                .get("transform")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    TableCatalogStoreError::Invalid("partition field transform must be a non-empty string".to_string())
-                })?;
-            validate_transform_for_source(transform, source_type, "partition field")?;
+            if let Some(source_type) = source_type {
+                validate_transform_for_source(transform, source_type, "partition field")?;
+            }
             let identity = (source_id, transform);
             if format_version != 1
                 && let Some(previous) = assigned_fields.insert(field_id, identity)
@@ -1591,13 +1795,18 @@ fn validate_partition_specs(
     Ok(())
 }
 
-fn validate_sort_orders(metadata: &serde_json::Value, schema_fields: &IcebergSchemaFields) -> TableCatalogStoreResult<()> {
+fn validate_sort_orders(
+    metadata: &serde_json::Value,
+    schema_fields: &IcebergSchemaFields,
+    current_schema_fields: &IcebergSchemaFields,
+) -> TableCatalogStoreResult<()> {
     let Some(sort_orders) = metadata.get("sort-orders") else {
         return Ok(());
     };
     let sort_orders = sort_orders
         .as_array()
         .ok_or_else(|| TableCatalogStoreError::Invalid("sort-orders must be an array".to_string()))?;
+    let default_sort_order_id = metadata.get("default-sort-order-id").and_then(serde_json::Value::as_i64);
     for sort_order in sort_orders {
         let sort_order = sort_order
             .as_object()
@@ -1625,7 +1834,12 @@ fn validate_sort_orders(metadata: &serde_json::Value, schema_fields: &IcebergSch
                 .as_object()
                 .ok_or_else(|| TableCatalogStoreError::Invalid("sort order fields must be JSON objects".to_string()))?;
             let source_id = required_positive_i32_value(field, "source-id", "sort field source-id")?;
-            let source_type = schema_fields.descriptors.get(&source_id).ok_or_else(|| {
+            let source_fields = if default_sort_order_id == Some(i64::from(order_id)) {
+                current_schema_fields
+            } else {
+                schema_fields
+            };
+            let source_type = source_fields.descriptors.get(&source_id).ok_or_else(|| {
                 TableCatalogStoreError::Invalid(format!("sort field source-id {source_id} does not reference a schema field"))
             })?;
             let transform = field
@@ -2116,8 +2330,15 @@ struct SnapshotGraphReadBudget {
     decoded_avro_bytes: usize,
     file_reference_count: usize,
     manifest_lists: BTreeMap<String, Arc<Vec<SnapshotGraphManifestLocation>>>,
-    manifests: BTreeMap<String, Arc<Vec<ManifestDataFileReference>>>,
+    manifests: BTreeMap<String, CachedSnapshotGraphManifest>,
     validated_live_objects: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct CachedSnapshotGraphManifest {
+    object_size: usize,
+    partition_spec_id: Option<i32>,
+    references: Arc<Vec<ManifestDataFileReference>>,
 }
 
 impl SnapshotGraphReadBudget {
@@ -2569,8 +2790,8 @@ where
             &manifest_location.manifest_path,
             TableMetadataMaintenanceObjectKind::ManifestFile,
         )?;
-        let references = if let Some(references) = budget.manifests.get(&manifest_key) {
-            Arc::clone(references)
+        let cached_manifest = if let Some(manifest) = budget.manifests.get(&manifest_key) {
+            manifest.clone()
         } else {
             budget.charge_manifests(1)?;
             let manifest_object = context
@@ -2579,30 +2800,35 @@ where
                 .await?
                 .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot manifest object is missing".to_string()))?;
             let manifest_size = manifest_object.data.len();
-            if manifest_location
-                .manifest_length
-                .is_some_and(|declared| u64::try_from(manifest_size).ok() != Some(declared))
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "manifest-list manifest_length does not match the manifest object".to_string(),
-                ));
-            }
             budget.charge_avro_bytes(manifest_size)?;
             let decoded_manifest = decode_manifest_avro_async(manifest_object.data).await?;
-            if manifest_location.from_manifest_list
-                && decoded_manifest
-                    .partition_spec_id
-                    .is_some_and(|manifest_spec_id| Some(manifest_spec_id) != manifest_location.partition_spec_id)
-            {
-                return Err(TableCatalogStoreError::Invalid(
-                    "manifest partition-spec-id does not match its manifest-list entry".to_string(),
-                ));
-            }
             budget.charge_decoded_avro_bytes(decoded_manifest.decoded_size)?;
-            let references = Arc::new(decoded_manifest.references);
-            budget.manifests.insert(manifest_key, Arc::clone(&references));
-            references
+            let manifest = CachedSnapshotGraphManifest {
+                object_size: manifest_size,
+                partition_spec_id: decoded_manifest.partition_spec_id,
+                references: Arc::new(decoded_manifest.references),
+            };
+            budget.manifests.insert(manifest_key, manifest.clone());
+            manifest
         };
+        if manifest_location
+            .manifest_length
+            .is_some_and(|declared| u64::try_from(cached_manifest.object_size).ok() != Some(declared))
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "manifest-list manifest_length does not match the manifest object".to_string(),
+            ));
+        }
+        if manifest_location.from_manifest_list
+            && cached_manifest
+                .partition_spec_id
+                .is_some_and(|manifest_spec_id| Some(manifest_spec_id) != manifest_location.partition_spec_id)
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "manifest partition-spec-id does not match its manifest-list entry".to_string(),
+            ));
+        }
+        let references = cached_manifest.references;
         validate_snapshot_graph_manifest_content(manifest_location, references.as_ref())?;
         budget.charge_file_references(references.len())?;
         validate_snapshot_graph_data_files(

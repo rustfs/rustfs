@@ -3448,6 +3448,9 @@ fn apply_table_commit_updates_at(
     if !metadata.is_object() {
         return Err(s3_error!(InvalidRequest, "current table metadata must be a JSON object"));
     }
+    if metadata.get("format-version").is_some() {
+        crate::table_catalog::synchronize_table_metadata_version_fields(&mut metadata).map_err(catalog_store_error)?;
+    }
     let mut next_schema_id = next_catalog_id_for_updates(&metadata, updates, "add-schema", "schemas", "schema-id")?;
     let mut next_spec_id = next_catalog_id_for_updates(&metadata, updates, "add-spec", "partition-specs", "spec-id")?;
     let mut next_sort_order_id = next_catalog_id_for_updates(&metadata, updates, "add-sort-order", "sort-orders", "order-id")?;
@@ -3535,12 +3538,35 @@ fn apply_table_commit_updates_at(
         }
     }
 
+    prune_intermediate_snapshot_log_entries(&mut metadata, &added_snapshot_ids)?;
+
     if metadata.get("format-version").is_some() {
         crate::table_catalog::synchronize_table_metadata_version_fields(&mut metadata).map_err(catalog_store_error)?;
     }
     append_previous_metadata_log(&mut metadata, previous_metadata_location)?;
     metadata_object_mut(&mut metadata)?.insert("last-updated-ms".to_string(), serde_json::Value::from(commit_timestamp_ms));
     Ok(metadata)
+}
+
+fn prune_intermediate_snapshot_log_entries(metadata: &mut serde_json::Value, added_snapshot_ids: &BTreeSet<i64>) -> S3Result<()> {
+    if added_snapshot_ids.is_empty() {
+        return Ok(());
+    }
+    let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
+    let snapshot_log = ensure_array_field(metadata, "snapshot-log")?;
+    for entry in snapshot_log.iter() {
+        entry
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-log snapshot-id must be an integer"))?;
+    }
+    snapshot_log.retain(|entry| {
+        entry
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_none_or(|snapshot_id| !added_snapshot_ids.contains(&snapshot_id) || Some(snapshot_id) == current_snapshot_id)
+    });
+    Ok(())
 }
 
 fn validate_view_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
@@ -3888,6 +3914,7 @@ fn apply_add_spec_update(metadata: &mut serde_json::Value, update: &serde_json::
         .unwrap_or(999);
     let existing_fields = existing_partition_field_ids(metadata)?;
     let last_partition_id = assign_partition_field_ids(&mut spec, current_last, &existing_fields)?;
+    crate::table_catalog::validate_partition_spec_sources_against_current_schema(metadata, &spec).map_err(catalog_store_error)?;
     ensure_array_field(metadata, "partition-specs")?.push(spec);
     let object = metadata_object_mut(metadata)?;
     object.insert("last-partition-id".to_string(), serde_json::Value::from(last_partition_id));
@@ -4029,6 +4056,8 @@ fn apply_add_sort_order_update(
         .is_empty();
     let assigned_id = if fields_are_empty { 0 } else { sort_order_id };
     sort_order_object.insert("order-id".to_string(), serde_json::Value::from(assigned_id));
+    crate::table_catalog::validate_sort_order_sources_against_current_schema(metadata, &sort_order)
+        .map_err(catalog_store_error)?;
     let sort_orders = ensure_array_field(metadata, "sort-orders")?;
     if assigned_id == 0 {
         sort_orders.retain(|order| order.get("order-id").and_then(serde_json::Value::as_i64) != Some(0));

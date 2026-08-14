@@ -1948,7 +1948,11 @@ fn catalog_assigns_read_only_schema_spec_and_sort_order_ids() {
         &[
             serde_json::json!({
                 "action": "add-schema",
-                "schema": {"type": "struct", "schema-id": 41, "fields": []}
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 41,
+                    "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+                }
             }),
             serde_json::json!({"action": "set-current-schema", "schema-id": -1}),
             serde_json::json!({
@@ -1984,6 +1988,166 @@ fn catalog_assigns_read_only_schema_spec_and_sort_order_ids() {
     assert_eq!(updated["sort-orders"][0]["order-id"], 1);
     assert_eq!(updated["sort-orders"][1]["order-id"], 0);
     assert_eq!(updated["default-sort-order-id"], 0);
+}
+
+#[test]
+fn standard_commit_binds_new_specs_and_sort_orders_to_current_schema() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "properties": {}
+    }))
+    .expect("create table request should parse");
+    let (_, metadata) =
+        table_entry_from_create_table_request("warehouse", &namespace, request).expect("table metadata should be created");
+    let schema_updates = [
+        serde_json::json!({
+            "action": "add-schema",
+            "schema": {"type": "struct", "schema-id": 1, "fields": []}
+        }),
+        serde_json::json!({"action": "set-current-schema", "schema-id": -1}),
+    ];
+
+    let mut spec_updates = schema_updates.to_vec();
+    spec_updates.push(serde_json::json!({
+        "action": "add-spec",
+        "spec": {
+            "spec-id": 1,
+            "fields": [{"source-id": 1, "name": "id", "transform": "identity"}]
+        }
+    }));
+    apply_table_commit_updates_at(
+        metadata.clone(),
+        &spec_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect_err("a new partition spec must bind to the current schema");
+    spec_updates[2]["spec"]["fields"][0]["transform"] = serde_json::Value::from("void");
+    apply_table_commit_updates_at(
+        metadata.clone(),
+        &spec_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect("a void partition field may retain a source removed from the current schema");
+
+    let mut sort_updates = schema_updates.to_vec();
+    sort_updates.push(serde_json::json!({
+        "action": "add-sort-order",
+        "sort-order": {
+            "order-id": 1,
+            "fields": [{
+                "source-id": 1,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    }));
+    apply_table_commit_updates_at(metadata, &sort_updates, "s3://warehouse/tables/table-id/metadata/v1.metadata.json", 2)
+        .expect_err("a new sort order must bind to the current schema");
+
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events_v1",
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "properties": {"format-version": "1"}
+    }))
+    .expect("v1 create table request should parse");
+    let (_, v1_metadata) =
+        table_entry_from_create_table_request("warehouse", &namespace, request).expect("v1 table metadata should be created");
+    spec_updates[2]["spec"]["fields"][0]["transform"] = serde_json::Value::from("identity");
+    apply_table_commit_updates_at(
+        v1_metadata.clone(),
+        &spec_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect_err("a new v1 partition spec must bind to the updated current schema");
+    apply_table_commit_updates_at(
+        v1_metadata.clone(),
+        &sort_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect_err("a new v1 sort order must bind to the updated current schema");
+
+    let mut singular_v1_metadata = v1_metadata.clone();
+    let singular_v1_object = singular_v1_metadata
+        .as_object_mut()
+        .expect("v1 table metadata should be an object");
+    for field in [
+        "schemas",
+        "current-schema-id",
+        "partition-specs",
+        "default-spec-id",
+        "last-partition-id",
+        "sort-orders",
+        "default-sort-order-id",
+    ] {
+        singular_v1_object.remove(field);
+    }
+    let singular_v1_updates = [
+        serde_json::json!({
+            "action": "add-schema",
+            "schema": {
+                "type": "struct",
+                "schema-id": 1,
+                "fields": [{"id": 2, "name": "category", "required": true, "type": "string"}]
+            }
+        }),
+        serde_json::json!({
+            "action": "add-spec",
+            "spec": {
+                "spec-id": 1,
+                "fields": [{"source-id": 1, "name": "id", "transform": "identity"}]
+            }
+        }),
+    ];
+    let singular_v1_updated = apply_table_commit_updates_at(
+        singular_v1_metadata,
+        &singular_v1_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect("a singular v1 table may add schema history without changing its current schema");
+    assert_eq!(singular_v1_updated["current-schema-id"], 0);
+    assert_eq!(singular_v1_updated["schema"]["schema-id"], 0);
+
+    let valid_v1_updates = [
+        serde_json::json!({
+            "action": "add-schema",
+            "schema": {
+                "type": "struct",
+                "schema-id": 1,
+                "fields": [{"id": 2, "name": "category", "required": true, "type": "string"}]
+            }
+        }),
+        serde_json::json!({"action": "set-current-schema", "schema-id": -1}),
+        serde_json::json!({
+            "action": "add-spec",
+            "spec": {
+                "spec-id": 1,
+                "fields": [{"source-id": 2, "name": "category", "transform": "identity"}]
+            }
+        }),
+    ];
+    apply_table_commit_updates_at(
+        v1_metadata,
+        &valid_v1_updates,
+        "s3://warehouse/tables/table-id/metadata/v1.metadata.json",
+        2,
+    )
+    .expect("a new v1 partition spec may bind to a field in the updated current schema");
 }
 
 #[test]
@@ -6457,6 +6621,12 @@ async fn standard_commit_accepts_multiple_ordered_snapshots() {
                     "manifest-list": first_manifest_list,
                     "summary": {"operation": "append"}
                 }
+            },
+            {
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "snapshot-id": 10,
+                "type": "branch"
             },
             {
                 "action": "add-snapshot",

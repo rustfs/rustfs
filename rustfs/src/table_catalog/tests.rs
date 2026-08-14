@@ -1197,6 +1197,21 @@ fn iceberg_metadata_validation_accepts_complete_v1_and_v2_shapes() {
         "metadata-log": []
     });
     validate_supported_table_metadata(&v1).expect("complete Iceberg v1 metadata should validate");
+
+    let mut v1_retired_partition_source = v1.clone();
+    v1_retired_partition_source["schemas"] = serde_json::json!([
+        {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        {"type": "struct", "schema-id": 1, "fields": []}
+    ]);
+    v1_retired_partition_source["current-schema-id"] = serde_json::Value::from(1);
+    v1_retired_partition_source["schema"] = serde_json::json!({"type": "struct", "schema-id": 1, "fields": []});
+    validate_supported_table_metadata(&v1_retired_partition_source)
+        .expect_err("the v1 partition spec must bind to the current schema rather than a historical schema");
+
     let mut negative_v1_schema_id = v1;
     negative_v1_schema_id["schema"]["schema-id"] = serde_json::Value::from(-1);
     validate_supported_table_metadata(&negative_v1_schema_id).expect_err("Iceberg v1 schema IDs must not be negative");
@@ -1647,6 +1662,57 @@ fn iceberg_metadata_validation_binds_partition_fields_to_schema_and_field_identi
 
     nested_source["partition-specs"][0]["fields"][0]["source-id"] = serde_json::Value::from(4);
     validate_supported_table_metadata(&nested_source).expect_err("a primitive nested in a list must not be a partition source");
+}
+
+#[test]
+fn iceberg_metadata_validation_binds_defaults_to_current_schema() {
+    let mut partitioned = table_metadata_json_for_validation();
+    partitioned["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({"type": "struct", "schema-id": 1, "fields": []}));
+    partitioned["current-schema-id"] = serde_json::Value::from(1);
+    partitioned["partition-specs"] = serde_json::json!([
+        {"spec-id": 0, "fields": []},
+        {
+            "spec-id": 1,
+            "fields": [{"source-id": 1, "field-id": 1000, "name": "id", "transform": "identity"}]
+        }
+    ]);
+    partitioned["default-spec-id"] = serde_json::Value::from(1);
+    partitioned["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&partitioned).expect_err("the default partition spec must bind to the current schema");
+    partitioned["partition-specs"][1]["fields"][0]["transform"] = serde_json::Value::from("void");
+    validate_supported_table_metadata(&partitioned)
+        .expect("a void partition field may retain a source removed from the current schema");
+    partitioned["partition-specs"][1]["fields"][0]["transform"] = serde_json::Value::from("identity");
+    partitioned["default-spec-id"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&partitioned)
+        .expect("a non-default historical partition spec may retain a source removed from the current schema");
+
+    let mut sorted = table_metadata_json_for_validation();
+    sorted["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({"type": "struct", "schema-id": 1, "fields": []}));
+    sorted["current-schema-id"] = serde_json::Value::from(1);
+    sorted["sort-orders"] = serde_json::json!([
+        {"order-id": 0, "fields": []},
+        {
+            "order-id": 1,
+            "fields": [{
+                "source-id": 1,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    ]);
+    sorted["default-sort-order-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&sorted).expect_err("the default sort order must bind to the current schema");
+    sorted["default-sort-order-id"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&sorted)
+        .expect("a non-default historical sort order may retain a source removed from the current schema");
 }
 
 #[test]
@@ -2685,6 +2751,87 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
     validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
         .await
         .expect("shared manifest objects must consume the commit budget only once");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
+    let manifest_bytes = manifest_avro_bytes_with_status_and_partition_spec(&[(data_file, 0, 1)], 0);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-10.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-11.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len() + 1)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/shared-manifest.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/shared.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([
+        {
+            "snapshot-id": 10,
+            "sequence-number": 7,
+            "timestamp-ms": 1,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/list-10.avro",
+            "summary": {"operation": "append"}
+        },
+        {
+            "snapshot-id": 11,
+            "sequence-number": 7,
+            "timestamp-ms": 2,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/list-11.avro",
+            "summary": {"operation": "append"}
+        }
+    ]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(11);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
+    let current_metadata = table_metadata_json_for_validation();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect_err("every manifest-list declaration must match the cached manifest object");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest-list manifest_length does not match the manifest object".to_string())
+    );
+
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-11.avro",
+            manifest_list_avro_bytes_with_spec(&[(manifest, manifest_bytes.len())], 1),
+        )
+        .await;
+    metadata["partition-specs"]
+        .as_array_mut()
+        .expect("partition specs should be an array")
+        .push(serde_json::json!({"spec-id": 1, "fields": []}));
+
+    let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect_err("every cached manifest must match each manifest-list partition spec declaration");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest partition-spec-id does not match its manifest-list entry".to_string())
+    );
 }
 
 #[tokio::test]
