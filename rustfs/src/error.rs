@@ -714,9 +714,14 @@ mod tests {
         let iam_error = rustfs_iam::error::Error::other("IAM test error");
         let api_error: ApiError = iam_error.into();
 
-        // IAM error is first converted to StorageError, then to ApiError
-        assert!(api_error.source.is_some());
-        assert!(api_error.message.contains("test error"));
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains("IAM test error")));
     }
 
     #[test]
