@@ -248,6 +248,16 @@ fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) 
     Ok(server_epoch)
 }
 
+fn decode_cross_pool_fence_capability(expected_member: &str, result: &[u8]) -> Result<(u32, Uuid)> {
+    let version = result
+        .get(..4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| Error::other("peer returned an invalid cross-pool fence capability version"))?;
+    let epoch = decode_remote_version_state_capability(expected_member, &result[4..])?;
+    Ok((version, epoch))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -1286,6 +1296,16 @@ impl PeerRestClient {
             .await?;
         let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
         Ok((self.topology_member.clone(), epoch))
+    }
+
+    pub async fn probe_cross_pool_fence(&self, topology_fingerprint: String) -> Result<(String, u32, Uuid)> {
+        let mut probe = rustfs_protos::CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.to_vec();
+        probe.extend_from_slice(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let (supported_version, epoch) = decode_cross_pool_fence_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), supported_version, epoch))
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -2736,6 +2756,24 @@ mod tests {
         let nil = rustfs_protos::encode_remote_version_state_capability("node-a:9000", Uuid::nil().as_bytes())
             .expect("small capability response should encode");
         assert!(decode_remote_version_state_capability("node-a:9000", &nil).is_err());
+    }
+
+    #[test]
+    fn cross_pool_fence_capability_decoder_fails_closed() {
+        let epoch = Uuid::new_v4();
+        let result = rustfs_protos::encode_cross_pool_fence_capability(1, "node-a:9000", epoch.as_bytes())
+            .expect("small capability response should encode");
+        assert_eq!(
+            decode_cross_pool_fence_capability("node-a:9000", &result).expect("valid capability should decode"),
+            (1, epoch)
+        );
+        for malformed in [&[][..], &[0, 0, 0][..], &result[..result.len() - 1]] {
+            assert!(decode_cross_pool_fence_capability("node-a:9000", malformed).is_err());
+        }
+        assert!(decode_cross_pool_fence_capability("node-b:9000", &result).is_err());
+        let nil = rustfs_protos::encode_cross_pool_fence_capability(1, "node-a:9000", Uuid::nil().as_bytes())
+            .expect("small capability response should encode");
+        assert!(decode_cross_pool_fence_capability("node-a:9000", &nil).is_err());
     }
 
     struct TierMutationResponseFixture<'a> {

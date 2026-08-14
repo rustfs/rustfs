@@ -641,7 +641,7 @@ pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
 }
 
-pub(super) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
+pub(crate) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
     observe_list_objects_mutations(store, bucket, 1).await.unwrap_or_default()
 }
 
@@ -3845,7 +3845,7 @@ impl ECStore {
         .await
     }
 
-    pub(crate) async fn inner_list_object_versions_for_lifecycle(
+    pub(crate) async fn list_object_versions_for_lifecycle(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
