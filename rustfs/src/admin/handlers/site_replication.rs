@@ -29,6 +29,7 @@ use crate::admin::storage_api::bucket::metadata::{
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
 use crate::admin::storage_api::bucket::metadata_sys;
+use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
@@ -7895,9 +7896,35 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
 
     if !skip_config_write {
         if let Some(data) = data {
-            metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
-                .await
-                .map_err(ApiError::from)?;
+            if item.r#type == "quota-config" {
+                let quota: BucketQuota = serde_json::from_slice(&data)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid bucket quota: {e}")))?;
+                if quota.has_unsupported_reservation_protocol() {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        "unsupported bucket quota reservation protocol".to_string(),
+                    ));
+                }
+                if quota.uses_durable_reservations() {
+                    let proof = crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::ServiceUnavailable,
+                            "durable quota capability is not confirmed across the cluster".to_string(),
+                        )
+                    })?;
+                    metadata_sys::update_quota_if_incarnation(&item.bucket, data, expected_incarnation_id, &proof)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
+            } else {
+                metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
         } else {
             metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
                 .await

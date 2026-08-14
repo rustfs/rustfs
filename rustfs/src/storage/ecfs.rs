@@ -301,7 +301,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_copy_object(req)).await
+        usecase.execute_copy_object(req).await
     }
 
     #[instrument(
@@ -704,7 +704,7 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         crate::hp_guard!("S3::get_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_get_object(req)).await
+        usecase.execute_get_object(req).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -1261,7 +1261,7 @@ impl S3 for FS {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_put_object(self, req)).await
+        usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {

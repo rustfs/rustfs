@@ -55,6 +55,7 @@ pub fn part_transaction_path(part_path: &str) -> String {
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
@@ -71,6 +72,28 @@ use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
+
+const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
+pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
+
+pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = Vec::with_capacity(bucket.len() + object.len() + 1);
+    input.extend_from_slice(bucket.as_bytes());
+    input.push(0);
+    input.extend_from_slice(object.as_bytes());
+    let digest = Sha256::digest(input);
+    format!(
+        "{QUOTA_MUTATION_FENCE_PREFIX}{}",
+        hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
+    )
+}
+
+pub(crate) fn is_quota_mutation_fence_path(path: &str) -> bool {
+    path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
 
 pub type DiskStore = Arc<Disk>;
 
@@ -95,6 +118,20 @@ impl SnapshotLeaseToken {
 
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[doc(hidden)]
+    pub fn revoke_all() -> Self {
+        Self(Uuid::nil())
+    }
+
+    #[doc(hidden)]
+    pub fn is_revoke_all(self) -> bool {
+        self.0.is_nil()
     }
 }
 
@@ -398,10 +435,8 @@ impl DiskAPI for Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        match self {
-            Disk::Local(local_disk) => local_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-            Disk::Remote(remote_disk) => remote_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-        }
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -627,6 +662,30 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
+}
+
+impl Disk {
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
         }
     }
 }

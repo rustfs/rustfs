@@ -4741,9 +4741,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
     async fn select_snapshot_rejects_latest_versioned_delete_marker_during_prepare() {
-        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
-        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[Arc::clone(&first_set), Arc::clone(&second_set)]).await;
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
         let bucket = "select-snapshot-latest-delete-marker";
         let object = "versioned-object.bin";
         let versioned_opts = ObjectOptions {
