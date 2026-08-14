@@ -1176,6 +1176,32 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn quota_object_fence_ignores_an_unrelated_offline_pool() {
+        let temp_dir = tempfile::tempdir().expect("create quota fence store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "quota-object-fence", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("quota-object-fence-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create quota fence bucket");
+        store.pools[1].disk_set[0].disks.write().await.fill(None);
+
+        crate::bucket::quota::reservation::fence_namespace_mutations_for_test(&store, &bucket, object, Some((0, 0)))
+            .await
+            .expect("the selected pool fence should ignore an unrelated offline pool");
+        let err = crate::bucket::quota::reservation::fence_namespace_mutations_for_test(&store, &bucket, object, None)
+            .await
+            .expect_err("legacy reservations must conservatively fence every pool");
+        assert!(matches!(err, StorageError::ErasureWriteQuorum));
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn tag_updates_skip_active_rebalance_source_pool() {
         let temp_dir = tempfile::tempdir().expect("create writer-fencing store dir");
         let (_ctx, store, shutdown) =

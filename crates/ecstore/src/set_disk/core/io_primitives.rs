@@ -46,6 +46,7 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::disk::{
     DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
@@ -590,7 +591,7 @@ impl MetadataQuorumAccumulator {
         })
     }
 
-    pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
+    pub(crate) fn default_write_quorum(&self) -> usize {
         if self.default_parity_count == 0 || self.default_parity_count >= self.total_disks {
             return self.total_disks;
         }
@@ -3011,18 +3012,138 @@ impl RenameConvergence {
     }
 }
 
+pub(in crate::set_disk) struct RenameDataCommit {
+    pub(in crate::set_disk) online_disks: Vec<Option<DiskStore>>,
+    pub(in crate::set_disk) convergence: RenameConvergence,
+    pub(in crate::set_disk) data_dir: Option<Uuid>,
+    pub(in crate::set_disk) cleanup_disks: Vec<Option<DiskStore>>,
+    pub(in crate::set_disk) old_current_size: Option<OldCurrentSize>,
+    pub(in crate::set_disk) committed_file_info: FileInfo,
+}
+
+type RenameDataLegacyTuple = (
+    Vec<Option<DiskStore>>,
+    RenameConvergence,
+    Option<Uuid>,
+    Vec<Option<DiskStore>>,
+    Option<OldCurrentSize>,
+);
+
+impl RenameDataCommit {
+    fn into_legacy_tuple(self) -> RenameDataLegacyTuple {
+        (
+            self.online_disks,
+            self.convergence,
+            self.data_dir,
+            self.cleanup_disks,
+            self.old_current_size,
+        )
+    }
+}
+
 impl SetDisks {
     pub(in crate::set_disk) fn default_read_quorum(&self) -> usize {
         self.set_drive_count - self.default_parity_count
     }
 
-    pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
+    pub(crate) fn default_write_quorum(&self) -> usize {
         let mut data_count = self.set_drive_count - self.default_parity_count;
         if data_count == self.default_parity_count {
             data_count += 1
         }
 
         data_count
+    }
+
+    pub(in crate::set_disk) async fn prepare_quota_mutation_fences(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+    ) -> crate::error::Result<(Vec<Option<DiskStore>>, Vec<Option<SnapshotLeaseToken>>)> {
+        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+        let results = join_all(disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let fence_path = fence_path.clone();
+            async move {
+                let disk = disk?;
+                match disk.acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path).await {
+                    Ok(token) => Some((disk, token)),
+                    Err(_) => None,
+                }
+            }
+        }))
+        .await;
+        if results.iter().flatten().count() < write_quorum {
+            for (disk, token) in results.iter().flatten() {
+                let _ = disk.release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, *token).await;
+            }
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+        let mut fenced_disks = Vec::with_capacity(results.len());
+        let mut tokens = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Some((disk, token)) => {
+                    fenced_disks.push(Some(disk));
+                    tokens.push(Some(token));
+                }
+                None => {
+                    fenced_disks.push(None);
+                    tokens.push(None);
+                }
+            }
+        }
+        Ok((fenced_disks, tokens))
+    }
+
+    pub(in crate::set_disk) async fn release_quota_mutation_fences(
+        disks: &[Option<DiskStore>],
+        tokens: &[Option<SnapshotLeaseToken>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+    ) -> crate::error::Result<()> {
+        let fence_path = crate::disk::quota_mutation_fence_path(bucket, object);
+        let results = join_all(disks.iter().zip(tokens).filter_map(|(disk, token)| {
+            let disk = disk.as_ref()?.clone();
+            let token = (*token)?;
+            let fence_path = fence_path.clone();
+            Some(async move { disk.release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token).await })
+        }))
+        .await;
+        if results.iter().filter(|result| result.is_ok()).count() < write_quorum {
+            return Err(StorageError::ErasureWriteQuorum);
+        }
+        Ok(())
+    }
+
+    pub(in crate::set_disk) fn assign_rename_data_indexes(file_infos: &mut [FileInfo]) {
+        for (index, file_info) in file_infos.iter_mut().enumerate() {
+            if file_info.erasure.index == 0 {
+                file_info.erasure.index = index + 1;
+            }
+        }
+    }
+
+    pub(in crate::set_disk) async fn abort_quota_reservation_after_fence(
+        reservation: crate::bucket::quota::reservation::QuotaReservation,
+        disks: &[Option<DiskStore>],
+        tokens: &[Option<SnapshotLeaseToken>],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+        fenced: bool,
+    ) {
+        let safe_to_abort = !fenced
+            || Self::release_quota_mutation_fences(disks, tokens, bucket, object, write_quorum)
+                .await
+                .is_ok();
+        if safe_to_abort {
+            reservation.abort().await;
+        } else {
+            reservation.defer_after_fence();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
@@ -3035,13 +3156,22 @@ impl SetDisks {
         dst_bucket: &str,
         dst_object: &str,
         write_quorum: usize,
-    ) -> disk::error::Result<(
-        Vec<Option<DiskStore>>,
-        RenameConvergence,
-        Option<Uuid>,
-        Vec<Option<DiskStore>>,
-        Option<OldCurrentSize>,
-    )> {
+    ) -> disk::error::Result<RenameDataLegacyTuple> {
+        Self::rename_data_owned(disks, src_bucket, src_object, file_infos.to_vec(), dst_bucket, dst_object, write_quorum)
+            .await
+            .map(RenameDataCommit::into_legacy_tuple)
+    }
+
+    #[tracing::instrument(level = "debug", skip(disks, file_infos))]
+    pub(in crate::set_disk) async fn rename_data_owned(
+        disks: &[Option<DiskStore>],
+        src_bucket: &str,
+        src_object: &str,
+        file_infos: Vec<FileInfo>,
+        dst_bucket: &str,
+        dst_object: &str,
+        write_quorum: usize,
+    ) -> disk::error::Result<RenameDataCommit> {
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -3066,7 +3196,7 @@ impl SetDisks {
 
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
-        let fanout_file_infos = file_infos.to_vec();
+        let fanout_file_infos = file_infos;
         let fanout_src_bucket = src_bucket.clone();
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
@@ -3078,9 +3208,9 @@ impl SetDisks {
         let fanout = tokio::spawn(async move {
             let futures = fanout_disks
                 .into_iter()
-                .zip(fanout_file_infos)
+                .zip(fanout_file_infos.iter())
                 .enumerate()
-                .map(|(i, (disk, mut file_info))| {
+                .map(|(i, (disk, file_info))| {
                     let src_bucket = fanout_src_bucket.clone();
                     let src_object = fanout_src_object.clone();
                     let dst_object = fanout_dst_object.clone();
@@ -3097,11 +3227,15 @@ impl SetDisks {
                         };
 
                         let is_delete_marker = file_info.is_canonical_delete_marker();
-                        if file_info.erasure.index == 0 {
-                            file_info.erasure.index = i + 1;
-                        }
-
-                        if !is_delete_marker && !file_info.has_valid_erasure_geometry() {
+                        let mut local_file_info;
+                        let file_info = if file_info.erasure.index == 0 {
+                            local_file_info = file_info.clone();
+                            local_file_info.erasure.index = i + 1;
+                            &local_file_info
+                        } else {
+                            file_info
+                        };
+                        if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
                             return Err(DiskError::FileCorrupt);
                         }
 
@@ -3109,12 +3243,13 @@ impl SetDisks {
                         // A no-op immediately-ready future in production.
                         Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                        disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                        disk.rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                             .await
                     })
                     .catch_unwind()
                 });
-            join_all(futures).await
+            let results = join_all(futures).await;
+            (results, fanout_file_infos)
         });
 
         let mut disk_versions = vec![None; disk_count];
@@ -3122,7 +3257,7 @@ impl SetDisks {
         let mut cleanup_data_dirs = vec![None; disk_count];
         let mut old_current_sizes = vec![None; disk_count];
 
-        let results = fanout.await.map_err(|_| DiskError::Unexpected)?;
+        let (results, mut file_infos) = fanout.await.map_err(|_| DiskError::Unexpected)?;
 
         for (idx, result) in results.iter().enumerate() {
             match result {
@@ -3178,7 +3313,7 @@ impl SetDisks {
                 }
 
                 if let Some(disk) = disks[i].as_ref() {
-                    let fi = file_infos[i].clone();
+                    let fi = std::mem::take(&mut file_infos[i]);
                     let old_data_dir = data_dirs[i];
                     let disk = disk.clone();
                     let dst_bucket = dst_bucket.clone();
@@ -3301,6 +3436,8 @@ impl SetDisks {
         let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
+        let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
+        let committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
                 .iter()
@@ -3318,7 +3455,14 @@ impl SetDisks {
             vec![None; disks.len()]
         };
 
-        Ok((online_disks, convergence, data_dir, cleanup_disks, old_current_size))
+        Ok(RenameDataCommit {
+            online_disks,
+            convergence,
+            data_dir,
+            cleanup_disks,
+            old_current_size,
+            committed_file_info,
+        })
     }
 
     /// rustfs/backlog#1009: reduce the per-disk observations of the

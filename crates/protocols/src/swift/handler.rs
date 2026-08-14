@@ -748,9 +748,10 @@ async fn handle_authenticated_request(
                                 }
 
                                 for (key, value) in info.user_defined.iter() {
-                                    if key != "content-type" {
-                                        let header_name = format!("x-object-meta-{}", key);
-                                        response = response.header(header_name, value.as_str());
+                                    if key != "content-type"
+                                        && let Some(key) = object::swift_response_user_metadata_key(key)
+                                    {
+                                        response = response.header(format!("x-object-meta-{key}"), value.as_str());
                                     }
                                 }
 
@@ -817,9 +818,10 @@ async fn handle_authenticated_request(
 
                     // Add custom metadata headers (X-Object-Meta-*)
                     for (key, value) in info.user_defined.iter() {
-                        if key != "content-type" {
-                            let header_name = format!("x-object-meta-{}", key);
-                            response = response.header(header_name, value.as_str());
+                        if key != "content-type"
+                            && let Some(key) = object::swift_response_user_metadata_key(key)
+                        {
+                            response = response.header(format!("x-object-meta-{key}"), value.as_str());
                         }
                     }
 
@@ -856,9 +858,10 @@ async fn handle_authenticated_request(
 
                     // Add custom metadata headers (X-Object-Meta-*)
                     for (key, value) in info.user_defined.iter() {
-                        if key != "content-type" {
-                            let header_name = format!("x-object-meta-{}", key);
-                            response = response.header(header_name, value.as_str());
+                        if key != "content-type"
+                            && let Some(key) = object::swift_response_user_metadata_key(key)
+                        {
+                            response = response.header(format!("x-object-meta-{key}"), value.as_str());
                         }
                     }
 
@@ -1168,9 +1171,10 @@ async fn handle_object_get(
                 }
 
                 for (key, value) in info.user_defined.iter() {
-                    if key != "content-type" {
-                        let header_name = format!("x-object-meta-{}", key);
-                        response = response.header(header_name, value.as_str());
+                    if key != "content-type"
+                        && let Some(key) = object::swift_response_user_metadata_key(key)
+                    {
+                        response = response.header(format!("x-object-meta-{key}"), value.as_str());
                     }
                 }
 
@@ -1237,9 +1241,10 @@ async fn handle_object_get(
         if key == "x-delete-at" {
             // Add X-Delete-At header directly (not as X-Object-Meta-*)
             response = response.header("x-delete-at", value.as_str());
-        } else if key != "content-type" {
-            let header_name = format!("x-object-meta-{}", key);
-            response = response.header(header_name, value.as_str());
+        } else if key != "content-type"
+            && let Some(key) = object::swift_response_user_metadata_key(key)
+        {
+            response = response.header(format!("x-object-meta-{key}"), value.as_str());
         }
     }
 
@@ -1293,9 +1298,10 @@ async fn handle_object_head(
         if key == "x-delete-at" {
             // Add X-Delete-At header directly (not as X-Object-Meta-*)
             response = response.header("x-delete-at", value.as_str());
-        } else if key != "content-type" {
-            let header_name = format!("x-object-meta-{}", key);
-            response = response.header(header_name, value.as_str());
+        } else if key != "content-type"
+            && let Some(key) = object::swift_response_user_metadata_key(key)
+        {
+            response = response.header(format!("x-object-meta-{key}"), value.as_str());
         }
     }
 

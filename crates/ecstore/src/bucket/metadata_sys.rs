@@ -50,6 +50,72 @@ use uuid::Uuid;
 
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(any(test, feature = "test-util"))]
+struct ConfigWriteLockProbeState {
+    bucket: String,
+    arrived: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+static CONFIG_WRITE_LOCK_PROBES: std::sync::OnceLock<StdMutex<Vec<Arc<ConfigWriteLockProbeState>>>> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-util"))]
+pub struct ConfigWriteLockProbe {
+    state: Arc<ConfigWriteLockProbeState>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl ConfigWriteLockProbe {
+    pub fn install(bucket: &str) -> Self {
+        let state = Arc::new(ConfigWriteLockProbeState {
+            bucket: bucket.to_string(),
+            arrived: tokio::sync::Notify::new(),
+        });
+        let mut probes = CONFIG_WRITE_LOCK_PROBES
+            .get_or_init(|| StdMutex::new(Vec::new()))
+            .lock()
+            .expect("config write lock probe mutex should not poison");
+        assert!(
+            !probes.iter().any(|current| current.bucket == state.bucket),
+            "config write lock probe must be unique for a bucket"
+        );
+        probes.push(Arc::clone(&state));
+        drop(probes);
+        Self { state }
+    }
+
+    pub async fn wait_until_attempted(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("bucket config update should attempt the transaction lock");
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for ConfigWriteLockProbe {
+    fn drop(&mut self) {
+        let mut probes = CONFIG_WRITE_LOCK_PROBES
+            .get_or_init(|| StdMutex::new(Vec::new()))
+            .lock()
+            .expect("config write lock probe mutex should not poison");
+        probes.retain(|state| !Arc::ptr_eq(state, &self.state));
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_config_write_lock_attempt(bucket: &str) {
+    let probe = CONFIG_WRITE_LOCK_PROBES
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .expect("config write lock probe mutex should not poison")
+        .iter()
+        .find(|probe| probe.bucket == bucket)
+        .cloned();
+    if let Some(probe) = probe {
+        probe.arrived.notify_one();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MetadataLoadMode {
     Initial,
@@ -590,6 +656,31 @@ pub async fn update_under_transaction_lock(
     update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data).await
 }
 
+pub async fn update_quota_if_incarnation(
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+) -> Result<OffsetDateTime> {
+    let sys = get_bucket_metadata_sys()?;
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(
+        sys.clone(),
+        bucket,
+        Some(expected_incarnation_id),
+    ))
+    .await?;
+    if !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof) {
+        return Err(Error::NamespaceLockQuorumUnavailable {
+            mode: "quota_capability",
+            bucket: bucket.to_string(),
+            object: rustfs_config::QUOTA_CONFIG_FILE.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data).await
+}
+
 pub async fn update_bucket_targets_under_transaction_lock(
     guard: &BucketMetadataMutationGuard,
     bucket: &str,
@@ -734,7 +825,26 @@ async fn acquire_transaction_lock_with_sys(
     let lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
         .await?;
-    Ok(lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
+    let acquire = lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout());
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        tokio::pin!(acquire);
+        let mut notified = false;
+        let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+            std::task::Poll::Pending => {
+                if !notified {
+                    notify_config_write_lock_attempt(bucket);
+                    notified = true;
+                }
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+        })
+        .await?;
+        Ok(guard)
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    Ok(acquire.await?)
 }
 
 /// The lock resource name is deliberately still the `bucket-targets` one it
@@ -886,6 +996,37 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
         BucketMetadataAuthority::Fabricated => {
             Err(Error::other(format!("bucket Object Lock metadata is not authoritative: {bucket}")))
         }
+    }
+}
+
+/// Re-read the quota configuration and bucket incarnation from the same
+/// authoritative metadata blob while the caller holds the bucket metadata
+/// transaction read lock.
+pub(crate) async fn get_quota_config_and_incarnation_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<(Option<BucketQuota>, Uuid, OffsetDateTime)> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+
+    match bucket_meta_sys
+        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+        .await?
+    {
+        BucketMetadataAuthority::Authoritative(metadata)
+            if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
+        {
+            Ok((
+                metadata.quota_config.clone(),
+                metadata.bucket_incarnation_id,
+                metadata.quota_config_updated_at,
+            ))
+        }
+        BucketMetadataAuthority::Authoritative(_) => {
+            Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+        }
+        BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
+        BucketMetadataAuthority::Fabricated => Err(Error::other(format!("bucket quota metadata is not authoritative: {bucket}"))),
     }
 }
 
