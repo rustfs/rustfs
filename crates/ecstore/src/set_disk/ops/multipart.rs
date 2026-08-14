@@ -1906,6 +1906,23 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             return Err(Error::PartMissingOrCorrupt);
         }
         let transformed_object = fi.is_compressed() || should_persist_encryption_original_size(&fi.metadata);
+        let data_movement_actual_size = if opts.data_movement {
+            rustfs_utils::http::get_consistent_str(&opts.user_defined, SUFFIX_ACTUAL_SIZE)
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value >= 0)
+                        .ok_or(Error::PartMissingOrCorrupt)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let data_movement_actual_size_u64 = data_movement_actual_size
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| Error::PartMissingOrCorrupt)?;
 
         let mut object_size: usize = 0;
         let mut object_actual_size: i64 = 0;
@@ -2034,7 +2051,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             object_size = object_size.checked_add(ext_part.size).ok_or(Error::PartMissingOrCorrupt)?;
-            if ext_part.actual_size < 0 && (quota_context.is_enforced() || (!opts.replication_request && !opts.data_movement)) {
+            let unknown_actual_size_allowed = opts.data_movement && transformed_object && data_movement_actual_size.is_some()
+                || opts.replication_request && !quota_context.is_enforced();
+            if ext_part.actual_size < 0 && !unknown_actual_size_allowed {
                 return Err(Error::PartMissingOrCorrupt);
             }
             let normalized_actual_size = if ext_part.actual_size >= 0 && !transformed_object {
@@ -2051,7 +2070,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             completed_part.actual_size = normalized_actual_size;
             fi.parts.push(completed_part);
         }
-
+        if !transformed_object && data_movement_actual_size.is_some_and(|actual_size| actual_size < object_actual_size) {
+            return Err(Error::PartMissingOrCorrupt);
+        }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
             if checksum_type.full_object_requested() {
                 if wtcs.encoded != checksum.encoded {
@@ -2097,7 +2118,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         } else {
             None
         };
-        let quota_new_size = match replication_actual_size {
+        let data_movement_quota_size = data_movement_actual_size_u64.filter(|_| quota_context.is_enforced());
+        let quota_new_size = match data_movement_quota_size.or(replication_actual_size) {
             Some(size) => size.max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
             None if quota_context.is_enforced() => u64::try_from(object_actual_size)
                 .map_err(|_| Error::PartMissingOrCorrupt)?
@@ -2154,20 +2176,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 crate::object_api::ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX,
             );
         }
-
-        let data_movement_actual_size = if opts.data_movement {
-            rustfs_utils::http::get_consistent_str(&opts.user_defined, SUFFIX_ACTUAL_SIZE)
-                .map(|value| {
-                    value
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|value| *value >= 0)
-                        .ok_or_else(|| Error::other("data movement actual size metadata is invalid"))
-                })
-                .transpose()?
-        } else {
-            None
-        };
 
         if let Some(actual_size) = data_movement_actual_size {
             insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
@@ -3109,12 +3117,34 @@ mod tests {
         content: &[u8],
         actual_size: i64,
     ) -> CompletePart {
+        put_test_part_with_opts(
+            set_disks,
+            bucket,
+            object,
+            upload_id,
+            part_number,
+            (content, actual_size),
+            &ObjectOptions::default(),
+        )
+        .await
+    }
+
+    async fn put_test_part_with_opts(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number: usize,
+        part: (&[u8], i64),
+        opts: &ObjectOptions,
+    ) -> CompletePart {
+        let (content, actual_size) = part;
         let mut reader = PutObjReader::new(
             HashReader::from_stream(Cursor::new(content.to_vec()), content.len() as i64, actual_size, None, None, false)
                 .expect("hash reader should be constructed"),
         );
         let part = set_disks
-            .put_object_part(bucket, object, upload_id, part_number, &mut reader, &ObjectOptions::default())
+            .put_object_part(bucket, object, upload_id, part_number, &mut reader, opts)
             .await
             .expect("uploading the part should succeed");
         CompletePart {
@@ -3850,7 +3880,6 @@ mod tests {
     async fn data_movement_complete_accepts_unknown_compressed_part_actual_size() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "data-movement-unknown-actual-size-bucket";
-        let object = "object";
         make_bucket_on_all(&disk_stores, bucket).await;
 
         let mut metadata = HashMap::new();
@@ -3864,6 +3893,63 @@ mod tests {
             rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
             "source-generation".to_string(),
         );
+
+        for (object, quota_limit) in [("without-quota", None), ("with-quota", Some(u64::MAX))] {
+            let create_opts = ObjectOptions {
+                data_movement: true,
+                user_defined: metadata.clone(),
+                ..Default::default()
+            };
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &create_opts)
+                .await
+                .expect("data movement upload should be created");
+
+            let mut completed_parts = Vec::new();
+            for (number, actual_size) in [(1, -1), (2, 1)] {
+                let mut reader = PutObjReader::new(
+                    HashReader::from_stream(Cursor::new(vec![number as u8]), 1, actual_size, None, None, false)
+                        .expect("part reader should be constructed"),
+                );
+                let part = set_disks
+                    .put_object_part(bucket, object, &upload.upload_id, number, &mut reader, &create_opts)
+                    .await
+                    .expect("data movement part should be written");
+                completed_parts.push(CompletePart {
+                    part_num: number,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+
+            let missing_size_err = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts.clone(), &create_opts)
+                .await
+                .expect_err("data movement completion must require an authoritative total size");
+            assert!(matches!(missing_size_err, StorageError::PartMissingOrCorrupt));
+
+            let mut complete_opts = create_opts.clone();
+            rustfs_utils::http::insert_str(
+                &mut complete_opts.user_defined,
+                rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+                "2".to_string(),
+            );
+            if let Some(quota_limit) = quota_limit {
+                assert!(complete_opts.set_quota_admission(0, quota_limit));
+            }
+            let completion = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &complete_opts)
+                .await;
+
+            let completed = completion.expect("data movement completion should accept the persisted unknown-size sentinel");
+
+            assert_eq!(completed.parts[0].actual_size, -1);
+            assert_eq!(completed.get_actual_size().expect("completed object actual size"), 2);
+        }
+
+        let object = "all-unknown-with-quota";
         let create_opts = ObjectOptions {
             data_movement: true,
             user_defined: metadata.clone(),
@@ -3873,43 +3959,93 @@ mod tests {
             .new_multipart_upload(bucket, object, &create_opts)
             .await
             .expect("data movement upload should be created");
-
-        let mut completed_parts = Vec::new();
-        for (number, actual_size) in [(1, -1), (2, 1)] {
-            let mut reader = PutObjReader::new(
-                HashReader::from_stream(Cursor::new(vec![number as u8]), 1, actual_size, None, None, false)
-                    .expect("part reader should be constructed"),
-            );
-            let part = set_disks
-                .put_object_part(bucket, object, &upload.upload_id, number, &mut reader, &create_opts)
-                .await
-                .expect("data movement part should be written");
-            completed_parts.push(CompletePart {
-                part_num: number,
-                etag: part.etag,
-                ..Default::default()
-            });
-        }
-
-        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "2".to_string());
+        let part = put_test_part_with_opts(&set_disks, bucket, object, &upload.upload_id, 1, (&[0x40], -1), &create_opts).await;
+        let mut complete_opts = create_opts;
+        rustfs_utils::http::insert_str(&mut complete_opts.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "2".to_string());
+        assert!(complete_opts.set_quota_admission(0, u64::MAX));
         let completed = set_disks
             .clone()
-            .complete_multipart_upload(
-                bucket,
-                object,
-                &upload.upload_id,
-                completed_parts,
-                &ObjectOptions {
-                    data_movement: true,
-                    user_defined: metadata,
-                    ..Default::default()
-                },
-            )
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
             .await
-            .expect("data movement completion should accept the persisted unknown-size sentinel");
-
+            .expect("quota must accept an all-unknown data movement upload with an authoritative total");
         assert_eq!(completed.parts[0].actual_size, -1);
         assert_eq!(completed.get_actual_size().expect("completed object actual size"), 2);
+
+        let object = "legacy-zero-fallback";
+        let create_opts = ObjectOptions {
+            data_movement: true,
+            user_defined: metadata.clone(),
+            ..Default::default()
+        };
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("data movement upload should be created");
+        let part =
+            put_test_part_with_opts(&set_disks, bucket, object, &upload.upload_id, 1, (&[0x41; 128], 128), &create_opts).await;
+        let mut complete_opts = create_opts;
+        rustfs_utils::http::insert_str(
+            &mut complete_opts.user_defined,
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "100".to_string(),
+        );
+        assert!(complete_opts.set_quota_admission(0, u64::MAX));
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect("legacy zero-to-physical part fallback must remain migratable");
+        assert_eq!(completed.parts[0].actual_size, 128);
+        assert_eq!(completed.get_actual_size().expect("completed object actual size"), 100);
+
+        let object = "inconsistent-untransformed-total";
+        let mut untransformed_metadata = metadata.clone();
+        rustfs_utils::http::remove_str(&mut untransformed_metadata, rustfs_utils::http::SUFFIX_COMPRESSION);
+        let create_opts = ObjectOptions {
+            data_movement: true,
+            user_defined: untransformed_metadata,
+            ..Default::default()
+        };
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("data movement upload should be created");
+        let part = put_test_part_with_opts(&set_disks, bucket, object, &upload.upload_id, 1, (&[0x42; 2], 2), &create_opts).await;
+        let mut complete_opts = create_opts;
+        rustfs_utils::http::insert_str(&mut complete_opts.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "1".to_string());
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect_err("authoritative total below known logical part sizes must fail closed");
+        assert!(matches!(err, StorageError::PartMissingOrCorrupt));
+
+        for (object, declared_size) in [("invalid-total", "invalid"), ("negative-total", "-1")] {
+            let create_opts = ObjectOptions {
+                data_movement: true,
+                user_defined: metadata.clone(),
+                ..Default::default()
+            };
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &create_opts)
+                .await
+                .expect("data movement upload should be created");
+            let part =
+                put_test_part_with_opts(&set_disks, bucket, object, &upload.upload_id, 1, (&[0x41], 1), &create_opts).await;
+            let mut complete_opts = create_opts.clone();
+            rustfs_utils::http::insert_str(
+                &mut complete_opts.user_defined,
+                rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+                declared_size.to_string(),
+            );
+
+            let err = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+                .await
+                .expect_err("invalid authoritative total size must fail closed");
+            assert!(matches!(err, StorageError::PartMissingOrCorrupt));
+        }
     }
 
     async fn assert_complete_first_linearizes(bucket: &'static str, object: &'static str, create_opts: ObjectOptions) {
