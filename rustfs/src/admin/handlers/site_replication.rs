@@ -1067,9 +1067,13 @@ fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
     state.peers = normalize_peer_map_by_identity(state.peers);
     // A peer-edit high-water mark only fences a CURRENT peer. A site that
     // leaves drops below two peers, which clears its own state object and
-    // restarts its generation counter at zero — a mark left over from the
-    // previous membership would then reject every edit it sends after it
-    // rejoins. Dropping departed origins on load also keeps the map bounded.
+    // restarts its generation counter — a mark left over from the previous
+    // membership must not reject the edits it sends after it rejoins. This
+    // pruning covers departures THIS site observed; an origin removed
+    // unilaterally elsewhere stays in this peer map with its mark, and the
+    // wall-clock floor in `next_peer_edit_generation` is what lifts its
+    // restarted counter over that mark. Dropping departed origins on load
+    // also keeps the map bounded.
     state
         .applied_edit_generations
         .retain(|origin, _| state.peers.contains_key(origin));
@@ -5935,11 +5939,51 @@ fn summarize_peer_error_detail(detail: &str) -> String {
     summary
 }
 
-/// Allocate the next peer-edit generation. Called inside the state
-/// transaction, so the counter is handed out under the distributed
-/// state-object lock and two nodes of this site can never take the same one.
+/// The wall clock in unix nanoseconds, clamped into u64. A pre-1970 (or
+/// post-2554) clock yields 0, which makes the hybrid allocation below
+/// degrade to the plain `previous + 1` counter — monotone, never panicking.
+fn edit_generation_wall_clock() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0)
+}
+
+/// Allocate the next peer-edit generation as a hybrid logical clock:
+/// `max(wall clock in unix nanoseconds, previous + 1)`. Called inside the
+/// state transaction, so the value is handed out under the distributed
+/// state-object lock and two nodes of this site can never take the same one
+/// (`previous + 1` keeps the sequence strictly increasing even when two
+/// allocations land in one clock tick, and keeps it monotone on a node
+/// whose clock stepped backwards mid-lifetime).
+///
+/// The wall-clock floor is what survives the counter's death. A site
+/// removed while unreachable — the receiver never dropped it from its peer
+/// map, so the load-time mark pruning in `parse_site_replication_state`
+/// never fired — that later rejoins recreates its state object with the
+/// counter back at zero. A plain counter would then hand out generations
+/// below the receiver's stale high-water mark and every delivery would be
+/// silently fenced until the counter caught up. Jumping to wall time clears
+/// that mark: every value the deleted lifetime handed out was capped by the
+/// wall clock at its own allocation (or by a prior lifetime's cap, applied
+/// inductively), so the recreated lifetime's first allocation exceeds them
+/// all — while a pre-removal delivery still in flight stays below the new
+/// floor and remains correctly fenced. Marks recorded by pre-hybrid
+/// receivers (small plain-counter values) sit far below any wall-clock
+/// value, so a restarted origin passes those too — the fix needs only the
+/// sender upgraded, nothing on the wire or in the receiver changed.
+///
+/// A wall clock that regresses across a delete/recreate (the recreating
+/// node's clock behind the clock that fed the previous lifetime) mints
+/// below the stale mark and the origin stays fenced — but only until real
+/// time passes the previous lifetime's last allocation, because every later
+/// allocation takes the wall-clock floor again. Bounded by the skew,
+/// self-healing, and no rollback window beyond the plain counter's: a
+/// delivery applies only at or above the receiver's mark, so the one
+/// cross-lifetime interleaving that can apply stale content — a
+/// pre-removal delivery whose generation lands above everything the
+/// regressed new lifetime has minted — required the same straggler landing
+/// above the mark under the plain counter, where the recreated counter's
+/// low restart made it strictly easier to hit.
 fn next_peer_edit_generation(state: &mut SiteReplicationState) -> u64 {
-    state.edit_generation = state.edit_generation.saturating_add(1);
+    state.edit_generation = edit_generation_wall_clock().max(state.edit_generation.saturating_add(1));
     state.edit_generation
 }
 
@@ -13244,6 +13288,104 @@ mod tests {
         assert!(!peer_edit_delivery_is_stale(&reloaded, "origin-site", 1));
     }
 
+    /// The unilateral-removal rejoin gap the hybrid clock closes. The origin
+    /// was removed while unreachable, but THIS site never dropped it from
+    /// its peer map, so the load-time mark pruning never fired and the mark
+    /// from the previous membership survives. The origin's recreated state
+    /// object restarts its counter, and with a plain `previous + 1` counter
+    /// every delivery it sent — generations 1, 2, … below the stale mark —
+    /// would be silently acked-and-dropped until the counter caught up. The
+    /// wall-clock floor in `next_peer_edit_generation` lifts the restarted
+    /// counter over every value the deleted lifetime handed out. Reverting
+    /// the allocation to the plain counter (dropping the wall-clock max)
+    /// turns the not-stale assertion red.
+    #[test]
+    fn hybrid_generation_unfences_a_rejoined_origin_whose_counter_restarted() {
+        // First lifetime of the origin's state object: two allocations, both
+        // capped by the wall clock at their own allocation.
+        let mut first_life = SiteReplicationState::default();
+        let straggler = next_peer_edit_generation(&mut first_life);
+        let last_applied = next_peer_edit_generation(&mut first_life);
+        assert!(last_applied > straggler, "allocations must be strictly increasing");
+
+        // The receiver applied up to `last_applied` and keeps the origin in
+        // its peer map across the unilateral removal — reloading must keep
+        // the mark, which is exactly why pruning cannot cover this case.
+        let mut receiver = SiteReplicationState::default();
+        receiver.peers.insert(
+            "origin-site".to_string(),
+            PeerInfo {
+                deployment_id: "origin-site".to_string(),
+                ..peer("origin", "https://origin.example:9000")
+            },
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", last_applied);
+        let mut receiver = parse_site_replication_state(&serde_json::to_vec(&receiver).expect("serialize")).expect("reload");
+        assert_eq!(receiver.applied_edit_generations.get("origin-site"), Some(&last_applied));
+
+        // The origin rejoins with a RECREATED state object: counter back at
+        // zero. The wall-clock floor must lift its first allocation over the
+        // previous lifetime's mark…
+        let mut second_life = SiteReplicationState::default();
+        let restarted = next_peer_edit_generation(&mut second_life);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "the recreated lifetime's first allocation ({restarted}) must not be fenced by the previous lifetime's mark ({last_applied})"
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", restarted);
+
+        // …while a pre-removal delivery still in flight stays below the new
+        // floor and remains correctly fenced — the rollback the fence exists
+        // to reject.
+        assert!(
+            peer_edit_delivery_is_stale(&receiver, "origin-site", straggler),
+            "a pre-removal in-flight delivery ({straggler}) must stay fenced after the rejoin"
+        );
+    }
+
+    /// Marks recorded before the hybrid clock existed are small plain-counter
+    /// values, far below any wall-clock allocation: a restarted origin passes
+    /// them as soon as the SENDER runs the hybrid clock — nothing changes on
+    /// the wire or in the receiver, so pre-hybrid receivers get the fix too.
+    /// The other direction is unchanged: among plain-counter values the
+    /// generation order still fences the delivery that lost the race.
+    #[test]
+    fn hybrid_generation_passes_marks_recorded_by_plain_counter_receivers() {
+        let mut receiver = SiteReplicationState::default();
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", 57);
+        assert!(peer_edit_delivery_is_stale(&receiver, "origin-site", 56));
+        assert!(!peer_edit_delivery_is_stale(&receiver, "origin-site", 57));
+
+        let mut rejoined = SiteReplicationState::default();
+        let restarted = next_peer_edit_generation(&mut rejoined);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "a wall-clock allocation ({restarted}) must clear a plain-counter mark (57)"
+        );
+    }
+
+    /// The `previous + 1` half of the hybrid clock: allocations stay strictly
+    /// increasing even when the wall clock cannot move them forward — two
+    /// allocations inside one clock tick, or a clock that stepped backwards
+    /// mid-lifetime (a counter already ahead of the wall clock advances by
+    /// exactly one per allocation instead of jumping back). Dropping the
+    /// `previous + 1` half (allocating bare wall time) turns this red.
+    #[test]
+    fn hybrid_generation_is_strictly_increasing_when_the_clock_stalls() {
+        let mut state = SiteReplicationState {
+            // A counter far ahead of any wall clock this test will see.
+            edit_generation: u64::MAX / 2,
+            ..Default::default()
+        };
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 1);
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 2);
+        // Saturation pins at the ceiling instead of wrapping; the equal-value
+        // escape (`applied > generation` is false for equal) keeps deliveries
+        // applying rather than fencing the origin out.
+        state.edit_generation = u64::MAX;
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX);
+    }
+
     #[test]
     fn test_retry_stats_for_state_counts_pending_and_failed() {
         let state = SiteReplicationState {
@@ -16044,10 +16186,77 @@ mod tests {
             generations.len(),
             "two nodes took the same edit generation, so their deliveries cannot be ordered: {generations:?}"
         );
+        // The hybrid clock allocates `max(wall nanos, previous + 1)` — the
+        // persisted counter is the largest allocation, and the `+ 1` half
+        // keeps allocations distinct even inside one clock tick.
+        assert_eq!(
+            Some(&load_site_replication_state().await.expect("reload").edit_generation),
+            unique.last(),
+            "the persisted counter must be the largest allocation handed out"
+        );
+    }
+
+    /// The unilateral-removal rejoin, end to end across the state object's
+    /// real lifecycle: dropping below two peers clears the object (the
+    /// counter dies with it), and the recreated object's first allocation —
+    /// raced by two nodes — must clear the previous lifetime's values via
+    /// the wall-clock floor, so a receiver still holding the old mark
+    /// accepts the restarted counter instead of fencing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
+        publish_ready_iam_context().await;
+        let seed = || SiteReplicationState {
+            peers: ["site-a", "site-b"]
+                .into_iter()
+                .map(|name| (name.to_string(), peer(name, &format!("https://{name}.example:9000"))))
+                .collect(),
+            ..Default::default()
+        };
+
+        save_site_replication_state(&seed()).await.expect("seed state");
+        let straggler = update_site_replication_state(|state| Ok(next_peer_edit_generation(state)))
+            .await
+            .expect("first-life allocation");
+        let last_applied = update_site_replication_state(|state| Ok(next_peer_edit_generation(state)))
+            .await
+            .expect("first-life allocation");
+        // A receiver that never dropped this site from its peer map holds
+        // this mark across the removal.
+        let mut receiver = SiteReplicationState::default();
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", last_applied);
+
+        // Unilateral removal: the site drops below two peers, which clears
+        // its state object and the counter with it.
+        let mut departed = seed();
+        departed.peers.remove("site-b");
+        save_site_replication_state(&departed).await.expect("clear state");
         assert_eq!(
             load_site_replication_state().await.expect("reload").edit_generation,
-            generations.len() as u64,
-            "the persisted counter must account for every allocation"
+            0,
+            "clearing the state object must take the counter with it"
+        );
+
+        // Rejoin recreates the state object; two nodes race the first
+        // allocation of the new life.
+        save_site_replication_state(&seed()).await.expect("recreate state");
+        let node_a = tokio::spawn(update_site_replication_state(|state| Ok(next_peer_edit_generation(state))));
+        let node_b = tokio::spawn(update_site_replication_state(|state| Ok(next_peer_edit_generation(state))));
+        let generation_a = node_a.await.expect("node a task").expect("node a allocation");
+        let generation_b = node_b.await.expect("node b task").expect("node b allocation");
+        assert_ne!(generation_a, generation_b, "racing allocations must stay distinct");
+
+        // The receiver's stale mark must not fence the restarted counter…
+        let restarted = generation_a.min(generation_b);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "the recreated life's first allocation ({restarted}) must clear the previous life's mark ({last_applied})"
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", restarted);
+        // …while the cleared life's in-flight leftovers stay fenced.
+        assert!(
+            peer_edit_delivery_is_stale(&receiver, "origin-site", straggler),
+            "a pre-removal in-flight delivery ({straggler}) must stay fenced after the rejoin"
         );
     }
 
