@@ -430,7 +430,7 @@ impl DiskAPI for Disk {
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: FileInfo,
+        fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
@@ -664,6 +664,20 @@ impl DiskAPI for Disk {
             Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
         }
+    }
+}
+
+#[cfg(test)]
+impl Disk {
+    async fn rename_data(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        <Self as DiskAPI>::rename_data(self, src_volume, src_path, &fi, dst_volume, dst_path).await
     }
 }
 
@@ -904,7 +918,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: FileInfo,
+        file_info: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp>;

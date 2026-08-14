@@ -1164,14 +1164,8 @@ impl SetDisks {
                                 let rename_result = if should_fail_heal_rename(bucket, object, index) {
                                     Err(DiskError::Unexpected)
                                 } else {
-                                    disk.rename_data(
-                                        RUSTFS_META_TMP_BUCKET,
-                                        &tmp_id,
-                                        parts_metadata[index].clone(),
-                                        bucket,
-                                        object,
-                                    )
-                                    .await
+                                    disk.rename_data(RUSTFS_META_TMP_BUCKET, &tmp_id, &parts_metadata[index], bucket, object)
+                                        .await
                                 };
 
                                 if let Err(err) = &rename_result {

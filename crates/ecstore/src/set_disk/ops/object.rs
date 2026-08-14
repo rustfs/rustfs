@@ -97,6 +97,7 @@ fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+#[cfg(test)]
 fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_slot: usize) -> usize {
     committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
 }
@@ -2236,11 +2237,13 @@ impl SetDisks {
                     return Err(err);
                 }
 
-                let rename_result = SetDisks::rename_data(
+                Self::assign_rename_data_indexes(&mut parts_metadatas);
+                let fallback_file_info = parts_metadatas.get(response_metadata_slot).cloned();
+                let rename_result = SetDisks::rename_data_owned(
                     &commit_disks,
                     RUSTFS_META_TMP_BUCKET,
                     commit_tmp_dir.as_str(),
-                    &parts_metadatas,
+                    parts_metadatas,
                     &commit_bucket,
                     &commit_object,
                     write_quorum,
@@ -2259,7 +2262,7 @@ impl SetDisks {
                 if rename_result.is_ok() {
                     quota_reservation.commit().await;
                 }
-                let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = match rename_result {
+                let rename_commit = match rename_result {
                     Ok(commit) => commit,
                     Err(err) => {
                         if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
@@ -2274,6 +2277,22 @@ impl SetDisks {
                             );
                         }
                         return Err(err.into());
+                    }
+                };
+                let online_disks = rename_commit.online_disks;
+                let convergence = rename_commit.convergence;
+                let op_old_dir = rename_commit.data_dir;
+                let cleanup_disks = rename_commit.cleanup_disks;
+                let old_current_size = rename_commit.old_current_size;
+                let mut fi = match rename_commit.committed_file_info.or(fallback_file_info) {
+                    Some(file_info) => file_info,
+                    None => {
+                        warn!(
+                            bucket = %commit_bucket,
+                            object = %commit_object,
+                            "rename_data committed without response metadata"
+                        );
+                        FileInfo::default()
                     }
                 };
                 // Do this before any post-commit await so request cancellation cannot
@@ -2383,9 +2402,6 @@ impl SetDisks {
                         );
                     }
                 }
-
-                let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
-                let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
 
                 if is_compressed {
                     record_compression_total_memory(actual_size as u64, w_size as u64).await;

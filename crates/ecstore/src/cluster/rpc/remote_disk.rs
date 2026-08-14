@@ -2280,7 +2280,7 @@ impl DiskAPI for RemoteDisk {
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: FileInfo,
+        fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
@@ -2301,8 +2301,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout_for_op(
             "rename_data",
             || async {
-                let file_info = compat_json(&fi)?;
-                let file_info_bin = encode_file_info_msgpack(&fi)?;
+                let file_info = compat_json(fi)?;
+                let file_info_bin = encode_file_info_msgpack(fi)?;
                 let mut client = self
                     .get_client()
                     .await

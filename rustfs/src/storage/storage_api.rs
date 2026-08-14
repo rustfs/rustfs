@@ -1150,7 +1150,7 @@ pub(crate) trait StorageDiskRpcExt {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
@@ -1301,7 +1301,7 @@ where
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp> {

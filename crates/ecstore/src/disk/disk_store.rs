@@ -1981,7 +1981,7 @@ impl DiskAPI for LocalDiskWrapper {
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: FileInfo,
+        fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
