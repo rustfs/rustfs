@@ -14,6 +14,8 @@
 
 //! rio_v2 selectively replaces legacy rio components while keeping the
 //! remaining API surface stable for feature-gated integration.
+//!
+//! RUSTFS_COMPAT_TODO(rio-v2-dormant-variant): this whole crate is the dormant candidate stream-format implementation for the rustfs/backlog#1638 SSE-interop adjudication and ships in no default or release build. Remove after that adjudication converges on one implementation: delete the losing implementation, its feature seam, and the gating CI jobs.
 
 mod compress_reader;
 mod encrypt_reader;

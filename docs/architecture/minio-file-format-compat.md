@@ -276,12 +276,13 @@ The interop harness reflects this. The reader tests are `#[ignore]` (`rustfs/src
 The variant is deliberately **dormant** until rustfs/backlog#1638 is
 adjudicated. Dormant means:
 
-- **Per-PR CI keeps one guard job.** Only `test-and-lint-rio-v2` in
-  `.github/workflows/ci.yml` runs per PR; its job is to keep the
+- **Per-pull-request CI keeps one guard job.** Only `test-and-lint-rio-v2` in
+  `.github/workflows/ci.yml` runs per pull request; its job is to keep the
   `#[cfg(feature = "rio-v2")]` seam compiling and its unit tests green so the
   variant does not bit-rot. The full-suite lanes —
   `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` — run only on the
-  weekly `schedule` and on `workflow_dispatch`, not per PR, per main push, or
+  weekly `schedule` and on `workflow_dispatch`, not per pull request, per main
+  push, or
   in the merge queue.
 - **Post-1.0 the variant is promoted or deleted.** The #1638 adjudication
   converges on one implementation: either `rio-v2` becomes a shipped
