@@ -138,6 +138,10 @@ where
     S: ShardStripeSource + Send + 'static,
     E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
 {
+    #[allow(
+        dead_code,
+        reason = "default-metrics-path constructor used only by this file's tests (backlog#1823)"
+    )]
     pub(crate) fn new(source: S, engine: E, total_length: usize) -> io::Result<Self> {
         Self::new_with_metrics_path(source, engine, total_length, GET_OBJECT_PATH_CODEC_STREAMING)
     }
@@ -679,6 +683,10 @@ pub(crate) struct SyncErasureDecodeReader<R> {
 }
 
 impl<R> SyncErasureDecodeReader<R> {
+    #[allow(
+        dead_code,
+        reason = "default-metrics-path constructor used only by this file's tests (backlog#1823)"
+    )]
     pub(crate) fn new(inner: R) -> Self {
         Self::new_with_metrics_path(inner, GET_OBJECT_PATH_CODEC_STREAMING)
     }
@@ -805,6 +813,7 @@ where
     Ok(true)
 }
 
+#[allow(dead_code, reason = "shard emission asserted by this file's tests (backlog#1823)")]
 fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     emit_data_shards_into(state, data_shards, block_size, remaining, &mut output)?;

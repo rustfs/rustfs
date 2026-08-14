@@ -166,6 +166,7 @@ where
     if total == 0 { Ok(None) } else { Ok(Some(total)) }
 }
 
+#[allow(dead_code, reason = "byte accounting asserted by this file's tests (backlog#1823)")]
 fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }

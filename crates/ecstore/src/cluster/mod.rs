@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: cluster/RPC migration leaves transport capabilities staged for upcoming owners.
-#![allow(dead_code)]
 
 mod control_plane;
 pub(crate) mod rpc;
