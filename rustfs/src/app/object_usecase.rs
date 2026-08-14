@@ -2173,10 +2173,11 @@ fn get_object_resume_control(ctx: GetObjectResumeContext) -> GetObjectResumeCont
 /// disks" failures keep the existing fail-loud behavior.
 fn is_object_relocation_error(err: &std::io::Error) -> bool {
     let Some(inner) = err.get_ref() else { return false };
-    matches!(
-        inner.downcast_ref::<StorageError>(),
-        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..))
-    )
+    match inner.downcast_ref::<StorageError>() {
+        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..)) => true,
+        Some(StorageError::Io(source)) => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 /// Resolve the S3 request-body inter-chunk read timeout from the environment.
@@ -13006,6 +13007,7 @@ mod tests {
             StorageError::FileNotFound,
             StorageError::ObjectNotFound("test-bucket".to_string(), "relocated-object".to_string()),
             StorageError::InsufficientReadQuorum("test-bucket".to_string(), "relocated-object".to_string()),
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "relocated shard disappeared")),
         ] {
             let reopen_count = Arc::new(AtomicUsize::new(0));
             let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
