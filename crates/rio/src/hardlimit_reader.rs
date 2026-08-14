@@ -24,12 +24,17 @@ pin_project! {
         #[pin]
         pub inner: R,
         remaining: i64,
+        scratch: Vec<u8>,
     }
 }
 
 impl<R> HardLimitReader<R> {
     pub fn new(inner: R, limit: i64) -> Self {
-        HardLimitReader { inner, remaining: limit }
+        HardLimitReader {
+            inner,
+            remaining: limit,
+            scratch: Vec::new(),
+        }
     }
 }
 
@@ -37,19 +42,21 @@ impl<R> AsyncRead for HardLimitReader<R>
 where
     R: AsyncRead,
 {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
-        if self.remaining < 0 {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
+        let mut this = self.project();
+        if *this.remaining < 0 {
             return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
         }
-        let original_filled = buf.filled().len();
-        if self.remaining == 0 {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if *this.remaining == 0 {
             let mut discard = [0u8; 8192];
             let mut discard_buf = ReadBuf::new(&mut discard);
-            return match self.as_mut().project().inner.poll_read(cx, &mut discard_buf) {
+            return match this.inner.as_mut().poll_read(cx, &mut discard_buf) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(())) => {
                     if discard_buf.filled().is_empty() {
-                        debug_assert_eq!(buf.filled().len(), original_filled);
                         Poll::Ready(Ok(()))
                     } else {
                         Poll::Ready(Err(Error::other("input provided more bytes than specified")))
@@ -58,30 +65,46 @@ where
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             };
         }
-        // Save the initial length
-        let before = original_filled;
 
-        // Poll the inner reader
-        let this = self.as_mut().project();
-        let poll = this.inner.poll_read(cx, buf);
-
-        if let Poll::Ready(Ok(())) = &poll {
-            let after = buf.filled().len();
-            let read = (after - before) as i64;
-            if read == 0 && *this.remaining > 0 {
-                return Poll::Ready(Err(Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    IncompleteBody {
-                        remaining: *this.remaining,
-                    },
-                )));
+        let remaining = match usize::try_from(*this.remaining) {
+            Ok(remaining) => remaining,
+            Err(_) => usize::MAX,
+        };
+        let allowed = remaining.min(buf.remaining());
+        let read = if allowed == buf.remaining() {
+            let before = buf.filled().len();
+            match this.inner.as_mut().poll_read(cx, buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => buf.filled().len() - before,
             }
-            *this.remaining -= read;
-            if *this.remaining < 0 {
-                return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
+        } else {
+            this.scratch.resize(allowed, 0);
+            let mut scratch_buf = ReadBuf::new(&mut this.scratch[..allowed]);
+            match this.inner.as_mut().poll_read(cx, &mut scratch_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => {
+                    let read = scratch_buf.filled().len();
+                    buf.put_slice(scratch_buf.filled());
+                    read
+                }
             }
+        };
+        if read == 0 {
+            return Poll::Ready(Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                IncompleteBody {
+                    remaining: *this.remaining,
+                },
+            )));
         }
-        poll
+        let read = match i64::try_from(read) {
+            Ok(read) => read,
+            Err(_) => return Poll::Ready(Err(Error::other("read count exceeds i64::MAX"))),
+        };
+        *this.remaining -= read;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -140,7 +163,12 @@ mod tests {
         assert!(err.is_some());
 
         let err = err.unwrap();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.get_ref()
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some_and(|source| source.to_string().contains("more bytes than specified"))
+        );
     }
 
     #[tokio::test]
@@ -153,6 +181,17 @@ mod tests {
         let n = r.read_to_end(&mut buf).await.unwrap();
         assert_eq!(n, 0);
         assert_eq!(&buf, data);
+    }
+
+    #[tokio::test]
+    async fn test_hardlimit_reader_zero_capacity_read_does_not_consume_input() {
+        let mut reader = HardLimitReader::new(BufReader::new(&b"abc"[..]), 3);
+        let mut empty = [];
+
+        assert_eq!(reader.read(&mut empty).await.expect("zero-capacity read should succeed"), 0);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("input should remain readable");
+        assert_eq!(out, b"abc");
     }
 
     #[tokio::test]
@@ -193,6 +232,20 @@ mod tests {
             .await
             .expect_err("bytes beyond the declared limit must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("more bytes than specified"));
+    }
+
+    #[tokio::test]
+    async fn test_hardlimit_reader_caps_each_read_before_reporting_extra_bytes() {
+        let mut reader = HardLimitReader::new(BufReader::new(&b"abcdef"[..]), 3);
+        let mut out = Vec::new();
+
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("bytes beyond the declared limit must be rejected");
+
+        assert_eq!(out, b"abc");
         assert!(err.to_string().contains("more bytes than specified"));
     }
 }

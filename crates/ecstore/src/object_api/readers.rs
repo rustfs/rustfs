@@ -808,7 +808,7 @@ impl ReadPlan {
                         }
                     }
                 } else {
-                    Box::new(LimitReader::new(dec_reader, total_plaintext_size))
+                    Box::new(HardLimitReader::new(dec_reader, decompressed_length))
                 };
 
                 let mut object_info = oi.clone();
@@ -900,7 +900,7 @@ impl ReadPlan {
                             )?;
                             Box::new(ranged_reader)
                         } else {
-                            Box::new(LimitReader::new(decompressed_reader, total_plaintext_size))
+                            Box::new(HardLimitReader::new(decompressed_reader, total_plaintext_size_i64))
                         }
                     } else if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
                         Box::new(RangedDecompressReader::new(
@@ -910,7 +910,7 @@ impl ReadPlan {
                             total_plaintext_size,
                         )?)
                     } else {
-                        Box::new(LimitReader::new(decrypted_reader, total_plaintext_size))
+                        Box::new(HardLimitReader::new(decrypted_reader, total_plaintext_size_i64))
                     };
 
                 let mut object_info = oi.clone();
