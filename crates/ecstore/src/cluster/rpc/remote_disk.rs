@@ -59,7 +59,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -216,6 +216,8 @@ where
 
 #[derive(Debug)]
 pub struct RemoteDisk {
+    /// Stable identity for this handle instance; replacement handles receive a new identity.
+    handle_id: Uuid,
     pub id: Mutex<Option<Uuid>>,
     pub addr: String,
     endpoint: Endpoint,
@@ -226,7 +228,18 @@ pub struct RemoteDisk {
     health: Arc<DiskHealthTracker>,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    recovery_monitor_active: Arc<AtomicBool>,
     data_transport: Arc<dyn InternodeDataTransport>,
+}
+
+struct RecoveryMonitorLease {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for RecoveryMonitorLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 // ── Connection lifecycle (grpc-optimization P3) ──
@@ -368,14 +381,15 @@ impl RemoteDisk {
             .await
     }
 
-    fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
+    fn recovery_monitor_span(addr: &str, endpoint: &Endpoint, handle_id: Uuid) -> tracing::Span {
         tracing::info_span!(
             "recovery-monitor",
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
             kind = "remote_disk",
             endpoint = %endpoint,
-            addr = %addr
+            addr = %addr,
+            handle_id = %handle_id
         )
     }
 
@@ -411,6 +425,7 @@ impl RemoteDisk {
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let disk = Self {
+            handle_id: Uuid::new_v4(),
             id: Mutex::new(None),
             addr,
             endpoint: ep.clone(),
@@ -418,6 +433,7 @@ impl RemoteDisk {
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
+            recovery_monitor_active: Arc::new(AtomicBool::new(false)),
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
@@ -433,6 +449,11 @@ impl RemoteDisk {
 
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
+    }
+
+    #[cfg(test)]
+    fn recovery_monitor_is_active(&self) -> bool {
+        self.recovery_monitor_active.load(Ordering::Acquire)
     }
 
     pub fn offline_duration_secs(&self) -> Option<u64> {
@@ -573,13 +594,40 @@ impl RemoteDisk {
             return;
         }
 
-        let addr = self.addr.clone();
-        let endpoint = self.endpoint.clone();
-        let health = Arc::clone(&self.health);
-        let cancel_token = self.cancel_token.clone();
-        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        Self::schedule_recovery_monitor(
+            self.addr.clone(),
+            self.endpoint.clone(),
+            self.handle_id,
+            Arc::clone(&self.health),
+            self.cancel_token.clone(),
+            Arc::clone(&self.recovery_monitor_active),
+        );
+    }
+
+    fn schedule_recovery_monitor(
+        addr: String,
+        endpoint: Endpoint,
+        handle_id: Uuid,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+        active: Arc<AtomicBool>,
+    ) {
+        if active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let span = Self::recovery_monitor_span(&addr, &endpoint, handle_id);
         super::spawn_background_monitor(span, async move {
-            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+            let lease = RecoveryMonitorLease {
+                active: Arc::clone(&active),
+            };
+            Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
+            drop(lease);
+            if !cancel_token.is_cancelled() && health.runtime_state() != RuntimeDriveHealthState::Online {
+                Self::schedule_recovery_monitor(addr, endpoint, handle_id, health, cancel_token, active);
+            }
         });
     }
 
@@ -588,7 +636,7 @@ impl RemoteDisk {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let endpoint = self.endpoint.clone();
         let addr = self.addr.clone();
-        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        let span = Self::recovery_monitor_span(&addr, &endpoint, self.handle_id);
         super::spawn_background_monitor(span, async move {
             warn!(
                 event = EVENT_REMOTE_DISK_HEALTH,
@@ -619,9 +667,11 @@ impl RemoteDisk {
         let cancel_token = self.cancel_token.clone();
         let addr = self.addr.clone();
         let endpoint = self.endpoint.clone();
+        let handle_id = self.handle_id;
+        let recovery_monitor_active = Arc::clone(&self.recovery_monitor_active);
 
         tokio::spawn(async move {
-            Self::monitor_remote_disk_health(addr, endpoint, health, cancel_token).await;
+            Self::monitor_remote_disk_health(addr, endpoint, handle_id, health, cancel_token, recovery_monitor_active).await;
         });
     }
 
@@ -629,8 +679,10 @@ impl RemoteDisk {
     async fn monitor_remote_disk_health(
         addr: String,
         endpoint: Endpoint,
+        handle_id: Uuid,
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
+        recovery_monitor_active: Arc<AtomicBool>,
     ) {
         let mut interval = time::interval(get_drive_active_check_interval());
 
@@ -655,11 +707,14 @@ impl RemoteDisk {
             let addr_clone = addr.clone();
             let endpoint_clone = endpoint.clone();
             let cancel_clone = cancel_token.clone();
-            let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
-
-            super::spawn_background_monitor(span, async move {
-                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-            });
+            Self::schedule_recovery_monitor(
+                addr_clone,
+                endpoint_clone,
+                handle_id,
+                health_clone,
+                cancel_clone,
+                Arc::clone(&recovery_monitor_active),
+            );
         }
 
         loop {
@@ -718,11 +773,14 @@ impl RemoteDisk {
                         let addr_clone = addr.clone();
                         let endpoint_clone = endpoint.clone();
                         let cancel_clone = cancel_token.clone();
-                        let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
-
-                        super::spawn_background_monitor(span, async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                        });
+                        Self::schedule_recovery_monitor(
+                            addr_clone,
+                            endpoint_clone,
+                            handle_id,
+                            health_clone,
+                            cancel_clone,
+                            Arc::clone(&recovery_monitor_active),
+                        );
                     }
                 }
             }
@@ -973,6 +1031,7 @@ impl RemoteDisk {
                 subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
                 endpoint = %self.endpoint,
                 addr = %self.addr,
+                handle_id = %self.handle_id,
                 op,
                 state = "faulty_short_circuit",
                 "Remote disk operation short-circuited by faulty state"
@@ -4380,6 +4439,45 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn faulty_handle_runs_only_one_recovery_monitor() {
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").expect("endpoint should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        if !disk.health_check {
+            return;
+        }
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        disk.spawn_recovery_monitor_if_needed();
+        disk.spawn_recovery_monitor_if_needed();
+        assert!(disk.recovery_monitor_is_active(), "only one recovery monitor should own the handle");
+
+        disk.cancel_token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.recovery_monitor_is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled recovery monitor should release its single-flight state");
+        assert!(!disk.recovery_monitor_is_active());
     }
 
     #[tokio::test]

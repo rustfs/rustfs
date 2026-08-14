@@ -384,6 +384,17 @@ pub struct DiskHealthTracker {
     pub last_capacity_free: AtomicU64,
     /// Last successful capacity probe timestamp
     pub last_capacity_probe_unix_secs: AtomicI64,
+    /// Authoritative atomically published runtime/status pair.
+    state_snapshot: AtomicU64,
+    transition_lock: std::sync::Mutex<()>,
+}
+
+fn pack_health_state(runtime_state: RuntimeDriveHealthState, status: u32) -> u64 {
+    (u64::from(runtime_state as u32) << 32) | u64::from(status)
+}
+
+fn unpack_health_state(snapshot: u64) -> (RuntimeDriveHealthState, u32) {
+    (RuntimeDriveHealthState::from_u32((snapshot >> 32) as u32), snapshot as u32)
 }
 
 #[derive(Debug)]
@@ -696,6 +707,8 @@ impl DiskHealthTracker {
             last_capacity_used: AtomicU64::new(0),
             last_capacity_free: AtomicU64::new(0),
             last_capacity_probe_unix_secs: AtomicI64::new(0),
+            state_snapshot: AtomicU64::new(pack_health_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK)),
+            transition_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -732,38 +745,56 @@ impl DiskHealthTracker {
 
     /// Check if disk is faulty
     pub fn is_faulty(&self) -> bool {
-        self.status.load(Ordering::Acquire) == DISK_HEALTH_FAULTY
+        unpack_health_state(self.state_snapshot.load(Ordering::Acquire)).1 == DISK_HEALTH_FAULTY
+    }
+
+    pub fn health_state_snapshot(&self) -> (RuntimeDriveHealthState, bool) {
+        let (runtime_state, status) = unpack_health_state(self.state_snapshot.load(Ordering::Acquire));
+        (runtime_state, status == DISK_HEALTH_FAULTY)
+    }
+
+    fn publish_state(&self, runtime_state: RuntimeDriveHealthState, status: u32) {
+        self.state_snapshot
+            .store(pack_health_state(runtime_state, status), Ordering::Release);
+        self.runtime_state.store(runtime_state as u32, Ordering::Release);
+        self.status.store(status, Ordering::Release);
     }
 
     /// Set disk as faulty
     pub fn set_faulty(&self) {
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_state(RuntimeDriveHealthState::Offline, DISK_HEALTH_FAULTY);
     }
 
     /// Set disk as OK
     pub fn set_ok(&self) {
-        self.status.store(DISK_HEALTH_OK, Ordering::Release);
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK);
     }
 
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
-        self.runtime_state.store(state as u32, Ordering::Release);
-        match state {
-            RuntimeDriveHealthState::Offline => self.set_faulty(),
-            RuntimeDriveHealthState::Online | RuntimeDriveHealthState::Suspect | RuntimeDriveHealthState::Returning => {
-                self.set_ok();
-            }
-        }
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let status = if state == RuntimeDriveHealthState::Offline {
+            DISK_HEALTH_FAULTY
+        } else {
+            DISK_HEALTH_OK
+        };
+        self.publish_state(state, status);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
-        self.status
-            .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_, status) = unpack_health_state(self.state_snapshot.load(Ordering::Acquire));
+        if status != DISK_HEALTH_OK {
+            return false;
+        }
+        self.publish_state(RuntimeDriveHealthState::Offline, DISK_HEALTH_FAULTY);
+        true
     }
 
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
-        RuntimeDriveHealthState::from_u32(self.runtime_state.load(Ordering::Acquire))
+        unpack_health_state(self.state_snapshot.load(Ordering::Acquire)).0
     }
 
     pub fn offline_duration(&self) -> Option<Duration> {
@@ -779,6 +810,7 @@ impl DiskHealthTracker {
     }
 
     pub fn mark_failure(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         let now = current_unix_secs();
         let next = match current {
@@ -807,23 +839,18 @@ impl DiskHealthTracker {
         };
 
         let became_offline = next == RuntimeDriveHealthState::Offline && current != RuntimeDriveHealthState::Offline;
-        if next == RuntimeDriveHealthState::Offline {
-            self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
-        } else {
-            self.status.store(DISK_HEALTH_OK, Ordering::Release);
-        }
         self.transition_state(endpoint, current, next, reason);
         became_offline
     }
 
     pub fn mark_offline(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         if current == RuntimeDriveHealthState::Offline {
             return false;
         }
 
         self.consecutive_successes.store(0, Ordering::Release);
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
         self.transition_state(endpoint, current, RuntimeDriveHealthState::Offline, reason);
         true
     }
@@ -837,11 +864,10 @@ impl DiskHealthTracker {
     }
 
     fn reset_for_store_init_retry_at(&self, endpoint: &Endpoint, now: Duration) {
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now_nanos = unix_nanos(now);
         let now_secs = unix_secs_i64(now);
-        self.status.store(DISK_HEALTH_OK, Ordering::Release);
-        self.runtime_state
-            .store(RuntimeDriveHealthState::Online as u32, Ordering::Release);
+        self.publish_state(RuntimeDriveHealthState::Online, DISK_HEALTH_OK);
         self.consecutive_failures.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
         self.offline_since_unix_secs.store(0, Ordering::Release);
@@ -853,6 +879,7 @@ impl DiskHealthTracker {
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        let _guard = self.transition_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.runtime_state();
         let next = match current {
             RuntimeDriveHealthState::Online => RuntimeDriveHealthState::Online,
@@ -873,7 +900,6 @@ impl DiskHealthTracker {
 
         let became_online = next == RuntimeDriveHealthState::Online;
         if became_online {
-            self.status.store(DISK_HEALTH_OK, Ordering::Release);
             self.consecutive_failures.store(0, Ordering::Release);
             self.consecutive_successes.store(0, Ordering::Release);
         }
@@ -903,7 +929,13 @@ impl DiskHealthTracker {
             return;
         }
 
-        self.runtime_state.store(next as u32, Ordering::Release);
+        let current_status = unpack_health_state(self.state_snapshot.load(Ordering::Acquire)).1;
+        let status = match next {
+            RuntimeDriveHealthState::Offline => DISK_HEALTH_FAULTY,
+            RuntimeDriveHealthState::Returning => current_status,
+            RuntimeDriveHealthState::Online | RuntimeDriveHealthState::Suspect => DISK_HEALTH_OK,
+        };
+        self.publish_state(next, status);
         self.last_transition_unix_secs
             .store(current_unix_secs() as i64, Ordering::Release);
 
@@ -1189,7 +1221,7 @@ impl LocalDiskWrapper {
                         return;
                     }
 
-                    if health.status.load(Ordering::Relaxed) != DISK_HEALTH_OK {
+                    if health.is_faulty() {
                         continue;
                     }
 
@@ -2898,6 +2930,35 @@ mod tests {
             assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(health.offline_duration().is_none());
         });
+    }
+
+    #[test]
+    fn concurrent_failure_and_recovery_publish_one_health_snapshot() {
+        let endpoint = Endpoint::try_from("/tmp/concurrent-health-snapshot").expect("endpoint should parse");
+        let health = Arc::new(DiskHealthTracker::new());
+        let workers = (0..8)
+            .map(|_| {
+                let health = Arc::clone(&health);
+                let endpoint = endpoint.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        health.mark_failure(&endpoint, "concurrent_test");
+                        health.mark_recovery_success(&endpoint, "concurrent_test");
+                        let (runtime, faulty) = health.health_state_snapshot();
+                        assert!(matches!(
+                            (runtime, faulty),
+                            (RuntimeDriveHealthState::Online, false)
+                                | (RuntimeDriveHealthState::Suspect, false)
+                                | (RuntimeDriveHealthState::Offline, true)
+                                | (RuntimeDriveHealthState::Returning, true)
+                        ));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("health transition worker should not panic");
+        }
     }
 
     #[test]
