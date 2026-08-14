@@ -134,7 +134,6 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
-use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
@@ -918,7 +917,7 @@ pin_project! {
 }
 
 struct MemoryTrackedBytesStream {
-    bytes: Bytes,
+    bytes: Option<Bytes>,
     emitted: bool,
     completed: bool,
     expected: usize,
@@ -1032,7 +1031,7 @@ impl MemoryTrackedBytesStream {
     ) -> Self {
         let length_mismatch = bytes.len() != expected;
         Self {
-            bytes,
+            bytes: Some(bytes),
             emitted: false,
             completed: !length_mismatch && expected == 0,
             expected,
@@ -1100,35 +1099,36 @@ impl futures::Stream for MemoryTrackedBytesStream {
         // differently sized body. This is a defense-in-depth backstop; the
         // buffered/cache callers reject the mismatch before headers are sent.
         if this.length_mismatch {
+            let actual = this.bytes.as_ref().map_or(0, Bytes::len);
             this.emitted = true;
             this.finish_err();
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "materialized GET body length mismatch: expected {}, got {}",
-                    this.expected,
-                    this.bytes.len()
-                ),
+                format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
             ))));
         }
 
-        let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
+        let Some(bytes) = this.bytes.take() else {
+            return Poll::Ready(None);
+        };
+        let bytes_len = bytes.len();
+        let first_byte_elapsed = (!bytes.is_empty()).then(|| this.started.elapsed());
         this.emitted = true;
         if let Some(elapsed) = first_byte_elapsed {
             rustfs_io_metrics::record_get_object_first_byte_latency(GET_OBJECT_STAGE_PATH_S3_HANDLER, elapsed.as_secs_f64());
         }
-        if this.bytes.len() >= this.expected {
+        if bytes_len >= this.expected {
             this.finish_ok();
         }
         if let Some(poll_start) = poll_start {
             rustfs_io_metrics::record_get_object_memory_body_stream_poll(
                 this.source,
                 GET_READER_STREAM_POLL_READY_DATA,
-                this.bytes.len(),
+                bytes_len,
                 poll_start.elapsed().as_secs_f64(),
             );
         }
-        Poll::Ready(Some(Ok(this.bytes.clone())))
+        Poll::Ready(Some(Ok(bytes)))
     }
 }
 
@@ -4148,10 +4148,7 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(bytes_stream(
-            MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle),
-            remaining,
-        ));
+        let blob = StreamingBlob::wrap(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
