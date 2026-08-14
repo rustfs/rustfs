@@ -8689,12 +8689,12 @@ impl DiskAPI for LocalDisk {
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: &FileInfo,
+        fi: FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
-        let mut fi = fi.clone();
+        let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
         // optimistic; this lease establishes the local commit/delete order and
@@ -10580,17 +10580,16 @@ impl DiskAPI for LocalDisk {
     }
 }
 
-#[cfg(test)]
 impl LocalDisk {
-    async fn rename_data(
+    pub(crate) async fn rename_data_borrowed(
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: FileInfo,
+        fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        <Self as DiskAPI>::rename_data(self, src_volume, src_path, &fi, dst_volume, dst_path).await
+        <Self as DiskAPI>::rename_data(self, src_volume, src_path, fi.clone(), dst_volume, dst_path).await
     }
 }
 

@@ -2604,9 +2604,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 return Err(StorageError::Unexpected);
             }
 
-            if let Some(committed) = committed_file_info {
-                fi = committed;
-            }
+            fi = committed_file_info;
             let committed_dir = fi.data_dir.unwrap_or_default().to_string();
 
             commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);

@@ -46,6 +46,7 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::disk::{
     DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
@@ -3017,7 +3018,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) data_dir: Option<Uuid>,
     pub(in crate::set_disk) cleanup_disks: Vec<Option<DiskStore>>,
     pub(in crate::set_disk) old_current_size: Option<OldCurrentSize>,
-    pub(in crate::set_disk) committed_file_info: Option<FileInfo>,
+    pub(in crate::set_disk) committed_file_info: FileInfo,
 }
 
 type RenameDataLegacyTuple = (
@@ -3242,7 +3243,7 @@ impl SetDisks {
                         // A no-op immediately-ready future in production.
                         Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                        disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                        disk.rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                             .await
                     })
                     .catch_unwind()
@@ -3435,10 +3436,8 @@ impl SetDisks {
         let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
-        let committed_file_info = online_disks
-            .iter()
-            .position(Option::is_some)
-            .map(|slot| std::mem::take(&mut file_infos[slot]));
+        let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
+        let committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
                 .iter()
