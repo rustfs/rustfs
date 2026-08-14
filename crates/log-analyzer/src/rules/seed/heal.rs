@@ -97,7 +97,7 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["Heal task execution failed", "Heal manager is not running"]),
+            anchors: strings(["Heal task execution failed"]),
             ..base(
                 "heal-task-failure",
                 P2Degraded,
@@ -106,7 +106,6 @@ pub(super) fn rules() -> Vec<Rule> {
                 any([
                     prefix("Heal task timeout"),
                     prefix("Heal task execution failed"),
-                    contains("Heal manager is not running"),
                 ]),
                 "heal 任务调度/执行层故障。",
                 "检查 heal 后台服务状态与资源压力。",
