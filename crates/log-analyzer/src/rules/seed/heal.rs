@@ -103,10 +103,7 @@ pub(super) fn rules() -> Vec<Rule> {
                 P2Degraded,
                 "heal",
                 "heal 任务调度/执行失败",
-                any([
-                    prefix("Heal task timeout"),
-                    prefix("Heal task execution failed"),
-                ]),
+                any([prefix("Heal task timeout"), prefix("Heal task execution failed")]),
                 "heal 任务调度/执行层故障。",
                 "检查 heal 后台服务状态与资源压力。",
             )
