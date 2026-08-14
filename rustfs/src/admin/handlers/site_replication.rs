@@ -8804,15 +8804,127 @@ impl Operation for SiteReplicationNetPerfHandler {
 
 pub struct SRPeerJoinHandler {}
 
-/// What the join transaction decided about an incoming peer join. The
-/// staleness check and the write share one transaction, so the verdict — and
-/// the committed state the back-fill afterwards needs — travel out of the
-/// closure instead of being answered where they are decided.
+/// What the join admission decided about an incoming peer join. The verdict —
+/// and the committed state the back-fill afterwards needs — travel out of
+/// [`admit_peer_join`] instead of being answered where they are decided.
 enum PeerJoinOutcome {
     Applied(Box<SiteReplicationState>, PeerInfo),
     /// A newer join already landed here; the sender is answered with the local
     /// peer record and nothing is written.
     Superseded(PeerInfo),
+}
+
+/// The serialized half of an accepted peer join: staleness check, IAM apply,
+/// state commit.
+///
+/// The whole sequence runs under the lifecycle guard, and the staleness check
+/// runs BEFORE `apply_iam`, against a load taken under that guard. Both
+/// halves matter: the IAM write and the state commit cannot share a
+/// transaction, so without the guard two joins accepted by this node can
+/// interleave as "A checks a stale snapshot, B applies secret B and commits,
+/// A overwrites IAM with secret A, A's commit is refused as superseded" —
+/// leaving the persisted state advertising B's contract while IAM only
+/// accepts A's secret, and every peer control-plane call failing auth. The
+/// closing transaction still re-checks staleness: another NODE of this site
+/// can accept a join concurrently (the guard is process-local, exactly as
+/// far as the pre-P1-15 process mutex reached), and the state-object lock is
+/// what arbitrates that.
+///
+/// `apply_iam` is injected so the interleaving regression test can gate it
+/// mid-flight; production passes the real service-account upsert.
+async fn admit_peer_join<F, Fut>(
+    local_endpoint: String,
+    join_req: SRPeerJoinReq,
+    defer_sync_state_enable: bool,
+    apply_iam: F,
+) -> S3Result<PeerJoinOutcome>
+where
+    F: FnOnce(SRPeerJoinReq) -> Fut,
+    Fut: std::future::Future<Output = S3Result<()>>,
+{
+    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+
+    let fresh = load_site_replication_state().await?;
+    let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+    if join_request_is_superseded(&fresh, join_req.updated_at) {
+        let peer = fresh
+            .peers
+            .get(&fresh_local_peer.deployment_id)
+            .cloned()
+            .unwrap_or(fresh_local_peer);
+        return Ok(PeerJoinOutcome::Superseded(peer));
+    }
+
+    apply_iam(join_req.clone()).await?;
+
+    let incoming_updated_at = join_req.updated_at;
+    update_site_replication_state_when_changed(move |state| {
+        let local_peer = local_peer_at_endpoint(local_endpoint, state);
+        if join_request_is_superseded(state, incoming_updated_at) {
+            let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+            return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+        }
+        apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+        Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+    })
+    .await
+}
+
+/// Upsert the replication service account a peer join carries. No-op when the
+/// join brings no credentials.
+async fn apply_peer_join_service_account(join_req: SRPeerJoinReq) -> S3Result<()> {
+    if join_req.svc_acct_access_key.is_empty() || join_req.svc_acct_secret_key.is_empty() {
+        return Ok(());
+    }
+    let Some(iam_sys) = current_iam_handle() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+
+    if iam_sys.get_service_account(&join_req.svc_acct_access_key).await.is_ok() {
+        iam_sys
+            .update_service_account(
+                &join_req.svc_acct_access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+                        Some(site_replicator_service_account_policy()?)
+                    } else {
+                        None
+                    },
+                    secret_key: Some(join_req.svc_acct_secret_key.clone()),
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: None,
+                    parent_user: None,
+                    allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+    } else {
+        iam_sys
+            .new_service_account(
+                &join_req.svc_acct_parent,
+                None,
+                NewServiceAccountOpts {
+                    session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+                        Some(site_replicator_service_account_policy()?)
+                    } else {
+                        None
+                    },
+                    access_key: join_req.svc_acct_access_key.clone(),
+                    secret_key: join_req.svc_acct_secret_key.clone(),
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
+                    claims: None,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -8821,87 +8933,16 @@ impl Operation for SRPeerJoinHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
-        let snapshot = load_site_replication_state().await?;
-        let local_peer = local_peer_at_endpoint(local_endpoint.clone(), &snapshot);
+        // The body is fully read before the admission takes the lifecycle
+        // guard: a sender that stalls mid-body must not block this node's
+        // add/remove/rotate/reconciler.
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
         let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
         let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
-        // Cheap reject before the IAM work below. The authoritative check runs
-        // again inside the commit, against the state loaded there.
-        if join_request_is_superseded(&snapshot, join_req.updated_at) {
-            return json_response(&SRPeerJoinResponse {
-                peer: snapshot.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
-                ..Default::default()
-            });
-        }
-
-        if !join_req.svc_acct_access_key.is_empty() && !join_req.svc_acct_secret_key.is_empty() {
-            let Some(iam_sys) = current_iam_handle() else {
-                return Err(s3_error!(InvalidRequest, "iam not init"));
-            };
-
-            if iam_sys.get_service_account(&join_req.svc_acct_access_key).await.is_ok() {
-                iam_sys
-                    .update_service_account(
-                        &join_req.svc_acct_access_key,
-                        UpdateServiceAccountOpts {
-                            session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
-                                Some(site_replicator_service_account_policy()?)
-                            } else {
-                                None
-                            },
-                            secret_key: Some(join_req.svc_acct_secret_key.clone()),
-                            name: None,
-                            description: None,
-                            expiration: None,
-                            status: None,
-                            parent_user: None,
-                            allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-            } else {
-                iam_sys
-                    .new_service_account(
-                        &join_req.svc_acct_parent,
-                        None,
-                        NewServiceAccountOpts {
-                            session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
-                                Some(site_replicator_service_account_policy()?)
-                            } else {
-                                None
-                            },
-                            access_key: join_req.svc_acct_access_key.clone(),
-                            secret_key: join_req.svc_acct_secret_key.clone(),
-                            name: None,
-                            description: None,
-                            expiration: None,
-                            allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                            claims: None,
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-            }
-        }
-
-        // The join is applied to the state loaded inside the transaction, not
-        // to the snapshot the IAM work above ran against: only the freshly
-        // loaded state can decide whether a newer join beat this one here.
-        let incoming_updated_at = join_req.updated_at;
-        let committed = update_site_replication_state_when_changed(move |state| {
-            let local_peer = local_peer_at_endpoint(local_endpoint, state);
-            if join_request_is_superseded(state, incoming_updated_at) {
-                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
-                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
-            }
-            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
-            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
-        })
-        .await?;
+        let committed =
+            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?;
         // Committed; the reverse-reachability probe and the bucket back-fill
         // run outside the transaction — their transport helpers' retry-event
         // bookkeeping re-enters it (P1-15).
@@ -15559,6 +15600,114 @@ mod tests {
             "a missed pending lookup persisted (and therefore cleared) the state object"
         );
         assert_eq!(reloaded.peers.len(), 1, "the peer record must survive the no-op calls");
+    }
+
+    /// Review follow-up on P1-15 PR2 (overtrue): two joins accepted by the
+    /// same node must not interleave their IAM writes with each other's
+    /// commits. Join A loads a stale snapshot and pauses before its IAM
+    /// write; join B (newer) applies secret B and commits; A resumes, its
+    /// IAM write would overwrite secret B, and its commit is then refused as
+    /// superseded — the persisted state advertises B's contract while IAM
+    /// holds A's secret. `admit_peer_join` closes this by serializing the
+    /// whole admission under the lifecycle guard and re-checking staleness
+    /// BEFORE the IAM step: with the guard, B cannot even start while A is
+    /// gated mid-IAM. Remove the guard (or move the IAM step ahead of the
+    /// fresh staleness check) and this test deadlocks or records B's IAM
+    /// write before A finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
+        publish_ready_iam_context().await;
+
+        // Whole-second timestamps so the RFC3339 round trip through the state
+        // object cannot lose sub-second precision under the equality asserts.
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
+        let local = PeerInfo {
+            deployment_id: "site-local".to_string(),
+            ..peer("site-local", "https://local.example:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-remote".to_string(),
+            ..peer("site-remote", "https://remote.example:9000")
+        };
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            updated_at: Some(now - Duration::from_secs(60)),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        let join_peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote.clone()),
+        ]);
+        let join_req = |updated_at: OffsetDateTime, secret: &str| SRPeerJoinReq {
+            svc_acct_access_key: "svc-join".to_string(),
+            svc_acct_secret_key: secret.to_string(),
+            svc_acct_parent: "root".to_string(),
+            peers: join_peers.clone(),
+            updated_at: Some(updated_at),
+        };
+
+        let iam_log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (a_entered_tx, a_entered_rx) = tokio::sync::oneshot::channel();
+        let (a_gate_tx, a_gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Join A (older, T1): pauses inside its IAM step.
+        let log_a = iam_log.clone();
+        let endpoint_a = "https://local.example:9000".to_string();
+        let req_a = join_req(now - Duration::from_secs(30), "secret-a");
+        let join_a = tokio::spawn(async move {
+            admit_peer_join(endpoint_a, req_a, true, move |_req| async move {
+                let _ = a_entered_tx.send(());
+                let _ = a_gate_rx.await;
+                log_a.lock().expect("iam log").push("iam-a");
+                Ok(())
+            })
+            .await
+        });
+        a_entered_rx.await.expect("join A reached its IAM step");
+
+        // Join B (newer, T2) arrives while A is gated mid-IAM. The lifecycle
+        // guard must hold it at the door.
+        let log_b = iam_log.clone();
+        let endpoint_b = "https://local.example:9000".to_string();
+        let req_b = join_req(now, "secret-b");
+        let join_b = tokio::spawn(async move {
+            admit_peer_join(endpoint_b, req_b, true, move |_req| async move {
+                log_b.lock().expect("iam log").push("iam-b");
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            iam_log.lock().expect("iam log").is_empty(),
+            "join B ran its IAM step while join A was still mid-admission: {:?}",
+            iam_log.lock().expect("iam log")
+        );
+
+        a_gate_tx.send(()).expect("release join A");
+        let outcome_a = join_a.await.expect("join A task").expect("join A admission");
+        let outcome_b = join_b.await.expect("join B task").expect("join B admission");
+        assert!(matches!(outcome_a, PeerJoinOutcome::Applied(..)), "join A must commit first");
+        assert!(
+            matches!(outcome_b, PeerJoinOutcome::Applied(..)),
+            "the newer join B must still apply after A"
+        );
+        assert_eq!(
+            *iam_log.lock().expect("iam log"),
+            vec!["iam-a", "iam-b"],
+            "IAM writes must land in admission order, ending on the committed join's secret"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").updated_at,
+            Some(now),
+            "the persisted state must end on join B, matching the last IAM write"
+        );
     }
 
     /// P1-15 PR2: the three-way contract of `finalize_pending_rotation_if_complete`
