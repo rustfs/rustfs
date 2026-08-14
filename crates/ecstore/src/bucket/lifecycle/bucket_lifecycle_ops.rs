@@ -5788,6 +5788,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         .expect("transitioned reader should open");
@@ -5852,6 +5853,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -5892,6 +5894,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6129,6 +6132,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6152,6 +6156,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
