@@ -148,7 +148,6 @@ mod heal_walk;
 pub use heal_walk::HealWalkVersion;
 mod init;
 pub(crate) mod init_format;
-mod list;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
@@ -601,7 +600,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         start_after: Option<String>,
         incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
-        self.handle_list_objects_v2(
+        self.inner_list_objects_v2(
             bucket,
             prefix,
             continuation_token,
@@ -624,7 +623,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        self.handle_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
     }
 
@@ -636,7 +635,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
         opts: WalkOptions,
     ) -> Result<()> {
-        self.handle_walk(rx, bucket, prefix, result, opts).await
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
 
