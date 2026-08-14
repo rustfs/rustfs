@@ -64,7 +64,9 @@ mod ecstore_metrics {
 }
 
 mod ecstore_notification {
-    pub(crate) use crate::storage::storage_api::ecstore_notification::NotificationSys;
+    pub(crate) use crate::storage::storage_api::ecstore_notification::{
+        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+    };
 }
 
 #[allow(unused_imports)]
@@ -111,6 +113,10 @@ pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 pub(crate) type TierCreds = ecstore_tier::tier_admin::TierCreds;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
 pub(crate) type TierConfigUpdateError = crate::storage::storage_api::TierConfigUpdateError;
+
+pub(crate) fn acquire_cross_pool_fence_fleet_proof() -> Option<ecstore_notification::CrossPoolFenceFleetProofToken> {
+    ecstore_notification::acquire_cross_pool_fence_fleet_proof()
+}
 
 pub(crate) mod runtime_sources {
     pub(crate) type DailyAllTierStats = super::DailyAllTierStats;
@@ -294,6 +300,15 @@ pub(crate) mod metadata_sys {
         expected_incarnation_id: uuid::Uuid,
     ) -> Result<OffsetDateTime> {
         super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
+    }
+
+    pub(crate) async fn update_quota_if_incarnation(
+        bucket: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_quota_if_incarnation(bucket, data, expected_incarnation_id, proof).await
     }
 
     pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {

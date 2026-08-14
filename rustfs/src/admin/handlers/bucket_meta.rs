@@ -465,6 +465,16 @@ impl Operation for ImportBucketMetadata {
             file_contents.push((file_path, content));
         }
 
+        let durable_quota_import = imported_quota_requires_fleet_proof(&file_contents)?;
+        let quota_fleet_proof =
+            if durable_quota_import {
+                Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                    s3_error!(ServiceUnavailable, "durable quota capability is not confirmed across the cluster")
+                })?)
+            } else {
+                None
+            };
+
         // Extract bucket names
         let mut bucket_names = Vec::new();
         for (file_path, _) in &file_contents {
@@ -707,21 +717,6 @@ impl Operation for ImportBucketMetadata {
                 }
 
                 BUCKET_QUOTA_CONFIG_FILE => {
-                    if let Err(e) = serde_json::from_slice::<BucketQuota>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
                     let metadata = match bucket_metadatas.get_mut(bucket_name) {
                         Some(m) => m,
                         None => continue,
@@ -830,10 +825,6 @@ impl Operation for ImportBucketMetadata {
             }
         }
 
-        // Persist the assembled metadata to disk. Prior to this, the import only mutated the
-        // in-memory `bucket_metadatas` map and returned 200, silently dropping every imported
-        // config. `metadata_sys::update` loads the on-disk metadata, overwrites the given config
-        // field and saves it, preserving any configs not present in the import archive.
         for (bucket_name, metadata) in &bucket_metadatas {
             for (config_file, data) in imported_configs_to_persist(metadata) {
                 let site_replication_item = imported_config_to_site_replication_item(bucket_name, metadata, config_file, &data)?;
@@ -842,7 +833,21 @@ impl Operation for ImportBucketMetadata {
                 } else {
                     None
                 };
-                if let Err(e) = metadata_sys::update(bucket_name, config_file, data).await {
+                let persist_result = if config_file == BUCKET_QUOTA_CONFIG_FILE {
+                    let quota: BucketQuota =
+                        serde_json::from_slice(&data).map_err(|e| s3_error!(InvalidRequest, "invalid bucket quota: {e}"))?;
+                    if quota.uses_durable_reservations() {
+                        let proof = quota_fleet_proof.as_ref().ok_or_else(|| {
+                            s3_error!(ServiceUnavailable, "durable quota capability is not confirmed across the cluster")
+                        })?;
+                        metadata_sys::update_quota_if_incarnation(bucket_name, data, metadata.bucket_incarnation_id, proof).await
+                    } else {
+                        metadata_sys::update_if_incarnation(bucket_name, config_file, data, metadata.bucket_incarnation_id).await
+                    }
+                } else {
+                    metadata_sys::update_if_incarnation(bucket_name, config_file, data, metadata.bucket_incarnation_id).await
+                };
+                if let Err(e) = persist_result {
                     warn!(
                         event = EVENT_ADMIN_BUCKET_META_STATE,
                         component = LOG_COMPONENT_ADMIN,
@@ -883,6 +888,26 @@ impl Operation for ImportBucketMetadata {
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
+}
+
+fn imported_quota_requires_fleet_proof(file_contents: &[(String, Vec<u8>)]) -> S3Result<bool> {
+    let mut durable = false;
+    for (file_path, content) in file_contents {
+        let mut parts = file_path.split(SLASH_SEPARATOR);
+        let Some(_bucket) = parts.next() else {
+            continue;
+        };
+        if parts.next() != Some(BUCKET_QUOTA_CONFIG_FILE) {
+            continue;
+        }
+        let quota: BucketQuota =
+            serde_json::from_slice(content).map_err(|e| s3_error!(InvalidRequest, "invalid bucket quota: {e}"))?;
+        if quota.has_unsupported_reservation_protocol() {
+            return Err(s3_error!(InvalidRequest, "unsupported bucket quota reservation protocol"));
+        }
+        durable |= quota.uses_durable_reservations();
+    }
+    Ok(durable)
 }
 
 /// The `(config_file, data)` pairs to persist for an imported bucket's metadata: every non-empty
@@ -1075,5 +1100,32 @@ mod import_persist_tests {
             .is_some();
 
         assert!(!has_site_replication_item);
+    }
+
+    #[test]
+    fn quota_import_preflight_rejects_invalid_and_unknown_protocols() {
+        let missing_limit = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            br#"{"quota":0,"reservation_protocol":1}"#.to_vec(),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&missing_limit).is_err());
+
+        let unknown_protocol = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            br#"{"quota":0,"reservation_protocol":2,"reservation_quota":1024}"#.to_vec(),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&unknown_protocol).is_err());
+    }
+
+    #[test]
+    fn quota_import_preflight_requires_proof_only_for_durable_quota() {
+        let legacy = vec![(format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"), br#"{"quota":1024}"#.to_vec())];
+        assert!(!imported_quota_requires_fleet_proof(&legacy).expect("legacy quota should remain compatible"));
+
+        let durable = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            serde_json::to_vec(&BucketQuota::new(Some(1024))).expect("durable quota should encode"),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&durable).expect("durable quota should pass preflight"));
     }
 }
