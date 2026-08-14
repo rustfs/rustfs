@@ -1343,6 +1343,26 @@ impl SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        self.put_object_with_old_current_size_boxed(bucket, object, data, opts).await
+    }
+
+    fn put_object_with_old_current_size_boxed<'a>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
+        data: &'a mut PutObjReader,
+        opts: &'a ObjectOptions,
+    ) -> impl Future<Output = Result<(ObjectInfo, Option<OldCurrentSize>)>> + Send + 'a {
+        Box::pin(self.put_object_with_old_current_size_inner(bucket, object, data, opts))
+    }
+
+    async fn put_object_with_old_current_size_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
         let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
@@ -6509,6 +6529,21 @@ mod replication_quota_safety_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn quota_put_future_keeps_commit_state_off_the_caller_stack() {
+        let (_temp_dirs, _disks, set_disks) = hermetic_set_disks(4).await;
+        let mut reader = PutObjReader::from_vec(Vec::new());
+        let opts = ObjectOptions::default();
+
+        let future = set_disks.put_object_with_old_current_size("bucket", "object", &mut reader, &opts);
+        let future_size = std::mem::size_of_val(&future);
+
+        assert!(
+            future_size <= 1024,
+            "put_object_with_old_current_size future must stay stack-bounded, got {future_size} bytes"
+        );
+    }
 
     #[tokio::test]
     async fn replication_put_quota_uses_physical_bytes_as_a_safety_floor() {
