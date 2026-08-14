@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: erasure codec migration keeps staged streaming decode paths in this module.
-#![allow(dead_code)]
 
 pub(crate) mod codec;
 pub(crate) mod coding;
