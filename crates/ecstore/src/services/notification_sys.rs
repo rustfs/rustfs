@@ -1539,6 +1539,7 @@ impl NotificationSys {
         workers.peers.remove(host);
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn tier_config_reload_worker_active(&self, host: &str) -> bool {
         self.tier_config_reload_workers
             .lock()
@@ -1712,6 +1713,7 @@ where
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn call_peer_with_timeout<F, Fut>(
     timeout_dur: Duration,
     host_label: &str,

@@ -23,6 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
+#[allow(
+    dead_code,
+    reason = "default operation label for the test-only AsyncBatchProcessor::new (backlog#1823)"
+)]
 const BATCH_PROCESSOR_OPERATION_CUSTOM: &str = "custom";
 const BATCH_PROCESSOR_OPERATION_READ: &str = "read";
 const BATCH_PROCESSOR_OPERATION_WRITE: &str = "write";
@@ -211,6 +215,7 @@ pub struct AsyncBatchProcessor {
 }
 
 impl AsyncBatchProcessor {
+    #[allow(dead_code, reason = "constructor used only by this file's tests (backlog#1823)")]
     pub fn new(max_concurrent: usize) -> Self {
         Self::new_with_operation(max_concurrent, BATCH_PROCESSOR_OPERATION_CUSTOM)
     }

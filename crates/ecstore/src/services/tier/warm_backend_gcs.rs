@@ -41,10 +41,7 @@ use crate::services::tier::{
 };
 use tracing::warn;
 
-const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
-const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 fn parse_generation(remote_version: &str) -> Result<Option<i64>, Error> {
     if remote_version.is_empty() {
@@ -64,7 +61,6 @@ pub struct WarmBackendGCS {
     pub control: Arc<StorageControl>,
     pub bucket: String,
     pub prefix: String,
-    pub storage_class: String,
 }
 
 impl WarmBackendGCS {
@@ -104,7 +100,6 @@ impl WarmBackendGCS {
             control,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
-            storage_class: "".to_string(),
         })
     }
 
