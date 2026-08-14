@@ -387,7 +387,7 @@ pub(crate) struct BlockingObjectPublication {
     backend: TestCatalogObjectBackend,
     object: String,
     started: Arc<tokio::sync::Notify>,
-    guard: Arc<parking_lot::Mutex<Option<Box<dyn Send>>>>,
+    guard: Arc<parking_lot::Mutex<Option<TableCatalogLockGuard>>>,
 }
 
 impl BlockingObjectPublication {
@@ -915,7 +915,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .collect())
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
         {
             let mut state = self.state.lock().await;
@@ -931,10 +931,10 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
                 .clone()
         };
-        Ok(Box::new(lock.write_owned().await))
+        Ok(TableCatalogLockGuard::stable(lock.write_owned().await))
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         // The admin fake implemented only acquire_write_lock, so the trait's
         // default read->write delegation made read acquisitions observable in
         // lock_attempts as well; keep that (backlog#1837 PR2).
@@ -953,7 +953,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
                 .clone()
         };
-        Ok(Box::new(lock.read_owned().await))
+        Ok(TableCatalogLockGuard::stable(lock.read_owned().await))
     }
 }
 

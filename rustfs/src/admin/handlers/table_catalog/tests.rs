@@ -2454,7 +2454,7 @@ async fn create_view_holds_publication_fences_from_metadata_write_through_regist
         create_view_response(create_store.as_ref(), &create_backend, "warehouse", &create_namespace, request, true).await
     });
     tokio::time::timeout(StdDuration::from_secs(2), async {
-        while metadata_backend.objects.lock().await.is_empty() {
+        while metadata_backend.state.lock().await.objects.is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -9839,9 +9839,10 @@ async fn seed_test_manifest_list(
     for manifest_location in manifest_locations {
         let manifest_key = test_snapshot_object_key(bucket, manifest_location);
         let manifest_length = backend
-            .objects
+            .state
             .lock()
             .await
+            .objects
             .get(&(bucket.to_string(), manifest_key))
             .map(|object| object.data.len())
             .expect("test manifest must be seeded before its manifest list");
@@ -9867,9 +9868,10 @@ async fn seed_test_manifest_list_entries(
     for (manifest_location, sequence_number, snapshot_id) in manifest_entries {
         let manifest_key = test_snapshot_object_key(bucket, manifest_location);
         let manifest_length = backend
-            .objects
+            .state
             .lock()
             .await
+            .objects
             .get(&(bucket.to_string(), manifest_key))
             .map(|object| object.data.len())
             .expect("test manifest must be seeded before its manifest list");
