@@ -97,7 +97,7 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["Heal task execution failed", "Heal manager is not running"]),
+            anchors: strings(["Heal task execution failed"]),
             ..base(
                 "heal-task-failure",
                 P2Degraded,
