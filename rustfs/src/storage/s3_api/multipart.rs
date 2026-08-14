@@ -39,6 +39,7 @@ pub(crate) struct ListMultipartUploadsParams {
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
+    let is_compressed = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
     ListPartsOutput {
         bucket: Some(res.bucket),
@@ -54,7 +55,7 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                     // Compressed parts store fewer bytes than the client sent; S3
                     // semantics report the uploaded (logical) size, matching
                     // GetObjectAttributes ObjectParts.
-                    size: if p.actual_size > 0 {
+                    size: if p.actual_size > 0 || (is_compressed && p.actual_size == 0) {
                         Some(p.actual_size)
                     } else {
                         p.size.try_into().ok()
@@ -279,6 +280,28 @@ mod tests {
             Some(8_388_608),
             "compressed parts must report the uploaded logical size, not the stored size"
         );
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_compressed_parts() {
+        let mut user_defined = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        let input = ListPartsInfo {
+            user_defined,
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Legacy SSE writes an 8-byte end record for an empty part.
+                size: 8,
+                actual_size: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
     }
 
     #[test]
