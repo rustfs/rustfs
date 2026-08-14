@@ -580,6 +580,9 @@ pub(crate) struct VaultConnectionSettings {
     pub(crate) namespace: Option<String>,
     /// Per-attempt HTTP timeout applied to the underlying reqwest client.
     pub(crate) attempt_timeout: Duration,
+    /// Whether to accept an unverified Vault server certificate. Gated on
+    /// `allow_insecure_dev_defaults` by `KmsConfig::validate`.
+    pub(crate) skip_tls_verify: bool,
 }
 
 impl VaultConnectionSettings {
@@ -593,6 +596,11 @@ impl VaultConnectionSettings {
         // operation-level retry policy.
         settings_builder.timeout(Some(self.attempt_timeout));
         settings_builder.token(token);
+        // Always set explicitly: left unset, vaultrs derives this from its own
+        // VAULT_SKIP_VERIFY variable, so a stray value in the environment would
+        // disable certificate verification behind the KMS configuration and its
+        // insecure-defaults gate.
+        settings_builder.verify(!self.skip_tls_verify);
 
         if let Some(namespace) = &self.namespace {
             settings_builder.namespace(Some(namespace.clone()));
@@ -969,6 +977,7 @@ mod tests {
             address: "http://127.0.0.1:8200".to_string(),
             namespace: Some("team-namespace".to_string()),
             attempt_timeout: Duration::from_secs(30),
+            skip_tls_verify: false,
         }
     }
 
@@ -1162,6 +1171,42 @@ mod tests {
             .expect("kubernetes auth must map to a login source");
 
         assert!(format!("{source:?}").contains("KubernetesLogin"));
+    }
+
+    /// The configured flag has to reach the HTTP client, not just the config
+    /// struct: every generation (authenticated and login) builds its own client,
+    /// and a Vault with a self-signed certificate fails the handshake unless
+    /// each one carries the setting.
+    #[test]
+    fn test_skip_tls_verify_reaches_every_vault_client_generation() {
+        for skip_tls_verify in [false, true] {
+            let settings = VaultConnectionSettings {
+                address: "https://vault.example.com:8200".to_string(),
+                namespace: None,
+                attempt_timeout: Duration::from_secs(30),
+                skip_tls_verify,
+            };
+
+            let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
+            assert_eq!(authenticated.settings.verify, !skip_tls_verify);
+
+            let login = settings.build_login_client().expect("login client must build");
+            assert_eq!(login.settings.verify, !skip_tls_verify);
+        }
+    }
+
+    /// vaultrs derives `verify` from its own VAULT_SKIP_VERIFY variable when the
+    /// builder leaves it unset, which would disable certificate verification
+    /// without passing the KMS insecure-defaults gate.
+    #[test]
+    fn test_vaultrs_skip_verify_env_cannot_override_the_configured_setting() {
+        temp_env::with_var("VAULT_SKIP_VERIFY", Some("true"), || {
+            let client = test_settings().build_client(TEST_TOKEN).expect("client must build");
+            assert!(
+                client.settings.verify,
+                "a stray VAULT_SKIP_VERIFY must not disable verification behind the KMS configuration"
+            );
+        });
     }
 
     /// The projected token is read fresh per login attempt and trimmed, so a
