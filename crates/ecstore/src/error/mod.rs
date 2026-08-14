@@ -1075,9 +1075,6 @@ pub struct GenericError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ObjectApiError {
-    #[error("BackendDown")]
-    BackendDown(String),
-
     #[error("The operation is not valid for the current state of the object {}/{}({})", .0.bucket, .0.object, .0.version_id)]
     InvalidObjectState(GenericError),
 }
@@ -1092,72 +1089,6 @@ pub struct ErrorResponse {
     pub region: Option<String>,
     pub request_id: Option<String>,
     pub host_id: String,
-}
-
-pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::io::Error {
-    let mut bucket = "";
-    let mut object = "";
-    let mut version_id = "";
-    if !params.is_empty() {
-        bucket = params[0];
-    }
-    if params.len() >= 2 {
-        object = params[1];
-    }
-    if params.len() >= 3 {
-        version_id = params[2];
-    }
-
-    if is_network_or_host_down(&err.to_string(), false) {
-        return std::io::Error::other(ObjectApiError::BackendDown(format!("{err}")));
-    }
-
-    let err_ = std::io::Error::other(err.to_string());
-    let r_err = err;
-    let err;
-    let bucket = bucket.to_string();
-    let object = object.to_string();
-    let version_id = version_id.to_string();
-
-    match r_err.code {
-        S3ErrorCode::BucketNotEmpty => {
-            err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
-        }
-        S3ErrorCode::InvalidBucketName => {
-            err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
-        }
-        S3ErrorCode::InvalidPart => {
-            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */));
-        }
-        S3ErrorCode::NoSuchBucket => {
-            err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-        }
-        S3ErrorCode::NoSuchKey => {
-            if !object.is_empty() {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
-            } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-            }
-        }
-        S3ErrorCode::NoSuchVersion => {
-            if !object.is_empty() {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
-            } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-            }
-        }
-        S3ErrorCode::AccessDenied => {
-            err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
-        }
-        S3ErrorCode::NoSuchUpload => {
-            err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
-        }
-        _ => {
-            err = err_;
-        }
-    }
-
-    err
 }
 
 #[cfg(test)]
