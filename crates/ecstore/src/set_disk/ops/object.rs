@@ -11183,7 +11183,7 @@ mod put_object_tmp_cleanup_tests {
     use tokio::io::AsyncReadExt;
 
     /// Large enough that the erasure shards are written as real tmp files
-    /// (never inlined into xl.meta), so both tests exercise actual cleanup.
+    /// (never inlined into xl.meta), so the cleanup tests exercise actual cleanup.
     const TEST_OBJECT_SIZE: usize = 1 << 20;
 
     /// Entries under `.rustfs.sys/tmp` on every disk, excluding the `.trash`
@@ -11207,6 +11207,18 @@ mod put_object_tmp_cleanup_tests {
         leftovers
     }
 
+    async fn wait_for_tmp_workspace_to_drain(temp_dirs: &[TempDir], failure_context: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leftovers = non_trash_tmp_entries(temp_dirs).await;
+            if leftovers.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{failure_context}, leftovers: {leftovers:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     async fn put_object_success_eventually_cleans_tmp_workspace() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -11222,22 +11234,39 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("put_object should succeed");
 
-        // The speculative cleanup runs on a spawned task off the PUT response
-        // path, so poll for the tmp workspace to drain instead of asserting
-        // immediately.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let leftovers = non_trash_tmp_entries(&temp_dirs).await;
-            if leftovers.is_empty() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "tmp workspace should drain after a successful PUT, leftovers: {leftovers:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        wait_for_tmp_workspace_to_drain(&temp_dirs, "tmp workspace should drain after a successful PUT").await;
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn cancelled_put_before_rename_cleans_tmp_workspace() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+
+        let bucket = "tmp-clean-cancelled-bucket";
+        let object = "cancelled-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterQuotaReservation);
+        let cancelled_set = set_disks.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![8u8; TEST_OBJECT_SIZE]);
+            cancelled_set
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        put.abort();
+        let join_error = put.await.expect_err("the paused PUT task must be cancelled");
+        assert!(join_error.is_cancelled(), "the paused PUT task must not panic");
+
+        // Keep the barrier armed so a detached child cannot proceed and hide
+        // missing cancellation cleanup.
+        wait_for_tmp_workspace_to_drain(&temp_dirs, "cancelling before rename should drain the tmp workspace").await;
+
+        drop(barrier);
         drop(temp_dirs);
     }
 
