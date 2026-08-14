@@ -34,20 +34,11 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("Heal configuration error: {message}")]
-    ConfigurationError { message: String },
-
     #[error("Other error: {0}")]
     Other(String),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
-
-    #[error("IO error: {0}")]
-    IO(String),
-
-    #[error("Not found: {0}")]
-    NotFound(String),
 
     #[error("Invalid checkpoint: {0}")]
     InvalidCheckpoint(String),
@@ -55,14 +46,8 @@ pub enum Error {
     #[error("Heal task not found: {task_id}")]
     TaskNotFound { task_id: String },
 
-    #[error("Heal task already exists: {task_id}")]
-    TaskAlreadyExists { task_id: String },
-
     #[error("Invalid heal client token")]
     InvalidClientToken,
-
-    #[error("Heal manager is not running")]
-    ManagerNotRunning,
 
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
@@ -78,12 +63,6 @@ pub enum Error {
 
     #[error("Heal task timeout")]
     TaskTimeout,
-
-    #[error("Heal event processing failed: {message}")]
-    EventProcessingFailed { message: String },
-
-    #[error("Heal progress tracking failed: {message}")]
-    ProgressTrackingFailed { message: String },
 }
 
 /// A specialized Result type for heal operations
@@ -129,9 +108,7 @@ impl Error {
                         | DiskError::FaultyDisk
                 ) || is_recoverable_heal_error_message(&err.to_string())
             }
-            Error::TaskExecutionFailed { message } | Error::IO(message) | Error::Other(message) => {
-                is_recoverable_heal_error_message(message)
-            }
+            Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
             Error::Io(err) => is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }

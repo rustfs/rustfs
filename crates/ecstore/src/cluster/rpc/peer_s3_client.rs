@@ -854,7 +854,6 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    pub node: Option<Node>,
     pub pools: Option<Vec<usize>>,
     addr: String,
     /// Health tracker for connection monitoring
@@ -886,7 +885,6 @@ impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
-            node,
             pools,
             addr,
             health: Arc::new(DiskHealthTracker::new()),
@@ -903,10 +901,6 @@ impl RemotePeerS3Client {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
-    }
-
-    pub fn get_addr(&self) -> String {
-        self.addr.clone()
     }
 
     /// Start health monitoring for the remote peer
@@ -1208,6 +1202,10 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "local bucket-heal path reached only by this file's tests (backlog#1823)"
+)]
 pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
     let disks = clone_drives().await;
     heal_bucket_local_on_disks(bucket, opts, disks).await
@@ -1404,6 +1402,10 @@ pub(crate) async fn heal_bucket_local_on_disks(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "reached only through heal_bucket_local, which only tests call (backlog#1823)"
+)]
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     runtime_sources::local_disk_entries().await
 }
@@ -1585,15 +1587,7 @@ mod tests {
     }
 
     fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
-        let node = Node {
-            url: url::Url::parse(addr).expect("test peer URL should parse"),
-            pools: vec![0],
-            is_local: false,
-            grid_host: addr.to_string(),
-        };
-
         RemotePeerS3Client {
-            node: Some(node),
             pools: Some(vec![0]),
             addr: addr.to_string(),
             health: Arc::new(DiskHealthTracker::new()),

@@ -25,9 +25,20 @@ use tokio::io::AsyncRead;
 
 #[cfg(feature = "rio-v2")]
 const MINIO_S2_COMPRESSION_SCHEME: &str = "klauspost/compress/s2";
+// The S2 padding multiple rio-v2 pads compressed streams to before
+// encryption. Only the padding test asserts it today, so the lib target sees
+// it as unused (backlog#1823).
 #[cfg(feature = "rio-v2")]
+#[allow(dead_code, reason = "on-disk contract asserted by the rio-v2 padding test (backlog#1823)")]
 const ENCRYPTED_S2_PADDING_MULTIPLE: usize = 256;
 
+/// Which rio implementation this build compiled in. Only the feature-seam
+/// guard test in lib.rs reads it, so the lib target sees it as unused
+/// (backlog#1823).
+#[allow(
+    dead_code,
+    reason = "asserted by the rio backend feature-seam test in lib.rs (backlog#1823)"
+)]
 pub const fn backend_name() -> &'static str {
     #[cfg(feature = "rio-v2")]
     {
@@ -53,17 +64,6 @@ pub fn compression_metadata_value(algorithm: CompressionAlgorithm) -> String {
     }
 }
 
-pub fn compression_scheme_to_algorithm(scheme: &str) -> std::io::Result<CompressionAlgorithm> {
-    #[cfg(feature = "rio-v2")]
-    if scheme.eq_ignore_ascii_case(MINIO_S2_COMPRESSION_SCHEME) {
-        // rio_v2 currently routes all compressed-object handling through the S2
-        // reader implementation, so the enum is only a placeholder token here.
-        return Ok(CompressionAlgorithm::default());
-    }
-
-    CompressionAlgorithm::from_str(scheme)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadCompressionBackend {
     Legacy,
@@ -82,6 +82,11 @@ pub fn compression_scheme_to_read_plan(scheme: &str) -> std::io::Result<(Compres
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadEncryptionBackend {
     Legacy,
+    // Never constructed today — every read still selects Legacy — but the
+    // decrypt paths below carry live match arms for it. This is the rio-v2
+    // read seam (backlog#1638 / #1835), not dead code: deleting the variant
+    // would delete those arms with it.
+    #[allow(dead_code, reason = "rio-v2 read seam; match arms below are live (backlog#1823)")]
     V2,
 }
 

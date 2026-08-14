@@ -189,6 +189,10 @@ impl Config {
     /// A topology-bound lookup fails closed for unknown drive counts and for
     /// deserialized legacy configurations that have no pool topology. Legacy
     /// callers retain scalar compatibility through [`Self::get_parity_for_sc`].
+    #[allow(
+        dead_code,
+        reason = "per-set parity resolution asserted by this file's tests (backlog#1823)"
+    )]
     pub(crate) fn parity_for_sc(&self, sc: &str, drives_per_set: usize) -> Option<usize> {
         if !self.initialized {
             return None;

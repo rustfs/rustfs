@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: data-movement migration keeps staged cleanup helpers until copy paths converge.
-#![allow(dead_code)]
 
 pub(crate) mod backpressure;
 
@@ -1019,6 +1018,10 @@ struct SourceCleanupDeleteBarrierState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
+)]
 pub(crate) struct SourceCleanupDeleteBarrier {
     state: Arc<SourceCleanupDeleteBarrierState>,
 }
@@ -1028,6 +1031,10 @@ static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Optio
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
+)]
 impl SourceCleanupDeleteBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(SourceCleanupDeleteBarrierState {
@@ -1166,6 +1173,7 @@ async fn find_data_movement_target_info(
     }
 }
 
+#[allow(dead_code, reason = "resume adjudication asserted by this file's tests (backlog#1823)")]
 fn resolve_data_movement_overwrite_resume_result(
     err: &Error,
     target_result: Result<Option<ObjectInfo>>,

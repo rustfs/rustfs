@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Cluster erasure set metrics collector.
 //!
 //! Collects erasure coding set metrics including parity, quorum,

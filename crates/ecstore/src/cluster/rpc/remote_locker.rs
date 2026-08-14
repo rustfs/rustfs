@@ -48,10 +48,6 @@ impl RemoteClient {
         Self { addr: endpoint }
     }
 
-    pub fn from_url(url: url::Url) -> Self {
-        Self { addr: url.to_string() }
-    }
-
     fn build_ping_request() -> PingRequest {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let payload = fbb.create_vector(b"health-check");

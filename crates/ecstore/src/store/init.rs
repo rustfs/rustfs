@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::core::pools::local_decommission_queue_prefix;
+use crate::core::pools::{local_decommission_queue_prefix, pool_meta_has_active_decommission};
 use crate::error::is_err_decommission_running;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
@@ -107,14 +107,6 @@ fn should_retry_format_load(err: &Error) -> bool {
 
 fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_meta_loaded: bool) -> bool {
     rebalance_meta_loaded && !decommission_running
-}
-
-fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
-    meta.pools.iter().any(|pool| {
-        pool.decommission
-            .as_ref()
-            .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
-    })
 }
 
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {

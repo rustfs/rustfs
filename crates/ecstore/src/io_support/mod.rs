@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: I/O backend selection keeps test-only and staged rio helpers scoped here.
-#![allow(dead_code)]
 
 pub(crate) mod bitrot;
 pub(crate) mod compress;

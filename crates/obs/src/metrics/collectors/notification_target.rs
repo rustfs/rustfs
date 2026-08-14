@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_MESSAGES_MD,
