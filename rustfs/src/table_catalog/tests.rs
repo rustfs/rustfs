@@ -896,17 +896,23 @@ async fn strong_catalog_view_replace_rejects_identity_recreation_during_metadata
     let replace_current_metadata = current_metadata.clone();
     let replace = tokio::spawn(async move {
         replace_store
-            .replace_view(ViewCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: replace_namespace.public_name(),
-                view: replace_view.as_str().to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: replace_current_metadata,
-                new_metadata_location: new_metadata,
-            })
+            .replace_view_with_publication(
+                ViewCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: replace_namespace.public_name(),
+                    view: replace_view.as_str().to_string(),
+                    expected_version_token: "token-v1".to_string(),
+                    expected_metadata_location: replace_current_metadata,
+                    new_metadata_location: new_metadata,
+                },
+                false,
+                &UnserializedTestPublication,
+            )
             .await
     });
-    metadata_read.wait_started().await;
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, metadata_read.wait_started())
+        .await
+        .expect("the replacement should reach the paused metadata read");
 
     store
         .drop_view(bucket, &namespace.public_name(), view.as_str())
@@ -12912,31 +12918,45 @@ async fn strong_catalog_does_not_guess_view_history_from_a_concurrent_replacemen
     let first_expected_metadata = initial_metadata.clone();
     let first_replace = tokio::spawn(async move {
         first_replace_store
-            .replace_view(ViewCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: first_namespace_name,
-                view: first_view_name,
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: first_expected_metadata,
-                new_metadata_location: first_metadata,
-            })
+            .replace_view_with_publication(
+                ViewCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: first_namespace_name,
+                    view: first_view_name,
+                    expected_version_token: "token-v1".to_string(),
+                    expected_metadata_location: first_expected_metadata,
+                    new_metadata_location: first_metadata,
+                },
+                false,
+                &UnserializedTestPublication,
+            )
             .await
     });
-    recovery_read.wait_started().await;
-    second
-        .replace_view(ViewCommitRequest {
-            table_bucket: bucket.to_string(),
-            namespace: namespace.public_name(),
-            view: view.as_str().to_string(),
-            expected_version_token: "token-v1".to_string(),
-            expected_metadata_location: initial_metadata,
-            new_metadata_location: second_metadata.clone(),
-        })
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, recovery_read.wait_started())
         .await
-        .expect("second writer should publish a different replacement");
+        .expect("the first replacement should reach its paused recovery read");
+    tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        second.replace_view_with_publication(
+            ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: initial_metadata,
+                new_metadata_location: second_metadata.clone(),
+            },
+            false,
+            &UnserializedTestPublication,
+        ),
+    )
+    .await
+    .expect("the independent replacement should not wait for publication serialization")
+    .expect("second writer should publish a different replacement");
     recovery_read.release();
-    let error = first_replace
+    let error = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, first_replace)
         .await
+        .expect("the first replacement should finish after its recovery read is released")
         .expect("first replacement task should join")
         .expect_err("a different generation-two view must not prove the first replacement succeeded");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("injected put failure"));
