@@ -55,6 +55,7 @@ pub fn part_transaction_path(part_path: &str) -> String {
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
@@ -434,10 +435,8 @@ impl DiskAPI for Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        match self {
-            Disk::Local(local_disk) => local_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-            Disk::Remote(remote_disk) => remote_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-        }
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -663,6 +662,30 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
+}
+
+impl Disk {
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
         }
     }
 }

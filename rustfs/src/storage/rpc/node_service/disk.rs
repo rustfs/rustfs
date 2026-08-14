@@ -1049,7 +1049,7 @@ impl NodeService {
                 .rename_data(
                     &request.src_volume,
                     &request.src_path,
-                    decoded_file_info.value,
+                    &decoded_file_info.value,
                     &request.dst_volume,
                     &request.dst_path,
                 )

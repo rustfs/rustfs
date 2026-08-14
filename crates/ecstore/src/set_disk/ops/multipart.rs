@@ -2527,11 +2527,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // The trailing `_` drops the rename_data old-size backfill
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
-            let rename_result = SetDisks::rename_data(
+            Self::assign_rename_data_indexes(&mut parts_metadatas);
+            let rename_result = SetDisks::rename_data_owned(
                 &commit_disks,
                 RUSTFS_META_MULTIPART_BUCKET,
                 &commit_upload_id_path,
-                &parts_metadatas,
+                parts_metadatas,
                 &commit_bucket,
                 &commit_object,
                 write_quorum,
@@ -2550,10 +2551,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             if rename_result.is_ok() {
                 quota_reservation.commit().await;
             }
-            let (online_disks, convergence, op_old_dir, cleanup_disks, _) = match rename_result {
+            let rename_commit = match rename_result {
                 Ok(result) => result,
                 Err(err) => return Err(err.into()),
             };
+            let online_disks = rename_commit.online_disks;
+            let convergence = rename_commit.convergence;
+            let op_old_dir = rename_commit.data_dir;
+            let cleanup_disks = rename_commit.cleanup_disks;
+            let committed_file_info = rename_commit.committed_file_info;
 
             // Detach admission before any post-commit await: client cancellation
             // must not couple durable convergence repair to cleanup work.
@@ -2598,9 +2604,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 return Err(StorageError::Unexpected);
             }
 
-            if let Some(committed_slot) = online_disks.iter().position(Option::is_some) {
-                fi = parts_metadatas[committed_slot].clone();
-            }
+            fi = committed_file_info;
             let committed_dir = fi.data_dir.unwrap_or_default().to_string();
 
             commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
