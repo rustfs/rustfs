@@ -20,6 +20,10 @@ use std::sync::atomic::AtomicI64;
 /// this type never grew past its counter. `total_events` is read by the
 /// notifier's log line but nothing increments it, so that field reports zero.
 #[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "held only by the dead ecstore EventNotifier; see services/event_notification.rs (backlog#1823)"
+)]
 pub struct TargetList {
     pub total_events: AtomicI64,
 }

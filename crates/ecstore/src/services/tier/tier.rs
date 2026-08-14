@@ -488,6 +488,7 @@ impl TierCandidateMutation {
         targets
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn affected_targets(
         &self,
         manager: &TierConfigMgr,
@@ -802,6 +803,7 @@ fn tier_persisted_reference_blocks_any_target(
         .any(|target| tier_persisted_reference_blocks_target(tier_name, backend_identity, target))
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn tier_object_blocks_target_rebind(object: &ObjectInfo, target: &TierMutationIntentTarget) -> io::Result<bool> {
     tier_object_blocks_any_target_rebind(object, std::slice::from_ref(target))
 }
@@ -2726,14 +2728,6 @@ impl TierConfigMgr {
         Self::publish_candidate_owned(handle, candidate, driver_tier.map(str::to_string), update).await
     }
 
-    fn begin_publish_transition(
-        handle: &Arc<RwLock<Self>>,
-        manager: &mut Self,
-        candidate: &Self,
-    ) -> std::result::Result<TierPublishTransition, AdminError> {
-        Self::begin_publish_transition_with_allowed_mutation_blocks(handle, manager, candidate, None)
-    }
-
     fn begin_publish_transition_with_allowed_mutation_blocks(
         handle: &Arc<RwLock<Self>>,
         manager: &mut Self,
@@ -2817,14 +2811,6 @@ impl TierConfigMgr {
             replaced_destinations,
             published: false,
         })
-    }
-
-    async fn publish_candidate_inner(
-        handle: &Arc<RwLock<Self>>,
-        candidate: Self,
-        driver_tier: Option<&str>,
-    ) -> std::result::Result<(), AdminError> {
-        Self::publish_candidate_inner_with_allowed_mutation_blocks(handle, candidate, driver_tier, None).await
     }
 
     async fn publish_candidate_inner_with_allowed_mutation_blocks(
@@ -2939,6 +2925,7 @@ impl TierConfigMgr {
         admin_err
     }
 
+    #[allow(dead_code, reason = "reached only through #[cfg(test)] helpers in this file (backlog#1823)")]
     async fn publish_candidate_owned(
         handle: &Arc<RwLock<Self>>,
         candidate: Self,
@@ -3541,6 +3528,7 @@ impl TierConfigMgr {
         Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Remove(tier_name.to_string(), force)).await
     }
 
+    #[allow(dead_code, reason = "reached only through #[cfg(test)] helpers in this file (backlog#1823)")]
     async fn remove_and_save_with<S>(
         handle: &Arc<RwLock<Self>>,
         api: Arc<S>,
@@ -3574,6 +3562,7 @@ impl TierConfigMgr {
         Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Clear(force)).await
     }
 
+    #[allow(dead_code, reason = "reached only through #[cfg(test)] helpers in this file (backlog#1823)")]
     async fn clear_and_save_with<S>(
         handle: &Arc<RwLock<Self>>,
         api: Arc<S>,
@@ -3612,6 +3601,10 @@ impl TierConfigMgr {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "lease accounting asserted by a bucket_lifecycle_ops test behind `--features test-util` (backlog#1823)"
+    )]
     pub(crate) async fn active_operation_lease_count(handle: &Arc<RwLock<Self>>, tier_name: &str) -> usize {
         let manager = handle.read().await;
         let Some(runtime) = registered_tier_driver_runtime(&manager) else {
@@ -3715,10 +3708,6 @@ impl TierConfigMgr {
             self.ensure_generation_is_idle(tier_name)?;
         }
         Ok(())
-    }
-
-    fn retire_driver(&mut self, tier_name: &str) {
-        self.revoke_driver(tier_name);
     }
 
     fn revoke_all_drivers(&mut self) {
@@ -3884,6 +3873,7 @@ impl TierConfigMgr {
         self.save_config(api, &config_file, data).await
     }
 
+    #[allow(dead_code, reason = "reached only through #[cfg(test)] helpers in this file (backlog#1823)")]
     async fn save_tiering_config_if_current<S>(
         &self,
         api: Arc<S>,

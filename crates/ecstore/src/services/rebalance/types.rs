@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
@@ -31,8 +30,6 @@ pub struct RebalanceStats {
     #[serde(rename = "cw", default)]
     pub cleanup_warnings: RebalanceCleanupWarnings,
 }
-
-pub type RStats = Vec<Arc<RebalanceStats>>;
 
 #[derive(Debug, Default)]
 pub(super) struct RebalanceBucketConfigs {
