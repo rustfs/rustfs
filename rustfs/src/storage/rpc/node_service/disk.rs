@@ -37,19 +37,28 @@ const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
 
+fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Response<SnapshotLeaseResponse> {
+    match result {
+        Ok(token) => Response::new(SnapshotLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: None,
+        }),
+        Err(err) => Response::new(SnapshotLeaseResponse {
+            success: false,
+            token: Bytes::new(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: Some(err.into()),
+        }),
+    }
+}
+
 struct DecodedRpcPayload<T> {
     value: T,
     from_msgpack: bool,
 }
 
-fn snapshot_lease_disabled_response() -> SnapshotLeaseResponse {
-    SnapshotLeaseResponse {
-        success: false,
-        token: Bytes::new(),
-        protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-        error: Some(DiskError::UnsupportedDisk.into()),
-    }
-}
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
     json: &str,
@@ -241,7 +250,12 @@ impl NodeService {
             rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()),
             "acquire_snapshot_lease",
         )?;
-        Ok(Response::new(snapshot_lease_disabled_response()))
+        let request = request.into_inner();
+        let result = match self.find_disk(&request.disk).await {
+            Some(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
+            None => Err(DiskError::other("cannot find disk")),
+        };
+        Ok(snapshot_lease_response(result))
     }
 
     pub(super) async fn handle_renew_snapshot_lease(
@@ -253,7 +267,14 @@ impl NodeService {
             rustfs_protos::canonical_snapshot_lease_renew_request_body(request.get_ref()),
             "renew_snapshot_lease",
         )?;
-        Ok(Response::new(snapshot_lease_disabled_response()))
+        let request = request.into_inner();
+        let token =
+            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
+        let result = match self.find_disk(&request.disk).await {
+            Some(disk) => disk.renew_snapshot_lease(&request.volume, &request.path, token).await,
+            None => Err(DiskError::other("cannot find disk")),
+        };
+        Ok(snapshot_lease_response(result))
     }
 
     pub(super) async fn handle_release_snapshot_lease(
@@ -266,8 +287,11 @@ impl NodeService {
             "release_snapshot_lease",
         )?;
         let request = request.into_inner();
-        let token =
-            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
+        let token = if request.token.as_ref() == SnapshotLeaseToken::revoke_all().as_bytes() {
+            SnapshotLeaseToken::revoke_all()
+        } else {
+            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?
+        };
         let Some(disk) = self.find_disk(&request.disk).await else {
             return Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: false,
@@ -1494,11 +1518,11 @@ mod tests {
     use super::{
         compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
         encode_batch_read_version_response_payloads, encode_file_info_msgpack, encode_msgpack, encode_msgpack_named,
-        encode_read_multiple_response_payloads, encode_rename_data_response_payloads, snapshot_lease_disabled_response,
+        encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
     use crate::storage::storage_api::ReadMultipleResp;
+    use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
-    use crate::storage::storage_api::{DiskError, RenameDataResp};
     use rustfs_filemeta::FileInfo;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use serde::{Deserialize, Serialize};
@@ -1507,17 +1531,6 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
-    }
-
-    #[test]
-    fn snapshot_lease_acquire_and_renew_fail_closed() {
-        let response = snapshot_lease_disabled_response();
-        let expected_error = DiskError::UnsupportedDisk.into();
-
-        assert!(!response.success);
-        assert!(response.token.is_empty());
-        assert_eq!(response.protocol_version, 1);
-        assert_eq!(response.error, Some(expected_error));
     }
 
     #[test]
