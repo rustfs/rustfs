@@ -46,6 +46,7 @@ use super::storage_api::multipart_usecase::options::{
     get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
     put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
+use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
@@ -553,6 +554,7 @@ impl DefaultMultipartUsecase {
         };
 
         let quota_metadata_sys = self.bucket_metadata_sys();
+        let quota_tracking = quota_metadata_sys.is_some();
         let mut quota_enabled = false;
         if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
@@ -569,27 +571,65 @@ impl DefaultMultipartUsecase {
             None => None,
         };
 
-        let obj_info = store
-            .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
-            .await
-            .map_err(ApiError::from)?;
-        let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
-        record_capacity_write(Some(capacity_scope_token)).await;
+        let complete_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let upload_id = upload_id.clone();
+            let opts = opts.clone();
+            async move {
+                let obj_info = store
+                    .clone()
+                    .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
+                    .await
+                    .map_err(ApiError::from)?;
+                let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
+                record_capacity_write(Some(capacity_scope_token)).await;
 
-        if quota_metadata_sys.is_some() {
-            let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
-            if versioned {
-                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-            } else {
-                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                if quota_tracking {
+                    let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+
+                    if versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                    }
+                }
+
+                enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+
+                let mt2 = obj_info.user_defined.clone();
+                let dsc = must_replicate_object(
+                    &bucket,
+                    &key,
+                    &mt2,
+                    "".to_string(),
+                    opts.delete_marker_replication_status(),
+                    opts.clone(),
+                )
+                .await;
+
+                if dsc.replicate_any() {
+                    warn!("need multipart replication");
+                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                Ok::<_, S3Error>(obj_info)
             }
-        }
+        });
+        let obj_info = complete_commit.await.map_err(|err| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("complete multipart upload commit owner task failed: {err}"),
+            )
+        })??;
 
-        enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
-
-        let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
-        let mpu_version = if versioned { raw_mpu_version.clone() } else { None };
+        let mpu_version = if versioned {
+            obj_info.version_id.map(|v| v.to_string())
+        } else {
+            None
+        };
         let mpu_version_for_event = mpu_version.clone();
         // checksum: stored (decrypted) values take precedence over the request input;
         // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
@@ -612,28 +652,18 @@ impl DefaultMultipartUsecase {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(location.clone()),
+            location: Some(location),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
-            checksum_crc32: checksum_crc32.clone(),
-            checksum_crc32c: checksum_crc32c.clone(),
-            checksum_sha1: checksum_sha1.clone(),
-            checksum_sha256: checksum_sha256.clone(),
-            checksum_crc64nvme: checksum_crc64nvme.clone(),
-            checksum_type: checksum_type.clone(),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             version_id: mpu_version,
             ..Default::default()
         };
-        let mt2 = obj_info.user_defined.clone();
-        let dsc =
-            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
-                .await;
-
-        if dsc.replicate_any() {
-            warn!("need multipart replication");
-            schedule_object_replication(obj_info.clone(), store, dsc).await;
-        }
-
         // Set object info for event notification
         helper = helper.object(obj_info);
         if let Some(version_id) = &mpu_version_for_event {
@@ -664,7 +694,6 @@ impl DefaultMultipartUsecase {
         }
         let result = Ok(response);
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 

@@ -137,6 +137,22 @@ pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
 
+/// Request the object-transaction fencing contract used by storage-owned
+/// cleanup receipts and lock-window optimizations.
+///
+/// This is fail-closed: enabling the writer without a live fleet proof rejects
+/// the commit rather than silently using a legacy-safe path.
+pub const ENV_OBJECT_TRANSACTION_FENCING_WRITE: &str = "RUSTFS_OBJECT_TRANSACTION_FENCING_WRITE";
+pub const DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE: bool = false;
+
+/// Operator-attested confirmation that every serving node understands the
+/// object transaction fencing contract.
+pub const ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED: &str = "RUSTFS_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED";
+pub const DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE);
+const _: () = assert!(!DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED);
+
 /// Request preserving legacy per-part checksum metadata during data movement.
 ///
 /// This remains ineffective until
@@ -671,6 +687,15 @@ mod remote_version_state_tests {
         assert_eq!(
             super::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED,
             "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn object_transaction_fencing_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_OBJECT_TRANSACTION_FENCING_WRITE, "RUSTFS_OBJECT_TRANSACTION_FENCING_WRITE");
+        assert_eq!(
+            super::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+            "RUSTFS_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED"
         );
     }
 }

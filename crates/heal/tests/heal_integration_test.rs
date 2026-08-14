@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::{

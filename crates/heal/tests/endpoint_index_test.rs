@@ -14,6 +14,8 @@
 
 //! test endpoint index settings
 
+#![recursion_limit = "256"]
+
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

@@ -89,7 +89,7 @@ use super::storage_api::object_usecase::options::{
     namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
     put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
-use super::storage_api::object_usecase::request_context::{self, spawn_traced};
+use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
@@ -3057,6 +3057,11 @@ struct PutObjectChecksums {
     crc64nvme: Option<String>,
 }
 
+struct PutObjectCommitResult {
+    obj_info: ObjectInfo,
+    put_versioned: bool,
+}
+
 fn normalize_delete_objects_version_id(
     version_id: Option<String>,
 ) -> std::result::Result<(Option<String>, Option<Uuid>), String> {
@@ -5524,9 +5529,24 @@ impl DefaultObjectUsecase {
         }
     }
 
-    #[instrument(level = "info", skip(self, _fs, req))]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
+    #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        self.execute_put_object_boxed(_fs, req).await
+    }
+
+    fn execute_put_object_boxed<'a>(
+        &'a self,
+        _fs: &'a FS,
+        req: S3Request<PutObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + 'a {
+        Box::pin(self.execute_put_object_inner(_fs, req))
+    }
+
+    #[hotpath::measure(
+        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_put_object",
+        impl_type = "DefaultObjectUsecase"
+    )]
+    async fn execute_put_object_inner(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
 
@@ -6020,7 +6040,7 @@ impl DefaultObjectUsecase {
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
-        let mut reader = PutObjReader::new(reader);
+        let reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
@@ -6093,98 +6113,140 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
-        let object_traffic_progress = object_traffic_health
-            .as_deref()
-            .and_then(ObjectTrafficHealth::track_write_storage);
-        let store_put_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let (obj_info, backfilled_old_current_size) = match store
-            .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)
-        {
-            Ok(obj_info) => {
-                store_put_watchdog.cancel();
-                debug!(
-                    target: "rustfs::app::object_usecase",
-                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                    component = LOG_COMPONENT_APP,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    put_path = put_path,
-                    object_size = actual_size,
-                    duration_ms = start_time.elapsed().as_millis() as u64,
-                    result = "success",
-                    "PutObject store write returned"
-                );
-                obj_info
+        let put_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let opts = opts.clone();
+            let cache_adapter = cache_adapter.clone();
+            let request_id = request_id.clone();
+            let put_path = put_path.to_string();
+            async move {
+                let object_traffic_progress = object_traffic_health
+                    .as_deref()
+                    .and_then(ObjectTrafficHealth::track_write_storage);
+                let mut reader = reader;
+                let store_put_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let (obj_info, backfilled_old_current_size) = match store
+                    .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
+                    .await
+                    .map_err(ApiError::from)
+                {
+                    Ok(obj_info) => {
+                        store_put_watchdog.cancel();
+                        debug!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            duration_ms = start_time.elapsed().as_millis() as u64,
+                            result = "success",
+                            "PutObject store write returned"
+                        );
+                        obj_info
+                    }
+                    Err(err) => {
+                        store_put_watchdog.cancel();
+                        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                        warn!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            duration_ms = start_time.elapsed().as_millis() as u64,
+                            result = "error",
+                            error = %err,
+                            "PutObject store write returned"
+                        );
+                        return Err(err.into());
+                    }
+                };
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                drop(object_traffic_progress);
+                #[cfg(test)]
+                wait_for_put_post_store_test_hook(&bucket).await;
+
+                let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+
+                let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                // Fast in-memory update for immediate quota and admin usage consistency.
+                // The previous current size comes from the prelookup when it ran,
+                // otherwise from the rename_data backfill (rustfs/backlog#1009); the
+                // backfill reproduces the lookup's observation bit for bit (latest
+                // version's ObjectInfo.size — 0 for a delete-marker latest — or
+                // not-found → None).
+                let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+                match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size))
+                {
+                    Some(previous_current_size) => {
+                        if put_versioned {
+                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                        } else {
+                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        }
+                    }
+                    None => {
+                        // Neither source could determine the previous state (peers
+                        // predating the backfill field during a rolling upgrade, or
+                        // sub-quorum metadata divergence). Record the components that
+                        // are correct regardless; the next authoritative scanner
+                        // refresh replaces the in-memory numbers.
+                        debug!(
+                            target: "rustfs::app::object_usecase",
+                            bucket = %bucket,
+                            key = %key,
+                            put_versioned,
+                            "put_object old-size backfill unknown; recording degraded usage delta"
+                        );
+                        record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, put_versioned).await;
+                    }
+                }
+
+                if dsc.replicate_any() {
+                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
+
+                let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let manager = get_capacity_manager();
+                manager.record_write_operation().await;
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
+
+                Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
+            }
+        });
+        let PutObjectCommitResult { obj_info, put_versioned } = match put_commit.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                let result: S3Result<S3Response<PutObjectOutput>> = Err(err);
+                put_request_guard.finish_err();
+                let _ = helper.complete(&result);
+                return result;
             }
             Err(err) => {
-                store_put_watchdog.cancel();
-                rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
-                warn!(
-                    target: "rustfs::app::object_usecase",
-                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                    component = LOG_COMPONENT_APP,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    put_path = put_path,
-                    object_size = actual_size,
-                    duration_ms = start_time.elapsed().as_millis() as u64,
-                    result = "error",
-                    error = %err,
-                    "PutObject store write returned"
-                );
-                let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
+                let result: S3Result<S3Response<PutObjectOutput>> = Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("put object commit owner task failed: {err}"),
+                ));
                 put_request_guard.finish_err();
                 let _ = helper.complete(&result);
                 return result;
             }
         };
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
-        drop(object_traffic_progress);
-        #[cfg(test)]
-        wait_for_put_post_store_test_hook(&bucket).await;
-
-        let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
-        let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
-
-        let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Fast in-memory update for immediate quota and admin usage consistency.
-        // The previous current size comes from the prelookup when it ran,
-        // otherwise from the rename_data backfill (rustfs/backlog#1009); the
-        // backfill reproduces the lookup's observation bit for bit (latest
-        // version's ObjectInfo.size — 0 for a delete-marker latest — or
-        // not-found → None).
-        let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
-        match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size)) {
-            Some(previous_current_size) => {
-                if put_versioned {
-                    record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                } else {
-                    record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
-                }
-            }
-            None => {
-                // Neither source could determine the previous state (peers
-                // predating the backfill field during a rolling upgrade, or
-                // sub-quorum metadata divergence). Record the components that
-                // are correct regardless; the next authoritative scanner
-                // refresh replaces the in-memory numbers.
-                debug!(
-                    target: "rustfs::app::object_usecase",
-                    bucket = %bucket,
-                    key = %key,
-                    put_versioned,
-                    "put_object old-size backfill unknown; recording degraded usage delta"
-                );
-                record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, put_versioned).await;
-            }
-        }
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -6198,17 +6260,6 @@ impl DefaultObjectUsecase {
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
-
-        // Reuse the single replication decision computed before commit (see `dsc`
-        // above) so the pending metadata persisted with the object and the
-        // post-commit schedule always derive from the same immutable decision.
-        // Recomputing here would repeat the versioning/config/target traversal and,
-        // worse, allow a replication-config hot update between the two phases to
-        // produce a pending-without-schedule or schedule-without-pending divergence
-        // (https://github.com/rustfs/backlog/issues/1320).
-        if dsc.replicate_any() {
-            schedule_object_replication(obj_info.clone(), store, dsc).await;
-        }
 
         let mut checksums = PutObjectChecksums {
             crc32: input.checksum_crc32,
@@ -6248,14 +6299,6 @@ impl DefaultObjectUsecase {
         inject_additional_checksum_headers(&mut response.headers, &put_extra_checksum_headers);
         let result = Ok(response);
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
-
-        // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
 
         // Record PutObject metrics via zero-copy-metrics
         {
@@ -7637,32 +7680,51 @@ impl DefaultObjectUsecase {
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
-        let oi = store
-            .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
-            .await
-            .map_err(ApiError::from)?;
-        drop(_self_copy_lock_guard);
+        let copy_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let src_bucket = src_bucket.clone();
+            let src_key = src_key.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let src_opts = src_opts.clone();
+            let dst_opts = dst_opts.clone();
+            async move {
+                let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
+                let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
+                let _self_copy_lock_guard = _self_copy_lock_guard;
 
-        // Reuse the single pre-commit replication decision (see `dsc` above) so
-        // the persisted pending marker and the schedule always agree, mirroring
-        // the PUT path.
-        if dsc.replicate_any() {
-            schedule_object_replication(oi.clone(), store.clone(), dsc).await;
-        }
+                let oi = store
+                    .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
-        let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+                // Reuse the single pre-commit replication decision (see `dsc` above) so
+                // the persisted pending marker and the schedule always agree, mirroring
+                // the PUT path.
+                if dsc.replicate_any() {
+                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc).await;
+                }
 
-        let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Update quota tracking after successful copy
-        if has_bucket_metadata {
-            let committed_size = quota_accounting_object_size(&oi, quota_enabled)?;
-            if dest_versioned {
-                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-            } else {
-                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+                let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+
+                let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                if has_bucket_metadata {
+                    let committed_size = quota_accounting_object_size(&oi, quota_enabled)?;
+                    if dest_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                    }
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                Ok::<_, S3Error>((oi, dest_versioned))
             }
-        }
+        });
+        let (oi, dest_versioned) = copy_commit.await.map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
+        })??;
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
         let dest_version = if dest_versioned { raw_dest_version } else { None };
@@ -7710,7 +7772,7 @@ impl DefaultObjectUsecase {
             }
         }
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
+            e_tag: oi.etag.as_ref().map(|etag| to_s3s_etag(etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             checksum_crc32: response_checksums.crc32,
             checksum_crc32c: response_checksums.crc32c,
@@ -7741,7 +7803,6 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -11627,6 +11688,76 @@ mod tests {
         let recovered = object_traffic_health.snapshot();
         assert!(!recovered.read_stalled);
         assert!(!recovered.write_stalled);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn cancelled_put_request_completes_post_commit_publication() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("put-owner-tail-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("PUT owner-tail bucket must be created");
+
+        let old_body = Bytes::from_static(b"old body that must be invalidated");
+        let old_info = put_real_cold_fill_object(&store, &bucket, object, &old_body).await;
+        let adapter = context.object_data_cache();
+        let old_plan = real_cold_fill_plan(&adapter, &bucket, object, &old_info);
+
+        let post_store_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let post_store_resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
+
+        let payload = Bytes::from_static(b"published despite caller cancellation");
+        let put_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let put = tokio::spawn(async move {
+            put_usecase
+                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
+            .await
+            .expect("PUT must reach the post-store owner-tail hook");
+        assert_eq!(
+            adapter.fill_body(&old_plan, old_body.clone()).await,
+            rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted,
+            "test must republish the old body while the owner tail is paused"
+        );
+        put.abort();
+        post_store_resume.wait().await;
+        let _ = put.await.expect_err("outer request task must be cancelled");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    adapter.lookup_body(&old_plan).await,
+                    rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-commit owner tail must invalidate stale body cache after caller cancellation");
+
+        let recovered = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cancelled request's owned commit must still publish the object");
+        assert_eq!(recovered.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
     }
 
     #[tokio::test]

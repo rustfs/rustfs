@@ -71,10 +71,16 @@ impl EncodedBlock {
 
 const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
+const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 16;
+// Vec growth may retain twice the requested logical length. Keeping the logical
+// workspace at half the budget bounds each cached workspace's shard allocation to 1 MiB.
+const LEGACY_REED_SOLOMON_CACHE_MAX_LOGICAL_SHARD_BYTES_PER_WORKSPACE: usize = 512 * 1024;
 
 type ModernReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<ReedSolomon>>>;
+type LegacyReedSolomonCache = RwLock<HashMap<(usize, usize), Arc<LegacyReedSolomonEncoder>>>;
 
 static MODERN_REED_SOLOMON_CACHE: OnceLock<ModernReedSolomonCache> = OnceLock::new();
+static LEGACY_REED_SOLOMON_CACHE: OnceLock<LegacyReedSolomonCache> = OnceLock::new();
 
 /// Errors returned when constructing an [`Erasure`] codec.
 #[derive(Debug, thiserror::Error)]
@@ -141,29 +147,46 @@ pub fn calc_shard_size_legacy(block_size: usize, data_shards: usize) -> usize {
 struct LegacyReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
-    encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
-    decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
-}
-
-impl Clone for LegacyReedSolomonEncoder {
-    fn clone(&self) -> Self {
-        Self {
-            data_shards: self.data_shards,
-            parity_shards: self.parity_shards,
-            encoder_cache: std::sync::RwLock::new(None),
-            decoder_cache: std::sync::RwLock::new(None),
-        }
-    }
+    cache_workspaces: bool,
+    encoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
+    decoder_cache: RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
 }
 
 impl LegacyReedSolomonEncoder {
-    fn new(_data_shards: usize, _parity_shards: usize) -> io::Result<Self> {
+    fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
+        Self::with_workspace_cache(data_shards, parity_shards, false)
+    }
+
+    fn with_workspace_cache(data_shards: usize, parity_shards: usize, cache_workspaces: bool) -> io::Result<Self> {
         Ok(Self {
-            data_shards: _data_shards,
-            parity_shards: _parity_shards,
-            encoder_cache: std::sync::RwLock::new(None),
-            decoder_cache: std::sync::RwLock::new(None),
+            data_shards,
+            parity_shards,
+            cache_workspaces,
+            encoder_cache: RwLock::new(None),
+            decoder_cache: RwLock::new(None),
         })
+    }
+
+    fn logical_shard_bytes_upper_bound(&self, shard_len: usize) -> Option<usize> {
+        let aligned_shard_len = shard_len.checked_add(63)?.checked_div(64)?.checked_mul(64)?;
+        let high_rate_decoder_work_count = self
+            .parity_shards
+            .checked_next_power_of_two()?
+            .checked_add(self.data_shards)?
+            .checked_next_power_of_two()?;
+        let low_rate_decoder_work_count = self
+            .data_shards
+            .checked_next_power_of_two()?
+            .checked_add(self.parity_shards)?
+            .checked_next_power_of_two()?;
+        aligned_shard_len.checked_mul(high_rate_decoder_work_count.max(low_rate_decoder_work_count))
+    }
+
+    fn should_cache_workspace(&self, shard_len: usize) -> bool {
+        self.cache_workspaces
+            && self
+                .logical_shard_bytes_upper_bound(shard_len)
+                .is_some_and(|bytes| bytes <= LEGACY_REED_SOLOMON_CACHE_MAX_LOGICAL_SHARD_BYTES_PER_WORKSPACE)
     }
 
     fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
@@ -172,12 +195,13 @@ impl LegacyReedSolomonEncoder {
             return Ok(());
         }
         let shard_len = shards_vec[0].len();
+        let cached_encoder = self
+            .encoder_cache
+            .write()
+            .map_err(|_| io::Error::other("Failed to acquire encoder cache lock"))?
+            .take();
         let mut encoder = {
-            let mut cache_guard = self
-                .encoder_cache
-                .write()
-                .map_err(|_| io::Error::other("Failed to acquire encoder cache lock"))?;
-            match cache_guard.take() {
+            match cached_encoder {
                 Some(mut cached) => {
                     if cached.reset(self.data_shards, self.parity_shards, shard_len).is_err() {
                         reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
@@ -204,10 +228,15 @@ impl LegacyReedSolomonEncoder {
             }
         }
         drop(result);
-        *self
-            .encoder_cache
-            .write()
-            .map_err(|_| io::Error::other("Failed to return encoder to cache"))? = Some(encoder);
+        if self.should_cache_workspace(shard_len) {
+            let mut cache = self
+                .encoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to return encoder to cache"))?;
+            if cache.is_none() {
+                *cache = Some(encoder);
+            }
+        }
         Ok(())
     }
 
@@ -221,13 +250,13 @@ impl LegacyReedSolomonEncoder {
             .find_map(|s| s.as_ref().map(|v| v.len()))
             .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
 
+        let cached_decoder = self
+            .decoder_cache
+            .write()
+            .map_err(|_| io::Error::other("Failed to acquire decoder cache lock"))?
+            .take();
         let mut decoder = {
-            let mut cache_guard = self
-                .decoder_cache
-                .write()
-                .map_err(|_| io::Error::other("Failed to acquire decoder cache lock"))?;
-
-            match cache_guard.take() {
+            match cached_decoder {
                 Some(mut cached_decoder) => {
                     if let Err(e) = cached_decoder.reset(self.data_shards, self.parity_shards, shard_len) {
                         warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
@@ -274,10 +303,15 @@ impl LegacyReedSolomonEncoder {
 
         drop(result);
 
-        *self
-            .decoder_cache
-            .write()
-            .map_err(|_| io::Error::other("Failed to return decoder to cache"))? = Some(decoder);
+        if self.should_cache_workspace(shard_len) {
+            let mut cache = self
+                .decoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to return decoder to cache"))?;
+            if cache.is_none() {
+                *cache = Some(decoder);
+            }
+        }
 
         Ok(())
     }
@@ -435,6 +469,39 @@ fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Resul
     Ok(encoder)
 }
 
+fn cached_legacy_reed_solomon(data_shards: usize, parity_shards: usize) -> io::Result<Arc<LegacyReedSolomonEncoder>> {
+    let cache = LEGACY_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    cached_legacy_reed_solomon_in(cache, data_shards, parity_shards)
+}
+
+fn cached_legacy_reed_solomon_in(
+    cache: &LegacyReedSolomonCache,
+    data_shards: usize,
+    parity_shards: usize,
+) -> io::Result<Arc<LegacyReedSolomonEncoder>> {
+    let key = (data_shards, parity_shards);
+    if let Some(encoder) = cache
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(encoder);
+    }
+
+    let mut cache = cache.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.get(&key) {
+        return Ok(Arc::clone(existing));
+    }
+    if cache.len() < LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES {
+        let encoder = Arc::new(LegacyReedSolomonEncoder::with_workspace_cache(data_shards, parity_shards, true)?);
+        cache.insert(key, Arc::clone(&encoder));
+        return Ok(encoder);
+    }
+    drop(cache);
+    Ok(Arc::new(LegacyReedSolomonEncoder::new(data_shards, parity_shards)?))
+}
+
 fn encode_parity_shards<F>(shards: &mut [Option<Vec<u8>>], data_shards: usize, parity_shards: usize, encode: F) -> io::Result<()>
 where
     F: FnOnce(SmallVec<[&mut [u8]; 16]>) -> io::Result<()>,
@@ -551,7 +618,7 @@ pub struct Erasure {
     pub data_shards: usize,
     pub parity_shards: usize,
     encoder: Option<ReedSolomonEncoder>,
-    legacy_encoder: Option<LegacyReedSolomonEncoder>,
+    legacy_encoder: Option<Arc<LegacyReedSolomonEncoder>>,
     pub block_size: usize,
     uses_legacy: bool,
     _id: Uuid,
@@ -687,7 +754,7 @@ impl Erasure {
 
         let legacy_encoder = if uses_legacy && parity_shards > 0 {
             Some(
-                LegacyReedSolomonEncoder::new(data_shards, parity_shards)
+                cached_legacy_reed_solomon(data_shards, parity_shards)
                     .map_err(|source| ErasureConstructionError::LegacyEncoder { source })?,
             )
         } else {
@@ -1405,12 +1472,99 @@ mod tests {
         assert_eq!(cloned.block_size, legacy.block_size);
         assert!(cloned.uses_legacy);
 
-        let data = b"legacy clone should keep independent SIMD caches";
+        let data = b"legacy clone should preserve SIMD codec behavior";
         let encoded = cloned.encode_data(data).expect("legacy clone should encode");
         let mut shards = optional_shards(&encoded);
         shards[0] = None;
         cloned.decode_data(&mut shards).expect("legacy clone should decode");
         assert_eq!(recover_data(&shards, cloned.data_shards, data.len()), data);
+    }
+
+    #[test]
+    fn legacy_codecs_share_process_cache_across_erasure_instances() {
+        let first = Erasure::new_with_options(6, 3, 64, true)
+            .legacy_encoder
+            .expect("legacy codec should be initialized");
+        let second = Erasure::new_with_options(6, 3, 128, true)
+            .legacy_encoder
+            .expect("same legacy shard layout should be initialized");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn legacy_workspace_cache_rejects_oversize_buffers_and_isolates_layouts() {
+        let four_plus_two = Erasure::new_with_options(4, 2, 64, true)
+            .legacy_encoder
+            .expect("legacy codec should be initialized");
+        let four_plus_one = Erasure::new_with_options(4, 1, 64, true)
+            .legacy_encoder
+            .expect("distinct parity layout should be initialized");
+        let three_plus_two = Erasure::new_with_options(3, 2, 64, true)
+            .legacy_encoder
+            .expect("distinct data layout should be initialized");
+
+        assert!(!Arc::ptr_eq(&four_plus_two, &four_plus_one));
+        assert!(!Arc::ptr_eq(&four_plus_two, &three_plus_two));
+        assert_eq!(four_plus_two.logical_shard_bytes_upper_bound(64 * 1024), Some(512 * 1024));
+        assert!(four_plus_two.should_cache_workspace(64 * 1024));
+        assert!(!four_plus_two.should_cache_workspace(64 * 1024 + 1));
+
+        let nine_plus_seven =
+            LegacyReedSolomonEncoder::with_workspace_cache(9, 7, true).expect("9+7 legacy codec should construct");
+        assert_eq!(nine_plus_seven.logical_shard_bytes_upper_bound(16 * 1024), Some(512 * 1024));
+        assert!(nine_plus_seven.should_cache_workspace(16 * 1024));
+        assert!(!nine_plus_seven.should_cache_workspace(16 * 1024 + 1));
+
+        let uncached = LegacyReedSolomonEncoder::new(4, 2).expect("uncached legacy codec should construct");
+        assert!(!uncached.should_cache_workspace(64));
+    }
+
+    #[test]
+    fn saturated_legacy_codec_cache_does_not_retain_more_workspaces() {
+        let cache = RwLock::new(HashMap::new());
+        for parity_shards in 1..=LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES {
+            let cached =
+                cached_legacy_reed_solomon_in(&cache, 32, parity_shards).expect("cacheable legacy codec should construct");
+            assert!(cached.cache_workspaces);
+        }
+
+        let uncached =
+            cached_legacy_reed_solomon_in(&cache, 31, 1).expect("uncached legacy codec should construct after saturation");
+        assert!(!uncached.cache_workspaces);
+        assert_eq!(
+            cache.read().expect("cache lock should remain healthy").len(),
+            LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn concurrent_legacy_codecs_preserve_byte_exact_results() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let payloads = [vec![0x35; 257], vec![0xca; 1025]];
+
+        std::thread::scope(|scope| {
+            let handles = payloads.each_ref().map(|payload| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let erasure = Erasure::new_with_options(6, 3, 2048, true);
+                    barrier.wait();
+                    let encoded = erasure.encode_data(payload).expect("concurrent legacy encode should succeed");
+                    barrier.wait();
+
+                    let mut shards = optional_shards(&encoded);
+                    shards[0] = None;
+                    erasure
+                        .decode_data(&mut shards)
+                        .expect("concurrent legacy decode should reconstruct the missing shard");
+                    recover_data(&shards, erasure.data_shards, payload.len())
+                })
+            });
+
+            for (handle, payload) in handles.into_iter().zip(payloads.iter()) {
+                assert_eq!(handle.join().expect("concurrent legacy codec worker should not panic"), *payload);
+            }
+        });
     }
 
     #[test]

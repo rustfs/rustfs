@@ -112,6 +112,8 @@ RustFS does not rotate keys on a schedule. There is no built-in rotation worker,
 
 Set `RUSTFS_KMS_ROTATION_MAX_AGE_SECS` to that period in whole seconds. Unset — the default — leaves the verdict unreported rather than assuming a policy: how often keys must be rotated is a compliance decision, and a built-in default would report keys as overdue against a rule nobody wrote. An unparsable value is treated the same way, with a warning, instead of silently falling back to a number the operator did not choose. Values below one hour are raised to one hour, because a threshold of seconds reports every key as overdue moments after it was rotated and teaches operators to ignore the signal.
 
+A second, independent threshold covers the cryptographic bound rather than the policy one. `RUSTFS_KMS_ROTATION_MAX_WRAPS` is the number of data keys one key's material may wrap before the verdict reports `rotation_due` with reason `wraps`. It follows the same discipline — unset or unparsable leaves the verdict unreported, and values below one million are raised to one million because wraps are accounted in reserved blocks of that size, so a smaller threshold would trip on the first reservation. Only backends where RustFS wraps locally and can rotate report a count (Vault KV2 today); Transit and AWS wrap externally and report none, so the wrap half stays silent there rather than guessing. When both thresholds are crossed the reported reason is `wraps`: the AES-GCM random-nonce ceiling is not negotiable, while the age period is a policy an operator chose.
+
 `GET /rustfs/admin/v3/kms/keys` then carries two additional fields per key:
 
 - `rotation_due` — whether the key has outlived the configured period.

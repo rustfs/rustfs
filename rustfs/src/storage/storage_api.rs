@@ -203,7 +203,9 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
+    pub(crate) use super::super::request_context::{
+        RequestContext, extract_request_id_from_headers, spawn_traced, spawn_traced_join,
+    };
 }
 
 pub(crate) mod rpc_consumer {

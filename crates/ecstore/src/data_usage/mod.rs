@@ -1391,7 +1391,18 @@ pub fn quota_object_size(object: &ObjectInfo) -> Result<u64, Error> {
         u64::try_from(object.size).map_err(|_| Error::PartMissingOrCorrupt)?
     } else {
         object.parts.iter().try_fold(0_u64, |total, part| {
-            let actual_size = u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+            // Compressed streaming objects persist -1 when the transformed
+            // part size is unknown. The physical part size remains a valid
+            // quota floor; reject only non-negative values that overflow.
+            let actual_size = if part.actual_size < 0 {
+                if object.is_compressed() {
+                    0
+                } else {
+                    return Err(Error::PartMissingOrCorrupt);
+                }
+            } else {
+                u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?
+            };
             let part_size = actual_size.max(u64::try_from(part.size).map_err(|_| Error::PartMissingOrCorrupt)?);
             total.checked_add(part_size).ok_or(Error::PartMissingOrCorrupt)
         })?
@@ -3174,19 +3185,41 @@ mod tests {
         };
         assert_eq!(quota_object_size(&framed).expect("physical framing must remain quota-accounted"), 17);
 
+        let legacy_compressed_part = ObjectInfo {
+            name: "legacy-compressed-part".to_string(),
+            size: 1,
+            user_defined: Arc::new((*framed.user_defined).clone()),
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                size: 1,
+                actual_size: -1,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            quota_object_size(&legacy_compressed_part).expect("unknown compressed part size is a valid sentinel"),
+            1
+        );
+
+        let uncompressed_negative_part = ObjectInfo {
+            name: "uncompressed-negative-part".to_string(),
+            size: 1,
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                size: 1,
+                actual_size: -1,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(matches!(quota_object_size(&uncompressed_negative_part), Err(Error::PartMissingOrCorrupt)));
+
         let mut corrupt_metadata = (*object.user_defined).clone();
         rustfs_utils::http::insert_str(&mut corrupt_metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "-1".to_string());
         let corrupt = ObjectInfo {
             user_defined: Arc::new(corrupt_metadata),
             ..object
         };
-        assert!(
-            matches!(
-                BucketUsageAccumulator::default().record("bucket", &corrupt),
-                Err(Error::PartMissingOrCorrupt)
-            ),
-            "negative logical metadata must not become a smaller quota baseline"
-        );
+        assert!(matches!(quota_object_size(&corrupt), Err(Error::PartMissingOrCorrupt)));
 
         let mut poisoned_metadata = HashMap::new();
         rustfs_utils::http::insert_str(

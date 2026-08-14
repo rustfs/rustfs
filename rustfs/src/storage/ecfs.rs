@@ -1261,7 +1261,7 @@ impl S3 for FS {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_put_object(self, req)).await
+        usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {

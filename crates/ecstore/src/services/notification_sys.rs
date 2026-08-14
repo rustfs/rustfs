@@ -249,6 +249,38 @@ fn fleet_capability_proof_valid_at(proof: Option<&FleetCapabilityProof>, expecte
     proof.is_some_and(|proof| proof.topology_fingerprint == expected_topology && now < proof.expires_at)
 }
 
+#[cfg(test)]
+pub(crate) struct RemoteVersionStateFleetProofGuard;
+
+#[cfg(test)]
+impl Drop for RemoteVersionStateFleetProofGuard {
+    fn drop(&mut self) {
+        replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerprint: &str) -> RemoteVersionStateFleetProofGuard {
+    match REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string()) {
+        Ok(()) => {}
+        Err(_)
+            if REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+                .get()
+                .is_some_and(|current| current == topology_fingerprint) => {}
+        Err(_) => panic!("remote version state test topology is already bound to another fingerprint"),
+    }
+    let peer_epochs = BTreeMap::new();
+    if let Some(err) = publish_fleet_capability_probe_result(
+        remote_version_state_fleet_proof_slot(),
+        topology_fingerprint,
+        Ok(peer_epochs),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    RemoteVersionStateFleetProofGuard
+}
+
 fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
     if epoch.is_nil() || peer_epochs.values().any(|existing| *existing == epoch) || peer_epochs.insert(peer, epoch).is_some() {
         return Err(Error::other("remote version state capability peer identity is invalid"));
