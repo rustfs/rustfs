@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: scanner/data-usage state is partially migrated and still owns staged cache helpers.
-#![allow(dead_code)]
 
 pub mod local_snapshot;
 
@@ -34,8 +33,8 @@ use crate::{
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
-    DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, LEGACY_DATA_USAGE_OBJECT_NAME, SizeHistogram, SizeSummary,
-    VersionsHistogram, observed_data_usage_is_newer,
+    DataUsageCache, DataUsageInfo, DiskUsageStatus, LEGACY_DATA_USAGE_OBJECT_NAME, SizeHistogram, VersionsHistogram,
+    observed_data_usage_is_newer,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -55,7 +54,6 @@ use tracing::{debug, error, info, instrument};
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
-const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
@@ -313,11 +311,6 @@ lazy_static::lazy_static! {
         LEGACY_DATA_USAGE_OBJECT_NAME
     );
     static ref LEGACY_DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
-    pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
-        crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR,
-        DATA_USAGE_BLOOM_NAME
-    );
     pub static ref DATA_COMPRESSION_TOTAL_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
@@ -858,6 +851,10 @@ async fn resolve_loaded_snapshot_pair_with_source(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "primary/backup snapshot fallback asserted by this file's tests (backlog#1823)"
+)]
 async fn resolve_loaded_snapshot(
     primary: Result<Vec<u8>, Error>,
     backup: impl Future<Output = Result<Vec<u8>, Error>>,
@@ -1187,6 +1184,10 @@ pub async fn invalidate_admin_data_usage_snapshot_cache() {
 }
 
 /// Aggregate usage information from local disk snapshots.
+#[allow(
+    dead_code,
+    reason = "reached only through aggregate_local_snapshots, which has no caller (backlog#1823)"
+)]
 fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapshot, latest_update: &mut Option<SystemTime>) {
     if let Some(update) = snapshot.last_update
         && latest_update.is_none_or(|current| update > current)
@@ -1220,6 +1221,10 @@ fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapsh
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "entry point of the local usage-snapshot feature, which has had no caller since it landed in #5307 (backlog#1823)"
+)]
 pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskUsageStatus>, DataUsageInfo), Error> {
     let mut aggregated = DataUsageInfo::default();
     let mut latest_update: Option<SystemTime> = None;
@@ -1742,11 +1747,6 @@ pub async fn record_bucket_object_write_unknown_previous_memory(bucket: &str, ne
     entry.pending_scanner_position = None;
 }
 
-/// Fast in-memory increment for immediate quota consistency.
-pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
-    record_bucket_object_write_memory(bucket, None, size_increment).await;
-}
-
 /// Fast in-memory update for successful object deletes.
 pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
     ensure_bucket_usage_cached(bucket).await;
@@ -1787,11 +1787,6 @@ pub async fn record_bucket_delete_marker_memory(bucket: &str) {
     entry.dirty = true;
     entry.stale_snapshot_pending = false;
     entry.pending_scanner_position = None;
-}
-
-/// Fast in-memory decrement for immediate quota consistency
-pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
-    record_bucket_object_delete_memory(bucket, size_decrement, size_decrement > 0).await;
 }
 
 /// Get bucket usage from the authoritative cache for this topology.
@@ -1986,91 +1981,6 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
 pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
     let authoritative = !runtime_sources::setup_is_dist_erasure().await;
     apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info, authoritative).await;
-}
-
-/// Sync memory cache with backend data (called by scanner)
-pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
-    if let Some(store) = runtime_sources::object_store_handle() {
-        match load_data_usage_from_backend(store.clone()).await {
-            Ok(data_usage_info) => {
-                replace_bucket_usage_memory_from_info(&data_usage_info).await;
-            }
-            Err(e) => {
-                debug!("Failed to sync memory cache with backend: {}", e);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Create a data usage cache entry from size summary
-pub fn create_cache_entry_from_summary(summary: &SizeSummary) -> DataUsageEntry {
-    let mut entry = DataUsageEntry::default();
-    entry.add_sizes(summary);
-    entry
-}
-
-/// Convert data usage cache to DataUsageInfo
-pub fn cache_to_data_usage_info(
-    cache: &DataUsageCache,
-    path: &str,
-    buckets: &[crate::storage_api_contracts::bucket::BucketInfo],
-) -> DataUsageInfo {
-    let e = match cache.find(path) {
-        Some(e) => e,
-        None => return DataUsageInfo::default(),
-    };
-    let flat = cache.flatten(&e);
-
-    let mut buckets_usage = HashMap::new();
-    for bucket in buckets.iter() {
-        let e = match cache.find(&bucket.name) {
-            Some(e) => e,
-            None => continue,
-        };
-        let flat = cache.flatten(&e);
-        let mut bui = BucketUsageInfo {
-            size: flat.size as u64,
-            versions_count: flat.versions as u64,
-            objects_count: flat.objects as u64,
-            delete_markers_count: flat.delete_markers as u64,
-            object_size_histogram: flat.obj_sizes.to_map(),
-            object_versions_histogram: flat.obj_versions.to_map(),
-            ..Default::default()
-        };
-
-        if let Some(rs) = &flat.replication_stats {
-            bui.replica_size = rs.replica_size;
-            bui.replica_count = rs.replica_count;
-
-            for (arn, stat) in rs.targets.iter() {
-                bui.replication_info.insert(
-                    arn.clone(),
-                    BucketTargetUsageInfo {
-                        replication_pending_size: stat.pending_size,
-                        replicated_size: stat.replicated_size,
-                        replication_failed_size: stat.failed_size,
-                        replication_pending_count: stat.pending_count,
-                        replication_failed_count: stat.failed_count,
-                        replicated_count: stat.replicated_count,
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-        buckets_usage.insert(bucket.name.clone(), bui);
-    }
-
-    DataUsageInfo {
-        last_update: cache.info.last_update,
-        objects_total_count: flat.objects as u64,
-        versions_total_count: flat.versions as u64,
-        delete_markers_total_count: flat.delete_markers as u64,
-        objects_total_size: flat.size as u64,
-        buckets_count: e.children.len() as u64,
-        buckets_usage,
-        ..Default::default()
-    }
 }
 
 // Helper functions for DataUsageCache operations

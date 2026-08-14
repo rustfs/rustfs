@@ -12,6 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Per-disk usage snapshots persisted under the metadata bucket.
+//!
+//! **Nothing calls into this module.** It landed complete with tests in #5307
+//! (2026-07-27) and its aggregation entry point,
+//! [`crate::data_usage::aggregate_local_snapshots`], has never had a caller in
+//! the tree's history. The live data-usage path is
+//! `load_data_usage_from_backend` / `store_data_usage_in_backend`. The items
+//! below therefore carry individual `dead_code` allows rather than a module
+//! blanket, so the gap stays greppable until it is either wired up or removed.
+
 use crate::data_usage::BucketUsageInfo;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
@@ -26,10 +36,12 @@ pub const DATA_USAGE_DIR: &str = "datausage";
 /// Directory used to store incremental scan state files under the metadata bucket.
 pub const DATA_USAGE_STATE_DIR: &str = "datausage/state";
 /// Snapshot file format version, allows forward compatibility if the structure evolves.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub const LOCAL_USAGE_SNAPSHOT_VERSION: u32 = 1;
 
 /// Additional metadata describing which disk produced the snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub struct LocalUsageSnapshotMeta {
     /// Disk UUID stored as a string for simpler serialization.
     pub disk_id: String,
@@ -43,6 +55,7 @@ pub struct LocalUsageSnapshotMeta {
 
 /// Usage snapshot produced by a single disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub struct LocalUsageSnapshot {
     /// Format version recorded in the snapshot.
     pub format_version: u32,
@@ -64,6 +77,7 @@ pub struct LocalUsageSnapshot {
     pub objects_total_size: u64,
 }
 
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 impl LocalUsageSnapshot {
     /// Create an empty snapshot with the default format version filled in.
     pub fn new(meta: LocalUsageSnapshotMeta) -> Self {
@@ -99,11 +113,13 @@ impl LocalUsageSnapshot {
 }
 
 /// Build the snapshot file name `<disk-id>.json`.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub fn snapshot_file_name(disk_id: &str) -> String {
     format!("{disk_id}.json")
 }
 
 /// Build the object path relative to `RUSTFS_META_BUCKET`, e.g. `datausage/<disk-id>.json`.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub fn snapshot_object_path(disk_id: &str) -> String {
     format!("{}/{}", DATA_USAGE_DIR, snapshot_file_name(disk_id))
 }
@@ -119,11 +135,13 @@ pub fn data_usage_state_dir(root: &Path) -> PathBuf {
 }
 
 /// Build the absolute path to the snapshot file for the provided disk ID.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub fn snapshot_path(root: &Path, disk_id: &str) -> PathBuf {
     data_usage_dir(root).join(snapshot_file_name(disk_id))
 }
 
 /// Read a snapshot from disk if it exists.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub async fn read_snapshot(root: &Path, disk_id: &str) -> Result<Option<LocalUsageSnapshot>> {
     let path = snapshot_path(root, disk_id);
     match fs::read(&path).await {
@@ -138,6 +156,7 @@ pub async fn read_snapshot(root: &Path, disk_id: &str) -> Result<Option<LocalUsa
 }
 
 /// Persist a snapshot to disk, creating directories as needed and overwriting any existing file.
+#[allow(dead_code, reason = "unwired local usage-snapshot feature; see module docs (backlog#1823)")]
 pub async fn write_snapshot(root: &Path, disk_id: &str, snapshot: &LocalUsageSnapshot) -> Result<()> {
     let dir = data_usage_dir(root);
     fs::create_dir_all(&dir).await.map_err(Error::other)?;
