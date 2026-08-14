@@ -1150,7 +1150,7 @@ pub(crate) trait StorageDiskRpcExt {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
@@ -1301,11 +1301,11 @@ where
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info, dst_volume, dst_path).await
+        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {

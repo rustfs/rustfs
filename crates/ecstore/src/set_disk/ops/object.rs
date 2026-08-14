@@ -97,10 +97,6 @@ fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn committed_response_metadata_slot<D>(committed_disks: &[Option<D>], fallback_slot: usize) -> usize {
-    committed_disks.iter().position(Option::is_some).unwrap_or(fallback_slot)
-}
-
 pub(in crate::set_disk::ops) fn assign_object_transaction_epoch(
     shuffle_disks: &[Option<DiskStore>],
     parts_metadatas: &mut [FileInfo],
@@ -236,38 +232,6 @@ mod duration_metrics_tests {
     #[test]
     fn duration_millis_preserves_sub_millisecond_precision() {
         assert_eq!(duration_millis_f64(Duration::from_micros(125)), 0.125);
-    }
-}
-
-#[cfg(test)]
-mod put_metadata_tests {
-    use super::*;
-
-    #[test]
-    fn committed_file_info_follows_exact_quorum_success_slot() {
-        let mut first_success = FileInfo::new("bucket/object", 2, 2);
-        first_success.name = "first-success".to_string();
-        let mut second_success = first_success.clone();
-        second_success.name = "second-success".to_string();
-        let mut parts_metadata = [FileInfo::default(), first_success, second_success, FileInfo::default()];
-        let committed_disks = [None, Some(()), Some(()), None];
-
-        assert_eq!(
-            committed_disks.iter().filter(|disk| disk.is_some()).count(),
-            2,
-            "fixture must meet exact quorum"
-        );
-        let selected_slot = committed_response_metadata_slot(&committed_disks, 3);
-        let selected = std::mem::take(&mut parts_metadata[selected_slot]);
-
-        assert_eq!(selected.name, "first-success");
-        assert_eq!(parts_metadata[1], FileInfo::default(), "selected metadata should move without cloning");
-        assert_eq!(parts_metadata[2].name, "second-success", "other committed metadata must remain available");
-        assert_eq!(
-            committed_response_metadata_slot::<()>(&[None, None, None, None], 3),
-            3,
-            "a violated post-commit success-mask invariant must not turn a durable PUT into an error"
-        );
     }
 }
 
@@ -2236,11 +2200,12 @@ impl SetDisks {
                     return Err(err);
                 }
 
-                let rename_result = SetDisks::rename_data(
+                Self::assign_rename_data_indexes(&mut parts_metadatas);
+                let rename_result = SetDisks::rename_data_owned(
                     &commit_disks,
                     RUSTFS_META_TMP_BUCKET,
                     commit_tmp_dir.as_str(),
-                    &parts_metadatas,
+                    parts_metadatas,
                     &commit_bucket,
                     &commit_object,
                     write_quorum,
@@ -2259,7 +2224,7 @@ impl SetDisks {
                 if rename_result.is_ok() {
                     quota_reservation.commit().await;
                 }
-                let (online_disks, convergence, op_old_dir, cleanup_disks, old_current_size) = match rename_result {
+                let rename_commit = match rename_result {
                     Ok(commit) => commit,
                     Err(err) => {
                         if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
@@ -2276,6 +2241,12 @@ impl SetDisks {
                         return Err(err.into());
                     }
                 };
+                let online_disks = rename_commit.online_disks;
+                let convergence = rename_commit.convergence;
+                let op_old_dir = rename_commit.data_dir;
+                let cleanup_disks = rename_commit.cleanup_disks;
+                let old_current_size = rename_commit.old_current_size;
+                let mut fi = rename_commit.committed_file_info;
                 // Do this before any post-commit await so request cancellation cannot
                 // bypass best-effort admission. A process crash before admission
                 // remains subject to the existing scanner reconciliation path.
@@ -2383,9 +2354,6 @@ impl SetDisks {
                         );
                     }
                 }
-
-                let committed_metadata_slot = committed_response_metadata_slot(&online_disks, response_metadata_slot);
-                let mut fi = std::mem::take(&mut parts_metadatas[committed_metadata_slot]);
 
                 if is_compressed {
                     record_compression_total_memory(actual_size as u64, w_size as u64).await;
