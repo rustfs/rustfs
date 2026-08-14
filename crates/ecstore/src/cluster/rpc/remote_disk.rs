@@ -229,6 +229,8 @@ pub struct RemoteDisk {
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
     recovery_monitor_active: Arc<AtomicBool>,
+    #[cfg(test)]
+    recovery_monitor_start_count: Arc<AtomicU32>,
     data_transport: Arc<dyn InternodeDataTransport>,
 }
 
@@ -434,6 +436,8 @@ impl RemoteDisk {
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
             recovery_monitor_active: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            recovery_monitor_start_count: Arc::new(AtomicU32::new(0)),
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
@@ -454,6 +458,11 @@ impl RemoteDisk {
     #[cfg(test)]
     fn recovery_monitor_is_active(&self) -> bool {
         self.recovery_monitor_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn recovery_monitor_start_count(&self) -> u32 {
+        self.recovery_monitor_start_count.load(Ordering::Acquire)
     }
 
     pub fn offline_duration_secs(&self) -> Option<u64> {
@@ -601,6 +610,8 @@ impl RemoteDisk {
             Arc::clone(&self.health),
             self.cancel_token.clone(),
             Arc::clone(&self.recovery_monitor_active),
+            #[cfg(test)]
+            Arc::clone(&self.recovery_monitor_start_count),
         );
     }
 
@@ -611,6 +622,7 @@ impl RemoteDisk {
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
         active: Arc<AtomicBool>,
+        #[cfg(test)] start_count: Arc<AtomicU32>,
     ) {
         if active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -620,13 +632,24 @@ impl RemoteDisk {
         }
         let span = Self::recovery_monitor_span(&addr, &endpoint, handle_id);
         super::spawn_background_monitor(span, async move {
+            #[cfg(test)]
+            start_count.fetch_add(1, Ordering::AcqRel);
             let lease = RecoveryMonitorLease {
                 active: Arc::clone(&active),
             };
             Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
             drop(lease);
             if !cancel_token.is_cancelled() && health.runtime_state() != RuntimeDriveHealthState::Online {
-                Self::schedule_recovery_monitor(addr, endpoint, handle_id, health, cancel_token, active);
+                Self::schedule_recovery_monitor(
+                    addr,
+                    endpoint,
+                    handle_id,
+                    health,
+                    cancel_token,
+                    active,
+                    #[cfg(test)]
+                    start_count,
+                );
             }
         });
     }
@@ -714,6 +737,8 @@ impl RemoteDisk {
                 health_clone,
                 cancel_clone,
                 Arc::clone(&recovery_monitor_active),
+                #[cfg(test)]
+                Arc::new(AtomicU32::new(0)),
             );
         }
 
@@ -780,6 +805,8 @@ impl RemoteDisk {
                             health_clone,
                             cancel_clone,
                             Arc::clone(&recovery_monitor_active),
+                            #[cfg(test)]
+                            Arc::new(AtomicU32::new(0)),
                         );
                     }
                 }
@@ -3160,15 +3187,23 @@ mod tests {
     use super::*;
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use crate::runtime::sources as runtime_sources;
+    use rustfs_protos::proto_gen::node_service::{DiskInfoResponse, ReadAllResponse};
     use serde_json::Value;
     use serial_test::serial;
+    use std::convert::Infallible;
+    use std::future::Future;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex, Mutex as StdMutex, Once};
     use std::task::{Context, Poll};
     use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
-    use tonic::transport::Endpoint as TonicEndpoint;
+    use tonic::transport::{Endpoint as TonicEndpoint, Server};
+    use tonic::{Response, Status};
+    use tonic::{
+        codegen::{Body as HttpBody, BoxFuture, StdError, http},
+        server::NamedService,
+    };
     use tracing::Level;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
     use uuid::Uuid;
@@ -3326,6 +3361,205 @@ mod tests {
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthenticatedReadPeer {
+        audience: String,
+        disk_info_calls: Arc<AtomicU32>,
+        read_all_calls: Arc<AtomicU32>,
+        read_all_disks: Arc<StdMutex<Vec<String>>>,
+        read_all_data: Bytes,
+    }
+
+    impl AuthenticatedReadPeer {
+        fn new(audience: String, read_all_data: Bytes) -> Self {
+            Self {
+                audience,
+                disk_info_calls: Arc::new(AtomicU32::new(0)),
+                read_all_calls: Arc::new(AtomicU32::new(0)),
+                read_all_disks: Arc::default(),
+                read_all_data,
+            }
+        }
+
+        fn disk_info_calls(&self) -> u32 {
+            self.disk_info_calls.load(Ordering::Acquire)
+        }
+
+        fn read_all_calls(&self) -> u32 {
+            self.read_all_calls.load(Ordering::Acquire)
+        }
+
+        fn read_all_disks(&self) -> Vec<String> {
+            self.read_all_disks.lock().expect("read_all disk list lock poisoned").clone()
+        }
+
+        fn verify_auth<T>(&self, request: &Request<T>, path: &str) -> std::result::Result<(), Status> {
+            let headers = request.metadata().clone().into_headers();
+            crate::cluster::rpc::verify_tonic_rpc_signature(&self.audience, path, &headers)
+                .map_err(|err| Status::unauthenticated(err.to_string()))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthenticatedReadPeerService {
+        peer: AuthenticatedReadPeer,
+    }
+
+    impl NamedService for AuthenticatedReadPeerService {
+        const NAME: &'static str = "node_service.NodeService";
+    }
+
+    impl<B> tower::Service<http::Request<B>> for AuthenticatedReadPeerService
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            match request.uri().path() {
+                "/node_service.NodeService/DiskInfo" => {
+                    #[derive(Clone)]
+                    struct DiskInfoSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<DiskInfoRequest> for DiskInfoSvc {
+                        type Response = DiskInfoResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<DiskInfoRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/DiskInfo")?;
+                                let request = request.into_inner();
+                                let opts = serde_json::from_str::<DiskInfoOptions>(&request.opts)
+                                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                                if !opts.noop {
+                                    return Err(Status::invalid_argument("recovery probe must use noop disk_info"));
+                                }
+                                peer.disk_info_calls.fetch_add(1, Ordering::AcqRel);
+                                let disk_info = serde_json::to_string(&DiskInfo {
+                                    total: 1,
+                                    free: 1,
+                                    endpoint: request.disk,
+                                    ..Default::default()
+                                })
+                                .map_err(|err| Status::internal(err.to_string()))?;
+                                Ok(Response::new(DiskInfoResponse {
+                                    success: true,
+                                    disk_info,
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = DiskInfoSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/ReadAll" => {
+                    #[derive(Clone)]
+                    struct ReadAllSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<ReadAllRequest> for ReadAllSvc {
+                        type Response = ReadAllResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<ReadAllRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/ReadAll")?;
+                                let request = request.into_inner();
+                                peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
+                                peer.read_all_disks
+                                    .lock()
+                                    .expect("read_all disk list lock poisoned")
+                                    .push(request.disk);
+                                Ok(Response::new(ReadAllResponse {
+                                    success: true,
+                                    data: peer.read_all_data.clone(),
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = ReadAllSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(tonic::Status::GRPC_STATUS, (tonic::Code::Unimplemented as i32).into());
+                    headers.insert(http::header::CONTENT_TYPE, tonic::metadata::GRPC_CONTENT_TYPE);
+                    Ok(response)
+                }),
+            }
+        }
+    }
+
+    struct TestGrpcPeer {
+        addr: String,
+        peer: AuthenticatedReadPeer,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestGrpcPeer {
+        async fn spawn(read_all_data: Bytes) -> Option<Self> {
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+                Err(err) => panic!("test gRPC listener should bind: {err}"),
+            };
+            let socket_addr = listener.local_addr().expect("listener local address should be available");
+            let addr = format!("http://{socket_addr}");
+            let audience = crate::cluster::rpc::normalize_tonic_rpc_audience(&socket_addr.to_string())
+                .expect("test audience should normalize");
+            let peer = AuthenticatedReadPeer::new(audience, read_all_data);
+            let service = AuthenticatedReadPeerService { peer: peer.clone() };
+            let shutdown = CancellationToken::new();
+            let shutdown_for_task = shutdown.clone();
+            let incoming = futures_util::stream::unfold(listener, |listener| async {
+                Some((listener.accept().await.map(|(stream, _)| stream), listener))
+            });
+            let task = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(incoming, shutdown_for_task.cancelled_owned())
+                    .await
+                    .expect("test gRPC peer should serve");
+            });
+
+            Some(Self {
+                addr,
+                peer,
+                shutdown,
+                task,
+            })
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let _ = self.task.await;
+        }
     }
 
     impl RecordingInternodeDataTransport {
@@ -4467,7 +4701,20 @@ mod tests {
         disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
         disk.spawn_recovery_monitor_if_needed();
         disk.spawn_recovery_monitor_if_needed();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.recovery_monitor_start_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery monitor should start");
+
         assert!(disk.recovery_monitor_is_active(), "only one recovery monitor should own the handle");
+        assert_eq!(
+            disk.recovery_monitor_start_count(),
+            1,
+            "the failed compare-exchange path must not start a second monitor"
+        );
 
         disk.cancel_token.cancel();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -4478,6 +4725,100 @@ mod tests {
         .await
         .expect("cancelled recovery monitor should release its single-flight state");
         assert!(!disk.recovery_monitor_is_active());
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn recovery_monitor_restores_online_then_real_reads_use_replacement_handle() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some(peer) = TestGrpcPeer::spawn(Bytes::from_static(b"replacement-data")).await else {
+            return;
+        };
+        let url = url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("endpoint should parse");
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("3")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                let monitor = tokio::spawn(RemoteDisk::monitor_remote_disk_recovery(
+                    disk.addr.clone(),
+                    endpoint.clone(),
+                    Arc::clone(&disk.health),
+                    disk.cancel_token.clone(),
+                ));
+
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while disk.runtime_state() != RuntimeDriveHealthState::Online {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("three authenticated recovery probes should restore the disk online");
+                monitor.await.expect("recovery monitor should exit after restoring Online");
+
+                assert_eq!(
+                    peer.peer.disk_info_calls(),
+                    3,
+                    "RemoteDisk recovery requires the configured three successful disk_info probes"
+                );
+                let recovered_read = disk.read_all("bucket", "object").await.expect("recovered handle should read");
+                assert_eq!(recovered_read, Bytes::from_static(b"replacement-data"));
+
+                let replacement = RemoteDisk::new(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                    Arc::new(TcpHttpInternodeDataTransport),
+                )
+                .await
+                .expect("replacement remote disk should construct");
+                let replacement_id = Uuid::new_v4();
+                replacement
+                    .set_disk_id(Some(replacement_id))
+                    .await
+                    .expect("replacement disk id should set");
+                let replacement_read = replacement
+                    .read_all("bucket", "object")
+                    .await
+                    .expect("replacement handle should route real reads");
+
+                assert_eq!(replacement_read, Bytes::from_static(b"replacement-data"));
+                assert_eq!(peer.peer.read_all_calls(), 2);
+                assert_eq!(
+                    peer.peer.read_all_disks(),
+                    vec![endpoint.to_string(), replacement_id.to_string()],
+                    "real reads must use the current handle's disk reference"
+                );
+                disk.cancel_token.cancel();
+                replacement.cancel_token.cancel();
+            },
+        )
+        .await;
+
+        peer.stop().await;
     }
 
     #[tokio::test]
