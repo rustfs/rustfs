@@ -19,6 +19,7 @@ use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
@@ -58,9 +59,15 @@ use std::{
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
 use uuid::Uuid;
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
@@ -746,6 +753,67 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         self.get_disks_by_key(object)
             .restore_transitioned_object(bucket, object, opts)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::list::ListOperations for Sets {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        self.inner_list_objects_v2(
+            bucket,
+            prefix,
+            continuation_token,
+            delimiter,
+            max_keys,
+            fetch_owner,
+            start_after,
+            incl_deleted,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
 
@@ -1835,7 +1903,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn set_level_list_objects_v2_lists_objects_written_through_the_pool() {
+    async fn sets_list_objects_v2_lists_objects_within_the_pool() {
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
         let format = FormatV3::new(1, 2);
         let mut endpoints = Vec::new();
@@ -1917,16 +1985,11 @@ mod tests {
             .await
             .expect("object should be written");
 
-        // Listing asserts against the set-level pipeline: the pool-level
-        // ListOperations impl for `Sets` was a pure forwarder over a duplicate
-        // pagination block that production never reached, and both were removed
-        // (backlog#1821). Writes still go through the pool, so this keeps
-        // covering the write-then-list round trip end to end.
-        let result = sets.disk_set[0]
+        let result = sets
             .clone()
             .list_objects_v2(&bucket, "", None, None, 1000, false, None, false)
             .await
-            .expect("set-level listing should succeed");
+            .expect("pool-level listing should succeed");
 
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].name, object);
