@@ -942,7 +942,9 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
-    pub(crate) use crate::storage::storage_api::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use crate::storage::storage_api::ecstore_compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod deadlock_detector {
@@ -1153,7 +1155,7 @@ pub(crate) mod multipart_usecase {
     }
 
     pub(crate) use super::{
-        access, bucket, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
+        access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
     };
     pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
 }

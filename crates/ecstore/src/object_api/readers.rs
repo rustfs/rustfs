@@ -1781,6 +1781,423 @@ mod tests {
         assert_eq!(actual, b"fghijkl");
     }
 
+    /// Compresses one multipart part exactly like the write path does
+    /// (`WritePlan::with_compression` wraps each part in its own
+    /// `compression_reader`), returning the on-disk bytes and the storage-format
+    /// compression index.
+    async fn compressed_part_fixture(data: &[u8]) -> (Vec<u8>, Option<Bytes>) {
+        use crate::io_support::rio::TryGetIndex as _;
+        let mut compressor =
+            crate::io_support::rio::compression_reader(Cursor::new(data.to_vec()), CompressionAlgorithm::default(), false);
+        let mut compressed = Vec::new();
+        compressor.read_to_end(&mut compressed).await.expect("compress part stream");
+        let index = compressor
+            .try_get_index()
+            .map(crate::io_support::rio::compression_index_storage_bytes);
+        (compressed, index)
+    }
+
+    struct CompressedMultipartFixture {
+        object_info: ObjectInfo,
+        stored: Vec<u8>,
+        plaintext: Vec<u8>,
+    }
+
+    /// Builds the on-disk representation of a compressed multipart object: each
+    /// part is an independent compressed stream and the storage layer serves
+    /// their concatenation.
+    async fn compressed_multipart_fixture(part_sizes: &[usize]) -> CompressedMultipartFixture {
+        let pattern = b"compressed multipart read path fixture data ";
+        let mut plaintext = Vec::new();
+        let mut stored = Vec::new();
+        let mut parts = Vec::with_capacity(part_sizes.len());
+
+        for (i, part_size) in part_sizes.iter().enumerate() {
+            let mut part_plaintext = Vec::with_capacity(*part_size);
+            while part_plaintext.len() < *part_size {
+                part_plaintext.extend_from_slice(pattern);
+                part_plaintext.push(i as u8);
+            }
+            part_plaintext.truncate(*part_size);
+
+            let (compressed, index) = compressed_part_fixture(&part_plaintext).await;
+            parts.push(ObjectPartInfo {
+                number: i + 1,
+                size: compressed.len(),
+                actual_size: *part_size as i64,
+                index,
+                ..Default::default()
+            });
+            stored.extend_from_slice(&compressed);
+            plaintext.extend_from_slice(&part_plaintext);
+        }
+
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
+        );
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+
+        let object_info = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "compressed-multipart".to_string(),
+            size: stored.len() as i64,
+            etag: Some(format!("6bcf86bed8807b8e78f0fc6e0a53079d-{}", part_sizes.len())),
+            parts: Arc::new(parts),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        CompressedMultipartFixture {
+            object_info,
+            stored,
+            plaintext,
+        }
+    }
+
+    /// Plans the read once to learn the storage window, then serves exactly that
+    /// window — mirroring how `set_disk` feeds the erasure read into the
+    /// returned reader.
+    async fn read_compressed_multipart(
+        fixture: &CompressedMultipartFixture,
+        rs: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> Vec<u8> {
+        let headers = HeaderMap::new();
+        let (_, offset, length) =
+            GetObjectReader::new(Box::new(Cursor::new(Vec::new())), rs.clone(), &fixture.object_info, opts, &headers)
+                .await
+                .expect("plan compressed multipart read");
+
+        let end = offset + usize::try_from(length).expect("storage window length must be non-negative");
+        assert!(
+            end <= fixture.stored.len(),
+            "planned storage window {offset}..{end} exceeds stored stream of {} bytes",
+            fixture.stored.len()
+        );
+        let window = fixture.stored[offset..end].to_vec();
+
+        let (mut reader, replay_offset, replay_length) =
+            GetObjectReader::new(Box::new(Cursor::new(window)), rs, &fixture.object_info, opts, &headers)
+                .await
+                .expect("build compressed multipart reader");
+        assert_eq!((replay_offset, replay_length), (offset, length), "read plan must be deterministic");
+
+        reader.read_all().await.expect("read compressed multipart stream")
+    }
+
+    /// Byte pattern with a 2 KiB period: it compresses extremely well while
+    /// looking nothing like ASCII fixtures. Mirrors the e2e generator that
+    /// exposed a truncated full GET on high-ratio multipart payloads.
+    fn high_ratio_binary_payload(size: usize, seed: u8) -> Vec<u8> {
+        (0..size)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761).wrapping_add(seed as u64) >> 3) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compressed_multipart_full_get_handles_high_ratio_binary_payload() {
+        let part_sizes = [5 * 1024 * 1024_usize, 1024 * 1024];
+        let mut plaintext = Vec::new();
+        let mut stored = Vec::new();
+        let mut parts = Vec::with_capacity(part_sizes.len());
+
+        for (i, part_size) in part_sizes.iter().enumerate() {
+            let part_plaintext = high_ratio_binary_payload(*part_size, if i == 0 { 7 } else { 61 });
+            let (compressed, index) = compressed_part_fixture(&part_plaintext).await;
+            parts.push(ObjectPartInfo {
+                number: i + 1,
+                size: compressed.len(),
+                actual_size: *part_size as i64,
+                index,
+                ..Default::default()
+            });
+            stored.extend_from_slice(&compressed);
+            plaintext.extend_from_slice(&part_plaintext);
+        }
+
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
+        );
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+        let fixture = CompressedMultipartFixture {
+            object_info: ObjectInfo {
+                bucket: "test-bucket".to_string(),
+                name: "high-ratio-multipart".to_string(),
+                size: stored.len() as i64,
+                etag: Some("6bcf86bed8807b8e78f0fc6e0a53079d-2".to_string()),
+                parts: Arc::new(parts),
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            },
+            stored,
+            plaintext,
+        };
+
+        let read = read_compressed_multipart(&fixture, None, &ObjectOptions::default()).await;
+
+        assert_eq!(read.len(), fixture.plaintext.len(), "full GET must return the logical size");
+        assert_eq!(read, fixture.plaintext, "high-ratio multipart payload must survive the roundtrip");
+    }
+
+    /// Full GET over a compressed multipart object must decode across part
+    /// boundaries: every part is an independent compressed stream (this is also
+    /// the on-disk shape written by builds before rustfs/rustfs#5169 disabled
+    /// multipart compression, so this pins legacy-object readability).
+    #[tokio::test]
+    async fn compressed_multipart_full_get_decodes_across_part_boundaries() {
+        let fixture = compressed_multipart_fixture(&[3 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024]).await;
+
+        let read = read_compressed_multipart(&fixture, None, &ObjectOptions::default()).await;
+
+        assert_eq!(read.len(), fixture.plaintext.len(), "full GET must return the logical size");
+        assert_eq!(read, fixture.plaintext, "full GET must reassemble all parts");
+    }
+
+    #[tokio::test]
+    async fn compressed_multipart_range_get_crosses_part_boundary() {
+        let fixture = compressed_multipart_fixture(&[3 * 1024 * 1024, 2 * 1024 * 1024]).await;
+        let boundary = 3 * 1024 * 1024_i64;
+        let rs = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: boundary - 100_000,
+            end: boundary + 100_000 - 1,
+        };
+
+        let read = read_compressed_multipart(&fixture, Some(rs), &ObjectOptions::default()).await;
+
+        let expected = &fixture.plaintext[(boundary - 100_000) as usize..(boundary + 100_000) as usize];
+        assert_eq!(read, expected, "boundary-crossing range must splice both parts");
+    }
+
+    #[tokio::test]
+    async fn compressed_multipart_range_get_seeks_into_later_part() {
+        let fixture = compressed_multipart_fixture(&[3 * 1024 * 1024, 4 * 1024 * 1024]).await;
+        // Deep inside part 2 so the plan skips part 1 entirely and (when the
+        // part carries an index) seeks within part 2.
+        let start = 3 * 1024 * 1024_i64 + 2 * 1024 * 1024_i64 + 137;
+        let rs = HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end: start + 64 * 1024 - 1,
+        };
+
+        let read = read_compressed_multipart(&fixture, Some(rs), &ObjectOptions::default()).await;
+
+        let expected = &fixture.plaintext[start as usize..(start + 64 * 1024) as usize];
+        assert_eq!(read, expected, "range inside a later part must decode from that part");
+    }
+
+    /// Parts written without a compression index (small parts skip the index in
+    /// the rio-v2 backend) must still be rangeable: the plan starts at the part
+    /// boundary and skips decompressed bytes.
+    #[tokio::test]
+    async fn compressed_multipart_range_get_works_without_part_indexes() {
+        let mut fixture = compressed_multipart_fixture(&[1024 * 1024, 1024 * 1024]).await;
+        let parts = fixture
+            .object_info
+            .parts
+            .iter()
+            .map(|part| ObjectPartInfo {
+                index: None,
+                ..part.clone()
+            })
+            .collect::<Vec<_>>();
+        fixture.object_info.parts = Arc::new(parts);
+
+        let start = 1024 * 1024_i64 + 4096;
+        let rs = HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end: start + 32 * 1024 - 1,
+        };
+
+        let read = read_compressed_multipart(&fixture, Some(rs), &ObjectOptions::default()).await;
+
+        let expected = &fixture.plaintext[start as usize..(start + 32 * 1024) as usize];
+        assert_eq!(read, expected, "index-less parts must fall back to part-boundary skip");
+    }
+
+    #[tokio::test]
+    async fn compressed_multipart_part_number_get_returns_single_part() {
+        let part_sizes = [3 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024];
+        let fixture = compressed_multipart_fixture(&part_sizes).await;
+
+        let mut logical_offset = 0_usize;
+        for (i, part_size) in part_sizes.iter().enumerate() {
+            let opts = ObjectOptions {
+                part_number: Some(i + 1),
+                ..Default::default()
+            };
+
+            let read = read_compressed_multipart(&fixture, None, &opts).await;
+
+            let expected = &fixture.plaintext[logical_offset..logical_offset + part_size];
+            assert_eq!(read.len(), *part_size, "partNumber={} GET must return the part's logical size", i + 1);
+            assert_eq!(read, expected, "partNumber={} GET must return the original part bytes", i + 1);
+            logical_offset += part_size;
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_multipart_suffix_range_reads_tail() {
+        let fixture = compressed_multipart_fixture(&[3 * 1024 * 1024, 1024 * 1024]).await;
+        let suffix_len = 128 * 1024_i64;
+        let rs = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: suffix_len,
+            end: -1,
+        };
+
+        let read = read_compressed_multipart(&fixture, Some(rs), &ObjectOptions::default()).await;
+
+        let expected = &fixture.plaintext[fixture.plaintext.len() - suffix_len as usize..];
+        assert_eq!(read, expected, "suffix range must return the tail of the last part");
+    }
+
+    /// Builds an SSE-C + disk-compression multipart object exactly like the
+    /// write path: each part is compressed into its own stream and then
+    /// encrypted with the per-part key schedule. The fixture is
+    /// legacy-encryption-specific (`rustfs_rio::EncryptReader`), matching the
+    /// pre-existing `build_legacy_ssec_multipart_fixture` shape, while the
+    /// compression layer follows the active backend feature.
+    async fn compressed_encrypted_multipart_fixture(key_bytes: [u8; 32], part_sizes: &[usize]) -> CompressedMultipartFixture {
+        let pattern = b"compressed encrypted multipart fixture data ";
+        let mut plaintext = Vec::new();
+        let mut stored = Vec::new();
+        let mut parts = Vec::with_capacity(part_sizes.len());
+
+        for (i, part_size) in part_sizes.iter().enumerate() {
+            let part_number = i + 1;
+            let mut part_plaintext = Vec::with_capacity(*part_size);
+            while part_plaintext.len() < *part_size {
+                part_plaintext.extend_from_slice(pattern);
+                part_plaintext.push(part_number as u8);
+            }
+            part_plaintext.truncate(*part_size);
+
+            let (compressed, index) = compressed_part_fixture(&part_plaintext).await;
+            let mut part_cipher = Vec::new();
+            rustfs_rio::EncryptReader::new_multipart(Cursor::new(compressed), key_bytes, LEGACY_FIXTURE_BASE_NONCE, part_number)
+                .read_to_end(&mut part_cipher)
+                .await
+                .expect("encrypt compressed fixture part");
+
+            parts.push(ObjectPartInfo {
+                number: part_number,
+                size: part_cipher.len(),
+                actual_size: *part_size as i64,
+                index,
+                ..Default::default()
+            });
+            stored.extend_from_slice(&part_cipher);
+            plaintext.extend_from_slice(&part_plaintext);
+        }
+
+        let mut user_defined = legacy_ssec_multipart_metadata(key_bytes, plaintext.len());
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
+        );
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+
+        let object_info = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "compressed-encrypted-multipart".to_string(),
+            size: stored.len() as i64,
+            etag: Some(format!("6bcf86bed8807b8e78f0fc6e0a53079d-{}", part_sizes.len())),
+            parts: Arc::new(parts),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        CompressedMultipartFixture {
+            object_info,
+            stored,
+            plaintext,
+        }
+    }
+
+    async fn read_compressed_encrypted_multipart(
+        fixture: &CompressedMultipartFixture,
+        key_bytes: [u8; 32],
+        rs: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> Vec<u8> {
+        let headers = ssec_headers_from_key(key_bytes);
+        let (_, offset, length) =
+            GetObjectReader::new(Box::new(Cursor::new(Vec::new())), rs.clone(), &fixture.object_info, opts, &headers)
+                .await
+                .expect("plan compressed encrypted multipart read");
+
+        let end = offset + usize::try_from(length).expect("storage window length must be non-negative");
+        assert!(
+            end <= fixture.stored.len(),
+            "planned storage window {offset}..{end} exceeds stored stream of {} bytes",
+            fixture.stored.len()
+        );
+        let window = fixture.stored[offset..end].to_vec();
+
+        let (mut reader, replay_offset, replay_length) =
+            GetObjectReader::new(Box::new(Cursor::new(window)), rs, &fixture.object_info, opts, &headers)
+                .await
+                .expect("build compressed encrypted multipart reader");
+        assert_eq!((replay_offset, replay_length), (offset, length), "read plan must be deterministic");
+
+        reader.read_all().await.expect("read compressed encrypted multipart stream")
+    }
+
+    #[tokio::test]
+    async fn compressed_encrypted_multipart_full_get_roundtrip() {
+        let key_bytes = [0x6Eu8; 32];
+        let fixture = compressed_encrypted_multipart_fixture(key_bytes, &[3 * 1024 * 1024, 1024 * 1024]).await;
+
+        let read = read_compressed_encrypted_multipart(&fixture, key_bytes, None, &ObjectOptions::default()).await;
+
+        assert_eq!(read.len(), fixture.plaintext.len(), "full GET must return the logical size");
+        assert_eq!(read, fixture.plaintext, "SSE-C + compression full GET must reassemble all parts");
+    }
+
+    #[tokio::test]
+    async fn compressed_encrypted_multipart_range_crosses_part_boundary() {
+        let key_bytes = [0x6Eu8; 32];
+        let fixture = compressed_encrypted_multipart_fixture(key_bytes, &[3 * 1024 * 1024, 1024 * 1024]).await;
+        let boundary = 3 * 1024 * 1024_i64;
+        let rs = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: boundary - 65_536,
+            end: boundary + 65_536 - 1,
+        };
+
+        let read = read_compressed_encrypted_multipart(&fixture, key_bytes, Some(rs), &ObjectOptions::default()).await;
+
+        let expected = &fixture.plaintext[(boundary - 65_536) as usize..(boundary + 65_536) as usize];
+        assert_eq!(read, expected, "SSE-C + compression boundary-crossing range must splice both parts");
+    }
+
+    #[tokio::test]
+    async fn compressed_encrypted_multipart_part_number_get_returns_single_part() {
+        let key_bytes = [0x6Eu8; 32];
+        let part_sizes = [3 * 1024 * 1024, 1024 * 1024];
+        let fixture = compressed_encrypted_multipart_fixture(key_bytes, &part_sizes).await;
+
+        let opts = ObjectOptions {
+            part_number: Some(2),
+            ..Default::default()
+        };
+        let read = read_compressed_encrypted_multipart(&fixture, key_bytes, None, &opts).await;
+
+        let expected = &fixture.plaintext[part_sizes[0]..];
+        assert_eq!(read.len(), part_sizes[1], "partNumber=2 GET must return the part's logical size");
+        assert_eq!(read, expected, "partNumber=2 GET must return the original part bytes");
+    }
+
     #[tokio::test]
     async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
