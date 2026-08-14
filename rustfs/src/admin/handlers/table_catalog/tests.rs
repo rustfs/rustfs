@@ -12,6 +12,7 @@ use datafusion::{
 use std::sync::Arc;
 
 use crate::table_catalog::test_support::{
+    TestCatalogObjectBackend as TestTableCatalogObjectBackend, TestCatalogObjectRecord,
     manifest_avro_bytes as test_manifest_avro_bytes,
     manifest_avro_bytes_with_nullable_sequences as test_manifest_avro_bytes_with_nullable_sequences,
     manifest_list_avro_bytes as test_manifest_list_avro_bytes, manifest_list_avro_entries as test_manifest_list_avro_entries,
@@ -2017,7 +2018,7 @@ fn format_upgrade_assigns_v1_snapshot_sequences_and_rejects_v3() {
 #[tokio::test]
 async fn create_table_response_writes_initial_metadata_for_standard_request() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -2094,7 +2095,7 @@ async fn create_table_holds_bucket_fence_from_metadata_write_through_registratio
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let metadata_backend = TestTableCatalogObjectBackend {
         put_object_barrier: Some(Arc::clone(&barrier)),
-        ..Default::default()
+        ..TestTableCatalogObjectBackend::content_addressed()
     };
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(store.as_ref(), "warehouse", true)
@@ -2128,7 +2129,7 @@ async fn create_table_holds_bucket_fence_from_metadata_write_through_registratio
         create_table_response(create_store.as_ref(), &create_backend, "warehouse", &create_namespace, request, true).await
     });
     tokio::time::timeout(StdDuration::from_secs(2), async {
-        while metadata_backend.objects.lock().await.is_empty() {
+        while metadata_backend.state.lock().await.objects.is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -2172,7 +2173,7 @@ async fn create_table_holds_bucket_fence_from_metadata_write_through_registratio
 
 #[tokio::test]
 async fn create_table_response_recreates_dropped_identifier_without_overwriting_retained_metadata() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
@@ -2308,9 +2309,9 @@ async fn create_table_response_recreates_dropped_identifier_without_overwriting_
 
 #[tokio::test]
 async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct_metadata() {
-    let catalog_backend = TestTableCatalogObjectBackend::default();
+    let catalog_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(catalog_backend);
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -2404,7 +2405,7 @@ async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct
 #[tokio::test]
 async fn standard_commit_applies_updates_and_writes_next_metadata() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_uuid = created.metadata["table-uuid"]
@@ -2535,7 +2536,7 @@ fn table_metadata_file_name_scoping_is_bounded_and_identity_sensitive() {
 
 #[tokio::test]
 async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metadata_files() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
     let source_namespace = crate::table_catalog::Namespace::parse("analytics").expect("source namespace should parse");
     let destination_namespace = crate::table_catalog::Namespace::parse("curated").expect("destination namespace should parse");
@@ -2952,7 +2953,7 @@ async fn standard_commit_recovers_matching_table_scoped_metadata_orphan() {
 
 #[tokio::test]
 async fn concurrent_identical_commits_reuse_table_scoped_metadata_winner() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
@@ -3192,7 +3193,7 @@ async fn standard_commit_rejects_fallback_readback_mismatch() {
 #[tokio::test]
 async fn standard_commit_uses_client_uuid_commit_id_in_metadata_file_name() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
 
@@ -3241,7 +3242,7 @@ async fn standard_commit_uses_client_uuid_commit_id_in_metadata_file_name() {
 #[tokio::test]
 async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_metadata_file_name() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
 
@@ -3284,7 +3285,7 @@ async fn standard_commit_accepts_non_uuid_client_commit_id_without_using_it_in_m
 #[tokio::test]
 async fn commit_publication_uses_idempotency_key_as_retry_identity() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let idempotency_key = Uuid::now_v7().to_string();
@@ -3319,7 +3320,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
         crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
         crate::table_catalog::TableCatalogBackingMode::DurableStrong,
     ] {
-        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
         let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         create_standard_events_table(&store, &metadata_backend, &namespace).await;
@@ -3435,7 +3436,7 @@ async fn commit_publication_replays_historical_standard_commit_across_backings()
 
 #[tokio::test]
 async fn staged_standard_commit_retry_revalidates_referenced_objects() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
@@ -3545,7 +3546,7 @@ async fn staged_standard_commit_retry_revalidates_referenced_objects() {
 #[tokio::test]
 async fn commit_publication_denies_generated_metadata_write_before_pointer_advance() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let before = store
@@ -3605,7 +3606,7 @@ async fn commit_publication_denies_generated_metadata_write_before_pointer_advan
 #[tokio::test]
 async fn commit_publication_authorizes_referenced_objects() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let entry = store
@@ -3672,7 +3673,7 @@ async fn commit_publication_authorizes_referenced_objects() {
 #[tokio::test]
 async fn commit_publication_denies_referenced_data_read_before_pointer_advance() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let before = store
@@ -3738,7 +3739,7 @@ async fn commit_publication_holds_referenced_object_locks_until_pointer_publish(
         commit_table_pause: Some(pause.clone()),
         ..Default::default()
     });
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(store.as_ref(), &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -3846,7 +3847,7 @@ async fn commit_publication_holds_referenced_object_locks_until_pointer_publish(
 
 #[tokio::test]
 async fn rolling_upgrade_commit_retains_legacy_data_file_guard_until_publication_completes() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let data_file = "tables/table-id/data/part-00001.parquet";
     metadata_backend.put_bytes("warehouse", data_file, b"data".to_vec()).await;
     let commit_backend = TableCommitObjectBackend::rolling_upgrade(metadata_backend.clone());
@@ -3908,7 +3909,7 @@ async fn rolling_upgrade_initial_publication_fences_old_and_new_data_plane_write
     .expect("namespace should seed");
 
     let data_file = "tables/table-id/data/part-00001.parquet";
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     metadata_backend.put_bytes("warehouse", data_file, b"data".to_vec()).await;
     let publication_backend = TableCommitObjectBackend::rolling_upgrade(metadata_backend.clone());
     assert!(
@@ -4004,7 +4005,7 @@ async fn warehouse_relocation_holds_bucket_fence_before_catalog_publication() {
         commit_table_pause: Some(pause.clone()),
         ..Default::default()
     });
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(store.as_ref(), &metadata_backend, &namespace).await;
     let current = store
@@ -4079,7 +4080,7 @@ async fn warehouse_relocation_holds_bucket_fence_before_catalog_publication() {
 
 #[tokio::test]
 async fn commit_publication_lock_order_remains_compatible_with_old_maintenance_nodes() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
     let current_metadata = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
@@ -4163,7 +4164,7 @@ async fn commit_publication_lock_order_remains_compatible_with_old_maintenance_n
 
 #[tokio::test]
 async fn commit_publication_acquires_discovered_object_locks_in_key_order() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let first = "metadata/a.json";
     let last = "metadata/z.json";
     metadata_backend.put_bytes("warehouse", first, b"a".to_vec()).await;
@@ -4238,7 +4239,7 @@ async fn commit_publication_acquires_discovered_object_locks_in_key_order() {
 
 #[tokio::test]
 async fn commit_publication_revalidates_objects_after_ordered_lock_acquisition() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let object = "metadata/current.json";
     metadata_backend.put_bytes("warehouse", object, b"before".to_vec()).await;
     let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
@@ -4260,16 +4261,16 @@ async fn commit_publication_revalidates_objects_after_ordered_lock_acquisition()
 
 #[tokio::test]
 async fn commit_publication_binds_fingerprint_to_returned_bytes() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let object = "metadata/current.json";
     let original = b"original".to_vec();
     let replacement = b"replacement".to_vec();
     let original_etag = hex_sha256(&original, str::to_string);
-    metadata_backend.objects.lock().await.insert(
+    metadata_backend.state.lock().await.objects.insert(
         ("warehouse".to_string(), object.to_string()),
-        crate::table_catalog::TableCatalogObject {
+        TestCatalogObjectRecord {
             data: replacement,
-            etag: Some(original_etag.clone()),
+            etag: original_etag.clone(),
             mod_time: None,
         },
     );
@@ -4278,11 +4279,11 @@ async fn commit_publication_binds_fingerprint_to_returned_bytes() {
         .await
         .expect("replacement bytes should be discovered")
         .expect("replacement object should exist");
-    metadata_backend.objects.lock().await.insert(
+    metadata_backend.state.lock().await.objects.insert(
         ("warehouse".to_string(), object.to_string()),
-        crate::table_catalog::TableCatalogObject {
+        TestCatalogObjectRecord {
             data: original,
-            etag: Some(original_etag),
+            etag: original_etag,
             mod_time: None,
         },
     );
@@ -4302,7 +4303,7 @@ async fn commit_publication_binds_fingerprint_to_returned_bytes() {
 #[tokio::test]
 async fn standard_commit_publishes_more_than_ten_thousand_live_files() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -4330,15 +4331,15 @@ async fn standard_commit_publishes_more_than_ten_thousand_live_files() {
         )
         .await;
     {
-        let mut objects = metadata_backend.objects.lock().await;
+        let mut state = metadata_backend.state.lock().await;
         let data = vec![1];
         let etag = hex_sha256(&data, str::to_string);
         for file in &data_files {
-            objects.insert(
+            state.objects.insert(
                 ("warehouse".to_string(), test_snapshot_object_key("warehouse", file)),
-                crate::table_catalog::TableCatalogObject {
+                TestCatalogObjectRecord {
                     data: data.clone(),
-                    etag: Some(etag.clone()),
+                    etag: etag.clone(),
                     mod_time: None,
                 },
             );
@@ -4390,7 +4391,7 @@ async fn standard_commit_publishes_more_than_ten_thousand_live_files() {
 
 #[tokio::test]
 async fn commit_publication_rejects_recreated_object_observed_by_exists() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let object = "data/part-00001.parquet";
     metadata_backend.put_bytes("warehouse", object, b"before".to_vec()).await;
     let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
@@ -4419,7 +4420,7 @@ async fn commit_publication_rejects_recreated_object_observed_by_exists() {
 #[tokio::test]
 async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     metadata_backend
@@ -4468,15 +4469,15 @@ async fn standard_commit_ignores_generation_only_orphan_metadata_file() {
 #[tokio::test]
 async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointer_conflict() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
 
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let metadata_backend = TestTableCatalogObjectBackend {
-        objects: Arc::clone(&metadata_backend.objects),
+        state: Arc::clone(&metadata_backend.state),
         put_object_barrier: Some(barrier),
-        ..Default::default()
+        ..TestTableCatalogObjectBackend::content_addressed()
     };
     let first_commit_id = "33333333-3333-4333-8333-333333333333";
     let second_commit_id = "44444444-4444-4444-8444-444444444444";
@@ -4537,7 +4538,7 @@ async fn concurrent_standard_commits_write_distinct_metadata_files_before_pointe
 #[tokio::test]
 async fn standard_commit_accepts_legacy_catalog_uuid_when_current_metadata_matches() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -4607,7 +4608,7 @@ async fn standard_commit_accepts_legacy_catalog_uuid_when_current_metadata_match
 #[tokio::test]
 async fn metadata_location_api_accepts_legacy_catalog_uuid_when_target_matches_current_metadata() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -4673,7 +4674,7 @@ async fn metadata_location_api_accepts_legacy_catalog_uuid_when_target_matches_c
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_runs_dry_run_and_delete() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -4847,7 +4848,7 @@ async fn table_metadata_maintenance_helper_runs_dry_run_and_delete() {
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5003,7 +5004,7 @@ async fn table_metadata_maintenance_helper_commits_snapshot_expiration() {
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_commits_compaction_through_publication_observer() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5095,7 +5096,7 @@ async fn table_metadata_maintenance_helper_commits_compaction_through_publicatio
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_rejects_snapshot_expiration_manual_review_commit() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5173,7 +5174,7 @@ async fn table_metadata_maintenance_helper_rejects_snapshot_expiration_manual_re
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_rejects_stale_snapshot_expiration_plan() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5257,7 +5258,7 @@ async fn table_metadata_maintenance_helper_rejects_stale_snapshot_expiration_pla
 
 #[tokio::test]
 async fn table_metadata_maintenance_helper_rejects_delete_with_snapshot_expiration_commit() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
 
@@ -5286,7 +5287,7 @@ async fn table_metadata_maintenance_helper_rejects_delete_with_snapshot_expirati
 
 #[tokio::test]
 async fn table_refs_response_reports_current_and_user_defined_refs() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5327,7 +5328,7 @@ async fn table_refs_response_reports_current_and_user_defined_refs() {
 
 #[tokio::test]
 async fn external_catalog_bridge_response_lists_supported_operator_bridges() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend);
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5362,7 +5363,7 @@ async fn external_catalog_bridge_response_lists_supported_operator_bridges() {
 
 #[tokio::test]
 async fn external_catalog_bridge_persists_identity_and_boundary() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend);
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5428,7 +5429,7 @@ async fn external_catalog_bridge_persists_identity_and_boundary() {
 
 #[tokio::test]
 async fn external_catalog_bridge_sync_registers_missing_table_from_snapshot() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5506,7 +5507,7 @@ async fn external_catalog_bridge_sync_registers_missing_table_from_snapshot() {
 
 #[tokio::test]
 async fn external_catalog_bridge_sync_commits_existing_table_pointer() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5563,7 +5564,7 @@ async fn external_catalog_bridge_sync_commits_existing_table_pointer() {
 
 #[tokio::test]
 async fn external_catalog_bridge_sync_denies_metadata_reads_before_pointer_publish() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5632,7 +5633,7 @@ async fn external_catalog_bridge_sync_denies_metadata_reads_before_pointer_publi
 
 #[tokio::test]
 async fn external_catalog_bridge_sync_conflicts_leave_pointer_unchanged() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -5823,7 +5824,7 @@ fn snapshot_conflict_rejects_unknown_snapshot_operations() {
 #[tokio::test]
 async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -5959,7 +5960,7 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
 #[tokio::test]
 async fn row_level_conflict_allows_v1_manifest_snapshot() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6069,7 +6070,7 @@ async fn row_level_conflict_allows_v1_manifest_snapshot() {
 #[tokio::test]
 async fn row_level_conflict_inherits_manifest_list_sequence_numbers() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6122,7 +6123,7 @@ async fn row_level_conflict_inherits_manifest_list_sequence_numbers() {
 #[tokio::test]
 async fn row_level_conflict_allows_inherited_manifests_on_append() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6228,7 +6229,7 @@ async fn row_level_conflict_allows_inherited_manifests_on_append() {
 #[tokio::test]
 async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6330,7 +6331,7 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
 #[tokio::test]
 async fn row_level_conflict_rejects_stale_new_manifest_sequence() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6389,7 +6390,7 @@ async fn row_level_conflict_rejects_stale_new_manifest_sequence() {
 #[tokio::test]
 async fn row_level_conflict_rejects_stale_added_entry_sequence() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6448,7 +6449,7 @@ async fn row_level_conflict_rejects_stale_added_entry_sequence() {
 #[tokio::test]
 async fn row_level_conflict_rejects_historical_change_in_new_manifest() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6507,7 +6508,7 @@ async fn row_level_conflict_rejects_historical_change_in_new_manifest() {
 #[tokio::test]
 async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6618,7 +6619,7 @@ async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
 #[tokio::test]
 async fn row_level_conflict_rejects_delete_of_non_current_file() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6737,7 +6738,7 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
 #[tokio::test]
 async fn row_level_conflict_rejects_append_with_delete_files() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6794,7 +6795,7 @@ async fn row_level_conflict_rejects_append_with_delete_files() {
 #[tokio::test]
 async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -6900,7 +6901,7 @@ async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
 #[tokio::test]
 async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -7133,7 +7134,7 @@ fn create_view_request_accepts_deep_warehouse_location() {
 #[tokio::test]
 async fn view_catalog_responses_persist_replace_and_drop_view_metadata() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -7297,7 +7298,7 @@ async fn view_catalog_responses_persist_replace_and_drop_view_metadata() {
 #[tokio::test]
 async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let table_location = created.metadata["location"]
@@ -7949,90 +7950,6 @@ impl TestCatalogPublishPause {
     }
 }
 
-type TestTableCatalogObjectLocks = Arc<tokio::sync::Mutex<BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>;
-
-#[derive(Clone, Default)]
-struct TestTableCatalogObjectBackend {
-    objects: Arc<tokio::sync::Mutex<BTreeMap<(String, String), crate::table_catalog::TableCatalogObject>>>,
-    put_object_barrier: Option<Arc<tokio::sync::Barrier>>,
-    fail_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
-    corrupt_put_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
-    missing_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
-    fail_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
-    locks: TestTableCatalogObjectLocks,
-    lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
-}
-
-impl TestTableCatalogObjectBackend {
-    async fn put_bytes(&self, bucket: &str, object: &str, data: Vec<u8>) {
-        let etag = hex_sha256(&data, str::to_string);
-        self.objects.lock().await.insert(
-            (bucket.to_string(), object.to_string()),
-            crate::table_catalog::TableCatalogObject {
-                data,
-                etag: Some(etag),
-                mod_time: None,
-            },
-        );
-    }
-
-    async fn put_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
-        self.put_json_with_mod_time(bucket, object, value, None).await;
-    }
-
-    async fn put_gzip_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
-        use std::io::Write;
-
-        let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&data).expect("metadata JSON should compress");
-        self.put_bytes(bucket, object, encoder.finish().expect("metadata gzip stream should finish"))
-            .await;
-    }
-
-    async fn put_json_with_mod_time(
-        &self,
-        bucket: &str,
-        object: &str,
-        value: serde_json::Value,
-        mod_time: Option<OffsetDateTime>,
-    ) {
-        let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
-        let etag = hex_sha256(&data, str::to_string);
-        self.objects.lock().await.insert(
-            (bucket.to_string(), object.to_string()),
-            crate::table_catalog::TableCatalogObject {
-                data,
-                etag: Some(etag),
-                mod_time,
-            },
-        );
-    }
-
-    async fn write_lock_is_held(&self, bucket: &str, object: &str) -> bool {
-        let lock = self
-            .locks
-            .lock()
-            .await
-            .get(&(bucket.to_string(), object.to_string()))
-            .cloned();
-        lock.is_some_and(|lock| lock.try_lock_owned().is_err())
-    }
-
-    async fn wait_for_lock_attempts(&self, count: usize) {
-        tokio::time::timeout(StdDuration::from_secs(2), async {
-            loop {
-                if self.lock_attempts.lock().await.len() >= count {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("lock acquisition attempts should be observable");
-    }
-}
-
 fn trusted_table_commit_backend(
     backend: &TestTableCatalogObjectBackend,
 ) -> TableCommitObjectBackend<TestTableCatalogObjectBackend> {
@@ -8210,7 +8127,7 @@ async fn standard_commit_foreign_primary_fixture() -> (
     String,
 ) {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let current = store
@@ -8252,7 +8169,7 @@ async fn standard_commit_primary_fixture(
     String,
 ) {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let current = store
@@ -8399,130 +8316,6 @@ async fn seed_object_table_for_metadata_maintenance(
     backend
         .put_json(bucket, "unrelated/ignored.json", serde_json::json!({}))
         .await;
-}
-
-#[async_trait::async_trait]
-impl crate::table_catalog::TableCatalogObjectBackend for TestTableCatalogObjectBackend {
-    async fn read_object(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
-        let mut missing_read_object_path = self.missing_read_object_path.lock().await;
-        if missing_read_object_path.as_deref() == Some(object) {
-            missing_read_object_path.take();
-            return Ok(None);
-        }
-        drop(missing_read_object_path);
-
-        let mut fail_read_object_path = self.fail_read_object_path.lock().await;
-        if fail_read_object_path.as_deref() == Some(object) {
-            fail_read_object_path.take();
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "private generated metadata read failure".to_string(),
-            ));
-        }
-        drop(fail_read_object_path);
-
-        Ok(self
-            .objects
-            .lock()
-            .await
-            .get(&(bucket.to_string(), object.to_string()))
-            .cloned())
-    }
-
-    async fn object_exists(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<bool> {
-        Ok(self
-            .objects
-            .lock()
-            .await
-            .contains_key(&(bucket.to_string(), object.to_string())))
-    }
-
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: Vec<u8>,
-        precondition: crate::table_catalog::TableCatalogPutPrecondition,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        let mut fail_put_object_path = self.fail_put_object_path.lock().await;
-        if fail_put_object_path.as_deref() == Some(object) {
-            fail_put_object_path.take();
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "injected metadata write failure".to_string(),
-            ));
-        }
-        drop(fail_put_object_path);
-
-        let mut corrupt_put_object_path = self.corrupt_put_object_path.lock().await;
-        let data = if corrupt_put_object_path.as_deref() == Some(object) {
-            corrupt_put_object_path.take();
-            b"{}".to_vec()
-        } else {
-            data
-        };
-        drop(corrupt_put_object_path);
-
-        let key = (bucket.to_string(), object.to_string());
-        let mut objects = self.objects.lock().await;
-        let result = if matches!(precondition, crate::table_catalog::TableCatalogPutPrecondition::IfAbsent)
-            && objects.contains_key(&key)
-        {
-            Err(crate::table_catalog::TableCatalogStoreError::Conflict(format!(
-                "object already exists: {object}"
-            )))
-        } else {
-            let etag = hex_sha256(&data, str::to_string);
-            objects.insert(
-                key,
-                crate::table_catalog::TableCatalogObject {
-                    data,
-                    etag: Some(etag),
-                    mod_time: None,
-                },
-            );
-            Ok(())
-        };
-        drop(objects);
-        if let Some(barrier) = &self.put_object_barrier {
-            barrier.wait().await;
-        }
-        result
-    }
-
-    async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.objects.lock().await.remove(&(bucket.to_string(), object.to_string()));
-        Ok(())
-    }
-
-    async fn list_objects(&self, bucket: &str, prefix: &str) -> crate::table_catalog::TableCatalogStoreResult<Vec<String>> {
-        Ok(self
-            .objects
-            .lock()
-            .await
-            .keys()
-            .filter(|(object_bucket, object)| object_bucket == bucket && object.starts_with(prefix))
-            .map(|(_, object)| object.clone())
-            .collect())
-    }
-
-    async fn acquire_write_lock(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Box<dyn Send>> {
-        self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
-        let lock = {
-            let mut locks = self.locks.lock().await;
-            locks
-                .entry((bucket.to_string(), object.to_string()))
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        Ok(Box::new(lock.lock_owned().await))
-    }
 }
 
 #[async_trait::async_trait]
@@ -9040,7 +8833,7 @@ async fn namespace_helpers_call_catalog_store() {
 #[tokio::test]
 async fn table_helpers_call_catalog_store() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9172,7 +8965,7 @@ async fn table_helpers_call_catalog_store() {
 #[tokio::test]
 async fn register_table_response_adopts_metadata_table_uuid() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9223,7 +9016,7 @@ async fn register_table_response_adopts_metadata_table_uuid() {
 #[tokio::test]
 async fn register_table_denies_metadata_read_before_catalog_publication() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let (namespace, metadata_location) = seed_events_registration_target(&store, &metadata_backend).await;
     let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let guarded_backend =
@@ -9266,7 +9059,7 @@ async fn register_table_denies_metadata_read_before_catalog_publication() {
 #[tokio::test]
 async fn catalog_import_denies_metadata_read_before_catalog_publication() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let (namespace, metadata_location) = seed_events_registration_target(&store, &metadata_backend).await;
     let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let guarded_backend =
@@ -9308,7 +9101,7 @@ async fn catalog_import_denies_metadata_read_before_catalog_publication() {
 
 #[tokio::test]
 async fn register_table_rejects_metadata_replaced_before_catalog_publication() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = Arc::new(crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone()));
     let (namespace, metadata_location) = seed_events_registration_target(store.as_ref(), &metadata_backend).await;
     let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
@@ -9376,7 +9169,7 @@ async fn register_table_rejects_metadata_replaced_before_catalog_publication() {
 
 #[tokio::test]
 async fn catalog_import_rejects_metadata_replaced_before_catalog_publication() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = Arc::new(crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone()));
     let (namespace, metadata_location) = seed_events_registration_target(store.as_ref(), &metadata_backend).await;
     let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
@@ -9445,7 +9238,7 @@ async fn catalog_import_rejects_metadata_replaced_before_catalog_publication() {
 #[tokio::test]
 async fn register_table_response_rejects_metadata_without_format_version() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9501,7 +9294,7 @@ async fn register_table_response_rejects_metadata_without_format_version() {
 #[tokio::test]
 async fn metadata_location_api_loads_and_updates_current_pointer() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9577,7 +9370,7 @@ async fn metadata_location_api_loads_and_updates_current_pointer() {
 #[tokio::test]
 async fn metadata_location_api_accepts_gzip_table_metadata() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let current = store
@@ -9616,7 +9409,7 @@ async fn metadata_location_api_accepts_gzip_table_metadata() {
 #[tokio::test]
 async fn metadata_location_api_validates_snapshot_graph_before_commit() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
     let current = store
@@ -9682,7 +9475,7 @@ async fn metadata_location_api_validates_snapshot_graph_before_commit() {
 
 #[tokio::test]
 async fn metadata_location_api_validates_relocated_snapshot_graph_under_target_warehouse() {
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
@@ -9741,7 +9534,7 @@ async fn metadata_location_api_validates_relocated_snapshot_graph_under_target_w
 #[tokio::test]
 async fn metadata_location_api_rejects_invalid_target_metadata_before_commit() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9819,7 +9612,7 @@ async fn metadata_location_api_rejects_invalid_target_metadata_before_commit() {
 #[tokio::test]
 async fn metadata_location_api_rejects_mismatched_table_uuid_before_commit() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await
@@ -9898,7 +9691,7 @@ async fn metadata_location_api_rejects_mismatched_table_uuid_before_commit() {
 
 #[tokio::test]
 async fn catalog_import_and_rollback_use_register_and_commit_paths() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -9993,7 +9786,7 @@ async fn catalog_import_and_rollback_use_register_and_commit_paths() {
 
 #[tokio::test]
 async fn rollback_denies_metadata_reads_before_pointer_publish() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -10055,7 +9848,7 @@ async fn rollback_denies_metadata_reads_before_pointer_publish() {
 
 #[tokio::test]
 async fn rollback_rejects_invalid_target_metadata_before_commit() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -10144,7 +9937,7 @@ async fn rollback_rejects_invalid_target_metadata_before_commit() {
 
 #[tokio::test]
 async fn rollback_rejects_mismatched_table_uuid_before_commit() {
-    let backend = TestTableCatalogObjectBackend::default();
+    let backend = TestTableCatalogObjectBackend::content_addressed();
     let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
     let bucket = "warehouse";
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
@@ -10229,7 +10022,7 @@ async fn rollback_rejects_mismatched_table_uuid_before_commit() {
 #[tokio::test]
 async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
     let store = TestTableCatalogStore::default();
-    let metadata_backend = TestTableCatalogObjectBackend::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     ensure_table_bucket_entry(&store, "warehouse", true)
         .await

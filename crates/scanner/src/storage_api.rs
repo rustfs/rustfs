@@ -278,7 +278,7 @@ pub(crate) mod scan {
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
     };
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::{MakeBucketOptions, ObjectIO};
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
 }
 
 pub(crate) mod scanner_io {

@@ -131,6 +131,8 @@ pub mod bucket {
     }
 
     pub mod metadata_sys {
+        #[cfg(feature = "test-util")]
+        pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
             BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
             capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
@@ -140,7 +142,7 @@ pub mod bucket {
             get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
             get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
             set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
-            update_under_transaction_lock,
+            update_quota_if_incarnation, update_under_transaction_lock,
         };
     }
 
@@ -316,7 +318,7 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
         invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
-        load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached,
+        load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached, quota_object_size,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
         record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
@@ -403,8 +405,11 @@ pub mod metrics {
 }
 
 pub mod notification {
+    #[cfg(any(test, feature = "test-util"))]
+    pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
         start_remote_version_state_fleet_probe,
     };
 }
@@ -464,7 +469,8 @@ pub mod set_disk {
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
-        pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
     }
 }
 

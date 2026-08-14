@@ -153,9 +153,7 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise unsupported during predeployment. Remove after composite acquisition,
-// activation fencing, fleet proof, commit-time proof revalidation, and fail-closed revocation ship together.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -2945,7 +2943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed_for_missing_disk() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
 
@@ -2962,7 +2960,7 @@ mod tests {
         let acquire = service
             .acquire_snapshot_lease(acquire)
             .await
-            .expect("disabled acquire should return a protocol response")
+            .expect("missing-disk acquire should return a protocol response")
             .into_inner();
 
         let mut renew = Request::new(SnapshotLeaseRenewRequest {
@@ -2979,14 +2977,14 @@ mod tests {
         let renew = service
             .renew_snapshot_lease(renew)
             .await
-            .expect("disabled renew should return a protocol response")
+            .expect("missing-disk renew should return a protocol response")
             .into_inner();
 
         for response in [acquire, renew] {
             assert!(!response.success);
             assert!(response.token.is_empty());
             assert_eq!(response.protocol_version, 1);
-            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+            assert_eq!(response.error, Some(DiskError::other("cannot find disk").into()));
         }
     }
 
@@ -3342,7 +3340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_unsupported_rollout_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3407,7 +3405,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &0_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &1_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");

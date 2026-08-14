@@ -23,6 +23,9 @@
 //! `ECStore` and one metadata-sys initialization exist per test binary.
 
 use super::storage_api::test::bucket::metadata_sys;
+use super::storage_api::test::bucket::quota::BucketQuota;
+use super::storage_api::test::bucket::quota::checker::QuotaChecker;
+use super::storage_api::test::contract::bucket::MakeBucketOptions;
 use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions};
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use super::{context::AppContext, object_traffic_health::ObjectTrafficHealth};
@@ -87,6 +90,17 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
     crate::storage::storage_api::new_global_notification_sys(endpoint_pools.clone())
         .await
         .expect("initialize notification system for gating test env");
+    let topology_fingerprint =
+        crate::storage::storage_api::heal_control_startup_consumer::heal_topology_fingerprint(&endpoint_pools)
+            .expect("single-node gating topology should hash");
+    crate::storage::storage_api::start_remote_version_state_fleet_probe(topology_fingerprint);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("single-node cross-pool fence capability proof should publish");
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -105,6 +119,24 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
 
     let _ = SHARED_GATING_ENV.set((disk_paths, ecstore.clone(), temp_dir));
     ecstore
+}
+
+pub(crate) async fn durable_quota_test_bucket(prefix: &str, limit: u64) -> (Arc<ECStore>, String) {
+    let store = shared_gating_ecstore().await;
+    crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+    let bucket = format!("{prefix:.30}-{}", uuid::Uuid::new_v4().simple());
+    store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create durable quota test bucket");
+    super::storage_api::test::data_usage::seed_bucket_usage_memory_for_test(&bucket, 0).await;
+    let metadata_sys =
+        crate::app::storage_api::test::get_global_bucket_metadata_sys().expect("test app context should expose bucket metadata");
+    QuotaChecker::new(metadata_sys)
+        .set_quota_config(&bucket, BucketQuota::new(Some(limit)))
+        .await
+        .expect("configure durable quota test bucket");
+    (store, bucket)
 }
 
 pub(crate) async fn shared_gating_ambient() -> Arc<AppContext> {
