@@ -27,11 +27,12 @@ use super::object::{
     object_transaction_fencing_requested, old_data_cleanup_receipt_path, read_object_transaction_epoch_fence,
     verify_object_transaction_epoch_fence,
 };
+use crate::bucket::quota::reservation;
 use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
 use futures::{StreamExt, stream};
 use std::future::Future;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -61,20 +62,21 @@ impl StaleMultipartCleanupGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultipartCommitPause {
+pub enum MultipartCommitPause {
     PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterRename,
     BeforeLockLost,
+    BeforeQuotaRename,
     BeforeTransactionEpochVerify,
     BeforeObjectPublication,
     AfterObjectPublication,
     AfterRename,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct MultipartCommitBarrierState {
     bucket: String,
     object: String,
@@ -85,27 +87,22 @@ struct MultipartCommitBarrierState {
     release: tokio::sync::Semaphore,
 }
 
-#[cfg(test)]
-pub(crate) struct MultipartCommitBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct MultipartCommitBarrier {
     state: Arc<MultipartCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static MULTIPART_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<MultipartCommitBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl MultipartCommitBarrier {
-    pub(crate) fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
+    pub fn install(bucket: &str, object: &str, pause: MultipartCommitPause) -> Self {
         Self::install_for_arrivals(bucket, object, pause, 1)
     }
 
-    pub(crate) fn install_for_arrivals(
-        bucket: &str,
-        object: &str,
-        pause: MultipartCommitPause,
-        expected_arrivals: usize,
-    ) -> Self {
+    pub fn install_for_arrivals(bucket: &str, object: &str, pause: MultipartCommitPause, expected_arrivals: usize) -> Self {
         assert!(expected_arrivals > 0, "multipart commit barrier must wait for at least one arrival");
         let state = Arc::new(MultipartCommitBarrierState {
             bucket: bucket.to_string(),
@@ -126,7 +123,7 @@ impl MultipartCommitBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let arrived = self.state.arrived.notified();
@@ -140,12 +137,12 @@ impl MultipartCommitBarrier {
         .expect("multipart completion should reach the deterministic commit barrier");
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.add_permits(self.state.expected_arrivals);
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for MultipartCommitBarrier {
     fn drop(&mut self) {
         self.release();
@@ -159,7 +156,7 @@ impl Drop for MultipartCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
     let barrier = {
         let mut slot = MULTIPART_COMMIT_BARRIER
@@ -1892,6 +1889,24 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
+        let quota_context = reservation::begin(
+            &self.ctx,
+            bucket,
+            object,
+            opts.quota_admission,
+            opts.data_movement,
+            self.pool_index,
+            self.set_index,
+        )
+        .await?;
+        let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
+        let preserve_replication_ciphertext = opts.replication_request
+            && contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
+        if quota_context.is_enforced() && preserve_replication_ciphertext {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        let transformed_object = fi.is_compressed() || should_persist_encryption_original_size(&fi.metadata);
+
         let mut object_size: usize = 0;
         let mut object_actual_size: i64 = 0;
 
@@ -2018,15 +2033,23 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 checksum_combined.extend_from_slice(cs.raw.as_slice());
             }
 
-            object_size += ext_part.size;
-            if opts.quota_admission.is_some() && ext_part.actual_size < 0 {
+            object_size = object_size.checked_add(ext_part.size).ok_or(Error::PartMissingOrCorrupt)?;
+            if ext_part.actual_size < 0 && (quota_context.is_enforced() || (!opts.replication_request && !opts.data_movement)) {
                 return Err(Error::PartMissingOrCorrupt);
             }
+            let normalized_actual_size = if ext_part.actual_size >= 0 && !transformed_object {
+                ext_part
+                    .actual_size
+                    .max(i64::try_from(ext_part.size).map_err(|_| Error::PartMissingOrCorrupt)?)
+            } else {
+                ext_part.actual_size
+            };
             object_actual_size = object_actual_size
-                .checked_add(ext_part.actual_size)
+                .checked_add(normalized_actual_size)
                 .ok_or(Error::PartMissingOrCorrupt)?;
-
-            fi.parts.push(completed_multipart_object_part(p.part_num, ext_part));
+            let mut completed_part = completed_multipart_object_part(p.part_num, ext_part);
+            completed_part.actual_size = normalized_actual_size;
+            fi.parts.push(completed_part);
         }
 
         if let Some(wtcs) = opts.want_checksum.as_ref() {
@@ -2053,15 +2076,34 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        if let Some(admission) = opts.quota_admission {
-            let quota_operation_size = u64::try_from(object_actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
-            if quota_operation_size > admission.remaining() {
-                return Err(Error::QuotaExceeded {
-                    current: admission.current_usage(),
-                    limit: admission.quota_limit(),
-                });
-            }
-        }
+        let declared_replication_actual_size = opts
+            .replication_request
+            .then(|| get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP))
+            .flatten();
+        let replication_actual_size = if opts.replication_request && quota_context.is_enforced() {
+            let observed_size = u64::try_from(object_actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+            let declared_cap = declared_replication_actual_size
+                .as_deref()
+                .map(|value| value.parse::<u64>().map_err(|_| Error::PartMissingOrCorrupt))
+                .transpose()?
+                .unwrap_or(0);
+            let declared_encryption_size = rustfs_utils::http::get_object_encryption_original_size(&fi.metadata)
+                .map_err(Error::other)?
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| Error::PartMissingOrCorrupt)?
+                .unwrap_or(0);
+            Some(observed_size.max(declared_cap).max(declared_encryption_size))
+        } else {
+            None
+        };
+        let quota_new_size = match replication_actual_size {
+            Some(size) => size.max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
+            None if quota_context.is_enforced() => u64::try_from(object_actual_size)
+                .map_err(|_| Error::PartMissingOrCorrupt)?
+                .max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
+            None => 0,
+        };
         if let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC) {
             if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(&rc_crc) {
                 fi.checksum = Some(Bytes::from(rc_crc_bytes));
@@ -2134,7 +2176,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
             }
         } else if opts.replication_request {
-            if let Some(actual_size) = get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP) {
+            if let Some(actual_size) = replication_actual_size {
+                insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
+                if persist_encryption_original_size {
+                    fi.metadata
+                        .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
+                }
+            } else if let Some(actual_size) = declared_replication_actual_size {
                 insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
                 if persist_encryption_original_size {
                     fi.metadata
@@ -2324,8 +2372,41 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         } else {
             None
         };
+
+        let quota_old_size = if quota_context.is_enforced() {
+            if opts.data_movement {
+                quota_new_size
+            } else {
+                reservation::replaced_logical_size(&self, bucket, object, opts).await?
+            }
+        } else {
+            0
+        };
+        let quota_reservation = quota_context.reserve(quota_old_size, quota_new_size).await?;
+        let (commit_disks, quota_fence_tokens) = if quota_mutation_fence {
+            match Self::prepare_quota_mutation_fences(&shuffle_disks, bucket, object, write_quorum).await {
+                Ok((disks, tokens)) => {
+                    for (metadata, token) in parts_metadatas.iter_mut().zip(tokens.iter().copied()) {
+                        if let Some(token) = token {
+                            insert_str(
+                                &mut metadata.metadata,
+                                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                                token.as_uuid().to_string(),
+                            );
+                        }
+                    }
+                    (disks, tokens)
+                }
+                Err(err) => {
+                    quota_reservation.abort().await;
+                    return Err(err);
+                }
+            }
+        } else {
+            (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+        };
         let transaction_epoch =
-            transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&shuffle_disks, &mut parts_metadatas));
+            transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&commit_disks, &mut parts_metadatas));
 
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
@@ -2333,49 +2414,152 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit_upload_id = upload_id.to_owned();
         let commit_upload_id_path = upload_id_path.clone();
         let commit_version_suspended = opts.version_suspended;
+        let commit_versioned = opts.versioned;
+        let commit_version_id = opts.version_id.clone();
+        let commit_namespace_lock_fence = opts.namespace_lock_fence.clone();
+        let commit_bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
         let commit_is_versioned = opts.versioned || opts.version_suspended;
         let commit_capacity_scope_token = opts.capacity_scope_token;
         let commit_object_lock_guard = object_lock_guard.take();
-        let detach_commit_owner = commit_object_lock_guard.is_some() || upload_guard.is_some();
+        let detach_commit_owner = commit_object_lock_guard.is_some() || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
             let _object_lock_guard = commit_object_lock_guard;
             let _upload_guard = upload_guard;
+            let mut quota_reservation = quota_reservation;
             let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            // Crash-consistency injection: hard power loss after the upload is fully
-            // staged and locked but before the authoritative rename_data commit. No
-            // disk has moved the staged data, so a crash here must leave any prior
-            // committed version byte-for-byte intact (rustfs/backlog#864) and the
-            // upload fully retryable. Compiles to a no-op outside `#[cfg(test)]`.
-            if crash_inject::should_crash_at(CrashPoint::MultipartBeforeCommitRename, &commit_object) {
-                return Err(StorageError::Unexpected);
+            let pre_rename_result: Result<()> = async {
+                // Crash-consistency injection: hard power loss after the upload is fully
+                // staged and locked but before the authoritative rename_data commit. No
+                // disk has moved the staged data, so a crash here must leave any prior
+                // committed version byte-for-byte intact (rustfs/backlog#864) and the
+                // upload fully retryable. Compiles to a no-op outside `#[cfg(test)]`.
+                if crash_inject::should_crash_at(CrashPoint::MultipartBeforeCommitRename, &commit_object) {
+                    return Err(StorageError::Unexpected);
+                }
+                quota_reservation.mark_commit_started().await?;
+                #[cfg(any(test, feature = "test-util"))]
+                pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeQuotaRename).await;
+                if quota_reservation.is_lock_lost()
+                    || !quota_reservation.capability_proof_matches()
+                    || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || _upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || commit_namespace_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                {
+                    return Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "quota_reservation",
+                        bucket: commit_bucket.clone(),
+                        object: commit_object.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+                let restore_opts = ObjectOptions {
+                    version_id: commit_version_id.clone(),
+                    versioned: commit_versioned,
+                    version_suspended: commit_version_suspended,
+                    no_lock: true,
+                    ..Default::default()
+                };
+                commit_set
+                    .require_current_restore_operation_id(
+                        &commit_bucket,
+                        &commit_object,
+                        &restore_opts,
+                        expected_restore_operation_id,
+                        "complete_multipart_upload_quota_reservation",
+                    )
+                    .await?;
+                if let Some(proof) = transaction_fencing_proof.as_ref()
+                    && !object_transaction_fencing_fleet_proof_matches(proof)
+                {
+                    return Err(Error::other(
+                        "object transaction fencing fleet capability changed during complete_multipart_upload",
+                    ));
+                }
+                if let Some(expected) = transaction_epoch_fence {
+                    #[cfg(test)]
+                    pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeTransactionEpochVerify)
+                        .await;
+                    verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                }
+                if quota_reservation.is_lock_lost()
+                    || !quota_reservation.capability_proof_matches()
+                    || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || _upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                    || commit_namespace_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                    || commit_bucket_lifecycle_lock_fence
+                        .as_ref()
+                        .is_some_and(NamespaceLockFence::is_lock_lost)
+                {
+                    return Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "quota_reservation",
+                        bucket: commit_bucket.clone(),
+                        object: commit_object.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = pre_rename_result {
+                SetDisks::abort_quota_reservation_after_fence(
+                    quota_reservation,
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    &commit_bucket,
+                    &commit_object,
+                    write_quorum,
+                    quota_mutation_fence,
+                )
+                .await;
+                return Err(err);
             }
 
             // The trailing `_` drops the rename_data old-size backfill
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
-            if let Some(proof) = transaction_fencing_proof.as_ref()
-                && !object_transaction_fencing_fleet_proof_matches(proof)
-            {
-                return Err(Error::other(
-                    "object transaction fencing fleet capability changed during complete_multipart_upload",
-                ));
-            }
-            if let Some(expected) = transaction_epoch_fence {
-                #[cfg(test)]
-                pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeTransactionEpochVerify).await;
-                verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
-            }
-            let (online_disks, convergence, op_old_dir, cleanup_disks, _) = SetDisks::rename_data(
-                &shuffle_disks,
+            Self::assign_rename_data_indexes(&mut parts_metadatas);
+            let rename_result = SetDisks::rename_data_owned(
+                &commit_disks,
                 RUSTFS_META_MULTIPART_BUCKET,
                 &commit_upload_id_path,
-                &parts_metadatas,
+                parts_metadatas,
                 &commit_bucket,
                 &commit_object,
                 write_quorum,
             )
-            .await?;
+            .await;
+            if quota_mutation_fence {
+                let _ = SetDisks::release_quota_mutation_fences(
+                    &commit_disks,
+                    &quota_fence_tokens,
+                    &commit_bucket,
+                    &commit_object,
+                    write_quorum,
+                )
+                .await;
+            }
+            if rename_result.is_ok() {
+                quota_reservation.commit().await;
+            }
+            let rename_commit = match rename_result {
+                Ok(result) => result,
+                Err(err) => return Err(err.into()),
+            };
+            let online_disks = rename_commit.online_disks;
+            let convergence = rename_commit.convergence;
+            let op_old_dir = rename_commit.data_dir;
+            let cleanup_disks = rename_commit.cleanup_disks;
+            let committed_file_info = rename_commit.committed_file_info;
 
             // Detach admission before any post-commit await: client cancellation
             // must not couple durable convergence repair to cleanup work.
@@ -2420,9 +2604,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 return Err(StorageError::Unexpected);
             }
 
-            if let Some(committed_slot) = online_disks.iter().position(Option::is_some) {
-                fi = parts_metadatas[committed_slot].clone();
-            }
+            fi = committed_file_info;
             let committed_dir = fi.data_dir.unwrap_or_default().to_string();
 
             commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
@@ -3162,7 +3344,7 @@ mod tests {
         let (upload_id, parts) =
             stage_upload_with_create_opts(&set_disks, bucket, object, &payload, &ObjectOptions::default()).await;
         let mut denied_opts = ObjectOptions::default();
-        assert!(denied_opts.set_quota_admission(100, 4195));
+        assert!(denied_opts.set_quota_admission(100, 4180));
 
         let err = set_disks
             .clone()
@@ -3173,7 +3355,7 @@ mod tests {
             err,
             StorageError::QuotaExceeded {
                 current: 100,
-                limit: 4195
+                limit: 4180
             }
         ));
 
@@ -3191,7 +3373,7 @@ mod tests {
         );
 
         let mut allowed_opts = ObjectOptions::default();
-        assert!(allowed_opts.set_quota_admission(100, 4196));
+        assert!(allowed_opts.set_quota_admission(100, 4181));
         let completed = set_disks
             .clone()
             .complete_multipart_upload(bucket, object, &upload_id, parts, &allowed_opts)
@@ -3229,6 +3411,120 @@ mod tests {
                 .await
                 .is_ok(),
             "quota rejection must leave compressed parts retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_quota_uses_server_observed_part_size_as_lower_bound() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-replication-quota-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let mut create_opts = ObjectOptions::default();
+        insert_str(&mut create_opts.user_defined, SUFFIX_COMPRESSION, "S2".to_string());
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("replication multipart upload should be created");
+        let part = put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x72; 4096], 1).await;
+        let mut complete_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        assert!(complete_opts.set_quota_admission(0, 4095));
+
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part.clone()], &complete_opts)
+            .await
+            .expect_err("a forged tiny replication logical size must not reduce quota admission");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 0, limit: 4095 }));
+        assert!(
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+                .await
+                .is_ok(),
+            "quota rejection must leave replicated multipart parts retryable"
+        );
+
+        assert!(complete_opts.set_quota_admission(0, 4096));
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect("the physical safety boundary should admit the transformed replica");
+        assert_eq!(completed.get_actual_size().expect("replica logical size should parse"), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_multipart_quota_uses_server_observed_part_size_as_lower_bound() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-direct-quota-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let part = put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x73; 4096], 1).await;
+        let mut complete_opts = ObjectOptions::default();
+        assert!(complete_opts.set_quota_admission(0, 4095));
+
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect_err("a forged tiny direct logical size must not reduce quota admission");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 0, limit: 4095 }));
+        assert!(
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+                .await
+                .is_ok(),
+            "quota rejection must leave direct multipart parts retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_rejects_ciphertext_replication_without_a_server_observed_logical_size() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-compressed-ciphertext-quota-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let mut create_opts = ObjectOptions::default();
+        insert_str(&mut create_opts.user_defined, SUFFIX_COMPRESSION, "S2".to_string());
+        insert_str(
+            &mut create_opts.user_defined,
+            rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT,
+            "true".to_string(),
+        );
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("ciphertext multipart upload should be created");
+        let payload = vec![0x74; 4096];
+        let part = put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &payload, 1).await;
+        let mut complete_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        assert!(complete_opts.set_quota_admission(0, u64::MAX));
+
+        let err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect_err("ciphertext replication has no server-observed logical quota size");
+        assert!(matches!(err, StorageError::PartMissingOrCorrupt));
+        assert!(
+            set_disks
+                .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+                .await
+                .is_ok(),
+            "rejection must leave ciphertext multipart parts retryable"
         );
     }
 
