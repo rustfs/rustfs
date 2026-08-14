@@ -13,13 +13,12 @@
 // limitations under the License.
 
 // #730: error taxonomy still exposes compatibility variants while callers move to contracts.
-#![allow(dead_code)]
 
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
 use crate::storage_api_contracts::{error::StorageErrorCode, range::HTTPRangeError};
 use rustfs_utils::path::decode_dir_object;
-use s3s::{S3Error, S3ErrorCode};
+use s3s::S3ErrorCode;
 
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
@@ -902,6 +901,7 @@ pub fn is_err_decommission_running(err: &Error) -> bool {
     matches!(err, &StorageError::DecommissionAlreadyRunning)
 }
 
+#[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_rebalance_running(err: &Error) -> bool {
     matches!(err, &StorageError::RebalanceAlreadyRunning)
 }
@@ -910,12 +910,9 @@ pub fn is_err_operation_canceled(err: &Error) -> bool {
     matches!(err, &StorageError::OperationCanceled)
 }
 
+#[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_not_initialized(err: &Error) -> bool {
     err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
-}
-
-pub fn is_err_io(err: &Error) -> bool {
-    matches!(err, &StorageError::Io(_))
 }
 
 /// Strict "not found" predicate that only matches genuine object/version/volume
@@ -1078,20 +1075,8 @@ pub struct GenericError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ObjectApiError {
-    #[error("Operation timed out")]
-    OperationTimedOut,
-
-    #[error("etag of the object has changed")]
-    InvalidETag,
-
     #[error("BackendDown")]
     BackendDown(String),
-
-    #[error("Unsupported headers in Metadata")]
-    UnsupportedMetadata,
-
-    #[error("Method not allowed: {}/{}", .0.bucket, .0.object)]
-    MethodNotAllowed(GenericError),
 
     #[error("The operation is not valid for the current state of the object {}/{}({})", .0.bucket, .0.object, .0.version_id)]
     InvalidObjectState(GenericError),
@@ -1173,30 +1158,6 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
     }
 
     err
-}
-
-pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
-    let storage_err = &err;
-    let mut bucket: String = "".to_string();
-    let mut object: String = "".to_string();
-    if !params.is_empty() {
-        bucket = params[0].to_string();
-    }
-    if params.len() >= 2 {
-        object = decode_dir_object(params[1]);
-    }
-    match storage_err {
-        StorageError::MethodNotAllowed => S3Error::with_message(
-            S3ErrorCode::MethodNotAllowed,
-            ObjectApiError::MethodNotAllowed(GenericError {
-                bucket,
-                object,
-                ..Default::default()
-            })
-            .to_string(),
-        ),
-        _ => s3s::S3Error::with_message(S3ErrorCode::Custom("err".into()), err.to_string()),
-    }
 }
 
 #[cfg(test)]

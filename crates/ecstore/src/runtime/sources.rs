@@ -38,7 +38,6 @@ use crate::{
         set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
-    services::event_notification::EventNotifier,
     services::notification_sys::{NotificationSys, get_global_notification_sys},
     services::tier::tier::TierConfigMgr,
     store::ECStore,
@@ -143,6 +142,10 @@ pub async fn setup_is_erasure_sd() -> bool {
     is_erasure_sd().await
 }
 
+#[allow(
+    dead_code,
+    reason = "setup-type override used only by tests across this crate (backlog#1823)"
+)]
 pub(crate) async fn current_setup_type() -> SetupType {
     if setup_is_dist_erasure().await {
         SetupType::DistErasure
@@ -155,6 +158,10 @@ pub(crate) async fn current_setup_type() -> SetupType {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "setup-type override used only by tests across this crate (backlog#1823)"
+)]
 pub(crate) async fn set_setup_type(setup_type: SetupType) {
     update_erasure_type(setup_type).await;
 }
@@ -230,14 +237,6 @@ pub(crate) async fn test_node_channel_is_cached(addr: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn ensure_test_rpc_secret() {
     let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
-}
-
-pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
-    get_global_storage_class_snapshot().get_parity_for_sc(storage_class.unwrap_or_default())
-}
-
-pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> bool {
-    get_global_storage_class_snapshot().should_inline(shard_size, versioned)
 }
 
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
@@ -332,21 +331,6 @@ pub(crate) fn storage_class_config_snapshot() -> Arc<storageclass::Config> {
     get_global_storage_class_snapshot()
 }
 
-/// Scalar STANDARD / RRS parity for backend-info reporting.
-///
-/// Retained for the rebalance/backend-info path. `get_parity_for_sc` returns
-/// `None` when the runtime config is uninitialized or (post per-pool support)
-/// when pools disagree, so STANDARD falls back to the caller's default and RRS
-/// stays `None` — matching the pre-per-pool scalar reporting.
-pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
-    let sc = get_global_storage_class_snapshot();
-    let standard = sc
-        .get_parity_for_sc(storageclass::CLASS_STANDARD)
-        .or(Some(default_standard_parity));
-    let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
-    (standard, reduced_redundancy)
-}
-
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {
     set_global_storage_class(config);
 }
@@ -412,10 +396,6 @@ pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 
 pub fn transition_state_handle() -> Arc<TransitionState> {
     crate::runtime::global::current_ctx().transition_state()
-}
-
-pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {
-    crate::runtime::global::current_ctx().event_notifier()
 }
 
 pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
@@ -509,30 +489,6 @@ pub(crate) async fn local_disk_set_drive(
     disk_idx: usize,
 ) -> Option<DiskStore> {
     instance_ctx.local_disk_set_drives().read().await[pool_idx][set_idx][disk_idx].clone()
-}
-
-pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
-    let set_drives = local_disk_set_drives_handle();
-    let global_set_drives = set_drives.read().await;
-    if global_set_drives.is_empty() {
-        return local_disk_map_handle()
-            .read()
-            .await
-            .get(&endpoint.to_string())
-            .cloned()
-            .unwrap_or(None);
-    }
-
-    let pool_idx = usize::try_from(endpoint.pool_idx).ok()?;
-    let set_idx = usize::try_from(endpoint.set_idx).ok()?;
-    let disk_idx = usize::try_from(endpoint.disk_idx).ok()?;
-
-    global_set_drives
-        .get(pool_idx)
-        .and_then(|sets| sets.get(set_idx))
-        .and_then(|disks| disks.get(disk_idx))
-        .cloned()
-        .unwrap_or(None)
 }
 
 pub(crate) async fn local_disk_paths() -> Vec<String> {

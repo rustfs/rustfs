@@ -23,6 +23,7 @@
 //! two are tested together because a reload is the only way to tell a real
 //! merge from one that happened to look right in the cache.
 
+#![recursion_limit = "256"]
 #![cfg(feature = "swift")]
 
 use std::collections::HashMap;

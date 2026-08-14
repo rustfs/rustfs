@@ -482,6 +482,7 @@ impl SetDisks {
     pub(super) async fn try_get_object_direct_data_shards_with_fileinfo(
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
@@ -502,13 +503,7 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
+        let erasure = erasure_cache.get_for_file_info(fi)?;
 
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -636,6 +631,7 @@ impl SetDisks {
         // &self,
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         offset: usize,
         length: i64,
         writer: &mut W,
@@ -730,13 +726,7 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
+        let erasure = erasure_cache.get_for_file_info(&fi)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1170,6 +1160,7 @@ impl SetDisks {
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
@@ -1180,14 +1171,7 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
-
+        let erasure = erasure_cache.get_for_file_info(fi)?;
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         if fi.parts.len() == 1 {
@@ -1574,7 +1558,7 @@ struct LazyCodecPartContext {
     fi: FileInfo,
     files: Vec<FileInfo>,
     disks: Vec<Option<DiskStore>>,
-    erasure: coding::Erasure,
+    erasure: Arc<coding::Erasure>,
     skip_verify_bitrot: bool,
     metrics_object_class: &'static str,
     metrics_size_bucket: &'static str,
@@ -2058,6 +2042,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             "bucket",
             "object",
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -2088,6 +2073,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             2,
             1,
             &mut output,
@@ -2111,6 +2097,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             usize::MAX,
             1,
             &mut output,
@@ -2132,6 +2119,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             1,
             1,
             &mut output,
@@ -2155,6 +2143,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -2192,6 +2181,7 @@ mod metadata_cache_tests {
         SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             0,
             &mut output,
@@ -2224,6 +2214,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -4128,6 +4119,7 @@ mod tests {
         let result = SetDisks::get_object_decode_reader_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             &fi,
             &[],
             &[],
@@ -4150,6 +4142,7 @@ mod tests {
         let invalid_size = SetDisks::get_object_decode_reader_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             &single_part,
             &[],
             &[],
@@ -4170,6 +4163,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &multipart,
                 &[],
                 &[],
@@ -4194,6 +4188,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &multipart,
                 &[],
                 &[],
@@ -4222,6 +4217,7 @@ mod tests {
                 SetDisks::get_object_decode_reader_with_fileinfo(
                     CODEC_STREAMING_TEST_BUCKET,
                     CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
                     &multipart,
                     &[],
                     &[],
@@ -4275,6 +4271,7 @@ mod tests {
                 SetDisks::get_object_decode_reader_with_fileinfo(
                     CODEC_STREAMING_TEST_BUCKET,
                     CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
                     &fi,
                     &files,
                     &disks,
@@ -4328,6 +4325,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &fi,
                 &files,
                 &disks,
@@ -4372,6 +4370,7 @@ mod tests {
         SetDisks::get_object_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             0,
             part_data.len() as i64,
             &mut output,

@@ -182,7 +182,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Readers: test-and-lint-rio-v2, build-rustfs-debug-binary-rio-v2.
+  # Readers: test-and-lint-rio-v2 (per-PR), build-rustfs-debug-binary-rio-v2
+  # (weekly schedule / manual dispatch only — dormant rio-v2 variant, see
+  # rustfs/backlog#1835 and docs/architecture/minio-file-format-compat.md).
+  # The second build below stays despite the reduced cadence: it warms the
+  # rio-v2,e2e-test-hooks feature resolution the scheduled build restores,
+  # which keeps that lane inside its 30-minute timeout.
   warm-ci-feat-rio:
     name: Warm ci-feat-rio
     runs-on: sm-standard-4

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Cluster config metrics collector.
 //!
 //! Collects cluster configuration metrics including storage class

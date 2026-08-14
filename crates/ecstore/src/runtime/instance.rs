@@ -402,6 +402,10 @@ impl InstanceContext {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "driven by the tier-delete-journal recovery test behind `--features test-util` (backlog#1823)"
+    )]
     pub(crate) fn wake_tier_delete_journal_recovery(&self) {
         self.tier_delete_journal_recovery_wakeup.notify_one();
     }

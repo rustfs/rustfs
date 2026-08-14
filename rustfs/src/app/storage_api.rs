@@ -998,7 +998,7 @@ pub(crate) mod options {
 }
 
 pub(crate) mod request_context {
-    pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
+    pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced, spawn_traced_join};
 }
 
 pub(crate) mod sse {
@@ -1150,7 +1150,9 @@ pub(crate) mod multipart_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse};
+    pub(crate) use super::{
+        access, bucket, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
+    };
     pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
 }
 

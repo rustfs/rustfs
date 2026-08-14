@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Replication metrics collector.
 //!
 //! Collects cluster-wide replication metrics including queue stats,

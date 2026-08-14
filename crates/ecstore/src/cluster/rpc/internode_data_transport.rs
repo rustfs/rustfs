@@ -43,6 +43,10 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+#[allow(
+    dead_code,
+    reason = "live in the cfg(not(test)) half of build_internode_data_transport_from_env (backlog#1823)"
+)]
 static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeDataTransport>, String>> = OnceLock::new();
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
@@ -134,6 +138,10 @@ fn put_file_capability_status_is_legacy(status: u16) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "capability-negotiation seam; constructed only by transport test doubles (backlog#1823)"
+)]
 pub struct InternodeDataTransportCapabilities {
     /// Backend can open a streaming remote disk reader.
     pub streaming_read: bool,
@@ -150,6 +158,10 @@ pub struct InternodeDataTransportCapabilities {
 }
 
 impl InternodeDataTransportCapabilities {
+    #[allow(
+        dead_code,
+        reason = "capability-negotiation seam; used by transport test doubles (backlog#1823)"
+    )]
     pub const fn tcp_http() -> Self {
         Self {
             streaming_read: true,
@@ -234,7 +246,12 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
         Err(Error::MethodNotAllowed)
     }
+    // Interface facet nobody calls yet: every transport implements both, but no
+    // caller negotiates on them. Kept for the internode transport split
+    // (backlog#1350); deleting them would delete the seam and six impls.
+    #[allow(dead_code, reason = "unused capability-negotiation facet (backlog#1823)")]
     fn name(&self) -> &'static str;
+    #[allow(dead_code, reason = "unused capability-negotiation facet (backlog#1823)")]
     fn capabilities(&self) -> InternodeDataTransportCapabilities;
 }
 
@@ -670,6 +687,10 @@ fn build_internode_data_transport_result(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "live in the cfg(test) half of build_internode_data_transport_from_env, which bypasses the process static (backlog#1823)"
+)]
 pub fn build_internode_data_transport(configured_transport: Option<&str>) -> Result<Arc<dyn InternodeDataTransport>> {
     build_internode_data_transport_result(configured_transport).map_err(Error::other)
 }

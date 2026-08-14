@@ -653,6 +653,7 @@ fn reconcile_servers_with_endpoint_topology(
     (added, report)
 }
 
+#[allow(dead_code, reason = "exercised by this file's topology tests (backlog#1823)")]
 fn server_topology_completeness_report(
     servers: &[ServerProperties],
     endpoints: &EndpointServerPools,

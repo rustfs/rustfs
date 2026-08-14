@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Scanner metrics collector.
 //!
 //! Collects background scanner metrics including bucket-drive scans,

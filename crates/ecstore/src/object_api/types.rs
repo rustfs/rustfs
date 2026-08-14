@@ -172,6 +172,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
     pub(crate) fn is_for_store_bucket(
         &self,
         store_id: Uuid,
