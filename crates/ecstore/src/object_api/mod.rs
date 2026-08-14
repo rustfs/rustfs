@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: object API readers keep staged compatibility paths during facade migration.
-#![allow(dead_code)]
 
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::replication::{
