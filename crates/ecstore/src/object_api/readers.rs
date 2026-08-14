@@ -479,7 +479,15 @@ enum ReadTransform {
     },
 }
 
-struct ReadPlan {
+/// How an object's stored bytes must be fetched and transformed to serve a
+/// request.
+///
+/// Public so callers that fetch the stored bytes from somewhere other than the
+/// local erasure set — the remote-tier read path — can position their own fetch
+/// with [`ReadPlan::storage_offset`] / [`ReadPlan::storage_length`] and then
+/// hand the resulting stream to [`ReadPlan::into_object_reader`], instead of
+/// reimplementing the transform decisions (rustfs/rustfs#6025).
+pub struct ReadPlan {
     storage_offset: usize,
     storage_length: i64,
     object_size: i64,
@@ -487,6 +495,43 @@ struct ReadPlan {
 }
 
 impl ReadPlan {
+    /// Byte offset into the object's **stored** bytes where the fetch must
+    /// start. Encrypted and compressed objects address their storage in a
+    /// different coordinate system than the plaintext range the caller asked
+    /// for, which is exactly the distinction this plan resolves.
+    pub fn storage_offset(&self) -> usize {
+        self.storage_offset
+    }
+
+    /// Number of **stored** bytes the fetch must deliver, in the same
+    /// coordinate system as [`Self::storage_offset`].
+    pub fn storage_length(&self) -> i64 {
+        self.storage_length
+    }
+
+    /// Build the plan for a request without consuming a stream, so a caller
+    /// that has to issue its own positioned fetch can read the offsets first.
+    pub async fn build_for_request(
+        rs: Option<HTTPRangeSpec>,
+        oi: &ObjectInfo,
+        opts: &ObjectOptions,
+        h: &HeaderMap<HeaderValue>,
+        resolver: Option<&dyn ObjectEncryptionResolver>,
+    ) -> Result<Self> {
+        Self::build_with_resolver(rs, oi, opts, h, resolver).await
+    }
+
+    /// Wrap `reader` — the stored bytes this plan asked for, already positioned
+    /// at [`Self::storage_offset`] — in the transforms that turn them into the
+    /// bytes the caller requested.
+    pub fn into_object_reader(
+        self,
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        oi: &ObjectInfo,
+    ) -> Result<GetObjectReader> {
+        self.into_reader(reader, oi).map(|(reader, _, _)| reader)
+    }
+
     #[cfg(test)]
     async fn build(rs: Option<HTTPRangeSpec>, oi: &ObjectInfo, opts: &ObjectOptions, h: &HeaderMap<HeaderValue>) -> Result<Self> {
         Self::build_with_resolver(rs, oi, opts, h, Some(&tests::TEST_RESOLVER)).await
@@ -500,8 +545,17 @@ impl ReadPlan {
         resolver: Option<&dyn ObjectEncryptionResolver>,
     ) -> Result<Self> {
         let mut rs = rs;
+        // A part number addresses the object's PLAINTEXT bytes. A restore read
+        // serves the stored representation instead (see
+        // [`restore_request_active`]), where that synthesized range would be
+        // reinterpreted as a storage range and truncate an encrypted or
+        // compressed payload by exactly its encoding overhead — the copy-back
+        // then fails its length check partway through
+        // (rustfs/rustfs#6025). An explicit caller range is already in storage
+        // coordinates on that path and is still honored.
         if let Some(part_number) = opts.part_number
             && rs.is_none()
+            && !restore_request_active(opts)
         {
             rs = http_range_spec_from_object_info(oi, part_number);
         }
