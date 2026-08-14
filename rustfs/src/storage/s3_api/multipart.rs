@@ -39,7 +39,11 @@ pub(crate) struct ListMultipartUploadsParams {
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
-    let is_compressed = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
+    let transformed_parts = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || res
+            .user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key));
 
     ListPartsOutput {
         bucket: Some(res.bucket),
@@ -55,7 +59,7 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                     // Compressed parts store fewer bytes than the client sent; S3
                     // semantics report the uploaded (logical) size, matching
                     // GetObjectAttributes ObjectParts.
-                    size: if p.actual_size > 0 || (is_compressed && p.actual_size == 0) {
+                    size: if p.actual_size > 0 || (transformed_parts && p.actual_size == 0) {
                         Some(p.actual_size)
                     } else {
                         p.size.try_into().ok()
@@ -302,6 +306,37 @@ mod tests {
         let parts = output.parts.as_ref().expect("parts should be present");
 
         assert_eq!(parts[0].size, Some(0));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_encrypted_parts() {
+        let input = ListPartsInfo {
+            user_defined: std::collections::HashMap::from([(
+                rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )]),
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 8,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 8,
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+        assert_eq!(parts[1].size, Some(8));
     }
 
     #[test]
