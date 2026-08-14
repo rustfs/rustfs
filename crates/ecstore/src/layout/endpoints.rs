@@ -209,15 +209,12 @@ impl AsMut<Vec<Endpoints>> for PoolEndpointList {
 }
 
 impl PoolEndpointList {
-    /// creates a list of endpoints per pool, resolves their relevant
-    /// hostnames and discovers those are local or remote.
-    async fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
-        Self::create_pool_endpoints_with(server_addr, disks_layout, None, None).await
-    }
-
-    /// Same as [`create_pool_endpoints`] but lets tests inject an explicit
-    /// startup topology convergence policy and local endpoint host instead of
-    /// resolving them from the environment.
+    /// Creates a list of endpoints per pool, resolves their relevant hostnames
+    /// and discovers whether those are local or remote.
+    ///
+    /// The policy and host overrides let tests inject an explicit startup
+    /// topology convergence policy and local endpoint host instead of
+    /// resolving them from the environment; production passes `None` for both.
     async fn create_pool_endpoints_with(
         server_addr: &str,
         disks_layout: &DisksLayout,
@@ -594,6 +591,10 @@ impl PoolEndpointList {
 }
 
 const DNS_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+#[allow(
+    dead_code,
+    reason = "retry-cap bound asserted by this file's dns_retry_delay tests (backlog#1823)"
+)]
 const DNS_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const DNS_RETRY_JITTER_PERCENT: u64 = 20;
 /// Minimum spacing between "still retrying" warnings so a long orchestrated
