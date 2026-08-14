@@ -46,15 +46,13 @@ use crate::bucket::lifecycle::transition_transaction::run_transition_transaction
 use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
-use crate::error::{
-    error_resp_to_object_err, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down,
-};
+use crate::error::{is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::object_api::{ObjectEncryptionResolver, ReadPlan};
 use crate::services::tier::{
     tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata},
     warm_backend::WarmBackendGetOpts,
@@ -4400,9 +4398,10 @@ pub async fn get_transitioned_object_reader(
     h: &HeaderMap,
     oi: &ObjectInfo,
     opts: &ObjectOptions,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
+    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr, resolver).await
 }
 
 fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
@@ -4422,6 +4421,10 @@ fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::
     }
 }
 
+// The resolver joins the tier manager as the second injected port this read
+// needs; grouping the request half into a struct would churn every call site of
+// a bug fix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     bucket: &str,
     object: &str,
@@ -4430,6 +4433,7 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     oi: &ObjectInfo,
     opts: &ObjectOptions,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     validate_transition_remote_version(oi)?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
@@ -4447,11 +4451,16 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
 
     tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
 
-    let ret = new_getobjectreader(rs, oi, opts, h);
-    if let Err(err) = ret {
-        return Err(error_resp_to_object_err(err, vec![bucket, object]));
-    }
-    let (get_fn, off, length) = ret.expect("get_transitioned_object_reader should succeed after error check");
+    // The same read plan the local path uses, so the tier fetch is positioned in
+    // the object's *stored* coordinate system and the stream is handed the same
+    // decrypt/decompress transforms. Reading an encrypted object's ciphertext
+    // through a plaintext-coordinate range and skipping the transform is how a
+    // transitioned SSE object used to come back as silently corrupt bytes of the
+    // right length (rustfs/rustfs#6025).
+    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
+        .await
+        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
+    let (off, length) = (plan.storage_offset() as i64, plan.storage_length());
     let mut gopts = WarmBackendGetOpts::default();
 
     if off >= 0 && length >= 0 {
@@ -4488,7 +4497,10 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
             );
             e
         })?;
-    Ok(attach_tier_operation_lease(get_fn(reader, h.clone()), tgt_client))
+    let object_reader = plan
+        .into_object_reader(Box::new(reader), oi)
+        .map_err(|err| std::io::Error::other(format!("wrapping the tier stream for {bucket}/{object} failed: {err}")))?;
+    Ok(attach_tier_operation_lease(object_reader, tgt_client))
 }
 
 struct TierOperationLeaseReader {
@@ -5776,6 +5788,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         .expect("transitioned reader should open");
@@ -5840,6 +5853,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -5880,6 +5894,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6117,6 +6132,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6140,6 +6156,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {

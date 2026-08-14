@@ -899,6 +899,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &object_info,
                 &opts,
                 &self.ctx.tier_config_mgr(),
+                self.ctx.object_encryption_resolver(),
             )
             .await?;
             return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
@@ -6065,6 +6066,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &oi,
                 &opts,
                 &self_.ctx.tier_config_mgr(),
+                self_.ctx.object_encryption_resolver(),
             )
             .await;
             if let Err(err) = gr {
@@ -6134,6 +6136,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     &oi,
                     &part_opts,
                     &self_.ctx.tier_config_mgr(),
+                    self_.ctx.object_encryption_resolver(),
                 )
                 .await
                 .map_err(StorageError::Io)?;
