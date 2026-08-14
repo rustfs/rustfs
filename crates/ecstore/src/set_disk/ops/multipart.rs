@@ -2034,7 +2034,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             object_size = object_size.checked_add(ext_part.size).ok_or(Error::PartMissingOrCorrupt)?;
-            if ext_part.actual_size < 0 && (!opts.replication_request || quota_context.is_enforced()) {
+            if ext_part.actual_size < 0 && (quota_context.is_enforced() || (!opts.replication_request && !opts.data_movement)) {
                 return Err(Error::PartMissingOrCorrupt);
             }
             let normalized_actual_size = if ext_part.actual_size >= 0 && !transformed_object {
