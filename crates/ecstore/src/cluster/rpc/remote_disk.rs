@@ -57,15 +57,17 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::Cursor,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::time;
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     time::timeout,
 };
@@ -211,6 +213,231 @@ where
 
         writer.write_all(&buffer[..bytes_read]).await?;
         copied += bytes_read as u64;
+    }
+}
+
+fn is_retryable_remote_body_error(error: &io::Error) -> bool {
+    if error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustfs_rio::BodyStalled>())
+        .is_some()
+    {
+        return true;
+    }
+
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn resumed_read_request(request: &ReadStreamRequest, emitted: usize) -> io::Result<ReadStreamRequest> {
+    let offset = request
+        .offset
+        .checked_add(emitted)
+        .ok_or_else(|| io::Error::other("remote read resume offset overflow"))?;
+    let length = if request.length == 0 {
+        0
+    } else {
+        request
+            .length
+            .checked_sub(emitted)
+            .ok_or_else(|| io::Error::other("remote read resume offset exceeds requested length"))?
+    };
+    Ok(ReadStreamRequest {
+        offset,
+        length,
+        ..request.clone()
+    })
+}
+
+type ReadResumeFuture = tokio::task::JoinHandle<Result<FileReader>>;
+
+struct RetryingRemoteReader {
+    reader: Option<FileReader>,
+    transport: Arc<dyn InternodeDataTransport>,
+    request: ReadStreamRequest,
+    emitted: usize,
+    retried: bool,
+    resume: Option<ReadResumeFuture>,
+}
+
+impl RetryingRemoteReader {
+    fn new(reader: FileReader, transport: Arc<dyn InternodeDataTransport>, request: ReadStreamRequest) -> Self {
+        Self {
+            reader: Some(reader),
+            transport,
+            request,
+            emitted: 0,
+            retried: false,
+            resume: None,
+        }
+    }
+
+    fn start_resume(&mut self) -> io::Result<()> {
+        if self.request.length != 0 && self.emitted >= self.request.length {
+            self.reader = None;
+            return Ok(());
+        }
+        let request = resumed_read_request(&self.request, self.emitted)?;
+        let transport = Arc::clone(&self.transport);
+        self.resume = Some(tokio::spawn(async move { transport.open_read_fresh(request).await }));
+        Ok(())
+    }
+}
+
+impl AsyncRead for RetryingRemoteReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(resume) = self.resume.as_mut() {
+                match Pin::new(resume).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(reader))) => {
+                        self.resume = None;
+                        self.reader = Some(reader);
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.resume = None;
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.resume = None;
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                }
+            }
+
+            let Some(reader) = self.reader.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            let before = buf.filled().len();
+            match Pin::new(reader).poll_read(cx, buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    let produced = buf.filled().len() - before;
+                    self.emitted = match self.emitted.checked_add(produced) {
+                        Some(emitted) => emitted,
+                        None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
+                    };
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
+                    self.retried = true;
+                    if let Err(resume_error) = self.start_resume() {
+                        return Poll::Ready(Err(resume_error));
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+type ChunkResumeFuture = tokio::task::JoinHandle<Result<Option<rustfs_rio::ChunkReaderBox>>>;
+
+struct RetryingRemoteChunkReader {
+    reader: Option<rustfs_rio::ChunkReaderBox>,
+    transport: Arc<dyn InternodeDataTransport>,
+    request: ReadStreamRequest,
+    emitted: usize,
+    retried: bool,
+    resume: Option<ChunkResumeFuture>,
+}
+
+impl RetryingRemoteChunkReader {
+    fn new(reader: rustfs_rio::ChunkReaderBox, transport: Arc<dyn InternodeDataTransport>, request: ReadStreamRequest) -> Self {
+        Self {
+            reader: Some(reader),
+            transport,
+            request,
+            emitted: 0,
+            retried: false,
+            resume: None,
+        }
+    }
+
+    fn start_resume(&mut self) -> io::Result<()> {
+        if self.request.length != 0 && self.emitted >= self.request.length {
+            self.reader = None;
+            return Ok(());
+        }
+        let request = resumed_read_request(&self.request, self.emitted)?;
+        let transport = Arc::clone(&self.transport);
+        self.resume = Some(tokio::spawn(async move { transport.open_read_chunks_fresh(request).await }));
+        Ok(())
+    }
+}
+
+impl AsyncRead for RetryingRemoteChunkReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        match rustfs_rio::ChunkReader::poll_read_chunk(self.as_mut(), cx, buf.remaining()) {
+            Poll::Ready(Ok(Some(chunk))) => {
+                buf.put_slice(&chunk);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
+    fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+        loop {
+            if let Some(resume) = self.resume.as_mut() {
+                match Pin::new(resume).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(Some(reader)))) => {
+                        self.resume = None;
+                        self.reader = Some(reader);
+                    }
+                    Poll::Ready(Ok(Ok(None))) => {
+                        self.resume = None;
+                        self.reader = None;
+                        return Poll::Ready(Err(io::Error::other("remote resume transport did not provide a chunk reader")));
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.resume = None;
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.resume = None;
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                }
+            }
+
+            let Some(reader) = self.reader.as_mut() else {
+                return Poll::Ready(Ok(None));
+            };
+            match rustfs_rio::ChunkReader::poll_read_chunk(Pin::new(reader.as_mut()), cx, max) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(Some(chunk))) => {
+                    self.emitted = match self.emitted.checked_add(chunk.len()) {
+                        Some(emitted) => emitted,
+                        None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
+                    };
+                    return Poll::Ready(Ok(Some(chunk)));
+                }
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
+                Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
+                    self.retried = true;
+                    if let Err(resume_error) = self.start_resume() {
+                        return Poll::Ready(Err(resume_error));
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
     }
 }
 
@@ -2469,7 +2696,7 @@ impl DiskAPI for RemoteDisk {
         }
         let disk = self.disk_ref().await;
         let stall_timeout = get_object_disk_read_timeout();
-        self.open_read_with_retry(ReadStreamRequest {
+        let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
             volume: volume.to_string(),
@@ -2477,8 +2704,9 @@ impl DiskAPI for RemoteDisk {
             offset,
             length,
             stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
-        })
-        .await
+        };
+        let reader = self.open_read_with_retry(request.clone()).await?;
+        Ok(Box::new(RetryingRemoteReader::new(reader, Arc::clone(&self.data_transport), request)))
     }
 
     async fn read_file_stream_chunks(
@@ -2493,7 +2721,7 @@ impl DiskAPI for RemoteDisk {
         }
         let disk = self.disk_ref().await;
         let stall_timeout = get_object_disk_read_timeout();
-        self.open_read_chunks_with_retry(ReadStreamRequest {
+        let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
             volume: volume.to_string(),
@@ -2501,8 +2729,12 @@ impl DiskAPI for RemoteDisk {
             offset,
             length,
             stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
-        })
-        .await
+        };
+        let reader = self.open_read_chunks_with_retry(request.clone()).await?;
+        Ok(reader.map(|reader| {
+            Box::new(RetryingRemoteChunkReader::new(reader, Arc::clone(&self.data_transport), request))
+                as rustfs_rio::ChunkReaderBox
+        }))
     }
 
     /// Buffered read for remote disks.
@@ -4121,6 +4353,278 @@ mod tests {
                 other => other,
             }
         }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ResumeReadStep {
+        PartialThenReset(Vec<u8>),
+        Data(Vec<u8>),
+    }
+
+    #[derive(Debug, Default)]
+    struct ResumeTransport {
+        read_steps: Mutex<Vec<ResumeReadStep>>,
+        chunk_steps: Mutex<Vec<ResumeReadStep>>,
+        read_requests: Mutex<Vec<ReadStreamRequest>>,
+        chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_read_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+    }
+
+    impl ResumeTransport {
+        fn with_read_steps(read_steps: Vec<ResumeReadStep>) -> Self {
+            Self {
+                read_steps: Mutex::new(read_steps),
+                ..Self::default()
+            }
+        }
+
+        fn with_chunk_steps(chunk_steps: Vec<ResumeReadStep>) -> Self {
+            Self {
+                chunk_steps: Mutex::new(chunk_steps),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChunkPartialThenErrorReader {
+        data: Option<Bytes>,
+        error: Option<io::Error>,
+    }
+
+    impl rustfs_rio::ChunkReader for ChunkPartialThenErrorReader {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            if let Some(mut data) = self.data.take() {
+                let take = data.len().min(max);
+                let chunk = data.split_to(take);
+                if !data.is_empty() {
+                    self.data = Some(data);
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            if let Some(error) = self.error.take() {
+                return Poll::Ready(Err(error));
+            }
+            Poll::Ready(Ok(None))
+        }
+    }
+
+    impl AsyncRead for ChunkPartialThenErrorReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("chunk reader must use chunk handoff")))
+        }
+    }
+
+    fn resume_step_reader(step: ResumeReadStep) -> FileReader {
+        match step {
+            ResumeReadStep::PartialThenReset(data) => Box::new(PartialThenErrorReader {
+                cursor: Cursor::new(data),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }),
+            ResumeReadStep::Data(data) => Box::new(Cursor::new(data)),
+        }
+    }
+
+    fn resume_step_chunk_reader(step: ResumeReadStep) -> rustfs_rio::ChunkReaderBox {
+        match step {
+            ResumeReadStep::PartialThenReset(data) => Box::new(ChunkPartialThenErrorReader {
+                data: Some(Bytes::from(data)),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }),
+            ResumeReadStep::Data(data) => Box::new(ChunkPartialThenErrorReader {
+                data: Some(Bytes::from(data)),
+                error: None,
+            }),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for ResumeTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .push(request);
+            let step = self
+                .read_steps
+                .lock()
+                .expect("read steps lock should not be poisoned")
+                .remove(0);
+            Ok(resume_step_reader(step))
+        }
+
+        async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .push(request.clone());
+            self.open_read(request).await
+        }
+
+        async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.chunk_requests
+                .lock()
+                .expect("chunk request lock should not be poisoned")
+                .push(request);
+            let step = self
+                .chunk_steps
+                .lock()
+                .expect("chunk steps lock should not be poisoned")
+                .remove(0);
+            Ok(Some(resume_step_chunk_reader(step)))
+        }
+
+        async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .push(request.clone());
+            self.open_read_chunks(request).await
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in remote read resume tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in remote read resume tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "resume-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    fn resume_request(length: usize) -> ReadStreamRequest {
+        ReadStreamRequest {
+            endpoint: "http://remote".to_string(),
+            disk: "disk".to_string(),
+            volume: "volume".to_string(),
+            path: "path".to_string(),
+            offset: 7,
+            length,
+            stall_timeout: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_reader_resumes_from_emitted_bytes_without_duplicates() {
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
+        let request = resume_request(10);
+        let reader = resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteReader::new(reader, transport.clone(), request);
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("one body reset should be resumed");
+
+        assert_eq!(output, b"0123456789");
+        let requests = transport
+            .read_requests
+            .lock()
+            .expect("read request lock should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 11);
+        assert_eq!(requests[0].length, 6);
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_resumes_from_emitted_bytes_without_duplicates() {
+        let transport = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
+        let request = resume_request(10);
+        let reader = resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteChunkReader::new(reader, transport.clone(), request);
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("chunk body reset should be resumed");
+
+        assert_eq!(output, b"0123456789");
+        let requests = transport
+            .chunk_requests
+            .lock()
+            .expect("chunk request lock should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 11);
+        assert_eq!(requests[0].length, 6);
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_reader_retries_at_most_once_and_preserves_non_retryable_errors() {
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::PartialThenReset(b"456".to_vec())]));
+        let mut reader = RetryingRemoteReader::new(
+            resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec())),
+            transport.clone(),
+            resume_request(7),
+        );
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("second reset must not retry");
+        assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            transport
+                .read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = PartialThenErrorReader {
+            cursor: Cursor::new(b"data".to_vec()),
+            error: Some(io::Error::new(std_io::ErrorKind::PermissionDenied, "permission denied")),
+        };
+        let mut reader = RetryingRemoteReader::new(Box::new(reader), transport.clone(), resume_request(4));
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("non-retryable errors must not retry");
+        assert_eq!(error.kind(), std_io::ErrorKind::PermissionDenied);
+        assert!(
+            transport
+                .read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resumed_read_request_checks_large_offsets() {
+        let request = ReadStreamRequest {
+            offset: usize::MAX - 1,
+            length: 0,
+            ..resume_request(0)
+        };
+        assert!(resumed_read_request(&request, 2).is_err());
+
+        let request = resume_request(4);
+        assert!(resumed_read_request(&request, 5).is_err());
     }
 
     fn init_tracing(filter_level: Level) {
