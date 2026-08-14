@@ -271,32 +271,6 @@ Seam 2 surfaces its own error, but only for objects that got past seam 1.
 
 The interop harness reflects this. The reader tests are `#[ignore]` (`rustfs/src/storage/minio_generated_read_test.rs:244`, `:250`), the workflow that would run them is disabled at the GitHub Actions level and states in its own header that end-to-end MinIO-to-RustFS SSE interop is not implemented (`.github/workflows/minio-interop.yml:24-29`, `:34-39`), and the fixture suite's scope note says the tests "do not yet validate full plaintext reconstruction from MinIO-written encrypted data" (`crates/rio-v2/tests/README.md:55`).
 
-### `rio-v2` variant lifecycle
-
-The variant is deliberately **dormant** until rustfs/backlog#1638 is
-adjudicated. Dormant means:
-
-- **Per-PR CI keeps one guard job.** Only `test-and-lint-rio-v2` in
-  `.github/workflows/ci.yml` runs per PR; its job is to keep the
-  `#[cfg(feature = "rio-v2")]` seam compiling and its unit tests green so the
-  variant does not bit-rot. The full-suite lanes —
-  `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` — run only on the
-  weekly `schedule` and on `workflow_dispatch`, not per PR, per main push, or
-  in the merge queue.
-- **Post-1.0 the variant is promoted or deleted.** The #1638 adjudication
-  converges on one implementation: either `rio-v2` becomes a shipped
-  configuration, or the losing side is removed together with its feature seam
-  and its gating CI jobs. Tracked as `rio-v2-dormant-variant` in
-  [compat-cleanup-register.md](compat-cleanup-register.md).
-- **DARE/S2 fixes land in both crates.** While both implementations exist,
-  any fix to the DARE V2 stream format or the S2 compression framing/index
-  must be applied to `crates/rio` **and** `crates/rio-v2` (each has its own
-  `encrypt_reader.rs` and `compress_reader.rs`). Both implement the same
-  stream primitives; a single-sided fix forks on-disk behavior between
-  default and `rio-v2` builds and invalidates the dormant variant as an
-  interop baseline — and with full-suite CI now weekly-only, the divergence
-  could go unnoticed for up to a week.
-
 ### Reverse direction
 
 Migrating back is also unsupported. Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots and labels it with MinIO's seal algorithm (`rustfs/src/storage/sse.rs:1830-1852`), so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots at all (`rustfs/src/storage/sse.rs:1796-1798`). Treat RustFS-written SSE objects as readable only by RustFS.
