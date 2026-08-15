@@ -1268,6 +1268,8 @@ pub(crate) struct TestTableCatalogStore {
     pub(crate) fail_put_table_bucket: tokio::sync::Mutex<bool>,
     pub(crate) register_table_pause: Option<TestCatalogPublishPause>,
     pub(crate) commit_table_pause: Option<TestCatalogPublishPause>,
+    pub(crate) create_view_pause: Option<TestCatalogPublishPause>,
+    pub(crate) replace_view_pause: Option<TestCatalogPublishPause>,
 }
 
 #[async_trait::async_trait]
@@ -1576,6 +1578,10 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
                 entry.table_bucket, entry.namespace
             )));
         }
+        if let Some(pause) = &self.create_view_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
         self.views.lock().await.push(entry);
         Ok(())
     }
@@ -1633,6 +1639,10 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
                 "current view metadata location does not match expected location".to_string(),
             ));
+        }
+        if let Some(pause) = &self.replace_view_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
         }
         let mut next = current;
         next.metadata_location = request.new_metadata_location;

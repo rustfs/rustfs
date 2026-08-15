@@ -6293,24 +6293,17 @@ fn snapshot_conflict_requirements_validate_snapshot_ref_id() {
 
 #[test]
 fn snapshot_conflict_rejects_unknown_parent_or_stale_sequence_number() {
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "current-snapshot-id": 10,
-        "last-sequence-number": 4,
-        "snapshots": [
-            {
-                "snapshot-id": 10,
-                "sequence-number": 4,
-                "timestamp-ms": 1234,
-                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
-                "summary": {
-                    "operation": "append"
-                }
-            }
-        ],
-        "snapshot-log": [],
-        "metadata-log": []
-    });
+    let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["last-sequence-number"] = serde_json::Value::from(4);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 4,
+        "timestamp-ms": 1234,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    metadata["refs"] = serde_json::json!({"main": {"snapshot-id": 10, "type": "branch"}});
 
     let unknown_parent = vec![serde_json::json!({
         "action": "add-snapshot",
@@ -6497,7 +6490,17 @@ fn newly_added_main_snapshot_uses_its_snapshot_timestamp_in_history() {
 fn only_v1_snapshots_may_omit_sequence_number() {
     let v1 = serde_json::json!({
         "format-version": 1,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
         "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "partition-spec": [],
+        "properties": {},
         "snapshots": [],
         "snapshot-log": [],
         "metadata-log": []
@@ -6520,14 +6523,7 @@ fn only_v1_snapshots_may_omit_sequence_number() {
     assert!(v1_updated["snapshots"][0].get("sequence-number").is_none());
     assert!(v1_updated.get("last-sequence-number").is_none());
 
-    let v2 = serde_json::json!({
-        "format-version": 2,
-        "last-sequence-number": 0,
-        "last-updated-ms": 1,
-        "snapshots": [],
-        "snapshot-log": [],
-        "metadata-log": []
-    });
+    let v2 = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
     let v2_error = apply_table_commit_updates_at(
         v2,
         &[serde_json::json!({
@@ -6549,13 +6545,7 @@ fn only_v1_snapshots_may_omit_sequence_number() {
 
 #[test]
 fn snapshot_updates_reject_non_integer_parent_ids() {
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "last-sequence-number": 0,
-        "snapshots": [],
-        "snapshot-log": [],
-        "metadata-log": []
-    });
+    let metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
     let error = apply_table_commit_updates_at(
         metadata,
         &[serde_json::json!({
@@ -6671,24 +6661,17 @@ async fn standard_commit_accepts_multiple_ordered_snapshots() {
 
 #[test]
 fn snapshot_conflict_rejects_unknown_snapshot_operations() {
-    let metadata = serde_json::json!({
-        "format-version": 2,
-        "current-snapshot-id": 10,
-        "last-sequence-number": 4,
-        "snapshots": [
-            {
-                "snapshot-id": 10,
-                "sequence-number": 4,
-                "timestamp-ms": 1234,
-                "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
-                "summary": {
-                    "operation": "append"
-                }
-            }
-        ],
-        "snapshot-log": [],
-        "metadata-log": []
-    });
+    let mut metadata = test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id");
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["last-sequence-number"] = serde_json::Value::from(4);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 4,
+        "timestamp-ms": 1234,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    metadata["refs"] = serde_json::json!({"main": {"snapshot-id": 10, "type": "branch"}});
 
     let updates = vec![serde_json::json!({
         "action": "add-snapshot",
@@ -8324,7 +8307,7 @@ fn table_encryption_key_updates_require_format_version_three() {
         serde_json::json!({"action": "remove-encryption-key", "key-id": "key-1"}),
     ] {
         let error = apply_table_commit_updates_at(
-            serde_json::json!({"format-version": 2}),
+            test_table_metadata_json("table-uuid", "s3://warehouse/tables/table-id"),
             &[update],
             "metadata/00001.metadata.json",
             100,
