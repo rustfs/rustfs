@@ -101,14 +101,50 @@ mod tests {
     }
 
     /// RustFS commonly generates ARNs with an empty region:
-    /// `arn:rustfs:replication::<deployment_id>:<bucket>`.
+    /// `arn:minio:replication::<deployment_id>:<bucket>`.
     #[test]
     fn from_str_handles_empty_region_segment() {
-        let parsed = ARN::from_str("arn:rustfs:replication::depl-123:bucket-a").expect("valid ARN must parse");
+        let parsed = ARN::from_str("arn:minio:replication::depl-123:bucket-a").expect("valid ARN must parse");
 
         assert_eq!(parsed.arn_type, BucketTargetType::ReplicationService);
         assert_eq!(parsed.region, "", "region segment is empty in this form");
         assert_eq!(parsed.id, "depl-123");
         assert_eq!(parsed.bucket, "bucket-a");
+    }
+
+    /// madmin-go's `ParseARN` hard-rejects anything that does not start with
+    /// `arn:minio:`, so generated ARNs must use the `minio` partition or the
+    /// native mc/madmin tooling cannot decode remote-target listings.
+    #[test]
+    fn display_emits_minio_partition() {
+        let arn = ARN::new(
+            BucketTargetType::ReplicationService,
+            "depl-123".to_string(),
+            String::new(),
+            "bucket-a".to_string(),
+        );
+
+        assert_eq!(arn.to_string(), "arn:minio:replication::depl-123:bucket-a");
+    }
+
+    /// Persisted bucket-targets.json files from older RustFS releases carry
+    /// `arn:rustfs:` ARNs; the legacy partition must stay parseable forever.
+    #[test]
+    fn from_str_accepts_legacy_rustfs_partition() {
+        let parsed = ARN::from_str("arn:rustfs:replication:us-east-1:depl-123:bucket-a").expect("legacy ARN must parse");
+
+        assert_eq!(parsed.arn_type, BucketTargetType::ReplicationService);
+        assert_eq!(parsed.region, "us-east-1");
+        assert_eq!(parsed.id, "depl-123");
+        assert_eq!(parsed.bucket, "bucket-a");
+    }
+
+    /// The partition whitelist is the only structural gate: `BucketTargetType::
+    /// from_str(...).unwrap_or_default()` never fails, so any 6-segment string
+    /// would otherwise parse as `type=None`.
+    #[test]
+    fn from_str_rejects_unknown_partition() {
+        assert!(ARN::from_str("arn:aws:replication::depl-123:bucket-a").is_err());
+        assert!(ARN::from_str("not-an-arn").is_err());
     }
 }
