@@ -2842,6 +2842,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn put_object_headers_carry_replication_timestamp_headers() {
+        // MinIO receivers resolve concurrent tag/retention/legal-hold edits by
+        // last-writer-wins on these headers (object-api-options.go parses them
+        // as RFC3339); a replica without them loses every conflict resolution.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        let tagging = OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("valid timestamp");
+        let retention = OffsetDateTime::from_unix_timestamp(1_700_000_002).expect("valid timestamp");
+        let legalhold = OffsetDateTime::from_unix_timestamp(1_700_000_003).expect("valid timestamp");
+        opts.internal.tagging_timestamp = tagging;
+        opts.internal.retention_timestamp = retention;
+        opts.internal.legalhold_timestamp = legalhold;
+
+        let header = opts.header();
+        for (suffix, expected) in [
+            ("source-replication-tagging-timestamp", tagging),
+            ("source-replication-retention-timestamp", retention),
+            ("source-replication-legalhold-timestamp", legalhold),
+        ] {
+            assert_eq!(
+                rustfs_utils::http::get_header(&header, suffix).as_deref(),
+                Some(expected.format(&Rfc3339).expect("RFC3339 timestamp").as_str()),
+                "replication put requests must carry the {suffix} header"
+            );
+        }
+    }
+
+    #[test]
+    fn put_object_headers_omit_unset_replication_timestamps() {
+        // UNIX_EPOCH means "never modified on the source"; sending it would
+        // make the receiver treat an unset category as a fresh modification.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        opts.internal.tagging_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.retention_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.legalhold_timestamp = OffsetDateTime::UNIX_EPOCH;
+
+        let header = opts.header();
+        for suffix in [
+            "source-replication-tagging-timestamp",
+            "source-replication-retention-timestamp",
+            "source-replication-legalhold-timestamp",
+        ] {
+            assert!(
+                rustfs_utils::http::get_header(&header, suffix).is_none(),
+                "unset {suffix} must not be sent to replication targets"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn get_remote_target_client_internal_rejects_loopback_endpoint() {
         let sys = BucketTargetSys::default();

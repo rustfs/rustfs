@@ -76,6 +76,18 @@ const SOURCE_MTIME_HEADERS: [&str; 2] = ["x-rustfs-source-mtime", "x-minio-sourc
 const SOURCE_REPLICATION_REQUEST_HEADERS: [&str; 2] =
     ["x-rustfs-source-replication-request", "x-minio-source-replication-request"];
 const SOURCE_ETAG_HEADERS: [&str; 2] = ["x-rustfs-source-etag", "x-minio-source-etag"];
+const SOURCE_TAGGING_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-tagging-timestamp",
+    "x-minio-source-replication-tagging-timestamp",
+];
+const SOURCE_RETENTION_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-retention-timestamp",
+    "x-minio-source-replication-retention-timestamp",
+];
+const SOURCE_LEGALHOLD_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-legalhold-timestamp",
+    "x-minio-source-replication-legalhold-timestamp",
+];
 const RESERVED_BUCKET_PREFIXES: [&str; 3] = ["xn--", "sthree-", "amzn-s3-demo-"];
 const RESERVED_BUCKET_SUFFIXES: [&str; 6] = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3", "-an"];
 
@@ -118,6 +130,25 @@ pub enum FaultAction {
     WrongEtag,
 }
 
+/// Replication LWW timestamp headers observed on a request, journaled so
+/// sender-side tests can assert what a real target would receive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationTimestampHeaders {
+    pub tagging: Option<String>,
+    pub retention: Option<String>,
+    pub legalhold: Option<String>,
+}
+
+impl ReplicationTimestampHeaders {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            tagging: header_value(headers, &SOURCE_TAGGING_TIMESTAMP_HEADERS).map(bounded_journal_value),
+            retention: header_value(headers, &SOURCE_RETENTION_TIMESTAMP_HEADERS).map(bounded_journal_value),
+            legalhold: header_value(headers, &SOURCE_LEGALHOLD_TIMESTAMP_HEADERS).map(bounded_journal_value),
+        }
+    }
+}
+
 /// Credential-free request metadata retained for deterministic assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestRecord {
@@ -131,6 +162,7 @@ pub struct RequestRecord {
     pub part_number: Option<i32>,
     pub content_length: Option<u64>,
     pub consumed_bytes: Option<usize>,
+    pub replication_timestamps: ReplicationTimestampHeaders,
     pub fault: Option<FaultAction>,
 }
 
@@ -536,7 +568,15 @@ impl S3Access for FaultAccess {
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
-        let fault = record_request(&self.control, operation, context.method().clone(), parsed, content_length);
+        let replication_timestamps = ReplicationTimestampHeaders::from_headers(context.headers());
+        let fault = record_request(
+            &self.control,
+            operation,
+            context.method().clone(),
+            parsed,
+            content_length,
+            replication_timestamps,
+        );
         if let Some(RequestFault {
             action: FaultAction::Status(status),
             ..
@@ -589,6 +629,7 @@ fn record_request(
     method: Method,
     parsed: ParsedRequest,
     content_length: Option<u64>,
+    replication_timestamps: ReplicationTimestampHeaders,
 ) -> Option<RequestFault> {
     let mut state = lock(control);
     let action = parsed
@@ -613,6 +654,7 @@ fn record_request(
         part_number: parsed.part_number,
         content_length,
         consumed_bytes: None,
+        replication_timestamps,
         fault: action.clone(),
     });
     action.map(|action| RequestFault { sequence, action })
@@ -1697,6 +1739,52 @@ mod tests {
             })
             .send()
             .await?)
+    }
+
+    #[tokio::test]
+    async fn journals_replication_timestamp_headers() -> Result<(), BoxError> {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("target-bucket");
+        let client = client(&target);
+
+        client
+            .put_object()
+            .bucket("target-bucket")
+            .key("plain")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await?;
+        client
+            .put_object()
+            .bucket("target-bucket")
+            .key("stamped")
+            .body(ByteStream::from_static(b"stamped"))
+            .customize()
+            .map_request(move |mut request| {
+                let headers = request.headers_mut();
+                headers.insert("x-rustfs-source-replication-tagging-timestamp", "2026-01-02T03:04:05Z");
+                headers.insert("x-minio-source-replication-retention-timestamp", "2026-01-02T03:04:06Z");
+                headers.insert("x-rustfs-source-replication-legalhold-timestamp", "2026-01-02T03:04:07Z");
+                Ok::<_, std::convert::Infallible>(request)
+            })
+            .send()
+            .await?;
+
+        let requests = target.requests();
+        let plain = requests
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("plain"))
+            .expect("plain PUT must be journaled");
+        assert_eq!(plain.replication_timestamps, ReplicationTimestampHeaders::default());
+
+        let stamped = requests
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("stamped"))
+            .expect("stamped PUT must be journaled");
+        assert_eq!(stamped.replication_timestamps.tagging.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(stamped.replication_timestamps.retention.as_deref(), Some("2026-01-02T03:04:06Z"));
+        assert_eq!(stamped.replication_timestamps.legalhold.as_deref(), Some("2026-01-02T03:04:07Z"));
+        Ok(())
     }
 
     macro_rules! assert_sdk_error {
@@ -2985,6 +3073,7 @@ mod tests {
                         part_number: None,
                     },
                     Some(0),
+                    ReplicationTimestampHeaders::default(),
                 );
             }
             let records = lock(&control).requests.clone();
@@ -3006,6 +3095,7 @@ mod tests {
                     part_number: None,
                 },
                 None,
+                ReplicationTimestampHeaders::default(),
             );
             {
                 let bounded_records = lock(&bounded_control);
