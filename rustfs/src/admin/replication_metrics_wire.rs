@@ -129,12 +129,40 @@ pub(crate) struct XferStatsWire {
     pub curr_rate: f64,
 }
 
-impl XferStatsWire {
-    fn merge(self, other: XferStatsWire) -> XferStatsWire {
+#[derive(Default)]
+struct XferStatsAverage {
+    sum: XferStatsWire,
+    active: u32,
+}
+
+impl XferStatsAverage {
+    fn add_active(&mut self, stats: XferStatsWire) {
+        if stats.peak_rate <= 0.0 {
+            return;
+        }
+        self.add_raw(stats);
+        self.active += 1;
+    }
+
+    fn add_raw(&mut self, stats: XferStatsWire) {
+        self.sum.avg_rate += stats.avg_rate;
+        self.sum.curr_rate += stats.curr_rate;
+        self.sum.peak_rate = self.sum.peak_rate.max(stats.peak_rate);
+    }
+
+    fn finish(self) -> XferStatsWire {
+        let active = self.active;
+        self.finish_with_divisor(active)
+    }
+
+    fn finish_with_divisor(self, divisor: u32) -> XferStatsWire {
+        if divisor == 0 {
+            return self.sum;
+        }
         XferStatsWire {
-            avg_rate: self.avg_rate + other.avg_rate,
-            peak_rate: self.peak_rate.max(other.peak_rate),
-            curr_rate: self.curr_rate + other.curr_rate,
+            avg_rate: self.sum.avg_rate / f64::from(divisor),
+            peak_rate: self.sum.peak_rate,
+            curr_rate: self.sum.curr_rate / f64::from(divisor),
         }
     }
 }
@@ -352,18 +380,32 @@ type XferSummaryWire = HashMap<&'static str, XferStatsWire>;
 type TargetXferSummaryWire = HashMap<String, XferSummaryWire>;
 
 fn transfer_summaries(stats: &InternalReplicationStats) -> (XferSummaryWire, TargetXferSummaryWire) {
-    let mut summary: XferSummaryWire = HashMap::new();
     let mut per_target: TargetXferSummaryWire = HashMap::new();
+    let mut large_summary = XferStatsAverage::default();
+    let mut small_summary = XferStatsAverage::default();
+    let mut total_summary = XferStatsAverage::default();
+    let mut active_targets = 0;
     for (arn, stat) in &stats.stats {
         let large = XferStatsWire::from(&stat.xfer_rate_lrg);
         let small = XferStatsWire::from(&stat.xfer_rate_sml);
-        let total = large.merge(small);
+        let mut target_total = XferStatsAverage::default();
+        target_total.add_active(large);
+        target_total.add_active(small);
+        let total = target_total.finish();
         per_target.insert(arn.clone(), HashMap::from([("Large", large), ("Small", small), ("Total", total)]));
-        for (key, value) in [("Large", large), ("Small", small), ("Total", total)] {
-            let entry = summary.entry(key).or_default();
-            *entry = entry.merge(value);
+        if large.peak_rate > 0.0 || small.peak_rate > 0.0 {
+            active_targets += 1;
+            large_summary.add_raw(large);
+            small_summary.add_raw(small);
+            total_summary.add_raw(large);
+            total_summary.add_raw(small);
         }
     }
+    let summary = HashMap::from([
+        ("Large", large_summary.finish_with_divisor(active_targets)),
+        ("Small", small_summary.finish_with_divisor(active_targets)),
+        ("Total", total_summary.finish_with_divisor(active_targets)),
+    ]);
     (summary, per_target)
 }
 
@@ -529,6 +571,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transfer_summaries_average_active_bins_and_targets() {
+        let mut stats = BucketStats::default();
+        let first = stats.replication_stats.stats.entry("target-a".to_string()).or_default();
+        first.xfer_rate_sml.avg = 50.0;
+        first.xfer_rate_sml.curr = 40.0;
+        first.xfer_rate_sml.peak = 60.0;
+        first.xfer_rate_lrg.avg = 100.0;
+        first.xfer_rate_lrg.curr = 80.0;
+        first.xfer_rate_lrg.peak = 120.0;
+
+        let second = stats.replication_stats.stats.entry("target-b".to_string()).or_default();
+        second.xfer_rate_sml.avg = 30.0;
+        second.xfer_rate_sml.curr = 20.0;
+        second.xfer_rate_sml.peak = 40.0;
+
+        let json = serde_json::to_value(MetricsV2Wire::from_stats(&stats, "node-1")).expect("v2 wire should serialize");
+        let node = &json["queueStats"]["nodes"][0];
+        let target_a = &node["tgtTransferStats"]["target-a"]["Total"];
+        assert_eq!(target_a["avgRate"], 75.0);
+        assert_eq!(target_a["currRate"], 60.0);
+        assert_eq!(target_a["peakRate"], 120.0);
+
+        let summary = &node["transferSummary"];
+        assert_eq!(summary["Small"]["avgRate"], 40.0);
+        assert_eq!(summary["Small"]["currRate"], 30.0);
+        assert_eq!(summary["Large"]["avgRate"], 50.0);
+        assert_eq!(summary["Total"]["avgRate"], 90.0);
+        assert_eq!(summary["Total"]["currRate"], 70.0);
+        assert_eq!(summary["Total"]["peakRate"], 120.0);
+    }
+
     /// Review regression: both metrics endpoints aggregate first, and the
     /// FailStats merge drops the process-local samples — the rolling windows
     /// must survive a peer-RPC round trip plus aggregation and still reach
@@ -551,9 +625,11 @@ mod tests {
 
         // Aggregation merges the remote stat with an empty local one.
         let merged_fail = remote.fail_stats.merge(&Default::default());
-        let mut aggregated = crate::admin::storage_api::replication::BucketReplicationStat::default();
-        aggregated.failed = merged_fail.to_metric();
-        aggregated.fail_stats = merged_fail;
+        let aggregated = crate::admin::storage_api::replication::BucketReplicationStat {
+            failed: merged_fail.to_metric(),
+            fail_stats: merged_fail,
+            ..Default::default()
+        };
 
         let mut stats = BucketStats::default();
         stats
