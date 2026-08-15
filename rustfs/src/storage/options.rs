@@ -710,6 +710,13 @@ fn is_reserved_user_metadata_key(key: &str) -> bool {
         || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
         || starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
         || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
+        // Replication transport names (source-replication timestamps,
+        // source-mtime/-etag/-version-id, ...). A bare stored key with one of
+        // these names is forwarded verbatim by the outbound replication
+        // header builder on a server-authorized request, so the receiver
+        // would persist attacker-chosen values as trusted internal LWW state.
+        || starts_with_ignore_ascii_case(key, "x-rustfs-source-")
+        || starts_with_ignore_ascii_case(key, "x-minio-source-")
 }
 
 fn stored_user_metadata_key(key: &str) -> String {
@@ -1644,6 +1651,49 @@ mod tests {
         let opts_invalid = result_invalid.unwrap();
         assert!(opts_invalid.replication_request);
         assert!(opts_invalid.mod_time.is_none());
+    }
+
+    /// A client PUT must not materialize the replication transport names as
+    /// bare stored user-metadata keys: the outbound replication header
+    /// builder forwards user metadata verbatim on a server-authorized
+    /// request, so a bare `x-rustfs-source-replication-*-timestamp` key would
+    /// deliver an attacker-chosen value into the replica's trusted internal
+    /// LWW state (for a tagless object nothing later overwrites it).
+    #[test]
+    fn test_replication_transport_names_cannot_be_forged_via_user_metadata() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-amz-meta-x-rustfs-source-replication-tagging-timestamp",
+            "x-amz-meta-x-minio-source-replication-legalhold-timestamp",
+            "x-rustfs-meta-x-rustfs-source-replication-retention-timestamp",
+            "x-amz-meta-x-rustfs-source-mtime",
+        ] {
+            headers.insert(
+                http::header::HeaderName::from_static(name),
+                HeaderValue::from_static("2026-01-02T03:04:05Z"),
+            );
+        }
+
+        let metadata = extract_metadata(&headers);
+
+        for forged in [
+            "x-rustfs-source-replication-tagging-timestamp",
+            "x-minio-source-replication-legalhold-timestamp",
+            "x-rustfs-source-replication-retention-timestamp",
+            "x-rustfs-source-mtime",
+        ] {
+            assert!(
+                metadata.get(forged).is_none(),
+                "{forged} must not be storable as a bare user-metadata key"
+            );
+        }
+        // The values survive, namespaced back under the user-metadata prefix.
+        assert_eq!(
+            metadata
+                .get("x-amz-meta-x-rustfs-source-replication-tagging-timestamp")
+                .map(String::as_str),
+            Some("2026-01-02T03:04:05Z")
+        );
     }
 
     #[test]
