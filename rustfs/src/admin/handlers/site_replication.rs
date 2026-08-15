@@ -14437,12 +14437,12 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_event_dequeue_preserves_collapsed_path_across_peer_identity() {
+    fn test_retry_event_dequeue_matches_deployment_id_or_endpoint() {
         let peer = PeerInfo {
             deployment_id: "current-dep".to_string(),
             ..peer("remote", "https://remote.example.com")
         };
-        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let path = SITE_REPLICATION_PEER_EDIT_PATH;
         let mut queue = vec![
             SiteReplicationRetryEvent {
                 id: "same-endpoint".to_string(),
@@ -14462,8 +14462,9 @@ mod tests {
 
         let removed = dequeue_site_replication_retry_events(&mut queue, &peer, path);
 
-        assert_eq!(removed, 0);
-        assert_eq!(queue.len(), 2);
+        assert_eq!(removed, 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, "different-path");
     }
 
     #[test]
