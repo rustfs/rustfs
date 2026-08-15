@@ -58,7 +58,9 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
+    insert_header,
 };
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
@@ -1476,9 +1478,12 @@ impl Default for AdvancedPutOptions {
             replication_status: ReplicationStatusType::Pending,
             source_mtime: OffsetDateTime::now_utc(),
             replication_request: false,
-            retention_timestamp: OffsetDateTime::now_utc(),
-            tagging_timestamp: OffsetDateTime::now_utc(),
-            legalhold_timestamp: OffsetDateTime::now_utc(),
+            // UNIX_EPOCH means "never modified": header() must not emit a
+            // timestamp header for it, otherwise a receiver would treat an
+            // unset category as a modification made right now.
+            retention_timestamp: OffsetDateTime::UNIX_EPOCH,
+            tagging_timestamp: OffsetDateTime::UNIX_EPOCH,
+            legalhold_timestamp: OffsetDateTime::UNIX_EPOCH,
             replication_validity_check: false,
         }
     }
@@ -1673,6 +1678,16 @@ impl PutObjectOptions {
                 SUFFIX_SOURCE_MTIME,
                 self.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
             );
+        }
+
+        for (suffix, timestamp) in [
+            (SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, self.internal.tagging_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, self.internal.retention_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, self.internal.legalhold_timestamp),
+        ] {
+            if timestamp.unix_timestamp() != 0 {
+                insert_header(&mut header, suffix, timestamp.format(&Rfc3339).unwrap_or_default());
+            }
         }
 
         if self.internal.replication_request {

@@ -17,11 +17,13 @@ use crate::storage::storage_api::options_consumer::contract::{object::HTTPPrecon
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
-    SUFFIX_SOURCE_VERSION_ID, get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
-    insert_header_map,
+    insert_header_map, insert_str,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
@@ -422,6 +424,9 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
         preserve_etag,
         ..Default::default()
     };
+    if replication_request {
+        apply_replication_timestamps_from_headers(headers, &mut opts);
+    }
     apply_replica_status_from_headers(headers, &mut opts, replication_request_authorized);
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
@@ -479,6 +484,7 @@ pub fn put_opts_from_headers_with_replication_authorization(
         if let Some(crc) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
             insert_header_map(&mut opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, crc.into_owned());
         }
+        apply_replication_timestamps_from_headers(headers, &mut opts);
     }
     Ok(opts)
 }
@@ -500,6 +506,47 @@ fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::Of
         Err(err) => {
             tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", value, err);
             None
+        }
+    }
+}
+
+/// Parses one replication LWW timestamp header. Invalid values are dropped
+/// with a warning (same tolerance as [`replication_source_mtime`]) so a
+/// malformed source header cannot wedge the replication queue.
+fn replication_timestamp_header(headers: &HeaderMap<HeaderValue>, suffix: &str) -> Option<time::OffsetDateTime> {
+    let value = get_header(headers, suffix)?;
+    let value = value.trim();
+    match time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
+        Ok(timestamp) => Some(timestamp),
+        Err(err) => {
+            tracing::warn!("Invalid {} value '{}' (replication request=true): {}", suffix, value, err);
+            None
+        }
+    }
+}
+
+/// Callers must gate on an authorized replication request: these headers are
+/// trusted source-cluster state, not client input.
+fn apply_replication_timestamps_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+    opts.replication_tagging_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP);
+    opts.replication_retention_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP);
+    opts.replication_legalhold_timestamp = replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP);
+
+    // Persist into the internal metadata keys so a later outbound replication
+    // pass (replication_target_boundary) reads the source's modification
+    // times instead of falling back to mod_time.
+    // TODO(P1-6): receiver-side LWW is still missing — when the stored
+    // per-category timestamp is newer than the inbound one, the existing
+    // tags/retention/legal-hold should win instead of being overwritten.
+    for (timestamp, suffix) in [
+        (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP),
+        (opts.replication_retention_timestamp, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP),
+        (opts.replication_legalhold_timestamp, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP),
+    ] {
+        if let Some(timestamp) = timestamp
+            && let Ok(value) = timestamp.format(&time::format_description::well_known::Rfc3339)
+        {
+            insert_str(&mut opts.user_defined, suffix, value);
         }
     }
 }
@@ -1622,9 +1669,18 @@ mod tests {
                 "unauthorized clients must not persist the {suffix} internal key"
             );
         }
+        assert!(untrusted.replication_tagging_timestamp.is_none());
+        assert!(untrusted.replication_retention_timestamp.is_none());
+        assert!(untrusted.replication_legalhold_timestamp.is_none());
 
         let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replication request should parse");
+        let parse = |value: &str| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).expect("valid RFC3339")
+        };
+        assert_eq!(trusted.replication_tagging_timestamp, Some(parse("2026-01-02T03:04:05Z")));
+        assert_eq!(trusted.replication_retention_timestamp, Some(parse("2026-01-02T03:04:06Z")));
+        assert_eq!(trusted.replication_legalhold_timestamp, Some(parse("2026-01-02T03:04:07Z")));
         for (suffix, expected) in [
             ("tagging-timestamp", "2026-01-02T03:04:05Z"),
             ("objectlock-retention-timestamp", "2026-01-02T03:04:06Z"),
@@ -1672,6 +1728,9 @@ mod tests {
                 "authorized multipart completes must persist the {suffix} internal key"
             );
         }
+        assert!(trusted.replication_tagging_timestamp.is_some());
+        assert!(trusted.replication_retention_timestamp.is_some());
+        assert!(trusted.replication_legalhold_timestamp.is_some());
     }
 
     #[test]
