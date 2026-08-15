@@ -7159,10 +7159,7 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     assert_eq!(unchanged.generation, current.generation);
 }
 
-/// Table-driven fold of the three commit-rejection cases whose bodies were
-/// identical apart from four literals (backlog#1837 PR3). Each row keeps its
-/// original manifest-list sequence, data-file name, manifest-entry snapshot
-/// id, and failure message, so no poison combination is lost.
+/// Table-driven coverage for stale or historical manifest sequence failures.
 #[tokio::test]
 async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
     // (case, manifest-list sequence, data-file suffix, manifest-entry snapshot id, expected failure)
@@ -7206,8 +7203,8 @@ async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
         let manifest_list = format!("{table_location}/metadata/snap-11.avro");
         let manifest = format!("{table_location}/metadata/manifest-11.avro");
         let data_file = format!("{table_location}/data/part-{data_file_suffix}.parquet");
-        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], *manifest_list_sequence, 11).await;
         seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, *entry_snapshot_id, 1)]).await;
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], *manifest_list_sequence, 11).await;
         let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
             "updates": [
                 {
