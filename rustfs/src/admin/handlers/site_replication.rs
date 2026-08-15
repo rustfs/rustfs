@@ -2323,20 +2323,31 @@ fn append_bootstrap_bucket_items(
         },
     )?;
     if replicate_ilm_expiry {
-        append_bootstrap_bucket_item(
-            &mut plan.bucket_items,
-            bucket,
-            "lc-config",
-            bucket.expiry_lc_config.clone(),
-            bucket.expiry_lc_config_updated_at,
-            |item, value| {
-                item.expiry_lc_config = Some(value);
-                // `updated_at` here is the entry's expiry axis (see the
-                // SRBucketInfo construction), not the wall clock.
-                item.expiry_updated_at = item.updated_at;
-                Ok(())
-            },
-        )?;
+        if bucket.expiry_lc_config.is_some() {
+            append_bootstrap_bucket_item(
+                &mut plan.bucket_items,
+                bucket,
+                "lc-config",
+                bucket.expiry_lc_config.clone(),
+                bucket.expiry_lc_config_updated_at,
+                |item, value| {
+                    item.expiry_lc_config = Some(value);
+                    // `updated_at` here is the entry's expiry axis (see the
+                    // SRBucketInfo construction), not the wall clock.
+                    item.expiry_updated_at = item.updated_at;
+                    Ok(())
+                },
+            )?;
+        } else if bucket.expiry_lc_config_updated_at.is_some() {
+            // Expiry rules were removed at this axis (lifecycle_expiry_statement):
+            // an explicit timestamped delete item, so a peer that missed the
+            // live delete converges on bootstrap/repair instead of keeping
+            // stale expiry rules. The receiver's staleness guard protects a
+            // peer whose expiry state is newer.
+            let mut item = bootstrap_bucket_meta_item(bucket, "lc-config", bucket.expiry_lc_config_updated_at);
+            item.expiry_updated_at = item.updated_at;
+            plan.bucket_items.push(item);
+        }
     }
     append_bootstrap_bucket_item(
         &mut plan.bucket_items,
@@ -4334,9 +4345,11 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             // Expiry subset only: this entry feeds both the bootstrap/repair
             // plan (peers must not receive transition rules) and cross-site
             // consistency views (transition rules are site-local and would
-            // read as false mismatches).
-            entry.expiry_lc_config =
-                lifecycle_expiry_subset_xml(&metadata.lifecycle_config_xml).and_then(|data| raw_config_to_base64(&data));
+            // read as false mismatches). A deleted expiry state is a `None`
+            // value with the deletion's axis so repair can converge peers
+            // that missed the live delete.
+            let expiry_statement = lifecycle_expiry_statement(&metadata);
+            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
             entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
             entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
             entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
@@ -4348,11 +4361,8 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             // The expiry axis, not the whole-config write time: local
             // transition-only edits inflate the latter, and a repair item
             // stamped with it could out-rank a newer real expiry edit on a
-            // third site. Legacy configs without the axis fall back to the
-            // whole-config time (bounded staleness, same as the receiver).
-            entry.expiry_lc_config_updated_at = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml)
-                .map(Some)
-                .unwrap_or_else(|| maybe_time(metadata.lifecycle_config_updated_at));
+            // third site.
+            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
             entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
             entry.replication_targets_online =
                 Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
@@ -7036,13 +7046,95 @@ fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> {
         .map(OffsetDateTime::from)
 }
 
-/// MinIO emits a zero-rule `<LifecycleConfiguration><ExpiryUpdatedAt>…`
-/// document for its delete tombstone / transition-only states; the s3s
-/// deserializer rejects a missing `<Rule>` outright. Such a document is the
-/// "no expiry rules here" statement and must map to delete semantics rather
-/// than an error.
-fn lifecycle_document_has_rules(raw: &[u8]) -> bool {
-    raw.windows(b"<Rule".len()).any(|window| window == b"<Rule")
+/// The timestamp an incoming lc-config item must beat to be applied.
+///
+/// - Present config with the expiry axis: the axis itself.
+/// - Present legacy config that has expiry rules but predates the axis
+///   field: the whole-config write time bounds its last expiry edit.
+/// - Present transition-only config without the axis: `UNIX_EPOCH` — there
+///   is no local expiry state to protect, and the whole-config time moves on
+///   transition edits, which must not shadow independent peer expiry updates.
+/// - Absent config: the whole-config write time — it survives deletion in
+///   bucket metadata as the deletion's lower bound, so a delayed stale
+///   broadcast cannot resurrect deleted expiry rules.
+fn local_lifecycle_staleness_axis(
+    local: Option<&s3s::dto::BucketLifecycleConfiguration>,
+    whole_config_axis: OffsetDateTime,
+) -> OffsetDateTime {
+    match local {
+        Some(config) => match config.expiry_updated_at.clone() {
+            Some(axis) => OffsetDateTime::from(axis),
+            None if config.rules.iter().any(lifecycle_rule_has_expiry) => whole_config_axis,
+            None => OffsetDateTime::UNIX_EPOCH,
+        },
+        None => whole_config_axis,
+    }
+}
+
+/// Recognize MinIO's zero-rule lifecycle tombstone (its delete /
+/// transition-only state marshals `<LifecycleConfiguration>` with no `<Rule>`
+/// child, which the strict s3s deserializer rejects). Only a well-delimited
+/// document qualifies as the "no expiry rules here" statement; truncated or
+/// otherwise malformed payloads are rejected rather than treated as a delete
+/// that would erase local expiry rules.
+fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let mut text = text.trim();
+    if let Some(rest) = text.strip_prefix("<?xml") {
+        let Some(end) = rest.find("?>") else {
+            return false;
+        };
+        text = rest[end + 2..].trim_start();
+    }
+    let Some(rest) = text.strip_prefix("<LifecycleConfiguration") else {
+        return false;
+    };
+    // Self-closing empty root.
+    if let Some(tail) = rest.trim_start().strip_prefix("/>") {
+        return tail.trim().is_empty();
+    }
+    // The root open tag may carry attributes (xmlns); it must close, and the
+    // document must end with the matching close tag.
+    let Some(open_end) = rest.find('>') else {
+        return false;
+    };
+    let Some(body) = rest[open_end + 1..].trim_end().strip_suffix("</LifecycleConfiguration>") else {
+        return false;
+    };
+    !body.contains("<Rule")
+}
+
+/// The ILM expiry statement this site contributes to its SRInfo bucket entry
+/// (feeding bootstrap/repair and consistency views), if any.
+/// `Some((subset_b64, axis))` — a `None` subset means "expiry rules were
+/// removed at `axis`" and travels as an explicit timestamped delete item, so
+/// a peer that missed the live delete still converges on repair.
+fn lifecycle_expiry_statement(
+    metadata: &crate::admin::storage_api::bucket::metadata::BucketMetadata,
+) -> Option<(Option<String>, OffsetDateTime)> {
+    if metadata.lifecycle_config_xml.is_empty() {
+        // Deleted vs never configured: the whole-config write time survives
+        // deletion in bucket metadata and strictly exceeds the created-time
+        // backfill only after a real write.
+        return (metadata.lifecycle_config_updated_at > metadata.created).then_some((None, metadata.lifecycle_config_updated_at));
+    }
+    let axis = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml);
+    match lifecycle_expiry_subset_xml(&metadata.lifecycle_config_xml) {
+        Some(subset) => {
+            // Legacy documents predate the axis field; their whole-config
+            // write time bounds the last expiry edit.
+            let axis = axis.unwrap_or(metadata.lifecycle_config_updated_at);
+            Some((raw_config_to_base64(&subset), axis))
+        }
+        // Transition-only config: with an expiry axis the site once had
+        // expiry rules and properly removed them — the delete travels at
+        // that axis. Without one there is nothing to say (a delete stamped
+        // off the whole-config time would let a local transition edit erase
+        // newer peer expiry state).
+        None => axis.map(|axis| (None, axis)),
+    }
 }
 
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
@@ -8194,8 +8286,10 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                     Ok(config) => Some(config),
                     // MinIO's delete tombstone / transition-only state is a
                     // zero-rule document the strict deserializer rejects; it
-                    // means "no expiry rules here" (delete semantics).
-                    Err(_) if !lifecycle_document_has_rules(&data) => None,
+                    // means "no expiry rules here" (delete semantics). Any
+                    // other malformed payload is rejected — treating it as a
+                    // delete would let a bad payload erase local expiry rules.
+                    Err(_) if is_zero_rule_lifecycle_tombstone(&data) => None,
                     Err(e) => return Err(s3_error!(InvalidRequest, "invalid lifecycle config: {e}")),
                 }
             }
@@ -8206,21 +8300,11 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
-        // Staleness axis: the config's expiry_updated_at when present. When
-        // the config is absent (deleted) or predates the axis field, fall
-        // back to the whole-config write time — it survives deletion in
-        // bucket metadata and is the deletion's lower bound, so a delayed
-        // stale broadcast cannot resurrect deleted expiry rules.
         let whole_config_axis = metadata_sys::get(&item.bucket)
             .await
             .map(|bucket_meta| bucket_meta.lifecycle_config_updated_at)
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        let local_expiry_updated_at = local
-            .as_ref()
-            .and_then(|config| config.expiry_updated_at.clone())
-            .map(OffsetDateTime::from)
-            .unwrap_or(whole_config_axis);
-        if is_stale_update(local_expiry_updated_at, incoming_updated_at) {
+        if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
             return Ok(());
         }
         let local_absent = local.is_none();
@@ -12913,6 +12997,87 @@ mod tests {
         assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
     }
 
+    /// A deleted expiry state (entry value None, axis set) must travel as an
+    /// explicit timestamped delete item — a peer that missed the live delete
+    /// otherwise keeps stale expiry rules through every repair (review
+    /// finding).
+    #[test]
+    fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
+        let deleted_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut info = SRInfo::default();
+        info.state.peers.insert(
+            "remote-dep".to_string(),
+            PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+        info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                expiry_lc_config: None,
+                expiry_lc_config_updated_at: Some(deleted_at),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+
+        let item = plan
+            .bucket_items
+            .iter()
+            .find(|item| item.r#type == "lc-config")
+            .expect("a deleted expiry state must produce an lc-config delete item");
+        assert!(item.expiry_lc_config.is_none(), "delete items carry no config body");
+        assert_eq!(item.expiry_updated_at, Some(deleted_at));
+        assert_eq!(item.updated_at, Some(deleted_at));
+    }
+
+    /// What each local lifecycle state contributes to the SRInfo entry:
+    /// deletions are timestamped statements, never-configured buckets and
+    /// transition-only configs without an expiry axis say nothing.
+    #[test]
+    fn test_lifecycle_expiry_statement_matrix() {
+        let created = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
+        meta.created = created;
+        // Never configured: load backfills the write time to `created`.
+        meta.lifecycle_config_updated_at = created;
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Deleted: the write time survives deletion and exceeds creation.
+        let deleted_at = created + time::Duration::seconds(100);
+        meta.lifecycle_config_updated_at = deleted_at;
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("deletion is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis, deleted_at);
+
+        // Present with expiry rules and the axis: subset + axis travel.
+        let expiry_axis = created + time::Duration::seconds(50);
+        let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        config.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
+        assert!(subset.is_some());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
+
+        // Transition-only without an axis: nothing to say (a delete stamped
+        // off the whole-config time would erase newer peer expiry state).
+        meta.lifecycle_config_xml = serialize(&lc_config(vec![lc_rule("t1", None, Some(30))])).expect("serialize config");
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Transition-only WITH an axis: expiry rules were properly removed —
+        // the delete travels at that axis.
+        let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        transition_only.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
+    }
+
     #[test]
     fn test_site_replication_repair_request_is_strict_and_requires_explicit_mode() {
         assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{"mode":"dry-run"}"#).is_ok());
@@ -14839,20 +15004,56 @@ mod tests {
         );
     }
 
-    /// MinIO emits a zero-rule lifecycle document (delete tombstone /
-    /// transition-only state); the strict deserializer rejects it, so the
-    /// apply path must recognize it as delete semantics via the rule sniff.
+    /// Only a well-delimited zero-rule `<LifecycleConfiguration>` document is
+    /// the delete statement; truncated or foreign payloads must be rejected,
+    /// not treated as a delete that erases local expiry rules.
     #[test]
-    fn test_lifecycle_document_has_rules_sniff() {
-        assert!(!lifecycle_document_has_rules(
+    fn test_zero_rule_lifecycle_tombstone_recognition() {
+        assert!(is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
         ));
-        assert!(lifecycle_document_has_rules(
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>"));
+
+        // Documents with rules are not tombstones (they must parse strictly).
+        assert!(!is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><Rule><ID>x</ID></Rule></LifecycleConfiguration>"
         ));
-        assert!(lifecycle_document_has_rules(
-            b"<LifecycleConfiguration><Rule ></Rule></LifecycleConfiguration>"
-        ));
+        // Truncated / malformed / foreign payloads are rejected.
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><ExpiryUpdatedAt>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><Rule></Broken>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"garbage"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<SomethingElse></SomethingElse>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b""));
+    }
+
+    /// The staleness axis an incoming lc-config item must beat: the expiry
+    /// axis when present; the whole-config write time only for deleted or
+    /// legacy-with-expiry state; epoch for a transition-only config (its
+    /// whole-config time moves on transition edits and must not shadow
+    /// independent peer expiry updates — review finding).
+    #[test]
+    fn test_local_lifecycle_staleness_axis_selection() {
+        let whole = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let axis_ts = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+
+        let mut with_axis = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        with_axis.expiry_updated_at = Some(s3s::dto::Timestamp::from(axis_ts));
+        assert_eq!(local_lifecycle_staleness_axis(Some(&with_axis), whole), axis_ts);
+
+        let legacy_with_expiry = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        assert_eq!(local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole), whole);
+
+        let transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&transition_only), whole),
+            OffsetDateTime::UNIX_EPOCH,
+            "a transition-only config has no expiry state to protect"
+        );
+
+        assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
     }
 
     /// Sender-side filter: only the expiry subset leaves this site. MinIO
