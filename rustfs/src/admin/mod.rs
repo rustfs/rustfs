@@ -17,9 +17,9 @@ mod auth;
 pub mod console;
 pub mod handlers;
 mod plugin_contract;
+pub(crate) mod replication_metrics_wire;
 // Contract inventory is validated by tests before later runtime integration.
 #[allow(dead_code)]
-pub(crate) mod replication_metrics_wire;
 pub(crate) mod route_policy;
 pub mod router;
 pub(crate) mod runtime_sources;

@@ -207,17 +207,29 @@ pub(crate) struct TargetMetricsWire {
 }
 
 fn target_timed_err_stats(stat: &InternalReplicationStat) -> TimedErrStatsWire {
-    let last_minute = stat.fail_stats.recent_since(Duration::from_secs(60));
-    let last_hour = stat.fail_stats.recent_since(Duration::from_secs(3600));
+    // Cluster aggregation merges FailStats without the process-local samples,
+    // so the serializable window snapshots (refreshed at each node's
+    // collection point, summed by merge) are authoritative here; the live
+    // samples only ever agree with or lag them, so take the larger.
+    let sampled_minute = stat.fail_stats.recent_since(Duration::from_secs(60));
+    let sampled_hour = stat.fail_stats.recent_since(Duration::from_secs(3600));
+    let window = |sampled_count: i64, sampled_size: i64, snapshot_count: i64, snapshot_size: i64| RStatWire {
+        count: sampled_count.max(snapshot_count) as f64,
+        bytes: sampled_size.max(snapshot_size),
+    };
     TimedErrStatsWire {
-        last_minute: RStatWire {
-            count: last_minute.count as f64,
-            bytes: last_minute.size,
-        },
-        last_hour: RStatWire {
-            count: last_hour.count as f64,
-            bytes: last_hour.size,
-        },
+        last_minute: window(
+            sampled_minute.count,
+            sampled_minute.size,
+            stat.fail_stats.last_minute.count,
+            stat.fail_stats.last_minute.size,
+        ),
+        last_hour: window(
+            sampled_hour.count,
+            sampled_hour.size,
+            stat.fail_stats.last_hour.count,
+            stat.fail_stats.last_hour.size,
+        ),
         totals: RStatWire {
             count: stat.failed.count as f64,
             bytes: stat.failed.size,
@@ -484,6 +496,46 @@ mod tests {
         assert!(node["activeWorkers"].get("curr").is_some());
         assert!(node["transferSummary"].get("Total").is_some());
         assert_eq!(json["downtimeInfo"], serde_json::json!({}));
+    }
+
+    /// Review regression: both metrics endpoints aggregate first, and the
+    /// FailStats merge drops the process-local samples — the rolling windows
+    /// must survive a peer-RPC round trip plus aggregation and still reach
+    /// the wire body.
+    #[test]
+    fn failure_windows_survive_aggregation_before_serialization() {
+        // Node A: live failure, windows stamped at the collection point.
+        let mut node_a = crate::admin::storage_api::replication::BucketReplicationStat::default();
+        node_a.fail_stats.add_size(512, None::<&std::io::Error>);
+        node_a.failed = node_a.fail_stats.to_metric();
+
+        // Node A's stats cross the peer RPC wire: the samples are dropped,
+        // the window snapshots travel.
+        let encoded = rmp_serde::to_vec_named(&node_a).expect("stat should encode");
+        let remote: crate::admin::storage_api::replication::BucketReplicationStat =
+            rmp_serde::from_slice(&encoded).expect("stat should decode");
+
+        // Aggregation merges the remote stat with an empty local one.
+        let merged_fail = remote.fail_stats.merge(&Default::default());
+        let mut aggregated = crate::admin::storage_api::replication::BucketReplicationStat::default();
+        aggregated.failed = merged_fail.to_metric();
+        aggregated.fail_stats = merged_fail;
+
+        let mut stats = BucketStats::default();
+        stats
+            .replication_stats
+            .stats
+            .insert("arn:minio:replication::t:b".to_string(), aggregated);
+
+        let json = serde_json::to_value(MetricsWire::from(&stats.replication_stats)).expect("wire should serialize");
+        let failed = &json["Stats"]["arn:minio:replication::t:b"]["failed"];
+        assert_eq!(failed["totals"]["count"], 1.0);
+        assert_eq!(
+            failed["lastMinute"]["count"], 1.0,
+            "the rolling minute window must survive RPC + aggregation"
+        );
+        assert_eq!(failed["lastMinute"]["bytes"], 512);
+        assert_eq!(failed["lastHour"]["count"], 1.0);
     }
 
     /// Pin the intra-cluster peer-RPC wire format of the internal stats: it
