@@ -44,8 +44,8 @@ use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, Wri
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
-    get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
+    parse_copy_source_range, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
@@ -777,7 +777,9 @@ impl DefaultMultipartUsecase {
 
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
 
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, replication_authorized);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
