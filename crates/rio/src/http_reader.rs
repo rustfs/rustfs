@@ -138,6 +138,12 @@ impl std::fmt::Display for InternodeHttpErrorKind {
     }
 }
 
+#[derive(thiserror::Error, Debug, Clone, Copy, Eq, PartialEq)]
+#[error("internode body stalled for {timeout:?}")]
+pub struct BodyStalled {
+    pub timeout: Duration,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InternodeHttpRequestContext {
     method: String,
@@ -269,6 +275,10 @@ pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Err
 #[doc(hidden)]
 pub fn internode_http_timeout_error(method: &Method, url: &str) -> io::Error {
     internode_kind_error(method, url, internode_rpc_operation(url), InternodeHttpErrorKind::ConnectTimeout)
+}
+
+fn body_stalled_error(stall_timeout: Duration) -> io::Error {
+    Error::new(io::ErrorKind::TimedOut, BodyStalled { timeout: stall_timeout })
 }
 
 /// Clone an internode HTTP I/O error while retaining its structured classification.
@@ -1085,10 +1095,7 @@ impl AsyncRead for HttpReader {
                     );
                     record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
                     record_internode_error(*this.track_internode_metrics, *this.internode_operation);
-                    Poll::Ready(Err(Error::new(
-                        io::ErrorKind::TimedOut,
-                        "HttpReader stall timeout: no data received before deadline",
-                    )))
+                    Poll::Ready(Err(body_stalled_error(stall_timeout)))
                 } else {
                     Poll::Pending
                 }
@@ -1217,10 +1224,7 @@ impl ChunkReader for HttpChunkReader {
                         );
                         record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
                         record_internode_error(*this.track_internode_metrics, *this.internode_operation);
-                        return Poll::Ready(Err(Error::new(
-                            io::ErrorKind::TimedOut,
-                            "HttpReader stall timeout: no data received before deadline",
-                        )));
+                        return Poll::Ready(Err(body_stalled_error(stall_timeout)));
                     }
                     return Poll::Pending;
                 }
@@ -2379,6 +2383,46 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("stall timeout should retain typed body-stalled source");
+        assert_eq!(stalled.timeout, Duration::from_millis(20));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_chunk_reader_stall_timeout_retains_typed_source() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/stall");
+        let mut reader =
+            HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(20)))
+                .await
+                .expect("chunk reader should open");
+
+        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
+            .await
+            .expect("initial body chunk should arrive")
+            .expect("initial body chunk should not be EOF");
+        assert_eq!(first, b"hello"[..]);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64)),
+        )
+        .await
+        .expect("stall timeout should wake chunk reader")
+        .expect_err("chunk reader should return a timeout error");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("chunk stall timeout should retain typed body-stalled source");
+        assert_eq!(stalled.timeout, Duration::from_millis(20));
 
         handle.abort();
     }

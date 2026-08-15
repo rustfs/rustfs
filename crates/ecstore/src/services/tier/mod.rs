@@ -30,6 +30,5 @@ pub mod warm_backend_minio;
 pub mod warm_backend_r2;
 pub mod warm_backend_rustfs;
 pub mod warm_backend_s3;
-pub mod warm_backend_s3sdk;
 pub mod warm_backend_tencent;
 pub mod warm_backend_wasabi;

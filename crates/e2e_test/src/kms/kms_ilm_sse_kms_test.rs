@@ -97,7 +97,7 @@ async fn start_enforcing_ilm_server(env: &mut LocalKMSTestEnvironment) -> TestRe
 
     let envs = [
         ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
-        ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "false"),
+        ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ("RUSTFS_SCANNER_CYCLE", "1"),
         ("RUSTFS_ILM_PROCESS_TIME", "1"),
         ("RUSTFS_ILM_DEBUG_DAY_SECS", "2"),
@@ -486,7 +486,6 @@ async fn ilm_expiration_on_sse_kms_bucket_under_enforcement() -> TestResult {
 /// depend on scanner scheduling; the 1s scanner cycle stays on as a backstop.
 #[tokio::test]
 #[serial]
-#[ignore = "pins rustfs/rustfs#6025: GET on a transitioned managed-SSE object silently returns corrupt bytes (fails with enforcement on AND off, so it is not an authorization regression); un-ignore with the fix"]
 async fn ilm_transition_on_sse_kms_bucket_under_enforcement_reads_back() -> TestResult {
     init_logging();
 

@@ -409,7 +409,9 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use rustfs_ecstore::api::compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod ecstore_cluster {
@@ -430,7 +432,7 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_data_usage_from_backend, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+        load_data_usage_from_backend, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
         record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
@@ -487,8 +489,12 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
+        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
 }
 
@@ -546,6 +552,11 @@ pub(crate) mod ecstore_test_support {
 }
 
 pub(crate) mod ecstore_set_disk {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+        fail_next_quota_ledger_save_for_test,
+    };
     pub(crate) use rustfs_ecstore::api::set_disk::{
         DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,
     };
@@ -1130,7 +1141,9 @@ pub(crate) trait StorageDiskRpcExt {
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
@@ -1139,7 +1152,7 @@ pub(crate) trait StorageDiskRpcExt {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
@@ -1258,8 +1271,16 @@ where
         ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
     }
 
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::acquire_snapshot_lease(self, volume, path).await
+    }
+
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()> {
         ecstore_disk::DiskAPI::release_snapshot_lease(self, volume, path, token).await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::renew_snapshot_lease(self, volume, path, token).await
     }
 
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo> {
@@ -1282,11 +1303,11 @@ where
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info, dst_volume, dst_path).await
+        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {

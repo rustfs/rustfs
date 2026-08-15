@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 # Excludes crates/e2e_test/ — test infrastructure legitimately uses s3s
 # to verify S3 behavior and does not widen the production s3s surface.
 S3S_IMPORT_FILES_BASELINE=213
-S3_ERROR_LINES_BASELINE=1621
+S3_ERROR_LINES_BASELINE=1620
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
 

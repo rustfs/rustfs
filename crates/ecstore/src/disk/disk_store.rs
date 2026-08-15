@@ -241,6 +241,40 @@ pub fn get_drive_list_dir_timeout() -> Duration {
     )
 }
 
+pub(crate) trait DiskStoreRenameDataExt {
+    async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp>;
+}
+
+impl DiskStoreRenameDataExt for LocalDiskWrapper {
+    async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        self.track_disk_health_mutation(
+            "rename_data",
+            DiskMetricMutation::Write,
+            || async {
+                self.disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+}
+
 pub fn get_drive_walkdir_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS,
@@ -1985,13 +2019,8 @@ impl DiskAPI for LocalDiskWrapper {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.track_disk_health_mutation(
-            "rename_data",
-            DiskMetricMutation::Write,
-            || async { self.disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {

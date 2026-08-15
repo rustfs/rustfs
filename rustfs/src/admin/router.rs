@@ -2901,7 +2901,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
             let usecase = default_object_usecase();
-            let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
+            let get_resp = usecase.execute_get_object(get_req).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {

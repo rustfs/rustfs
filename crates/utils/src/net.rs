@@ -659,9 +659,6 @@ mod test {
         // Port should be in valid range (u16 max is always <= 65535)
         assert!(port1 > 0);
         assert!(port2 > 0);
-
-        // Different calls should typically return different ports
-        assert_ne!(port1, port2);
     }
 
     #[test]

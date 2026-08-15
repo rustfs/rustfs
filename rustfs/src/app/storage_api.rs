@@ -47,6 +47,8 @@ pub(crate) mod capacity {
 pub(crate) mod data_usage {
     use std::sync::Arc;
 
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::quota_object_size;
+
     pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
@@ -940,7 +942,9 @@ pub(crate) mod concurrency {
 }
 
 pub(crate) mod compression {
-    pub(crate) use crate::storage::storage_api::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use crate::storage::storage_api::ecstore_compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod deadlock_detector {
@@ -1151,7 +1155,7 @@ pub(crate) mod multipart_usecase {
     }
 
     pub(crate) use super::{
-        access, bucket, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
+        access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
     };
     pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
 }
@@ -1214,4 +1218,14 @@ pub(crate) mod test {
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
     };
+    pub(crate) mod set_disk {
+        pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
+            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+            fail_next_quota_ledger_save_for_test,
+        };
+    }
+
+    pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
+    }
 }

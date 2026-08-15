@@ -94,6 +94,7 @@ jobs:
       short_sha: ${{ steps.check.outputs.short_sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
       create_latest: ${{ steps.check.outputs.create_latest }}
+      source_ref: ${{ steps.check.outputs.source_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -118,6 +119,7 @@ jobs:
           short_sha=""
           is_prerelease=false
           create_latest=false
+          source_ref="$GITHUB_SHA"
 
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             # Triggered by build workflow completion
@@ -137,6 +139,7 @@ jobs:
             # Extract version info from commit message or use commit SHA
             # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
             short_sha=$(git rev-parse --short "$HEAD_SHA")
+            source_ref="$HEAD_SHA"
 
             # Determine build type based on triggering workflow event and ref
             triggering_event="$TRIGGERING_EVENT"
@@ -261,6 +264,23 @@ jobs:
                 echo "⚠️  Only release versions (latest, v1.0.0, 1.0.0) and prereleases (v1.0.0-alpha1, 1.0.0-beta2) are supported"
                 ;;
             esac
+
+            if [[ "$should_build" == true && "$input_version" != "latest" ]]; then
+              tag_ref="refs/tags/$input_version"
+              if ! git ls-remote --exit-code origin "$tag_ref" >/dev/null 2>&1; then
+                if [[ "$input_version" == v* ]]; then
+                  tag_ref="refs/tags/${input_version#v}"
+                else
+                  tag_ref="refs/tags/v$input_version"
+                fi
+              fi
+
+              if ! git ls-remote --exit-code origin "$tag_ref" >/dev/null 2>&1; then
+                echo "❌ Release tag not found for Docker build: $input_version"
+                exit 1
+              fi
+              source_ref="$tag_ref"
+            fi
           fi
 
           {
@@ -271,6 +291,7 @@ jobs:
             echo "short_sha=$short_sha"
             echo "is_prerelease=$is_prerelease"
             echo "create_latest=$create_latest"
+            echo "source_ref=$source_ref"
           } >> "$GITHUB_OUTPUT"
 
           echo "🐳 Docker Build Summary:"
@@ -281,6 +302,7 @@ jobs:
           echo "  - Short SHA: $short_sha"
           echo "  - Is prerelease: $is_prerelease"
           echo "  - Create latest: $create_latest"
+          echo "  - Source ref: $source_ref"
 
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
@@ -308,6 +330,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ needs.build-check.outputs.source_ref }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -397,7 +420,8 @@ jobs:
           LABELS="org.opencontainers.image.title=RustFS"
           LABELS="$LABELS,org.opencontainers.image.description=RustFS distributed object storage system"
           LABELS="$LABELS,org.opencontainers.image.version=$VERSION"
-          LABELS="$LABELS,org.opencontainers.image.revision=${{ github.sha }}"
+          SOURCE_REVISION="$(git rev-parse HEAD)"
+          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"
           LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
           LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           LABELS="$LABELS,org.opencontainers.image.build-type=$BUILD_TYPE"

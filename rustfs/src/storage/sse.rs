@@ -4565,11 +4565,9 @@ mod tests {
         })
         .await
         .expect_err("mismatched kms context should fail");
-        assert!(
-            err.message.contains("context") || err.message.contains("Context"),
-            "unexpected error for mismatched kms context: {}",
-            err.message
-        );
+        assert_eq!(err.code, S3ErrorCode::InternalError);
+        assert_eq!(err.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        assert_eq!(super::kms_data_plane_error_class(&err), "context_mismatch");
 
         manager.stop().await.expect("kms service should stop cleanly");
         reset_sse_dek_provider();
@@ -5336,7 +5334,16 @@ mod tests {
 
         let error = TestSseDekProvider::decrypt_dek(&envelope, [0x55u8; 32])
             .expect_err("unknown JSON envelope versions must fail closed");
-        assert!(error.message.contains("Unsupported encrypted DEK format version"));
+        assert_eq!(error.code, S3ErrorCode::InternalError);
+        assert_eq!(error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        let source = error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error
+            .to_string()
+            .contains("Unsupported encrypted DEK format version")));
     }
 
     #[tokio::test]
@@ -5894,10 +5901,16 @@ mod tests {
     }
 
     #[test]
-    fn test_map_get_object_reader_error_leaves_non_ssec_errors_unchanged() {
+    fn test_map_get_object_reader_error_redacts_non_ssec_internal_errors() {
         let err = map_get_object_reader_error(StorageError::other("plain io failure"));
         assert_eq!(err.code, S3ErrorCode::InternalError);
-        assert_eq!(err.message, "Io error: plain io failure");
+        assert_eq!(err.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        let source = err
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains("plain io failure")));
     }
 
     #[test]

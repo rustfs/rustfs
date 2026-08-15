@@ -4012,7 +4012,7 @@ mod tests {
     use crate::scanner_budget::ScannerCycleBudgetConfig;
     use crate::scanner_folder::ScannerItem;
     use crate::storage_api::owner::{EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats};
-    use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
+    use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
     use crate::{
         DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
         ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
@@ -4237,16 +4237,21 @@ mod tests {
     async fn multi_pool_scanner_cycle_zero_fills_bucket_absent_from_first_pool() {
         let (_temp_dir, store) = setup_two_pool_scanner_store().await;
         let bucket = format!("scanner-second-pool-{}", Uuid::new_v4().simple());
-        store.pools[1].disk_set[0]
+        store
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
-            .expect("bucket should be created only in the second pool");
+            .expect("bucket and its authoritative metadata should be created");
         let body = b"second-only";
         let mut reader = ScannerPutObjReader::from_vec(body.to_vec());
-        store.pools[1].disk_set[0]
+        store.pools[1]
             .put_object(&bucket, "pool-b", &mut reader, &ScannerObjectOptions::default())
             .await
             .expect("object should be written only to the second pool");
+        store.pools[0]
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket should be removed from the first pool only");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());

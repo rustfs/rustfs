@@ -67,7 +67,10 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn capture_command_logs(command: &mut Command, log_path: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn capture_command_logs(
+    command: &mut Command,
+    log_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(log_path) = log_path else {
         return Ok(());
     };
