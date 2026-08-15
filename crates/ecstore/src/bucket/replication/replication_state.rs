@@ -704,6 +704,12 @@ impl ReplicationStats {
         } else {
             BucketReplicationStats::new()
         };
+        // Stamp the serializable failure windows from the live samples: the
+        // samples themselves do not cross the peer-RPC wire, so this snapshot
+        // is what cluster aggregation and the metrics endpoints see.
+        for stat in replication_stats.stats.values_mut() {
+            stat.fail_stats.refresh_windows();
+        }
         let uptime = if cache.contains_key(bucket) {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

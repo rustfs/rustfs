@@ -417,6 +417,10 @@ pub(crate) mod replication {
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
+    pub(crate) type BucketReplicationStats = super::ecstore_bucket::replication::BucketReplicationStats;
+    pub(crate) type BucketReplicationStat = super::ecstore_bucket::replication::BucketReplicationStat;
+    pub(crate) type InQueueMetric = super::ecstore_bucket::replication::InQueueMetric;
+    pub(crate) type XferStats = super::ecstore_bucket::replication::XferStats;
     pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
