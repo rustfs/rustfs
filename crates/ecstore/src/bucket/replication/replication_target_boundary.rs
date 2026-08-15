@@ -259,15 +259,23 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
 
         if !tags.is_empty() {
             put_options.user_tags = tags;
-            put_options.internal.tagging_timestamp =
-                if let Some(timestamp) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
-                    OffsetDateTime::parse(&timestamp, &Rfc3339)
-                        .map_err(|err| Error::other(format!("Failed to parse tagging timestamp: {err}")))?
-                } else {
-                    object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-                };
         }
     }
+    // Load the stored tagging timestamp independently of whether any tags
+    // remain: DeleteObjectTagging leaves the object tagless but stamps this
+    // key, and the deletion's LWW timestamp must still reach the replica.
+    // With no stored key, fall back to mod_time only while tags exist
+    // (MinIO parity); a tagless object without the key was never tagged and
+    // keeps the epoch default (no header).
+    put_options.internal.tagging_timestamp = if let Some(timestamp) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP)
+    {
+        OffsetDateTime::parse(&timestamp, &Rfc3339)
+            .map_err(|err| Error::other(format!("Failed to parse tagging timestamp: {err}")))?
+    } else if !put_options.user_tags.is_empty() {
+        object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    } else {
+        OffsetDateTime::UNIX_EPOCH
+    };
 
     let metadata = &*object_info.user_defined;
 
@@ -692,6 +700,44 @@ mod tests {
         assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef");
         assert_eq!(options.internal.replication_status, ReplicationStatusType::Replica);
         assert!(options.internal.replication_request);
+    }
+
+    /// DeleteObjectTagging leaves the object tagless but stamps the
+    /// tagging-timestamp internal key; the deletion's LWW timestamp must
+    /// still be loaded (and therefore sent) so the replica can order the
+    /// deletion against concurrent tag edits.
+    #[test]
+    fn replication_put_options_carry_tagging_timestamp_after_tag_deletion() {
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, SUFFIX_TAGGING_TIMESTAMP, "2026-01-02T03:04:05Z".to_string());
+
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            user_tags: Arc::new(String::new()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            version_id: Some(Uuid::nil()),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
+
+        assert!(options.user_tags.is_empty());
+        assert_eq!(
+            options.internal.tagging_timestamp,
+            OffsetDateTime::parse("2026-01-02T03:04:05Z", &Rfc3339).expect("valid timestamp"),
+            "the stored tagging timestamp must load independently of remaining tags"
+        );
+
+        // A tagless object without the stored key was never tagged: the epoch
+        // default keeps the header unsent.
+        let untagged = ObjectInfo {
+            user_tags: Arc::new(String::new()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            version_id: Some(Uuid::nil()),
+            ..Default::default()
+        };
+        let (options, _) = replication_put_object_options("", &untagged).expect("build put options");
+        assert_eq!(options.internal.tagging_timestamp, OffsetDateTime::UNIX_EPOCH);
     }
 
     #[test]
