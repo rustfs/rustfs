@@ -14413,7 +14413,10 @@ mod tests {
         assert!(!target.secure);
         assert_eq!(target.target_bucket, "photos");
         assert_eq!(target.deployment_id, "remote");
-        assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        // Freshly minted ARNs use the `minio` partition so madmin-go tooling
+        // can parse them; legacy `arn:rustfs:` targets are preserved as-is
+        // (see the MinIO-era preservation test below).
+        assert_eq!(target.arn, "arn:minio:replication::remote:photos");
         assert_eq!(target.region, "us-east-1");
         let credentials = target
             .credentials

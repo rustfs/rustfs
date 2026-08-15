@@ -40,7 +40,14 @@ impl ARN {
 
 impl Display for ARN {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "arn:rustfs:{}:{}:{}:{}", self.arn_type, self.region, self.id, self.bucket)
+        // The `minio` partition is deliberate: madmin-go's ParseARN
+        // hard-rejects any other partition, so native mc/madmin tooling can
+        // only decode remote-target ARNs minted in this form (backlog#1675
+        // P1-7). Legacy `arn:rustfs:` ARNs persisted by older releases stay
+        // readable via the FromStr whitelist below; runtime matching between
+        // targets and replication rules is by full-string equality, so mixed
+        // partitions coexist safely.
+        write!(f, "arn:minio:{}:{}:{}:{}", self.arn_type, self.region, self.id, self.bucket)
     }
 }
 
@@ -48,7 +55,12 @@ impl FromStr for ARN {
     type Err = std::io::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if !s.starts_with("arn:rustfs:") {
+        // Partition whitelist, not just an `arn:` check: `BucketTargetType::
+        // from_str(...).unwrap_or_default()` below never fails, so this is
+        // the only structural gate rejecting foreign ARNs. `arn:rustfs:` is
+        // the legacy partition and must stay accepted forever (persisted
+        // bucket-targets.json / replication configs from older releases).
+        if !s.starts_with("arn:minio:") && !s.starts_with("arn:rustfs:") {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid ARN format"));
         }
 
