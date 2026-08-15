@@ -17,6 +17,7 @@ use crate::config::storageclass;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
+use futures::{StreamExt as _, stream::FuturesUnordered};
 pub(in crate::store) mod support;
 use support::{
     LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
@@ -32,6 +33,10 @@ struct BackendStorageClassInfo {
     rr_sc_data: Vec<usize>,
     rr_sc_parities: Vec<usize>,
     rr_sc_parity: Option<usize>,
+}
+
+fn latest_get_object_candidate_key(mod_time: Option<OffsetDateTime>, pool_idx: usize) -> (OffsetDateTime, usize) {
+    (mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH), pool_idx)
 }
 
 fn resolve_pool_layout(
@@ -581,6 +586,60 @@ impl ECStore {
         resolve_latest_object_info_candidates(candidates, bucket, object, opts)
     }
 
+    pub(super) async fn prepare_latest_get_object_metadata_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: &Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> Result<(Option<crate::set_disk::PreparedGetObjectMetadata>, usize)> {
+        let mut futures = FuturesUnordered::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if opts.skip_decommissioned && self.is_suspended(idx).await {
+                continue;
+            }
+
+            if opts.skip_rebalancing && self.is_pool_rebalancing(idx).await {
+                continue;
+            }
+
+            futures.push(async move {
+                (
+                    idx,
+                    pool.prepare_get_object_reader_metadata(bucket, object, opts)
+                        .await
+                        .map_err(|err| to_object_err(err, vec![bucket, object])),
+                )
+            });
+        }
+
+        let mut selected = None;
+        while let Some((pool_idx, result)) = futures.next().await {
+            let candidate = match result {
+                Ok(metadata) => {
+                    let key = latest_get_object_candidate_key(metadata.object_info().mod_time, pool_idx);
+                    let reusable = metadata.has_self_contained_body(range, opts).then_some(metadata);
+                    Some((Ok(reusable), key))
+                }
+                Err(err) if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) => {
+                    Some((Err(err), latest_get_object_candidate_key(None, pool_idx)))
+                }
+                Err(_) => None,
+            };
+            if let Some(candidate) = candidate
+                && selected.as_ref().is_none_or(|(_, current_key)| candidate.1 > *current_key)
+            {
+                selected = Some(candidate);
+            }
+        }
+
+        match selected {
+            Some((Ok(metadata), (_, pool_idx))) => Ok((metadata, pool_idx)),
+            Some((Err(err), _)) => Err(err),
+            None => Err(pool_lookup_not_found_error(bucket, object, opts)),
+        }
+    }
+
     pub(super) async fn delete_object_from_all_pools(
         &self,
         bucket: &str,
@@ -1083,6 +1142,16 @@ mod tests {
             delete_marker,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn latest_get_object_candidate_key_preserves_epoch_error_ordering() {
+        assert!(latest_get_object_candidate_key(Some(OffsetDateTime::UNIX_EPOCH), 1) > latest_get_object_candidate_key(None, 0));
+        assert!(latest_get_object_candidate_key(Some(OffsetDateTime::UNIX_EPOCH), 0) < latest_get_object_candidate_key(None, 1));
+        assert!(
+            latest_get_object_candidate_key(Some(OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1)), 1)
+                < latest_get_object_candidate_key(None, 0)
+        );
     }
 
     #[test]

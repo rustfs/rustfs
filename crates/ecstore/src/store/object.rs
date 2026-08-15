@@ -1315,15 +1315,14 @@ impl ECStore {
             let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
             (metadata, pool)
         } else {
-            let (_, pool_idx) = self
-                .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            let (metadata, pool_idx) = self
+                .prepare_latest_accessible_get_object_metadata_with_idx(bucket, &object, &range, &opts)
                 .await?;
             let pool = self
                 .pools
                 .get(pool_idx)
                 .cloned()
                 .ok_or_else(|| Error::other(format!("resolved GET pool index {pool_idx} is out of bounds")))?;
-            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
             (metadata, pool)
         };
 
@@ -1574,6 +1573,44 @@ impl ECStore {
         resolve_latest_object_access(bucket, object, info, idx, opts)
     }
 
+    async fn prepare_latest_accessible_get_object_metadata_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: &Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> Result<(crate::set_disk::PreparedGetObjectMetadata, usize)> {
+        let (metadata, pool_idx) = self
+            .prepare_latest_get_object_metadata_with_idx(bucket, object, range, opts)
+            .await?;
+        let metadata = self
+            .refresh_selected_get_object_metadata_if_needed(bucket, object, opts, metadata, pool_idx)
+            .await?;
+        if let Some(err) = latest_object_access_delete_marker_error(bucket, object, metadata.object_info(), opts) {
+            return Err(err);
+        }
+        Ok((metadata, pool_idx))
+    }
+
+    async fn refresh_selected_get_object_metadata_if_needed(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        metadata: Option<crate::set_disk::PreparedGetObjectMetadata>,
+        pool_idx: usize,
+    ) -> Result<crate::set_disk::PreparedGetObjectMetadata> {
+        if let Some(metadata) = metadata {
+            return Ok(metadata);
+        }
+
+        let pool = self
+            .pools
+            .get(pool_idx)
+            .ok_or_else(|| Error::other(format!("resolved GET pool index {pool_idx} is out of bounds")))?;
+        pool.prepare_get_object_reader_metadata(bucket, object, opts).await
+    }
+
     pub(super) async fn select_data_movement_pool_idx(
         &self,
         bucket: &str,
@@ -1780,11 +1817,11 @@ impl ECStore {
                 .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         } else {
-            let (_, idx) = self
-                .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            let (metadata, pool_idx) = self
+                .prepare_latest_accessible_get_object_metadata_with_idx(bucket, &object, &range, &opts)
                 .await?;
-            self.pools[idx]
-                .get_object_reader(bucket, object.as_ref(), range, h, &opts)
+            self.pools[pool_idx]
+                .get_object_reader_with_prepared_metadata(bucket, object.as_ref(), range, h, &opts, metadata)
                 .await?
         };
 
@@ -4940,12 +4977,12 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn prepared_reader_resolves_object_from_second_pool() {
+    async fn prepared_reader_refreshes_path_backed_object_from_second_pool() {
         let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
         let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
         let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
         let bucket = "prepared-reader-second-pool";
-        let object = "object.bin";
+        let object = "prepared-reader-second-pool-object.bin";
         let payload = b"prepared-reader-second-pool-payload-".repeat(40_000);
         let opts = ObjectOptions {
             no_lock: true,
@@ -4963,10 +5000,16 @@ mod tests {
             .await
             .expect("object should be written only to the second pool");
 
+        let calls = disk_call_counters::observe(object);
         let prepared = store
             .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
             .await
             .expect("prepared reader should resolve the second-pool object");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            12,
+            "path-backed multi-pool preparation must refresh the winning pool"
+        );
         assert_eq!(prepared.object_info().size, payload.len() as i64);
         let mut reader = prepared.into_reader().await.expect("prepared body reader should open");
         let mut restored = Vec::new();
@@ -4976,6 +5019,657 @@ mod tests {
             .await
             .expect("prepared body should stream");
         assert_eq!(restored, payload);
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            12,
+            "prepared body construction must consume the refreshed winning metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_reader_reuses_self_contained_inline_winner() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "prepared-reader-inline-multi-pool";
+        let object = "prepared-reader-inline-multi-pool-object.bin";
+        let payload = vec![b'i'; 8 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        let info = store.pools[1]
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("inline object should be written to the second pool");
+        assert!(info.inlined, "test object should use inline data shards");
+
+        let calls = disk_call_counters::observe(object);
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("staged inline reader should resolve the second-pool object");
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+
+        let mut reader = prepared.into_reader().await.expect("staged inline body reader should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("staged inline body should stream");
+        assert_eq!(restored, payload);
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+    }
+
+    #[tokio::test]
+    async fn selected_path_backed_metadata_is_refreshed_after_overwrite() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "multi-pool-stale-prepared-refresh";
+        let object = "multi-pool-stale-prepared-refresh-object.bin";
+        let old_payload = vec![b'o'; 512 * 1024];
+        let new_payload = vec![b'n'; 640 * 1024];
+        let old_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let new_mod_time = old_mod_time + time::Duration::hours(1);
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut old_reader = PutObjReader::from_vec(old_payload);
+        store.pools[1]
+            .put_object(
+                bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    mod_time: Some(old_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old path-backed object should be written");
+
+        let (stale_metadata, pool_idx) = store
+            .prepare_latest_get_object_metadata_with_idx(bucket, object, &None, &read_opts)
+            .await
+            .expect("initial cross-pool metadata selection should succeed");
+        assert_eq!(pool_idx, 1);
+        assert!(
+            stale_metadata.is_none(),
+            "path-backed metadata must not be retained while other pools finish"
+        );
+
+        let mut new_reader = PutObjReader::from_vec(new_payload.clone());
+        store.pools[1]
+            .put_object(
+                bucket,
+                object,
+                &mut new_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    mod_time: Some(new_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("concurrent replacement should commit");
+
+        let calls = disk_call_counters::observe(object);
+        let refreshed = store
+            .refresh_selected_get_object_metadata_if_needed(bucket, object, &read_opts, stale_metadata, pool_idx)
+            .await
+            .expect("path-backed selected metadata should be refreshed");
+        assert_eq!(refreshed.object_info().mod_time, Some(new_mod_time));
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+
+        let mut reader = store.pools[pool_idx]
+            .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &read_opts, refreshed)
+            .await
+            .expect("refreshed body reader should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("refreshed body should stream");
+        assert_eq!(restored, new_payload);
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+    }
+
+    #[tokio::test]
+    async fn multi_pool_prepared_get_preserves_version_and_delete_marker_semantics() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let bucket = "multi-pool-prepared-version-semantics";
+        let object = "versioned-object.bin";
+        let older_payload = b"older visible generation".repeat(4_000);
+        let versioned_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+
+        for set_disks in [&first_set, &second_set] {
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+        }
+        let mut older_reader = PutObjReader::from_vec(older_payload.clone());
+        let older = first_set
+            .put_object(bucket, object, &mut older_reader, &versioned_opts)
+            .await
+            .expect("older versioned object should be written");
+        let older_version_id = older
+            .version_id
+            .filter(|version_id| !version_id.is_nil())
+            .expect("versioned object should have a non-nil version ID");
+
+        let mut hidden_reader = PutObjReader::from_vec(b"hidden generation".repeat(4_000));
+        second_set
+            .put_object(bucket, object, &mut hidden_reader, &versioned_opts)
+            .await
+            .expect("newer versioned object should be written");
+        let marker = second_set
+            .delete_object(bucket, object, versioned_opts.clone())
+            .await
+            .expect("versioned delete should create a marker");
+        let marker_version_id = marker
+            .version_id
+            .filter(|version_id| !version_id.is_nil())
+            .expect("delete marker should have a non-nil version ID");
+
+        let explicit_version_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            version_id: Some(older_version_id.to_string()),
+            ..Default::default()
+        };
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &explicit_version_opts)
+            .await
+            .expect("explicit version should resolve from the first pool");
+        assert_eq!(prepared.object_info().version_id, Some(older_version_id));
+        let mut reader = prepared.into_reader().await.expect("explicit version body should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("explicit version body should stream");
+        assert_eq!(restored, older_payload);
+
+        let latest_error = match store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("latest delete marker should hide older live versions"),
+            Err(error) => error,
+        };
+        assert!(is_err_object_not_found(&latest_error));
+
+        let marker_error = match store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    versioned: true,
+                    version_id: Some(marker_version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("explicit delete marker reads should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(marker_error, Error::MethodNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn multi_pool_prepared_get_preserves_missing_error_shape() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "multi-pool-prepared-missing";
+        let object = "missing-object.bin";
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+
+        let latest_calls = disk_call_counters::observe(object);
+        let latest_error = match store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("missing object should not prepare a reader"),
+            Err(error) => error,
+        };
+        assert!(is_err_object_not_found(&latest_error));
+        assert_eq!(latest_calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+        drop(latest_calls);
+
+        let version_id = Uuid::from_u128(17).to_string();
+        let version_calls = disk_call_counters::observe(object);
+        let version_error = match store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    versioned: true,
+                    version_id: Some(version_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("missing version should not prepare a reader"),
+            Err(error) => error,
+        };
+        assert_eq!(version_error, Error::VersionNotFound(bucket.to_string(), object.to_string(), version_id));
+        assert_eq!(version_calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+    }
+
+    #[tokio::test]
+    async fn multi_pool_prepared_get_preserves_mixed_quorum_results() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "multi-pool-prepared-quorum";
+        let live_object = "multi-pool-quorum-live-object.bin";
+        let missing_object = "multi-pool-quorum-error-object.bin";
+        let payload = b"live object from healthy pool".repeat(4_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[0]
+            .put_object(bucket, live_object, &mut put_reader, &opts)
+            .await
+            .expect("live object should be written to the healthy pool");
+        for object in [live_object, missing_object] {
+            let mut put_reader = PutObjReader::from_vec(b"unreadable pool object".repeat(4_000));
+            store.pools[1]
+                .put_object(bucket, object, &mut put_reader, &opts)
+                .await
+                .expect("object should be written before the pool loses quorum");
+        }
+
+        let degraded_set = store.pools[1].get_disks_by_key(live_object);
+        let mut disks = degraded_set.disks.write().await;
+        for disk in disks.iter_mut().take(3) {
+            *disk = None;
+        }
+        drop(disks);
+
+        let missing_error = match store
+            .prepare_get_object_reader(bucket, missing_object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("quorum failure must not collapse into object not found"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing_error,
+            Error::InsufficientReadQuorum(bucket.to_string(), missing_object.to_string())
+        );
+
+        let prepared = store
+            .prepare_get_object_reader(bucket, live_object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("a newer live candidate should outrank another pool's quorum error");
+        let mut reader = prepared.into_reader().await.expect("healthy pool body should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("healthy pool body should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn multi_pool_prepared_get_skips_decommissioned_and_rebalancing_pools() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "multi-pool-prepared-skip-pools";
+        let object = "multi-pool-prepared-skip-pools-object.bin";
+        let available_payload = b"available-pool-payload".repeat(4_000);
+        let skipped_payload = b"newer-skipped-pool-payload".repeat(4_000);
+        let available_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let skipped_mod_time = available_mod_time + time::Duration::hours(1);
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        for (pool_idx, payload, mod_time) in [
+            (0, &available_payload, available_mod_time),
+            (1, &skipped_payload, skipped_mod_time),
+        ] {
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            store.pools[pool_idx]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut put_reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        mod_time: Some(mod_time),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("object should be written to the selected pool");
+        }
+
+        store.pool_meta.write().await.pools = vec![
+            crate::core::pools::PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::now_utc(),
+                decommission: None,
+            },
+            crate::core::pools::PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::now_utc(),
+                decommission: Some(crate::core::pools::PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                }),
+            },
+        ];
+
+        let decommission_calls = disk_call_counters::observe(object);
+        let prepared = store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    skip_decommissioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("decommissioned pool should be skipped");
+        assert_eq!(prepared.object_info().mod_time, Some(available_mod_time));
+        assert_eq!(decommission_calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+        drop(decommission_calls);
+
+        store.pool_meta.write().await.pools[1].decommission = None;
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            pool_stats: vec![
+                crate::services::rebalance::RebalanceStats::default(),
+                crate::services::rebalance::RebalanceStats {
+                    participating: true,
+                    info: crate::services::rebalance::RebalanceInfo {
+                        status: crate::services::rebalance::RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let rebalance_calls = disk_call_counters::observe(object);
+        let prepared = store
+            .prepare_get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    skip_rebalancing: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rebalancing pool should be skipped");
+        assert_eq!(prepared.object_info().mod_time, Some(available_mod_time));
+        assert_eq!(rebalance_calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+
+        let mut reader = prepared.into_reader().await.expect("available pool body should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("available pool body should stream");
+        assert_eq!(restored, available_payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn direct_reader_refreshes_path_backed_winner_and_preserves_tie_break() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "direct-reader-multi-pool-metadata";
+        let object = "direct-reader-multi-pool-metadata-object.bin";
+        let first_payload = b"first-pool-payload".repeat(40_000);
+        let second_payload = b"second-pool-payload".repeat(40_000);
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let put_opts = ObjectOptions {
+            no_lock: true,
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        for (pool_idx, payload) in [(0, &first_payload), (1, &second_payload)] {
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            let info = store.pools[pool_idx]
+                .put_object(bucket, object, &mut put_reader, &put_opts)
+                .await
+                .expect("object should be written to the selected pool");
+            assert_eq!(info.mod_time, Some(mod_time));
+        }
+
+        clear_get_object_body_cache_hook();
+        let hook = Arc::new(CountingMissHook {
+            calls: AtomicUsize::new(0),
+        });
+        register_get_object_body_cache_hook(Arc::clone(&hook) as Arc<dyn GetObjectBodyCacheHook>);
+        let _hook_guard = BodyCacheHookGuard;
+
+        let calls = disk_call_counters::observe(object);
+        let mut reader = store
+            .handle_get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts)
+            .await
+            .expect("direct reader should resolve equal timestamps to the higher pool index");
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 1, "direct reader should probe the body cache once");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            12,
+            "path-backed direct GET must refresh the winning pool metadata"
+        );
+
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("direct body should stream");
+        assert_eq!(restored, second_payload);
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            12,
+            "direct body construction must consume the refreshed prepared metadata"
+        );
+        assert_eq!(
+            hook.calls.load(Ordering::Relaxed),
+            1,
+            "prepared metadata must not duplicate the cache probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_reader_reuses_self_contained_inline_winner() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "direct-reader-inline-multi-pool";
+        let object = "direct-reader-inline-multi-pool-object.bin";
+        let first_payload = vec![b'a'; 8 * 1024];
+        let second_payload = vec![b'b'; 8 * 1024];
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let put_opts = ObjectOptions {
+            no_lock: true,
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        for (pool_idx, payload) in [(0, &first_payload), (1, &second_payload)] {
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            let info = store.pools[pool_idx]
+                .put_object(bucket, object, &mut put_reader, &put_opts)
+                .await
+                .expect("inline object should be written to each pool");
+            assert!(info.inlined, "test object should use inline data shards");
+        }
+
+        let calls = disk_call_counters::observe(object);
+        let mut reader = store
+            .handle_get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts)
+            .await
+            .expect("inline GET should resolve equal timestamps to the higher pool index");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            8,
+            "self-contained inline GET should not refresh the winning pool metadata"
+        );
+
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("inline body should stream");
+        assert_eq!(restored, second_payload);
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
+    }
+
+    #[tokio::test]
+    async fn direct_reader_reuses_self_contained_empty_winner() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "direct-reader-empty-multi-pool";
+        let object = "direct-reader-empty-multi-pool-object.bin";
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(Vec::new());
+        store.pools[1]
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("empty object should be written to the second pool");
+
+        let calls = disk_call_counters::observe(object);
+        let mut reader = store
+            .handle_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("empty GET should resolve the second-pool object");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            8,
+            "self-contained empty GET should not refresh the winning pool metadata"
+        );
+
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("empty body should stream");
+        assert!(restored.is_empty());
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 8);
     }
 
     #[tokio::test]

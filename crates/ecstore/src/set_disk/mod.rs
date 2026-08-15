@@ -840,6 +840,23 @@ impl PreparedGetObjectMetadata {
     pub(crate) fn read_semantics_identity(&self) -> [u8; 32] {
         SetDisks::file_info_quorum_hash(self.snapshot.fi())
     }
+
+    /// Whether the body can be produced without reopening its `data_dir`.
+    /// Path-backed snapshots must be refreshed after cross-Pool selection because
+    /// a concurrent overwrite may reclaim the selected generation's data files.
+    pub(crate) fn has_self_contained_body(&self, range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
+        let object_info = self.object_info();
+        if object_info.size == 0 {
+            return true;
+        }
+
+        let fi = self.snapshot.fi();
+        should_use_inline_fast_path(range, object_info, fi, opts)
+            && collect_inline_data_shard_fileinfos_by_index(self.snapshot.parts_metadata(), fi, fi.erasure.data_blocks, |index| {
+                self.snapshot.online_disks().get(index).is_some_and(Option::is_some)
+            })
+            .is_some()
+    }
 }
 
 tokio::task_local! {
