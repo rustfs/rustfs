@@ -6171,6 +6171,48 @@ fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool 
     )
 }
 
+/// Exponential backoff base for the background retry drain, aligned with the
+/// reconcile cadence (`site_replication_reconcile::RECONCILE_INTERVAL`).
+const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
+/// Backoff ceiling: a permanently failed peer is still probed daily.
+const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
+
+/// What the background drain may do for one retry event. Everything not
+/// representable here is operator territory (manual repair).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryDrainAction {
+    /// Constant-path IAM item deliveries collapse into one queue entry per
+    /// peer and their bodies are not persisted; the only faithful replay is
+    /// the current IAM snapshot from the bootstrap plan.
+    IamSnapshot,
+    /// Same collapse for bucket-meta deliveries: replay the bucket metadata
+    /// snapshot from the bootstrap plan.
+    BucketMetadataSnapshot,
+    /// A self-contained bucket op the bootstrap plan can re-derive for its
+    /// bucket (`make-with-versioning` / `configure-replication`).
+    BucketOpReplay { operation: String, bucket: String },
+    /// Re-send the current peer records under a fresh edit generation.
+    PeerEdit,
+}
+
+fn classify_site_replication_retry_event(_event: &SiteReplicationRetryEvent) -> Option<RetryDrainAction> {
+    // No background consumer exists yet: every event waits for a manual
+    // repair.
+    None
+}
+
+/// Whether the drain may attempt this event now.
+fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetryEvent, now: OffsetDateTime) -> bool {
+    let _ = (event, now);
+    true
+}
+
+/// The subset of the retry queue the background drain is allowed to touch.
+fn actionable_site_replication_retry_events(state: &SiteReplicationState, now: OffsetDateTime) -> Vec<SiteReplicationRetryEvent> {
+    let _ = now;
+    state.retry_queue.clone()
+}
+
 /// Remove a retry event for (peer, path) from the queue on successful delivery.
 /// This is a no-op (load + no-op persist skipped) when no matching entry exists,
 /// avoiding unnecessary I/O on the common path.
@@ -11425,6 +11467,130 @@ mod tests {
         let target_state = endpoint_refresh_target_state(&state, &pending);
         assert!(!state.peers["remote"].skip_tls_verify);
         assert!(target_state.peers["remote"].skip_tls_verify);
+    }
+
+    fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<OffsetDateTime>) -> SiteReplicationRetryEvent {
+        SiteReplicationRetryEvent {
+            id: format!("evt-{peer}"),
+            peer_deployment_id: peer.to_string(),
+            peer_endpoint: format!("https://{peer}.example.com"),
+            path: path.to_string(),
+            retry_count,
+            failed: retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER,
+            last_error: "remote-operation-failed".to_string(),
+            updated_at,
+            edit_generation: None,
+        }
+    }
+
+    /// P1-3 red-light: the drain must only ever act on deliveries it can
+    /// replay faithfully. IAM / bucket-meta entries collapse per (peer, path)
+    /// with no body persisted — only a snapshot resend is truthful; bucket
+    /// makes/replication configs are re-derivable; destructive bucket ops and
+    /// `internal:` marker records (the pending-endpoint-refresh backup store)
+    /// are never background-replayed.
+    #[test]
+    fn test_classify_site_replication_retry_event_actions() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let classify = |path: &str| classify_site_replication_retry_event(&drain_event("remote", path, 1, Some(now)));
+
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/iam-item"),
+            Some(RetryDrainAction::IamSnapshot)
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
+            Some(RetryDrainAction::BucketMetadataSnapshot)
+        );
+        assert_eq!(classify(SITE_REPLICATION_PEER_EDIT_PATH), Some(RetryDrainAction::PeerEdit));
+        assert_eq!(
+            classify(
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning&createdAt=1"
+            ),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication"),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        // Destructive ops are operator territory: replaying a bucket delete
+        // against a peer whose bucket was since recreated is irreversible.
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket"),
+            None
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket"),
+            None
+        );
+        // `internal:` records store payloads in `last_error`, not failures.
+        assert_eq!(classify(SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH), None);
+        assert_eq!(classify("internal:some-future-marker"), None);
+        assert_eq!(classify("/rustfs/admin/v3/site-replication/peer/unknown"), None);
+    }
+
+    /// Exponential backoff gates every attempt: without it a dead peer's
+    /// entries hit `failed` (retry_count >= 3) within 30 minutes of reconcile
+    /// ticks and the retry stats lose their signal.
+    #[test]
+    fn test_site_replication_retry_backoff_schedule() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let at = |secs_ago: i64| Some(now - time::Duration::seconds(secs_ago));
+        let elapsed = |retry_count: u32, secs_ago: i64| {
+            site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", retry_count, at(secs_ago)), now)
+        };
+
+        // No record of when it failed: attempt now.
+        assert!(site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", 1, None), now));
+        // First failure: one reconcile interval.
+        assert!(!elapsed(1, 599));
+        assert!(elapsed(1, 601));
+        // Third failure: 600 * 2^2 = 2400s.
+        assert!(!elapsed(3, 1200));
+        assert!(elapsed(3, 2401));
+        // Ceiling: a long-dead peer is still probed daily, never less often.
+        assert!(!elapsed(30, 86_000));
+        assert!(elapsed(30, 86_401));
+    }
+
+    /// The actionable subset respects classification, peer membership and
+    /// backoff; everything else stays untouched in the queue.
+    #[test]
+    fn test_actionable_site_replication_retry_events_filters() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let old = Some(now - time::Duration::seconds(700));
+        let mut state = SiteReplicationState::default();
+        state
+            .peers
+            .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+        state.retry_queue = vec![
+            // Eligible: known peer, replayable, past backoff.
+            drain_event("remote", "/rustfs/admin/v3/site-replication/peer/iam-item", 1, old),
+            // Not yet due.
+            drain_event("remote", "/rustfs/admin/v3/site-replication/peer/bucket-meta", 2, Some(now)),
+            // Unknown peer (removed since the failure was recorded).
+            drain_event("gone", "/rustfs/admin/v3/site-replication/peer/iam-item", 1, old),
+            // Marker record, not a delivery failure.
+            drain_event("remote", SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH, 0, old),
+            // Destructive op: operator-only.
+            drain_event(
+                "remote",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
+                1,
+                old,
+            ),
+        ];
+
+        let actionable = actionable_site_replication_retry_events(&state, now);
+        assert_eq!(actionable.len(), 1, "only the due, replayable, known-peer event is actionable");
+        assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/iam-item");
     }
 
     #[test]
