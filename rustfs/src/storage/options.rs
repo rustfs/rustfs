@@ -463,6 +463,12 @@ pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap
     put_opts_from_headers_with_replication_authorization(headers, metadata, false)
 }
 
+pub(crate) fn has_replication_retention_update(headers: &HeaderMap<HeaderValue>, replication_request_authorized: bool) -> bool {
+    replication_request_authorized
+        && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true")
+        && replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
+}
+
 pub fn put_opts_from_headers_with_replication_authorization(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
@@ -1136,15 +1142,16 @@ mod tests {
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
         get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
-        namespace_reserved_user_metadata, parse_copy_source_range, put_opts, put_opts_from_headers,
-        put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
+        has_replication_retention_update, namespace_reserved_user_metadata, parse_copy_source_range, put_opts,
+        put_opts_from_headers, put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
         validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
-        SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+        SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+        SUFFIX_SOURCE_VERSION_ID, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -1575,6 +1582,24 @@ mod tests {
     }
 
     #[test]
+    fn test_replication_retention_update_requires_authorization() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z");
+
+        assert!(!has_replication_retention_update(&headers, false));
+        assert!(has_replication_retention_update(&headers, true));
+
+        let mut missing_request = HeaderMap::new();
+        insert_header(
+            &mut missing_request,
+            SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(!has_replication_retention_update(&missing_request, true));
+    }
+
+    #[test]
     fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
         use rustfs_utils::http::object_encryption_keys::{
             INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
@@ -1683,7 +1708,7 @@ mod tests {
             "x-rustfs-source-mtime",
         ] {
             assert!(
-                metadata.get(forged).is_none(),
+                !metadata.contains_key(forged),
                 "{forged} must not be storable as a bare user-metadata key"
             );
         }

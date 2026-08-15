@@ -117,6 +117,7 @@ use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::shared_types::convert_ecstore_object_info;
+use crate::storage::options::has_replication_retention_update;
 use crate::table_catalog;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -5799,7 +5800,9 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, inbound_replication_put);
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
@@ -10081,6 +10084,19 @@ mod tests {
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
         assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
         assert_eq!(metadata.get("x-amz-meta-x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+
+        let mut replication_headers = HeaderMap::new();
+        insert_header(&mut replication_headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(
+            &mut replication_headers,
+            rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        let mut replica_metadata = HashMap::new();
+        let explicit_clear = has_replication_retention_update(&replication_headers, true);
+        apply_bucket_default_lock_retention("bucket", &state, &mut replica_metadata, explicit_clear).unwrap();
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
