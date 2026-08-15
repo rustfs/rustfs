@@ -498,15 +498,49 @@ mod tests {
         assert_eq!(json["downtimeInfo"], serde_json::json!({}));
     }
 
+    /// minio-go's transferSummary labels mean >= 128 MiB for Large; the
+    /// producer must bin on the same boundary (MIN_LARGE_OBJ_SIZE, shared
+    /// with the worker-pool split), or a 2 MiB replication shows under Large
+    /// while Small stays zero.
+    #[test]
+    fn transfer_summary_bins_on_the_128_mib_boundary() {
+        const MIB: i64 = 1024 * 1024;
+        let mut stats = BucketStats::default();
+        let stat = stats
+            .replication_stats
+            .stats
+            .entry("arn:minio:replication::t:b".to_string())
+            .or_default();
+        stat.update_xfer_rate(2 * MIB, std::time::Duration::from_secs(1));
+        stat.update_xfer_rate(127 * MIB, std::time::Duration::from_secs(1));
+        stat.update_xfer_rate(128 * MIB, std::time::Duration::from_secs(1));
+
+        let json = serde_json::to_value(MetricsV2Wire::from_stats(&stats, "node-1")).expect("v2 wire should serialize");
+        let summary = &json["queueStats"]["nodes"][0]["tgtTransferStats"]["arn:minio:replication::t:b"];
+        let small_peak = summary["Small"]["peakRate"].as_f64().expect("Small peakRate");
+        let large_peak = summary["Large"]["peakRate"].as_f64().expect("Large peakRate");
+        assert!(
+            (small_peak - (127 * MIB) as f64).abs() < 1.0,
+            "2 MiB and 127 MiB transfers must bin as Small (peak {small_peak})"
+        );
+        assert!(
+            (large_peak - (128 * MIB) as f64).abs() < 1.0,
+            "exactly 128 MiB must bin as Large (peak {large_peak})"
+        );
+    }
+
     /// Review regression: both metrics endpoints aggregate first, and the
     /// FailStats merge drops the process-local samples — the rolling windows
     /// must survive a peer-RPC round trip plus aggregation and still reach
     /// the wire body.
     #[test]
     fn failure_windows_survive_aggregation_before_serialization() {
-        // Node A: live failure, windows stamped at the collection point.
+        // Node A: live failure; the windows are stamped at the collection
+        // point (get_latest_replication_stats calls refresh_windows before
+        // the stats cross the wire), never on the failure hot path.
         let mut node_a = crate::admin::storage_api::replication::BucketReplicationStat::default();
         node_a.fail_stats.add_size(512, None::<&std::io::Error>);
+        node_a.fail_stats.refresh_windows();
         node_a.failed = node_a.fail_stats.to_metric();
 
         // Node A's stats cross the peer RPC wire: the samples are dropped,

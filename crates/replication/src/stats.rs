@@ -543,13 +543,14 @@ impl FailStats {
         self.size = self.size.saturating_add(size);
         self.recent.push_back(FailureSample { observed_at, size });
         self.prune(observed_at);
-        self.refresh_windows();
     }
 
     /// Recompute the serializable rolling-window snapshots from the local
-    /// samples. Only meaningful on the live per-node struct: a deserialized
-    /// or merged struct has no samples, and refreshing it would wipe the
-    /// aggregated windows.
+    /// samples. Called at the collection point (per-node stats snapshot),
+    /// never on the failure hot path — the two deque scans are O(window) and
+    /// `add_size` runs under the bucket-stats write lock. Only meaningful on
+    /// the live per-node struct: a deserialized or merged struct has no
+    /// samples, and refreshing it would wipe the aggregated windows.
     pub fn refresh_windows(&mut self) {
         self.last_minute = self.recent_since(Duration::from_secs(60));
         self.last_hour = self.recent_since(Duration::from_secs(3600));
@@ -664,7 +665,9 @@ impl BucketReplicationStat {
     }
 
     pub fn update_xfer_rate(&mut self, size: i64, duration: Duration) {
-        if size > 1024 * 1024 {
+        // Same boundary as the worker-pool split and minio-go's
+        // Large/Small transfer-summary labels: >= 128 MiB is "large".
+        if size >= crate::runtime::MIN_LARGE_OBJ_SIZE {
             self.xfer_rate_lrg.add_size(size, duration);
         } else {
             self.xfer_rate_sml.add_size(size, duration);
