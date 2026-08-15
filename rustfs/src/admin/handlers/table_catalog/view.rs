@@ -43,8 +43,9 @@ impl Operation for RestCreateViewHandler {
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let publication_backend = TableCommitObjectBackend::preauthorized(metadata_backend);
         let response =
-            create_view_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
+            create_view_response(&store, &publication_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -87,17 +88,20 @@ pub struct RestReplaceViewHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestReplaceViewHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let request = read_json_body::<RestCommitViewRequest>(req.input).await?;
+        let request = read_rest_commit_view_request(std::mem::take(&mut req.input)).await?;
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = replace_view_response(&store, &metadata_backend, &warehouse, &namespace, &view, request).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result = replace_view_response(&store, &commit_backend, &warehouse, &namespace, &view, request).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

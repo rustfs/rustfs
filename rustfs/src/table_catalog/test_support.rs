@@ -55,23 +55,35 @@ pub(crate) fn table_metadata_json(table_uuid: &str, location: &str) -> serde_jso
     })
 }
 
-pub(crate) fn manifest_list_avro_bytes(manifest_paths: &[&str], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
-    let manifests = manifest_paths
-        .iter()
-        .map(|manifest_path| (*manifest_path, 0, sequence_number, snapshot_id))
-        .collect::<Vec<_>>();
-    manifest_list_avro_entries_with_partition_specs(&manifests)
-}
-
-pub(crate) fn manifest_list_avro_entries(manifests: &[(&str, i64, i64)]) -> Vec<u8> {
+pub(crate) fn manifest_list_avro_bytes(manifests: &[(&str, usize)], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
     let manifests = manifests
         .iter()
-        .map(|(manifest_path, sequence_number, snapshot_id)| (*manifest_path, 0, *sequence_number, *snapshot_id))
+        .map(|(manifest_path, manifest_length)| (*manifest_path, *manifest_length, 0, sequence_number, snapshot_id))
         .collect::<Vec<_>>();
     manifest_list_avro_entries_with_partition_specs(&manifests)
 }
 
-pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, i32, i64, i64)]) -> Vec<u8> {
+pub(crate) fn manifest_list_avro_entries(manifests: &[(&str, usize, i64, i64)]) -> Vec<u8> {
+    let manifests = manifests
+        .iter()
+        .map(|(manifest_path, manifest_length, sequence_number, snapshot_id)| {
+            (*manifest_path, *manifest_length, 0, *sequence_number, *snapshot_id)
+        })
+        .collect::<Vec<_>>();
+    manifest_list_avro_entries_with_partition_specs(&manifests)
+}
+
+pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str, usize, i32, i64, i64)]) -> Vec<u8> {
+    let manifests = manifests
+        .iter()
+        .map(|(path, length, spec_id, sequence_number, snapshot_id)| {
+            (*path, *length, *spec_id, 0, *sequence_number, *snapshot_id)
+        })
+        .collect::<Vec<_>>();
+    manifest_list_avro_entries_with_content(&manifests)
+}
+
+pub(crate) fn manifest_list_avro_entries_with_content(manifests: &[(&str, usize, i32, i32, i64, i64)]) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -97,16 +109,19 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
     )
     .expect("manifest list avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
-    for (manifest_path, partition_spec_id, sequence_number, snapshot_id) in manifests {
+    for (manifest_path, manifest_length, partition_spec_id, content, sequence_number, snapshot_id) in manifests {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
                 (
                     "manifest_path".to_string(),
                     apache_avro::types::Value::String((*manifest_path).to_string()),
                 ),
-                ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
+                (
+                    "manifest_length".to_string(),
+                    apache_avro::types::Value::Long(i64::try_from(*manifest_length).expect("test manifest length should fit")),
+                ),
                 ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
-                ("content".to_string(), apache_avro::types::Value::Int(0)),
+                ("content".to_string(), apache_avro::types::Value::Int(*content)),
                 ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
                 ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
                 ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
@@ -122,7 +137,86 @@ pub(crate) fn manifest_list_avro_entries_with_partition_specs(manifests: &[(&str
     writer.into_inner().expect("manifest list avro bytes should flush")
 }
 
+pub(crate) fn manifest_list_avro_entries_with_nullable_counts(manifests: &[(&str, usize, i32, i64, i64)]) -> Vec<u8> {
+    let schema = apache_avro::Schema::parse_str(
+        r#"
+            {
+              "type": "record",
+              "name": "manifest_file",
+              "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": ["null", "int"], "default": null},
+                {"name": "existing_files_count", "type": ["null", "int"], "default": null},
+                {"name": "deleted_files_count", "type": ["null", "int"], "default": null},
+                {"name": "added_rows_count", "type": ["null", "long"], "default": null},
+                {"name": "existing_rows_count", "type": ["null", "long"], "default": null},
+                {"name": "deleted_rows_count", "type": ["null", "long"], "default": null}
+              ]
+            }
+            "#,
+    )
+    .expect("manifest list avro schema should parse");
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest list writer should initialize");
+    for (manifest_path, manifest_length, partition_spec_id, sequence_number, snapshot_id) in manifests {
+        writer
+            .append_value(apache_avro::types::Value::Record(vec![
+                (
+                    "manifest_path".to_string(),
+                    apache_avro::types::Value::String((*manifest_path).to_string()),
+                ),
+                (
+                    "manifest_length".to_string(),
+                    apache_avro::types::Value::Long(i64::try_from(*manifest_length).expect("test manifest length should fit")),
+                ),
+                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(*partition_spec_id)),
+                ("content".to_string(), apache_avro::types::Value::Int(0)),
+                ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                ("min_sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
+                (
+                    "added_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "existing_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "deleted_files_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "added_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "existing_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "deleted_rows_count".to_string(),
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+            ]))
+            .expect("manifest list record should append");
+    }
+    writer.into_inner().expect("manifest list avro bytes should flush")
+}
+
 pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u8> {
+    manifest_avro_bytes_with_partition_spec(files, None)
+}
+
+pub(crate) fn manifest_avro_bytes_with_partition_spec(
+    files: &[(&str, i32, i32, i64, i64)],
+    partition_spec_id: Option<i32>,
+) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
             {
@@ -141,6 +235,7 @@ pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"}
                     ]
@@ -152,6 +247,11 @@ pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u
     )
     .expect("manifest avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("manifest writer should initialize");
+    if let Some(partition_spec_id) = partition_spec_id {
+        writer
+            .add_user_metadata("partition-spec-id".to_string(), partition_spec_id.to_string())
+            .expect("manifest partition spec metadata should write");
+    }
     for (file_path, content, status, snapshot_id, sequence_number) in files {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
@@ -164,6 +264,7 @@ pub(crate) fn manifest_avro_bytes(files: &[(&str, i32, i32, i64, i64)]) -> Vec<u
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                     ]),
@@ -200,6 +301,7 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"}
                     ]
@@ -223,6 +325,7 @@ pub(crate) fn manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                     ]),
@@ -284,7 +387,7 @@ pub(crate) struct BlockingObjectPublication {
     backend: TestCatalogObjectBackend,
     object: String,
     started: Arc<tokio::sync::Notify>,
-    guard: Arc<parking_lot::Mutex<Option<Box<dyn Send>>>>,
+    guard: Arc<parking_lot::Mutex<Option<TableCatalogLockGuard>>>,
 }
 
 impl BlockingObjectPublication {
@@ -812,7 +915,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .collect())
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         self.lock_attempts.lock().await.push((bucket.to_string(), object.to_string()));
         {
             let mut state = self.state.lock().await;
@@ -828,10 +931,10 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
                 .clone()
         };
-        Ok(Box::new(lock.write_owned().await))
+        Ok(TableCatalogLockGuard::stable(lock.write_owned().await))
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         // The admin fake implemented only acquire_write_lock, so the trait's
         // default read->write delegation made read acquisitions observable in
         // lock_attempts as well; keep that (backlog#1837 PR2).
@@ -850,7 +953,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
                 .clone()
         };
-        Ok(Box::new(lock.read_owned().await))
+        Ok(TableCatalogLockGuard::stable(lock.read_owned().await))
     }
 }
 
@@ -1165,6 +1268,8 @@ pub(crate) struct TestTableCatalogStore {
     pub(crate) fail_put_table_bucket: tokio::sync::Mutex<bool>,
     pub(crate) register_table_pause: Option<TestCatalogPublishPause>,
     pub(crate) commit_table_pause: Option<TestCatalogPublishPause>,
+    pub(crate) create_view_pause: Option<TestCatalogPublishPause>,
+    pub(crate) replace_view_pause: Option<TestCatalogPublishPause>,
 }
 
 #[async_trait::async_trait]
@@ -1473,6 +1578,10 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
                 entry.table_bucket, entry.namespace
             )));
         }
+        if let Some(pause) = &self.create_view_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
         self.views.lock().await.push(entry);
         Ok(())
     }
@@ -1530,6 +1639,10 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
                 "current view metadata location does not match expected location".to_string(),
             ));
+        }
+        if let Some(pause) = &self.replace_view_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
         }
         let mut next = current;
         next.metadata_location = request.new_metadata_location;

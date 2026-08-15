@@ -1478,7 +1478,7 @@ async fn retain_table_data_plane_publication_guard<T>(
         .map_err(|err| s3_error!(InternalError, "failed to acquire table publication guard: {}", err))?;
     let mut state = retained.state.lock();
     state.keys.insert(key);
-    state.guards.push(guard);
+    state.guards.push(Box::new(guard));
     drop(state);
     req.extensions.insert(retained);
     Ok(())

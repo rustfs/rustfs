@@ -338,6 +338,107 @@ async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     assert_direct_commit_uses_publication_lock(&strong_store, &strong_backend).await;
 }
 
+#[derive(Default)]
+struct LosingTestPublication {
+    table_checks: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl TableCommitPublication for LosingTestPublication {
+    async fn begin_table_bucket(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    async fn prepare(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    fn holds_table_bucket(&self, _table_bucket: &str) -> bool {
+        true
+    }
+
+    fn holds_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
+        self.table_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    fn complete(&self) {}
+}
+
+async fn assert_view_replacement_rechecks_publication_fence<S>(store: &S, backend: &TestCatalogObjectBackend)
+where
+    S: TableCatalogStore,
+{
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+    let current_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+    let next_metadata = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+    store
+        .put_table_bucket(test_bucket_entry(bucket))
+        .await
+        .expect("table bucket should be created");
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .expect("namespace should be created");
+    store
+        .create_view(test_view_entry(bucket, &namespace, &view, current_metadata.clone()))
+        .await
+        .expect("view should be created");
+    backend
+        .seed_object(
+            bucket,
+            &next_metadata,
+            serde_json::to_vec(&serde_json::json!({
+                "format-version": 1,
+                "view-uuid": "view-uuid",
+                "location": format!("s3://{bucket}/views/view-id")
+            }))
+            .expect("view metadata should encode"),
+        )
+        .await;
+
+    let error = store
+        .replace_view_with_publication(
+            ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata.clone(),
+                new_metadata_location: next_metadata,
+            },
+            true,
+            &LosingTestPublication::default(),
+        )
+        .await
+        .expect_err("a lost publication fence must stop the view replacement");
+    assert_matches!(
+        error,
+        TableCatalogStoreError::Internal(message) if message.contains("publication fence was lost")
+    );
+
+    let loaded = store
+        .load_view(bucket, &namespace.public_name(), view.as_str())
+        .await
+        .expect("view lookup should succeed")
+        .expect("view should remain present");
+    assert_eq!(loaded.metadata_location, current_metadata);
+    assert_eq!(loaded.version_token, "token-v1");
+    assert_eq!(loaded.generation, 1);
+}
+
+#[tokio::test]
+async fn catalog_backings_stop_view_replacement_after_publication_fence_loss() {
+    let object_backend = TestCatalogObjectBackend::default();
+    let object_store = ObjectTableCatalogStore::new(object_backend.clone());
+    assert_view_replacement_rechecks_publication_fence(&object_store, &object_backend).await;
+
+    let strong_backend = TestCatalogObjectBackend::default();
+    let strong_store = StrongTableCatalogStore::new(strong_backend.clone());
+    assert_view_replacement_rechecks_publication_fence(&strong_store, &strong_backend).await;
+}
+
 #[tokio::test]
 async fn strong_table_registration_and_drop_acquire_publication_before_migration_read_lock() {
     let backend = TestCatalogObjectBackend::default();
@@ -795,17 +896,23 @@ async fn strong_catalog_view_replace_rejects_identity_recreation_during_metadata
     let replace_current_metadata = current_metadata.clone();
     let replace = tokio::spawn(async move {
         replace_store
-            .replace_view(ViewCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: replace_namespace.public_name(),
-                view: replace_view.as_str().to_string(),
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: replace_current_metadata,
-                new_metadata_location: new_metadata,
-            })
+            .replace_view_with_publication(
+                ViewCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: replace_namespace.public_name(),
+                    view: replace_view.as_str().to_string(),
+                    expected_version_token: "token-v1".to_string(),
+                    expected_metadata_location: replace_current_metadata,
+                    new_metadata_location: new_metadata,
+                },
+                false,
+                &UnserializedTestPublication,
+            )
             .await
     });
-    metadata_read.wait_started().await;
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, metadata_read.wait_started())
+        .await
+        .expect("the replacement should reach the paused metadata read");
 
     store
         .drop_view(bucket, &namespace.public_name(), view.as_str())
@@ -927,20 +1034,38 @@ fn object_cleanup_report<'a>(
         .expect("metadata maintenance object cleanup report should exist")
 }
 
-fn manifest_list_avro_bytes(manifest_paths: &[&str]) -> Vec<u8> {
-    manifest_list_avro_bytes_with_spec(manifest_paths, 0)
+fn manifest_list_avro_bytes(manifests: &[(&str, usize)]) -> Vec<u8> {
+    manifest_list_avro_bytes_with_spec(manifests, 0)
 }
 
-fn manifest_list_avro_bytes_with_spec(manifest_paths: &[&str], partition_spec_id: i32) -> Vec<u8> {
-    // Historical fixed values of this file's fixtures: sequence 7, snapshot 20.
-    let manifests = manifest_paths
+fn manifest_list_avro_bytes_with_spec(manifests: &[(&str, usize)], partition_spec_id: i32) -> Vec<u8> {
+    manifest_list_avro_bytes_with_spec_and_content(manifests, partition_spec_id, 0)
+}
+
+fn manifest_list_avro_bytes_with_spec_and_content(manifests: &[(&str, usize)], partition_spec_id: i32, content: i32) -> Vec<u8> {
+    let manifests = manifests
         .iter()
-        .map(|path| (*path, partition_spec_id, 7_i64, 20_i64))
+        .map(|(path, length)| (*path, *length, partition_spec_id, content, 7_i64, 20_i64))
         .collect::<Vec<_>>();
-    crate::table_catalog::test_support::manifest_list_avro_entries_with_partition_specs(&manifests)
+    crate::table_catalog::test_support::manifest_list_avro_entries_with_content(&manifests)
 }
 
-fn v1_manifest_list_avro_bytes(manifest_path: &str) -> Vec<u8> {
+fn manifest_list_avro_bytes_with_spec_and_null_counts(
+    manifests: &[(&str, usize)],
+    partition_spec_id: i32,
+    null_counts: bool,
+) -> Vec<u8> {
+    if !null_counts {
+        return manifest_list_avro_bytes_with_spec(manifests, partition_spec_id);
+    }
+    let manifests = manifests
+        .iter()
+        .map(|(path, length)| (*path, *length, partition_spec_id, 7_i64, 20_i64))
+        .collect::<Vec<_>>();
+    crate::table_catalog::test_support::manifest_list_avro_entries_with_nullable_counts(&manifests)
+}
+
+fn v1_manifest_list_avro_bytes(manifest_path: &str, manifest_length: usize) -> Vec<u8> {
     let schema = apache_avro::Schema::parse_str(
         r#"
         {
@@ -960,7 +1085,10 @@ fn v1_manifest_list_avro_bytes(manifest_path: &str) -> Vec<u8> {
     writer
         .append_value(apache_avro::types::Value::Record(vec![
             ("manifest_path".to_string(), apache_avro::types::Value::String(manifest_path.to_string())),
-            ("manifest_length".to_string(), apache_avro::types::Value::Long(1)),
+            (
+                "manifest_length".to_string(),
+                apache_avro::types::Value::Long(i64::try_from(manifest_length).expect("test manifest length should fit")),
+            ),
             ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
             ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(10)),
         ]))
@@ -997,6 +1125,9 @@ fn v1_manifest_avro_bytes(data_file_path: &str) -> Vec<u8> {
     )
     .expect("v1 manifest schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("v1 manifest writer should initialize");
+    writer
+        .add_user_metadata("partition-spec-id".to_string(), "0")
+        .expect("v1 manifest partition spec metadata should write");
     writer
         .append_value(apache_avro::types::Value::Record(vec![
             ("status".to_string(), apache_avro::types::Value::Int(1)),
@@ -1059,13 +1190,31 @@ fn iceberg_metadata_validation_accepts_complete_v1_and_v2_shapes() {
             "schema-id": 0,
             "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
         },
-        "partition-spec": [],
+        "partition-spec": [{"source-id": 1, "name": "id", "transform": "identity"}],
         "properties": {},
         "snapshots": [],
         "snapshot-log": [],
         "metadata-log": []
     });
     validate_supported_table_metadata(&v1).expect("complete Iceberg v1 metadata should validate");
+
+    let mut v1_retired_partition_source = v1.clone();
+    v1_retired_partition_source["schemas"] = serde_json::json!([
+        {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        {"type": "struct", "schema-id": 1, "fields": []}
+    ]);
+    v1_retired_partition_source["current-schema-id"] = serde_json::Value::from(1);
+    v1_retired_partition_source["schema"] = serde_json::json!({"type": "struct", "schema-id": 1, "fields": []});
+    validate_supported_table_metadata(&v1_retired_partition_source)
+        .expect_err("the v1 partition spec must bind to the current schema rather than a historical schema");
+
+    let mut negative_v1_schema_id = v1;
+    negative_v1_schema_id["schema"]["schema-id"] = serde_json::Value::from(-1);
+    validate_supported_table_metadata(&negative_v1_schema_id).expect_err("Iceberg v1 schema IDs must not be negative");
 }
 
 #[test]
@@ -1100,6 +1249,529 @@ fn iceberg_metadata_validation_rejects_incomplete_v2_and_dangling_references() {
 }
 
 #[test]
+fn iceberg_metadata_validation_rejects_invalid_primitive_types_and_field_ids() {
+    let metadata = table_metadata_json_for_validation();
+    for invalid_type in [
+        "banana",
+        "decimal(0,0)",
+        "decimal(10,11)",
+        "fixed[0]",
+        "fixed[2147483648]",
+        "decimal(10)",
+    ] {
+        let mut invalid = metadata.clone();
+        invalid["schemas"][0]["fields"][0]["type"] = serde_json::Value::from(invalid_type);
+        validate_supported_table_metadata(&invalid).expect_err("invalid Iceberg primitive types must be rejected");
+    }
+    for valid_type in [
+        "decimal(38,38)",
+        "decimal(9, 2)",
+        "decimal( 9 , 2 )",
+        "fixed[16]",
+        "fixed[ 16 ]",
+        "timestamptz",
+        "uuid",
+    ] {
+        let mut valid = metadata.clone();
+        valid["schemas"][0]["fields"][0]["type"] = serde_json::Value::from(valid_type);
+        validate_supported_table_metadata(&valid).expect("standard Iceberg primitive types should validate");
+    }
+    for invalid_id in [0, -1] {
+        let mut invalid = metadata.clone();
+        invalid["schemas"][0]["fields"][0]["id"] = serde_json::Value::from(invalid_id);
+        validate_supported_table_metadata(&invalid).expect_err("Iceberg field IDs must be positive");
+    }
+    let mut reserved_id = metadata;
+    reserved_id["schemas"][0]["fields"][0]["id"] = serde_json::Value::from(2_147_483_448_i64);
+    validate_supported_table_metadata(&reserved_id).expect_err("reserved Iceberg metadata field IDs must be rejected");
+
+    let mut negative_schema_id = table_metadata_json_for_validation();
+    negative_schema_id["schemas"][0]["schema-id"] = serde_json::Value::from(-1);
+    negative_schema_id["current-schema-id"] = serde_json::Value::from(-1);
+    validate_supported_table_metadata(&negative_schema_id).expect_err("Iceberg schema IDs must not be negative");
+
+    let mut negative_last_partition_id = table_metadata_json_for_validation();
+    negative_last_partition_id["last-partition-id"] = serde_json::Value::from(-1);
+    validate_supported_table_metadata(&negative_last_partition_id).expect_err("Iceberg last-partition-id must not be negative");
+}
+
+#[test]
+fn iceberg_metadata_validation_enforces_schema_evolution() {
+    let mut promoted = table_metadata_json_for_validation();
+    promoted["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("int");
+    promoted["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        }));
+    promoted["current-schema-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&promoted).expect("int fields may promote to long");
+
+    let mut decimal_promotion = table_metadata_json_for_validation();
+    decimal_promotion["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("decimal(9, 2)");
+    decimal_promotion["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "decimal( 10 , 2 )"}]
+        }));
+    decimal_promotion["current-schema-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&decimal_promotion)
+        .expect("decimal precision promotion must accept optional parameter whitespace");
+
+    let mut incompatible = promoted;
+    incompatible["schemas"][1]["fields"][0]["type"] = serde_json::Value::from("string");
+    let error = validate_supported_table_metadata(&incompatible).expect_err("field IDs must retain compatible types");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("schema field 1 has an incompatible type evolution".to_string())
+    );
+
+    let mut moved_into_collection = table_metadata_json_for_validation();
+    moved_into_collection["last-column-id"] = serde_json::Value::from(2);
+    moved_into_collection["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [{
+                "id": 2,
+                "name": "items",
+                "required": true,
+                "type": {
+                    "type": "list",
+                    "element-id": 1,
+                    "element-required": true,
+                    "element": "long"
+                }
+            }]
+        }));
+    moved_into_collection["current-schema-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&moved_into_collection).expect_err("a schema field ID must not move into a list or map");
+
+    let mut reused = table_metadata_json_for_validation();
+    reused["schemas"] = serde_json::json!([
+        {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        {"type": "struct", "schema-id": 1, "fields": []},
+        {
+            "type": "struct",
+            "schema-id": 2,
+            "fields": [{"id": 1, "name": "replacement", "required": true, "type": "long"}]
+        }
+    ]);
+    reused["current-schema-id"] = serde_json::Value::from(2);
+    let error = validate_supported_table_metadata(&reused).expect_err("removed Iceberg field IDs must never be reused");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("schema field 1 cannot be reused after removal".to_string())
+    );
+
+    let mut stale_last_column_id = table_metadata_json_for_validation();
+    stale_last_column_id["last-column-id"] = serde_json::Value::from(0);
+    let error = validate_supported_table_metadata(&stale_last_column_id)
+        .expect_err("last-column-id must cover nested and top-level assigned field IDs");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid(
+            "last-column-id must be non-negative and cover every assigned schema field id".to_string()
+        )
+    );
+}
+
+#[test]
+fn iceberg_metadata_transition_preserves_assignment_watermarks_and_schema_history() {
+    let current = table_metadata_json_for_validation();
+
+    let mut lower_column_watermark = current.clone();
+    lower_column_watermark["last-column-id"] = serde_json::Value::from(0);
+    let error = validate_table_metadata_transition(&current, &lower_column_watermark)
+        .expect_err("last-column-id must not decrease across commits");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("last-column-id must not decrease across table metadata commits".to_string())
+    );
+
+    let mut lower_partition_watermark = current.clone();
+    lower_partition_watermark["last-partition-id"] = serde_json::Value::from(998);
+    let error = validate_table_metadata_transition(&current, &lower_partition_watermark)
+        .expect_err("last-partition-id must not decrease across commits");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("last-partition-id must not decrease across table metadata commits".to_string())
+    );
+
+    let mut current_sequence = current.clone();
+    current_sequence["last-sequence-number"] = serde_json::Value::from(2);
+    let mut lower_sequence_watermark = current_sequence.clone();
+    lower_sequence_watermark["last-sequence-number"] = serde_json::Value::from(1);
+    let error = validate_table_metadata_transition(&current_sequence, &lower_sequence_watermark)
+        .expect_err("last-sequence-number must not decrease across commits");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("last-sequence-number must not decrease across table metadata commits".to_string())
+    );
+
+    let mut current_partitioned = current.clone();
+    current_partitioned["partition-specs"] = serde_json::json!([{
+        "spec-id": 0,
+        "fields": [{
+            "source-id": 1,
+            "field-id": 1000,
+            "name": "id",
+            "transform": "identity"
+        }]
+    }]);
+    current_partitioned["last-partition-id"] = serde_json::Value::from(1000);
+    let mut modified_partition = current_partitioned.clone();
+    modified_partition["partition-specs"][0]["fields"][0]["name"] = serde_json::Value::from("renamed_id");
+    let error = validate_table_metadata_transition(&current_partitioned, &modified_partition)
+        .expect_err("published partition specs must be immutable");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("existing partition spec 0 must not be modified".to_string())
+    );
+
+    let mut current_sorted = current.clone();
+    current_sorted["sort-orders"] = serde_json::json!([
+        {"order-id": 0, "fields": []},
+        {
+            "order-id": 1,
+            "fields": [{
+                "source-id": 1,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    ]);
+    current_sorted["default-sort-order-id"] = serde_json::Value::from(1);
+    let mut modified_sort = current_sorted.clone();
+    modified_sort["sort-orders"][1]["fields"][0]["direction"] = serde_json::Value::from("desc");
+    let error =
+        validate_table_metadata_transition(&current_sorted, &modified_sort).expect_err("published sort orders must be immutable");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("existing sort order 1 must not be modified".to_string())
+    );
+
+    let mut current_with_snapshot = current.clone();
+    current_with_snapshot["last-sequence-number"] = serde_json::Value::from(1);
+    current_with_snapshot["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    let mut modified_snapshot = current_with_snapshot.clone();
+    modified_snapshot["snapshots"][0]["timestamp-ms"] = serde_json::Value::from(2);
+    let error = validate_table_metadata_transition(&current_with_snapshot, &modified_snapshot)
+        .expect_err("published snapshots must be immutable");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("existing snapshot 10 must not be modified".to_string())
+    );
+
+    let mut modified_history = current.clone();
+    modified_history["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("string");
+    let error = validate_table_metadata_transition(&current, &modified_history)
+        .expect_err("published schema definitions must be immutable");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("existing schema 0 must not be modified".to_string())
+    );
+
+    let mut current_with_retired_id = current.clone();
+    current_with_retired_id["schemas"] = serde_json::json!([
+        {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        {"type": "struct", "schema-id": 1, "fields": []}
+    ]);
+    current_with_retired_id["current-schema-id"] = serde_json::Value::from(1);
+    let mut reused_id = current_with_retired_id.clone();
+    reused_id["schemas"] = serde_json::json!([
+        {"type": "struct", "schema-id": 1, "fields": []},
+        {
+            "type": "struct",
+            "schema-id": 2,
+            "fields": [{"id": 1, "name": "replacement", "required": true, "type": "long"}]
+        }
+    ]);
+    reused_id["current-schema-id"] = serde_json::Value::from(2);
+    let error = validate_table_metadata_transition(&current_with_retired_id, &reused_id)
+        .expect_err("new schemas must not reuse a previously assigned field ID");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("schema field 1 cannot reuse a previously assigned field id".to_string())
+    );
+
+    let mut valid = current.clone();
+    valid["last-column-id"] = serde_json::Value::from(2);
+    valid["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {"id": 1, "name": "renamed_id", "required": true, "type": "long"},
+                {"id": 2, "name": "value", "required": false, "type": "string"}
+            ]
+        }));
+    valid["current-schema-id"] = serde_json::Value::from(1);
+    validate_table_metadata_transition(&current, &valid)
+        .expect("renaming an existing field and allocating a new field ID must remain valid");
+}
+
+#[test]
+fn iceberg_metadata_validation_enforces_identifier_field_contracts() {
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-column-id"] = serde_json::Value::from(10);
+    metadata["schemas"][0]["fields"] = serde_json::json!([
+        {"id": 1, "name": "id", "required": true, "type": "long"},
+        {"id": 2, "name": "optional_id", "required": false, "type": "string"},
+        {"id": 3, "name": "float_id", "required": true, "type": "float"},
+        {
+            "id": 4,
+            "name": "required_parent",
+            "required": true,
+            "type": {
+                "type": "struct",
+                "fields": [{"id": 5, "name": "nested_id", "required": true, "type": "string"}]
+            }
+        },
+        {
+            "id": 6,
+            "name": "optional_parent",
+            "required": false,
+            "type": {
+                "type": "struct",
+                "fields": [{"id": 7, "name": "nested_id", "required": true, "type": "long"}]
+            }
+        },
+        {
+            "id": 8,
+            "name": "ids",
+            "required": true,
+            "type": {"type": "list", "element-id": 9, "element-required": true, "element": "long"}
+        }
+    ]);
+    metadata["schemas"][0]["identifier-field-ids"] = serde_json::json!([1, 5]);
+    validate_supported_table_metadata(&metadata).expect("required primitive fields in required structs may identify rows");
+
+    for invalid_id in [2, 3, 4, 7, 9] {
+        let mut invalid = metadata.clone();
+        invalid["schemas"][0]["identifier-field-ids"] = serde_json::json!([invalid_id]);
+        validate_supported_table_metadata(&invalid)
+            .expect_err("optional, floating, complex, collection, and optional-parent fields must not identify rows");
+    }
+}
+
+#[test]
+fn iceberg_metadata_validation_binds_partition_fields_to_schema_and_field_identity() {
+    let mut missing_source = table_metadata_json_for_validation();
+    missing_source["partition-specs"] = serde_json::json!([{
+        "spec-id": 0,
+        "fields": [{"source-id": 99, "field-id": 1000, "name": "missing", "transform": "identity"}]
+    }]);
+    missing_source["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&missing_source).expect_err("partition source IDs must reference schema fields");
+
+    let mut reassigned = table_metadata_json_for_validation();
+    reassigned["last-column-id"] = serde_json::Value::from(2);
+    reassigned["schemas"][0]["fields"] = serde_json::json!([
+        {"id": 1, "name": "id", "required": true, "type": "long"},
+        {"id": 2, "name": "category", "required": false, "type": "string"}
+    ]);
+    reassigned["partition-specs"] = serde_json::json!([
+        {
+            "spec-id": 0,
+            "fields": [{"source-id": 1, "field-id": 1000, "name": "id", "transform": "identity"}]
+        },
+        {
+            "spec-id": 1,
+            "fields": [{"source-id": 2, "field-id": 1000, "name": "category", "transform": "identity"}]
+        }
+    ]);
+    reassigned["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&reassigned)
+        .expect_err("a partition field ID must not be reassigned to a different source or transform");
+
+    reassigned["partition-specs"][1]["fields"][0] =
+        serde_json::json!({"source-id": 1, "field-id": 1000, "name": "renamed_id", "transform": "identity"});
+    validate_supported_table_metadata(&reassigned)
+        .expect("a historical partition field may retain its ID when only its name changes");
+
+    let mut v1_missing_source = serde_json::json!({
+        "format-version": 1,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id",
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {
+            "type": "struct",
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        },
+        "partition-spec": [{"source-id": 2, "name": "missing", "transform": "identity"}]
+    });
+    validate_supported_table_metadata(&v1_missing_source)
+        .expect_err("Iceberg v1 partition source IDs must reference schema fields");
+    v1_missing_source["partition-spec"][0]["source-id"] = serde_json::Value::from(1);
+    v1_missing_source["partition-spec"][0]["field-id"] = serde_json::Value::from(1001);
+    validate_supported_table_metadata(&v1_missing_source)
+        .expect_err("explicit Iceberg v1 partition field IDs must retain sequential compatibility IDs");
+
+    let mut nested_source = table_metadata_json_for_validation();
+    nested_source["last-column-id"] = serde_json::Value::from(4);
+    nested_source["schemas"][0]["fields"] = serde_json::json!([
+        {
+            "id": 1,
+            "name": "payload",
+            "required": true,
+            "type": {
+                "type": "struct",
+                "fields": [{"id": 2, "name": "event_date", "required": true, "type": "date"}]
+            }
+        },
+        {
+            "id": 3,
+            "name": "dates",
+            "required": true,
+            "type": {"type": "list", "element-id": 4, "element-required": true, "element": "date"}
+        }
+    ]);
+    nested_source["partition-specs"] = serde_json::json!([{
+        "spec-id": 0,
+        "fields": [{"source-id": 2, "field-id": 1000, "name": "event_day", "transform": "day"}]
+    }]);
+    nested_source["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&nested_source).expect("a primitive nested in a struct may be a partition source");
+
+    nested_source["partition-specs"][0]["fields"][0]["source-id"] = serde_json::Value::from(4);
+    validate_supported_table_metadata(&nested_source).expect_err("a primitive nested in a list must not be a partition source");
+}
+
+#[test]
+fn iceberg_metadata_validation_binds_defaults_to_current_schema() {
+    let mut partitioned = table_metadata_json_for_validation();
+    partitioned["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({"type": "struct", "schema-id": 1, "fields": []}));
+    partitioned["current-schema-id"] = serde_json::Value::from(1);
+    partitioned["partition-specs"] = serde_json::json!([
+        {"spec-id": 0, "fields": []},
+        {
+            "spec-id": 1,
+            "fields": [{"source-id": 1, "field-id": 1000, "name": "id", "transform": "identity"}]
+        }
+    ]);
+    partitioned["default-spec-id"] = serde_json::Value::from(1);
+    partitioned["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&partitioned).expect_err("the default partition spec must bind to the current schema");
+    partitioned["partition-specs"][1]["fields"][0]["transform"] = serde_json::Value::from("void");
+    validate_supported_table_metadata(&partitioned)
+        .expect("a void partition field may retain a source removed from the current schema");
+    partitioned["partition-specs"][1]["fields"][0]["transform"] = serde_json::Value::from("identity");
+    partitioned["default-spec-id"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&partitioned)
+        .expect("a non-default historical partition spec may retain a source removed from the current schema");
+
+    let mut sorted = table_metadata_json_for_validation();
+    sorted["schemas"]
+        .as_array_mut()
+        .expect("schemas should be an array")
+        .push(serde_json::json!({"type": "struct", "schema-id": 1, "fields": []}));
+    sorted["current-schema-id"] = serde_json::Value::from(1);
+    sorted["sort-orders"] = serde_json::json!([
+        {"order-id": 0, "fields": []},
+        {
+            "order-id": 1,
+            "fields": [{
+                "source-id": 1,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    ]);
+    sorted["default-sort-order-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&sorted).expect_err("the default sort order must bind to the current schema");
+    sorted["default-sort-order-id"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&sorted)
+        .expect("a non-default historical sort order may retain a source removed from the current schema");
+}
+
+#[test]
+fn iceberg_metadata_validation_binds_transforms_to_source_types() {
+    let mut valid = table_metadata_json_for_validation();
+    valid["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("date");
+    valid["partition-specs"] = serde_json::json!([{
+        "spec-id": 0,
+        "fields": [{"source-id": 1, "field-id": 1000, "name": "day", "transform": "day"}]
+    }]);
+    valid["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&valid).expect("day transforms may bind to date fields");
+
+    let mut invalid_source = valid;
+    invalid_source["schemas"][0]["fields"][0]["type"] = serde_json::Value::from("string");
+    validate_supported_table_metadata(&invalid_source).expect_err("day transforms must reject string fields");
+
+    let mut invalid_width = table_metadata_json_for_validation();
+    invalid_width["partition-specs"] = serde_json::json!([{
+        "spec-id": 0,
+        "fields": [{"source-id": 1, "field-id": 1000, "name": "bucket", "transform": "bucket[0]"}]
+    }]);
+    invalid_width["last-partition-id"] = serde_json::Value::from(1000);
+    validate_supported_table_metadata(&invalid_width).expect_err("bucket widths must be positive");
+}
+
+#[test]
+fn iceberg_metadata_validation_enforces_sort_order_fields() {
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["sort-orders"] = serde_json::json!([{
+        "order-id": 1,
+        "fields": [{
+            "source-id": 1,
+            "transform": "identity",
+            "direction": "asc",
+            "null-order": "nulls-first"
+        }]
+    }]);
+    metadata["default-sort-order-id"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&metadata).expect("complete sort order fields should validate");
+
+    for (field, invalid_value) in [
+        ("source-id", serde_json::Value::from(99)),
+        ("transform", serde_json::Value::from("")),
+        ("direction", serde_json::Value::from("ascending")),
+        ("null-order", serde_json::Value::from("first")),
+    ] {
+        let mut invalid = metadata.clone();
+        invalid["sort-orders"][0]["fields"][0][field] = invalid_value;
+        validate_supported_table_metadata(&invalid).expect_err("invalid Iceberg sort fields must be rejected");
+    }
+
+    let mut reserved_unsorted = metadata;
+    reserved_unsorted["sort-orders"][0]["order-id"] = serde_json::Value::from(0);
+    reserved_unsorted["default-sort-order-id"] = serde_json::Value::from(0);
+    validate_supported_table_metadata(&reserved_unsorted).expect_err("sort order 0 must remain unsorted");
+}
+
+#[test]
 fn iceberg_metadata_validation_enforces_snapshot_and_ref_contracts() {
     let mut metadata = table_metadata_json_for_validation();
     metadata["last-sequence-number"] = serde_json::Value::from(1);
@@ -1122,12 +1794,24 @@ fn iceberg_metadata_validation_enforces_snapshot_and_ref_contracts() {
     empty_operation["snapshots"][0]["summary"]["operation"] = serde_json::Value::from("");
     validate_supported_table_metadata(&empty_operation).expect_err("snapshot operation must not be empty");
 
+    let mut non_string_summary = metadata.clone();
+    non_string_summary["snapshots"][0]["summary"]["added-records"] = serde_json::Value::from(1);
+    validate_supported_table_metadata(&non_string_summary).expect_err("snapshot summary values must be strings");
+
     let mut missing_timestamp = metadata.clone();
     missing_timestamp["snapshots"][0]
         .as_object_mut()
         .expect("snapshot should be an object")
         .remove("timestamp-ms");
     validate_supported_table_metadata(&missing_timestamp).expect_err("snapshot timestamp must be required");
+
+    let mut malformed_snapshot_log = metadata.clone();
+    malformed_snapshot_log["snapshot-log"] = serde_json::json!([{"timestamp-ms": 1, "snapshot-id": "10"}]);
+    validate_supported_table_metadata(&malformed_snapshot_log).expect_err("snapshot log entries must use integer snapshot IDs");
+
+    let mut malformed_metadata_log = metadata.clone();
+    malformed_metadata_log["metadata-log"] = serde_json::json!([{"timestamp-ms": 1, "metadata-file": ""}]);
+    validate_supported_table_metadata(&malformed_metadata_log).expect_err("metadata log entries must identify a metadata file");
 
     let mut mismatched_main = metadata.clone();
     mismatched_main["snapshots"]
@@ -1153,6 +1837,309 @@ fn iceberg_metadata_validation_enforces_snapshot_and_ref_contracts() {
 }
 
 #[test]
+fn iceberg_metadata_validation_rejects_duplicate_snapshot_statistics() {
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(1);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    let statistics = serde_json::json!({
+        "snapshot-id": 10,
+        "statistics-path": "s3://warehouse/tables/table-id/metadata/stats.puffin",
+        "file-size-in-bytes": 1,
+        "file-footer-size-in-bytes": 0,
+        "blob-metadata": []
+    });
+    metadata["statistics"] = serde_json::json!([statistics.clone(), statistics]);
+
+    let error = validate_supported_table_metadata(&metadata).expect_err("a snapshot must not have duplicate statistics entries");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("statistics contains duplicate entries for snapshot 10".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_bounds_changed_statistics_object_fanout() {
+    let backend = TestCatalogObjectBackend::default();
+    let mut metadata = table_metadata_json_for_validation();
+    let object_count = TABLE_COMMIT_MAX_STATISTICS_OBJECTS + 1;
+    metadata["last-sequence-number"] = serde_json::Value::from(object_count);
+    metadata["snapshots"] = serde_json::Value::Array(
+        (1..=object_count)
+            .map(|snapshot_id| {
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "sequence-number": snapshot_id,
+                    "timestamp-ms": snapshot_id,
+                    "manifest-list": format!("s3://warehouse/tables/table-id/metadata/snap-{snapshot_id}.avro"),
+                    "summary": {"operation": "append"}
+                })
+            })
+            .collect(),
+    );
+    metadata["partition-statistics"] = serde_json::Value::Array(
+        (1..=object_count)
+            .map(|snapshot_id| {
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "statistics-path": format!(
+                        "s3://warehouse/tables/table-id/metadata/partition-stats-{snapshot_id}.parquet"
+                    ),
+                    "file-size-in-bytes": 1
+                })
+            })
+            .collect(),
+    );
+    let entry = TableEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: "warehouse".to_string(),
+        namespace: "analytics".to_string(),
+        table: "events".to_string(),
+        table_id: "table-id".to_string(),
+        table_uuid: "table-uuid".to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+        metadata_location: "metadata/00001.metadata.json".to_string(),
+        version_token: "token-v1".to_string(),
+        generation: 1,
+        state: TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    };
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("statistics object fanout must be bounded before storage lookups");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("statistics object count exceeds the commit limit".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_bounds_changed_statistics_object_bytes() {
+    let backend = TestCatalogObjectBackend::default();
+    let mut metadata = table_metadata_json_for_validation();
+    let object_count = TABLE_COMMIT_MAX_STATISTICS_BYTES / TABLE_STATISTICS_FILE_MAX_SIZE + 1;
+    metadata["last-sequence-number"] = serde_json::Value::from(object_count);
+    metadata["snapshots"] = serde_json::Value::Array(
+        (1..=object_count)
+            .map(|snapshot_id| {
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "sequence-number": snapshot_id,
+                    "timestamp-ms": snapshot_id,
+                    "manifest-list": format!("s3://warehouse/tables/table-id/metadata/snap-{snapshot_id}.avro"),
+                    "summary": {"operation": "append"}
+                })
+            })
+            .collect(),
+    );
+    metadata["partition-statistics"] = serde_json::Value::Array(
+        (1..=object_count)
+            .map(|snapshot_id| {
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "statistics-path": format!(
+                        "s3://warehouse/tables/table-id/metadata/partition-stats-{snapshot_id}.parquet"
+                    ),
+                    "file-size-in-bytes": TABLE_STATISTICS_FILE_MAX_SIZE
+                })
+            })
+            .collect(),
+    );
+    let entry = TableEntry {
+        version: TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: "warehouse".to_string(),
+        namespace: "analytics".to_string(),
+        table: "events".to_string(),
+        table_id: "table-id".to_string(),
+        table_uuid: "table-uuid".to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+        metadata_location: "metadata/00001.metadata.json".to_string(),
+        version_token: "token-v1".to_string(),
+        generation: 1,
+        state: TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    };
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("statistics bytes must be bounded before storage lookups");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("statistics bytes exceed the commit validation limit".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_rechecks_retained_statistics_locations() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let mut current = table_metadata_json_for_validation();
+    current["last-sequence-number"] = serde_json::Value::from(1);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/missing-history.avro",
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    current["statistics"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "statistics-path": "s3://warehouse/tables/another-table/metadata/stats.puffin",
+        "file-size-in-bytes": 1,
+        "file-footer-size-in-bytes": 0,
+        "blob-metadata": []
+    }]);
+    let target = current.clone();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect_err("retained statistics must remain inside the table warehouse");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("statistics object is outside the table warehouse".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_rejects_non_puffin_table_statistics() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let mut current = table_metadata_json_for_validation();
+    current["last-sequence-number"] = serde_json::Value::from(1);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut target = current.clone();
+    let statistics = b"notpuffin".to_vec();
+    target["statistics"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "statistics-path": "s3://warehouse/tables/table-id/metadata/stats.puffin",
+        "file-size-in-bytes": statistics.len(),
+        "file-footer-size-in-bytes": 0,
+        "blob-metadata": []
+    }]);
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/stats.puffin", statistics)
+        .await;
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect_err("table statistics must be a Puffin file");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("table statistics object is not a Puffin file".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_rejects_non_parquet_partition_statistics() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let mut current = table_metadata_json_for_validation();
+    current["last-sequence-number"] = serde_json::Value::from(1);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut target = current.clone();
+    let statistics = b"notparquet".to_vec();
+    target["partition-statistics"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "statistics-path": "s3://warehouse/tables/table-id/metadata/partition-stats.parquet",
+        "file-size-in-bytes": statistics.len()
+    }]);
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/partition-stats.parquet", statistics)
+        .await;
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect_err("partition statistics must be a Parquet file");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("partition statistics object is not a Parquet file".to_string())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_validation_rejects_statistics_size_mismatch() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let mut current = table_metadata_json_for_validation();
+    current["last-sequence-number"] = serde_json::Value::from(1);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut target = current.clone();
+    let statistics = b"PFA1PFA1".to_vec();
+    target["statistics"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "statistics-path": "s3://warehouse/tables/table-id/metadata/stats.puffin",
+        "file-size-in-bytes": statistics.len() + 1,
+        "file-footer-size-in-bytes": 0,
+        "blob-metadata": []
+    }]);
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/stats.puffin", statistics)
+        .await;
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect_err("statistics lengths must match the published object");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("statistics file-size-in-bytes does not match the object".to_string())
+    );
+}
+
+#[test]
 fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
     let mut v2 = table_metadata_json_for_validation();
     v2["last-sequence-number"] = serde_json::Value::from(1);
@@ -1169,6 +2156,16 @@ fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
         TableCatalogStoreError::Invalid(
             "Iceberg v2 snapshot sequence-number must be between zero and last-sequence-number".to_string()
         )
+    );
+    v2["last-sequence-number"] = serde_json::Value::from(0);
+    v2["snapshots"][0]
+        .as_object_mut()
+        .expect("snapshot should be an object")
+        .remove("sequence-number");
+    let error = validate_supported_table_metadata(&v2).expect_err("Iceberg v2 snapshots must include sequence-number");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("Iceberg v2 snapshot sequence-number is required".to_string())
     );
 
     let mut v1 = serde_json::json!({
@@ -1193,6 +2190,11 @@ fn iceberg_metadata_validation_bounds_snapshot_sequence_numbers() {
     );
     v1["snapshots"][0]["sequence-number"] = serde_json::Value::from(0);
     validate_supported_table_metadata(&v1).expect("a zero v1 compatibility sequence should validate");
+    v1["snapshots"][0]
+        .as_object_mut()
+        .expect("snapshot should be an object")
+        .remove("sequence-number");
+    validate_supported_table_metadata(&v1).expect("Iceberg v1 snapshots may omit sequence-number");
 }
 
 #[test]
@@ -1261,7 +2263,7 @@ fn iceberg_metadata_version_synchronization_builds_complete_v2_shape() {
 }
 
 #[test]
-fn iceberg_manifest_validation_accepts_deflate_and_rejects_unknown_content() {
+fn iceberg_manifest_validation_accepts_standard_codecs_and_rejects_unknown_content() {
     let schema = apache_avro::Schema::parse_str(
         r#"
         {
@@ -1275,22 +2277,29 @@ fn iceberg_manifest_validation_accepts_deflate_and_rejects_unknown_content() {
         "#,
     )
     .expect("manifest list schema should parse");
-    let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), apache_avro::Codec::Deflate(Default::default()))
-        .expect("compressed manifest list writer should initialize");
-    writer
-        .append_value(apache_avro::types::Value::Record(vec![
-            (
-                "manifest_path".to_string(),
-                apache_avro::types::Value::String("s3://warehouse/tables/table-id/metadata/manifest.avro".to_string()),
-            ),
-            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
-        ]))
-        .expect("compressed manifest list record should append");
-    let compressed = writer.into_inner().expect("compressed manifest list should flush");
-    let references = manifest_list_references_from_manifest_list_avro(&compressed)
-        .expect("deflate-compressed manifest lists should be supported with bounded decoding");
-    assert_eq!(references.len(), 1);
-    assert_eq!(references[0].manifest_path, "s3://warehouse/tables/table-id/metadata/manifest.avro");
+    for (label, codec) in [
+        ("null", apache_avro::Codec::Null),
+        ("deflate", apache_avro::Codec::Deflate(Default::default())),
+        ("snappy", apache_avro::Codec::Snappy),
+        ("zstandard", apache_avro::Codec::Zstandard(Default::default())),
+    ] {
+        let mut writer = apache_avro::Writer::with_codec(&schema, Vec::new(), codec)
+            .expect("compressed manifest list writer should initialize");
+        writer
+            .append_value(apache_avro::types::Value::Record(vec![
+                (
+                    "manifest_path".to_string(),
+                    apache_avro::types::Value::String("s3://warehouse/tables/table-id/metadata/manifest.avro".to_string()),
+                ),
+                ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+            ]))
+            .expect("compressed manifest list record should append");
+        let compressed = writer.into_inner().expect("compressed manifest list should flush");
+        let references = manifest_list_references_from_manifest_list_avro(&compressed)
+            .unwrap_or_else(|error| panic!("{label}-compressed manifest lists should be supported: {error}"));
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].manifest_path, "s3://warehouse/tables/table-id/metadata/manifest.avro");
+    }
 
     let unknown_content = manifest_avro_bytes_with_status(&[("s3://warehouse/tables/table-id/data/part.parquet", 3, 1)]);
     let error = data_file_references_from_manifest_avro(&unknown_content)
@@ -1366,7 +2375,7 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/snap-10.avro",
-            manifest_list_avro_bytes_with_spec(&[manifest_location], 7),
+            manifest_list_avro_bytes_with_spec(&[(manifest_location, 1)], 7),
         )
         .await;
     let mut metadata = table_metadata_json_for_validation();
@@ -1392,6 +2401,118 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
 }
 
 #[tokio::test]
+async fn iceberg_snapshot_graph_accepts_null_manifest_list_counts() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
+    let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-10.avro";
+    let manifest = manifest_avro_bytes(&[]);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-10.avro",
+            manifest_list_avro_bytes_with_spec_and_null_counts(&[(manifest_location, manifest.len())], 0, true),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/manifest-10.avro", manifest)
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect("nullable v2 manifest-list counts must remain compatible");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_revalidates_unchanged_snapshots_after_spec_removal() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
+    let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-10.avro";
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/snap-10.avro",
+            manifest_list_avro_bytes_with_spec(&[(manifest_location, 1)], 7),
+        )
+        .await;
+    let mut current = table_metadata_json_for_validation();
+    current["partition-specs"]
+        .as_array_mut()
+        .expect("partition specs should be an array")
+        .push(serde_json::json!({"spec-id": 7, "fields": []}));
+    current["last-sequence-number"] = serde_json::Value::from(7);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list_location,
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut target = current.clone();
+    target["partition-specs"]
+        .as_array_mut()
+        .expect("partition specs should be an array")
+        .retain(|spec| spec.get("spec-id").and_then(serde_json::Value::as_i64) != Some(7));
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect_err("removing a spec referenced by an unchanged snapshot must fail");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("snapshot manifest references missing partition spec 7".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_skips_unchanged_history_after_spec_addition() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let mut current = table_metadata_json_for_validation();
+    current["last-sequence-number"] = serde_json::Value::from(1);
+    current["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 1,
+        "timestamp-ms": 1,
+        "manifest-list": "s3://warehouse/tables/table-id/metadata/missing-history.avro",
+        "summary": {"operation": "append"}
+    }]);
+    current["current-snapshot-id"] = serde_json::Value::from(10);
+    current["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let mut target = current.clone();
+    target["partition-specs"]
+        .as_array_mut()
+        .expect("partition specs should be an array")
+        .push(serde_json::json!({"spec-id": 7, "fields": []}));
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    validate_table_snapshot_changes(&context, Some(&current), &target)
+        .await
+        .expect("adding a partition spec must not reread unchanged snapshot history");
+}
+
+#[tokio::test]
 async fn iceberg_snapshot_graph_allows_missing_deleted_files() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
@@ -1400,19 +2521,16 @@ async fn iceberg_snapshot_graph_allows_missing_deleted_files() {
     let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-10.avro";
     let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-10.avro";
     let deleted_data_location = "s3://warehouse/tables/table-id/data/deleted.parquet";
+    let manifest_bytes = manifest_avro_bytes_with_status(&[(deleted_data_location, 0, 2)]);
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/snap-10.avro",
-            manifest_list_avro_bytes(&[manifest_location]),
+            manifest_list_avro_bytes(&[(manifest_location, manifest_bytes.len())]),
         )
         .await;
     backend
-        .seed_object(
-            "warehouse",
-            "tables/table-id/metadata/manifest-10.avro",
-            manifest_avro_bytes_with_status(&[(deleted_data_location, 0, 2)]),
-        )
+        .seed_object("warehouse", "tables/table-id/metadata/manifest-10.avro", manifest_bytes)
         .await;
     let mut metadata = table_metadata_json_for_validation();
     metadata["last-sequence-number"] = serde_json::Value::from(7);
@@ -1469,19 +2587,16 @@ async fn iceberg_v2_snapshot_graph_accepts_reused_v1_manifests() {
     let manifest_list_location = "s3://warehouse/tables/table-id/metadata/snap-v1.avro";
     let manifest_location = "s3://warehouse/tables/table-id/metadata/manifest-v1.avro";
     let data_location = "s3://warehouse/tables/table-id/data/v1.parquet";
+    let manifest_bytes = v1_manifest_avro_bytes(data_location);
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/snap-v1.avro",
-            v1_manifest_list_avro_bytes(manifest_location),
+            v1_manifest_list_avro_bytes(manifest_location, manifest_bytes.len()),
         )
         .await;
     backend
-        .seed_object(
-            "warehouse",
-            "tables/table-id/metadata/manifest-v1.avro",
-            v1_manifest_avro_bytes(data_location),
-        )
+        .seed_object("warehouse", "tables/table-id/metadata/manifest-v1.avro", manifest_bytes)
         .await;
     backend
         .seed_object("warehouse", "tables/table-id/data/v1.parquet", vec![1])
@@ -1549,7 +2664,7 @@ async fn iceberg_snapshot_change_validation_skips_unchanged_history() {
 }
 
 #[tokio::test]
-async fn iceberg_snapshot_registration_validates_only_active_snapshot_heads() {
+async fn iceberg_snapshot_registration_validates_all_retained_snapshots() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
@@ -1579,9 +2694,13 @@ async fn iceberg_snapshot_registration_validates_only_active_snapshot_heads() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
-    validate_table_snapshot_changes(&context, None, &metadata)
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
-        .expect("registration should validate active snapshot heads without traversing all history");
+        .expect_err("registration must validate every retained snapshot");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("snapshot manifest-list object is missing".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1593,19 +2712,16 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
     let manifest_list = "s3://warehouse/tables/table-id/metadata/shared-list.avro";
     let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
     let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(data_file, 0)]);
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/shared-list.avro",
-            manifest_list_avro_bytes(&[manifest]),
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
         )
         .await;
     backend
-        .seed_object(
-            "warehouse",
-            "tables/table-id/metadata/shared-manifest.avro",
-            manifest_avro_bytes(&[(data_file, 0)]),
-        )
+        .seed_object("warehouse", "tables/table-id/metadata/shared-manifest.avro", manifest_bytes)
         .await;
     backend
         .seed_object("warehouse", "tables/table-id/data/shared.parquet", vec![1])
@@ -1638,6 +2754,142 @@ async fn iceberg_snapshot_graph_counts_shared_manifests_once() {
 }
 
 #[tokio::test]
+async fn iceberg_snapshot_graph_revalidates_cached_manifest_declarations() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
+    let manifest_bytes = manifest_avro_bytes_with_status_and_partition_spec(&[(data_file, 0, 1)], 0);
+    let manifest_length = manifest_bytes.len();
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-10.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_length)]),
+        )
+        .await;
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-11.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_length + 1)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/shared-manifest.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/shared.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([
+        {
+            "snapshot-id": 10,
+            "sequence-number": 7,
+            "timestamp-ms": 1,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/list-10.avro",
+            "summary": {"operation": "append"}
+        },
+        {
+            "snapshot-id": 11,
+            "sequence-number": 7,
+            "timestamp-ms": 2,
+            "manifest-list": "s3://warehouse/tables/table-id/metadata/list-11.avro",
+            "summary": {"operation": "append"}
+        }
+    ]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(11);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 11}});
+    let current_metadata = table_metadata_json_for_validation();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect_err("every manifest-list declaration must match the cached manifest object");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest-list manifest_length does not match the manifest object".to_string())
+    );
+
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-11.avro",
+            manifest_list_avro_bytes_with_spec(&[(manifest, manifest_length)], 1),
+        )
+        .await;
+    metadata["partition-specs"]
+        .as_array_mut()
+        .expect("partition specs should be an array")
+        .push(serde_json::json!({"spec-id": 1, "fields": []}));
+
+    let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect_err("every cached manifest must match each manifest-list partition spec declaration");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest partition-spec-id does not match its manifest-list entry".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_bounds_shared_manifest_traversals() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/shared-list.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/shared-manifest.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/shared.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(data_file, 0)]);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/shared-list.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/shared-manifest.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/shared.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::Value::Array(
+        (0..=TABLE_COMMIT_MAX_MANIFEST_TRAVERSALS)
+            .map(|index| {
+                let snapshot_id = i64::try_from(index + 1).expect("snapshot id should fit in i64");
+                serde_json::json!({
+                    "snapshot-id": snapshot_id,
+                    "sequence-number": 7,
+                    "timestamp-ms": snapshot_id,
+                    "manifest-list": manifest_list,
+                    "summary": {"operation": "append"}
+                })
+            })
+            .collect(),
+    );
+    let current_snapshot_id = i64::try_from(TABLE_COMMIT_MAX_MANIFEST_TRAVERSALS + 1).expect("snapshot id should fit in i64");
+    metadata["current-snapshot-id"] = serde_json::Value::from(current_snapshot_id);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": current_snapshot_id}});
+    let current_metadata = table_metadata_json_for_validation();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, Some(&current_metadata), &metadata)
+        .await
+        .expect_err("logical manifest traversals must remain bounded across shared snapshots");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("snapshot manifest traversal count exceeds the commit limit".to_string())
+    );
+}
+
+#[tokio::test]
 async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
@@ -1645,14 +2897,6 @@ async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
     let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
     let manifest_list = "s3://warehouse/tables/table-id/metadata/boundary-list.avro";
     let manifest = "s3://warehouse/tables/table-id/metadata/boundary-manifest.avro";
-    backend
-        .seed_object(
-            "warehouse",
-            "tables/table-id/metadata/boundary-list.avro",
-            manifest_list_avro_bytes(&[manifest]),
-        )
-        .await;
-
     let data_file_count = 10_001;
     let data_files = (0..data_file_count)
         .map(|index| format!("s3://warehouse/tables/table-id/data/part-{index:05}.parquet"))
@@ -1669,12 +2913,16 @@ async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
             .await;
     }
     let references = data_files.iter().map(|data_file| (data_file.as_str(), 0)).collect::<Vec<_>>();
+    let manifest_bytes = manifest_avro_bytes(&references);
     backend
         .seed_object(
             "warehouse",
-            "tables/table-id/metadata/boundary-manifest.avro",
-            manifest_avro_bytes(&references),
+            "tables/table-id/metadata/boundary-list.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
         )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/boundary-manifest.avro", manifest_bytes)
         .await;
 
     let mut metadata = table_metadata_json_for_validation();
@@ -1696,7 +2944,7 @@ async fn iceberg_snapshot_graph_accepts_more_than_ten_thousand_live_files() {
 }
 
 #[tokio::test]
-async fn iceberg_v2_snapshot_graph_accepts_embedded_v2_manifests() {
+async fn iceberg_v2_snapshot_graph_rejects_embedded_v2_manifests() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
@@ -1726,13 +2974,17 @@ async fn iceberg_v2_snapshot_graph_accepts_embedded_v2_manifests() {
     metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
     let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
 
-    validate_table_snapshot_changes(&context, None, &metadata)
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
         .await
-        .expect("embedded v2 manifests should use the enclosing snapshot sequence bound");
+        .expect_err("new v2 snapshots must use a manifest list");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("new Iceberg v2 snapshots require manifest-list".to_string())
+    );
 }
 
 #[tokio::test]
-async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
+async fn iceberg_snapshot_graph_rejects_delete_files_in_data_manifest() {
     let backend = TestCatalogObjectBackend::default();
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
@@ -1740,19 +2992,61 @@ async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
     let manifest_list = "s3://warehouse/tables/table-id/metadata/list-10.avro";
     let manifest = "s3://warehouse/tables/table-id/metadata/snap-delete-manifest.avro";
     let delete_file = "s3://warehouse/tables/table-id/data/position-deletes.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(delete_file, 1)]);
     backend
         .seed_object(
             "warehouse",
             "tables/table-id/metadata/list-10.avro",
-            manifest_list_avro_bytes(&[manifest]),
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
         )
         .await;
     backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-delete-manifest.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/position-deletes.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 10,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "delete"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(10);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 10}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("a data manifest must not contain delete files");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest-list content does not match manifest file content".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_accepts_delete_files_in_delete_manifest() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/list-10.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/snap-delete-manifest.avro";
+    let delete_file = "s3://warehouse/tables/table-id/data/position-deletes.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(delete_file, 1)]);
+    backend
         .seed_object(
             "warehouse",
-            "tables/table-id/metadata/snap-delete-manifest.avro",
-            manifest_avro_bytes(&[(delete_file, 1)]),
+            "tables/table-id/metadata/list-10.avro",
+            manifest_list_avro_bytes_with_spec_and_content(&[(manifest, manifest_bytes.len())], 0, 1),
         )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/snap-delete-manifest.avro", manifest_bytes)
         .await;
     backend
         .seed_object("warehouse", "tables/table-id/data/position-deletes.parquet", vec![1])
@@ -1772,7 +3066,97 @@ async fn iceberg_snapshot_graph_accepts_delete_files_in_data_directory() {
 
     validate_table_snapshot_changes(&context, None, &metadata)
         .await
-        .expect("manifest content should identify delete files stored under the data directory");
+        .expect("a delete manifest may contain delete files regardless of their object directory");
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_rejects_manifest_length_mismatch() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/list-20.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/manifest-20.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/part-20.parquet";
+    let manifest_bytes = manifest_avro_bytes(&[(data_file, 0)]);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-20.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len() + 1)]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/manifest-20.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/part-20.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 20,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(20);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 20}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("manifest-list lengths must match the published manifest object");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest-list manifest_length does not match the manifest object".to_string())
+    );
+}
+
+#[tokio::test]
+async fn iceberg_snapshot_graph_rejects_manifest_partition_spec_mismatch() {
+    let backend = TestCatalogObjectBackend::default();
+    let namespace = Namespace::parse("analytics").expect("namespace should parse");
+    let table = IdentifierSegment::parse("events").expect("table should parse");
+    let entry = test_table_entry("warehouse", &namespace, &table, "tables/table-id/metadata/v1.metadata.json".to_string());
+    let manifest_list = "s3://warehouse/tables/table-id/metadata/list-20.avro";
+    let manifest = "s3://warehouse/tables/table-id/metadata/manifest-20.avro";
+    let data_file = "s3://warehouse/tables/table-id/data/part-20.parquet";
+    let manifest_bytes = manifest_avro_bytes_with_status_and_partition_spec(&[(data_file, 0, 1)], 7);
+    backend
+        .seed_object(
+            "warehouse",
+            "tables/table-id/metadata/list-20.avro",
+            manifest_list_avro_bytes(&[(manifest, manifest_bytes.len())]),
+        )
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/metadata/manifest-20.avro", manifest_bytes)
+        .await;
+    backend
+        .seed_object("warehouse", "tables/table-id/data/part-20.parquet", vec![1])
+        .await;
+    let mut metadata = table_metadata_json_for_validation();
+    metadata["last-sequence-number"] = serde_json::Value::from(7);
+    metadata["snapshots"] = serde_json::json!([{
+        "snapshot-id": 20,
+        "sequence-number": 7,
+        "timestamp-ms": 1,
+        "manifest-list": manifest_list,
+        "summary": {"operation": "append"}
+    }]);
+    metadata["current-snapshot-id"] = serde_json::Value::from(20);
+    metadata["refs"] = serde_json::json!({"main": {"type": "branch", "snapshot-id": 20}});
+    let context = TableSnapshotGraphValidationContext::new(&backend, "warehouse", &entry);
+
+    let error = validate_table_snapshot_changes(&context, None, &metadata)
+        .await
+        .expect_err("manifest headers must agree with their manifest-list entry");
+    assert_eq!(
+        error,
+        TableCatalogStoreError::Invalid("manifest partition-spec-id does not match its manifest-list entry".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1797,13 +3181,19 @@ fn manifest_avro_bytes(files: &[(&str, i32)]) -> Vec<u8> {
 }
 
 fn manifest_avro_bytes_with_status(files: &[(&str, i32, i32)]) -> Vec<u8> {
-    // Historical fixed values of this file's fixtures: snapshot 20, sequence 7
-    // (the shared constructor takes snapshot_id fourth, sequence fifth).
     let files = files
         .iter()
         .map(|(path, content, status)| (*path, *content, *status, 20_i64, 7_i64))
         .collect::<Vec<_>>();
     crate::table_catalog::test_support::manifest_avro_bytes(&files)
+}
+
+fn manifest_avro_bytes_with_status_and_partition_spec(files: &[(&str, i32, i32)], partition_spec_id: i32) -> Vec<u8> {
+    let files = files
+        .iter()
+        .map(|(path, content, status)| (*path, *content, *status, 20_i64, 7_i64))
+        .collect::<Vec<_>>();
+    crate::table_catalog::test_support::manifest_avro_bytes_with_partition_spec(&files, Some(partition_spec_id))
 }
 
 fn manifest_avro_bytes_with_dt_partition(files: &[(&str, i32, &str)]) -> Vec<u8> {
@@ -1839,6 +3229,9 @@ fn manifest_avro_bytes_with_dt_partition(files: &[(&str, i32, &str)]) -> Vec<u8>
     )
     .expect("partitioned manifest avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("partitioned manifest writer should initialize");
+    writer
+        .add_user_metadata("partition-spec-id".to_string(), "0")
+        .expect("manifest partition spec metadata should write");
     for (file_path, content, partition_value) in files {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
@@ -1887,6 +3280,7 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
                     "fields": [
                       {"name": "content", "type": "int"},
                       {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                       {"name": "record_count", "type": "long"},
                       {"name": "file_size_in_bytes", "type": "long"},
                       {"name": "sort_order_id", "type": ["null", "int"], "default": null}
@@ -1899,6 +3293,9 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
     )
     .expect("sort-order manifest avro schema should parse");
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).expect("sorted manifest writer should initialize");
+    writer
+        .add_user_metadata("partition-spec-id".to_string(), "0")
+        .expect("manifest partition spec metadata should write");
     for (file_path, content, sort_order_id) in files {
         writer
             .append_value(apache_avro::types::Value::Record(vec![
@@ -1911,6 +3308,7 @@ fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
                     apache_avro::types::Value::Record(vec![
                         ("content".to_string(), apache_avro::types::Value::Int(*content)),
                         ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
                         ("record_count".to_string(), apache_avro::types::Value::Long(1)),
                         ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
                         (
@@ -2297,6 +3695,61 @@ async fn object_table_catalog_store_persists_view_entries_and_blocks_non_empty_n
         .unwrap();
     assert!(store.list_views(bucket, &namespace.public_name()).await.unwrap().is_empty());
     store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
+}
+
+#[tokio::test]
+async fn object_catalog_view_replacement_recovers_after_committed_write_response_loss() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+    let current_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+    let next_metadata = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+    store
+        .create_view(test_view_entry(bucket, &namespace, &view, current_metadata.clone()))
+        .await
+        .unwrap();
+    backend
+        .seed_object(
+            bucket,
+            &next_metadata,
+            serde_json::to_vec(&serde_json::json!({
+                "format-version": 1,
+                "view-uuid": "view-uuid",
+                "location": format!("s3://{bucket}/views/view-id")
+            }))
+            .expect("view metadata should encode"),
+        )
+        .await;
+    let view_path = store.paths.view_entry_path(bucket, &namespace, &view);
+    backend.fail_after_next_put(RUSTFS_META_BUCKET, &view_path).await;
+
+    let replaced = store
+        .replace_view(ViewCommitRequest {
+            table_bucket: bucket.to_string(),
+            namespace: namespace.public_name(),
+            view: view.as_str().to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata,
+            new_metadata_location: next_metadata.clone(),
+        })
+        .await
+        .expect("an exact persisted replacement must prove the ambiguous write succeeded");
+
+    assert_eq!(replaced.view.metadata_location, next_metadata);
+    assert_eq!(replaced.view.generation, 2);
+    let loaded = store
+        .load_view(bucket, &namespace.public_name(), view.as_str())
+        .await
+        .expect("view lookup should succeed")
+        .expect("view should remain present");
+    assert_eq!(loaded, replaced.view);
 }
 
 #[tokio::test]
@@ -5206,14 +6659,13 @@ async fn maintenance_worker_preserves_queued_dry_run_after_delete_is_enabled() {
     let data_file = format!("{table_root}data/part-00001.parquet");
     let orphan_data = format!("{table_root}data/orphan.parquet");
     let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
     backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
     backend
@@ -6140,14 +7592,13 @@ async fn maintenance_reachability_expands_manifest_avro_references() {
     let manifest = format!("{metadata_dir}/manifest-10.avro");
     let data_file = format!("{table_root}data/part-00001.parquet");
     let delete_file = format!("{table_root}delete/pos-00001.parquet");
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0), (&delete_file, 1)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0), (&delete_file, 1)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
     backend.seed_object(bucket, &delete_file, b"delete".to_vec()).await;
     backend
@@ -6281,14 +7732,13 @@ async fn maintenance_reachability_uses_table_warehouse_object_paths() {
     let manifest = "tables/table-id/metadata/manifest-10.avro".to_string();
     let data_file = "tables/table-id/data/part-00001.parquet".to_string();
     let orphan_data = "tables/table-id/data/orphan.parquet".to_string();
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
     backend.seed_object(bucket, &orphan_data, b"orphan".to_vec()).await;
     backend
@@ -6407,14 +7857,13 @@ async fn maintenance_dry_run_reports_unreachable_manifest_data_and_delete_candid
     let orphan_manifest = format!("{metadata_dir}/manifest-orphan.avro");
     let orphan_data = format!("{table_root}data/orphan.parquet");
     let orphan_delete = format!("{table_root}delete/orphan-delete.parquet");
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
     backend.seed_object(bucket, &orphan_manifest, manifest_avro_bytes(&[])).await;
     backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
@@ -6485,14 +7934,13 @@ async fn maintenance_delete_removes_only_planned_unreachable_table_objects() {
     let data_file = format!("{table_root}data/part-00001.parquet");
     let orphan_manifest = format!("{metadata_dir}/manifest-orphan.avro");
     let orphan_data = format!("{table_root}data/orphan.parquet");
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
     backend.seed_object(bucket, &orphan_manifest, manifest_avro_bytes(&[])).await;
     backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
@@ -6947,18 +8395,13 @@ async fn compaction_plan_reports_row_level_delete_files_without_rewrite_candidat
     let data_file = format!("{data_dir}/part-left.parquet");
     let position_delete_file = format!("{delete_dir}/pos-left.parquet");
     let equality_delete_file = format!("{delete_dir}/eq-left.parquet");
+    let manifest_bytes = manifest_avro_bytes(&[(&data_file, 0), (&position_delete_file, 1), (&equality_delete_file, 2)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(
-            bucket,
-            &manifest,
-            manifest_avro_bytes(&[(&data_file, 0), (&position_delete_file, 1), (&equality_delete_file, 2)]),
-        )
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &data_file, parquet_i32_bytes(&[1, 2])).await;
     backend
         .seed_object(bucket, &position_delete_file, b"position-delete".to_vec())
@@ -7130,18 +8573,13 @@ async fn compaction_commit_rewrites_small_data_files_and_advances_pointer() {
     let retained_values = (10..20_000).collect::<Vec<_>>();
     let retained_parquet = parquet_i32_bytes(&retained_values);
     let small_file_threshold_bytes = u64::try_from(left_parquet.len().max(right_parquet.len())).unwrap();
+    let manifest_bytes = manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0), (&retained_data, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(
-            bucket,
-            &manifest,
-            manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0), (&retained_data, 0)]),
-        )
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &left_data, left_parquet).await;
     backend.seed_object(bucket, &right_data, right_parquet).await;
     backend.seed_object(bucket, &retained_data, retained_parquet).await;
@@ -7309,22 +8747,17 @@ async fn compaction_commit_keeps_partition_rewrite_groups_isolated() {
     let other_partition_parquet = parquet_i32_bytes(&[5, 6]);
     let small_file_threshold_bytes =
         u64::try_from(left_parquet.len().max(right_parquet.len()).max(other_partition_parquet.len())).unwrap();
+    let manifest_bytes = manifest_avro_bytes_with_dt_partition(&[
+        (&left_data, 0, "2026-06-24"),
+        (&right_data, 0, "2026-06-24"),
+        (&other_partition_data, 0, "2026-06-25"),
+    ]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(
-            bucket,
-            &manifest,
-            manifest_avro_bytes_with_dt_partition(&[
-                (&left_data, 0, "2026-06-24"),
-                (&right_data, 0, "2026-06-24"),
-                (&other_partition_data, 0, "2026-06-25"),
-            ]),
-        )
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &left_data, left_parquet).await;
     backend.seed_object(bucket, &right_data, right_parquet).await;
     backend
@@ -7495,18 +8928,14 @@ async fn compaction_commit_preserves_sort_order_and_keeps_groups_isolated() {
     let other_sort_parquet = parquet_i32_bytes(&[5, 6]);
     let small_file_threshold_bytes =
         u64::try_from(left_parquet.len().max(right_parquet.len()).max(other_sort_parquet.len())).unwrap();
+    let manifest_bytes =
+        manifest_avro_bytes_with_sort_order(&[(&left_data, 0, 7), (&right_data, 0, 7), (&other_sort_data, 0, 8)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(
-            bucket,
-            &manifest,
-            manifest_avro_bytes_with_sort_order(&[(&left_data, 0, 7), (&right_data, 0, 7), (&other_sort_data, 0, 8)]),
-        )
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &left_data, left_parquet).await;
     backend.seed_object(bucket, &right_data, right_parquet).await;
     backend.seed_object(bucket, &other_sort_data, other_sort_parquet).await;
@@ -7632,14 +9061,13 @@ async fn compaction_commit_rejects_schema_mismatch_without_advancing_pointer() {
     let manifest = format!("{metadata_dir}/manifest-20.avro");
     let left_data = format!("{data_dir}/part-left.parquet");
     let right_data = format!("{data_dir}/part-right.parquet");
+    let manifest_bytes = manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&left_data, 0), (&right_data, 0)]))
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &left_data, parquet_i32_bytes(&[1, 2])).await;
     backend.seed_object(bucket, &right_data, parquet_i64_bytes(&[3, 4])).await;
     backend
@@ -7708,18 +9136,13 @@ async fn compaction_commit_rejects_deleted_manifest_entries_without_advancing_po
     let manifest = format!("{metadata_dir}/manifest-20.avro");
     let left_data = format!("{data_dir}/part-left.parquet");
     let deleted_data = format!("{data_dir}/part-deleted.parquet");
+    let manifest_bytes = manifest_avro_bytes_with_status(&[(&left_data, 0, 1), (&deleted_data, 0, 2)]);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
         .await;
-    backend
-        .seed_object(
-            bucket,
-            &manifest,
-            manifest_avro_bytes_with_status(&[(&left_data, 0, 1), (&deleted_data, 0, 2)]),
-        )
-        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
     backend.seed_object(bucket, &left_data, parquet_i32_bytes(&[1, 2])).await;
     backend.seed_object(bucket, &deleted_data, parquet_i32_bytes(&[3, 4])).await;
     backend
@@ -11643,31 +13066,45 @@ async fn strong_catalog_does_not_guess_view_history_from_a_concurrent_replacemen
     let first_expected_metadata = initial_metadata.clone();
     let first_replace = tokio::spawn(async move {
         first_replace_store
-            .replace_view(ViewCommitRequest {
-                table_bucket: bucket.to_string(),
-                namespace: first_namespace_name,
-                view: first_view_name,
-                expected_version_token: "token-v1".to_string(),
-                expected_metadata_location: first_expected_metadata,
-                new_metadata_location: first_metadata,
-            })
+            .replace_view_with_publication(
+                ViewCommitRequest {
+                    table_bucket: bucket.to_string(),
+                    namespace: first_namespace_name,
+                    view: first_view_name,
+                    expected_version_token: "token-v1".to_string(),
+                    expected_metadata_location: first_expected_metadata,
+                    new_metadata_location: first_metadata,
+                },
+                false,
+                &UnserializedTestPublication,
+            )
             .await
     });
-    recovery_read.wait_started().await;
-    second
-        .replace_view(ViewCommitRequest {
-            table_bucket: bucket.to_string(),
-            namespace: namespace.public_name(),
-            view: view.as_str().to_string(),
-            expected_version_token: "token-v1".to_string(),
-            expected_metadata_location: initial_metadata,
-            new_metadata_location: second_metadata.clone(),
-        })
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, recovery_read.wait_started())
         .await
-        .expect("second writer should publish a different replacement");
+        .expect("the first replacement should reach its paused recovery read");
+    tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        second.replace_view_with_publication(
+            ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: initial_metadata,
+                new_metadata_location: second_metadata.clone(),
+            },
+            false,
+            &UnserializedTestPublication,
+        ),
+    )
+    .await
+    .expect("the independent replacement should not wait for publication serialization")
+    .expect("second writer should publish a different replacement");
     recovery_read.release();
-    let error = first_replace
+    let error = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, first_replace)
         .await
+        .expect("the first replacement should finish after its recovery read is released")
         .expect("first replacement task should join")
         .expect_err("a different generation-two view must not prove the first replacement succeeded");
     assert_matches!(error, TableCatalogStoreError::Internal(message) if message.contains("injected put failure"));
@@ -12404,6 +13841,76 @@ async fn catalog_backings_reject_table_view_identifier_collisions() {
             .await
             .expect_err("table must not reuse a view identifier");
         assert_matches!(table_error, TableCatalogStoreError::Conflict(_));
+    }
+}
+
+#[tokio::test]
+async fn catalog_backings_persist_table_format_upgrade_and_replay() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let bucket = format!("format-upgrade-{mode:?}").to_ascii_lowercase();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        store
+            .put_table_bucket(test_bucket_entry(&bucket))
+            .await
+            .expect("table bucket should be created");
+        store
+            .create_namespace(test_namespace_entry(&bucket, &namespace))
+            .await
+            .expect("namespace should be created");
+        let mut entry = test_table_entry(&bucket, &namespace, &table, current_metadata.clone());
+        entry.format_version = 1;
+        store.create_table(entry).await.expect("v1 table should be created");
+        backend
+            .seed_object(
+                &bucket,
+                &next_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": format!("s3://{bucket}/tables/table-id")
+                }))
+                .expect("target metadata should encode"),
+            )
+            .await;
+        let request = TableCommitRequest {
+            table_bucket: bucket.clone(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            commit_id: "format-upgrade-commit".to_string(),
+            idempotency_key: Some("format-upgrade-request".to_string()),
+            operation: "upgrade-format-version".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: current_metadata,
+            new_metadata_location: next_metadata,
+            requirements: Vec::new(),
+            writer: Some("iceberg-rest/test".to_string()),
+        };
+
+        let committed = store
+            .commit_table(request.clone())
+            .await
+            .expect("format upgrade should commit");
+        assert_eq!(committed.table.format_version, 2);
+        let replay = store
+            .commit_table(request)
+            .await
+            .expect("exact format upgrade replay should succeed");
+        assert_eq!(replay, committed);
+
+        let restarted = ConfiguredTableCatalogStore::new_for_test(backend, mode);
+        let loaded = restarted
+            .load_table(&bucket, &namespace.public_name(), table.as_str())
+            .await
+            .expect("restarted catalog should load")
+            .expect("upgraded table should persist");
+        assert_eq!(loaded.format_version, 2);
+        assert_eq!(loaded.metadata_location, committed.table.metadata_location);
     }
 }
 

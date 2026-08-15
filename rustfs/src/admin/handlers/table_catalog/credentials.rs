@@ -29,6 +29,6 @@ impl Operation for RestLoadCredentialsHandler {
         let issuer = IamTableCredentialIssuer::from_request(&req)?;
         let response =
             load_credentials_response(&store, &warehouse, &namespace, &table, &issuer, Some(&principal.credentials)).await?;
-        build_json_response(StatusCode::OK, &response)
+        build_sensitive_json_response(StatusCode::OK, &response)
     }
 }
