@@ -22,6 +22,7 @@ use crate::admin::{
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid_with_context, get_session_token};
+use crate::error::ApiError;
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use bytes::Bytes;
@@ -1766,19 +1767,19 @@ async fn read_limited_body(mut input: Body, max_size: usize, timeout: StdDuratio
         .await
         .map_err(|_| {
             operation.map_or_else(
-                || s3_error!(InvalidRequest, "timed out reading request body"),
-                |operation| s3_error!(InvalidRequest, "timed out reading {operation} request body"),
+                || S3Error::from(ApiError::invalid_request("timed out reading request body")),
+                |operation| S3Error::from(ApiError::invalid_request(format!("timed out reading {operation} request body"))),
             )
         })?
-        .map_err(|err| s3_error!(InvalidRequest, "failed to read request body: {}", err))
+        .map_err(|err| S3Error::from(ApiError::invalid_request(format!("failed to read request body: {err}"))))
 }
 
 async fn read_json_body<T: DeserializeOwned>(input: Body) -> S3Result<T> {
     let body = read_limited_body(input, MAX_ADMIN_REQUEST_BODY_SIZE, TABLE_CATALOG_REQUEST_BODY_TIMEOUT, None).await?;
     if body.is_empty() {
-        return Err(s3_error!(InvalidRequest, "request body is required"));
+        return Err(S3Error::from(ApiError::invalid_request("request body is required")));
     }
-    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+    serde_json::from_slice(&body).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 fn validate_rest_commit_request_shape(
@@ -1788,7 +1789,7 @@ fn validate_rest_commit_request_shape(
 ) -> S3Result<()> {
     let object = value
         .as_object()
-        .ok_or_else(|| s3_error!(InvalidRequest, "commit request must be a JSON object"))?;
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request("commit request must be a JSON object")))?;
     if object.get("new-metadata-location").is_some_and(serde_json::Value::is_string) {
         for field in ["requirements", "updates"] {
             if object
@@ -1796,19 +1797,18 @@ fn validate_rest_commit_request_shape(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|values| !values.is_empty())
             {
-                return Err(s3_error!(
-                    InvalidRequest,
+                return Err(S3Error::from(ApiError::invalid_request(format!(
                     "legacy metadata pointer commit must not include standard {field}"
-                ));
+                ))));
             }
         }
         return Ok(());
     }
     if require_requirements && !object.contains_key("requirements") {
-        return Err(s3_error!(InvalidRequest, "commit request requires requirements"));
+        return Err(S3Error::from(ApiError::invalid_request("commit request requires requirements")));
     }
     if require_updates && !object.contains_key("updates") {
-        return Err(s3_error!(InvalidRequest, "commit request requires updates"));
+        return Err(S3Error::from(ApiError::invalid_request("commit request requires updates")));
     }
     Ok(())
 }
@@ -1816,13 +1816,13 @@ fn validate_rest_commit_request_shape(
 async fn read_rest_commit_table_request(input: Body) -> S3Result<RestCommitTableRequest> {
     let value = read_json_body::<serde_json::Value>(input).await?;
     validate_rest_commit_request_shape(&value, true, true)?;
-    serde_json::from_value(value).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {err}"))
+    serde_json::from_value(value).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 async fn read_rest_commit_view_request(input: Body) -> S3Result<RestCommitViewRequest> {
     let value = read_json_body::<serde_json::Value>(input).await?;
     validate_rest_commit_request_shape(&value, false, true)?;
-    serde_json::from_value(value).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {err}"))
+    serde_json::from_value(value).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 async fn read_bounded_json_body<T: DeserializeOwned>(
@@ -1835,18 +1835,18 @@ async fn read_bounded_json_body<T: DeserializeOwned>(
     if let Some(content_length) = headers.get(http::header::CONTENT_LENGTH) {
         let content_length = content_length
             .to_str()
-            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be valid ASCII"))?
+            .map_err(|_| S3Error::from(ApiError::invalid_request("Content-Length must be valid ASCII")))?
             .parse::<usize>()
-            .map_err(|_| s3_error!(InvalidRequest, "Content-Length must be a non-negative integer"))?;
+            .map_err(|_| S3Error::from(ApiError::invalid_request("Content-Length must be a non-negative integer")))?;
         if content_length > max_size {
-            return Err(s3_error!(InvalidRequest, "{operation} request body is too large"));
+            return Err(S3Error::from(ApiError::invalid_request(format!("{operation} request body is too large"))));
         }
     }
     let body = read_limited_body(input, max_size, timeout, Some(operation)).await?;
     if body.is_empty() {
-        return Err(s3_error!(InvalidRequest, "request body is required"));
+        return Err(S3Error::from(ApiError::invalid_request("request body is required")));
     }
-    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {err}"))
+    serde_json::from_slice(&body).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 async fn read_json_body_or_default<T>(input: Body) -> S3Result<T>
@@ -1857,13 +1857,13 @@ where
     if body.is_empty() {
         return Ok(T::default());
     }
-    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+    serde_json::from_slice(&body).map_err(|err| S3Error::from(ApiError::invalid_request(format!("invalid JSON: {err}"))))
 }
 
 fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let warehouse = params.get("warehouse").unwrap_or("");
     if warehouse.is_empty() {
-        return Err(s3_error!(InvalidRequest, "warehouse is required"));
+        return Err(S3Error::from(ApiError::invalid_request("warehouse is required")));
     }
     Ok(warehouse.to_string())
 }
@@ -2873,7 +2873,9 @@ fn validate_metadata_identity_matches_current_metadata(
         ));
     }
     if target_format_version < expected_format_version {
-        return Err(s3_error!(InvalidRequest, "table metadata format-version cannot be downgraded"));
+        return Err(S3Error::from(ApiError::invalid_request(
+            "table metadata format-version cannot be downgraded",
+        )));
     }
     Ok(())
 }
@@ -3129,7 +3131,7 @@ fn initial_table_metadata_json(
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let sort_order_id = if sort_order_fields
         .as_array()
-        .ok_or_else(|| s3_error!(InvalidRequest, "write-order fields must be an array"))?
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request("write-order fields must be an array")))?
         .is_empty()
     {
         0
@@ -3186,7 +3188,7 @@ fn initial_view_metadata_json(
     let timestamp_ms = view_version_object
         .get("timestamp-ms")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| s3_error!(InvalidRequest, "view-version timestamp-ms must be an integer"))?;
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request("view-version timestamp-ms must be an integer")))?;
 
     let metadata = serde_json::json!({
         "format-version": entry.format_version,
@@ -3369,7 +3371,11 @@ fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements
                 )?;
             }
             "assert-ref-snapshot-id" => validate_ref_snapshot_requirement(metadata, requirement)?,
-            _ => return Err(s3_error!(InvalidRequest, "unsupported commit requirement: {requirement_type}")),
+            _ => {
+                return Err(S3Error::from(ApiError::invalid_request(format!(
+                    "unsupported commit requirement: {requirement_type}"
+                ))));
+            }
         }
     }
     Ok(())
@@ -3534,7 +3540,7 @@ fn apply_table_commit_updates_at(
                     "table encryption keys require Iceberg format-version 3",
                 ));
             }
-            _ => return Err(s3_error!(InvalidRequest, "unsupported table update: {action}")),
+            _ => return Err(S3Error::from(ApiError::invalid_request(format!("unsupported table update: {action}")))),
         }
     }
 
@@ -3558,7 +3564,7 @@ fn prune_intermediate_snapshot_log_entries(metadata: &mut serde_json::Value, add
         entry
             .get("snapshot-id")
             .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-log snapshot-id must be an integer"))?;
+            .ok_or_else(|| S3Error::from(ApiError::invalid_request("snapshot-log snapshot-id must be an integer")))?;
     }
     snapshot_log.retain(|entry| {
         entry
@@ -3589,7 +3595,11 @@ fn validate_view_commit_requirements(metadata: &serde_json::Value, requirements:
                     return Err(commit_requirement_failed("commit requirement failed: view uuid changed"));
                 }
             }
-            _ => return Err(s3_error!(InvalidRequest, "unsupported view commit requirement: {requirement_type}")),
+            _ => {
+                return Err(S3Error::from(ApiError::invalid_request(format!(
+                    "unsupported view commit requirement: {requirement_type}"
+                ))));
+            }
         }
     }
     Ok(())
@@ -3642,7 +3652,7 @@ fn apply_view_commit_updates_at(
             "set-location" => apply_set_location_update(&mut metadata, update)?,
             "set-properties" => apply_set_properties_update(&mut metadata, update)?,
             "remove-properties" => apply_remove_properties_update(&mut metadata, update)?,
-            _ => return Err(s3_error!(InvalidRequest, "unsupported view update: {action}")),
+            _ => return Err(S3Error::from(ApiError::invalid_request(format!("unsupported view update: {action}")))),
         }
     }
 
@@ -3660,7 +3670,7 @@ fn apply_set_snapshot_file_update(
     let value = update
         .get(update_field)
         .cloned()
-        .ok_or_else(|| s3_error!(InvalidRequest, "{update_field} is required"))?;
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request(format!("{update_field} is required"))))?;
     let snapshot_id =
         crate::table_catalog::validate_iceberg_statistics_file(&value, update_field, kind).map_err(catalog_store_error)?;
     if let Some(deprecated_snapshot_id) = update.get("snapshot-id") {
@@ -3689,7 +3699,7 @@ fn apply_remove_snapshot_file_update(
     let snapshot_id = update
         .get("snapshot-id")
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| s3_error!(InvalidRequest, "remove update requires snapshot-id"))?;
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request("remove update requires snapshot-id")))?;
     if let Some(values) = metadata.get_mut(metadata_field).and_then(serde_json::Value::as_array_mut) {
         values.retain(|value| value.get("snapshot-id").and_then(serde_json::Value::as_i64) != Some(snapshot_id));
     }
@@ -3706,12 +3716,12 @@ fn apply_remove_metadata_ids_update(
     let ids = update
         .get(update_field)
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| s3_error!(InvalidRequest, "{update_field} must be an array"))?
+        .ok_or_else(|| S3Error::from(ApiError::invalid_request(format!("{update_field} must be an array"))))?
         .iter()
         .map(|value| {
             value
                 .as_i64()
-                .ok_or_else(|| s3_error!(InvalidRequest, "{update_field} must contain integers"))
+                .ok_or_else(|| S3Error::from(ApiError::invalid_request(format!("{update_field} must contain integers"))))
         })
         .collect::<S3Result<BTreeSet<_>>>()?;
     if let Some(values) = metadata.get_mut(metadata_field).and_then(serde_json::Value::as_array_mut) {
