@@ -7078,67 +7078,70 @@ fn local_lifecycle_staleness_axis(
 /// otherwise malformed payloads are rejected rather than treated as a delete
 /// that would erase local expiry rules.
 fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(raw) else {
-        return false;
-    };
-    let mut text = text.trim();
-    if let Some(rest) = text.strip_prefix("<?xml") {
-        let Some(end) = rest.find("?>") else {
-            return false;
-        };
-        text = rest[end + 2..].trim_start();
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Tombstone {
+        #[serde(rename = "@xmlns")]
+        _xmlns: Option<String>,
+        #[serde(rename = "ExpiryUpdatedAt")]
+        _expiry_updated_at: Option<s3s::dto::Timestamp>,
     }
-    let Some(rest) = text.strip_prefix("<LifecycleConfiguration") else {
-        return false;
+
+    let mut reader = quick_xml::Reader::from_reader(raw);
+    let mut depth = 0usize;
+    let mut seen_root = false;
+    let mut closed_root = false;
+    let mut seen_declaration = false;
+    let well_formed_document = loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                }
+                depth += 1;
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                if depth == 0 {
+                    break false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Decl(_)) => {
+                if seen_declaration || seen_root || depth != 0 {
+                    break false;
+                }
+                seen_declaration = true;
+            }
+            Ok(quick_xml::events::Event::DocType(_)) => break false,
+            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+                break false;
+            }
+            Ok(quick_xml::events::Event::Text(_)) => {}
+            Ok(quick_xml::events::Event::CData(_)) if depth == 0 => break false,
+            Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
+            Ok(quick_xml::events::Event::Eof) => break seen_root && closed_root && depth == 0,
+            Ok(_) if depth == 0 => break false,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
     };
-    // Self-closing empty root.
-    if let Some(tail) = rest.trim_start().strip_prefix("/>") {
-        return tail.trim().is_empty();
-    }
-    // The root open tag may carry attributes (xmlns); it must close, and the
-    // document must end with the matching close tag.
-    let Some(open_end) = rest.find('>') else {
-        return false;
-    };
-    let Some(body) = rest[open_end + 1..].trim_end().strip_suffix("</LifecycleConfiguration>") else {
-        return false;
-    };
-    // The body must be a sequence of well-formed simple children (MinIO's
-    // tombstone carries e.g. <ExpiryUpdatedAt>…</ExpiryUpdatedAt>), none of
-    // them a Rule. A dangling open tag or stray text is malformed, not a
-    // tombstone.
-    let mut body = body.trim();
-    while !body.is_empty() {
-        let Some(rest) = body.strip_prefix('<') else {
-            return false;
-        };
-        let name_len = rest.bytes().take_while(|byte| byte.is_ascii_alphanumeric()).count();
-        if name_len == 0 {
-            return false;
-        }
-        let name = &rest[..name_len];
-        if name == "Rule" {
-            return false;
-        }
-        let after_name = &rest[name_len..];
-        if let Some(tail) = after_name.trim_start().strip_prefix("/>") {
-            body = tail.trim_start();
-            continue;
-        }
-        let Some(content_start) = after_name.find('>') else {
-            return false;
-        };
-        let content = &after_name[content_start + 1..];
-        let close = format!("</{name}>");
-        let Some(content_end) = content.find(&close) else {
-            return false;
-        };
-        if content[..content_end].contains('<') {
-            return false;
-        }
-        body = content[content_end + close.len()..].trim_start();
-    }
-    true
+
+    well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
 }
 
 /// The ILM expiry statement this site contributes to its SRInfo bucket entry
@@ -8300,7 +8303,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             None
         };
 
-    let merged_lifecycle_config = if item.r#type == "lc-config" {
+    let (merged_lifecycle_config, lifecycle_guard) = if item.r#type == "lc-config" {
         // Receiver-side gate, symmetric with the sender hook: a peer must not
         // install expiry rules here while `replicateILMExpiry` is off. When
         // the state cannot be read, fall through and apply (pre-gate
@@ -8330,20 +8333,28 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             }
             None => None,
         };
-        let local = match metadata_sys::get_lifecycle_config(&item.bucket).await {
-            Ok((config, _)) => Some(config),
-            Err(StorageError::ConfigNotFound) => None,
-            Err(err) => return Err(ApiError::from(err).into()),
-        };
-        let whole_config_axis = metadata_sys::get(&item.bucket)
+        let lifecycle_guard =
+            metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(&item.bucket, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
+        let local_metadata = metadata_sys::get_config_from_disk(&item.bucket)
             .await
-            .map(|bucket_meta| bucket_meta.lifecycle_config_updated_at)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            .map_err(ApiError::from)?;
+        let local = if local_metadata.lifecycle_config_xml.is_empty() {
+            None
+        } else {
+            Some(
+                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&local_metadata.lifecycle_config_xml).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}"))
+                })?,
+            )
+        };
+        let whole_config_axis = local_metadata.lifecycle_config_updated_at;
         if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
             return Ok(());
         }
         let local_absent = local.is_none();
-        match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
+        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
             Some(config) => Some(
                 serialize(&config)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?,
@@ -8352,9 +8363,10 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                 skip_config_write = local_absent;
                 None
             }
-        }
+        };
+        (merged, Some(lifecycle_guard))
     } else {
-        None
+        (None, None)
     };
 
     let data = match item.r#type.as_str() {
@@ -8405,16 +8417,29 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                         .map_err(ApiError::from)?;
                 }
             } else {
-                metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                if let Some(guard) = lifecycle_guard.as_ref() {
+                    metadata_sys::update_under_transaction_lock(guard, &item.bucket, config_file, data)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
+            }
+        } else {
+            if let Some(guard) = lifecycle_guard.as_ref() {
+                metadata_sys::delete_under_transaction_lock(guard, &item.bucket, config_file)
+                    .await
+                    .map_err(ApiError::from)?;
+            } else {
+                metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
             }
-        } else {
-            metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
-                .await
-                .map_err(ApiError::from)?;
         }
     }
+    drop(lifecycle_guard);
     drop(targets_guard);
 
     if item.r#type == "replication-config" {
@@ -15074,10 +15099,39 @@ mod tests {
         assert!(!is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><A><Rule/></A></LifecycleConfiguration>"
         ));
-        // A self-closing non-Rule child stays acceptable.
-        assert!(is_zero_rule_lifecycle_tombstone(
+        assert!(!is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><Marker/></LifecycleConfiguration>"
         ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>&bogus;</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<evil:LifecycleConfiguration/>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration><Marker/>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>&bogus;"));
+    }
+
+    #[test]
+    fn test_lifecycle_merge_holds_metadata_transaction_across_read_and_write() {
+        let source = include_str!("site_replication.rs");
+        let apply = source
+            .split("async fn apply_bucket_meta_item")
+            .nth(1)
+            .and_then(|rest| rest.split("fn group_info_requires_upsert").next())
+            .expect("apply_bucket_meta_item source");
+        let acquire = apply
+            .find("acquire_bucket_metadata_transaction_lock_for_incarnation")
+            .expect("lifecycle merge transaction acquisition");
+        let read = apply.find("get_config_from_disk").expect("fresh lifecycle config read");
+        let write = apply
+            .find("update_under_transaction_lock")
+            .expect("lifecycle config write under transaction");
+
+        assert!(
+            acquire < read && read < write,
+            "the transaction must span the lifecycle read, merge, and write"
+        );
     }
 
     /// The staleness axis an incoming lc-config item must beat: the expiry

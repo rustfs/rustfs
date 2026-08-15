@@ -321,6 +321,34 @@ pub(crate) mod metadata_sys {
         crate::storage::storage_api::acquire_bucket_metadata_transaction_lock(bucket).await
     }
 
+    pub(crate) async fn acquire_bucket_metadata_transaction_lock_for_incarnation(
+        bucket: &str,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
+        super::ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(
+            bucket,
+            expected_incarnation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn update_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_under_transaction_lock(guard, bucket, config_file, data).await
+    }
+
+    pub(crate) async fn delete_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        config_file: &str,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_under_transaction_lock(guard, bucket, config_file).await
+    }
+
     pub(crate) async fn update_bucket_targets_under_transaction_lock(
         guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
         bucket: &str,
