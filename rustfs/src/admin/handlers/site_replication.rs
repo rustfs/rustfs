@@ -6209,6 +6209,12 @@ fn classify_site_replication_retry_event(event: &SiteReplicationRetryEvent) -> O
         // pending-endpoint-refresh backup); they are not delivery failures.
         return None;
     }
+    if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        // Already snapshot-replayed once for this failure episode; a possible
+        // deletion cannot be replayed from a snapshot, so re-sending daily
+        // proves nothing. A new hook failure overwrites the marker.
+        return None;
+    }
     let base_path = event.path.split_once('?').map(|(base, _)| base).unwrap_or(&event.path);
     match base_path {
         "/rustfs/admin/v3/site-replication/peer/iam-item" => Some(RetryDrainAction::IamSnapshot),
@@ -6238,40 +6244,52 @@ fn retry_bucket_name(path: &str) -> Option<String> {
         .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
 }
 
-/// Settle a constant-path (collapsed) retry event only if no newer failure
-/// was recorded for it after `snapshot_updated_at`. The drain's snapshot
-/// resend proves delivery of the state as of plan-build time; a failure
-/// recorded during the (potentially long) delivery window belongs to a newer
-/// local commit the snapshot did not contain, and clearing it would leave the
-/// peer silently diverged. Returns how many events would be (or were) kept
-/// back for that reason plus how many were settled.
-fn settle_site_replication_retry_events_up_to(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
+/// A collapsed (constant-path) retry event after a successful snapshot
+/// resend is escalated with this marker instead of being cleared: the
+/// snapshot replays every entity that still exists, but a failed *deletion*
+/// leaves no task in the plan, so remote absence is unproven and the entry
+/// must stay operator-visible until a later full delivery or a manual repair
+/// settles it. The drain skips marked entries so the once-per-episode
+/// snapshot is not re-sent daily; a new hook failure overwrites the marker
+/// and re-arms the drain.
+const SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER: &str = "snapshot replayed; a failed deletion cannot be replayed from a snapshot — run site replication repair or re-deliver to settle";
+
+/// Escalate a collapsed retry event after its snapshot resend succeeded,
+/// unless a newer failure was recorded after `snapshot_updated_at` (that
+/// failure belongs to a newer local commit the snapshot did not contain and
+/// must keep the entry drain-eligible).
+fn escalate_site_replication_retry_events_up_to(
+    queue: &mut [SiteReplicationRetryEvent],
     peer: &PeerInfo,
     path: &str,
     snapshot_updated_at: Option<OffsetDateTime>,
 ) -> usize {
-    let before = queue.len();
-    queue.retain(|event| {
+    let mut escalated = 0usize;
+    for event in queue.iter_mut() {
         if !retry_event_matches(event, peer, path) {
-            return true;
+            continue;
         }
-        match (event.updated_at, snapshot_updated_at) {
-            // A failure stamped after our snapshot: keep it.
+        let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
             (Some(current), Some(seen)) => current > seen,
             (Some(_), None) => true,
-            // Legacy entry without a timestamp cannot be newer than anything.
             (None, _) => false,
+        };
+        if newer_failure_recorded {
+            continue;
         }
-    });
-    before - queue.len()
+        event.failed = true;
+        event.retry_count = event.retry_count.max(SITE_REPLICATION_RETRY_FAILED_AFTER);
+        event.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
+        escalated += 1;
+    }
+    escalated
 }
 
-async fn dequeue_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
+async fn escalate_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
     let peer_owned = peer.clone();
     let path_owned = path.to_string();
     let result = update_site_replication_state(move |state| {
-        settle_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
+        escalate_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
         Ok(())
     })
     .await;
@@ -6285,7 +6303,7 @@ async fn dequeue_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str,
             deployment_id = %peer.deployment_id,
             path,
             error = ?err,
-            "failed to settle site replication retry event"
+            "failed to escalate site replication retry event"
         );
     }
 }
@@ -6316,9 +6334,13 @@ fn actionable_site_replication_retry_events(state: &SiteReplicationState, now: O
 
 /// Background consumer for the retry queue, run from the reconcile tick.
 ///
-/// Scope: this settles "delivered once and failed" entries. A hook that never
-/// fired (crash between the local commit and the send) leaves no entry, so
-/// the drain is not a full cross-site diff-heal; manual repair remains the
+/// Scope: this settles "delivered once and failed" entries whose replay is
+/// faithful (bucket ops, peer edits). Collapsed iam-item / bucket-meta
+/// entries are snapshot-resent and then *escalated*, not cleared — a failed
+/// deletion leaves no task in the snapshot, so remote absence stays unproven
+/// until a later delivery or a manual repair. A hook that never fired (crash
+/// between the local commit and the send) leaves no entry at all, so the
+/// drain is not a full cross-site diff-heal; manual repair remains the
 /// authoritative catch-all.
 async fn drain_site_replication_retry_queue() {
     if let Err(err) = drain_site_replication_retry_queue_inner().await {
@@ -6474,11 +6496,13 @@ async fn drain_one_site_replication_retry_event(
                     return Err(err);
                 }
             }
-            // Conditional settlement: iam-item / bucket-meta entries collapse
-            // per (peer, path), so a hook failure recorded while this snapshot
-            // was in flight belongs to a commit the snapshot did not contain
-            // and must survive this success.
-            dequeue_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
+            // The snapshot replays every entity that still exists, but a
+            // failed *deletion* leaves no task in the plan — remote absence
+            // is unproven, so escalate (operator-visible, drain-idle) instead
+            // of clearing. Conditional on the snapshot timestamp: a hook
+            // failure recorded while this snapshot was in flight belongs to a
+            // newer commit and keeps the entry drain-eligible.
+            escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
             Ok(true)
         }
         RetryDrainAction::BucketOpReplay { operation, bucket } => {
@@ -11965,47 +11989,59 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    /// Conditional settlement for collapsed (constant-path) entries: a
-    /// failure stamped after the drain snapshot belongs to a newer local
-    /// commit the snapshot did not contain and must survive the snapshot's
-    /// success.
+    /// A successful snapshot resend cannot prove a failed *deletion* was
+    /// replayed, so the collapsed entry is escalated (operator-visible,
+    /// drain-idle) instead of cleared — unless a newer failure was stamped
+    /// during the delivery window, which keeps the entry drain-eligible.
     #[test]
-    fn test_settle_up_to_keeps_failures_newer_than_the_snapshot() {
+    fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
         let target = peer("remote", "https://remote.example.com");
         let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
         let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
 
-        // Failure re-stamped after the snapshot: kept.
+        // Failure re-stamped after the snapshot: untouched, still eligible.
         let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at + time::Duration::seconds(5)))];
         assert_eq!(
-            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
             0
         );
-        assert_eq!(queue.len(), 1, "a failure newer than the snapshot must survive");
+        assert!(!queue[0].failed);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_some(),
+            "a newer failure must stay drain-eligible"
+        );
 
-        // Unchanged since the snapshot: settled.
+        // Unchanged since the snapshot: escalated, kept, drain-idle.
         let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
         assert_eq!(
-            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
             1
         );
-        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 1, "the entry must survive until remote absence is proven");
+        assert!(queue[0].failed);
+        assert_eq!(queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_none(),
+            "a snapshot-replayed entry must not be re-sent daily"
+        );
+        // A later hook failure overwrites the marker and re-arms the drain.
+        upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
+        assert!(classify_site_replication_retry_event(&queue[0]).is_some());
 
-        // Legacy entry without a timestamp cannot be newer: settled.
+        // Legacy entry without a timestamp: escalated.
         let mut queue = vec![drain_event("remote", path, 2, None)];
         assert_eq!(
-            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
             1
         );
-        assert!(queue.is_empty());
 
         // Other (peer, path) entries are untouched.
         let mut queue = vec![drain_event("other", path, 2, Some(snapshot_at))];
         assert_eq!(
-            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
             0
         );
-        assert_eq!(queue.len(), 1);
+        assert!(!queue[0].failed);
     }
 
     #[test]
