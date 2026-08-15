@@ -102,7 +102,7 @@ bytes.workspace = true
 hex-simd.workspace = true
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
