@@ -32,15 +32,22 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID,
     GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
-    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
-    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
-    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
-    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
-    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK,
-    GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED,
+    GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, GET_METADATA_EARLY_STOP_REASON_ERROR,
+    GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, GET_METADATA_EARLY_STOP_REASON_NOT_FOUND,
+    GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND,
+    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
+    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
+    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
+    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
     GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
     GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
@@ -652,36 +659,48 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.erasure.distribution == right.erasure.distribution
 }
 
-pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
+pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     bucket: &str,
     object: &str,
     candidate: &FileInfo,
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
-) -> bool {
-    if !candidate.inline_data()
-        || candidate.is_compressed()
+) -> Option<&'static str> {
+    if !candidate.inline_data() {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE);
+    }
+    if candidate.is_compressed()
         || candidate
             .metadata
             .keys()
             .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
-        || candidate.is_remote()
-        || candidate.deleted
-        || candidate.size <= 0
-        || candidate.parts.len() != 1
-        || !candidate.has_valid_erasure_geometry()
     {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED);
+    }
+    if candidate.is_remote() {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE);
+    }
+    if candidate.deleted {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED);
+    }
+    if candidate.size <= 0 {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    }
+    if candidate.parts.len() != 1 {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    }
+    if !candidate.has_valid_erasure_geometry() {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
     }
 
     let Ok(object_size) = usize::try_from(candidate.size) else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     };
     if candidate.parts.first().is_none_or(|part| part.size != object_size) {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
     }
     if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
 
     let Ok(erasure) = coding::Erasure::try_new_with_options(
@@ -690,18 +709,18 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
         candidate.erasure.block_size,
         candidate.uses_legacy_checksum,
     ) else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
     };
-    let Some(data_files) =
-        collect_inline_data_shard_fileinfos_by_index(parts_metadata, candidate, erasure.data_shards, |index| {
+    let data_files =
+        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
             disks.get(index).is_some_and(Option::is_some)
-        })
-    else {
-        return false;
-    };
+        }) {
+            Ok(data_files) => data_files,
+            Err(reason) => return Some(reason),
+        };
 
     let Some(part) = candidate.parts.first() else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
     };
     let checksum_info = candidate.erasure.get_checksum_info(part.number);
     let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -721,12 +740,13 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
     let Ok(mut readers) =
         build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
     else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
 
-    try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size)
-        .await
-        .is_some_and(|body| body.len() == object_size)
+    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
+        Some(body) if body.len() == object_size => None,
+        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    }
 }
 
 pub(in crate::set_disk) fn classify_metadata_response_error(err: &DiskError) -> &'static str {
@@ -2469,6 +2489,7 @@ impl SetDisks {
         let mut next_fanout_index = 0usize;
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
+        let mut final_miss_reason_override = None;
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
                 let task_opts = opts;
@@ -2541,17 +2562,29 @@ impl SetDisks {
                     .or_else(|| accumulator.version_early_stop_decision())
             {
                 let should_return_early = if read_data {
-                    let allow_data_read_early_stop = match accumulator.candidate.as_ref() {
-                        Some(candidate) => {
-                            data_read_early_stop_inline_body_verified(bucket.as_ref(), object.as_ref(), candidate, &ress, disks)
-                                .await
+                    match accumulator.candidate.as_ref() {
+                        Some(candidate) => match data_read_early_stop_inline_body_miss_reason(
+                            bucket.as_ref(),
+                            object.as_ref(),
+                            candidate,
+                            &ress,
+                            disks,
+                        )
+                        .await
+                        {
+                            None => true,
+                            Some(reason) => {
+                                force_full_wait = true;
+                                final_miss_reason_override = Some(reason);
+                                false
+                            }
+                        },
+                        None => {
+                            force_full_wait = true;
+                            final_miss_reason_override = Some(GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM);
+                            false
                         }
-                        None => false,
-                    };
-                    if !allow_data_read_early_stop {
-                        force_full_wait = true;
                     }
-                    allow_data_read_early_stop
                 } else {
                     true
                 };
@@ -2613,7 +2646,12 @@ impl SetDisks {
             }
         }
 
-        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(metrics_path, accumulator.final_miss_reason());
+        let accumulator_miss_reason = accumulator.final_miss_reason();
+        let final_miss_reason = match (final_miss_reason_override, accumulator_miss_reason) {
+            (Some(reason), GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM) => reason,
+            _ => accumulator_miss_reason,
+        };
+        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(metrics_path, final_miss_reason);
         rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(metrics_path, 0);
         rustfs_io_metrics::record_get_object_metadata_fanout_lifecycle(metrics_path, scheduled_count, scheduled_count, 0);
         let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
@@ -6067,8 +6105,123 @@ mod tests {
             .clone();
 
         assert!(
-            data_read_early_stop_inline_body_verified(bucket, object, &candidate, &parts_metadata, &disks).await,
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &parts_metadata, &disks)
+                .await
+                .is_none(),
             "legacy inline metadata must use the legacy bitrot shard sizing and checksum algorithm"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_read_early_stop_reports_inline_miss_reasons() {
+        let bucket = "inline-data-get-miss-reason-bucket";
+        let object = "inline-data-get-miss-reason-object";
+        let payload = b"verified inline payload";
+        let (_dirs, disks) = call_counter_local_disks(bucket, 4).await;
+        let files = inline_metadata_fanout_fileinfos_with_mode(bucket, object, payload, false).await;
+        let distribution = files
+            .first()
+            .map(|file| file.erasure.distribution.clone())
+            .expect("fixture should include metadata");
+        let order = bounded_metadata_fanout_order(bucket, object, 4, 2);
+        let mut parts_metadata = vec![FileInfo::default(); 4];
+        for disk_index in order.into_iter().take(3) {
+            let block_index = distribution
+                .get(disk_index)
+                .copied()
+                .expect("fixture distribution should cover every disk");
+            parts_metadata[disk_index] = files
+                .get(block_index.checked_sub(1).expect("erasure block indexes are one-based"))
+                .expect("fixture should include every distributed shard")
+                .clone();
+        }
+        let candidate = parts_metadata
+            .iter()
+            .find(|file| file.name == object)
+            .expect("fixture should include observed metadata")
+            .clone();
+        let data_disk = distribution
+            .iter()
+            .position(|block_index| *block_index == 1)
+            .expect("fixture distribution should include first data shard");
+
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &parts_metadata, &disks).await,
+            None
+        );
+
+        let mut not_inline = candidate.clone();
+        rustfs_utils::http::remove_str(&mut not_inline.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA);
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &not_inline, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE)
+        );
+
+        let mut transformed = candidate.clone();
+        rustfs_utils::http::insert_str(&mut transformed.metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &transformed, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED)
+        );
+
+        let mut deleted = candidate.clone();
+        deleted.deleted = true;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &deleted, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED)
+        );
+
+        let mut zero_size = candidate.clone();
+        zero_size.size = 0;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &zero_size, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE)
+        );
+
+        let mut multipart = candidate.clone();
+        multipart.parts.push(multipart.parts[0].clone());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &multipart, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE)
+        );
+
+        let mut invalid_geometry = candidate.clone();
+        invalid_geometry.erasure.data_blocks = 0;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &invalid_geometry, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY)
+        );
+
+        let mut missing_shard = parts_metadata.clone();
+        missing_shard[data_disk] = FileInfo::default();
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &missing_shard, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD)
+        );
+
+        let mut missing_payload = parts_metadata.clone();
+        missing_payload[data_disk].data = None;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &missing_payload, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD)
+        );
+
+        let mut identity_mismatch = parts_metadata.clone();
+        identity_mismatch[data_disk].version_id = Some(Uuid::new_v4());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &identity_mismatch, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH)
+        );
+
+        let mut corrupt = parts_metadata.clone();
+        if let Some(data) = corrupt[data_disk].data.as_mut() {
+            let mut corrupt_data = data.to_vec();
+            corrupt_data[0] ^= 0x01;
+            *data = Bytes::from(corrupt_data);
+        }
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &corrupt, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
         );
     }
 
@@ -6161,7 +6314,7 @@ mod tests {
                 &[
                     ("path", GET_OBJECT_PATH_INTERNAL_META),
                     ("decision", "miss"),
-                    ("reason", GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM),
+                    ("reason", GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
                 ],
             ),
             1,
@@ -6173,7 +6326,7 @@ mod tests {
                 &[
                     ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
                     ("decision", "miss"),
-                    ("reason", GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM),
+                    ("reason", GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
                 ],
             ),
             0,
