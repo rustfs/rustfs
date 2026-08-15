@@ -656,6 +656,16 @@ pub async fn update_under_transaction_lock(
     update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data).await
 }
 
+/// Clear one config file while the caller holds this bucket's transaction lock.
+pub async fn delete_under_transaction_lock(
+    guard: &BucketMetadataMutationGuard,
+    bucket: &str,
+    config_file: &str,
+) -> Result<OffsetDateTime> {
+    guard.ensure_valid(bucket)?;
+    delete_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file).await
+}
+
 pub async fn update_quota_if_incarnation(
     bucket: &str,
     data: Vec<u8>,
@@ -793,6 +803,14 @@ where
 /// rather than [`update`] — see that function.
 pub async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<BucketMetadataMutationGuard> {
     acquire_config_write_guard(get_bucket_metadata_sys()?, bucket).await
+}
+
+/// Acquire the bucket transaction lock only if its incarnation still matches.
+pub async fn acquire_bucket_metadata_transaction_lock_for_incarnation(
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+) -> Result<BucketMetadataMutationGuard> {
+    acquire_config_write_guard_for_incarnation(get_bucket_metadata_sys()?, bucket, Some(expected_incarnation_id)).await
 }
 
 pub(crate) async fn acquire_bucket_metadata_transaction_lock_in(

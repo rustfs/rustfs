@@ -135,7 +135,8 @@ pub mod bucket {
         pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
             BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
-            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
+            acquire_bucket_metadata_transaction_lock_for_incarnation, capture_bucket_metadata_incarnation, delete,
+            delete_if_incarnation, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
