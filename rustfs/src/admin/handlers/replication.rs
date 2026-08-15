@@ -1223,7 +1223,10 @@ fn build_mrf_response(
         total_failed_size,
         queued_count: queued.count,
         queued_size: queued.bytes,
-        per_object_entries_available: false,
+        // The default (non-aggregate) response mode streams the durable
+        // backlog per object, so the enumerable API exists whenever the
+        // backlog is readable.
+        per_object_entries_available: durable.available,
         runtime_stats_available: bucket_stats.replication_stats.provider_available,
         cluster_complete: bucket_stats.replication_stats.cluster_complete,
         observed_node_count: bucket_stats.replication_stats.observed_node_count,
@@ -1235,29 +1238,105 @@ fn build_mrf_response(
     }
 }
 
+/// One durable MRF backlog entry rendered for the default (madmin-compatible)
+/// stream. Field names are the exact json tags of madmin-go `ReplicationMRF`
+/// (replication-api.go), which `mc replicate backlog` decodes one JSON
+/// document at a time. `Size` and `TargetARNs` are RustFS extension keys with
+/// no madmin counterpart; Go decoders ignore unknown keys.
+#[derive(Debug, Serialize)]
+struct MrfEntryDocument {
+    /// The durable backlog is a cluster-shared ledger with no per-node
+    /// attribution, so the madmin `nodeName` tag is always empty.
+    #[serde(rename = "nodeName")]
+    node_name: String,
+    #[serde(rename = "bucket")]
+    bucket: String,
+    #[serde(rename = "object")]
+    object: String,
+    #[serde(rename = "versionId")]
+    version_id: String,
+    #[serde(rename = "retryCount")]
+    retry_count: i32,
+    #[serde(rename = "Size")]
+    size: i64,
+    #[serde(rename = "TargetARNs", skip_serializing_if = "Vec::is_empty")]
+    target_arns: Vec<String>,
+}
+
+/// Project the durable backlog into madmin `ReplicationMRF` documents,
+/// scoped to `bucket` when it is non-empty (madmin allows an empty bucket to
+/// mean "across all buckets").
+fn mrf_entry_documents(
+    bucket: &str,
+    durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
+) -> Vec<MrfEntryDocument> {
+    durable
+        .entries
+        .iter()
+        .filter(|entry| bucket.is_empty() || entry.bucket == bucket)
+        .map(|entry| MrfEntryDocument {
+            node_name: String::new(),
+            bucket: entry.bucket.clone(),
+            object: entry.object.clone(),
+            // Delete-marker purge entries track the marker version separately;
+            // fall back to it so those rows still carry a version identity.
+            version_id: entry
+                .version_id
+                .or(entry.delete_marker_version_id)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            retry_count: entry.retry_count,
+            size: entry.size,
+            target_arns: entry.target_arns.clone(),
+        })
+        .collect()
+}
+
 /// Render the MRF backlog as a response body.
 ///
-/// madmin's `BucketReplicationMRF` reads the body with a `json.Decoder` loop
-/// (one `ReplicationMRF` document per line), so an envelope object would
-/// decode as a single entry whose `"Bucket"` key case-insensitively matches
-/// `ReplicationMRF.Bucket` — a phantom row in `mc replicate backlog`.
+/// Default (madmin-compatible) mode emits one `ReplicationMRF` JSON document
+/// per line with no envelope — madmin's `BucketReplicationMRF` reads the body
+/// with a `json.Decoder` loop, so an envelope object would decode as a single
+/// entry whose `"Bucket"` key case-insensitively matches
+/// `ReplicationMRF.Bucket` (a phantom row in `mc replicate backlog`), and an
+/// empty backlog must render an empty body so the loop ends on io.EOF with
+/// zero rows.
+///
+/// `aggregate=true` (RustFS extension) keeps the enveloped counter shape;
+/// backlog-source health (`RuntimeStatsAvailable`/`DurableBacklogAvailable`)
+/// is only representable there and is signalled out-of-band for the stream.
 fn render_mrf_backlog(
     response: &MrfResponse,
-    _durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
-    _aggregate: bool,
+    durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
+    aggregate: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(response)
+    if aggregate {
+        return serde_json::to_vec(response);
+    }
+
+    let mut data = Vec::new();
+    for entry in mrf_entry_documents(&response.bucket, durable) {
+        serde_json::to_writer(&mut data, &entry)?;
+        data.push(b'\n');
+    }
+    Ok(data)
 }
 
 /// `GET /v3/replication/mrf`
 ///
 /// Reports the failed-replication backlog (MinIO's MRF concept) for a bucket.
 ///
-/// Compatibility note: MinIO returns a stream of individual MRF entries. RustFS
-/// deliberately returns aggregate runtime and durable counters instead.
-/// `PerObjectEntriesAvailable` remains false until an enumerable API exists.
-/// `PerTargetDurableEntriesAvailable` is false when the durable backlog includes
-/// older entries that cannot be attributed to a target.
+/// The default response is a madmin-compatible stream of `ReplicationMRF`
+/// documents built from the durable backlog ledger (in-memory failures that
+/// have not been flushed yet — the persister runs every few seconds — are not
+/// visible). `?aggregate=true` (RustFS extension) returns the enveloped
+/// runtime + durable counter shape instead; `PerTargetDurableEntriesAvailable`
+/// is false there when the durable backlog includes older entries that cannot
+/// be attributed to a target.
+///
+/// The madmin `node` parameter is accepted but has no filtering effect: the
+/// durable ledger is cluster-shared with no per-node attribution, so every
+/// node serves the same (complete) backlog.
 pub struct ReplicationMrfHandler {}
 
 #[async_trait::async_trait]
@@ -1289,15 +1368,37 @@ impl Operation for ReplicationMrfHandler {
             return Err(ApiError::from(err).into());
         }
 
+        if let Some(node) = queries.get("node").filter(|node| !node.is_empty() && node.as_str() != "all") {
+            // The durable backlog ledger is cluster-shared with no per-node
+            // attribution, so a node-scoped request still sees the complete
+            // (superset) backlog.
+            debug!(node = %node, "replication mrf node filter has no effect on the cluster-shared backlog");
+        }
+
         let durable = crate::admin::storage_api::replication::read_durable_mrf_backlog(store).await;
         let bucket_stats = cluster_replication_stats(&bucket, app_context_from_req(&req)).await;
         let aggregate = queries.get("aggregate").map(String::as_str) == Some("true");
         let response = build_mrf_response(bucket, &bucket_stats, &durable);
 
+        if !durable.available && !aggregate {
+            // The madmin stream has no envelope to carry source health; an
+            // unreadable backlog would otherwise be indistinguishable from an
+            // empty (healthy) one.
+            tracing::warn!(
+                bucket = %response.bucket,
+                "durable MRF backlog is unreadable; stream response is empty — use aggregate=true to see source health"
+            );
+        }
+
         let data = render_mrf_backlog(&response, &durable, aggregate)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // Out-of-band source-health signal for the bare stream (madmin/mc
+        // ignore unknown headers), mirroring x-rustfs-replication-diff-truncated.
+        if !durable.available {
+            headers.insert("x-rustfs-replication-mrf-backlog-unavailable", HeaderValue::from_static("true"));
+        }
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
@@ -1538,7 +1639,9 @@ mod tests {
         assert_eq!(json["RuntimeStatsAvailable"], true);
         assert_eq!(json["ClusterComplete"], false);
         assert_eq!(json["Targets"][0]["ObservationScope"], "partial_cluster");
-        assert_eq!(json["PerObjectEntriesAvailable"], false);
+        // The bare stream enumerates the durable backlog per object, so a
+        // readable backlog advertises the enumerable API.
+        assert_eq!(json["PerObjectEntriesAvailable"], true);
         assert_eq!(json["PerTargetDurableEntriesAvailable"], true);
 
         let targets = json["Targets"].as_array().expect("targets should serialize as an array");
