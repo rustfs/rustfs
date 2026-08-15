@@ -7103,7 +7103,42 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
     let Some(body) = rest[open_end + 1..].trim_end().strip_suffix("</LifecycleConfiguration>") else {
         return false;
     };
-    !body.contains("<Rule")
+    // The body must be a sequence of well-formed simple children (MinIO's
+    // tombstone carries e.g. <ExpiryUpdatedAt>…</ExpiryUpdatedAt>), none of
+    // them a Rule. A dangling open tag or stray text is malformed, not a
+    // tombstone.
+    let mut body = body.trim();
+    while !body.is_empty() {
+        let Some(rest) = body.strip_prefix('<') else {
+            return false;
+        };
+        let name_len = rest.bytes().take_while(|byte| byte.is_ascii_alphanumeric()).count();
+        if name_len == 0 {
+            return false;
+        }
+        let name = &rest[..name_len];
+        if name == "Rule" {
+            return false;
+        }
+        let after_name = &rest[name_len..];
+        if let Some(tail) = after_name.trim_start().strip_prefix("/>") {
+            body = tail.trim_start();
+            continue;
+        }
+        let Some(content_start) = after_name.find('>') else {
+            return false;
+        };
+        let content = &after_name[content_start + 1..];
+        let close = format!("</{name}>");
+        let Some(content_end) = content.find(&close) else {
+            return false;
+        };
+        if content[..content_end].contains('<') {
+            return false;
+        }
+        body = content[content_end + close.len()..].trim_start();
+    }
+    true
 }
 
 /// The ILM expiry statement this site contributes to its SRInfo bucket entry
@@ -15027,6 +15062,22 @@ mod tests {
         assert!(!is_zero_rule_lifecycle_tombstone(b"garbage"));
         assert!(!is_zero_rule_lifecycle_tombstone(b"<SomethingElse></SomethingElse>"));
         assert!(!is_zero_rule_lifecycle_tombstone(b""));
+        // Malformed children inside a well-delimited root are still rejected
+        // (second review round): a dangling open tag, stray text, an
+        // unclosed child, or nested markup is not a tombstone.
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration>stray text</LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><A><Rule/></A></LifecycleConfiguration>"
+        ));
+        // A self-closing non-Rule child stays acceptable.
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><Marker/></LifecycleConfiguration>"
+        ));
     }
 
     /// The staleness axis an incoming lc-config item must beat: the expiry
