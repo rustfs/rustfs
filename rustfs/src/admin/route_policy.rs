@@ -1459,10 +1459,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
+    // The default stream enumerates object names/version ids and requires
+    // ReplicationDiff (MinIO parity); only ?aggregate=true relaxes to
+    // GetReplicationMetrics in the handler.
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/replication/mrf",
-        GET_REPLICATION_METRICS,
+        REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
 ];
