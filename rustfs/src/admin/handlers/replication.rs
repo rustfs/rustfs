@@ -1266,8 +1266,8 @@ struct MrfEntryDocument {
 /// Upper bound on the number of documents one stream response emits. The
 /// durable ledger is not bounded by the in-memory pending cap (recovery can
 /// persist far larger generations), and the body is buffered before send, so
-/// an unbounded read could stage hundreds of MB per request. A truncated
-/// stream is signalled via `x-rustfs-replication-mrf-truncated`.
+/// an unbounded read could stage hundreds of MB per request. The handler
+/// rejects a response beyond this bound instead of returning a partial 200.
 const REPLICATION_MRF_MAX_STREAM_ENTRIES: usize = 10_000;
 
 /// Project the durable backlog into madmin `ReplicationMRF` documents,
@@ -1348,6 +1348,16 @@ fn render_mrf_backlog(
         data.push(b'\n');
     }
     Ok((data, truncated))
+}
+
+fn ensure_complete_mrf_stream(truncated: bool) -> S3Result<()> {
+    if truncated {
+        return Err(S3Error::with_message(
+            S3ErrorCode::ServiceUnavailable,
+            "durable MRF backlog exceeds the stream limit; narrow the bucket scope or drain the backlog".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `GET /v3/replication/mrf`
@@ -1441,16 +1451,17 @@ impl Operation for ReplicationMrfHandler {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if truncated {
-            // The madmin stream has no envelope to carry truncation; signal
-            // it out-of-band (madmin/mc ignore unknown headers), mirroring
-            // x-rustfs-replication-diff-truncated.
             tracing::warn!(
+                event = "replication_mrf_stream_rejected",
+                component = "admin",
+                subsystem = "replication",
+                result = "rejected",
                 bucket = %response.bucket,
                 max_entries = REPLICATION_MRF_MAX_STREAM_ENTRIES,
-                "replication mrf stream truncated; narrow with ?bucket= or drain the backlog"
+                "replication mrf stream exceeds the response limit"
             );
-            headers.insert("x-rustfs-replication-mrf-truncated", HeaderValue::from_static("true"));
         }
+        ensure_complete_mrf_stream(truncated)?;
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
@@ -1927,6 +1938,8 @@ mod tests {
             String::from_utf8(body).expect("utf-8").lines().count(),
             super::REPLICATION_MRF_MAX_STREAM_ENTRIES
         );
+        let error = super::ensure_complete_mrf_stream(truncated).expect_err("partial streams must not return 200");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]
