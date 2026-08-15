@@ -86,8 +86,8 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+    preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -117,7 +117,6 @@ use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::shared_types::convert_ecstore_object_info;
-use crate::storage::options::has_replication_retention_update;
 use crate::table_catalog;
 use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};

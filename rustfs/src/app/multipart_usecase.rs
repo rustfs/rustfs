@@ -44,8 +44,8 @@ use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, Wri
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
-    get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
+    parse_copy_source_range, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
@@ -76,7 +76,6 @@ use crate::app::runtime_sources::{
 };
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
-use crate::storage::options::has_replication_retention_update;
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
