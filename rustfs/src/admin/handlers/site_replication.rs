@@ -6140,7 +6140,12 @@ async fn enqueue_site_replication_retry_event_for_generation(
     let path_owned = path.to_string();
     let error_text = error.to_string();
     let result = update_site_replication_state(move |state| {
-        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        // A peer that left the state can never drain its entries again
+        // (remove_sites already pruned them); recording a late failure for it
+        // would only pollute retry_stats until the queue cap evicts it.
+        if state.peers.contains_key(&peer_owned.deployment_id) {
+            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        }
         Ok(())
     })
     .await;
@@ -6233,6 +6238,58 @@ fn retry_bucket_name(path: &str) -> Option<String> {
         .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
 }
 
+/// Settle a constant-path (collapsed) retry event only if no newer failure
+/// was recorded for it after `snapshot_updated_at`. The drain's snapshot
+/// resend proves delivery of the state as of plan-build time; a failure
+/// recorded during the (potentially long) delivery window belongs to a newer
+/// local commit the snapshot did not contain, and clearing it would leave the
+/// peer silently diverged. Returns how many events would be (or were) kept
+/// back for that reason plus how many were settled.
+fn settle_site_replication_retry_events_up_to(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    snapshot_updated_at: Option<OffsetDateTime>,
+) -> usize {
+    let before = queue.len();
+    queue.retain(|event| {
+        if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        match (event.updated_at, snapshot_updated_at) {
+            // A failure stamped after our snapshot: keep it.
+            (Some(current), Some(seen)) => current > seen,
+            (Some(_), None) => true,
+            // Legacy entry without a timestamp cannot be newer than anything.
+            (None, _) => false,
+        }
+    });
+    before - queue.len()
+}
+
+async fn dequeue_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
+    let peer_owned = peer.clone();
+    let path_owned = path.to_string();
+    let result = update_site_replication_state(move |state| {
+        settle_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
+        Ok(())
+    })
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = %peer.endpoint,
+            deployment_id = %peer.deployment_id,
+            path,
+            error = ?err,
+            "failed to settle site replication retry event"
+        );
+    }
+}
+
 /// Whether the drain may attempt this event now.
 fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetryEvent, now: OffsetDateTime) -> bool {
     let Some(updated_at) = event.updated_at else {
@@ -6287,12 +6344,23 @@ async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     let Some(store) = current_object_store_handle() else {
         return Ok(());
     };
-    // Mutual exclusion with operator repair: the repair preflight token
-    // hashes the replayable retry events, so a drain settling entries between
-    // dry-run and execute would strand the operator on a stale preflight.
-    // Lock order matches repair: lifecycle guard (held by the reconcile tick)
-    // -> repair execution lock -> state object lock inside the send
-    // bookkeeping. An operator repair holding the lock makes this tick skip.
+    if runtime.state.pending_endpoint_refresh.is_some()
+        || runtime.state.pending_remove.is_some()
+        || runtime.state.pending_rotation.is_some()
+    {
+        // The tick-level gate ran before the reconcilers; a multi-step flow
+        // (endpoint refresh commits its pending marker without the lifecycle
+        // guard) may have started since. Re-check on the fresh state.
+        return Ok(());
+    }
+    // Serialize against operator repair execution. This does NOT close the
+    // dry-run -> execute window (dry-run takes no lock): a drain settling a
+    // replayable bucket-op entry in that window changes the preflight token
+    // and execute fails safe with "preflight is stale" — the operator
+    // re-runs the dry-run. Lock order matches repair: lifecycle guard (held
+    // by the reconcile tick) -> repair execution lock -> state object lock
+    // inside the send bookkeeping. An operator repair holding the lock makes
+    // this tick skip after the lock-acquire timeout.
     with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
         drain_site_replication_retry_queue_locked(runtime, actionable).await
     })
@@ -6406,7 +6474,11 @@ async fn drain_one_site_replication_retry_event(
                     return Err(err);
                 }
             }
-            dequeue_site_replication_retry_event(peer, &event.path).await;
+            // Conditional settlement: iam-item / bucket-meta entries collapse
+            // per (peer, path), so a hook failure recorded while this snapshot
+            // was in flight belongs to a commit the snapshot did not contain
+            // and must survive this success.
+            dequeue_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
             Ok(true)
         }
         RetryDrainAction::BucketOpReplay { operation, bucket } => {
@@ -11877,6 +11949,65 @@ mod tests {
         assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/iam-item");
     }
 
+    /// The drain settles a peer-edit success under a freshly allocated
+    /// generation; legacy queue entries carry `edit_generation: None` and
+    /// must be cleared by that generation-scoped settlement (`(Some, None)`
+    /// falls through to removal), or the drain would spin on them forever.
+    #[test]
+    fn test_settle_clears_legacy_none_generation_event_for_generation_scoped_success() {
+        let target = peer("remote", "https://remote.example.com");
+        let mut queue = vec![drain_event("remote", SITE_REPLICATION_PEER_EDIT_PATH, 1, None)];
+        assert!(queue[0].edit_generation.is_none());
+
+        let settled = settle_site_replication_retry_events(&mut queue, &target, SITE_REPLICATION_PEER_EDIT_PATH, Some(42));
+
+        assert_eq!(settled, 1, "a legacy None-generation event must settle under a newer generation");
+        assert!(queue.is_empty());
+    }
+
+    /// Conditional settlement for collapsed (constant-path) entries: a
+    /// failure stamped after the drain snapshot belongs to a newer local
+    /// commit the snapshot did not contain and must survive the snapshot's
+    /// success.
+    #[test]
+    fn test_settle_up_to_keeps_failures_newer_than_the_snapshot() {
+        let target = peer("remote", "https://remote.example.com");
+        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+
+        // Failure re-stamped after the snapshot: kept.
+        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at + time::Duration::seconds(5)))];
+        assert_eq!(
+            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            0
+        );
+        assert_eq!(queue.len(), 1, "a failure newer than the snapshot must survive");
+
+        // Unchanged since the snapshot: settled.
+        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
+        assert_eq!(
+            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert!(queue.is_empty());
+
+        // Legacy entry without a timestamp cannot be newer: settled.
+        let mut queue = vec![drain_event("remote", path, 2, None)];
+        assert_eq!(
+            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert!(queue.is_empty());
+
+        // Other (peer, path) entries are untouched.
+        let mut queue = vec![drain_event("other", path, 2, Some(snapshot_at))];
+        assert_eq!(
+            settle_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            0
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
     #[test]
     fn test_pending_endpoint_refresh_retry_summary_redacts_pem() {
         let pem = "-----BEGIN CERTIFICATE-----\nsecret-marker\n-----END CERTIFICATE-----";
@@ -16722,17 +16853,31 @@ mod tests {
     async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
         publish_ready_iam_context().await;
 
+        const ROUNDS: usize = 8;
         let seed = SiteReplicationState {
             pending_rotation: Some(PendingRotation {
                 id: "rot-1".to_string(),
                 access_key: "svc-account".to_string(),
                 ..Default::default()
             }),
+            // Retry events are only recorded for current peers; seed them so
+            // the concurrency assertion below exercises the persist path.
+            peers: (0..ROUNDS)
+                .map(|round| {
+                    let deployment_id = format!("peer-{round}-deployment");
+                    (
+                        deployment_id.clone(),
+                        PeerInfo {
+                            endpoint: format!("https://peer-{round}.example:9000"),
+                            deployment_id,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
             ..Default::default()
         };
         save_site_replication_state(&seed).await.expect("seed state");
-
-        const ROUNDS: usize = 8;
         for round in 0..ROUNDS {
             let peer = PeerInfo {
                 endpoint: format!("https://peer-{round}.example:9000"),
