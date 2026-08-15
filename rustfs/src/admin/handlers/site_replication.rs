@@ -14437,7 +14437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_event_dequeue_matches_deployment_id_or_endpoint() {
+    fn test_retry_event_dequeue_preserves_collapsed_path_across_peer_identity() {
         let peer = PeerInfo {
             deployment_id: "current-dep".to_string(),
             ..peer("remote", "https://remote.example.com")
@@ -14462,9 +14462,8 @@ mod tests {
 
         let removed = dequeue_site_replication_retry_events(&mut queue, &peer, path);
 
-        assert_eq!(removed, 1);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].id, "different-path");
+        assert_eq!(removed, 0);
+        assert_eq!(queue.len(), 2);
     }
 
     #[test]
