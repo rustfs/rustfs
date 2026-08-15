@@ -6847,6 +6847,22 @@ fn merge_incoming_replication_config(
     Some(ReplicationConfiguration { role, rules })
 }
 
+/// Merge a peer's ILM expiry document into the local lifecycle config.
+///
+/// Mirrors MinIO's `mergeWithCurrentLCConfig` with one hardening: incoming
+/// transition fields are discarded outright (trust boundary — a peer must
+/// never install tier/transition rules on this site, whatever it sends).
+/// Local transition rules always survive; a delete (`incoming == None`)
+/// therefore merges with the empty set instead of dropping the whole config.
+fn merge_incoming_lifecycle_config(
+    incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
+    local: Option<s3s::dto::BucketLifecycleConfiguration>,
+    updated_at: Option<OffsetDateTime>,
+) -> Option<s3s::dto::BucketLifecycleConfiguration> {
+    let _ = (local, updated_at);
+    incoming
+}
+
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
@@ -14297,6 +14313,228 @@ mod tests {
     #[test]
     fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
         assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
+    }
+
+    fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
+        s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            expiration: expiry_days.map(|days| s3s::dto::LifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            }),
+            transitions: transition_days.map(|days| {
+                vec![s3s::dto::Transition {
+                    days: Some(days),
+                    storage_class: Some(s3s::dto::TransitionStorageClass::from_static(s3s::dto::TransitionStorageClass::GLACIER)),
+                    date: None,
+                }]
+            }),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+        }
+    }
+
+    fn lc_config(rules: Vec<s3s::dto::LifecycleRule>) -> s3s::dto::BucketLifecycleConfiguration {
+        s3s::dto::BucketLifecycleConfiguration {
+            rules,
+            expiry_updated_at: None,
+        }
+    }
+
+    fn rule_ids(config: &s3s::dto::BucketLifecycleConfiguration) -> Vec<&str> {
+        config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
+    }
+
+    /// P1-1 red-light: an incoming expiry-only document must not erase the
+    /// receiver's local transition/tiering rules (today the receiver
+    /// overwrites the whole lifecycle config).
+    #[test]
+    fn test_merge_incoming_lifecycle_preserves_local_transition_rule() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t1"]);
+        let t1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("t1")).unwrap();
+        assert!(t1.transitions.as_ref().is_some_and(|t| !t.is_empty()), "local transition must survive");
+    }
+
+    /// Same-id incoming rule updates the expiry side but the local transition
+    /// side is authoritative (MinIO `CloneNonTransition` + restore).
+    #[test]
+    fn test_merge_incoming_lifecycle_same_id_keeps_local_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("r1", Some(1), Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        assert_eq!(merged.rules.len(), 1);
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7), "incoming expiry wins");
+        assert!(
+            r1.transitions.as_ref().is_some_and(|t| !t.is_empty()),
+            "local transition is authoritative"
+        );
+    }
+
+    /// Trust boundary: whatever the peer sends, its transition fields never
+    /// land here — a new incoming rule is stripped to its expiry parts.
+    #[test]
+    fn test_merge_incoming_lifecycle_strips_incoming_transitions() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), Some(1))])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let r1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("r1")).unwrap();
+        assert!(
+            r1.transitions.as_ref().is_none_or(|t| t.is_empty()),
+            "incoming transition fields must be discarded"
+        );
+    }
+
+    /// A local rule whose expiry part was dropped upstream loses only the
+    /// expiry fields; a pure-expiry rule disappears entirely.
+    #[test]
+    fn test_merge_incoming_lifecycle_dropped_rule_strips_expiry_keeps_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("other", Some(3), None)])),
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["mixed", "other"], "pure-expiry rule not in the incoming set is removed");
+        let mixed = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("mixed")).unwrap();
+        assert!(mixed.expiration.is_none(), "expiry side cleared");
+        assert!(mixed.transitions.as_ref().is_some_and(|t| !t.is_empty()), "transition side kept");
+    }
+
+    /// Peer lifecycle delete merges with the empty set: local transition rules
+    /// survive with their expiry parts cleared; only when nothing remains does
+    /// the whole config disappear.
+    #[test]
+    fn test_merge_incoming_lifecycle_delete_merges_with_empty() {
+        let merged = merge_incoming_lifecycle_config(
+            None,
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("transition rules must survive a peer lifecycle delete");
+        assert_eq!(rule_ids(&merged), vec!["mixed"]);
+        assert!(merged.rules[0].expiration.is_none());
+
+        assert!(
+            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None).is_none(),
+            "an all-expiry config deletes cleanly"
+        );
+    }
+
+    /// Disabled rules must survive the merge like enabled ones — the merge
+    /// must not reuse ENABLED-filtered helpers.
+    #[test]
+    fn test_merge_incoming_lifecycle_keeps_disabled_transition_rule() {
+        let mut disabled = lc_rule("t-disabled", None, Some(30));
+        disabled.status = s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::DISABLED);
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![disabled])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t-disabled"]);
+    }
+
+    /// Abort-multipart-only rules carry no expiry semantics: local ones stay
+    /// untouched, incoming ones are not installed (they are site-local, like
+    /// MinIO's sender-side filter).
+    #[test]
+    fn test_merge_incoming_lifecycle_abort_mpu_rules_stay_local() {
+        let abort_only = |id: &str| s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                days_after_initiation: Some(3),
+            }),
+            del_marker_expiration: None,
+            expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            transitions: None,
+        };
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![abort_only("incoming-abort"), lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![abort_only("local-abort")])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["e1", "local-abort"],
+            "incoming abort-mpu rule is not installed; local one survives"
+        );
+    }
+
+    /// Repeated delivery of the same document must be byte-stable (rule order
+    /// deterministic), or every broadcast rewrites bucket metadata.
+    #[test]
+    fn test_merge_incoming_lifecycle_is_idempotent() {
+        let incoming = || Some(lc_config(vec![lc_rule("e1", Some(7), None), lc_rule("e2", Some(9), None)]));
+        let local = Some(lc_config(vec![lc_rule("t1", None, Some(30))]));
+
+        let once = merge_incoming_lifecycle_config(incoming(), local, None).expect("first merge");
+        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None).expect("second merge");
+
+        assert_eq!(
+            serialize(&once).expect("serialize once"),
+            serialize(&twice).expect("serialize twice"),
+            "merge must be idempotent for identical input"
+        );
+    }
+
+    /// The merged config records the expiry axis timestamp so the staleness
+    /// guard compares expiry updates against expiry updates (a local
+    /// transition-only edit must not shadow newer peer expiry updates).
+    #[test]
+    fn test_merge_incoming_lifecycle_stamps_expiry_updated_at() {
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let merged = merge_incoming_lifecycle_config(Some(lc_config(vec![lc_rule("e1", Some(7), None)])), None, Some(updated_at))
+            .expect("merge should keep rules");
+
+        let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
+        assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
     }
 
     // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
