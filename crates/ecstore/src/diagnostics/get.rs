@@ -190,6 +190,17 @@ pub(crate) const GET_METADATA_CACHE_REASON_VERSION_SUSPENDED: &str = "version_su
 pub(crate) const GET_METADATA_CACHE_REASON_VERSIONED: &str = "versioned";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA: &str = "conflicting_metadata";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER: &str = "delete_marker";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY: &str = "data_read_inline_body_verify";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED: &str = "data_read_inline_deleted";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY: &str = "data_read_inline_geometry";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH: &str = "data_read_inline_identity_mismatch";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD: &str = "data_read_inline_missing_payload";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD: &str = "data_read_inline_missing_shard";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE: &str = "data_read_inline_not_inline";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE: &str = "data_read_inline_part_shape";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE: &str = "data_read_inline_remote";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE: &str = "data_read_inline_size";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED: &str = "data_read_inline_transformed";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_ERROR: &str = "error";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM: &str = "insufficient_quorum";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_NOT_FOUND: &str = "not_found";
@@ -551,6 +562,32 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_VERSIONED, "versioned");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, "conflicting_metadata");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, "delete_marker");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY,
+            "data_read_inline_body_verify"
+        );
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED, "data_read_inline_deleted");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY, "data_read_inline_geometry");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+            "data_read_inline_identity_mismatch"
+        );
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+            "data_read_inline_missing_payload"
+        );
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD,
+            "data_read_inline_missing_shard"
+        );
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE, "data_read_inline_not_inline");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE, "data_read_inline_part_shape");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE, "data_read_inline_remote");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE, "data_read_inline_size");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED,
+            "data_read_inline_transformed"
+        );
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_ERROR, "error");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, "insufficient_quorum");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, "not_found");
