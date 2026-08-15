@@ -3956,7 +3956,7 @@ async fn persist_site_replication_repair_task(
         match failure.as_deref() {
             Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
             None => {
-                dequeue_site_replication_retry_events(&mut state.retry_queue, &peer, &path);
+                dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
             }
         }
         Ok(())
@@ -6044,6 +6044,20 @@ fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEve
     settle_site_replication_retry_events(queue, peer, path, None)
 }
 
+/// Repair-path settlement: also clears snapshot-escalated entries. Running a
+/// repair is the operator's explicit accountability transfer for the
+/// possibly-unreplayed deletion the marker records; ordinary delivery
+/// successes must not clear it (see [`settle_site_replication_retry_events`]).
+fn dequeue_site_replication_retry_events_including_escalated(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+) -> usize {
+    let before = queue.len();
+    queue.retain(|event| !retry_event_matches(event, peer, path));
+    before.saturating_sub(queue.len())
+}
+
 /// Remove the retry events for (peer, path) that `generation` is entitled to
 /// settle. A successful delivery only proves the peer reached the state the
 /// delivery carried: while it was in flight another edit can commit, fail its
@@ -6061,6 +6075,13 @@ fn settle_site_replication_retry_events(
     let before = queue.len();
     queue.retain(|event| {
         if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        // A snapshot-escalated entry records a possibly-unreplayed deletion.
+        // Collapsed paths are shared by every entity, so a later successful
+        // delivery of a DIFFERENT item proves nothing about the deleted one —
+        // only a repair settles it (dequeue_..._including_escalated).
+        if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
             return true;
         }
         match (generation, event.edit_generation) {
@@ -12024,7 +12045,19 @@ mod tests {
             classify_site_replication_retry_event(&queue[0]).is_none(),
             "a snapshot-replayed entry must not be re-sent daily"
         );
+        // Ordinary success dequeues must not clear the marker: collapsed
+        // paths are shared by every entity, so a successful Bob update
+        // proves nothing about a failed Alice deletion (second review
+        // round).
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
+        assert_eq!(queue.len(), 1, "an escalated entry must survive an ordinary delivery success");
+        // Only a repair — the operator's accountability transfer — settles it.
+        assert_eq!(dequeue_site_replication_retry_events_including_escalated(&mut queue, &target, path), 1);
+        assert!(queue.is_empty());
+
         // A later hook failure overwrites the marker and re-arms the drain.
+        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
+        escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
         upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
         assert!(classify_site_replication_retry_event(&queue[0]).is_some());
 
