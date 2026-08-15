@@ -2331,6 +2331,8 @@ fn append_bootstrap_bucket_items(
             bucket.expiry_lc_config_updated_at,
             |item, value| {
                 item.expiry_lc_config = Some(value);
+                // `updated_at` here is the entry's expiry axis (see the
+                // SRBucketInfo construction), not the wall clock.
                 item.expiry_updated_at = item.updated_at;
                 Ok(())
             },
@@ -4343,7 +4345,14 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
             entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
             entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            entry.expiry_lc_config_updated_at = maybe_time(metadata.lifecycle_config_updated_at);
+            // The expiry axis, not the whole-config write time: local
+            // transition-only edits inflate the latter, and a repair item
+            // stamped with it could out-rank a newer real expiry edit on a
+            // third site. Legacy configs without the axis fall back to the
+            // whole-config time (bounded staleness, same as the receiver).
+            entry.expiry_lc_config_updated_at = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml)
+                .map(Some)
+                .unwrap_or_else(|| maybe_time(metadata.lifecycle_config_updated_at));
             entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
             entry.replication_targets_online =
                 Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
@@ -6865,23 +6874,22 @@ fn merge_incoming_replication_config(
 /// Merge a peer's ILM expiry document into the local lifecycle config.
 ///
 /// Mirrors MinIO's `mergeWithCurrentLCConfig` with one hardening: incoming
-/// transition fields are discarded outright (trust boundary — a peer must
-/// never install tier/transition rules on this site, whatever it sends).
-/// Local transition rules always survive; a delete (`incoming == None`)
-/// therefore merges with the empty set instead of dropping the whole config.
+/// site-local fields (transitions, abort-multipart, del-marker expiration —
+/// exactly what MinIO's `CloneNonTransition` sender never emits) are
+/// discarded outright at the trust boundary, whatever the peer sends. Local
+/// site-local fields always survive; a delete (`incoming == None`) therefore
+/// merges with the empty set instead of dropping the whole config.
 fn merge_incoming_lifecycle_config(
     incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
     local: Option<s3s::dto::BucketLifecycleConfiguration>,
     updated_at: Option<OffsetDateTime>,
 ) -> Option<s3s::dto::BucketLifecycleConfiguration> {
-    // Incoming rules reduced to their expiry side (trust boundary). Rules
-    // that carry no expiry semantics after the strip — transition-only or
-    // abort-multipart-only — are site-local and are not installed.
+    // Incoming rules reduced to their traveling expiry side. Rules with no
+    // expiry semantics after the strip are not installed.
     let mut incoming_by_id: HashMap<String, s3s::dto::LifecycleRule> = HashMap::new();
     let mut incoming_order: Vec<String> = Vec::new();
     for mut rule in incoming.into_iter().flat_map(|config| config.rules) {
-        rule.transitions = None;
-        rule.noncurrent_version_transitions = None;
+        strip_site_local_lifecycle_fields(&mut rule);
         if !lifecycle_rule_has_expiry(&rule) {
             continue;
         }
@@ -6900,23 +6908,28 @@ fn merge_incoming_lifecycle_config(
         let id = rule.id.clone().unwrap_or_default();
         if let Some(mut incoming_rule) = incoming_by_id.remove(&id) {
             incoming_order.retain(|pending| pending != &id);
-            // The incoming expiry side wins; the local transition side is
+            // The incoming expiry side wins; the local site-local side is
             // authoritative (MinIO CloneNonTransition + restore).
             incoming_rule.transitions = rule.transitions.take();
             incoming_rule.noncurrent_version_transitions = rule.noncurrent_version_transitions.take();
+            incoming_rule.abort_incomplete_multipart_upload = rule.abort_incomplete_multipart_upload.take();
+            incoming_rule.del_marker_expiration = rule.del_marker_expiration.take();
             rules.push(incoming_rule);
         } else if lifecycle_rule_has_expiry(&rule) {
-            // Expiry rule dropped upstream: remove a pure-expiry rule, or
-            // strip only the expiry side when a transition side remains.
-            if lifecycle_rule_has_transition(&rule) {
-                rule.expiration = None;
-                rule.noncurrent_version_expiration = None;
-                rule.del_marker_expiration = None;
+            // Expiry rule dropped upstream: strip only the traveling expiry
+            // side; the rule survives while any site-local action remains.
+            rule.expiration = None;
+            rule.noncurrent_version_expiration = None;
+            if lifecycle_rule_has_transition(&rule)
+                || rule.abort_incomplete_multipart_upload.is_some()
+                || rule.del_marker_expiration.is_some()
+            {
                 rules.push(rule);
             }
         } else {
-            // No expiry semantics (transition-only / abort-mpu-only): not
-            // managed by expiry replication, keep untouched.
+            // No traveling expiry semantics (transition-only / abort-mpu-only
+            // / del-marker-only): not managed by expiry replication, keep
+            // untouched.
             rules.push(rule);
         }
     }
@@ -6932,17 +6945,20 @@ fn merge_incoming_lifecycle_config(
 
     Some(s3s::dto::BucketLifecycleConfiguration {
         rules,
-        // Stamp the expiry axis so the staleness guard compares expiry
-        // updates against expiry updates; a local transition-only edit moves
-        // only the whole-config timestamp, not this one.
+        // Record the expiry axis the staleness guard compares on. (The PUT
+        // path stamps `expiry_updated_at` only when the expiry subset
+        // changes, so this axis is not inflated by transition-only edits.)
         expiry_updated_at: updated_at.map(s3s::dto::Timestamp::from).or(local_expiry_updated_at),
     })
 }
 
-/// True when the rule carries expiry semantics that `replicateILMExpiry` is
-/// allowed to propagate.
+/// True when the rule carries the expiry semantics that `replicateILMExpiry`
+/// propagates. Del-marker expiration and abort-multipart are deliberately
+/// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
+/// both), so treating them as traveling state would let a MinIO peer's
+/// broadcast delete this site's del-marker-only rules.
 fn lifecycle_rule_has_expiry(rule: &s3s::dto::LifecycleRule) -> bool {
-    rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some() || rule.del_marker_expiration.is_some()
+    rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
 }
 
 fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
@@ -6951,6 +6967,15 @@ fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
             .noncurrent_version_transitions
             .as_ref()
             .is_some_and(|transitions| !transitions.is_empty())
+}
+
+/// Remove the fields that never travel between sites (MinIO
+/// `CloneNonTransition` parity).
+fn strip_site_local_lifecycle_fields(rule: &mut s3s::dto::LifecycleRule) {
+    rule.transitions = None;
+    rule.noncurrent_version_transitions = None;
+    rule.abort_incomplete_multipart_upload = None;
+    rule.del_marker_expiration = None;
 }
 
 /// Reduce a lifecycle XML document to the expiry subset that is allowed to
@@ -6977,8 +7002,7 @@ fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
         .rules
         .into_iter()
         .filter_map(|mut rule| {
-            rule.transitions = None;
-            rule.noncurrent_version_transitions = None;
+            strip_site_local_lifecycle_fields(&mut rule);
             lifecycle_rule_has_expiry(&rule).then_some(rule)
         })
         .collect();
@@ -6996,6 +7020,29 @@ fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
             Some(raw.to_vec())
         }
     }
+}
+
+/// The expiry replication axis persisted in a lifecycle XML document, if any.
+/// Used for the SRInfo bucket entry so bootstrap/repair items carry the
+/// expiry axis instead of the whole-config write time (which local
+/// transition-only edits inflate).
+fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> {
+    if raw.is_empty() {
+        return None;
+    }
+    deserialize::<s3s::dto::BucketLifecycleConfiguration>(raw)
+        .ok()
+        .and_then(|config| config.expiry_updated_at)
+        .map(OffsetDateTime::from)
+}
+
+/// MinIO emits a zero-rule `<LifecycleConfiguration><ExpiryUpdatedAt>…`
+/// document for its delete tombstone / transition-only states; the s3s
+/// deserializer rejects a missing `<Rule>` outright. Such a document is the
+/// "no expiry rules here" statement and must map to delete semantics rather
+/// than an error.
+fn lifecycle_document_has_rules(raw: &[u8]) -> bool {
+    raw.windows(b"<Rule".len()).any(|window| window == b"<Rule")
 }
 
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
@@ -8130,32 +8177,49 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         // Receiver-side gate, symmetric with the sender hook: a peer must not
         // install expiry rules here while `replicateILMExpiry` is off. When
         // the state cannot be read, fall through and apply (pre-gate
-        // behavior) rather than silently dropping a legitimate update.
+        // behavior) rather than silently dropping a legitimate update. Note
+        // the gate acks with 200 — the sender treats the item as delivered
+        // and will not retry; items skipped inside the enable-flag
+        // propagation window are healed by repair, not by retry.
         if let Ok(state) = load_site_replication_state().await
             && !site_replication_state_replicates_ilm_expiry(&state)
         {
             return Ok(());
         }
 
-        let incoming = item
-            .expiry_lc_config
-            .as_ref()
-            .map(|raw| {
+        let incoming = match item.expiry_lc_config.as_ref() {
+            Some(raw) => {
                 let data = decode_bucket_meta_wire_value(raw);
-                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data)
-            })
-            .transpose()
-            .map_err(|e| s3_error!(InvalidRequest, "invalid lifecycle config: {e}"))?;
+                match deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data) {
+                    Ok(config) => Some(config),
+                    // MinIO's delete tombstone / transition-only state is a
+                    // zero-rule document the strict deserializer rejects; it
+                    // means "no expiry rules here" (delete semantics).
+                    Err(_) if !lifecycle_document_has_rules(&data) => None,
+                    Err(e) => return Err(s3_error!(InvalidRequest, "invalid lifecycle config: {e}")),
+                }
+            }
+            None => None,
+        };
         let local = match metadata_sys::get_lifecycle_config(&item.bucket).await {
             Ok((config, _)) => Some(config),
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
+        // Staleness axis: the config's expiry_updated_at when present. When
+        // the config is absent (deleted) or predates the axis field, fall
+        // back to the whole-config write time — it survives deletion in
+        // bucket metadata and is the deletion's lower bound, so a delayed
+        // stale broadcast cannot resurrect deleted expiry rules.
+        let whole_config_axis = metadata_sys::get(&item.bucket)
+            .await
+            .map(|bucket_meta| bucket_meta.lifecycle_config_updated_at)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let local_expiry_updated_at = local
             .as_ref()
             .and_then(|config| config.expiry_updated_at.clone())
             .map(OffsetDateTime::from)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            .unwrap_or(whole_config_axis);
         if is_stale_update(local_expiry_updated_at, incoming_updated_at) {
             return Ok(());
         }
@@ -14723,6 +14787,72 @@ mod tests {
 
         let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
         assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
+    }
+
+    /// MinIO's sender never emits del-marker-expiration rules
+    /// (CloneNonTransition drops them), so a MinIO expiry broadcast must not
+    /// delete this site's del-marker-only rules, and the local del-marker
+    /// side of a same-id rule is authoritative.
+    #[test]
+    fn test_merge_incoming_lifecycle_del_marker_rules_stay_local() {
+        let del_marker_only = |id: &str| {
+            let mut rule = lc_rule(id, None, None);
+            rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+            rule
+        };
+
+        // A local del-marker-only rule survives an incoming expiry document
+        // that does not mention it.
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![del_marker_only("dm-local")])),
+            None,
+        )
+        .expect("merge should keep rules");
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["dm-local", "e1"]);
+
+        // Same-id: the incoming expiry side wins, the local del-marker /
+        // abort-mpu side is authoritative and an incoming del-marker field is
+        // discarded at the trust boundary.
+        let mut local_mixed = lc_rule("r1", Some(1), None);
+        local_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+        local_mixed.abort_incomplete_multipart_upload = Some(s3s::dto::AbortIncompleteMultipartUpload {
+            days_after_initiation: Some(5),
+        });
+        let mut incoming_mixed = lc_rule("r1", Some(7), None);
+        incoming_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(9) });
+
+        let merged =
+            merge_incoming_lifecycle_config(Some(lc_config(vec![incoming_mixed])), Some(lc_config(vec![local_mixed])), None)
+                .expect("merge should keep rules");
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7));
+        assert_eq!(r1.del_marker_expiration.as_ref().and_then(|d| d.days), Some(3), "local del-marker wins");
+        assert_eq!(
+            r1.abort_incomplete_multipart_upload
+                .as_ref()
+                .and_then(|a| a.days_after_initiation),
+            Some(5),
+            "local abort-mpu wins"
+        );
+    }
+
+    /// MinIO emits a zero-rule lifecycle document (delete tombstone /
+    /// transition-only state); the strict deserializer rejects it, so the
+    /// apply path must recognize it as delete semantics via the rule sniff.
+    #[test]
+    fn test_lifecycle_document_has_rules_sniff() {
+        assert!(!lifecycle_document_has_rules(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(lifecycle_document_has_rules(
+            b"<LifecycleConfiguration><Rule><ID>x</ID></Rule></LifecycleConfiguration>"
+        ));
+        assert!(lifecycle_document_has_rules(
+            b"<LifecycleConfiguration><Rule ></Rule></LifecycleConfiguration>"
+        ));
     }
 
     /// Sender-side filter: only the expiry subset leaves this site. MinIO
