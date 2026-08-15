@@ -1304,7 +1304,9 @@ fn mrf_entry_documents(
 ///
 /// `aggregate=true` (RustFS extension) keeps the enveloped counter shape;
 /// backlog-source health (`RuntimeStatsAvailable`/`DurableBacklogAvailable`)
-/// is only representable there and is signalled out-of-band for the stream.
+/// is only representable there — an unreadable ledger fails the stream
+/// request outright in the handler (madmin only decodes the body of a 200,
+/// so an empty stream would read as a healthy zero-row backlog).
 fn render_mrf_backlog(
     response: &MrfResponse,
     durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
@@ -1381,24 +1383,24 @@ impl Operation for ReplicationMrfHandler {
         let response = build_mrf_response(bucket, &bucket_stats, &durable);
 
         if !durable.available && !aggregate {
-            // The madmin stream has no envelope to carry source health; an
-            // unreadable backlog would otherwise be indistinguishable from an
-            // empty (healthy) one.
+            // The madmin stream has no envelope to carry source health, and
+            // madmin only decodes the body of a 200 — an empty stream would
+            // read as a clean, healthy zero-row backlog. Fail loudly instead;
+            // aggregate mode still reports the availability fields.
             tracing::warn!(
                 bucket = %response.bucket,
-                "durable MRF backlog is unreadable; stream response is empty — use aggregate=true to see source health"
+                "durable MRF backlog is unreadable; failing the stream request — use aggregate=true to see source health"
             );
+            return Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "durable MRF backlog is unreadable; retry, or use aggregate=true for source health".to_string(),
+            ));
         }
 
         let data = render_mrf_backlog(&response, &durable, aggregate)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        // Out-of-band source-health signal for the bare stream (madmin/mc
-        // ignore unknown headers), mirroring x-rustfs-replication-diff-truncated.
-        if !durable.available {
-            headers.insert("x-rustfs-replication-mrf-backlog-unavailable", HeaderValue::from_static("true"));
-        }
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
