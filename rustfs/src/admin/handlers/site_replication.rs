@@ -6119,6 +6119,7 @@ async fn migrate_collapsed_retry_queue_paths() -> S3Result<()> {
     .await
 }
 
+#[cfg(test)]
 fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
     settle_site_replication_retry_events(queue, peer, path, None)
 }
