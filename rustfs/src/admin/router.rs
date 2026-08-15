@@ -1548,7 +1548,8 @@ async fn build_replication_metrics_response(
     let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
-    let body = serialize_replication_metrics_body(&bucket_stats, route)?;
+    let node_name = crate::runtime_sources::current_local_node_name().await.unwrap_or_default();
+    let body = serialize_replication_metrics_body(&bucket_stats, route, &node_name)?;
 
     let mut resp = S3Response::with_status(Body::from(body), StatusCode::OK);
     resp.headers
@@ -1608,12 +1609,24 @@ fn apply_replication_metrics_runtime_fields(
     bucket_stats
 }
 
-fn serialize_replication_metrics_body(bucket_stats: &BucketStats, route: ReplicationExtRoute) -> S3Result<Vec<u8>> {
+/// Serialize the metrics body in the minio-go wire shapes
+/// (`replication.Metrics` for v1, `replication.MetricsV2` for v2). The
+/// internal `BucketStats` serde names are the intra-cluster peer-RPC wire
+/// format and must never appear here — see
+/// `crate::admin::replication_metrics_wire`.
+fn serialize_replication_metrics_body(
+    bucket_stats: &BucketStats,
+    route: ReplicationExtRoute,
+    node_name: &str,
+) -> S3Result<Vec<u8>> {
+    use crate::admin::replication_metrics_wire::{MetricsV2Wire, MetricsWire};
     match route {
         ReplicationExtRoute::MetricsV1 => {
-            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))
+            serde_json::to_vec(&MetricsWire::from(&bucket_stats.replication_stats)).map_err(|e| s3_error!(InternalError, "{e}"))
         }
-        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(bucket_stats).map_err(|e| s3_error!(InternalError, "{e}")),
+        ReplicationExtRoute::MetricsV2 => {
+            serde_json::to_vec(&MetricsV2Wire::from_stats(bucket_stats, node_name)).map_err(|e| s3_error!(InternalError, "{e}"))
+        }
         ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Err(s3_error!(InternalError, "invalid route for metrics response"))
         }
@@ -4166,8 +4179,8 @@ mod tests {
             .replicated_count = 5;
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1).expect("metrics v1 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1, "node-1:9000")
+            .expect("metrics v1 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
         assert_eq!(payload["replicaCount"], 7);
@@ -4289,8 +4302,8 @@ mod tests {
         stats.replication_stats.q_stat = stats.replication_stats.q_stat.snapshot();
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2).expect("metrics v2 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2, "node-1:9000")
+            .expect("metrics v2 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
         assert_eq!(payload["uptime"], 99);

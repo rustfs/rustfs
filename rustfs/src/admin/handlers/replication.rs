@@ -535,8 +535,13 @@ impl Operation for GetReplicationMetricsHandler {
 
         let bucket_stats = cluster_replication_stats(bucket, app_context_from_req(&req)).await;
 
-        let data = serde_json::to_vec(&bucket_stats.replication_stats)
-            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
+        // Same minio-go `replication.Metrics` wire shape as
+        // `?replication-metrics` — the internal snake_case stats are the peer
+        // RPC wire format and must not leak here.
+        let data = serde_json::to_vec(&crate::admin::replication_metrics_wire::MetricsWire::from(
+            &bucket_stats.replication_stats,
+        ))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
