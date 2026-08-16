@@ -88,6 +88,7 @@ pub mod inspect;
 pub(crate) mod kms_deletion_gate;
 pub mod license;
 pub mod memory_observability;
+pub mod module_switches;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;

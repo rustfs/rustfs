@@ -16,11 +16,7 @@
 #   cycle|left_layer<->right_layer
 cycle|app<->infra
 cycle|app<->interface
-cycle|composition<->infra
-cycle|composition<->interface
 cycle|infra<->interface
-dep|rustfs/src/admin/handlers/scanner.rs|interface->composition|crate::startup_background::ENV_SCANNER_ENABLED
-dep|rustfs/src/admin/handlers/scanner.rs|interface->composition|crate::startup_background::scanner_enabled_from_env
 dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_bucket_meta_hook
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
@@ -29,8 +25,6 @@ dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_depe
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
 dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::server::cors
 dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery
-dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::is_audit_module_enabled
-dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::is_notify_module_enabled
 dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_audit_module_enabled
 dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_notify_module_enabled
 dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
@@ -40,5 +34,3 @@ dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::servic
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM
-dep|rustfs/src/storage/rpc/node_service/heal.rs|infra->composition|crate::startup_background::heal_enabled_from_env
-dep|rustfs/src/storage/rpc/node_service/heal.rs|infra->composition|crate::startup_background::scanner_enabled_from_env

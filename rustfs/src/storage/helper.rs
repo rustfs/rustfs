@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::{is_audit_module_enabled, is_notify_module_enabled};
+use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
 use crate::shared_types::convert_ecstore_object_info;
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::RequestContext;

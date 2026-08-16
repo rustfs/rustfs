@@ -12,31 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage_api::startup::background::{ECStore, set_workload_admission_snapshot_provider};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_workload_provider,
 };
-use rustfs_utils::get_env_bool_with_aliases;
 use std::{io::Result, sync::Arc};
 use tracing::{debug, info};
 
-pub(crate) const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
-pub(crate) const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
-pub(crate) const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
-pub(crate) const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
-
-pub(crate) fn scanner_enabled_from_env() -> bool {
-    get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true)
-}
-
-pub(crate) fn heal_enabled_from_env() -> bool {
-    get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true)
-}
 
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
     let _ = create_ahm_services_cancel_token();
