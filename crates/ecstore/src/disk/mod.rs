@@ -1375,6 +1375,7 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
 }
