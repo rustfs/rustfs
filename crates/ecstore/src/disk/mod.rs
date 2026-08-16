@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: disk abstractions still carry staged health and direct-I/O migration paths.
-#![allow(dead_code)]
 
 pub mod disk_store;
 pub mod endpoint;
@@ -1114,6 +1113,10 @@ pub struct DiskInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "MinIO-parity disk info shape with no constructor in this port (backlog#1823)"
+)]
 pub struct Info {
     pub total: u64,
     pub free: u64,
