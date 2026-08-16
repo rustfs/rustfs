@@ -83,7 +83,10 @@ where
     Ok(ans)
 }
 
-#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+#[allow(
+    dead_code,
+    reason = "xml serialize helper with no caller in this port; the live sibling is deserialize (backlog#1823)"
+)]
 pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
     let mut buf = Vec::with_capacity(256);
     {

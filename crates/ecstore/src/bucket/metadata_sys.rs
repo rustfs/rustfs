@@ -893,7 +893,10 @@ pub async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, OffsetDateTi
     bucket_meta_sys.get_bucket_policy_raw(bucket).await
 }
 
-#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+#[allow(
+    dead_code,
+    reason = "free-function facade over the live BucketMetadataSys::get_bucket_acl_config; no caller in this port (backlog#1823)"
+)]
 pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -1108,7 +1111,10 @@ pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
     bucket_meta_sys.get_config_from_disk(bucket).await
 }
 
-#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+#[allow(
+    dead_code,
+    reason = "ambient-facade variant of the live created_at_in; no caller in this port (backlog#1823)"
+)]
 pub async fn created_at(bucket: &str) -> Result<OffsetDateTime> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;

@@ -7476,7 +7476,7 @@ mod tests {
     #[allow(unsafe_code)]
     #[allow(
         dead_code,
-        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+        reason = "transition-queue env fixture kept for tests that scope those vars; no test uses it today (backlog#1823)"
     )]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
