@@ -3935,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_bounded_fanout_defaults_to_enabled() {
+    fn metadata_early_stop_bounded_fanout_defaults_to_disabled() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
@@ -3944,9 +3944,12 @@ mod tests {
             ],
             || {
                 assert!(is_get_metadata_data_read_early_stop_enabled());
-                assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
+                assert!(!is_get_metadata_early_stop_bounded_fanout_enabled());
             },
         );
+        temp_env::with_vars([(ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true"))], || {
+            assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
+        });
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
