@@ -103,6 +103,10 @@ pub(crate) fn table_warehouse_index_entry(entry: &TableEntry) -> TableCatalogSto
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 fn table_warehouse_data_dir_path(entry: &TableEntry) -> TableCatalogStoreResult<String> {
     Ok(format!("{}{}", table_warehouse_object_prefix(entry)?, DATA_DIR))
 }
@@ -2414,11 +2418,35 @@ struct SnapshotGraphManifestLocation {
     sequence_number: Option<i64>,
     min_sequence_number: Option<i64>,
     added_snapshot_id: Option<i64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     added_files_count: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     existing_files_count: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     deleted_files_count: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     added_rows_count: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     existing_rows_count: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     deleted_rows_count: Option<u64>,
     from_manifest_list: bool,
 }
