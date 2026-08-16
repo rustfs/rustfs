@@ -180,11 +180,13 @@ pub(in crate::set_disk) enum GetCodecStreamingReaderBuildOutcome {
     Fallback(GetCodecStreamingFallbackReason),
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) struct MultipartCodecStreamingReader {
     pub(in crate::set_disk) readers: VecDeque<Box<dyn AsyncRead + Unpin + Send + Sync>>,
 }
 
 impl MultipartCodecStreamingReader {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) fn new(readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>>) -> Self {
         Self {
             readers: VecDeque::from(readers),
@@ -1836,6 +1838,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
@@ -2126,6 +2129,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     setup
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -2442,6 +2446,7 @@ impl SetDisks {
         let bucket: Arc<str> = Arc::from(bucket);
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let task_opts = opts;
@@ -2449,10 +2454,14 @@ impl SetDisks {
             let bucket = bucket.clone();
             let object = object.clone();
             let version_id = version_id.clone();
+            let slowtail_fault = slowtail_fault.clone();
             tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
+                    if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
+                        tokio::time::sleep(delay).await;
+                    }
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                         .await
                 } else {
@@ -2548,6 +2557,7 @@ impl SetDisks {
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
         let mut final_miss_reason_override = None;
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
                 let task_opts = opts;
@@ -2555,6 +2565,7 @@ impl SetDisks {
                 let bucket = bucket.clone();
                 let object = object.clone();
                 let version_id = version_id.clone();
+                let slowtail_fault = slowtail_fault.clone();
                 join_set.spawn(async move {
                     let response_start = Instant::now();
                     let result = if let Some(disk) = disk {
@@ -2563,6 +2574,9 @@ impl SetDisks {
                         Self::record_read_version_call(&object, index);
                         #[cfg(test)]
                         Self::read_version_fanout_barrier(&object, index).await;
+                        if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
+                            tokio::time::sleep(delay).await;
+                        }
                         disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                             .await
                     } else {
@@ -2955,6 +2969,7 @@ impl SetDisks {
         (meta_file_infos, errs)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn read_multiple_files(
         disks: &[Option<DiskStore>],
         req: ReadMultipleReq,
@@ -3134,6 +3149,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) committed_file_info: FileInfo,
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
     RenameConvergence,
@@ -3143,6 +3159,7 @@ type RenameDataLegacyTuple = (
 );
 
 impl RenameDataCommit {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn into_legacy_tuple(self) -> RenameDataLegacyTuple {
         (
             self.online_disks,
@@ -3261,6 +3278,7 @@ impl SetDisks {
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -5073,6 +5091,7 @@ fn is_cleanup_not_found(e: &DiskError) -> bool {
 /// normalized to `DiskNotFound`: a panic is not a "disk absent" condition and
 /// must not be silently swallowed as an ignorable error (fixes the historical
 /// `Unexpected`/`DiskNotFound` misclassification).
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn map_cleanup_join_result(joined: std::result::Result<Option<DiskError>, tokio::task::JoinError>) -> Option<DiskError> {
     match joined {
         Ok(res) => res,
@@ -5297,6 +5316,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier_phase {
     /// The per-disk old-data-dir cleanup phase of the commit fan-out.
     pub const CLEANUP: &str = "cleanup";
     /// The per-disk `read_version` phase of metadata read fan-out.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub const READ_VERSION: &str = "read_version";
 }
 
@@ -5732,6 +5752,130 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[test]
+    fn metadata_slowtail_fault_delay_parses_and_filters_request() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some("bench-bucket")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            || {
+                assert_eq!(
+                    get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, true),
+                    Some(Duration::from_millis(25))
+                );
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 2, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("other-bucket", "objects/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "other/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, false).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_slowtail_fault_delay_disables_invalid_disk_list() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,nope")),
+            ],
+            || {
+                assert!(get_metadata_slowtail_fault_delay("bucket", "object", 1, true).is_none());
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_only_data_read_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-fault-bucket";
+        let object = "objects/metadata-slowtail-fault-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let read_without_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", false, false, false, true, 2);
+                tokio::time::timeout(Duration::from_millis(100), read_without_data)
+                    .await
+                    .expect("non-data metadata fanout must not be delayed by the data-read slowtail hook")
+                    .expect("metadata fanout without read_data should resolve");
+
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "data-read metadata fanout must wait for the injected slow read_version response"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected slowtail should eventually complete")
+                    .expect("data-read metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_early_stop_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-early-stop-bucket";
+        let object = "objects/metadata-slowtail-early-stop-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "early-stop metadata fanout must still wait for the injected slow response after fallback to full wait"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected early-stop slowtail should eventually complete")
+                    .expect("early-stop metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
     }
 
     /// Demo / regression guard for the backlog#1325 per-disk call counters.

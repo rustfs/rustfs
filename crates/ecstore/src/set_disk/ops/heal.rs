@@ -1716,6 +1716,10 @@ impl SetDisks {
         Ok((result, None))
     }
 
+    #[allow(
+        dead_code,
+        reason = "lock-taking wrapper over the live heal_object_dir_locked; only comments reference it (backlog#1823)"
+    )]
     #[tracing::instrument(level = "trace", skip(self), fields(bucket = %bucket, object = %object))]
     pub(in crate::set_disk) async fn heal_object_dir(
         &self,

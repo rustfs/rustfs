@@ -3507,6 +3507,10 @@ struct TransitionUploadedSaveProbeState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionUploadedSaveProbe {
     state: Arc<TransitionUploadedSaveProbeState>,
 }
@@ -3517,6 +3521,10 @@ static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Opti
 
 #[cfg(test)]
 impl TransitionUploadedSaveProbe {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedSaveProbeState {
             bucket: bucket.to_string(),
@@ -3533,6 +3541,10 @@ impl TransitionUploadedSaveProbe {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn attempts(&self) -> usize {
         self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -3738,6 +3750,10 @@ struct TransitionCommitBarrierState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionCommitBarrier {
     state: Arc<TransitionCommitBarrierState>,
 }
@@ -3748,14 +3764,26 @@ static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Ar
 
 #[cfg(test)]
 impl TransitionCommitBarrier {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_before_lock_lost_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLockLost)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseValidation)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_after_lease_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseValidation)
     }
@@ -3778,12 +3806,20 @@ impl TransitionCommitBarrier {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("transition should reach the deterministic commit barrier");
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn release(&self) {
         self.state.release.notify_one();
     }
@@ -10168,6 +10204,288 @@ mod transition_upload_integrity_tests {
             "the internal checksum sidecar must not be uploaded as remote user metadata"
         );
         assert!(backend.contains(remote_object).await, "committed remote object should remain available");
+    }
+
+    /// Compresses `plaintext` with the codec the PUT path uses, so the stored
+    /// bytes round-trip through the read path's decompressor.
+    async fn compress_for_storage(plaintext: &[u8]) -> Vec<u8> {
+        let mut reader = crate::io_support::rio::compression_reader(
+            Cursor::new(plaintext.to_vec()),
+            rustfs_utils::CompressionAlgorithm::default(),
+            false,
+        );
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("plaintext should compress");
+        assert!(compressed.len() < plaintext.len(), "test payload must actually compress");
+        compressed
+    }
+
+    /// Writes a genuinely compressed object: stored data is `compressed`, and the
+    /// metadata marks it compressed with the plaintext length as its actual size,
+    /// exactly as the app-layer compress path records it.
+    async fn write_compressed_source(
+        set_disks: &Arc<SetDisks>,
+        disk_stores: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        plaintext: &[u8],
+        compressed: &[u8],
+    ) -> ObjectInfo {
+        for disk in disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(rustfs_utils::CompressionAlgorithm::default()),
+        );
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+        let stream = crate::io_support::rio::HashReader::from_stream(
+            Cursor::new(compressed.to_vec()),
+            compressed.len() as i64,
+            plaintext.len() as i64,
+            None,
+            None,
+            false,
+        )
+        .expect("hash reader over compressed bytes");
+        let mut reader = PutObjReader::new(stream);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    user_defined,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("compressed object should be written")
+    }
+
+    async fn read_transitioned(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> (Vec<u8>, i64) {
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, range, HeaderMap::new(), opts)
+            .await
+            .expect("transitioned object reader should open");
+        let published_size = reader.object_info.size;
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("transitioned body should drain");
+        (body, published_size)
+    }
+
+    /// Transition uploads the object's STORED bytes, so a tiered read has to
+    /// apply the same transform an erasure read would. #6107 routed this path
+    /// through `ReadPlan` to stop serving an encrypted object's ciphertext;
+    /// compression rides the same plan, and nothing pinned it (backlog#1851).
+    /// Without the transform this GET returns the compressed bytes under the
+    /// compressed size — silent corruption for every client of a compressed
+    /// object that ILM has moved to a warm tier.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_compressed_object_get_returns_plaintext() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-get-bucket";
+        let object = "object.txt";
+        let plaintext = b"transitioned compressed objects must decompress on read ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let (local_body, local_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(local_body, plaintext, "control: the pre-transition read must decompress");
+        assert_eq!(
+            local_size,
+            plaintext.len() as i64,
+            "control: the pre-transition read publishes the plaintext size"
+        );
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should upload one remote candidate");
+        let remote_bytes = backend
+            .bytes(&put_versions[0].0)
+            .await
+            .expect("remote candidate should be stored");
+        assert_eq!(
+            remote_bytes, compressed,
+            "transition uploads the stored representation; the read side is what has to decode it"
+        );
+
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(body, plaintext, "a tiered read must return the object's content, not its stored bytes");
+        assert_eq!(
+            published_size,
+            plaintext.len() as i64,
+            "a tiered read must publish the plaintext size, not the compressed one"
+        );
+    }
+
+    /// A ranged tiered read is expressed in plaintext coordinates, so the plan
+    /// has to translate it into the remote copy's compressed extent and skip
+    /// into the decompressed stream — the same translation the erasure path does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_compressed_object_range_get_returns_plaintext_slice() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-range-bucket";
+        let object = "object.txt";
+        let plaintext = b"ranged reads of transitioned compressed objects must land in plaintext ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        // Deliberately past the compressed size, so a range still measured in
+        // stored coordinates could not produce this slice.
+        let start = compressed.len() as i64 + 4096;
+        let end = start + 511;
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end,
+        };
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, Some(range), &opts).await;
+
+        let expected = &plaintext[start as usize..=end as usize];
+        assert_eq!(body, expected, "a ranged tiered read must return that plaintext slice");
+        assert_eq!(published_size, expected.len() as i64, "a ranged tiered read publishes the slice length");
+    }
+
+    /// The restore copy-back re-writes the object under its original metadata,
+    /// which still says "compressed". It therefore has to keep receiving the
+    /// STORED bytes: `restore_request_active` holds it on the plan's `Plain`
+    /// branch, and decompressing there would write plaintext under compressed
+    /// metadata.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_read_of_transitioned_compressed_object_keeps_stored_bytes() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-restore-bucket";
+        let object = "object.txt";
+        let plaintext = b"restore copy-back must keep the stored representation intact ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let oi = set_disks
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("transitioned metadata should resolve");
+        let restore_opts = ObjectOptions {
+            no_lock: true,
+            part_number: Some(1),
+            transition: TransitionOptions {
+                restore_request: s3s::dto::RestoreRequest {
+                    days: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            bucket,
+            object,
+            &None,
+            &HeaderMap::new(),
+            &oi,
+            &restore_opts,
+            &set_disks.ctx.tier_config_mgr(),
+            set_disks.ctx.object_encryption_resolver(),
+        )
+        .await
+        .expect("restore read of the tiered copy should open");
+        let published_size = reader.object_info.size;
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("restore body should drain");
+
+        assert_eq!(body, compressed, "a restore read must copy the stored bytes back verbatim");
+        assert_eq!(
+            published_size,
+            compressed.len() as i64,
+            "a restore read must keep publishing the stored size"
+        );
+    }
+
+    /// Plain objects must keep streaming the remote bytes through untouched:
+    /// their plan is `Plain`, so the tiered read stays byte-identical.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_plain_object_get_is_unchanged() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-plain-get-bucket";
+        let object = "object.bin";
+        let payload = b"plain transitioned objects must keep reading back byte-identical ".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(body, payload);
+        assert_eq!(published_size, payload.len() as i64);
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 100,
+            end: 611,
+        };
+        let (ranged_body, ranged_size) = read_transitioned(&set_disks, bucket, object, Some(range), &opts).await;
+        assert_eq!(ranged_body, &payload[100..=611]);
+        assert_eq!(ranged_size, payload.len() as i64, "a plain ranged read keeps publishing the object size");
     }
 
     async fn corrupt_beyond_read_quorum(
