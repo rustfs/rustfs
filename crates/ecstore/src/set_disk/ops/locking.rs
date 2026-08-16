@@ -66,8 +66,7 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 }
 
 impl SetDisks {
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
     pub(in crate::set_disk) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
             LockResult::Timeout => {
@@ -81,7 +80,7 @@ impl SetDisks {
         }
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
     pub(in crate::set_disk) fn format_lock_error_from_error(
         &self,
         bucket: &str,
@@ -157,7 +156,10 @@ impl SetDisks {
         disks
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "local-only sibling of the test-covered get_online_disks; no caller in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let snapshot = self.drive_membership_snapshot().await;
         let mut disks = snapshot
@@ -437,7 +439,10 @@ impl SetDisks {
         Ok((disk, fm))
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity healing-disk accessor with no caller in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_disk_with_healing(
         &self,
         incl_healing: bool,
@@ -446,7 +451,10 @@ impl SetDisks {
         Ok((new_disks, healing > 0))
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "reached only from get_online_disk_with_healing, itself uncalled in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_disk_with_healing_and_info(
         &self,
         incl_healing: bool,
