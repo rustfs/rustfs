@@ -1900,6 +1900,40 @@ fn create_table_assigns_positive_ids_to_spark_schema() {
 }
 
 #[test]
+fn create_table_assigns_fresh_id_to_negative_temporary_field_id() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "identifier-field-ids": [-1],
+            "fields": [{"id": -1, "name": "id", "required": true, "type": "long"}]
+        },
+        "partition-spec": {
+            "fields": [{"source-id": -1, "name": "id", "transform": "identity"}]
+        },
+        "write-order": {
+            "fields": [{
+                "source-id": -1,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    }))
+    .expect("create table request with a negative temporary field ID should parse");
+
+    let (_, metadata) = table_entry_from_create_table_request("warehouse", &namespace, request)
+        .expect("catalog should replace the negative temporary field ID");
+
+    assert_eq!(metadata["schemas"][0]["fields"][0]["id"], 1);
+    assert_eq!(metadata["schemas"][0]["identifier-field-ids"], serde_json::json!([1]));
+    assert_eq!(metadata["partition-specs"][0]["fields"][0]["source-id"], 1);
+    assert_eq!(metadata["sort-orders"][0]["fields"][0]["source-id"], 1);
+    assert_eq!(metadata["last-column-id"], 1);
+}
+
+#[test]
 fn create_table_request_honors_supported_format_version_property() {
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let request: CreateTableRequest = serde_json::from_value(serde_json::json!({

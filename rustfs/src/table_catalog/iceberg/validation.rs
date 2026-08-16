@@ -1474,9 +1474,6 @@ impl FreshCreateSchemaIdAssigner {
         label: &str,
     ) -> TableCatalogStoreResult<()> {
         let old_id = required_i32_value(object, field, label)?;
-        if old_id < 0 {
-            return Err(TableCatalogStoreError::Invalid(format!("{label} must be non-negative")));
-        }
         let entry = match self.old_to_new.entry(old_id) {
             std::collections::btree_map::Entry::Occupied(_) => {
                 return Err(TableCatalogStoreError::Invalid(format!("duplicate create schema field id {old_id}")));
