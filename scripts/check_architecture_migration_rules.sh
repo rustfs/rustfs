@@ -5450,6 +5450,57 @@ if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
   report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
+# --- ecstore module-level lint blankets (backlog#1823 step 9) ---
+#
+# Two rules:
+#   1. ecstore carries zero `#![allow(dead_code)]` after the step 2 burn-down;
+#      the count may only stay at zero.
+#   2. Every other module-level blanket (unused_variables / unused_must_use /
+#      clippy::all) must match scripts/ecstore-module-lint-register.txt exactly.
+#      Exact match, not "no additions": a one-way rule lets the register rot
+#      into an amnesty list, which is what backlog#1834 found in the
+#      layer-dependency baseline.
+
+ECSTORE_LINT_REGISTER="${ROOT_DIR}/scripts/ecstore-module-lint-register.txt"
+ECSTORE_DEAD_CODE_HITS="${TMP_DIR}/ecstore_dead_code_blankets.txt"
+ECSTORE_LINT_ACTUAL="${TMP_DIR}/ecstore_lint_actual.txt"
+ECSTORE_LINT_EXPECTED="${TMP_DIR}/ecstore_lint_expected.txt"
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\(dead_code\)\]' crates/ecstore/src/ 2>/dev/null || true
+) >"$ECSTORE_DEAD_CODE_HITS"
+
+if [[ -s "$ECSTORE_DEAD_CODE_HITS" ]]; then
+  report_failure "ecstore must carry no module-level #![allow(dead_code)] (backlog#1823 step 2 cleared them; re-add an item-level allow with a reason instead): $(paste -sd '; ' "$ECSTORE_DEAD_CODE_HITS")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\((unused_variables|unused_must_use|clippy::all)\)\]' crates/ecstore/src/ 2>/dev/null |
+    sed -E 's#^([^:]+):[0-9]+:\#!\[allow\(([^)]+)\)\]#\1|\2#' | sort -u
+) >"$ECSTORE_LINT_ACTUAL"
+
+if [[ ! -f "$ECSTORE_LINT_REGISTER" ]]; then
+  report_failure "missing scripts/ecstore-module-lint-register.txt (backlog#1823 step 9)"
+else
+  rg -v '^\s*(#|$)' "$ECSTORE_LINT_REGISTER" | sort -u >"$ECSTORE_LINT_EXPECTED"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_EXPECTED"; then
+      report_failure "new ecstore module-level lint blanket '${entry}' is not in scripts/ecstore-module-lint-register.txt; prefer an item-level allow with a reason, or add the line with a rationale in the PR description (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_ACTUAL"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_ACTUAL"; then
+      report_failure "scripts/ecstore-module-lint-register.txt lists '${entry}' but the blanket is gone; delete the line in the same PR so the register can only shrink (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_EXPECTED"
+fi
+
 if (( FAILURES > 0 )); then
   exit 1
 fi
