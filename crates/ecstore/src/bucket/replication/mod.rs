@@ -60,7 +60,7 @@ pub use replication_filemeta_boundary::{
 pub(crate) use replication_filemeta_boundary::{
     replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
 };
-pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
+pub(crate) use replication_lifecycle_bridge::ReplicationLifecycleBridge;
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::{DeleteReplicationConfigSnapshot, ReplicationConfig};

@@ -71,6 +71,10 @@ pub(crate) struct DecodedManifest {
     pub partition_spec_id: Option<i32>,
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<String>> {
     Ok(manifest_list_references_from_manifest_list_avro(data)?
         .into_iter()
@@ -78,6 +82,10 @@ pub(crate) fn manifest_paths_from_manifest_list_avro(data: &[u8]) -> TableCatalo
         .collect())
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn manifest_list_references_from_manifest_list_avro(
     data: &[u8],
 ) -> TableCatalogStoreResult<Vec<ManifestListReference>> {
@@ -157,6 +165,10 @@ pub(crate) async fn decode_manifest_list_avro_async(data: Vec<u8>) -> TableCatal
         .map_err(|err| TableCatalogStoreError::Internal(format!("manifest-list parser task failed: {err}")))?
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn file_references_from_manifest_avro(
     data: &[u8],
 ) -> TableCatalogStoreResult<Vec<(String, TableMetadataMaintenanceObjectKind)>> {
@@ -166,6 +178,10 @@ pub(crate) fn file_references_from_manifest_avro(
         .collect())
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Vec<ManifestDataFileReference>> {
     Ok(decode_manifest_avro(data)?.references)
 }

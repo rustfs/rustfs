@@ -180,11 +180,13 @@ pub(in crate::set_disk) enum GetCodecStreamingReaderBuildOutcome {
     Fallback(GetCodecStreamingFallbackReason),
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) struct MultipartCodecStreamingReader {
     pub(in crate::set_disk) readers: VecDeque<Box<dyn AsyncRead + Unpin + Send + Sync>>,
 }
 
 impl MultipartCodecStreamingReader {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) fn new(readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>>) -> Self {
         Self {
             readers: VecDeque::from(readers),
@@ -1836,6 +1838,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
@@ -2126,6 +2129,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     setup
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -2965,6 +2969,7 @@ impl SetDisks {
         (meta_file_infos, errs)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn read_multiple_files(
         disks: &[Option<DiskStore>],
         req: ReadMultipleReq,
@@ -3144,6 +3149,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) committed_file_info: FileInfo,
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
     RenameConvergence,
@@ -3153,6 +3159,7 @@ type RenameDataLegacyTuple = (
 );
 
 impl RenameDataCommit {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn into_legacy_tuple(self) -> RenameDataLegacyTuple {
         (
             self.online_disks,
@@ -3271,6 +3278,7 @@ impl SetDisks {
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -5083,6 +5091,7 @@ fn is_cleanup_not_found(e: &DiskError) -> bool {
 /// normalized to `DiskNotFound`: a panic is not a "disk absent" condition and
 /// must not be silently swallowed as an ignorable error (fixes the historical
 /// `Unexpected`/`DiskNotFound` misclassification).
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn map_cleanup_join_result(joined: std::result::Result<Option<DiskError>, tokio::task::JoinError>) -> Option<DiskError> {
     match joined {
         Ok(res) => res,
@@ -5307,6 +5316,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier_phase {
     /// The per-disk old-data-dir cleanup phase of the commit fan-out.
     pub const CLEANUP: &str = "cleanup";
     /// The per-disk `read_version` phase of metadata read fan-out.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub const READ_VERSION: &str = "read_version";
 }
 

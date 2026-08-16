@@ -164,6 +164,10 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn list_namespaces_page(
         &self,
         table_bucket: &str,
@@ -193,8 +197,16 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()>;
 
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
     async fn register_table_with_publication(
@@ -250,6 +262,10 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     ///
     /// Callers publishing client-supplied Iceberg metadata must validate its logical shape and the physical graph of
     /// newly introduced or changed snapshots before invoking this persistence boundary.
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
 
     async fn commit_table_with_publication(
@@ -495,6 +511,10 @@ pub(crate) struct TableCatalogLockGuard {
 }
 
 impl TableCatalogLockGuard {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) fn stable(guard: impl Send + 'static) -> Self {
         Self {
             _guard: Box::new(guard),
@@ -615,6 +635,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool>;
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
         self.object_exists(bucket, object).await
     }
@@ -1006,6 +1030,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) fn backing_mode(&self) -> TableCatalogBackingMode {
         match self {
             Self::ObjectBacked(_) => TableCatalogBackingMode::ObjectBacked,
@@ -1529,6 +1557,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn get_external_catalog_bridge(
         &self,
         table_bucket: &str,
@@ -1541,6 +1573,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn put_external_catalog_bridge(
         &self,
         entry: ExternalCatalogBridgeEntry,
