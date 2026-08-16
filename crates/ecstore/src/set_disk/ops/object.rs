@@ -3507,6 +3507,10 @@ struct TransitionUploadedSaveProbeState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionUploadedSaveProbe {
     state: Arc<TransitionUploadedSaveProbeState>,
 }
@@ -3517,6 +3521,10 @@ static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Opti
 
 #[cfg(test)]
 impl TransitionUploadedSaveProbe {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedSaveProbeState {
             bucket: bucket.to_string(),
@@ -3533,6 +3541,10 @@ impl TransitionUploadedSaveProbe {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn attempts(&self) -> usize {
         self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -3738,6 +3750,10 @@ struct TransitionCommitBarrierState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionCommitBarrier {
     state: Arc<TransitionCommitBarrierState>,
 }
@@ -3748,14 +3764,26 @@ static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Ar
 
 #[cfg(test)]
 impl TransitionCommitBarrier {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_before_lock_lost_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLockLost)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseValidation)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_after_lease_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseValidation)
     }
@@ -3778,12 +3806,20 @@ impl TransitionCommitBarrier {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("transition should reach the deterministic commit barrier");
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn release(&self) {
         self.state.release.notify_one();
     }
