@@ -356,6 +356,7 @@ pub(crate) struct TestCatalogObjectBackend {
     pub(crate) missing_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
     pub(crate) fail_read_object_path: Arc<tokio::sync::Mutex<Option<String>>>,
     pub(crate) lock_attempts: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    pub(crate) reject_reads_while_write_locked: bool,
     /// Content-addressed (sha256) etags instead of the store fake's counter.
     /// The admin handler tests observe an object's etag and expect rewriting
     /// identical bytes to reproduce it, so their fixtures set this.
@@ -689,6 +690,14 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         drop(fail_read_object_path);
 
         let key = (bucket.to_string(), object.to_string());
+        if self.reject_reads_while_write_locked {
+            let lock = self.locks.lock().await.get(&key).cloned();
+            if lock.as_ref().is_some_and(|lock| lock.try_read().is_err()) {
+                return Err(TableCatalogStoreError::Internal(format!(
+                    "catalog read attempted while its write lock is held: {object}"
+                )));
+            }
+        }
         let (attempt, pause_before) = {
             let mut state = self.state.lock().await;
             state.read_calls += 1;
