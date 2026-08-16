@@ -111,6 +111,9 @@ pub(crate) struct PostObjectRequestMarker;
 #[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
 
+#[derive(Clone, Debug)]
+struct StagedMultipartPartAuthorization;
+
 #[derive(Clone, Default)]
 struct TableDataPlanePublicationGuards {
     state: Arc<parking_lot::Mutex<TableDataPlanePublicationState>>,
@@ -1333,6 +1336,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     Err(denial.deny("no_policy_allows_action", action))
 }
 
+// Multipart parts are staged and become visible only after CompleteMultipartUpload,
+// which uses the normal publication-fenced authorization path.
+async fn authorize_staged_multipart_part<T>(req: &mut S3Request<T>) -> S3Result<()> {
+    req.extensions.insert(StagedMultipartPartAuthorization);
+    let result = authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await;
+    req.extensions.remove::<StagedMultipartPartAuthorization>();
+    result
+}
+
 /// Check if the request has the x-amz-bypass-governance-retention header set to true
 pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
     headers
@@ -1433,6 +1445,10 @@ fn table_data_plane_content_mutation(action: Action) -> bool {
                 | S3Action::PutObjectFanOutAction
         )
     )
+}
+
+fn table_data_plane_publication_fence_required<T>(req: &S3Request<T>, action: Action) -> bool {
+    req.extensions.get::<StagedMultipartPartAuthorization>().is_none() && table_data_plane_content_mutation(action)
 }
 
 fn table_catalog_backend_for_data_plane<T>(
@@ -1613,7 +1629,7 @@ async fn authorize_table_data_plane_if_needed<T>(
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
     };
-    if table_data_plane_content_mutation(action) {
+    if table_data_plane_publication_fence_required(req, action) {
         retain_table_bucket_publication_guard(req, bucket).await?;
     }
     let table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
@@ -1639,7 +1655,7 @@ async fn authorize_table_data_plane_if_needed<T>(
         })
         .await;
     if allowed {
-        if table_data_plane_content_mutation(action) {
+        if table_data_plane_publication_fence_required(req, action) {
             retain_table_publication_guard(req, &resource).await?;
         }
         return Ok(());
@@ -1675,7 +1691,7 @@ async fn deny_anonymous_table_data_plane_if_needed<T>(
     if table_data_plane_admin_action(action).is_none() {
         return Ok(());
     }
-    if table_data_plane_content_mutation(action) {
+    if table_data_plane_publication_fence_required(req, action) {
         retain_table_bucket_publication_guard(req, bucket).await?;
     }
     let table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
@@ -2906,7 +2922,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        authorize_staged_multipart_part(req).await?;
         req.extensions.insert(bucket_generation?);
         Ok(())
     }
@@ -2943,7 +2959,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = None;
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        authorize_staged_multipart_part(req).await?;
         req.extensions.insert(bucket_generation?);
         Ok(())
     }
@@ -3157,6 +3173,99 @@ mod tests {
                 .expect("authorization should load the table bucket marker");
             assert!(fence < marker, "{function} must fence pre-enable writers before reading the marker");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multipart_parts_skip_table_publication_fence_but_completion_retains_it() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms),))));
+        let fs = FS::with_server_ctx(server_ctx);
+        let bucket = format!("multipart-table-fence-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("test bucket should be created");
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("new bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test bucket policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("test bucket policy should be published");
+
+        let mut part_req = build_request(
+            UploadPartInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .build()
+                .expect("upload part input should build"),
+            Method::PUT,
+        );
+        ensure_req_info(&mut part_req);
+        part_req.extensions.insert(fs.server_ctx().clone());
+        fs.upload_part(&mut part_req)
+            .await
+            .expect("anonymous UploadPart should be authorized by the test policy");
+        assert!(
+            part_req.extensions.get::<TableDataPlanePublicationGuards>().is_none(),
+            "staged part data must not retain a table publication fence"
+        );
+
+        let mut copy_part_req = build_request(
+            UploadPartCopyInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(2)
+                .copy_source(CopySource::Bucket {
+                    bucket: bucket.clone().into(),
+                    key: "source".into(),
+                    version_id: None,
+                })
+                .build()
+                .expect("upload part copy input should build"),
+            Method::PUT,
+        );
+        ensure_req_info(&mut copy_part_req);
+        copy_part_req.extensions.insert(fs.server_ctx().clone());
+        fs.upload_part_copy(&mut copy_part_req)
+            .await
+            .expect("anonymous UploadPartCopy should be authorized by the test policy");
+        assert!(
+            copy_part_req.extensions.get::<TableDataPlanePublicationGuards>().is_none(),
+            "staged copied part data must not retain a table publication fence"
+        );
+
+        let mut complete_req = build_request(
+            CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .multipart_upload(Some(CompletedMultipartUpload::default()))
+                .build()
+                .expect("complete multipart input should build"),
+            Method::POST,
+        );
+        ensure_req_info(&mut complete_req);
+        complete_req.extensions.insert(fs.server_ctx().clone());
+        fs.complete_multipart_upload(&mut complete_req)
+            .await
+            .expect("anonymous CompleteMultipartUpload should be authorized by the test policy");
+        let bucket_fence = (bucket, crate::table_catalog::default_table_bucket_publication_lock_path());
+        let guards = complete_req
+            .extensions
+            .get::<TableDataPlanePublicationGuards>()
+            .expect("completion should retain a table publication fence");
+        assert!(guards.state.lock().keys.contains(&bucket_fence));
     }
 
     #[tokio::test]
