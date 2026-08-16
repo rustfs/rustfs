@@ -174,15 +174,14 @@ use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::Path,
-    sync::Arc,
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -716,6 +715,11 @@ const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
+
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX";
 
 // --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
 
@@ -1693,6 +1697,95 @@ fn is_get_metadata_early_stop_bounded_fanout_enabled() -> bool {
             )
         })
     }
+}
+
+#[derive(Debug)]
+struct GetMetadataSlowtailFaultConfig {
+    delay: Duration,
+    disks: Arc<[usize]>,
+    bucket: Option<String>,
+    object_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GetMetadataSlowtailFaultRequest {
+    delay: Duration,
+    disks: Arc<[usize]>,
+}
+
+impl GetMetadataSlowtailFaultRequest {
+    fn delay_for_disk(&self, disk_index: usize) -> Option<Duration> {
+        self.disks.contains(&disk_index).then_some(self.delay)
+    }
+}
+
+fn parse_get_metadata_slowtail_fault_disks(raw: &str) -> Option<Vec<usize>> {
+    let mut disks = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let Ok(index) = item.parse::<usize>() else {
+            return None;
+        };
+        if !disks.contains(&index) {
+            disks.push(index);
+        }
+    }
+    (!disks.is_empty()).then_some(disks)
+}
+
+fn load_get_metadata_slowtail_fault_config() -> Option<GetMetadataSlowtailFaultConfig> {
+    let delay_ms = rustfs_utils::get_env_u64(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, 0);
+    if delay_ms == 0 {
+        return None;
+    }
+    let disks = parse_get_metadata_slowtail_fault_disks(&std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS).ok()?)?;
+    let bucket = std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let object_prefix = std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX)
+        .ok()
+        .filter(|value| !value.is_empty());
+    Some(GetMetadataSlowtailFaultConfig {
+        delay: Duration::from_millis(delay_ms),
+        disks: Arc::from(disks.into_boxed_slice()),
+        bucket,
+        object_prefix,
+    })
+}
+
+fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {
+    if !read_data {
+        return None;
+    }
+
+    #[cfg(test)]
+    let config = load_get_metadata_slowtail_fault_config();
+    #[cfg(test)]
+    let config = config.as_ref()?;
+    #[cfg(not(test))]
+    let config = ({
+        static CACHED: OnceLock<Option<GetMetadataSlowtailFaultConfig>> = OnceLock::new();
+        CACHED.get_or_init(load_get_metadata_slowtail_fault_config).as_ref()
+    })?;
+
+    if let Some(expected_bucket) = &config.bucket
+        && expected_bucket != bucket
+    {
+        return None;
+    }
+    if let Some(expected_prefix) = &config.object_prefix
+        && !object.starts_with(expected_prefix)
+    {
+        return None;
+    }
+    Some(GetMetadataSlowtailFaultRequest {
+        delay: config.delay,
+        disks: config.disks.clone(),
+    })
+}
+
+#[cfg(test)]
+fn get_metadata_slowtail_fault_delay(bucket: &str, object: &str, disk_index: usize, read_data: bool) -> Option<Duration> {
+    get_metadata_slowtail_fault_request(bucket, object, read_data)?.delay_for_disk(disk_index)
 }
 
 /// Check if multipart reads prefetch the next part's bitrot reader setup
