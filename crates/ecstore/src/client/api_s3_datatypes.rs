@@ -29,10 +29,6 @@ use crate::client::utils::base64_decode;
 
 use super::transition_api;
 
-pub struct ListAllMyBucketsResult {
-    pub owner: Owner,
-}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CommonPrefix {
     pub prefix: String,
@@ -89,6 +85,10 @@ pub struct ListVersionsResult {
     pub next_version_id_marker: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "fields of a MinIO-parity list result that this port builds but never reads back (backlog#1823)"
+)]
 pub struct ListBucketResult {
     common_prefixes: Vec<CommonPrefix>,
     contents: Vec<transition_api::ObjectInfo>,
@@ -102,6 +102,10 @@ pub struct ListBucketResult {
     prefix: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "fields of a MinIO-parity list result that this port builds but never reads back (backlog#1823)"
+)]
 pub struct ListMultipartUploadsResult {
     bucket: String,
     key_marker: String,
@@ -117,14 +121,13 @@ pub struct ListMultipartUploadsResult {
     common_prefixes: Vec<CommonPrefix>,
 }
 
+#[allow(
+    dead_code,
+    reason = "fields of a MinIO-parity list result that this port builds but never reads back (backlog#1823)"
+)]
 pub struct Initiator {
     id: String,
     display_name: String,
-}
-
-pub struct CopyObjectResult {
-    pub etag: String,
-    pub last_modified: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +263,7 @@ pub struct CompletePart {
 }
 
 impl CompletePart {
+    #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
     fn checksum(&self, t: &ChecksumMode) -> String {
         match t {
             ChecksumMode::ChecksumCRC32C => {
@@ -282,11 +286,6 @@ impl CompletePart {
             }
         }
     }
-}
-
-pub struct CopyObjectPartResult {
-    pub etag: String,
-    pub last_modified: OffsetDateTime,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -357,29 +356,14 @@ impl CompleteMultipartUpload {
     }
 }
 
-pub struct CreateBucketConfiguration {
-    pub location: String,
-}
-
+#[allow(
+    dead_code,
+    reason = "live via quick_xml::de::from_str in bucket_cache.rs; serde deserialization is not a construction (backlog#1823)"
+)]
 #[derive(serde::Serialize)]
 pub struct DeleteObject {
     //api has
     pub key: String,
-    pub version_id: String,
-}
-
-pub struct DeletedObject {
-    //s3s has
-    pub key: String,
-    pub version_id: String,
-    pub deletemarker: bool,
-    pub deletemarker_version_id: String,
-}
-
-pub struct NonDeletedObject {
-    pub key: String,
-    pub code: String,
-    pub message: String,
     pub version_id: String,
 }
 
@@ -402,6 +386,7 @@ impl DeleteMultiObjects {
         Ok(buf)
     }
 
+    #[allow(dead_code, reason = "MinIO-parity XML helper with no caller in this port (backlog#1823)")]
     pub fn unmarshal(buf: &[u8]) -> Result<Self, std::io::Error> {
         #[derive(Debug, Deserialize)]
         struct WireDeleteObject {
@@ -435,9 +420,4 @@ impl DeleteMultiObjects {
                 .collect(),
         })
     }
-}
-
-pub struct DeleteMultiObjectsResult {
-    pub deleted_objects: Vec<DeletedObject>,
-    pub undeleted_objects: Vec<NonDeletedObject>,
 }

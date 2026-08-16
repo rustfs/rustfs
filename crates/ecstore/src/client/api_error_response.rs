@@ -229,17 +229,6 @@ pub fn http_resp_to_error_response(
     err_resp
 }
 
-pub fn err_transfer_acceleration_bucket(bucket_name: &str) -> ErrorResponse {
-    ErrorResponse {
-        status_code: StatusCode::BAD_REQUEST,
-        code: S3ErrorCode::InvalidArgument,
-        message: "The name of the bucket used for Transfer Acceleration must be DNS-compliant and must not contain periods ‘.’."
-            .to_string(),
-        bucket_name: bucket_name.to_string(),
-        ..Default::default()
-    }
-}
-
 pub fn err_entity_too_large(total_size: i64, max_object_size: i64, bucket_name: &str, object_name: &str) -> ErrorResponse {
     let msg = format!(
         "Your proposed upload size ‘{}’ exceeds the maximum allowed object size ‘{}’ for single PUT operation.",
@@ -289,16 +278,6 @@ pub fn err_invalid_argument(message: &str) -> ErrorResponse {
     ErrorResponse {
         status_code: StatusCode::BAD_REQUEST,
         code: S3ErrorCode::InvalidArgument,
-        message: message.to_string(),
-        request_id: "rustfs".to_string(),
-        ..Default::default()
-    }
-}
-
-pub fn err_api_not_supported(message: &str) -> ErrorResponse {
-    ErrorResponse {
-        status_code: StatusCode::NOT_IMPLEMENTED,
-        code: S3ErrorCode::Custom("APINotSupported".into()),
         message: message.to_string(),
         request_id: "rustfs".to_string(),
         ..Default::default()
