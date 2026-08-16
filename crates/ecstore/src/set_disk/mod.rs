@@ -39,7 +39,6 @@
 //! - `metadata.rs`, `replication.rs`, `shard_source.rs` — supporting helpers.
 
 // #730: SetDisks still hosts staged read/heal/write migration helpers.
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
@@ -624,7 +623,9 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
 // Each flag has a corresponding `*_ROLLOUT_PCT` for percentage-based gradual rollout.
 // ============================================================================
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
@@ -697,7 +698,15 @@ const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EAR
 // the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
@@ -909,6 +918,7 @@ mod prepared_get_object_metadata_tests {
             .expect("test should find an object whose initial fanout covers both data shards")
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn bounded_spare_disk_index(bucket: &str, object: &str) -> usize {
         *bounded_metadata_fanout_order(bucket, object, 4, 2)
             .get(3)
@@ -1714,6 +1724,10 @@ fn is_multipart_reader_setup_prefetch_enabled() -> bool {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1753,6 +1767,10 @@ fn should_use_codec_streaming(config: GetCodecStreamingConfig, bucket: &str, obj
 }
 
 /// Should this specific request use metadata early-stop?
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
     let base = is_get_metadata_early_stop_enabled();
     let pct = get_metadata_early_stop_rollout_pct();
@@ -2186,6 +2204,7 @@ fn classify_get_codec_streaming_object_class(
     GetCodecStreamingObjectClass::PlainSinglePart
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn is_get_small_object_direct_memory_eligible_with_threshold(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -2791,6 +2810,7 @@ pub struct SetDisks {
     /// Stable namespace shared by every object lock created for this set.
     set_lock_namespace: Arc<str>,
     pub format: FormatV3,
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
@@ -3066,11 +3086,13 @@ struct GetObjectMetadataCacheEntry {
 
 #[derive(Clone, Debug)]
 struct DiskHealthEntry {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     last_check: Instant,
     online: bool,
 }
 
 impl DiskHealthEntry {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn cached_value(&self) -> Option<bool> {
         if self.last_check.elapsed() <= DISK_HEALTH_CACHE_TTL {
             Some(self.online)
@@ -3664,6 +3686,7 @@ fn multipart_put_large_batch_min_size_bytes() -> usize {
     })
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
     if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
         SmallWritePath::Inline
@@ -4242,6 +4265,7 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 ///
 /// Fail closed: when bucket metadata cannot be resolved the check stays on, so
 /// object-lock protection is never skipped because of a metadata lookup miss.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(crate) fn object_lock_delete_check_required(bucket_meta: Option<&crate::bucket::metadata::BucketMetadata>) -> bool {
     bucket_meta.is_none_or(|meta| meta.object_locking())
 }
@@ -4515,15 +4539,6 @@ impl Hash for ObjProps {
         self.successor_mod_time.hash(state);
         self.num_versions.hash(state);
     }
-}
-
-#[derive(Default, Clone, Debug)]
-pub struct HealEntryResult {
-    pub bytes: usize,
-    pub success: bool,
-    pub skipped: bool,
-    pub entry_done: bool,
-    pub name: String,
 }
 
 fn is_object_dangling(
@@ -5302,6 +5317,7 @@ pub fn is_valid_storage_class(storage_class: &str) -> bool {
 }
 
 /// Returns true if the storage class is a cold storage tier that requires special handling
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn is_cold_storage_class(storage_class: &str) -> bool {
     matches!(
         storage_class,
@@ -5310,6 +5326,7 @@ pub fn is_cold_storage_class(storage_class: &str) -> bool {
 }
 
 /// Returns true if the storage class is an infrequent access tier
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn is_infrequent_access_class(storage_class: &str) -> bool {
     matches!(
         storage_class,

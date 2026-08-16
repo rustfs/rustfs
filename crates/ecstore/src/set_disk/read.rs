@@ -116,6 +116,7 @@ impl SetDisks {
             .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<Arc<GetObjectMetadataCacheEntry>> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
             MetadataCacheLookup::Hit(entry) => Some(entry),
@@ -1826,6 +1827,7 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
         .then_some(GET_METADATA_CACHE_REASON_META_BUCKET)
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
     get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
 }
