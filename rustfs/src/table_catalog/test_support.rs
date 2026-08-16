@@ -746,6 +746,12 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         Ok(result)
     }
 
+    async fn read_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let mut backend = self.clone();
+        backend.reject_reads_while_write_locked = false;
+        backend.read_object(bucket, object).await
+    }
+
     async fn read_object_limited(
         &self,
         bucket: &str,
