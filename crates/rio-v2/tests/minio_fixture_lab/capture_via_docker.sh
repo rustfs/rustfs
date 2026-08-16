@@ -34,8 +34,19 @@ if [ "${cases[0]}" != "all" ]; then
   done
 fi
 
+# Base images are overridable so a network without Docker Hub access can point
+# them at a mirror (see the Dockerfile header). Unset by default, which keeps the
+# Dockerfile's Docker Hub defaults for CI.
+build_args=()
+if [ -n "${MINIO_LAB_MINIO_IMAGE:-}" ]; then
+  build_args+=(--build-arg "MINIO_IMAGE=${MINIO_LAB_MINIO_IMAGE}")
+fi
+if [ -n "${MINIO_LAB_PYTHON_IMAGE:-}" ]; then
+  build_args+=(--build-arg "PYTHON_IMAGE=${MINIO_LAB_PYTHON_IMAGE}")
+fi
+
 echo ">> building ${IMAGE}"
-docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" "${SCRIPT_DIR}"
+docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" "${build_args[@]}" "${SCRIPT_DIR}"
 
 echo ">> capturing fixtures into ${FIXTURE_REL}"
 docker run --rm -v "${REPO_ROOT}:/repo" "${IMAGE}" \
