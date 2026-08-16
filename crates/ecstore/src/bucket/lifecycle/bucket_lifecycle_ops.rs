@@ -126,11 +126,23 @@ const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
 const EVENT_LIFECYCLE_NOT_ENQUEUED: &str = "lifecycle_not_enqueued";
 const EVENT_LIFECYCLE_DELETE_DISPATCHED: &str = "lifecycle_delete_dispatched";
 const EVENT_LIFECYCLE_DELETE_COMPLETED: &str = "lifecycle_delete_completed";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
 const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
 const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TraceFn =
     Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
@@ -140,9 +152,21 @@ static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 pub const AMZ_ENCRYPTION_AES: &str = "AES256";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
@@ -280,6 +304,10 @@ impl LifecycleSys {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     pub fn trace(oi: &ObjectInfo) -> TraceFn {
         let bucket = oi.bucket.clone();
         let name = oi.name.clone();
@@ -570,6 +598,10 @@ async fn delete_free_version_remote_object(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_free_version_remote_object_then<T, F, Fut>(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
@@ -2868,6 +2900,10 @@ fn stale_upload_default_due(initiated: OffsetDateTime, default_expiry: StdDurati
     initiated + time::Duration::seconds(default_expiry.as_secs() as i64)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<String, String>, upload_dir: &str) -> Option<usize> {
     stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
 }
@@ -3352,6 +3388,10 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
     if remote_delete_succeeded {
         opts.skip_decommissioned = true;
@@ -4373,6 +4413,10 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     result
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     let tier = _tier.to_string();
     Arc::new(move || {
@@ -4391,6 +4435,10 @@ pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn get_transitioned_object_reader(
     bucket: &str,
     object: &str,
@@ -5145,6 +5193,10 @@ async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Res
     ReplicationObjectBridge::delete_request_config(api, &oi.bucket).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
@@ -7422,6 +7474,10 @@ mod tests {
     // process environment while `env::set_var`/`env::remove_var` is active.
     // SAFETY: keep this note adjacent to the allowance for the repository guard.
     #[allow(unsafe_code)]
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
         F: FnOnce() -> Fut,

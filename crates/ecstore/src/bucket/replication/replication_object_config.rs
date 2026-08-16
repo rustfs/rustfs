@@ -231,6 +231,10 @@ pub(crate) async fn load_delete_replication_config(
     delete_snapshot_from_metadata(ReplicationMetadataStore::delete_metadata(bucket).await?)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+)]
 pub(crate) async fn load_delete_replication_config_in(
     ctx: &ReplicationInstanceContext,
     bucket: &str,

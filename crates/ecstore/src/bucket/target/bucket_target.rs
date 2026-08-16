@@ -59,6 +59,7 @@ impl fmt::Debug for Credentials {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub enum ServiceType {
     #[default]
     Replication,

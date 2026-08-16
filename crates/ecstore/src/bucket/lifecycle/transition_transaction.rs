@@ -50,8 +50,16 @@ pub type Result<T> = std::result::Result<T, TransitionTransactionError>;
 #[derive(Debug, thiserror::Error)]
 pub enum TransitionTransactionError {
     #[error("transition transaction already exists")]
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     AlreadyExists,
     #[error("transition transaction is not found")]
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     NotFound,
     #[error("transition transaction is corrupt: {0}")]
     Corrupt(&'static str),

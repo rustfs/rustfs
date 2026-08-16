@@ -148,6 +148,10 @@ struct RecoveryCursor {
     object: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn recover_tier_free_versions(
     api: Arc<ECStore>,
     limit: usize,
