@@ -918,7 +918,10 @@ mod prepared_get_object_metadata_tests {
             .expect("test should find an object whose initial fanout covers both data shards")
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "test fixture no assertion in this module uses today; the live namesake lives in io_primitives tests (backlog#1823)"
+    )]
     fn bounded_spare_disk_index(bucket: &str, object: &str) -> usize {
         *bounded_metadata_fanout_order(bucket, object, 4, 2)
             .get(3)
