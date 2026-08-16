@@ -1874,6 +1874,32 @@ fn create_table_request_accepts_standard_iceberg_rest_shape() {
 }
 
 #[test]
+fn create_table_assigns_positive_ids_to_spark_schema() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {"id": 0, "name": "id", "required": false, "type": "long"},
+                {"id": 1, "name": "payload", "required": false, "type": "string"}
+            ]
+        },
+        "partition-spec": {"spec-id": 0, "fields": []},
+        "properties": {"owner": "spark"}
+    }))
+    .expect("Spark create table request should parse");
+
+    let (_, metadata) = table_entry_from_create_table_request("warehouse", &namespace, request)
+        .expect("catalog should assign positive field IDs");
+
+    assert_eq!(metadata["schemas"][0]["fields"][0]["id"], 1);
+    assert_eq!(metadata["schemas"][0]["fields"][1]["id"], 2);
+    assert_eq!(metadata["last-column-id"], 2);
+}
+
+#[test]
 fn create_table_request_honors_supported_format_version_property() {
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
     let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
@@ -1988,6 +2014,142 @@ fn catalog_assigns_read_only_schema_spec_and_sort_order_ids() {
     assert_eq!(updated["sort-orders"][0]["order-id"], 1);
     assert_eq!(updated["sort-orders"][1]["order-id"], 0);
     assert_eq!(updated["default-sort-order-id"], 0);
+}
+
+#[test]
+fn create_table_assigns_fresh_schema_field_ids_and_rewrites_references() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "schema-id": 41,
+            "identifier-field-ids": [0],
+            "fields": [
+                {"id": 0, "name": "id", "required": true, "type": "long"},
+                {
+                    "id": 10,
+                    "name": "details",
+                    "required": false,
+                    "type": {
+                        "type": "struct",
+                        "fields": [{"id": 11, "name": "category", "required": false, "type": "string"}]
+                    }
+                },
+                {
+                    "id": 20,
+                    "name": "tags",
+                    "required": false,
+                    "type": {
+                        "type": "list",
+                        "element-id": 21,
+                        "element-required": false,
+                        "element": "string"
+                    }
+                },
+                {
+                    "id": 30,
+                    "name": "attributes",
+                    "required": false,
+                    "type": {
+                        "type": "map",
+                        "key-id": 31,
+                        "key": "string",
+                        "value-id": 32,
+                        "value-required": false,
+                        "value": {
+                            "type": "struct",
+                            "fields": [{"id": 33, "name": "score", "required": false, "type": "int"}]
+                        }
+                    }
+                }
+            ]
+        },
+        "partition-spec": {
+            "spec-id": 42,
+            "fields": [{"source-id": 0, "name": "id", "transform": "identity"}]
+        },
+        "write-order": {
+            "order-id": 43,
+            "fields": [{
+                "source-id": 11,
+                "transform": "identity",
+                "direction": "asc",
+                "null-order": "nulls-first"
+            }]
+        }
+    }))
+    .expect("create table request should parse");
+
+    let (_, metadata) =
+        table_entry_from_create_table_request("warehouse", &namespace, request).expect("catalog should assign fresh field IDs");
+
+    let schema = &metadata["schemas"][0];
+    assert_eq!(schema["fields"][0]["id"], 1);
+    assert_eq!(schema["fields"][1]["id"], 2);
+    assert_eq!(schema["fields"][2]["id"], 3);
+    assert_eq!(schema["fields"][3]["id"], 4);
+    assert_eq!(schema["fields"][1]["type"]["fields"][0]["id"], 5);
+    assert_eq!(schema["fields"][2]["type"]["element-id"], 6);
+    assert_eq!(schema["fields"][3]["type"]["key-id"], 7);
+    assert_eq!(schema["fields"][3]["type"]["value-id"], 8);
+    assert_eq!(schema["fields"][3]["type"]["value"]["fields"][0]["id"], 9);
+    assert_eq!(schema["identifier-field-ids"], serde_json::json!([1]));
+    assert_eq!(metadata["last-column-id"], 9);
+    assert_eq!(metadata["partition-specs"][0]["fields"][0]["source-id"], 1);
+    assert_eq!(metadata["sort-orders"][0]["fields"][0]["source-id"], 5);
+}
+
+#[test]
+fn create_table_rejects_duplicate_temporary_schema_field_ids() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {"id": 0, "name": "id", "required": false, "type": "long"},
+                {"id": 0, "name": "payload", "required": false, "type": "string"}
+            ]
+        }
+    }))
+    .expect("create table request should parse");
+
+    let error = table_entry_from_create_table_request("warehouse", &namespace, request)
+        .expect_err("duplicate temporary field IDs must be rejected");
+
+    assert_eq!(error.message(), Some("duplicate create schema field id 0"));
+}
+
+#[test]
+fn create_table_rejects_excessive_schema_nesting() {
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    let mut field_type = serde_json::Value::from("long");
+    for element_id in 1..=crate::table_catalog::ICEBERG_MAX_SCHEMA_NESTING_DEPTH + 1 {
+        field_type = serde_json::json!({
+            "type": "list",
+            "element-id": element_id,
+            "element-required": false,
+            "element": field_type
+        });
+    }
+    let request = CreateTableRequest {
+        name: "events".to_string(),
+        location: None,
+        schema: serde_json::json!({
+            "type": "struct",
+            "fields": [{"id": 0, "name": "nested", "required": false, "type": field_type}]
+        }),
+        partition_spec: None,
+        write_order: None,
+        stage_create: false,
+        properties: BTreeMap::new(),
+    };
+
+    let error = table_entry_from_create_table_request("warehouse", &namespace, request)
+        .expect_err("excessively nested create schemas must be rejected");
+
+    assert_eq!(error.message(), Some("create schema exceeds the maximum nesting depth"));
 }
 
 #[test]
@@ -2247,7 +2409,11 @@ fn create_table_counts_collection_ids_in_last_column_id() {
     let (_, metadata) =
         table_entry_from_create_table_request("warehouse", &namespace, request).expect("table metadata should be created");
 
-    assert_eq!(metadata["last-column-id"], 9);
+    let schema = &metadata["schemas"][0];
+    assert_eq!(schema["fields"][0]["type"]["element-id"], 3);
+    assert_eq!(schema["fields"][1]["type"]["key-id"], 4);
+    assert_eq!(schema["fields"][1]["type"]["value-id"], 5);
+    assert_eq!(metadata["last-column-id"], 5);
 }
 
 #[test]

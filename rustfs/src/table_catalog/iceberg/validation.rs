@@ -19,6 +19,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use super::super::*;
 
 const ICEBERG_MAX_USER_FIELD_ID: i32 = i32::MAX - 200;
+pub(crate) const ICEBERG_MAX_SCHEMA_NESTING_DEPTH: usize = 128;
 
 fn normalize_warehouse_object_prefix(object_prefix: &str, max_prefix_depth: Option<usize>) -> TableCatalogStoreResult<String> {
     let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
@@ -1355,6 +1356,191 @@ pub(crate) fn validate_sort_order_sources_against_current_schema(
 
 fn validate_iceberg_schema(schema: &serde_json::Value, label: &str) -> TableCatalogStoreResult<BTreeSet<i32>> {
     Ok(validate_iceberg_schema_fields(schema, label)?.field_ids)
+}
+
+pub(crate) fn assign_fresh_create_schema_ids(
+    schema: &mut serde_json::Value,
+    partition_spec: Option<&mut serde_json::Value>,
+    sort_order: Option<&mut serde_json::Value>,
+) -> TableCatalogStoreResult<()> {
+    let mut assigner = FreshCreateSchemaIdAssigner::new();
+    assigner.assign_schema(schema)?;
+    assigner.remap_identifier_field_ids(schema)?;
+    if let Some(partition_spec) = partition_spec {
+        assigner.remap_source_ids(partition_spec, "partition spec")?;
+    }
+    if let Some(sort_order) = sort_order {
+        assigner.remap_source_ids(sort_order, "sort order")?;
+    }
+    Ok(())
+}
+
+struct FreshCreateSchemaIdAssigner {
+    next_id: i32,
+    old_to_new: BTreeMap<i32, i32>,
+}
+
+impl FreshCreateSchemaIdAssigner {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            old_to_new: BTreeMap::new(),
+        }
+    }
+
+    fn assign_schema(&mut self, schema: &mut serde_json::Value) -> TableCatalogStoreResult<()> {
+        let schema = schema
+            .as_object_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("create schema must be a JSON object".to_string()))?;
+        if schema.get("type").and_then(serde_json::Value::as_str) != Some("struct") {
+            return Err(TableCatalogStoreError::Invalid("create schema type must be struct".to_string()));
+        }
+        let fields = schema
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("create schema fields must be an array".to_string()))?;
+        self.assign_struct_fields(fields, 0)
+    }
+
+    fn assign_struct_fields(&mut self, fields: &mut [serde_json::Value], depth: usize) -> TableCatalogStoreResult<()> {
+        for field in fields.iter_mut() {
+            let field = field
+                .as_object_mut()
+                .ok_or_else(|| TableCatalogStoreError::Invalid("create schema fields must be JSON objects".to_string()))?;
+            self.assign_object_id(field, "id", "create schema field id")?;
+        }
+        for field in fields {
+            let field = field
+                .as_object_mut()
+                .ok_or_else(|| TableCatalogStoreError::Invalid("create schema fields must be JSON objects".to_string()))?;
+            let field_type = field
+                .get_mut("type")
+                .ok_or_else(|| TableCatalogStoreError::Invalid("create schema field type is required".to_string()))?;
+            self.assign_type_ids(field_type, depth)?;
+        }
+        Ok(())
+    }
+
+    fn assign_type_ids(&mut self, field_type: &mut serde_json::Value, depth: usize) -> TableCatalogStoreResult<()> {
+        if field_type.is_string() {
+            return Ok(());
+        }
+        if depth >= ICEBERG_MAX_SCHEMA_NESTING_DEPTH {
+            return Err(TableCatalogStoreError::Invalid(
+                "create schema exceeds the maximum nesting depth".to_string(),
+            ));
+        }
+        let nested_depth = depth + 1;
+        let field_type = field_type.as_object_mut().ok_or_else(|| {
+            TableCatalogStoreError::Invalid("create schema field type must be a string or JSON object".to_string())
+        })?;
+        match field_type.get("type").and_then(serde_json::Value::as_str) {
+            Some("struct") => {
+                let fields = field_type
+                    .get_mut("fields")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("create schema struct fields must be an array".to_string()))?;
+                self.assign_struct_fields(fields, nested_depth)
+            }
+            Some("list") => {
+                self.assign_object_id(field_type, "element-id", "create schema list element-id")?;
+                let element = field_type
+                    .get_mut("element")
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("create schema list element is required".to_string()))?;
+                self.assign_type_ids(element, nested_depth)
+            }
+            Some("map") => {
+                self.assign_object_id(field_type, "key-id", "create schema map key-id")?;
+                self.assign_object_id(field_type, "value-id", "create schema map value-id")?;
+                let key = field_type
+                    .get_mut("key")
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("create schema map key is required".to_string()))?;
+                self.assign_type_ids(key, nested_depth)?;
+                let value = field_type
+                    .get_mut("value")
+                    .ok_or_else(|| TableCatalogStoreError::Invalid("create schema map value is required".to_string()))?;
+                self.assign_type_ids(value, nested_depth)
+            }
+            _ => Err(TableCatalogStoreError::Invalid(
+                "create schema contains an unsupported field type".to_string(),
+            )),
+        }
+    }
+
+    fn assign_object_id(
+        &mut self,
+        object: &mut serde_json::Map<String, serde_json::Value>,
+        field: &str,
+        label: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let old_id = required_i32_value(object, field, label)?;
+        if old_id < 0 {
+            return Err(TableCatalogStoreError::Invalid(format!("{label} must be non-negative")));
+        }
+        let entry = match self.old_to_new.entry(old_id) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(TableCatalogStoreError::Invalid(format!("duplicate create schema field id {old_id}")));
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => entry,
+        };
+        let new_id = self.next_id;
+        if new_id > ICEBERG_MAX_USER_FIELD_ID {
+            return Err(TableCatalogStoreError::Invalid(
+                "create schema exceeds the available Iceberg field ID range".to_string(),
+            ));
+        }
+        self.next_id = new_id.checked_add(1).ok_or_else(|| {
+            TableCatalogStoreError::Invalid("create schema exceeds the available Iceberg field ID range".to_string())
+        })?;
+        entry.insert(new_id);
+        object.insert(field.to_string(), serde_json::Value::from(new_id));
+        Ok(())
+    }
+
+    fn remap_identifier_field_ids(&self, schema: &mut serde_json::Value) -> TableCatalogStoreResult<()> {
+        let Some(identifier_field_ids) = schema
+            .as_object_mut()
+            .and_then(|schema| schema.get_mut("identifier-field-ids"))
+        else {
+            return Ok(());
+        };
+        let identifier_field_ids = identifier_field_ids
+            .as_array_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("create schema identifier-field-ids must be an array".to_string()))?;
+        for field_id in identifier_field_ids {
+            let old_id = required_i32(field_id, "create schema identifier field id")?;
+            let new_id = self.old_to_new.get(&old_id).ok_or_else(|| {
+                TableCatalogStoreError::Invalid(format!(
+                    "create schema identifier field id {old_id} does not reference a schema field"
+                ))
+            })?;
+            *field_id = serde_json::Value::from(*new_id);
+        }
+        Ok(())
+    }
+
+    fn remap_source_ids(&self, value: &mut serde_json::Value, label: &str) -> TableCatalogStoreResult<()> {
+        let value = value
+            .as_object_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{label} must be a JSON object")))?;
+        let Some(fields) = value.get_mut("fields") else {
+            return Ok(());
+        };
+        let fields = fields
+            .as_array_mut()
+            .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{label} fields must be an array")))?;
+        for field in fields {
+            let field = field
+                .as_object_mut()
+                .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{label} fields must be JSON objects")))?;
+            let old_id = required_i32_value(field, "source-id", &format!("{label} source-id"))?;
+            let new_id = self.old_to_new.get(&old_id).ok_or_else(|| {
+                TableCatalogStoreError::Invalid(format!("{label} source-id {old_id} does not reference the create schema"))
+            })?;
+            field.insert("source-id".to_string(), serde_json::Value::from(*new_id));
+        }
+        Ok(())
+    }
 }
 
 fn validate_iceberg_schema_fields(schema: &serde_json::Value, label: &str) -> TableCatalogStoreResult<IcebergSchemaFields> {
