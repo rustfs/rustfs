@@ -12,6 +12,13 @@
 #                                                 # ignored interop tests consume
 #   ./capture_via_docker.sh sse-s3-singlepart-64k # specific case id(s)
 #   ./capture_via_docker.sh all                   # full SSE/size matrix
+#
+# The SSE-C cases are not reachable over the default plain-HTTP endpoint: MinIO
+# refuses SSE-C unless the connection is secure ("Requests specifying Server
+# Side Encryption with Customer provided keys must be made over a secure
+# connection"). Capture those by pointing the lab at its self-signed HTTPS
+# endpoint, which it provisions itself:
+#   MINIO_LAB_ENDPOINT=https://127.0.0.1:9000 ./capture_via_docker.sh all
 set -euo pipefail
 
 IMAGE="${MINIO_LAB_IMAGE:-rustfs-minio-lab:latest}"
@@ -46,7 +53,10 @@ if [ -n "${MINIO_LAB_PYTHON_IMAGE:-}" ]; then
 fi
 
 echo ">> building ${IMAGE}"
-docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" "${build_args[@]}" "${SCRIPT_DIR}"
+# ${arr[@]+"${arr[@]}"} rather than "${arr[@]}": under `set -u`, bash 3.2 —
+# still the default /bin/bash on macOS — treats an empty array expansion as an
+# unbound variable and aborts.
+docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE}" ${build_args[@]+"${build_args[@]}"} "${SCRIPT_DIR}"
 
 echo ">> capturing fixtures into ${FIXTURE_REL}"
 docker run --rm -v "${REPO_ROOT}:/repo" "${IMAGE}" \
@@ -54,6 +64,7 @@ docker run --rm -v "${REPO_ROOT}:/repo" "${IMAGE}" \
     --root "/repo/${FIXTURE_REL}" \
     --work-root /tmp/minio-lab-work \
     --minio-binary /usr/local/bin/minio \
-    "${case_args[@]}"
+    --endpoint "${MINIO_LAB_ENDPOINT:-http://127.0.0.1:9000}" \
+    ${case_args[@]+"${case_args[@]}"}
 
 echo ">> done — fixtures under ${REPO_ROOT}/${FIXTURE_REL}/cases/"

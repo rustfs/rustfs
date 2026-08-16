@@ -34,6 +34,14 @@ MINIO_LAB_PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim \
 
 Pin the MinIO tag to the same release the Dockerfile names; an unpinned `:latest` captures whatever format that day's build writes, which is not what the interop tests were validated against.
 
+## Capturing the SSE-C cases
+
+MinIO refuses SSE-C over a plain-HTTP connection, so the `sse-c-*` cases cannot be captured against the default endpoint — `./capture_via_docker.sh all` fails on the first SSE-C upload with `InvalidRequest ... must be made over a secure connection`. The lab provisions its own self-signed certificate; point it at the HTTPS endpoint to capture them:
+
+```bash
+MINIO_LAB_ENDPOINT=https://127.0.0.1:9000 ./capture_via_docker.sh all
+```
+
 ## Layout
 
 The default root is `artifacts/minio-fixture-lab`, which is already ignored by the repository.
