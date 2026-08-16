@@ -3021,13 +3021,10 @@ impl SetDisks {
             });
         }
 
-        let (ress, errors) = match collect_read_multiple_results(futures, read_quorum).await {
+        let (ress, _errors) = match collect_read_multiple_results(futures, read_quorum).await {
             Ok(collected) => collected,
             Err(()) => return empty_quorum_result(),
         };
-
-        // debug!("ReadMultipleResp ress {:?}", ress);
-        // debug!("ReadMultipleResp errors {:?}", errors);
 
         let mut ret = Vec::with_capacity(req.files.len());
 

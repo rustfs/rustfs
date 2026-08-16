@@ -5656,7 +5656,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // TODO: Lifecycle
 
         let mut version_found = true;
-        let (mut goi, write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
+        // delete_object_version below derives its own majority quorum from the
+        // disk array, so the object-derived quorum here is unused.
+        let (mut goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
@@ -6410,7 +6412,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         for disk in disks.iter() {
-            if let Some(disk) = disk {
+            if disk.is_some() {
                 continue;
             }
             let _ = self
