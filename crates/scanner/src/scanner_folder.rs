@@ -4621,6 +4621,8 @@ mod tests {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
+        let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
 
         let object_dir = temp_dir.join("bucket").join("object");
@@ -4689,7 +4691,7 @@ mod tests {
         let fields = &events[0]["fields"];
         assert_eq!(fields["component"], LOG_COMPONENT_SCANNER);
         assert_eq!(fields["subsystem"], LOG_SUBSYSTEM_FOLDER);
-        assert_eq!(fields["drive"], temp_dir.to_string_lossy().as_ref());
+        assert_eq!(fields["drive"], canonical_temp_dir.to_string_lossy().as_ref());
         assert_eq!(fields["bucket"], "bucket");
         assert_eq!(fields["object"], "object");
         assert_eq!(fields["metadata_path"], metadata_path.to_string_lossy().as_ref());
