@@ -7505,7 +7505,7 @@ mod get_object_downstream_close_accounting_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use crate::diagnostics::get::{
-        GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT,
+        GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT,
         GetObjectFailureReason,
     };
     use crate::disk::RUSTFS_META_BUCKET;
@@ -7637,8 +7637,8 @@ mod get_object_downstream_close_accounting_tests {
             legacy_completed,
             internal_cancelled,
             legacy_cancelled,
-            internal_unsafe_miss,
-            legacy_unsafe_miss,
+            internal_not_found_miss,
+            legacy_not_found_miss,
             internal_saved,
             legacy_saved,
         ) = metrics::with_local_recorder(&recorder, || {
@@ -7714,7 +7714,7 @@ mod get_object_downstream_close_accounting_tests {
                         &[
                             ("path", GET_OBJECT_PATH_INTERNAL_META),
                             ("decision", "miss"),
-                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_NOT_FOUND),
                         ],
                     ),
                     recorder.counter_value(
@@ -7722,7 +7722,7 @@ mod get_object_downstream_close_accounting_tests {
                         &[
                             ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
                             ("decision", "miss"),
-                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_NOT_FOUND),
                         ],
                     ),
                     recorder.histogram_values(
@@ -7773,21 +7773,21 @@ mod get_object_downstream_close_accounting_tests {
             "internal metadata lifecycle cancelled count must not leak into legacy_duplex"
         );
         assert_eq!(
-            internal_unsafe_miss, 1,
-            "internal metadata unsafe early-stop miss must retain its path label"
+            internal_not_found_miss, 1,
+            "internal metadata not-found early-stop miss must retain its path label"
         );
         assert_eq!(
-            legacy_unsafe_miss, 0,
-            "internal metadata unsafe early-stop miss must not leak into legacy_duplex"
+            legacy_not_found_miss, 0,
+            "internal metadata not-found early-stop miss must not leak into legacy_duplex"
         );
         assert_eq!(
             internal_saved,
             vec![0.0],
-            "internal metadata unsafe miss must record zero saved responses on internal_meta"
+            "internal metadata not-found miss must record zero saved responses on internal_meta"
         );
         assert!(
             legacy_saved.is_empty(),
-            "internal metadata unsafe miss saved responses must not leak into legacy_duplex"
+            "internal metadata not-found miss saved responses must not leak into legacy_duplex"
         );
     }
 }
