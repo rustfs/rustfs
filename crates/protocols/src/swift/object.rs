@@ -122,12 +122,10 @@ fn swift_user_metadata(headers: &HeaderMap) -> Option<HashMap<String, String>> {
 ///
 /// Handles URL encoding/decoding and path normalization for Swift object keys.
 /// Swift object names can contain any UTF-8 characters except null bytes.
-#[allow(dead_code)] // Used in: object operations
 pub struct ObjectKeyMapper;
 
 impl ObjectKeyMapper {
     /// Create a new object key mapper
-    #[allow(dead_code)] // Used in: object operations
     pub fn new() -> Self {
         Self
     }
@@ -140,7 +138,6 @@ impl ObjectKeyMapper {
     /// - Not contain null bytes
     /// - Not contain '..' path segments (directory traversal)
     /// - Not start with '/' (leading slash handled by routing)
-    #[allow(dead_code)] // Used in: object operations
     pub fn validate_object_name(object: &str) -> SwiftResult<()> {
         if object.is_empty() {
             return Err(SwiftError::BadRequest("Object name cannot be empty".to_string()));
@@ -183,7 +180,6 @@ impl ObjectKeyMapper {
     /// Example:
     /// - Swift: "photos/vacation/beach photo.jpg"
     /// - S3: "photos/vacation/beach photo.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn swift_to_s3_key(object: &str) -> SwiftResult<String> {
         Self::validate_object_name(object)?;
         Ok(object.to_string())
@@ -193,7 +189,6 @@ impl ObjectKeyMapper {
     ///
     /// This is essentially an identity transformation since we store
     /// Swift object names as-is in S3.
-    #[allow(dead_code)] // Used in: object operations
     pub fn s3_to_swift_name(key: &str) -> String {
         key.to_string()
     }
@@ -208,7 +203,6 @@ impl ObjectKeyMapper {
     /// - Object: "vacation/beach.jpg"
     /// - Bucket: "abc123:photos"
     /// - Key: "vacation/beach.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn build_s3_key(object: &str) -> SwiftResult<String> {
         Self::swift_to_s3_key(object)
     }
@@ -220,7 +214,6 @@ impl ObjectKeyMapper {
     ///
     /// Example URL: /v1/AUTH_abc/container/path%2Fto%2Ffile.txt
     /// Decoded: "path/to/file.txt"
-    #[allow(dead_code)] // Used in: object operations
     pub fn decode_object_from_url(encoded: &str) -> SwiftResult<String> {
         // Decode percent-encoding
         let decoded = urlencoding::decode(encoded).map_err(|e| SwiftError::BadRequest(format!("Invalid URL encoding: {}", e)))?;
@@ -233,7 +226,6 @@ impl ObjectKeyMapper {
     ///
     /// When constructing URLs (e.g., for redirect responses), we need to
     /// percent-encode object names.
-    #[allow(dead_code)] // Used in: object operations
     pub fn encode_object_for_url(object: &str) -> String {
         urlencoding::encode(object).to_string()
     }
@@ -241,7 +233,6 @@ impl ObjectKeyMapper {
     /// Check if object name represents a directory (pseudo-directory)
     ///
     /// In Swift, objects ending with '/' are treated as directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn is_directory_marker(object: &str) -> bool {
         object.ends_with('/')
     }
@@ -250,7 +241,6 @@ impl ObjectKeyMapper {
     ///
     /// Removes redundant slashes and normalizes the path while preserving
     /// trailing slashes for directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn normalize_path(object: &str) -> String {
         // Split by '/', filter out empty segments (except if it's the end)
         let has_trailing_slash = object.ends_with('/');
@@ -324,7 +314,6 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 /// # Returns
 /// * `Ok(etag)` - Object ETag on success
 /// * `Err(SwiftError)` - Error if validation fails or upload fails
-#[allow(dead_code)] // Handler integration: PUT object
 pub async fn put_object<R>(
     account: &str,
     container: &str,
@@ -445,7 +434,6 @@ where
 ///
 /// Similar to put_object, but allows directly specifying metadata instead of extracting from headers.
 /// This is used internally for storing SLO manifests and marker objects.
-#[allow(dead_code)] // Used by SLO implementation
 pub async fn put_object_with_metadata<R>(
     account: &str,
     container: &str,
@@ -549,7 +537,6 @@ where
 /// - `bytes=1000-1999` - Bytes 1000-1999
 /// - `bytes=1000-` - From byte 1000 to end
 /// - `bytes=-500` - Last 500 bytes
-#[allow(dead_code)] // Handler integration: GET object
 pub async fn get_object(
     account: &str,
     container: &str,
@@ -608,7 +595,6 @@ pub async fn get_object(
 /// # Returns
 /// * `Ok(object_info)` - Object metadata (ObjectInfo)
 /// * `Err(SwiftError)` - Error if validation fails or object not found
-#[allow(dead_code)] // Handler integration: HEAD object
 pub async fn head_object(
     account: &str,
     container: &str,
@@ -671,7 +657,6 @@ pub async fn head_object(
 /// # Returns
 /// * `Ok(())` - Object deleted successfully (or didn't exist)
 /// * `Err(SwiftError)` - Error if validation fails or deletion fails
-#[allow(dead_code)] // Handler integration: DELETE object
 pub async fn delete_object(account: &str, container: &str, object: &str, credentials: &Credentials) -> SwiftResult<()> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -732,7 +717,6 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
 /// # Returns
 /// * `Ok(())` - Metadata updated successfully
 /// * `Err(SwiftError)` - Error if validation fails, object not found, or update fails
-#[allow(dead_code)] // Handler integration: POST object
 pub async fn update_object_metadata(
     account: &str,
     container: &str,
@@ -846,7 +830,6 @@ pub async fn update_object_metadata(
 /// # Handler Integration Note
 /// The current handler architecture needs to be updated to pass headers through
 /// to support COPY method and X-Copy-From header detection. See handler.rs for details.
-#[allow(dead_code)] // Handler integration: COPY object
 #[allow(clippy::too_many_arguments)] // Necessary for full copy functionality
 pub async fn copy_object(
     src_account: &str,
@@ -979,7 +962,6 @@ pub async fn copy_object(
 /// assert_eq!(container, "my-container");
 /// assert_eq!(object, "path/to/file.txt");
 /// ```
-#[allow(dead_code)] // Handler integration: COPY method
 pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, String)> {
     let destination = destination.trim_start_matches('/');
     let parts: Vec<&str> = destination.splitn(2, '/').collect();
@@ -1013,7 +995,6 @@ pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, Strin
 /// # Returns
 /// * `Ok((container, object))` - Parsed container and object names
 /// * `Err(SwiftError)` - Error if format is invalid
-#[allow(dead_code)] // Handler integration: X-Copy-From
 pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> {
     // Same parsing logic as Destination header
     parse_destination_header(copy_from)
@@ -1042,7 +1023,6 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.start, 0);
 /// assert_eq!(range.end, 1023);
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
 pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
@@ -1124,7 +1104,6 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
 /// let header = format_content_range(0, 1023, 5000);
 /// assert_eq!(header, "bytes 0-1023/5000");
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
 pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
     format!("bytes {}-{}/{}", start, end, total)
 }
