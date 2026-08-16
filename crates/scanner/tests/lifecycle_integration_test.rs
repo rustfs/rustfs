@@ -1069,309 +1069,314 @@ mod serial_tests {
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_transition_and_restore_flows() {
-        let (disk_paths, ecstore) = setup_test_env().await;
+        async move {
+            let (disk_paths, ecstore) = setup_test_env().await;
 
-        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
-        let backend = register_mock_tier(&tier_name).await;
+            let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&tier_name).await;
 
-        let put_bucket = format!("test-immediate-put-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let put_object = "test/object.txt";
-        let put_payload = b"Hello, immediate transition!";
+            let put_bucket = format!("test-immediate-put-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let put_object = "test/object.txt";
+            let put_payload = b"Hello, immediate transition!";
 
-        create_test_bucket(&ecstore, put_bucket.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(put_bucket.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
-
-        let mut reader = PutObjReader::from_vec(put_payload.to_vec());
-        let mut metadata = HashMap::new();
-        metadata.insert("content-type".to_string(), "text/plain".to_string());
-        ecstore
-            .put_object(
-                put_bucket.as_str(),
-                put_object,
-                &mut reader,
-                &ObjectOptions {
-                    user_defined: metadata,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("Failed to upload transition metadata test object");
-
-        enqueue_transition_for_existing_objects(ecstore.clone(), put_bucket.as_str())
-            .await
-            .expect("Failed to enqueue transitioned put object");
-
-        let put_info = wait_for_transition(&ecstore, put_bucket.as_str(), put_object, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("object should transition after enqueueing existing objects");
-
-        assert_eq!(put_info.transitioned_object.status, "complete");
-        assert_eq!(put_info.transitioned_object.tier, tier_name);
-        assert!(backend.contains(&put_info.transitioned_object.name).await);
-        {
-            let transitioned = backend
-                .stored(&put_info.transitioned_object.name)
+            create_test_bucket(&ecstore, put_bucket.as_str()).await;
+            set_bucket_lifecycle_transition_with_tier(put_bucket.as_str(), &tier_name)
                 .await
-                .expect("transitioned object should be present in mock backend");
-            assert_eq!(transitioned.metadata.get("content-type"), Some(&"text/plain".to_string()));
-            assert!(
-                !transitioned.metadata.contains_key("x-amz-replication-status"),
-                "transitioned objects must not inherit replication status defaults"
-            );
-            assert!(
-                !transitioned.metadata.contains_key("x-amz-object-lock-legal-hold"),
-                "transitioned objects must not invent object lock headers"
-            );
-        }
+                .expect("Failed to set lifecycle configuration");
 
-        // Cross-shard xl.meta transition assertion helper (rustfs/backlog#1148 ilm-6):
-        // every disk must agree on the transition tuple for the object.
-        let put_meta = assert_transition_meta_consistent(&disk_paths, put_bucket.as_str(), put_object).await;
-        assert_eq!(put_meta.status, "complete");
-        assert_eq!(put_meta.tier, tier_name);
+            let mut reader = PutObjReader::from_vec(put_payload.to_vec());
+            let mut metadata = HashMap::new();
+            metadata.insert("content-type".to_string(), "text/plain".to_string());
+            ecstore
+                .put_object(
+                    put_bucket.as_str(),
+                    put_object,
+                    &mut reader,
+                    &ObjectOptions {
+                        user_defined: metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to upload transition metadata test object");
 
-        let multipart_bucket = format!("test-immediate-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let multipart_object = "test/multipart.txt";
+            enqueue_transition_for_existing_objects(ecstore.clone(), put_bucket.as_str())
+                .await
+                .expect("Failed to enqueue transitioned put object");
 
-        create_test_bucket(&ecstore, multipart_bucket.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(multipart_bucket.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
+            let put_info = wait_for_transition(&ecstore, put_bucket.as_str(), put_object, TRANSITION_WAIT_TIMEOUT)
+                .await
+                .expect("object should transition after enqueueing existing objects");
 
-        let upload = ecstore
-            .new_multipart_upload(multipart_bucket.as_str(), multipart_object, &ObjectOptions::default())
-            .await
-            .expect("Failed to create multipart upload");
+            assert_eq!(put_info.transitioned_object.status, "complete");
+            assert_eq!(put_info.transitioned_object.tier, tier_name);
+            assert!(backend.contains(&put_info.transitioned_object.name).await);
+            {
+                let transitioned = backend
+                    .stored(&put_info.transitioned_object.name)
+                    .await
+                    .expect("transitioned object should be present in mock backend");
+                assert_eq!(transitioned.metadata.get("content-type"), Some(&"text/plain".to_string()));
+                assert!(
+                    !transitioned.metadata.contains_key("x-amz-replication-status"),
+                    "transitioned objects must not inherit replication status defaults"
+                );
+                assert!(
+                    !transitioned.metadata.contains_key("x-amz-object-lock-legal-hold"),
+                    "transitioned objects must not invent object lock headers"
+                );
+            }
 
-        let part_data = b"multipart immediate transition";
-        let mut reader = PutObjReader::from_vec(part_data.to_vec());
-        let part = ecstore
-            .put_object_part(
-                multipart_bucket.as_str(),
-                multipart_object,
-                &upload.upload_id,
-                1,
-                &mut reader,
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to upload multipart part");
+            // Cross-shard xl.meta transition assertion helper (rustfs/backlog#1148 ilm-6):
+            // every disk must agree on the transition tuple for the object.
+            let put_meta = assert_transition_meta_consistent(&disk_paths, put_bucket.as_str(), put_object).await;
+            assert_eq!(put_meta.status, "complete");
+            assert_eq!(put_meta.tier, tier_name);
 
-        ecstore
-            .clone()
-            .complete_multipart_upload(
-                multipart_bucket.as_str(),
-                multipart_object,
-                &upload.upload_id,
-                vec![CompletePart {
-                    part_num: 1,
-                    etag: part.etag.clone(),
-                    ..Default::default()
-                }],
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to complete multipart upload");
+            let multipart_bucket = format!("test-immediate-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let multipart_object = "test/multipart.txt";
 
-        enqueue_transition_for_existing_objects(ecstore.clone(), multipart_bucket.as_str())
-            .await
-            .expect("Failed to enqueue transitioned multipart object");
+            create_test_bucket(&ecstore, multipart_bucket.as_str()).await;
+            set_bucket_lifecycle_transition_with_tier(multipart_bucket.as_str(), &tier_name)
+                .await
+                .expect("Failed to set lifecycle configuration");
 
-        let multipart_info = wait_for_transition(&ecstore, multipart_bucket.as_str(), multipart_object, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("object should transition after enqueueing existing objects");
+            let upload = ecstore
+                .new_multipart_upload(multipart_bucket.as_str(), multipart_object, &ObjectOptions::default())
+                .await
+                .expect("Failed to create multipart upload");
 
-        assert_eq!(multipart_info.transitioned_object.status, "complete");
-        assert_eq!(multipart_info.transitioned_object.tier, tier_name);
-        assert!(backend.contains(&multipart_info.transitioned_object.name).await);
+            let part_data = b"multipart immediate transition";
+            let mut reader = PutObjReader::from_vec(part_data.to_vec());
+            let part = ecstore
+                .put_object_part(
+                    multipart_bucket.as_str(),
+                    multipart_object,
+                    &upload.upload_id,
+                    1,
+                    &mut reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to upload multipart part");
 
-        let src_bucket = format!("test-immediate-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let dst_bucket = format!("test-immediate-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let src_object = "test/source.txt";
-        let dst_object = "test/copied.txt";
-        let payload = b"copy object immediate transition";
-
-        create_test_bucket(&ecstore, src_bucket.as_str()).await;
-        create_test_bucket(&ecstore, dst_bucket.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(dst_bucket.as_str(), &tier_name)
-            .await
-            .expect("Failed to set destination lifecycle configuration");
-
-        upload_test_object(&ecstore, src_bucket.as_str(), src_object, payload).await;
-
-        let mut src_info = ecstore
-            .get_object_info(src_bucket.as_str(), src_object, &ObjectOptions::default())
-            .await
-            .expect("Failed to load source object info");
-        src_info.put_object_reader = Some(PutObjReader::from_vec(payload.to_vec()));
-
-        ecstore
-            .copy_object(
-                src_bucket.as_str(),
-                src_object,
-                dst_bucket.as_str(),
-                dst_object,
-                &mut src_info,
-                &ObjectOptions::default(),
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to copy object");
-
-        enqueue_transition_for_existing_objects(ecstore.clone(), dst_bucket.as_str())
-            .await
-            .expect("Failed to enqueue transitioned copied object");
-
-        let copy_info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("copied object should transition after enqueueing existing objects");
-
-        assert_eq!(copy_info.transitioned_object.status, "complete");
-        assert_eq!(copy_info.transitioned_object.tier, tier_name);
-        assert!(backend.contains(&copy_info.transitioned_object.name).await);
-
-        let bucket_name = format!("test-lifecycle-update-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let object_name = "test/existing.txt";
-        let payload = b"existing object before lifecycle";
-
-        create_test_bucket(&ecstore, bucket_name.as_str()).await;
-        upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
-
-        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
-
-        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
-            .await
-            .expect("Failed to enqueue transition for existing objects");
-
-        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("existing object should transition after lifecycle update");
-
-        assert_eq!(info.transitioned_object.status, "complete");
-        assert_eq!(info.transitioned_object.tier, tier_name);
-        assert!(backend.contains(&info.transitioned_object.name).await);
-
-        let bucket_name = format!("test-restore-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let object_name = "test/restore.txt";
-        let part1 = vec![b'a'; 5 * 1024 * 1024];
-        let part2 = b"restored-tail".to_vec();
-        let expected = [part1.clone(), part2.clone()].concat();
-
-        create_test_bucket(&ecstore, bucket_name.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
-
-        let upload = ecstore
-            .new_multipart_upload(bucket_name.as_str(), object_name, &ObjectOptions::default())
-            .await
-            .expect("Failed to create multipart upload");
-
-        let mut part1_reader = PutObjReader::from_vec(part1);
-        let uploaded_part1 = ecstore
-            .put_object_part(
-                bucket_name.as_str(),
-                object_name,
-                &upload.upload_id,
-                1,
-                &mut part1_reader,
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to upload first multipart part");
-
-        let mut part2_reader = PutObjReader::from_vec(part2);
-        let uploaded_part2 = ecstore
-            .put_object_part(
-                bucket_name.as_str(),
-                object_name,
-                &upload.upload_id,
-                2,
-                &mut part2_reader,
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to upload second multipart part");
-
-        ecstore
-            .clone()
-            .complete_multipart_upload(
-                bucket_name.as_str(),
-                object_name,
-                &upload.upload_id,
-                vec![
-                    CompletePart {
+            ecstore
+                .clone()
+                .complete_multipart_upload(
+                    multipart_bucket.as_str(),
+                    multipart_object,
+                    &upload.upload_id,
+                    vec![CompletePart {
                         part_num: 1,
-                        etag: uploaded_part1.etag.clone(),
+                        etag: part.etag.clone(),
                         ..Default::default()
-                    },
-                    CompletePart {
-                        part_num: 2,
-                        etag: uploaded_part2.etag.clone(),
-                        ..Default::default()
-                    },
-                ],
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("Failed to complete multipart upload");
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to complete multipart upload");
 
-        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
-            .await
-            .expect("Failed to enqueue transitioned restore object");
+            enqueue_transition_for_existing_objects(ecstore.clone(), multipart_bucket.as_str())
+                .await
+                .expect("Failed to enqueue transitioned multipart object");
 
-        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("multipart object should transition after enqueueing existing objects");
-        assert_eq!(transitioned.parts.len(), 2);
+            let multipart_info =
+                wait_for_transition(&ecstore, multipart_bucket.as_str(), multipart_object, TRANSITION_WAIT_TIMEOUT)
+                    .await
+                    .expect("object should transition after enqueueing existing objects");
 
-        ecstore
-            .clone()
-            .restore_transitioned_object(
-                bucket_name.as_str(),
-                object_name,
-                &ObjectOptions {
-                    transition: TransitionOptions {
-                        restore_request: RestoreRequest {
-                            days: Some(1),
-                            description: None,
-                            glacier_job_parameters: None,
-                            output_location: None,
-                            select_parameters: None,
-                            tier: None,
-                            type_: None,
+            assert_eq!(multipart_info.transitioned_object.status, "complete");
+            assert_eq!(multipart_info.transitioned_object.tier, tier_name);
+            assert!(backend.contains(&multipart_info.transitioned_object.name).await);
+
+            let src_bucket = format!("test-immediate-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let dst_bucket = format!("test-immediate-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let src_object = "test/source.txt";
+            let dst_object = "test/copied.txt";
+            let payload = b"copy object immediate transition";
+
+            create_test_bucket(&ecstore, src_bucket.as_str()).await;
+            create_test_bucket(&ecstore, dst_bucket.as_str()).await;
+            set_bucket_lifecycle_transition_with_tier(dst_bucket.as_str(), &tier_name)
+                .await
+                .expect("Failed to set destination lifecycle configuration");
+
+            upload_test_object(&ecstore, src_bucket.as_str(), src_object, payload).await;
+
+            let mut src_info = ecstore
+                .get_object_info(src_bucket.as_str(), src_object, &ObjectOptions::default())
+                .await
+                .expect("Failed to load source object info");
+            src_info.put_object_reader = Some(PutObjReader::from_vec(payload.to_vec()));
+
+            ecstore
+                .copy_object(
+                    src_bucket.as_str(),
+                    src_object,
+                    dst_bucket.as_str(),
+                    dst_object,
+                    &mut src_info,
+                    &ObjectOptions::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to copy object");
+
+            enqueue_transition_for_existing_objects(ecstore.clone(), dst_bucket.as_str())
+                .await
+                .expect("Failed to enqueue transitioned copied object");
+
+            let copy_info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
+                .await
+                .expect("copied object should transition after enqueueing existing objects");
+
+            assert_eq!(copy_info.transitioned_object.status, "complete");
+            assert_eq!(copy_info.transitioned_object.tier, tier_name);
+            assert!(backend.contains(&copy_info.transitioned_object.name).await);
+
+            let bucket_name = format!("test-lifecycle-update-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let object_name = "test/existing.txt";
+            let payload = b"existing object before lifecycle";
+
+            create_test_bucket(&ecstore, bucket_name.as_str()).await;
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+
+            set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+                .await
+                .expect("Failed to set lifecycle configuration");
+
+            enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+                .await
+                .expect("Failed to enqueue transition for existing objects");
+
+            let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+                .await
+                .expect("existing object should transition after lifecycle update");
+
+            assert_eq!(info.transitioned_object.status, "complete");
+            assert_eq!(info.transitioned_object.tier, tier_name);
+            assert!(backend.contains(&info.transitioned_object.name).await);
+
+            let bucket_name = format!("test-restore-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let object_name = "test/restore.txt";
+            let part1 = vec![b'a'; 5 * 1024 * 1024];
+            let part2 = b"restored-tail".to_vec();
+            let expected = [part1.clone(), part2.clone()].concat();
+
+            create_test_bucket(&ecstore, bucket_name.as_str()).await;
+            set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+                .await
+                .expect("Failed to set lifecycle configuration");
+
+            let upload = ecstore
+                .new_multipart_upload(bucket_name.as_str(), object_name, &ObjectOptions::default())
+                .await
+                .expect("Failed to create multipart upload");
+
+            let mut part1_reader = PutObjReader::from_vec(part1);
+            let uploaded_part1 = ecstore
+                .put_object_part(
+                    bucket_name.as_str(),
+                    object_name,
+                    &upload.upload_id,
+                    1,
+                    &mut part1_reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to upload first multipart part");
+
+            let mut part2_reader = PutObjReader::from_vec(part2);
+            let uploaded_part2 = ecstore
+                .put_object_part(
+                    bucket_name.as_str(),
+                    object_name,
+                    &upload.upload_id,
+                    2,
+                    &mut part2_reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to upload second multipart part");
+
+            ecstore
+                .clone()
+                .complete_multipart_upload(
+                    bucket_name.as_str(),
+                    object_name,
+                    &upload.upload_id,
+                    vec![
+                        CompletePart {
+                            part_num: 1,
+                            etag: uploaded_part1.etag.clone(),
+                            ..Default::default()
+                        },
+                        CompletePart {
+                            part_num: 2,
+                            etag: uploaded_part2.etag.clone(),
+                            ..Default::default()
+                        },
+                    ],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to complete multipart upload");
+
+            enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+                .await
+                .expect("Failed to enqueue transitioned restore object");
+
+            let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+                .await
+                .expect("multipart object should transition after enqueueing existing objects");
+            assert_eq!(transitioned.parts.len(), 2);
+
+            ecstore
+                .clone()
+                .restore_transitioned_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            restore_request: RestoreRequest {
+                                days: Some(1),
+                                description: None,
+                                glacier_job_parameters: None,
+                                output_location: None,
+                                select_parameters: None,
+                                tier: None,
+                                type_: None,
+                            },
+                            ..Default::default()
                         },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("Failed to restore transitioned multipart object");
+                )
+                .await
+                .expect("Failed to restore transitioned multipart object");
 
-        let restored = ecstore
-            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
-            .await
-            .expect("Failed to load restored object info");
-        assert_eq!(restored.parts.len(), 2);
-        assert!(restored.restore_expires.is_some());
-        assert!(!restored.restore_ongoing);
+            let restored = ecstore
+                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+                .await
+                .expect("Failed to load restored object info");
+            assert_eq!(restored.parts.len(), 2);
+            assert!(restored.restore_expires.is_some());
+            assert!(!restored.restore_ongoing);
 
-        let mut reader = ecstore
-            .get_object_reader(bucket_name.as_str(), object_name, None, http::HeaderMap::new(), &ObjectOptions::default())
-            .await
-            .expect("Failed to read restored object");
-        let mut data = Vec::new();
-        reader
-            .stream
-            .read_to_end(&mut data)
-            .await
-            .expect("Failed to consume restored object stream");
-        assert_eq!(data, expected);
+            let mut reader = ecstore
+                .get_object_reader(bucket_name.as_str(), object_name, None, http::HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("Failed to read restored object");
+            let mut data = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut data)
+                .await
+                .expect("Failed to consume restored object stream");
+            assert_eq!(data, expected);
+        }
+        .boxed_local()
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
