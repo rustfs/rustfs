@@ -666,7 +666,8 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
-    if !candidate.inline_data() {
+    // `inline_data` excludes remote objects; this diagnostic reports them separately.
+    if !rustfs_utils::http::contains_key_str(&candidate.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE);
     }
     if candidate.is_compressed()
@@ -6367,6 +6368,13 @@ mod tests {
         assert_eq!(
             data_read_early_stop_inline_body_miss_reason(bucket, object, &not_inline, &parts_metadata, &disks).await,
             Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE)
+        );
+
+        let mut remote = candidate.clone();
+        remote.transition_status = TRANSITION_COMPLETE.to_string();
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &remote, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE)
         );
 
         let mut transformed = candidate.clone();
