@@ -340,6 +340,10 @@ impl ReplicationStats {
     }
 
     /// Site replication update replica statistics
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     fn sr_update_replica_stat(&self, size: i64) {
         self.sr_stats.replica_size.fetch_add(size, Ordering::Relaxed);
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);

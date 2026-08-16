@@ -385,6 +385,10 @@ impl ExpiryOp for Jentry {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
     let result = delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await;
     if let Err(err) = &result
@@ -395,6 +399,10 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
     result
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
     #[cfg(test)]
     if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, tier_name) {
@@ -405,6 +413,10 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
     delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, &tier_config_mgr).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_object_from_remote_tier_raw_with_manager(
     obj_name: &str,
     rv_id: &str,
@@ -485,6 +497,10 @@ pub enum RemoteTierDeleteOutcome {
     AlreadyRemoved,
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn delete_object_from_remote_tier_idempotent(
     obj_name: &str,
     rv_id: &str,
