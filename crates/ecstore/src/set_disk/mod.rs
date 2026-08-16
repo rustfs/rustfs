@@ -692,8 +692,9 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
 // requests `should_allow_metadata_early_stop` classifies as safe (latest-version
-// metadata-only reads by default, without version_id / healing / free-version
-// needs) and still requires a full read-quorum agreement before stopping. Set
+// reads by default, without version_id / healing / free-version needs) and still
+// requires a full read-quorum agreement before stopping. Data-read requests add
+// a separate inline-shard verifier before cancelling the remaining fanout. Set
 // the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
@@ -704,10 +705,10 @@ const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_META
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
 
 // --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
 
@@ -1039,7 +1040,7 @@ mod prepared_get_object_metadata_tests {
 
     #[test]
     #[serial_test::serial(body_cache_hook)]
-    fn inline_data_read_early_stop_reader_returns_exact_body() {
+    fn inline_data_read_early_stop_defaults_return_exact_body() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1071,9 +1072,9 @@ mod prepared_get_object_metadata_tests {
 
                 temp_env::async_with_vars(
                     [
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
                     ],
                     async {
                         let slow_initial_disk = bounded_slow_initial_disk_index(bucket, &object);
@@ -1285,9 +1286,9 @@ mod prepared_get_object_metadata_tests {
 
                     temp_env::async_with_vars(
                         [
-                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
                         ],
                         async {
                             let calls = disk_call_counters::observe(&object);
