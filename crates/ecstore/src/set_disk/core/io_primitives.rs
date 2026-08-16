@@ -7141,7 +7141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_metadata_early_stop_defaults_keep_data_get_full_fanout() {
+    async fn bounded_metadata_early_stop_defaults_keep_non_inline_data_get_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-default-bucket";
         let object = "bounded-data-get-default-object";
@@ -7164,7 +7164,7 @@ mod tests {
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "default GET data-read metadata must keep full fanout for read-failure tolerance"
+                    "default non-inline GET data-read metadata must keep full fanout for read-failure tolerance"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);

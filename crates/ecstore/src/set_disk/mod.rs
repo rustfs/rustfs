@@ -692,8 +692,9 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
 // requests `should_allow_metadata_early_stop` classifies as safe (latest-version
-// metadata-only reads by default, without version_id / healing / free-version
-// needs) and still requires a full read-quorum agreement before stopping. Set
+// reads by default, without version_id / healing / free-version needs) and still
+// requires a full read-quorum agreement before stopping. Data-read requests add
+// a separate inline-shard verifier before cancelling the remaining fanout. Set
 // the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
@@ -704,7 +705,7 @@ const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_META
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
@@ -915,12 +916,6 @@ mod prepared_get_object_metadata_tests {
             .expect("4-disk test geometry should leave one bounded spare disk")
     }
 
-    fn bounded_slow_initial_disk_index(bucket: &str, object: &str) -> usize {
-        *bounded_metadata_fanout_order(bucket, object, 4, 2)
-            .get(2)
-            .expect("4-disk test geometry should include a third initial metadata disk")
-    }
-
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
         let snapshot = GetObjectFileInfo::owned(FileInfo::default(), Vec::new(), Vec::new());
@@ -1039,7 +1034,7 @@ mod prepared_get_object_metadata_tests {
 
     #[test]
     #[serial_test::serial(body_cache_hook)]
-    fn inline_data_read_early_stop_reader_returns_exact_body() {
+    fn inline_data_read_early_stop_defaults_return_exact_body() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1071,14 +1066,14 @@ mod prepared_get_object_metadata_tests {
 
                 temp_env::async_with_vars(
                     [
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
                     ],
                     async {
-                        let slow_initial_disk = bounded_slow_initial_disk_index(bucket, &object);
+                        let slow_parity_disk = bounded_spare_disk_index(bucket, &object);
                         let barrier =
-                            rename_fanout_barrier::arm(&object, slow_initial_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                            rename_fanout_barrier::arm(&object, slow_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                         let calls = disk_call_counters::observe(&object);
                         let set_disks_for_read = Arc::clone(&set_disks);
                         let opts_for_read = opts.clone();
@@ -1091,10 +1086,10 @@ mod prepared_get_object_metadata_tests {
 
                         tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
                             .await
-                            .expect("bounded inline GET should pause a slow initial metadata read");
+                            .expect("default inline GET should pause a slow parity metadata read");
                         let mut reader = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut open_reader)
                             .await
-                            .expect("production inline GET should return before the paused metadata response")
+                            .expect("default production inline GET should return before the paused parity metadata response")
                             .expect("inline GET reader task should not panic")
                             .expect("inline GET reader should open");
                         let object_size = reader.object_info.size;
@@ -1115,14 +1110,14 @@ mod prepared_get_object_metadata_tests {
 
         assert_eq!(object_size, payload.len() as i64);
         assert_eq!(restored, payload);
-        assert_eq!(calls_total, 4, "bounded production GET should schedule the initial quorum plus one spare");
+        assert_eq!(calls_total, 4, "default production GET should eagerly schedule the full metadata fanout");
         assert_eq!(
             recorder.histogram_values(
                 "rustfs_io_get_object_metadata_fanout_scheduled",
                 &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
             ),
             vec![4.0],
-            "bounded production GET should record all scheduled metadata tasks"
+            "default production GET should record all scheduled metadata tasks"
         );
         assert_eq!(
             recorder.histogram_values(
@@ -1130,7 +1125,7 @@ mod prepared_get_object_metadata_tests {
                 &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
             ),
             vec![3.0],
-            "bounded production GET should record only observed metadata responses as completed"
+            "default production GET should record only observed metadata responses as completed"
         );
         assert_eq!(
             recorder.histogram_values(
@@ -1138,7 +1133,7 @@ mod prepared_get_object_metadata_tests {
                 &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
             ),
             vec![1.0],
-            "bounded production GET should record the aborted slow metadata task"
+            "default production GET should record the aborted slow parity metadata task"
         );
     }
 
@@ -1285,9 +1280,9 @@ mod prepared_get_object_metadata_tests {
 
                     temp_env::async_with_vars(
                         [
-                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
                         ],
                         async {
                             let calls = disk_call_counters::observe(&object);

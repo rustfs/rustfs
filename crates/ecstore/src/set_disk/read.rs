@@ -3886,13 +3886,15 @@ mod tests {
                 assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
                 // observe=false (non-observed fanout) also disables early-stop.
                 assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
-                assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
+                // Whole/latest data-read metadata is now allowed by default;
+                // the inline verifier still decides whether it can stop early.
+                assert!(metadata_early_stop_permitted(true, true, true, "", false, false));
             },
         );
     }
 
     #[test]
-    fn metadata_early_stop_keeps_data_reads_opt_in_by_default() {
+    fn metadata_early_stop_allows_safe_data_reads_by_default() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
@@ -3900,7 +3902,7 @@ mod tests {
                 (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
             ],
             || {
-                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(should_allow_metadata_early_stop(true, "", false, false));
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
                 assert!(!should_allow_metadata_early_stop(false, "version-id", false, false));
@@ -3928,6 +3930,34 @@ mod tests {
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
                 assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_early_stop_bounded_fanout_defaults_to_disabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, None),
+            ],
+            || {
+                assert!(is_get_metadata_data_read_early_stop_enabled());
+                assert!(!is_get_metadata_early_stop_bounded_fanout_enabled());
+            },
+        );
+        temp_env::with_vars([(ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true"))], || {
+            assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
+        });
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false")),
+            ],
+            || {
+                assert!(!is_get_metadata_data_read_early_stop_enabled());
+                assert!(!is_get_metadata_early_stop_bounded_fanout_enabled());
             },
         );
     }
