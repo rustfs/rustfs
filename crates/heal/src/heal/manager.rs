@@ -673,6 +673,12 @@ fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(Hea
     Some((request, delay, error))
 }
 
+async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
+    let (_, delay, error) = retry_request_for_result(task, result)?;
+    let request = task.retry_request_with_remaining_timeout().await.ok()?;
+    Some((request, delay, error))
+}
+
 fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
     let retry_attempt = retry_attempt.clamp(1, 5);
     let delay = Duration::from_secs(2_u64.saturating_pow(retry_attempt));
@@ -690,7 +696,7 @@ pub struct HealConfig {
     pub max_concurrent_heals: usize,
     /// Maximum concurrent heal tasks allowed for a single erasure set
     pub max_concurrent_per_set: usize,
-    /// Task timeout
+    /// Aggregate task execution timeout across recoverable retries
     pub task_timeout: Duration,
     /// Queue size
     pub queue_size: usize,
@@ -3106,7 +3112,7 @@ impl HealManager {
                         "Heal scheduler task started"
                     );
                     let result = task.execute().await;
-                    let retry_request = retry_request_for_result(task.as_ref(), &result);
+                    let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
                     match &result {
                         Ok(_) => {
                             debug!(
@@ -4537,6 +4543,25 @@ mod tests {
         assert_eq!(retry_request.priority, task.priority);
         assert!(retry_delay > Duration::ZERO);
         assert!(retry_error.contains("Lock acquisition timeout"));
+    }
+
+    #[tokio::test]
+    async fn retry_request_for_result_preserves_remaining_timeout_budget() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+        request.options.timeout = Some(Duration::from_secs(60));
+        let task = HealTask::from_request(request, storage);
+        let result = task.execute().await;
+
+        let (retry_request, _, _) = retry_request_for_result_with_budget(&task, &result)
+            .await
+            .expect("read quorum failure should retain the unused timeout budget");
+        let remaining = retry_request
+            .options
+            .timeout
+            .expect("configured timeout should remain present");
+        assert!(remaining < Duration::from_secs(60));
+        assert!(remaining > Duration::from_secs(59));
     }
 
     #[test]
@@ -6054,7 +6079,7 @@ mod tests {
         process_manager_queue_once(&manager).await;
         let defaulted_status = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Ok(status @ HealTaskStatus::Retrying { .. }) = manager.get_task_status(&defaulted_id).await {
+                if let Ok(status @ HealTaskStatus::Timeout) = manager.get_task_status(&defaulted_id).await {
                     break status;
                 }
                 tokio::task::yield_now().await;
@@ -6062,23 +6087,8 @@ mod tests {
         })
         .await
         .expect("configured timeout should finish the task");
-        assert!(matches!(defaulted_status, HealTaskStatus::Retrying { .. }));
-        assert_eq!(
-            manager
-                .retrying_heals
-                .lock()
-                .await
-                .get(&defaulted_id)
-                .expect("timed out task should retain its retry request")
-                .request
-                .options
-                .timeout,
-            Some(Duration::ZERO)
-        );
-        manager
-            .cancel_task(&defaulted_id)
-            .await
-            .expect("retrying timeout task should be cancelled");
+        assert_eq!(defaulted_status, HealTaskStatus::Timeout);
+        assert!(manager.retrying_heals.lock().await.get(&defaulted_id).is_none());
 
         let mut explicit = bucket_request("explicit-timeout", HealPriority::Normal, HealRequestSource::Admin);
         explicit.options.timeout = Some(Duration::from_secs(60));

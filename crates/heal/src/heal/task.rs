@@ -196,7 +196,7 @@ pub struct HealOptions {
     /// Whether to skip namespace locking
     #[serde(default)]
     pub no_lock: bool,
-    /// Timeout
+    /// Aggregate execution timeout across recoverable manager retries
     pub timeout: Option<Duration>,
     /// pool index
     pub pool_index: Option<usize>,
@@ -440,6 +440,14 @@ impl HealTask {
             created_at: self.created_at,
             enqueued_at: SystemTime::now(),
         }
+    }
+
+    pub(crate) async fn retry_request_with_remaining_timeout(&self) -> Result<HealRequest> {
+        let mut request = self.retry_request();
+        if self.options.timeout.is_some() {
+            request.options.timeout = self.remaining_timeout().await?;
+        }
+        Ok(request)
     }
 
     pub(crate) fn from_replacement_recovery_request(
@@ -2656,6 +2664,36 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::storage_api::status::BucketInfo;
+
+    #[tokio::test]
+    async fn retry_request_carries_remaining_timeout_budget() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage::default());
+        let mut request = HealRequest::bucket("bucket".to_string());
+        request.options.timeout = Some(Duration::from_secs(100));
+        let task = HealTask::from_request(request, storage.clone());
+        *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_secs(40));
+
+        let retry = task
+            .retry_request_with_remaining_timeout()
+            .await
+            .expect("first retry should retain the unused timeout budget");
+        let first_remaining = retry.options.timeout.expect("configured timeout should remain present");
+        assert!(first_remaining <= Duration::from_secs(60));
+        assert!(first_remaining > Duration::from_secs(59));
+
+        let retry_task = HealTask::from_request(retry, storage);
+        *retry_task.task_start_instant.write().await = Some(Instant::now() - Duration::from_secs(20));
+        let second_retry = retry_task
+            .retry_request_with_remaining_timeout()
+            .await
+            .expect("second retry should retain only the unused aggregate budget");
+        let second_remaining = second_retry
+            .options
+            .timeout
+            .expect("configured timeout should remain present");
+        assert!(second_remaining <= Duration::from_secs(40));
+        assert!(second_remaining > Duration::from_secs(39));
+    }
 
     #[test]
     fn format_result_requires_every_requested_target_to_be_ok() {
