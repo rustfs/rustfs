@@ -132,18 +132,8 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str, rest_path: st
                 "expected-version-token": "stale-token-from-previous-load",
                 "expected-metadata-location": "current-metadata-location-from-load-table",
                 "new-metadata-location": f"s3://{warehouse}/tables/table-id/metadata/conflict_probe.metadata.json",
-                "requirements": [
-                    {
-                        "type": "assert-current-snapshot-id",
-                        "snapshot-id": 0,
-                    }
-                ],
-                "updates": [
-                    {
-                        "action": "set-current-schema",
-                        "schema-id": 0,
-                    }
-                ],
+                "requirements": [],
+                "updates": [],
             },
         ),
         probe_step(
@@ -157,6 +147,8 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str, rest_path: st
                 "expected-version-token": "current-version-token-from-load-table",
                 "expected-metadata-location": "current-metadata-location-from-load-table",
                 "new-metadata-location": f"s3://{warehouse}/tables/table-id/metadata/does_not_exist.metadata.json",
+                "requirements": [],
+                "updates": [],
             },
         ),
         probe_step(

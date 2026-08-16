@@ -23,6 +23,7 @@ const X_OBS_VERSION_ID: &str = "x-obs-version-id";
 const MAX_REMOTE_VERSION_ID_LEN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "bucket versioning states kept as a complete vocabulary (backlog#1823)")]
 pub(crate) enum BucketVersioningState {
     Unknown,
     Disabled,
@@ -47,6 +48,7 @@ impl RemoteVersion {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
     pub(crate) fn exact_request_id(&self) -> Result<Option<&str>, Error> {
         match self {
             Self::Unknown => Err(Error::new(

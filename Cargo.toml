@@ -171,7 +171,7 @@ tower = { version = "0.5.3" }
 tower-http = { version = "0.7.0" }
 
 # Serialization and Data Formats
-apache-avro = "0.22.0"
+apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
 bytes = { version = "1.12.1" }
 bytesize = "2.7.0"
 byteorder = "1.5.0"

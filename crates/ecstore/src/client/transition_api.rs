@@ -101,6 +101,10 @@ where
 
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
+#[allow(
+    dead_code,
+    reason = "reachable only from the unused transition client methods below (backlog#1823)"
+)]
 const C_ONLINE: i32 = 1;
 
 fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
@@ -320,6 +324,10 @@ impl TransitionClient {
         Ok(client)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client surface with no caller in this port (backlog#1823)"
+    )]
     fn endpoint_url(&self) -> Url {
         self.endpoint_url.clone()
     }
@@ -348,12 +356,20 @@ impl TransitionClient {
             .to_string())
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn trace_errors_only_off(&self) {
         if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
             *trace_errors_only = false;
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn trace_off(&self) {
         if let Ok(mut is_trace_enabled) = self.is_trace_enabled.lock() {
             *is_trace_enabled = false;
@@ -363,12 +379,20 @@ impl TransitionClient {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
         if let Ok(mut endpoint) = self.s3_accelerate_endpoint.lock() {
             *endpoint = accelerate_endpoint.to_string();
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
         if let Ok(mut dual_stack) = self.s3_dual_stack_enabled.lock() {
             *dual_stack = enabled;
@@ -398,10 +422,18 @@ impl TransitionClient {
         (hash_algos, hash_sums)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn is_online(&self) -> bool {
         !self.is_offline()
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn mark_offline(&self) {
         self.health_status
             .compare_exchange(C_ONLINE, C_OFFLINE, Ordering::SeqCst, Ordering::SeqCst);
@@ -411,10 +443,18 @@ impl TransitionClient {
         self.health_status.load(Ordering::SeqCst) == C_OFFLINE
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn health_check(hc_duration: Duration) {
         let _ = hc_duration;
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
@@ -1102,6 +1142,7 @@ impl Default for ObjectInfo {
 }
 
 impl ObjectInfo {
+    #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
     pub(crate) fn remote_version(
         &self,
         capabilities: ProviderVersionCapabilities,

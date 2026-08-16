@@ -262,6 +262,29 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()>;
 
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.view)
+            .await?;
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a view publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.create_view(entry).await
+    }
+
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>>;
 
     async fn list_views_page(
@@ -282,6 +305,32 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>>;
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult>;
+
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
+        if table_bucket_fence_required {
+            publication.begin_table_bucket(&request.table_bucket).await?;
+            if !publication.holds_table_bucket(&request.table_bucket) {
+                return Err(TableCatalogStoreError::Internal(
+                    "view replacement requires a table-bucket publication fence".to_string(),
+                ));
+            }
+        }
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.view)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement requires a view publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.replace_view(request).await
+    }
 
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()>;
 
@@ -338,7 +387,7 @@ struct TableCommitLockPublication<'a, B> {
 struct TableCommitLockPublicationState {
     table_bucket: Option<String>,
     table: Option<(String, String, String)>,
-    guards: Vec<Box<dyn Send>>,
+    guards: Vec<TableCatalogLockGuard>,
 }
 
 impl<'a, B> TableCommitLockPublication<'a, B> {
@@ -409,15 +458,17 @@ where
     }
 
     fn holds_table_bucket(&self, table_bucket: &str) -> bool {
-        self.state.lock().table_bucket.as_deref() == Some(table_bucket)
+        let state = self.state.lock();
+        state.table_bucket.as_deref() == Some(table_bucket) && state.guards.iter().all(|guard| !guard.is_lock_lost())
     }
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
-        self.state
-            .lock()
+        let state = self.state.lock();
+        state
             .table
             .as_ref()
             .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
+            && state.guards.iter().all(|guard| !guard.is_lock_lost())
     }
 
     fn complete(&self) {
@@ -436,6 +487,32 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+}
+
+pub(crate) struct TableCatalogLockGuard {
+    _guard: Box<dyn Send>,
+    lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+}
+
+impl TableCatalogLockGuard {
+    pub(crate) fn stable(guard: impl Send + 'static) -> Self {
+        Self {
+            _guard: Box::new(guard),
+            lock_lost: None,
+        }
+    }
+
+    fn namespace(guard: rustfs_lock::NamespaceLockGuard) -> Self {
+        let lock_lost = guard.lock_lost_signal();
+        Self {
+            _guard: Box::new(guard),
+            lock_lost,
+        }
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.lock_lost.as_ref().is_some_and(|signal| signal.is_lost())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,11 +665,11 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         Ok(TableCatalogObjectListPage { objects, is_truncated })
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         self.acquire_write_lock(bucket, object).await
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard>;
 
     async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
         Ok(())
@@ -1169,6 +1246,17 @@ where
         }
     }
 
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.create_view_with_publication(entry, publication).await,
+            Self::DurableStrong(store) => store.create_view_with_publication(entry, publication).await,
+        }
+    }
+
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_views(table_bucket, namespace).await,
@@ -1200,6 +1288,26 @@ where
         match self {
             Self::ObjectBacked(store) => store.replace_view(request).await,
             Self::DurableStrong(store) => store.replace_view(request).await,
+        }
+    }
+
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
+                    .await
+            }
+            Self::DurableStrong(store) => {
+                store
+                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
+                    .await
+            }
         }
     }
 
@@ -1686,7 +1794,7 @@ where
         })
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -1696,10 +1804,10 @@ where
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog table lock: {err}")))?;
-        Ok(Box::new(guard))
+        Ok(TableCatalogLockGuard::namespace(guard))
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -1709,7 +1817,7 @@ where
             .get_read_lock(get_lock_acquire_timeout())
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog migration lock: {err}")))?;
-        Ok(Box::new(guard))
+        Ok(TableCatalogLockGuard::namespace(guard))
     }
 }
 

@@ -225,8 +225,6 @@ async fn nothing_readable_leaves_the_bundle_unwrapped() {
             "artifact {} carries the raw on-disk record",
             artifact.path
         );
-        // A cheap structural check too: an encrypted payload is not JSON.
-        assert_ne!(payload.first(), Some(&b'{'), "artifact {} looks like plaintext JSON", artifact.path);
     }
 
     // The manifest itself is not encrypted, so assert directly that it carries

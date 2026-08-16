@@ -86,8 +86,8 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+    preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -5799,7 +5799,9 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, inbound_replication_put);
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
@@ -10081,6 +10083,19 @@ mod tests {
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
         assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
         assert_eq!(metadata.get("x-amz-meta-x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+
+        let mut replication_headers = HeaderMap::new();
+        insert_header(&mut replication_headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(
+            &mut replication_headers,
+            rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        let mut replica_metadata = HashMap::new();
+        let explicit_clear = has_replication_retention_update(&replication_headers, true);
+        apply_bucket_default_lock_retention("bucket", &state, &mut replica_metadata, explicit_clear).unwrap();
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {

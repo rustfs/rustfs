@@ -59,7 +59,10 @@ use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
-    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
     GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX,
     GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE,
@@ -3883,8 +3886,17 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
     parts_metadata: &'a [FileInfo],
     fi: &FileInfo,
     data_shards: usize,
-    mut disk_is_online: impl FnMut(usize) -> bool,
+    disk_is_online: impl FnMut(usize) -> bool,
 ) -> Option<Vec<&'a FileInfo>> {
+    collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, fi, data_shards, disk_is_online).ok()
+}
+
+fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
+    parts_metadata: &'a [FileInfo],
+    fi: &FileInfo,
+    data_shards: usize,
+    mut disk_is_online: impl FnMut(usize) -> bool,
+) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
     let distribution = &fi.erasure.distribution;
     let mut data_files = vec![None; data_shards];
 
@@ -3892,27 +3904,35 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
         if !disk_is_online(disk_index) {
             continue;
         }
-        let block_index = *distribution.get(disk_index)?;
+        let Some(&block_index) = distribution.get(disk_index) else {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+        };
         if block_index == 0 || block_index > data_shards {
             continue;
         }
+        if file_info.name.is_empty() {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD);
+        }
         if file_info.erasure.index != block_index {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
         }
         if !file_info.has_valid_erasure_geometry() {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
         }
         if !core::io_primitives::metadata_early_stop_candidate_matches(file_info, fi) {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
         }
         if file_info.data.as_ref().is_none_or(|data| data.is_empty()) {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD);
         }
 
         data_files[block_index - 1] = Some(file_info);
     }
 
-    data_files.into_iter().collect()
+    data_files
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD)
 }
 
 impl SetDisks {
