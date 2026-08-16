@@ -668,6 +668,60 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
+    if let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(candidate) {
+        return Some(reason);
+    }
+
+    let Ok(erasure) = coding::Erasure::try_new_with_options(
+        candidate.erasure.data_blocks,
+        candidate.erasure.parity_blocks,
+        candidate.erasure.block_size,
+        candidate.uses_legacy_checksum,
+    ) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+    };
+    let data_files =
+        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
+            disks.get(index).is_some_and(Option::is_some)
+        }) {
+            Ok(data_files) => data_files,
+            Err(reason) => return Some(reason),
+        };
+
+    let Some(part) = candidate.parts.first() else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    };
+    let Ok(object_size) = usize::try_from(candidate.size) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    };
+    let checksum_info = candidate.erasure.get_checksum_info(part.number);
+    let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    };
+    let read_length = inline_erasure_shard_file_offset(
+        0,
+        object_size,
+        object_size,
+        candidate.erasure.block_size,
+        erasure.data_shards,
+        candidate.uses_legacy_checksum,
+    );
+    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, erasure.data_shards, candidate.uses_legacy_checksum);
+    let Ok(mut readers) =
+        build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
+    else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+    };
+
+    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
+        Some(body) if body.len() == object_size => None,
+        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    }
+}
+
+fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Option<&'static str> {
     // `inline_data` excludes remote objects; this diagnostic reports them separately.
     if !rustfs_utils::http::contains_key_str(&candidate.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE);
@@ -705,51 +759,7 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
-
-    let Ok(erasure) = coding::Erasure::try_new_with_options(
-        candidate.erasure.data_blocks,
-        candidate.erasure.parity_blocks,
-        candidate.erasure.block_size,
-        candidate.uses_legacy_checksum,
-    ) else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
-    };
-    let data_files =
-        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
-            disks.get(index).is_some_and(Option::is_some)
-        }) {
-            Ok(data_files) => data_files,
-            Err(reason) => return Some(reason),
-        };
-
-    let Some(part) = candidate.parts.first() else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
-    };
-    let checksum_info = candidate.erasure.get_checksum_info(part.number);
-    let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-        HashAlgorithm::HighwayHash256SLegacy
-    } else {
-        checksum_info.algorithm
-    };
-    let read_length = inline_erasure_shard_file_offset(
-        0,
-        object_size,
-        object_size,
-        candidate.erasure.block_size,
-        erasure.data_shards,
-        candidate.uses_legacy_checksum,
-    );
-    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, erasure.data_shards, candidate.uses_legacy_checksum);
-    let Ok(mut readers) =
-        build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
-    else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-    };
-
-    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
-        Some(body) if body.len() == object_size => None,
-        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
-    }
+    None
 }
 
 fn data_read_inline_missing_shards_are_pending(
@@ -2610,6 +2620,14 @@ impl SetDisks {
                     Ok(file_info) => {
                         observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
                         accumulator.observe_file_info(&file_info);
+                        if bounded_fanout
+                            && read_data
+                            && !force_full_wait
+                            && let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(&file_info)
+                        {
+                            force_full_wait = true;
+                            final_miss_reason_override.get_or_insert(reason);
+                        }
                         if let Some(slot) = ress.get_mut(index) {
                             *slot = file_info;
                         }
@@ -7225,7 +7243,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bounded_non_inline_data_get_hedges_then_waits_for_full_fanout() {
+    async fn bounded_non_inline_data_get_immediately_forces_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-hedge-bucket";
         let object = "bounded-data-get-hedge-object";
@@ -7256,7 +7274,7 @@ mod tests {
                     }
                 })
                 .await
-                .expect("bounded data-read fanout should hedge by starting the spare disk");
+                .expect("bounded non-inline data-read fanout should immediately schedule the spare disk");
 
                 let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
                 assert!(
@@ -7272,7 +7290,7 @@ mod tests {
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "bounded data-read fanout should issue the paused disk plus one spare hedge"
+                    "bounded non-inline data-read fanout should issue the paused disk plus the remaining spare"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
@@ -7299,16 +7317,42 @@ mod tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
             ],
             async {
+                let barrier = rename_fanout_barrier::arm(object, 2, rename_fanout_barrier::PHASE_READ_VERSION);
                 let calls = disk_call_counters::observe(object);
-                let (parts_metadata, errs, diagnostics) =
-                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2)
+                let disks_for_read = disks.clone();
+                let mut read = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed(&disks_for_read, bucket, bucket, object, "", true, false, false, true, 2)
                         .await
-                        .expect("default data-read metadata should resolve");
+                });
+
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                    .await
+                    .expect("default bounded non-inline read should schedule the paused metadata task");
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    while calls.for_disk(disk_call_counters::KIND_READ_VERSION, 3) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect(
+                    "default bounded non-inline read should immediately force full fanout after the first non-inline response",
+                );
+
+                let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
+                assert!(
+                    pending.is_err(),
+                    "default non-inline data reads must not return before the paused metadata response"
+                );
+                barrier.release();
+                let (parts_metadata, errs, diagnostics) = read
+                    .await
+                    .expect("metadata read task should not panic")
+                    .expect("default data-read metadata should resolve");
 
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "default non-inline GET data-read metadata must keep full fanout for read-failure tolerance"
+                    "default non-inline GET data-read metadata must keep full fanout without waiting for a quorum miss first"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);

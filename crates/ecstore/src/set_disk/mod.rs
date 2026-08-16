@@ -714,7 +714,7 @@ const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_ME
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS";
 const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS";
@@ -1125,7 +1125,10 @@ mod prepared_get_object_metadata_tests {
 
         assert_eq!(object_size, payload.len() as i64);
         assert_eq!(restored, payload);
-        assert_eq!(calls_total, 4, "default production GET should eagerly schedule the full metadata fanout");
+        assert_eq!(
+            calls_total, 4,
+            "default production inline GET should schedule the initial bounded quorum plus one hedge"
+        );
         assert_eq!(
             recorder.histogram_values(
                 "rustfs_io_get_object_metadata_fanout_scheduled",
