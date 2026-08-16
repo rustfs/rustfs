@@ -5626,12 +5626,18 @@ impl LocalDisk {
     }
 
     // Check if a path is valid
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
+    )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         check_local_disk_valid_path(self.io_root(), path)
     }
 
-    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function reject_local_disk_symlink_components; no caller in this port (backlog#1823)"
+    )]
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(self.io_root(), path)
     }
