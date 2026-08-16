@@ -704,6 +704,7 @@ pub(crate) async fn create_bitrot_reader_from_bytes_with_stage_metrics(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn create_deferred_bitrot_reader(
     inline_data: Option<Bytes>,
     disk: Option<DiskStore>,

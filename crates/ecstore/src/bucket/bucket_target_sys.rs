@@ -82,7 +82,6 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 

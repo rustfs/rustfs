@@ -415,6 +415,7 @@ fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize
 /// never returned, but flips `is_truncated` to `true` and yields a
 /// `next_upload_id_marker` pointing at the last returned upload so the caller can
 /// resume paging.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn paginate_upload_page(remaining: &[MultipartInfo], max_uploads: usize) -> (Vec<MultipartInfo>, bool, Option<String>) {
     let is_truncated = remaining.len() > max_uploads;
     let page: Vec<MultipartInfo> = remaining.iter().take(max_uploads).cloned().collect();
@@ -557,6 +558,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(super) async fn check_upload_id_exists(
         &self,
         bucket: &str,

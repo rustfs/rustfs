@@ -1274,6 +1274,10 @@ where
         Ok(Some((entry, etag)))
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn write_table_entry(
         &self,
         entry: TableEntry,
@@ -1694,6 +1698,10 @@ where
         Ok(config)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn put_table_bucket_maintenance_config(
         &self,
         table_bucket: &str,
@@ -3023,6 +3031,10 @@ where
         table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn commit_table_compaction(
         &self,
         table_bucket: &str,
@@ -3576,6 +3588,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
         &self,
         table_bucket: &str,
@@ -3590,6 +3606,10 @@ where
             .await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn run_table_metadata_maintenance(
         &self,
         table_bucket: &str,
@@ -3771,6 +3791,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(in crate::table_catalog) async fn delete_table_metadata_maintenance_report(
         &self,
         table_bucket: &str,
