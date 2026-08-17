@@ -178,6 +178,7 @@ pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir_all if it's a directory
     match fs::remove_file(path.as_ref()).await {

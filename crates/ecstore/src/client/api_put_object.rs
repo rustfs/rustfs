@@ -37,7 +37,7 @@ use crate::client::{
     api_put_object_common::optimal_part_info,
     api_put_object_multipart::UploadPartParams,
     api_s3_datatypes::{CompleteMultipartUpload, CompletePart, ObjectPart},
-    constants::{ISO8601_DATEFORMAT, MAX_MULTIPART_PUT_OBJECT_SIZE, MIN_PART_SIZE, TOTAL_WORKERS},
+    constants::{ISO8601_DATEFORMAT, MAX_MULTIPART_PUT_OBJECT_SIZE, MIN_PART_SIZE},
     credentials::SignatureType,
     transition_api::{ReaderImpl, TransitionClient, UploadInfo},
     utils::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},

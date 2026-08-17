@@ -387,6 +387,7 @@ where
 
     async fn has_active_namespace_descendant(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
         let parent = namespace.public_name();
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, namespace);
         let descendant_prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), namespace.storage_id());
         let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
             .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
@@ -398,6 +399,9 @@ where
                 .await?;
             let last_scanned = page.objects.last().cloned();
             for object in page.objects {
+                if object == namespace_path {
+                    continue;
+                }
                 if self
                     .read_active_namespace_evidence(&object)
                     .await?
@@ -1036,6 +1040,20 @@ where
             .await
     }
 
+    async fn restore_table_warehouse_index_after_failed_drop(&self, entry: &TableEntry, reason: &'static str) {
+        if let Err(err) = self.reserve_table_warehouse_index(entry).await {
+            tracing::warn!(
+                table_bucket = %entry.table_bucket,
+                namespace = %entry.namespace,
+                table = %entry.table,
+                table_id = %entry.table_id,
+                reason,
+                error = %err,
+                "failed to restore table warehouse index after table drop stopped"
+            );
+        }
+    }
+
     async fn delete_table_warehouse_index_if_changed(&self, current: &TableEntry, next: &TableEntry) {
         let Ok(current_index) = table_warehouse_index_entry(current) else {
             return;
@@ -1256,6 +1274,10 @@ where
         Ok(Some((entry, etag)))
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn write_table_entry(
         &self,
         entry: TableEntry,
@@ -1316,6 +1338,15 @@ where
         }
         self.ensure_table_warehouse_prefix_available(&entry).await?;
         let reservation = self.reserve_table_warehouse_index(&entry).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket)
+            || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
+        {
+            self.delete_created_table_warehouse_index(&entry, reservation, "table publication fence lost")
+                .await;
+            return Err(TableCatalogStoreError::Internal(
+                "table registration publication fence was lost before catalog update".to_string(),
+            ));
+        }
         let result = self
             .write_entry_unlocked(self.catalog_bucket(), &table_path, &entry, precondition)
             .await;
@@ -1327,7 +1358,25 @@ where
     }
 
     async fn write_view_entry(&self, entry: ViewEntry, precondition: TableCatalogPutPrecondition) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        self.write_view_entry_with_publication(entry, precondition, &publication)
+            .await
+    }
+
+    async fn write_view_entry_with_publication(
+        &self,
+        entry: ViewEntry,
+        precondition: TableCatalogPutPrecondition,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
         validate_view_entry_version_and_id(&entry)?;
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let view = parse_table_for_store(&entry.view)?;
@@ -1352,6 +1401,17 @@ where
                 "catalog object already exists: table {}/{}/{}",
                 entry.table_bucket, entry.namespace, entry.view
             )));
+        }
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.view)
+            .await?;
+        if !publication.holds_table_bucket(&entry.table_bucket)
+            || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.view)
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation publication fence was lost before catalog update".to_string(),
+            ));
         }
         self.write_entry_unlocked(self.catalog_bucket(), &view_path, &entry, precondition)
             .await
@@ -1638,6 +1698,10 @@ where
         Ok(config)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn put_table_bucket_maintenance_config(
         &self,
         table_bucket: &str,
@@ -1754,7 +1818,6 @@ where
         &self,
         report: &TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<()> {
-        let report = table_maintenance_report_with_recommended_actions(report.clone());
         let namespace = parse_namespace_for_store(&report.job.namespace)?;
         let table = parse_table_for_store(&report.job.table)?;
         let Some((entry, _)) = self
@@ -1768,20 +1831,27 @@ where
                 table.as_str()
             )));
         };
-        validate_table_maintenance_report_owner(&report, &report.job.table_bucket, &namespace, &table, &entry.table_id)?;
-        let job_path = self.paths.table_maintenance_job_path(
-            &report.job.table_bucket,
-            &namespace,
-            &table,
-            &report.job.table_id,
-            &report.job.job_id,
-        );
+        self.put_table_metadata_maintenance_report_for_entry(report, &entry).await
+    }
+
+    async fn put_table_metadata_maintenance_report_for_entry(
+        &self,
+        report: &TableMetadataMaintenanceReport,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<()> {
+        let report = table_maintenance_report_with_recommended_actions(report.clone());
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        validate_table_maintenance_report_owner(&report, &entry.table_bucket, &namespace, &table, &entry.table_id)?;
+        let job_path =
+            self.paths
+                .table_maintenance_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id, &report.job.job_id);
         let latest_job_path =
             self.paths
-                .table_maintenance_latest_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
+                .table_maintenance_latest_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id);
         let current_job_path =
             self.paths
-                .table_maintenance_current_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
+                .table_maintenance_current_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id);
         self.write_entry(self.catalog_bucket(), &job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
         self.write_entry(self.catalog_bucket(), &latest_job_path, &report, TableCatalogPutPrecondition::Any)
@@ -2097,7 +2167,7 @@ where
                         before_status,
                         before_quarantined_object_count,
                     );
-                    self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+                    self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
                     report
                 }
                 TableMaintenanceSchedulerPreflight::Complete(report) => *report,
@@ -2210,7 +2280,7 @@ where
                 before_status,
                 before_quarantined_object_count,
             );
-            self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+            self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
             report
         };
 
@@ -2321,6 +2391,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance worker lease expired",
                     TableMaintenanceAuditAction::WorkerLeaseExpired,
@@ -2332,6 +2403,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance scheduler lease expired",
                     TableMaintenanceAuditAction::SchedulerLeaseExpired,
@@ -2495,7 +2567,7 @@ where
                 before_status,
                 before_quarantined_object_count,
             );
-            self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+            self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
 
             let delete = matches!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
             (report, effective, delete)
@@ -2561,6 +2633,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance worker lease expired",
                     TableMaintenanceAuditAction::WorkerLeaseExpired,
@@ -2575,6 +2648,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance scheduler lease expired",
                     TableMaintenanceAuditAction::SchedulerLeaseExpired,
@@ -2677,13 +2751,14 @@ where
             Some(TableMetadataMaintenanceJobStatus::Running),
             before_quarantined_object_count,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
         Ok(report)
     }
 
     async fn expire_table_maintenance_job(
         &self,
         mut report: TableMetadataMaintenanceReport,
+        entry: &TableEntry,
         now: OffsetDateTime,
         reason: &str,
         action: TableMaintenanceAuditAction,
@@ -2703,7 +2778,7 @@ where
             before_status,
             before_quarantined_object_count,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, entry).await?;
         Ok(report)
     }
 
@@ -2780,7 +2855,8 @@ where
             None,
             None,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, control.entry)
+            .await?;
         Ok(report)
     }
 
@@ -2857,7 +2933,8 @@ where
             None,
             None,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, control.entry)
+            .await?;
         Ok(report)
     }
 
@@ -2954,6 +3031,10 @@ where
         table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn commit_table_compaction(
         &self,
         table_bucket: &str,
@@ -3507,6 +3588,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
         &self,
         table_bucket: &str,
@@ -3521,6 +3606,10 @@ where
             .await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn run_table_metadata_maintenance(
         &self,
         table_bucket: &str,
@@ -3702,6 +3791,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(in crate::table_catalog) async fn delete_table_metadata_maintenance_report(
         &self,
         table_bucket: &str,
@@ -4493,16 +4586,16 @@ where
         validate_commit_metadata_digest(&request, &new_metadata_object)?;
         let table_bucket = request.table_bucket.clone();
         let metadata_location = request.new_metadata_location.clone();
-        let next_warehouse_location = tokio::task::spawn_blocking(move || {
-            table_metadata_warehouse_location(&table_bucket, &metadata_location, &new_metadata_object)
+        let next_metadata_state = tokio::task::spawn_blocking(move || {
+            table_metadata_commit_state(&table_bucket, &metadata_location, &new_metadata_object)
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("table metadata parser task failed: {err}")))??;
-        if next_warehouse_location
+        let warehouse_relocation = next_metadata_state
+            .warehouse_location
             .as_ref()
-            .is_some_and(|warehouse_location| warehouse_location != &current.warehouse_location)
-            && !publication.holds_table_bucket(&request.table_bucket)
-        {
+            .is_some_and(|warehouse_location| warehouse_location != &current.warehouse_location);
+        if warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket) {
             return table_commit_result(
                 &request.table_bucket,
                 &request.namespace,
@@ -4537,8 +4630,11 @@ where
 
         let mut next = current.clone();
         next.metadata_location = staged_commit_log.new_metadata_location.clone();
-        if let Some(warehouse_location) = next_warehouse_location {
+        if let Some(warehouse_location) = next_metadata_state.warehouse_location {
             next.warehouse_location = warehouse_location;
+        }
+        if let Some(format_version) = next_metadata_state.format_version {
+            next.format_version = format_version;
         }
         next.version_token = staged_commit_log.new_version_token.clone();
         next.generation = current.generation.saturating_add(1);
@@ -4582,6 +4678,24 @@ where
                 &request.operation,
                 commit_started,
                 Err(err),
+            );
+        }
+
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table)
+            || (warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket))
+        {
+            self.delete_created_table_warehouse_index(&next, reservation, "table publication fence lost")
+                .await;
+            return table_commit_result(
+                &request.table_bucket,
+                &request.namespace,
+                &request.table,
+                &request.commit_id,
+                &request.operation,
+                commit_started,
+                Err(TableCatalogStoreError::Internal(
+                    "table commit publication fence was lost before pointer update".to_string(),
+                )),
             );
         }
 
@@ -4662,20 +4776,21 @@ where
             )));
         };
         self.delete_owned_table_warehouse_index_for_drop(&entry).await?;
+        if !publication.holds_table_bucket(table_bucket)
+            || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
+        {
+            self.restore_table_warehouse_index_after_failed_drop(&entry, "table publication fence lost")
+                .await;
+            return Err(TableCatalogStoreError::Internal(
+                "table drop publication fence was lost before catalog update".to_string(),
+            ));
+        }
         if let Err(err) = self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await {
             match self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await {
                 Ok(None) => return Ok(()),
                 Ok(Some((current, _))) if current == entry => {
-                    if let Err(restore_err) = self.reserve_table_warehouse_index(&entry).await {
-                        tracing::warn!(
-                            table_bucket = %entry.table_bucket,
-                            namespace = %entry.namespace,
-                            table = %entry.table,
-                            table_id = %entry.table_id,
-                            error = %restore_err,
-                            "failed to restore table warehouse index after table entry delete failure"
-                        );
-                    }
+                    self.restore_table_warehouse_index_after_failed_drop(&entry, "table entry delete failed")
+                        .await;
                 }
                 Ok(Some(_)) => {
                     return Err(TableCatalogStoreError::Internal(format!(
@@ -4701,6 +4816,15 @@ where
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
         self.write_view_entry(entry, TableCatalogPutPrecondition::IfAbsent).await
+    }
+
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        self.write_view_entry_with_publication(entry, TableCatalogPutPrecondition::IfAbsent, publication)
+            .await
     }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
@@ -4757,8 +4881,26 @@ where
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        self.replace_view_with_publication(request, true, &publication).await
+    }
+
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let view = parse_table_for_store(&request.view)?;
+        if table_bucket_fence_required {
+            publication.begin_table_bucket(&request.table_bucket).await?;
+            if !publication.holds_table_bucket(&request.table_bucket) {
+                return Err(TableCatalogStoreError::Internal(
+                    "view replacement requires a table-bucket publication fence".to_string(),
+                ));
+            }
+        }
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&request.table_bucket).await?;
         let namespace_path = self.paths.namespace_entry_path(&request.table_bucket, &namespace);
         let _namespace_guard = self
@@ -4767,6 +4909,16 @@ where
             .await?;
         let view_path = self.paths.view_entry_path(&request.table_bucket, &namespace, &view);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &view_path).await?;
+        // Preserve catalog -> publication -> object lock order across rolling upgrades.
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.view)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement requires a table publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
         let Some((current, current_etag)) = self
             .read_view_with_etag_unlocked(&request.table_bucket, &namespace, &view)
             .await?
@@ -4814,6 +4966,14 @@ where
         })
         .await
         .map_err(|err| TableCatalogStoreError::Internal(format!("view metadata parser task failed: {err}")))??;
+        let warehouse_relocation = next_warehouse_location
+            .as_deref()
+            .is_some_and(|location| location != current.warehouse_location);
+        if warehouse_relocation && !publication.holds_table_bucket(&request.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view warehouse relocation requires a table-bucket publication fence".to_string(),
+            ));
+        }
 
         let mut next = current;
         next.metadata_location = request.new_metadata_location;
@@ -4822,13 +4982,40 @@ where
         }
         next.version_token = format!("token-{}", Uuid::new_v4());
         next.generation = next.generation.saturating_add(1);
-        self.write_entry_unlocked(
-            self.catalog_bucket(),
-            &view_path,
-            &next,
-            TableCatalogPutPrecondition::IfMatch(current_etag),
-        )
-        .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view)
+            || ((table_bucket_fence_required || warehouse_relocation) && !publication.holds_table_bucket(&request.table_bucket))
+        {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement publication fence was lost before catalog update".to_string(),
+            ));
+        }
+        let write_result = self
+            .write_entry_unlocked(
+                self.catalog_bucket(),
+                &view_path,
+                &next,
+                TableCatalogPutPrecondition::IfMatch(current_etag),
+            )
+            .await;
+        if let Err(err) = write_result {
+            match self
+                .read_view_with_etag_unlocked(&request.table_bucket, &namespace, &view)
+                .await
+            {
+                Ok(Some((persisted, _))) if persisted == next => {}
+                Ok(_) => return Err(err),
+                Err(read_err) => {
+                    tracing::warn!(
+                        table_bucket = %request.table_bucket,
+                        namespace = %request.namespace,
+                        view = %request.view,
+                        error = %read_err,
+                        "failed to verify view state after an ambiguous catalog update"
+                    );
+                    return Err(err);
+                }
+            }
+        }
         Ok(ViewCommitResult { view: next })
     }
 

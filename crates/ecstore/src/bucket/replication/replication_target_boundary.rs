@@ -27,8 +27,10 @@ use rustfs_utils::http::{
     AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
     AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE,
     HeaderExt as _, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map,
-    is_internal_key, is_object_encryption_marker, is_replication_stripped_encryption_key, ssec_replication_transport_header,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP,
+    get_str, insert_header_map, is_internal_key, is_object_encryption_marker, is_replication_stripped_encryption_key,
+    ssec_replication_transport_header,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -119,6 +121,27 @@ fn classify_replication_source_encryption(metadata: &HashMap<String, String>) ->
     }
 }
 
+fn is_legacy_source_replication_timestamp_key(key: &str) -> bool {
+    fn has_prefix_and_suffix(key: &str, prefix: &str, suffix: &str) -> bool {
+        let key = key.as_bytes();
+        key.len() == prefix.len() + suffix.len()
+            && key[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            && key[prefix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    }
+
+    [
+        SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP,
+        SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+        SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    ]
+    .iter()
+    .any(|suffix| {
+        ["x-rustfs-", "x-minio-"]
+            .iter()
+            .any(|prefix| has_prefix_and_suffix(key, prefix, suffix))
+    })
+}
+
 pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
     rustfs_replication::is_ssec_encrypted(user_defined)
 }
@@ -173,6 +196,11 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         // never leave the source site: envelopes and intent headers are only
         // meaningful to the source KMS.
         if is_replication_stripped_encryption_key(key) {
+            continue;
+        }
+
+        if is_legacy_source_replication_timestamp_key(key) {
+            meta.insert(format!("x-amz-meta-{key}"), value.to_string());
             continue;
         }
 
@@ -259,15 +287,23 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
 
         if !tags.is_empty() {
             put_options.user_tags = tags;
-            put_options.internal.tagging_timestamp =
-                if let Some(timestamp) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
-                    OffsetDateTime::parse(&timestamp, &Rfc3339)
-                        .map_err(|err| Error::other(format!("Failed to parse tagging timestamp: {err}")))?
-                } else {
-                    object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-                };
         }
     }
+    // Load the stored tagging timestamp independently of whether any tags
+    // remain: DeleteObjectTagging leaves the object tagless but stamps this
+    // key, and the deletion's LWW timestamp must still reach the replica.
+    // With no stored key, fall back to mod_time only while tags exist
+    // (MinIO parity); a tagless object without the key was never tagged and
+    // keeps the epoch default (no header).
+    put_options.internal.tagging_timestamp = if let Some(timestamp) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP)
+    {
+        OffsetDateTime::parse(&timestamp, &Rfc3339)
+            .map_err(|err| Error::other(format!("Failed to parse tagging timestamp: {err}")))?
+    } else if !put_options.user_tags.is_empty() {
+        object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    } else {
+        OffsetDateTime::UNIX_EPOCH
+    };
 
     let metadata = &*object_info.user_defined;
 
@@ -283,13 +319,15 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         put_options.cache_control = cache_control.to_string();
     }
 
-    if let Some(mode) = metadata.lookup(AMZ_OBJECT_LOCK_MODE) {
+    if let Some(mode) = metadata.lookup(AMZ_OBJECT_LOCK_MODE).filter(|mode| !mode.is_empty()) {
         put_options.mode = Some(ObjectLockRetentionMode::from(mode.to_uppercase().as_str()));
     }
 
     if let Some(retain_until_date) = metadata.lookup(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
-        put_options.retain_until_date = OffsetDateTime::parse(retain_until_date, &Rfc3339)
-            .map_err(|err| Error::other(format!("Failed to parse retain until date: {err}")))?;
+        if !retain_until_date.is_empty() {
+            put_options.retain_until_date = OffsetDateTime::parse(retain_until_date, &Rfc3339)
+                .map_err(|err| Error::other(format!("Failed to parse retain until date: {err}")))?;
+        }
         put_options.internal.retention_timestamp =
             if let Some(timestamp) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP) {
                 OffsetDateTime::parse(&timestamp, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
@@ -692,6 +730,110 @@ mod tests {
         assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef");
         assert_eq!(options.internal.replication_status, ReplicationStatusType::Replica);
         assert!(options.internal.replication_request);
+    }
+
+    /// DeleteObjectTagging leaves the object tagless but stamps the
+    /// tagging-timestamp internal key; the deletion's LWW timestamp must
+    /// still be loaded (and therefore sent) so the replica can order the
+    /// deletion against concurrent tag edits.
+    #[test]
+    fn replication_put_options_carry_tagging_timestamp_after_tag_deletion() {
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, SUFFIX_TAGGING_TIMESTAMP, "2026-01-02T03:04:05Z".to_string());
+
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            user_tags: Arc::new(String::new()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            version_id: Some(Uuid::nil()),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
+
+        assert!(options.user_tags.is_empty());
+        assert_eq!(
+            options.internal.tagging_timestamp,
+            OffsetDateTime::parse("2026-01-02T03:04:05Z", &Rfc3339).expect("valid timestamp"),
+            "the stored tagging timestamp must load independently of remaining tags"
+        );
+
+        // A tagless object without the stored key was never tagged: the epoch
+        // default keeps the header unsent.
+        let untagged = ObjectInfo {
+            user_tags: Arc::new(String::new()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            version_id: Some(Uuid::nil()),
+            ..Default::default()
+        };
+        let (options, _) = replication_put_object_options("", &untagged).expect("build put options");
+        assert_eq!(options.internal.tagging_timestamp, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn replication_put_options_do_not_promote_legacy_user_timestamp_metadata() {
+        let legacy_keys = [
+            "x-rustfs-source-replication-tagging-timestamp",
+            "x-rustfs-source-replication-retention-timestamp",
+            "x-rustfs-source-replication-legalhold-timestamp",
+            "x-minio-source-replication-tagging-timestamp",
+            "x-minio-source-replication-retention-timestamp",
+            "x-minio-source-replication-legalhold-timestamp",
+        ];
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(
+                legacy_keys
+                    .iter()
+                    .map(|key| (key.to_string(), "2099-01-02T03:04:05Z".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
+
+        for legacy_key in legacy_keys {
+            assert!(!options.user_metadata.contains_key(legacy_key));
+            assert_eq!(
+                options
+                    .user_metadata
+                    .get(&format!("x-amz-meta-{legacy_key}"))
+                    .map(String::as_str),
+                Some("2099-01-02T03:04:05Z")
+            );
+        }
+        assert_eq!(options.internal.tagging_timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(options.internal.retention_timestamp, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(options.internal.legalhold_timestamp, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn replication_put_options_carry_retention_timestamp_after_clear() {
+        let mut metadata = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE.to_string(), String::new()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), String::new()),
+        ]);
+        rustfs_utils::http::insert_str(&mut metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-02T03:04:05Z".to_string());
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let (options, _) = replication_put_object_options("", &object_info).expect("retention clear must replicate");
+
+        assert!(options.mode.is_none());
+        assert_eq!(options.retain_until_date, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(
+            options.internal.retention_timestamp,
+            OffsetDateTime::parse("2026-01-02T03:04:05Z", &Rfc3339).expect("valid timestamp")
+        );
+        let headers = options.header();
+        assert!(!headers.contains_key(AMZ_OBJECT_LOCK_MODE));
+        assert!(!headers.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE));
+        assert_eq!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).as_deref(),
+            Some("2026-01-02T03:04:05Z")
+        );
     }
 
     #[test]

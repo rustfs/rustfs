@@ -487,22 +487,21 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
 
 /// Record the streaming strategy chosen for a GetObject response body.
 #[inline(always)]
-pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
+pub fn record_get_object_stream_strategy(strategy: &'static str, buffer_size_bytes: usize, response_size_bytes: i64) {
     if !get_stage_metrics_enabled() {
         return;
     }
-    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
-    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
-        .record(usize_to_f64(buffer_size_bytes));
-    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
+    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy).increment(1);
+    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy).record(usize_to_f64(buffer_size_bytes));
+    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy)
         .record(i64_non_negative_to_f64(response_size_bytes));
 }
 
 /// Record the response-body handoff shape from a GetObject reader into the S3 streaming body.
 #[inline(always)]
 pub fn record_get_object_response_handoff(
-    strategy: &str,
-    buffer_source: &str,
+    strategy: &'static str,
+    buffer_source: &'static str,
     buffer_size_bytes: usize,
     response_size_bytes: i64,
     duration_secs: f64,
@@ -512,26 +511,26 @@ pub fn record_get_object_response_handoff(
     }
     counter!(
         "rustfs_io_get_object_response_handoff_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .increment(1);
     histogram!(
         "rustfs_io_get_object_response_handoff_buffer_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(usize_to_f64(buffer_size_bytes));
     histogram!(
         "rustfs_io_get_object_response_handoff_response_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(i64_non_negative_to_f64(response_size_bytes));
     histogram!(
         "rustfs_io_get_object_response_handoff_duration_seconds",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(duration_secs);
     record_get_object_response_handoff_duration("s3_handler", duration_secs);
@@ -539,14 +538,18 @@ pub fn record_get_object_response_handoff(
 
 /// Record ReaderStream capacity chosen for GetObject handoff.
 #[inline(always)]
-pub fn record_get_object_reader_stream_buffer_size(strategy: &str, buffer_source: &str, buffer_size_bytes: usize) {
+pub fn record_get_object_reader_stream_buffer_size(
+    strategy: &'static str,
+    buffer_source: &'static str,
+    buffer_size_bytes: usize,
+) {
     if !get_stage_metrics_enabled() {
         return;
     }
     histogram!(
         "rustfs_io_get_object_reader_stream_buffer_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(usize_to_f64(buffer_size_bytes));
 }
@@ -554,8 +557,8 @@ pub fn record_get_object_reader_stream_buffer_size(strategy: &str, buffer_source
 /// Record ReaderStream poll outcomes for GetObject handoff attribution.
 #[inline(always)]
 pub fn record_get_object_reader_stream_poll(
-    strategy: &str,
-    buffer_source: &str,
+    strategy: &'static str,
+    buffer_source: &'static str,
     outcome: &'static str,
     remaining_before: usize,
     bytes: usize,
@@ -567,36 +570,36 @@ pub fn record_get_object_reader_stream_poll(
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     counter!(
         "rustfs_io_get_object_reader_stream_poll_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .increment(1);
     counter!(
         "rustfs_io_get_object_reader_stream_poll_bytes_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .increment(bytes);
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_remaining_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(usize_to_f64(remaining_before));
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(usize_to_f64(bytes as usize));
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_duration_seconds",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(duration_secs);

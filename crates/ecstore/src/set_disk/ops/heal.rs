@@ -453,7 +453,9 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let write_lock_guard = if !opts.no_lock {
+        // Bound, not `_`: this guard must live to the end of the scope. A bare
+        // `_` would drop it here and release the namespace write lock.
+        let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             Some(
                 ns_lock
@@ -996,7 +998,7 @@ impl SetDisks {
                                                 readers.push(None);
                                                 continue;
                                             }
-                                            Err(e) => {
+                                            Err(_e) => {
                                                 readers.push(None);
                                                 continue;
                                             }
@@ -1545,6 +1547,9 @@ impl SetDisks {
 
         for candidate in candidates.iter_mut().filter(|candidate| candidate.local_payload) {
             for (disk_index, disk) in disks.iter().enumerate() {
+                // Only the #[cfg(test)] fault-injection branch below reads this.
+                #[cfg(not(test))]
+                let _ = disk_index;
                 let Some(disk) = disk else {
                     return Ok(DanglingDeleteSafety::UnsafeToDelete);
                 };
@@ -1716,6 +1721,10 @@ impl SetDisks {
         Ok((result, None))
     }
 
+    #[allow(
+        dead_code,
+        reason = "lock-taking wrapper over the live heal_object_dir_locked; only comments reference it (backlog#1823)"
+    )]
     #[tracing::instrument(level = "trace", skip(self), fields(bucket = %bucket, object = %object))]
     pub(in crate::set_disk) async fn heal_object_dir(
         &self,

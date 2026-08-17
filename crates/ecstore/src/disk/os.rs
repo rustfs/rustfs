@@ -571,6 +571,10 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
+#[allow(
+    dead_code,
+    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+)]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir.as_ref())? {
         let entry = entry?;
@@ -583,6 +587,7 @@ pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
 
 /// Async wrapper around [`sync_dir_files_std`]. Large directories flush files
 /// concurrently, bounded both per directory and process-wide.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub async fn sync_dir_files(dir: impl AsRef<Path>) -> io::Result<()> {
     sync_dir_files_with_limiter(dir, Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS))).await
 }
@@ -1809,10 +1814,6 @@ impl RenameCommitGuard {
         })
     }
 
-    pub(crate) fn lock_destination_directory_for_path_access(&self, directory: &Path) -> io::Result<RenameDestinationPathGuard> {
-        self.destination_directory_guard(directory, false)
-    }
-
     pub(crate) fn create_destination_directory_for_path_access(
         &self,
         directory: &Path,
@@ -2856,13 +2857,6 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     Ok(())
-}
-
-/// Check if a file exists.
-/// Returns true if the file exists, false otherwise.
-#[tracing::instrument(level = "debug", skip_all)]
-pub fn file_exists(path: impl AsRef<Path>) -> bool {
-    std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
 }
 
 /// Whether an [`io::Error`] means "the directory is not empty".

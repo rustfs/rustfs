@@ -365,6 +365,10 @@ mod tests {
 pub struct Checksum {
     checksum_type: ChecksumMode,
     r: Vec<u8>,
+    #[allow(
+        dead_code,
+        reason = "checksum bookkeeping field kept beside the value it guards (backlog#1823)"
+    )]
     computed: bool,
 }
 

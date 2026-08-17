@@ -415,6 +415,7 @@ fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize
 /// never returned, but flips `is_truncated` to `true` and yields a
 /// `next_upload_id_marker` pointing at the last returned upload so the caller can
 /// resume paging.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn paginate_upload_page(remaining: &[MultipartInfo], max_uploads: usize) -> (Vec<MultipartInfo>, bool, Option<String>) {
     let is_truncated = remaining.len() > max_uploads;
     let page: Vec<MultipartInfo> = remaining.iter().take(max_uploads).cloned().collect();
@@ -557,6 +558,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(super) async fn check_upload_id_exists(
         &self,
         bucket: &str,
@@ -1398,7 +1400,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let mut count = max_parts;
 
-        for (i, part) in object_parts.iter().enumerate() {
+        for part in object_parts.iter() {
             if let Some(err) = &part.error {
                 warn!("list_object_parts part error: {:?}", &err);
             }
@@ -2041,8 +2043,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     && let Err(err) = checksum.add_part(&cs, ext_part.actual_size)
                 {
                     error!(
-                        "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
-                        p.part_num, bucket, object
+                        "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}, err={}",
+                        p.part_num, bucket, object, err
                     );
                     return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
@@ -2087,8 +2089,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 }
             } else if let Err(err) = wtcs.matches(&checksum_combined, uploaded_parts.len() as i32) {
                 error!(
-                    "complete_multipart_upload checksum matches failed want={}, got={}",
-                    wtcs.encoded, checksum.encoded
+                    "complete_multipart_upload checksum matches failed want={}, got={}, err={}",
+                    wtcs.encoded, checksum.encoded, err
                 );
                 return Err(Error::other(format!(
                     "complete_multipart_upload checksum matches failed want={}, got={}",

@@ -81,18 +81,6 @@ async fn read_multipart_part(reader: &mut ReaderImpl, want: usize) -> Result<Vec
     }
 }
 
-pub struct UploadedPartRes {
-    pub error: std::io::Error,
-    pub part_num: i64,
-    pub size: i64,
-    pub part: ObjectPart,
-}
-
-pub struct UploadPartReq {
-    pub part_num: i64,
-    pub part: ObjectPart,
-}
-
 impl TransitionClient {
     pub async fn put_object_multipart_stream(
         self: Arc<Self>,

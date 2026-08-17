@@ -21,11 +21,31 @@ pub(crate) use rustfs_replication::{
     should_count_head_proxy_failure,
 };
 
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
 pub(crate) const RESYNC_FILE_MAX_BYTES: usize = rustfs_replication::RESYNC_FILE_MAX_BYTES;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const WIRE_ZERO_TIME_UNIX: i64 = rustfs_replication::resync::WIRE_ZERO_TIME_UNIX;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
 
 fn map_replication_error(err: rustfs_replication::Error) -> Error {

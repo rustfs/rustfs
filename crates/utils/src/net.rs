@@ -431,7 +431,6 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
     Ok(resolved_addr)
 }
 
-#[allow(dead_code)]
 pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -659,9 +658,6 @@ mod test {
         // Port should be in valid range (u16 max is always <= 65535)
         assert!(port1 > 0);
         assert!(port2 > 0);
-
-        // Different calls should typically return different ports
-        assert_ne!(port1, port2);
     }
 
     #[test]

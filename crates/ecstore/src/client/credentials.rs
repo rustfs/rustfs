@@ -67,6 +67,10 @@ impl<P: Provider + Default> Credentials<P> {
         Ok(self.creds.clone())
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity credential surface with no caller in this port (backlog#1823)"
+    )]
     fn expire(&mut self) {
         self.force_refresh = true;
     }
@@ -133,6 +137,10 @@ impl Provider for Static {
 
 #[derive(Debug, Clone, Default)]
 pub struct STSError {
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity STS error detail that this port never reads back (backlog#1823)"
+    )]
     pub r#type: String,
     pub code: String,
     pub message: String,
@@ -141,6 +149,10 @@ pub struct STSError {
 #[derive(Debug, Clone, thiserror::Error)]
 pub struct ErrorResponse {
     pub sts_error: STSError,
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity STS error detail that this port never reads back (backlog#1823)"
+    )]
     pub request_id: String,
 }
 
@@ -157,23 +169,4 @@ impl ErrorResponse {
         }
         return self.sts_error.message.clone();
     }
-}
-
-pub fn xml_decoder<T>(body: &[u8]) -> Result<T, Error>
-where
-    for<'de> T: Deserialize<'de>,
-{
-    match std::str::from_utf8(body) {
-        Ok(xml_body) => quick_xml::de::from_str::<T>(xml_body).map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string())),
-        Err(err) => Err(Error::new(ErrorKind::InvalidData, err.to_string())),
-    }
-}
-
-pub fn xml_decode_and_body<T>(body_reader: &[u8]) -> Result<(Vec<u8>, T), std::io::Error>
-where
-    for<'de> T: Deserialize<'de>,
-{
-    let body = body_reader.to_vec();
-    let parsed = xml_decoder(&body)?;
-    Ok((body, parsed))
 }

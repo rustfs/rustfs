@@ -60,7 +60,7 @@ pub use replication_filemeta_boundary::{
 pub(crate) use replication_filemeta_boundary::{
     replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
 };
-pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
+pub(crate) use replication_lifecycle_bridge::ReplicationLifecycleBridge;
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::{DeleteReplicationConfigSnapshot, ReplicationConfig};
@@ -81,6 +81,6 @@ pub use replication_queue_boundary::{
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
-pub use replication_stats_boundary::{BucketReplicationStats, BucketStats};
+pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;

@@ -2323,18 +2323,31 @@ fn append_bootstrap_bucket_items(
         },
     )?;
     if replicate_ilm_expiry {
-        append_bootstrap_bucket_item(
-            &mut plan.bucket_items,
-            bucket,
-            "lc-config",
-            bucket.expiry_lc_config.clone(),
-            bucket.expiry_lc_config_updated_at,
-            |item, value| {
-                item.expiry_lc_config = Some(value);
-                item.expiry_updated_at = item.updated_at;
-                Ok(())
-            },
-        )?;
+        if bucket.expiry_lc_config.is_some() {
+            append_bootstrap_bucket_item(
+                &mut plan.bucket_items,
+                bucket,
+                "lc-config",
+                bucket.expiry_lc_config.clone(),
+                bucket.expiry_lc_config_updated_at,
+                |item, value| {
+                    item.expiry_lc_config = Some(value);
+                    // `updated_at` here is the entry's expiry axis (see the
+                    // SRBucketInfo construction), not the wall clock.
+                    item.expiry_updated_at = item.updated_at;
+                    Ok(())
+                },
+            )?;
+        } else if bucket.expiry_lc_config_updated_at.is_some() {
+            // Expiry rules were removed at this axis (lifecycle_expiry_statement):
+            // an explicit timestamped delete item, so a peer that missed the
+            // live delete converges on bootstrap/repair instead of keeping
+            // stale expiry rules. The receiver's staleness guard protects a
+            // peer whose expiry state is newer.
+            let mut item = bootstrap_bucket_meta_item(bucket, "lc-config", bucket.expiry_lc_config_updated_at);
+            item.expiry_updated_at = item.updated_at;
+            plan.bucket_items.push(item);
+        }
     }
     append_bootstrap_bucket_item(
         &mut plan.bucket_items,
@@ -2973,6 +2986,18 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
             return;
         };
 
+        if let Err(err) = migrate_collapsed_retry_queue_paths().await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "retry_queue_migration_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+            return;
+        }
+
         match load_site_replication_state().await {
             Ok(state) => {
                 if state.pending_endpoint_refresh.is_some() || state.pending_remove.is_some() || state.pending_rotation.is_some()
@@ -3004,6 +3029,9 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
+        // Failed peer deliveries recorded in the retry queue; runs behind the
+        // same lifecycle guard and pending_* gates as the reconcilers above.
+        drain_site_replication_retry_queue().await;
     })
 }
 
@@ -3953,7 +3981,7 @@ async fn persist_site_replication_repair_task(
         match failure.as_deref() {
             Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
             None => {
-                dequeue_site_replication_retry_events(&mut state.retry_queue, &peer, &path);
+                dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
             }
         }
         Ok(())
@@ -4220,12 +4248,22 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
     broadcast_site_replication_json(&path, &serde_json::json!({})).await
 }
 
-pub async fn site_replication_bucket_meta_hook(item: SRBucketMeta) -> S3Result<()> {
+pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
     if item.r#type == "lc-config" && !site_replication_state_replicates_ilm_expiry(&runtime.state) {
         return Ok(());
+    }
+    if item.r#type == "lc-config" {
+        // Only the expiry subset travels (MinIO peers install incoming rules
+        // verbatim, so transition rules must never leave this site). An empty
+        // subset becomes a delete, which the receiver merges with the empty
+        // set — local transition rules there survive.
+        item.expiry_lc_config = item
+            .expiry_lc_config
+            .and_then(|raw| lifecycle_expiry_subset_xml(raw.as_bytes()))
+            .map(|data| String::from_utf8_lossy(&data).into_owned());
     }
     broadcast_site_replication_json_with_runtime(
         &runtime,
@@ -4319,7 +4357,14 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
             entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
             entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
-            entry.expiry_lc_config = raw_config_to_base64(&metadata.lifecycle_config_xml);
+            // Expiry subset only: this entry feeds both the bootstrap/repair
+            // plan (peers must not receive transition rules) and cross-site
+            // consistency views (transition rules are site-local and would
+            // read as false mismatches). A deleted expiry state is a `None`
+            // value with the deletion's axis so repair can converge peers
+            // that missed the live delete.
+            let expiry_statement = lifecycle_expiry_statement(&metadata);
+            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
             entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
             entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
             entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
@@ -4328,7 +4373,11 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
             entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
             entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            entry.expiry_lc_config_updated_at = maybe_time(metadata.lifecycle_config_updated_at);
+            // The expiry axis, not the whole-config write time: local
+            // transition-only edits inflate the latter, and a repair item
+            // stamped with it could out-rank a newer real expiry edit on a
+            // third site.
+            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
             entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
             entry.replication_targets_online =
                 Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
@@ -6094,8 +6143,94 @@ fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path:
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
 }
 
+const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
+const SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH: &str = "internal:retry-snapshot:bucket-metadata";
+
+fn collapsed_retry_queue_path(path: &str) -> Option<&'static str> {
+    let base_path = path.split_once('?').map(|(base, _)| base).unwrap_or(path);
+    match base_path {
+        "/rustfs/admin/v3/site-replication/peer/iam-item" | SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => {
+            Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
+        }
+        "/rustfs/admin/v3/site-replication/peer/bucket-meta" | SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => {
+            Some(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_collapsed_retry_queue_paths(queue: &mut Vec<SiteReplicationRetryEvent>) -> bool {
+    let mut changed = false;
+    let mut normalized: Vec<SiteReplicationRetryEvent> = Vec::with_capacity(queue.len());
+    for mut event in queue.drain(..) {
+        if let Some(path) = collapsed_retry_queue_path(&event.path)
+            && event.path != path
+        {
+            event.path = path.to_string();
+            changed = true;
+        }
+
+        let duplicate = normalized.iter().position(|existing| {
+            existing.path == event.path
+                && (existing.peer_deployment_id == event.peer_deployment_id || existing.peer_endpoint == event.peer_endpoint)
+        });
+        let Some(index) = duplicate else {
+            normalized.push(event);
+            continue;
+        };
+
+        changed = true;
+        let existing = &mut normalized[index];
+        let event_is_newer = match (event.updated_at, existing.updated_at) {
+            (Some(event), Some(existing)) => event >= existing,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if event_is_newer {
+            let retry_count = existing.retry_count.max(event.retry_count);
+            *existing = event;
+            existing.retry_count = retry_count;
+        } else {
+            existing.retry_count = existing.retry_count.max(event.retry_count);
+        }
+        existing.failed = existing.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
+    }
+    *queue = normalized;
+    changed
+}
+
+async fn migrate_collapsed_retry_queue_paths() -> S3Result<()> {
+    update_site_replication_state_when_changed(|state| {
+        Ok(if normalize_collapsed_retry_queue_paths(&mut state.retry_queue) {
+            StateCommit::Changed(())
+        } else {
+            StateCommit::Unchanged(())
+        })
+    })
+    .await
+}
+
+#[cfg(test)]
 fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
     settle_site_replication_retry_events(queue, peer, path, None)
+}
+
+/// Repair-path settlement: also clears snapshot-escalated entries. Running a
+/// repair is the operator's explicit accountability transfer for the
+/// possibly-unreplayed deletion the marker records; ordinary delivery
+/// successes must not clear it (see [`settle_site_replication_retry_events`]).
+fn dequeue_site_replication_retry_events_including_escalated(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+) -> usize {
+    let before = queue.len();
+    let collapsed_path = collapsed_retry_queue_path(path);
+    queue.retain(|event| {
+        !retry_event_matches(event, peer, path)
+            && !collapsed_path.is_some_and(|collapsed_path| retry_event_matches(event, peer, collapsed_path))
+    });
+    before.saturating_sub(queue.len())
 }
 
 /// Remove the retry events for (peer, path) that `generation` is entitled to
@@ -6113,8 +6248,22 @@ fn settle_site_replication_retry_events(
     generation: Option<u64>,
 ) -> usize {
     let before = queue.len();
+    let collapsed_path = collapsed_retry_queue_path(path);
     queue.retain(|event| {
         if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        // A wire-path success identifies no IAM or bucket-metadata entity.
+        // This also protects legacy rows until the startup migration moves
+        // them under their internal snapshot path.
+        if collapsed_path.is_some() {
+            return true;
+        }
+        // A snapshot-escalated entry records a possibly-unreplayed deletion.
+        // Collapsed paths are shared by every entity, so a later successful
+        // delivery of a DIFFERENT item proves nothing about the deleted one —
+        // only a repair settles it (dequeue_..._including_escalated).
+        if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
             return true;
         }
         match (generation, event.edit_generation) {
@@ -6132,6 +6281,7 @@ fn upsert_site_replication_retry_event(
     error: &str,
     generation: Option<u64>,
 ) {
+    let path = collapsed_retry_queue_path(path).unwrap_or(path);
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
@@ -6194,7 +6344,12 @@ async fn enqueue_site_replication_retry_event_for_generation(
     let path_owned = path.to_string();
     let error_text = error.to_string();
     let result = update_site_replication_state(move |state| {
-        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        // A peer that left the state can never drain its entries again
+        // (remove_sites already pruned them); recording a late failure for it
+        // would only pollute retry_stats until the queue cap evicts it.
+        if state.peers.contains_key(&peer_owned.deployment_id) {
+            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        }
         Ok(())
     })
     .await;
@@ -6226,6 +6381,595 @@ fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool 
         retry_bucket_operation(&event.path).as_deref(),
         Some(SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION)
     )
+}
+
+/// Exponential backoff base for the background retry drain, aligned with the
+/// reconcile cadence (`site_replication_reconcile::RECONCILE_INTERVAL`).
+const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
+/// Backoff ceiling: a permanently failed peer is still probed daily.
+const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
+
+/// What the background drain may do for one retry event. Everything not
+/// representable here is operator territory (manual repair).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryDrainAction {
+    /// Constant-path IAM item deliveries collapse into one queue entry per
+    /// peer and their bodies are not persisted; the only faithful replay is
+    /// the current IAM snapshot from the bootstrap plan.
+    IamSnapshot,
+    /// Same collapse for bucket-meta deliveries: replay the bucket metadata
+    /// snapshot from the bootstrap plan.
+    BucketMetadataSnapshot,
+    /// A self-contained bucket op the bootstrap plan can re-derive for its
+    /// bucket (`make-with-versioning` / `configure-replication`).
+    BucketOpReplay { operation: String, bucket: String },
+    /// Re-send the current peer records under a fresh edit generation.
+    PeerEdit,
+}
+
+#[derive(Clone)]
+enum RetrySnapshot {
+    Iam(Vec<SRIAMItem>),
+    BucketMetadata(Vec<SRBucketMeta>),
+}
+
+impl RetrySnapshot {
+    fn from_plan(action: &RetryDrainAction, plan: &SiteReplicationBootstrapPlan) -> Option<Self> {
+        match action {
+            RetryDrainAction::IamSnapshot => Some(Self::Iam(plan.iam_items.clone())),
+            RetryDrainAction::BucketMetadataSnapshot => Some(Self::BucketMetadata(plan.bucket_items.clone())),
+            _ => None,
+        }
+    }
+
+    fn fingerprint(&self) -> S3Result<Vec<Vec<u8>>> {
+        let mut payloads = match self {
+            Self::Iam(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+            Self::BucketMetadata(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+        }
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry snapshot failed: {err}")))?;
+        payloads.sort_unstable();
+        Ok(payloads)
+    }
+
+    fn replay_after_change(previous: &Self, fresh: &Self, observed_at: OffsetDateTime) -> Self {
+        match (previous, fresh) {
+            (Self::Iam(previous), Self::Iam(fresh)) => {
+                let fresh_keys: HashSet<IamSnapshotKey> = fresh.iter().filter_map(iam_snapshot_key).collect();
+                let mut replay = fresh.clone();
+                for item in previous {
+                    if iam_snapshot_key(item).is_some_and(|key| !fresh_keys.contains(&key)) {
+                        replay.extend(iam_snapshot_tombstones(item, observed_at));
+                    }
+                }
+                Self::Iam(replay)
+            }
+            (Self::BucketMetadata(previous), Self::BucketMetadata(fresh)) => {
+                let fresh_keys: HashSet<(&str, &str)> = fresh
+                    .iter()
+                    .map(|item| (item.bucket.as_str(), item.r#type.as_str()))
+                    .collect();
+                let mut replay = fresh.clone();
+                for item in previous {
+                    if !fresh_keys.contains(&(item.bucket.as_str(), item.r#type.as_str())) {
+                        replay.push(bucket_metadata_snapshot_tombstone(item, observed_at));
+                    }
+                }
+                Self::BucketMetadata(replay)
+            }
+            _ => fresh.clone(),
+        }
+    }
+
+    async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<()> {
+        match self {
+            Self::Iam(items) => {
+                for item in items {
+                    SiteReplicationRepairTask::Iam(item)
+                        .send(transport, access_key, secret_key)
+                        .await?;
+                }
+            }
+            Self::BucketMetadata(items) => {
+                for item in items {
+                    SiteReplicationRepairTask::BucketMetadata(item)
+                        .send(transport, access_key, secret_key)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum IamSnapshotKey {
+    Policy(String),
+    User(String),
+    Group(String),
+    PolicyMapping { target: String, user_type: i64, is_group: bool },
+}
+
+fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
+    match item.r#type.as_str() {
+        "policy" => Some(IamSnapshotKey::Policy(item.name.clone())),
+        "iam-user" => item
+            .iam_user
+            .as_ref()
+            .map(|user| IamSnapshotKey::User(user.access_key.clone())),
+        "group-info" => item
+            .group_info
+            .as_ref()
+            .map(|group| IamSnapshotKey::Group(group.update_req.group.clone())),
+        "policy-mapping" => item.policy_mapping.as_ref().map(|mapping| IamSnapshotKey::PolicyMapping {
+            target: mapping.user_or_group.clone(),
+            user_type: mapping.user_type,
+            is_group: mapping.is_group,
+        }),
+        _ => None,
+    }
+}
+
+fn iam_snapshot_tombstones(item: &SRIAMItem, observed_at: OffsetDateTime) -> Vec<SRIAMItem> {
+    let mut tombstone = item.clone();
+    tombstone.updated_at = Some(observed_at);
+    match item.r#type.as_str() {
+        "policy" => tombstone.policy = None,
+        "iam-user" => {
+            if let Some(user) = tombstone.iam_user.as_mut() {
+                user.is_delete_req = true;
+                user.user_req = None;
+            }
+        }
+        "group-info" => {
+            let Some(group) = tombstone.group_info.as_mut() else {
+                return Vec::new();
+            };
+            group.update_req.is_remove = true;
+            if group.update_req.members.is_empty() {
+                return vec![tombstone];
+            }
+            let mut delete = tombstone.clone();
+            if let Some(group) = delete.group_info.as_mut() {
+                group.update_req.members.clear();
+            }
+            return vec![tombstone, delete];
+        }
+        "policy-mapping" => {
+            if let Some(mapping) = tombstone.policy_mapping.as_mut() {
+                mapping.policy.clear();
+            }
+        }
+        _ => return Vec::new(),
+    }
+    vec![tombstone]
+}
+
+fn bucket_metadata_snapshot_tombstone(item: &SRBucketMeta, observed_at: OffsetDateTime) -> SRBucketMeta {
+    SRBucketMeta {
+        r#type: item.r#type.clone(),
+        bucket: item.bucket.clone(),
+        updated_at: Some(observed_at),
+        expiry_updated_at: Some(observed_at),
+        api_version: item.api_version.clone(),
+        ..Default::default()
+    }
+}
+
+const SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS: usize = 3;
+
+fn classify_site_replication_retry_event(event: &SiteReplicationRetryEvent) -> Option<RetryDrainAction> {
+    let snapshot_action = match event.path.as_str() {
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => Some(RetryDrainAction::IamSnapshot),
+        SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => Some(RetryDrainAction::BucketMetadataSnapshot),
+        _ => None,
+    };
+    if snapshot_action.is_some() && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        return snapshot_action;
+    }
+    if event.path.starts_with("internal:") {
+        // Marker records store payloads in `last_error` (legacy
+        // pending-endpoint-refresh backup and snapshot liabilities); they are
+        // not drainable delivery failures.
+        return None;
+    }
+    if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        // Already snapshot-replayed once for this failure episode; a possible
+        // deletion cannot be replayed from a snapshot, so re-sending daily
+        // proves nothing. A new hook failure overwrites the marker.
+        return None;
+    }
+    let base_path = event.path.split_once('?').map(|(base, _)| base).unwrap_or(&event.path);
+    match base_path {
+        "/rustfs/admin/v3/site-replication/peer/iam-item" => Some(RetryDrainAction::IamSnapshot),
+        "/rustfs/admin/v3/site-replication/peer/bucket-meta" => Some(RetryDrainAction::BucketMetadataSnapshot),
+        SITE_REPLICATION_PEER_EDIT_PATH => Some(RetryDrainAction::PeerEdit),
+        SITE_REPLICATION_PEER_BUCKET_OPS_PATH => {
+            let operation = retry_bucket_operation(&event.path)?;
+            if !matches!(
+                operation.as_str(),
+                SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION
+            ) {
+                // Destructive ops (delete-bucket / force-delete-bucket) are
+                // operator territory: replaying them against a peer whose
+                // bucket was since recreated is irreversible.
+                return None;
+            }
+            let bucket = retry_bucket_name(&event.path)?;
+            Some(RetryDrainAction::BucketOpReplay { operation, bucket })
+        }
+        _ => None,
+    }
+}
+
+fn retry_bucket_name(path: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    form_urlencoded::parse(query.as_bytes())
+        .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
+}
+
+/// A collapsed retry event after a stable snapshot resend is escalated with
+/// this marker instead of being cleared: the snapshot contains no task for a
+/// failed deletion, so remote absence remains operator-visible. Collapsed
+/// failures use an internal queue path so ordinary successes and older nodes
+/// cannot settle an unrelated entity's liability.
+const SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER: &str = "snapshot replayed; a failed deletion cannot be replayed from a snapshot — run site replication repair or re-deliver to settle";
+
+/// Escalate a collapsed retry event after its snapshot resend succeeded,
+/// unless a newer failure was recorded after `snapshot_updated_at` (that
+/// failure belongs to a newer local commit the snapshot did not contain and
+/// must keep the entry drain-eligible).
+fn escalate_site_replication_retry_events_up_to(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    snapshot_updated_at: Option<OffsetDateTime>,
+) -> usize {
+    let Some(marker_path) = collapsed_retry_queue_path(path) else {
+        return 0;
+    };
+
+    if path != marker_path {
+        queue.retain(|event| {
+            if !retry_event_matches(event, peer, path) {
+                return true;
+            }
+            matches!((event.updated_at, snapshot_updated_at), (Some(current), Some(seen)) if current > seen)
+                || matches!((event.updated_at, snapshot_updated_at), (Some(_), None))
+        });
+    }
+
+    let marker_index = queue.iter().position(|event| retry_event_matches(event, peer, marker_path));
+    let marker_index = marker_index.unwrap_or_else(|| {
+        queue.push(SiteReplicationRetryEvent {
+            id: Uuid::new_v4().to_string(),
+            peer_deployment_id: peer.deployment_id.clone(),
+            peer_endpoint: peer.endpoint.clone(),
+            path: marker_path.to_string(),
+            updated_at: snapshot_updated_at,
+            ..Default::default()
+        });
+        queue.len() - 1
+    });
+    let event = &mut queue[marker_index];
+    let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
+        (Some(current), Some(seen)) => current > seen,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if newer_failure_recorded && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        return 0;
+    }
+    event.failed = true;
+    event.retry_count = event.retry_count.max(SITE_REPLICATION_RETRY_FAILED_AFTER);
+    event.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
+    event.updated_at = Some(OffsetDateTime::now_utc());
+    1
+}
+
+async fn escalate_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
+    let peer_owned = peer.clone();
+    let path_owned = path.to_string();
+    let result = update_site_replication_state(move |state| {
+        escalate_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
+        Ok(())
+    })
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = %peer.endpoint,
+            deployment_id = %peer.deployment_id,
+            path,
+            error = ?err,
+            "failed to escalate site replication retry event"
+        );
+    }
+}
+
+/// Whether the drain may attempt this event now.
+fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetryEvent, now: OffsetDateTime) -> bool {
+    let Some(updated_at) = event.updated_at else {
+        return true;
+    };
+    // 600 * 2^8 already exceeds the daily ceiling; capping the shift keeps
+    // the arithmetic overflow-free for any persisted retry_count.
+    let exponent = event.retry_count.saturating_sub(1).min(8);
+    let delay = (SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS << exponent).min(SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS);
+    now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= delay
+}
+
+/// The subset of the retry queue the background drain is allowed to touch.
+fn actionable_site_replication_retry_events(state: &SiteReplicationState, now: OffsetDateTime) -> Vec<SiteReplicationRetryEvent> {
+    state
+        .retry_queue
+        .iter()
+        .filter(|event| classify_site_replication_retry_event(event).is_some())
+        .filter(|event| state.peers.contains_key(&event.peer_deployment_id))
+        .filter(|event| site_replication_retry_backoff_elapsed(event, now))
+        .cloned()
+        .collect()
+}
+
+/// Background consumer for the retry queue, run from the reconcile tick.
+///
+/// Scope: this settles "delivered once and failed" entries whose replay is
+/// faithful (bucket ops, peer edits). Collapsed iam-item / bucket-meta
+/// entries are snapshot-resent and then *escalated*, not cleared — a failed
+/// deletion leaves no task in the snapshot, so remote absence stays unproven
+/// until a later delivery or a manual repair. A hook that never fired (crash
+/// between the local commit and the send) leaves no entry at all, so the
+/// drain is not a full cross-site diff-heal; manual repair remains the
+/// authoritative catch-all.
+async fn drain_site_replication_retry_queue() {
+    if let Err(err) = drain_site_replication_retry_queue_inner().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+    }
+}
+
+async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    let actionable = actionable_site_replication_retry_events(&runtime.state, OffsetDateTime::now_utc());
+    if actionable.is_empty() {
+        return Ok(());
+    }
+    let Some(store) = current_object_store_handle() else {
+        return Ok(());
+    };
+    if runtime.state.pending_endpoint_refresh.is_some()
+        || runtime.state.pending_remove.is_some()
+        || runtime.state.pending_rotation.is_some()
+    {
+        // The tick-level gate ran before the reconcilers; a multi-step flow
+        // (endpoint refresh commits its pending marker without the lifecycle
+        // guard) may have started since. Re-check on the fresh state.
+        return Ok(());
+    }
+    // Serialize against operator repair execution. This does NOT close the
+    // dry-run -> execute window (dry-run takes no lock): a drain settling a
+    // replayable bucket-op entry in that window changes the preflight token
+    // and execute fails safe with "preflight is stale" — the operator
+    // re-runs the dry-run. Lock order matches repair: lifecycle guard (held
+    // by the reconcile tick) -> repair execution lock -> state object lock
+    // inside the send bookkeeping. An operator repair holding the lock makes
+    // this tick skip after the lock-acquire timeout.
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        drain_site_replication_retry_queue_locked(runtime, actionable).await
+    })
+    .await
+    .map_err(ApiError::from)?
+}
+
+async fn drain_site_replication_retry_queue_locked(
+    runtime: SiteReplicationRuntime,
+    events: Vec<SiteReplicationRetryEvent>,
+) -> S3Result<()> {
+    let needs_plan = events
+        .iter()
+        .any(|event| !matches!(classify_site_replication_retry_event(event), Some(RetryDrainAction::PeerEdit)));
+    // The plan is a full local snapshot (buckets + IAM); build it once per
+    // tick and only when a snapshot resend is actually due.
+    let plan = if needs_plan {
+        let info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
+        Some(site_replication_bootstrap_plan(&info)?)
+    } else {
+        None
+    };
+
+    let mut events_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
+    for event in events {
+        events_by_peer
+            .entry(event.peer_deployment_id.clone())
+            .or_default()
+            .push(event);
+    }
+
+    let mut settled = 0usize;
+    let mut failures = 0usize;
+    for (deployment_id, peer_events) in events_by_peer {
+        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
+            continue;
+        };
+        if deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            continue;
+        }
+        let transport = match PeerTransport::for_runtime_peer(peer).await {
+            Ok(transport) => transport,
+            Err(err) => {
+                // Record the attempt so backoff advances for an unreachable
+                // peer instead of re-dialing it every tick.
+                for event in &peer_events {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                }
+                failures += peer_events.len();
+                continue;
+            }
+        };
+        for event in peer_events {
+            let Some(action) = classify_site_replication_retry_event(&event) else {
+                continue;
+            };
+            match drain_one_site_replication_retry_event(&runtime, peer, &transport, &event, action, plan.as_ref()).await {
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(_) => failures += 1,
+            }
+        }
+    }
+
+    if settled > 0 || failures > 0 {
+        info!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_settled",
+            settled,
+            failures,
+            "admin site replication state"
+        );
+    }
+    Ok(())
+}
+
+/// Replay one retry event against its peer. Returns `Ok(true)` when the
+/// event was settled (delivered, or provably stale), `Ok(false)` when it was
+/// skipped, and `Err` after a failed delivery (already re-queued with an
+/// incremented retry count).
+async fn drain_one_site_replication_retry_event(
+    runtime: &SiteReplicationRuntime,
+    peer: &PeerInfo,
+    transport: &PeerTransport,
+    event: &SiteReplicationRetryEvent,
+    action: RetryDrainAction,
+    plan: Option<&SiteReplicationBootstrapPlan>,
+) -> S3Result<bool> {
+    let access_key = &runtime.state.service_account_access_key;
+    let secret_key = &runtime.service_account_secret_key;
+    match action.clone() {
+        RetryDrainAction::IamSnapshot | RetryDrainAction::BucketMetadataSnapshot => {
+            let Some(plan) = plan else {
+                return Ok(false);
+            };
+            let mut current_snapshot = RetrySnapshot::from_plan(&action, plan).expect("snapshot action has a snapshot");
+            let mut replay = current_snapshot.clone();
+            for _ in 0..SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS {
+                let current_fingerprint = current_snapshot.fingerprint()?;
+                if let Err(err) = replay.send(transport, access_key, secret_key).await {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                    return Err(err);
+                }
+                let fresh_info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
+                let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
+                let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
+                if fresh_snapshot.fingerprint()? == current_fingerprint {
+                    escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
+                    return Ok(true);
+                }
+                replay = RetrySnapshot::replay_after_change(&current_snapshot, &fresh_snapshot, OffsetDateTime::now_utc());
+                current_snapshot = fresh_snapshot;
+            }
+            Ok(false)
+        }
+        RetryDrainAction::BucketOpReplay { operation, bucket } => {
+            let Some(plan) = plan else {
+                return Ok(false);
+            };
+            // Replay from the CURRENT plan, never the recorded path: the
+            // recorded query can carry an expired one-shot bootstrap token or
+            // a stale createdAt.
+            let make_op = operation == SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING;
+            let paths = if make_op {
+                &plan.bucket_make_ops
+            } else {
+                &plan.bucket_configure_ops
+            };
+            let tasks: Vec<SiteReplicationRepairTask<'_>> = paths
+                .iter()
+                .filter(|path| retry_bucket_name(path).as_deref() == Some(bucket.as_str()))
+                .map(|path| {
+                    if make_op {
+                        SiteReplicationRepairTask::BucketMake(path)
+                    } else {
+                        SiteReplicationRepairTask::Replication(path)
+                    }
+                })
+                .collect();
+            if tasks.is_empty() {
+                // The bucket left the plan (deleted, or replication no longer
+                // configured): the recorded intent is stale, settle it.
+                dequeue_site_replication_retry_event(peer, &event.path).await;
+                return Ok(true);
+            }
+            for task in &tasks {
+                if let Err(err) = task.send(transport, access_key, secret_key).await {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                    return Err(err);
+                }
+            }
+            dequeue_site_replication_retry_event(peer, &event.path).await;
+            Ok(true)
+        }
+        RetryDrainAction::PeerEdit => {
+            // The recorded generation is stale by definition — the receiver
+            // fences it. Allocate a fresh generation and re-send the current
+            // peer records (a superset of the failed body; the receiver
+            // upserts), all inside one state transaction so the fence and the
+            // bodies agree.
+            let target_id = peer.deployment_id.clone();
+            let (generation, bodies) = update_site_replication_state(move |state| {
+                if !state.peers.contains_key(&target_id) {
+                    return Ok((None, Vec::new()));
+                }
+                Ok((Some(next_peer_edit_generation(state)), state.peers.values().cloned().collect::<Vec<_>>()))
+            })
+            .await?;
+            let Some(generation) = generation else {
+                // Peer left between the snapshot and now; the queue entry was
+                // already pruned by remove_sites.
+                return Ok(false);
+            };
+            let local_deployment_id = Some(runtime.local_peer.deployment_id.as_str()).filter(|id| !id.is_empty());
+            let edit_path = peer_edit_path_with_fence(local_deployment_id, generation);
+            let delivery_fence = local_deployment_id.is_some().then_some(generation);
+            for body in &bodies {
+                if let Err(err) = send_peer_admin_request_with_client(
+                    &transport.client,
+                    &transport.connection,
+                    &edit_path,
+                    access_key,
+                    secret_key,
+                    body,
+                )
+                .await
+                {
+                    enqueue_site_replication_retry_event_for_generation(
+                        peer,
+                        SITE_REPLICATION_PEER_EDIT_PATH,
+                        &err,
+                        delivery_fence,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+            dequeue_site_replication_retry_event_for_generation(peer, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence).await;
+            Ok(true)
+        }
+    }
 }
 
 /// Remove a retry event for (peer, path) from the queue on successful delivery.
@@ -6902,6 +7646,300 @@ fn merge_incoming_replication_config(
     };
 
     Some(ReplicationConfiguration { role, rules })
+}
+
+/// Merge a peer's ILM expiry document into the local lifecycle config.
+///
+/// Mirrors MinIO's `mergeWithCurrentLCConfig` with one hardening: incoming
+/// site-local fields (transitions, abort-multipart, del-marker expiration —
+/// exactly what MinIO's `CloneNonTransition` sender never emits) are
+/// discarded outright at the trust boundary, whatever the peer sends. Local
+/// site-local fields always survive; a delete (`incoming == None`) therefore
+/// merges with the empty set instead of dropping the whole config.
+fn merge_incoming_lifecycle_config(
+    incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
+    local: Option<s3s::dto::BucketLifecycleConfiguration>,
+    updated_at: Option<OffsetDateTime>,
+) -> Option<s3s::dto::BucketLifecycleConfiguration> {
+    // Incoming rules reduced to their traveling expiry side. Rules with no
+    // expiry semantics after the strip are not installed.
+    let mut incoming_by_id: HashMap<String, s3s::dto::LifecycleRule> = HashMap::new();
+    let mut incoming_order: Vec<String> = Vec::new();
+    for mut rule in incoming.into_iter().flat_map(|config| config.rules) {
+        strip_site_local_lifecycle_fields(&mut rule);
+        if !lifecycle_rule_has_expiry(&rule) {
+            continue;
+        }
+        let id = rule.id.clone().unwrap_or_default();
+        if incoming_by_id.insert(id.clone(), rule).is_none() {
+            incoming_order.push(id);
+        }
+    }
+
+    // Local order first, incoming-new appended: repeated delivery of the same
+    // document is byte-stable, so bucket metadata is written once, not on
+    // every broadcast.
+    let local_expiry_updated_at = local.as_ref().and_then(|config| config.expiry_updated_at.clone());
+    let mut rules: Vec<s3s::dto::LifecycleRule> = Vec::new();
+    for mut rule in local.into_iter().flat_map(|config| config.rules) {
+        let id = rule.id.clone().unwrap_or_default();
+        if let Some(mut incoming_rule) = incoming_by_id.remove(&id) {
+            incoming_order.retain(|pending| pending != &id);
+            // The incoming expiry side wins; the local site-local side is
+            // authoritative (MinIO CloneNonTransition + restore).
+            incoming_rule.transitions = rule.transitions.take();
+            incoming_rule.noncurrent_version_transitions = rule.noncurrent_version_transitions.take();
+            incoming_rule.abort_incomplete_multipart_upload = rule.abort_incomplete_multipart_upload.take();
+            incoming_rule.del_marker_expiration = rule.del_marker_expiration.take();
+            rules.push(incoming_rule);
+        } else if lifecycle_rule_has_expiry(&rule) {
+            // Expiry rule dropped upstream: strip only the traveling expiry
+            // side; the rule survives while any site-local action remains.
+            rule.expiration = None;
+            rule.noncurrent_version_expiration = None;
+            if lifecycle_rule_has_transition(&rule)
+                || rule.abort_incomplete_multipart_upload.is_some()
+                || rule.del_marker_expiration.is_some()
+            {
+                rules.push(rule);
+            }
+        } else {
+            // No traveling expiry semantics (transition-only / abort-mpu-only
+            // / del-marker-only): not managed by expiry replication, keep
+            // untouched.
+            rules.push(rule);
+        }
+    }
+    for id in incoming_order {
+        if let Some(rule) = incoming_by_id.remove(&id) {
+            rules.push(rule);
+        }
+    }
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    Some(s3s::dto::BucketLifecycleConfiguration {
+        rules,
+        // Record the expiry axis the staleness guard compares on. (The PUT
+        // path stamps `expiry_updated_at` only when the expiry subset
+        // changes, so this axis is not inflated by transition-only edits.)
+        expiry_updated_at: updated_at.map(s3s::dto::Timestamp::from).or(local_expiry_updated_at),
+    })
+}
+
+/// True when the rule carries the expiry semantics that `replicateILMExpiry`
+/// propagates. Del-marker expiration and abort-multipart are deliberately
+/// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
+/// both), so treating them as traveling state would let a MinIO peer's
+/// broadcast delete this site's del-marker-only rules.
+fn lifecycle_rule_has_expiry(rule: &s3s::dto::LifecycleRule) -> bool {
+    rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
+}
+
+fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
+    rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty())
+        || rule
+            .noncurrent_version_transitions
+            .as_ref()
+            .is_some_and(|transitions| !transitions.is_empty())
+}
+
+/// Remove the fields that never travel between sites (MinIO
+/// `CloneNonTransition` parity).
+fn strip_site_local_lifecycle_fields(rule: &mut s3s::dto::LifecycleRule) {
+    rule.transitions = None;
+    rule.noncurrent_version_transitions = None;
+    rule.abort_incomplete_multipart_upload = None;
+    rule.del_marker_expiration = None;
+}
+
+/// Reduce a lifecycle XML document to the expiry subset that is allowed to
+/// travel between sites (what MinIO's sender emits): transition fields are
+/// stripped and rules left with no expiry semantics are dropped. Returns
+/// `None` when nothing remains — the receiver then merges with the empty set,
+/// which is exactly the "no expiry rules here" statement. A document that
+/// fails to parse is forwarded unfiltered (`Some(original)`): the receiver
+/// merge strips it anyway, and turning a local parse error into a `None`
+/// would delete the peers' replicated expiry rules.
+fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let config: s3s::dto::BucketLifecycleConfiguration = match deserialize(raw) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!("failed to parse local lifecycle config for expiry replication; forwarding unfiltered: {err}");
+            return Some(raw.to_vec());
+        }
+    };
+    let expiry_updated_at = config.expiry_updated_at.clone();
+    let rules: Vec<s3s::dto::LifecycleRule> = config
+        .rules
+        .into_iter()
+        .filter_map(|mut rule| {
+            strip_site_local_lifecycle_fields(&mut rule);
+            lifecycle_rule_has_expiry(&rule).then_some(rule)
+        })
+        .collect();
+    if rules.is_empty() {
+        return None;
+    }
+    let subset = s3s::dto::BucketLifecycleConfiguration {
+        rules,
+        expiry_updated_at,
+    };
+    match serialize(&subset) {
+        Ok(data) => Some(data),
+        Err(err) => {
+            warn!("failed to serialize lifecycle expiry subset; forwarding unfiltered: {err}");
+            Some(raw.to_vec())
+        }
+    }
+}
+
+/// The expiry replication axis persisted in a lifecycle XML document, if any.
+/// Used for the SRInfo bucket entry so bootstrap/repair items carry the
+/// expiry axis instead of the whole-config write time (which local
+/// transition-only edits inflate).
+fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> {
+    if raw.is_empty() {
+        return None;
+    }
+    deserialize::<s3s::dto::BucketLifecycleConfiguration>(raw)
+        .ok()
+        .and_then(|config| config.expiry_updated_at)
+        .map(OffsetDateTime::from)
+}
+
+/// The timestamp an incoming lc-config item must beat to be applied.
+///
+/// - Present config with the expiry axis: the axis itself.
+/// - Present legacy config that has expiry rules but predates the axis
+///   field: the whole-config write time bounds its last expiry edit.
+/// - Present transition-only config without the axis: `UNIX_EPOCH` — there
+///   is no local expiry state to protect, and the whole-config time moves on
+///   transition edits, which must not shadow independent peer expiry updates.
+/// - Absent config: the whole-config write time — it survives deletion in
+///   bucket metadata as the deletion's lower bound, so a delayed stale
+///   broadcast cannot resurrect deleted expiry rules.
+fn local_lifecycle_staleness_axis(
+    local: Option<&s3s::dto::BucketLifecycleConfiguration>,
+    whole_config_axis: OffsetDateTime,
+) -> OffsetDateTime {
+    match local {
+        Some(config) => match config.expiry_updated_at.clone() {
+            Some(axis) => OffsetDateTime::from(axis),
+            None if config.rules.iter().any(lifecycle_rule_has_expiry) => whole_config_axis,
+            None => OffsetDateTime::UNIX_EPOCH,
+        },
+        None => whole_config_axis,
+    }
+}
+
+/// Recognize MinIO's zero-rule lifecycle tombstone (its delete /
+/// transition-only state marshals `<LifecycleConfiguration>` with no `<Rule>`
+/// child, which the strict s3s deserializer rejects). Only a well-delimited
+/// document qualifies as the "no expiry rules here" statement; truncated or
+/// otherwise malformed payloads are rejected rather than treated as a delete
+/// that would erase local expiry rules.
+fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Tombstone {
+        #[serde(rename = "@xmlns")]
+        _xmlns: Option<String>,
+        #[serde(rename = "ExpiryUpdatedAt")]
+        _expiry_updated_at: Option<s3s::dto::Timestamp>,
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(raw);
+    let mut depth = 0usize;
+    let mut seen_root = false;
+    let mut closed_root = false;
+    let mut seen_declaration = false;
+    let well_formed_document = loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                }
+                depth += 1;
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                if depth == 0 {
+                    break false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Decl(_)) => {
+                if seen_declaration || seen_root || depth != 0 {
+                    break false;
+                }
+                seen_declaration = true;
+            }
+            Ok(quick_xml::events::Event::DocType(_)) => break false,
+            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+                break false;
+            }
+            Ok(quick_xml::events::Event::Text(_)) => {}
+            Ok(quick_xml::events::Event::CData(_)) if depth == 0 => break false,
+            Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
+            Ok(quick_xml::events::Event::Eof) => break seen_root && closed_root && depth == 0,
+            Ok(_) if depth == 0 => break false,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+
+    well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
+}
+
+/// The ILM expiry statement this site contributes to its SRInfo bucket entry
+/// (feeding bootstrap/repair and consistency views), if any.
+/// `Some((subset_b64, axis))` — a `None` subset means "expiry rules were
+/// removed at `axis`" and travels as an explicit timestamped delete item, so
+/// a peer that missed the live delete still converges on repair.
+fn lifecycle_expiry_statement(
+    metadata: &crate::admin::storage_api::bucket::metadata::BucketMetadata,
+) -> Option<(Option<String>, OffsetDateTime)> {
+    if metadata.lifecycle_config_xml.is_empty() {
+        // Deleted vs never configured: the whole-config write time survives
+        // deletion in bucket metadata and strictly exceeds the created-time
+        // backfill only after a real write.
+        return (metadata.lifecycle_config_updated_at > metadata.created).then_some((None, metadata.lifecycle_config_updated_at));
+    }
+    let axis = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml);
+    match lifecycle_expiry_subset_xml(&metadata.lifecycle_config_xml) {
+        Some(subset) => {
+            // Legacy documents predate the axis field; their whole-config
+            // write time bounds the last expiry edit.
+            let axis = axis.unwrap_or(metadata.lifecycle_config_updated_at);
+            Some((raw_config_to_base64(&subset), axis))
+        }
+        // Transition-only config: with an expiry axis the site once had
+        // expiry rules and properly removed them — the delete travels at
+        // that axis. Without one there is nothing to say (a delete stamped
+        // off the whole-config time would let a local transition edit erase
+        // newer peer expiry state).
+        None => axis.map(|axis| (None, axis)),
+    }
 }
 
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
@@ -7985,7 +9023,12 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     } else {
         None
     };
-    if let Ok(bucket_meta) = metadata_sys::get(&item.bucket).await {
+    // lc-config staleness is judged on the expiry axis inside its merge block
+    // below: `lifecycle_config_updated_at` moves on local transition-only
+    // edits too, which would shadow newer peer expiry updates.
+    if item.r#type != "lc-config"
+        && let Ok(bucket_meta) = metadata_sys::get(&item.bucket).await
+    {
         let local_updated_at = bucket_meta_local_updated_at(&bucket_meta, config_file);
         if is_stale_update(local_updated_at, incoming_updated_at) {
             return Ok(());
@@ -8027,6 +9070,72 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             None
         };
 
+    let (merged_lifecycle_config, lifecycle_guard) = if item.r#type == "lc-config" {
+        // Receiver-side gate, symmetric with the sender hook: a peer must not
+        // install expiry rules here while `replicateILMExpiry` is off. When
+        // the state cannot be read, fall through and apply (pre-gate
+        // behavior) rather than silently dropping a legitimate update. Note
+        // the gate acks with 200 — the sender treats the item as delivered
+        // and will not retry; items skipped inside the enable-flag
+        // propagation window are healed by repair, not by retry.
+        if let Ok(state) = load_site_replication_state().await
+            && !site_replication_state_replicates_ilm_expiry(&state)
+        {
+            return Ok(());
+        }
+
+        let incoming = match item.expiry_lc_config.as_ref() {
+            Some(raw) => {
+                let data = decode_bucket_meta_wire_value(raw);
+                match deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data) {
+                    Ok(config) => Some(config),
+                    // MinIO's delete tombstone / transition-only state is a
+                    // zero-rule document the strict deserializer rejects; it
+                    // means "no expiry rules here" (delete semantics). Any
+                    // other malformed payload is rejected — treating it as a
+                    // delete would let a bad payload erase local expiry rules.
+                    Err(_) if is_zero_rule_lifecycle_tombstone(&data) => None,
+                    Err(e) => return Err(s3_error!(InvalidRequest, "invalid lifecycle config: {e}")),
+                }
+            }
+            None => None,
+        };
+        let lifecycle_guard =
+            metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(&item.bucket, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
+        let local_metadata = metadata_sys::get_config_from_disk(&item.bucket)
+            .await
+            .map_err(ApiError::from)?;
+        let local = if local_metadata.lifecycle_config_xml.is_empty() {
+            None
+        } else {
+            Some(
+                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&local_metadata.lifecycle_config_xml).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}"))
+                })?,
+            )
+        };
+        let whole_config_axis = local_metadata.lifecycle_config_updated_at;
+        if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
+            return Ok(());
+        }
+        let local_absent = local.is_none();
+        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
+            Some(config) => Some(
+                serialize(&config)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?,
+            ),
+            None => {
+                skip_config_write = local_absent;
+                None
+            }
+        };
+        (merged, Some(lifecycle_guard))
+    } else {
+        (None, None)
+    };
+
     let data = match item.r#type.as_str() {
         "policy" => item
             .policy
@@ -8043,7 +9152,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         "object-lock-config" => decode_bucket_meta_wire_option(item.object_lock_config),
         "sse-config" => decode_bucket_meta_wire_option(item.sse_config),
         "replication-config" => merged_replication_config,
-        "lc-config" => decode_bucket_meta_wire_option(item.expiry_lc_config),
+        "lc-config" => merged_lifecycle_config,
         "cors-config" => decode_bucket_meta_wire_option(item.cors),
         _ => unreachable!(),
     };
@@ -8075,16 +9184,29 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                         .map_err(ApiError::from)?;
                 }
             } else {
-                metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                if let Some(guard) = lifecycle_guard.as_ref() {
+                    metadata_sys::update_under_transaction_lock(guard, &item.bucket, config_file, data)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
+            }
+        } else {
+            if let Some(guard) = lifecycle_guard.as_ref() {
+                metadata_sys::delete_under_transaction_lock(guard, &item.bucket, config_file)
+                    .await
+                    .map_err(ApiError::from)?;
+            } else {
+                metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
             }
-        } else {
-            metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
-                .await
-                .map_err(ApiError::from)?;
         }
     }
+    drop(lifecycle_guard);
     drop(targets_guard);
 
     if item.r#type == "replication-config" {
@@ -11490,6 +12612,320 @@ mod tests {
         assert!(target_state.peers["remote"].skip_tls_verify);
     }
 
+    fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<OffsetDateTime>) -> SiteReplicationRetryEvent {
+        SiteReplicationRetryEvent {
+            id: format!("evt-{peer}"),
+            peer_deployment_id: peer.to_string(),
+            peer_endpoint: format!("https://{peer}.example.com"),
+            path: path.to_string(),
+            retry_count,
+            failed: retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER,
+            last_error: "remote-operation-failed".to_string(),
+            updated_at,
+            edit_generation: None,
+        }
+    }
+
+    /// P1-3 red-light: the drain must only ever act on deliveries it can
+    /// replay faithfully. IAM / bucket-meta entries collapse per (peer, path)
+    /// with no body persisted — only a snapshot resend is truthful; bucket
+    /// makes/replication configs are re-derivable; destructive bucket ops and
+    /// unrelated `internal:` marker records are never background-replayed.
+    #[test]
+    fn test_classify_site_replication_retry_event_actions() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let classify = |path: &str| classify_site_replication_retry_event(&drain_event("remote", path, 1, Some(now)));
+
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/iam-item"),
+            Some(RetryDrainAction::IamSnapshot)
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
+            Some(RetryDrainAction::BucketMetadataSnapshot)
+        );
+        assert_eq!(classify(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH), Some(RetryDrainAction::IamSnapshot));
+        assert_eq!(
+            classify(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH),
+            Some(RetryDrainAction::BucketMetadataSnapshot)
+        );
+        assert_eq!(classify(SITE_REPLICATION_PEER_EDIT_PATH), Some(RetryDrainAction::PeerEdit));
+        assert_eq!(
+            classify(
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning&createdAt=1"
+            ),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication"),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        // Destructive ops are operator territory: replaying a bucket delete
+        // against a peer whose bucket was since recreated is irreversible.
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket"),
+            None
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket"),
+            None
+        );
+        // `internal:` records store payloads in `last_error`, not failures.
+        assert_eq!(classify(SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH), None);
+        assert_eq!(classify("internal:some-future-marker"), None);
+        assert_eq!(classify("/rustfs/admin/v3/site-replication/peer/unknown"), None);
+    }
+
+    #[test]
+    fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
+        let old = SRIAMItem {
+            r#type: "policy".to_string(),
+            name: "readwrite".to_string(),
+            updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.updated_at = Some(OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("timestamp"));
+
+        let sent = RetrySnapshot::Iam(vec![old]);
+        let changed = RetrySnapshot::Iam(vec![new]);
+        assert_ne!(sent.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn test_retry_snapshot_replays_a_concurrent_deletion_as_a_tombstone() {
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_010).expect("timestamp");
+        let policy = SRIAMItem {
+            r#type: "policy".to_string(),
+            name: "readwrite".to_string(),
+            policy: Some(serde_json::json!({"Version": "2012-10-17"})),
+            ..Default::default()
+        };
+        let replay =
+            RetrySnapshot::replay_after_change(&RetrySnapshot::Iam(vec![policy]), &RetrySnapshot::Iam(Vec::new()), observed_at);
+        let RetrySnapshot::Iam(items) = replay else {
+            panic!("IAM snapshot expected");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "readwrite");
+        assert!(items[0].policy.is_none());
+        assert_eq!(items[0].updated_at, Some(observed_at));
+
+        let bucket = SRBucketMeta {
+            r#type: "tags".to_string(),
+            bucket: "photos".to_string(),
+            tags: Some("encoded-tags".to_string()),
+            ..Default::default()
+        };
+        let replay = RetrySnapshot::replay_after_change(
+            &RetrySnapshot::BucketMetadata(vec![bucket]),
+            &RetrySnapshot::BucketMetadata(Vec::new()),
+            observed_at,
+        );
+        let RetrySnapshot::BucketMetadata(items) = replay else {
+            panic!("bucket metadata snapshot expected");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].bucket, "photos");
+        assert_eq!(items[0].r#type, "tags");
+        assert!(items[0].tags.is_none());
+        assert_eq!(items[0].updated_at, Some(observed_at));
+    }
+
+    /// Exponential backoff gates every attempt: without it a dead peer's
+    /// entries hit `failed` (retry_count >= 3) within 30 minutes of reconcile
+    /// ticks and the retry stats lose their signal.
+    #[test]
+    fn test_site_replication_retry_backoff_schedule() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let at = |secs_ago: i64| Some(now - time::Duration::seconds(secs_ago));
+        let elapsed = |retry_count: u32, secs_ago: i64| {
+            site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", retry_count, at(secs_ago)), now)
+        };
+
+        // No record of when it failed: attempt now.
+        assert!(site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", 1, None), now));
+        // First failure: one reconcile interval.
+        assert!(!elapsed(1, 599));
+        assert!(elapsed(1, 601));
+        // Third failure: 600 * 2^2 = 2400s.
+        assert!(!elapsed(3, 1200));
+        assert!(elapsed(3, 2401));
+        // Ceiling: a long-dead peer is still probed daily, never less often.
+        assert!(!elapsed(30, 86_000));
+        assert!(elapsed(30, 86_401));
+    }
+
+    /// The actionable subset respects classification, peer membership and
+    /// backoff; everything else stays untouched in the queue.
+    #[test]
+    fn test_actionable_site_replication_retry_events_filters() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let old = Some(now - time::Duration::seconds(700));
+        let mut state = SiteReplicationState::default();
+        state
+            .peers
+            .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+        state.retry_queue = vec![
+            // Eligible: known peer, replayable, past backoff.
+            drain_event("remote", SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, 1, old),
+            // Not yet due.
+            drain_event("remote", "/rustfs/admin/v3/site-replication/peer/bucket-meta", 2, Some(now)),
+            // Unknown peer (removed since the failure was recorded).
+            drain_event("gone", "/rustfs/admin/v3/site-replication/peer/iam-item", 1, old),
+            // Marker record, not a delivery failure.
+            drain_event("remote", SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH, 0, old),
+            // Destructive op: operator-only.
+            drain_event(
+                "remote",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
+                1,
+                old,
+            ),
+        ];
+
+        let actionable = actionable_site_replication_retry_events(&state, now);
+        assert_eq!(actionable.len(), 1, "only the due, replayable, known-peer event is actionable");
+        assert_eq!(actionable[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+    }
+
+    /// The drain settles a peer-edit success under a freshly allocated
+    /// generation; legacy queue entries carry `edit_generation: None` and
+    /// must be cleared by that generation-scoped settlement (`(Some, None)`
+    /// falls through to removal), or the drain would spin on them forever.
+    #[test]
+    fn test_settle_clears_legacy_none_generation_event_for_generation_scoped_success() {
+        let target = peer("remote", "https://remote.example.com");
+        let mut queue = vec![drain_event("remote", SITE_REPLICATION_PEER_EDIT_PATH, 1, None)];
+        assert!(queue[0].edit_generation.is_none());
+
+        let settled = settle_site_replication_retry_events(&mut queue, &target, SITE_REPLICATION_PEER_EDIT_PATH, Some(42));
+
+        assert_eq!(settled, 1, "a legacy None-generation event must settle under a newer generation");
+        assert!(queue.is_empty());
+    }
+
+    /// A successful snapshot resend cannot prove a failed *deletion* was
+    /// replayed, so the collapsed entry is escalated (operator-visible,
+    /// drain-idle) instead of cleared — unless a newer failure was stamped
+    /// during the delivery window, which keeps the entry drain-eligible.
+    #[test]
+    fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
+        let target = peer("remote", "https://remote.example.com");
+        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+
+        // Failure re-stamped after the snapshot: untouched, still eligible.
+        let mut queue = vec![drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            2,
+            Some(snapshot_at + time::Duration::seconds(5)),
+        )];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(
+                &mut queue,
+                &target,
+                SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+                Some(snapshot_at),
+            ),
+            0
+        );
+        assert!(!queue[0].failed);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_some(),
+            "a newer failure must stay drain-eligible"
+        );
+
+        // Unchanged since the snapshot: escalated, kept, drain-idle.
+        let mut queue = vec![drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            2,
+            Some(snapshot_at),
+        )];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert_eq!(queue.len(), 1, "the entry must survive until remote absence is proven");
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert!(queue[0].failed);
+        assert_eq!(queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_none(),
+            "a snapshot-replayed entry must not be re-sent daily"
+        );
+        // Ordinary success dequeues must not clear the marker: collapsed
+        // paths are shared by every entity, so a successful Bob update
+        // proves nothing about a failed Alice deletion (second review
+        // round).
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
+        assert_eq!(queue.len(), 1, "an escalated entry must survive an ordinary delivery success");
+        // Only a repair — the operator's accountability transfer — settles it.
+        assert_eq!(dequeue_site_replication_retry_events_including_escalated(&mut queue, &target, path), 1);
+        assert!(queue.is_empty());
+
+        // A failed Alice deletion is stored under the internal path, so a
+        // successful Bob update on the shared wire path cannot erase it even
+        // before the drain runs.
+        let mut queue = Vec::new();
+        upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+
+        // A later hook failure overwrites the marker and re-arms the drain.
+        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
+        escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
+        upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
+        assert!(classify_site_replication_retry_event(&queue[0]).is_some());
+
+        // Legacy entry without a timestamp: escalated.
+        let mut queue = vec![drain_event("remote", path, 2, None)];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+
+        // A cloned event can disappear during replay; escalation recreates
+        // the internal liability while leaving another peer's row untouched.
+        let mut queue = vec![drain_event("other", path, 2, Some(snapshot_at))];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert!(!queue[0].failed);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[1].peer_deployment_id, target.deployment_id);
+        assert_eq!(queue[1].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+    }
+
+    #[test]
+    fn test_collapsed_retry_queue_migration_preserves_legacy_liability() {
+        let peer = PeerInfo {
+            deployment_id: "remote-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let wire_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut queue = vec![drain_event("remote-dep", wire_path, 2, Some(now))];
+
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, wire_path), 0);
+        assert!(normalize_collapsed_retry_queue_paths(&mut queue));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert!(!normalize_collapsed_retry_queue_paths(&mut queue));
+    }
+
     #[test]
     fn test_pending_endpoint_refresh_retry_summary_redacts_pem() {
         let pem = "-----BEGIN CERTIFICATE-----\nsecret-marker\n-----END CERTIFICATE-----";
@@ -12719,6 +14155,87 @@ mod tests {
         assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
     }
 
+    /// A deleted expiry state (entry value None, axis set) must travel as an
+    /// explicit timestamped delete item — a peer that missed the live delete
+    /// otherwise keeps stale expiry rules through every repair (review
+    /// finding).
+    #[test]
+    fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
+        let deleted_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut info = SRInfo::default();
+        info.state.peers.insert(
+            "remote-dep".to_string(),
+            PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+        info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                expiry_lc_config: None,
+                expiry_lc_config_updated_at: Some(deleted_at),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+
+        let item = plan
+            .bucket_items
+            .iter()
+            .find(|item| item.r#type == "lc-config")
+            .expect("a deleted expiry state must produce an lc-config delete item");
+        assert!(item.expiry_lc_config.is_none(), "delete items carry no config body");
+        assert_eq!(item.expiry_updated_at, Some(deleted_at));
+        assert_eq!(item.updated_at, Some(deleted_at));
+    }
+
+    /// What each local lifecycle state contributes to the SRInfo entry:
+    /// deletions are timestamped statements, never-configured buckets and
+    /// transition-only configs without an expiry axis say nothing.
+    #[test]
+    fn test_lifecycle_expiry_statement_matrix() {
+        let created = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
+        meta.created = created;
+        // Never configured: load backfills the write time to `created`.
+        meta.lifecycle_config_updated_at = created;
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Deleted: the write time survives deletion and exceeds creation.
+        let deleted_at = created + time::Duration::seconds(100);
+        meta.lifecycle_config_updated_at = deleted_at;
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("deletion is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis, deleted_at);
+
+        // Present with expiry rules and the axis: subset + axis travel.
+        let expiry_axis = created + time::Duration::seconds(50);
+        let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        config.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
+        assert!(subset.is_some());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
+
+        // Transition-only without an axis: nothing to say (a delete stamped
+        // off the whole-config time would erase newer peer expiry state).
+        meta.lifecycle_config_xml = serialize(&lc_config(vec![lc_rule("t1", None, Some(30))])).expect("serialize config");
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Transition-only WITH an axis: expiry rules were properly removed —
+        // the delete travels at that axis.
+        let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        transition_only.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
+    }
+
     #[test]
     fn test_site_replication_repair_request_is_strict_and_requires_explicit_mode() {
         assert!(serde_json::from_str::<SiteReplicationRepairRequest>(r#"{"mode":"dry-run"}"#).is_ok());
@@ -13126,6 +14643,7 @@ mod tests {
         upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
 
         assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
         assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
         assert!(queue[0].failed);
         assert_eq!(queue[0].last_error, "third");
@@ -13167,12 +14685,12 @@ mod tests {
         );
         assert!(queue.is_empty());
 
-        // Broadcast paths carry no generation and keep settling unconditionally
-        // — their retry events live under their own path and never collide
-        // with a peer-edit delivery.
+        // Collapsed broadcast failures live under an internal snapshot path;
+        // an unrelated success on their shared wire path cannot settle them.
         let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
         upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 1);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 0);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     }
 
     /// P1-15 review follow-up: the receiving side of the ordering fence. Two
@@ -13579,7 +15097,7 @@ mod tests {
             deployment_id: "current-dep".to_string(),
             ..peer("remote", "https://remote.example.com")
         };
-        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let path = SITE_REPLICATION_PEER_EDIT_PATH;
         let mut queue = vec![
             SiteReplicationRetryEvent {
                 id: "same-endpoint".to_string(),
@@ -14461,6 +15979,405 @@ mod tests {
         assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
     }
 
+    fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
+        s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            expiration: expiry_days.map(|days| s3s::dto::LifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            }),
+            transitions: transition_days.map(|days| {
+                vec![s3s::dto::Transition {
+                    days: Some(days),
+                    storage_class: Some(s3s::dto::TransitionStorageClass::from_static(s3s::dto::TransitionStorageClass::GLACIER)),
+                    date: None,
+                }]
+            }),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+        }
+    }
+
+    fn lc_config(rules: Vec<s3s::dto::LifecycleRule>) -> s3s::dto::BucketLifecycleConfiguration {
+        s3s::dto::BucketLifecycleConfiguration {
+            rules,
+            expiry_updated_at: None,
+        }
+    }
+
+    fn rule_ids(config: &s3s::dto::BucketLifecycleConfiguration) -> Vec<&str> {
+        config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
+    }
+
+    /// P1-1 red-light: an incoming expiry-only document must not erase the
+    /// receiver's local transition/tiering rules (today the receiver
+    /// overwrites the whole lifecycle config).
+    #[test]
+    fn test_merge_incoming_lifecycle_preserves_local_transition_rule() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t1"]);
+        let t1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("t1")).unwrap();
+        assert!(t1.transitions.as_ref().is_some_and(|t| !t.is_empty()), "local transition must survive");
+    }
+
+    /// Same-id incoming rule updates the expiry side but the local transition
+    /// side is authoritative (MinIO `CloneNonTransition` + restore).
+    #[test]
+    fn test_merge_incoming_lifecycle_same_id_keeps_local_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("r1", Some(1), Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        assert_eq!(merged.rules.len(), 1);
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7), "incoming expiry wins");
+        assert!(
+            r1.transitions.as_ref().is_some_and(|t| !t.is_empty()),
+            "local transition is authoritative"
+        );
+    }
+
+    /// Trust boundary: whatever the peer sends, its transition fields never
+    /// land here — a new incoming rule is stripped to its expiry parts.
+    #[test]
+    fn test_merge_incoming_lifecycle_strips_incoming_transitions() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), Some(1))])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let r1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("r1")).unwrap();
+        assert!(
+            r1.transitions.as_ref().is_none_or(|t| t.is_empty()),
+            "incoming transition fields must be discarded"
+        );
+    }
+
+    /// A local rule whose expiry part was dropped upstream loses only the
+    /// expiry fields; a pure-expiry rule disappears entirely.
+    #[test]
+    fn test_merge_incoming_lifecycle_dropped_rule_strips_expiry_keeps_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("other", Some(3), None)])),
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["mixed", "other"], "pure-expiry rule not in the incoming set is removed");
+        let mixed = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("mixed")).unwrap();
+        assert!(mixed.expiration.is_none(), "expiry side cleared");
+        assert!(mixed.transitions.as_ref().is_some_and(|t| !t.is_empty()), "transition side kept");
+    }
+
+    /// Peer lifecycle delete merges with the empty set: local transition rules
+    /// survive with their expiry parts cleared; only when nothing remains does
+    /// the whole config disappear.
+    #[test]
+    fn test_merge_incoming_lifecycle_delete_merges_with_empty() {
+        let merged = merge_incoming_lifecycle_config(
+            None,
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("transition rules must survive a peer lifecycle delete");
+        assert_eq!(rule_ids(&merged), vec!["mixed"]);
+        assert!(merged.rules[0].expiration.is_none());
+
+        assert!(
+            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None).is_none(),
+            "an all-expiry config deletes cleanly"
+        );
+    }
+
+    /// Disabled rules must survive the merge like enabled ones — the merge
+    /// must not reuse ENABLED-filtered helpers.
+    #[test]
+    fn test_merge_incoming_lifecycle_keeps_disabled_transition_rule() {
+        let mut disabled = lc_rule("t-disabled", None, Some(30));
+        disabled.status = s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::DISABLED);
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![disabled])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t-disabled"]);
+    }
+
+    /// Abort-multipart-only rules carry no expiry semantics: local ones stay
+    /// untouched, incoming ones are not installed (they are site-local, like
+    /// MinIO's sender-side filter).
+    #[test]
+    fn test_merge_incoming_lifecycle_abort_mpu_rules_stay_local() {
+        let abort_only = |id: &str| s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                days_after_initiation: Some(3),
+            }),
+            del_marker_expiration: None,
+            expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            transitions: None,
+        };
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![abort_only("incoming-abort"), lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![abort_only("local-abort")])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["e1", "local-abort"],
+            "incoming abort-mpu rule is not installed; local one survives"
+        );
+    }
+
+    /// Repeated delivery of the same document must be byte-stable (rule order
+    /// deterministic), or every broadcast rewrites bucket metadata.
+    #[test]
+    fn test_merge_incoming_lifecycle_is_idempotent() {
+        let incoming = || Some(lc_config(vec![lc_rule("e1", Some(7), None), lc_rule("e2", Some(9), None)]));
+        let local = Some(lc_config(vec![lc_rule("t1", None, Some(30))]));
+
+        let once = merge_incoming_lifecycle_config(incoming(), local, None).expect("first merge");
+        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None).expect("second merge");
+
+        assert_eq!(
+            serialize(&once).expect("serialize once"),
+            serialize(&twice).expect("serialize twice"),
+            "merge must be idempotent for identical input"
+        );
+    }
+
+    /// The merged config records the expiry axis timestamp so the staleness
+    /// guard compares expiry updates against expiry updates (a local
+    /// transition-only edit must not shadow newer peer expiry updates).
+    #[test]
+    fn test_merge_incoming_lifecycle_stamps_expiry_updated_at() {
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let merged = merge_incoming_lifecycle_config(Some(lc_config(vec![lc_rule("e1", Some(7), None)])), None, Some(updated_at))
+            .expect("merge should keep rules");
+
+        let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
+        assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
+    }
+
+    /// MinIO's sender never emits del-marker-expiration rules
+    /// (CloneNonTransition drops them), so a MinIO expiry broadcast must not
+    /// delete this site's del-marker-only rules, and the local del-marker
+    /// side of a same-id rule is authoritative.
+    #[test]
+    fn test_merge_incoming_lifecycle_del_marker_rules_stay_local() {
+        let del_marker_only = |id: &str| {
+            let mut rule = lc_rule(id, None, None);
+            rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+            rule
+        };
+
+        // A local del-marker-only rule survives an incoming expiry document
+        // that does not mention it.
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![del_marker_only("dm-local")])),
+            None,
+        )
+        .expect("merge should keep rules");
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["dm-local", "e1"]);
+
+        // Same-id: the incoming expiry side wins, the local del-marker /
+        // abort-mpu side is authoritative and an incoming del-marker field is
+        // discarded at the trust boundary.
+        let mut local_mixed = lc_rule("r1", Some(1), None);
+        local_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+        local_mixed.abort_incomplete_multipart_upload = Some(s3s::dto::AbortIncompleteMultipartUpload {
+            days_after_initiation: Some(5),
+        });
+        let mut incoming_mixed = lc_rule("r1", Some(7), None);
+        incoming_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(9) });
+
+        let merged =
+            merge_incoming_lifecycle_config(Some(lc_config(vec![incoming_mixed])), Some(lc_config(vec![local_mixed])), None)
+                .expect("merge should keep rules");
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7));
+        assert_eq!(r1.del_marker_expiration.as_ref().and_then(|d| d.days), Some(3), "local del-marker wins");
+        assert_eq!(
+            r1.abort_incomplete_multipart_upload
+                .as_ref()
+                .and_then(|a| a.days_after_initiation),
+            Some(5),
+            "local abort-mpu wins"
+        );
+    }
+
+    /// Only a well-delimited zero-rule `<LifecycleConfiguration>` document is
+    /// the delete statement; truncated or foreign payloads must be rejected,
+    /// not treated as a delete that erases local expiry rules.
+    #[test]
+    fn test_zero_rule_lifecycle_tombstone_recognition() {
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>"));
+
+        // Documents with rules are not tombstones (they must parse strictly).
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><Rule><ID>x</ID></Rule></LifecycleConfiguration>"
+        ));
+        // Truncated / malformed / foreign payloads are rejected.
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><ExpiryUpdatedAt>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><Rule></Broken>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"garbage"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<SomethingElse></SomethingElse>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b""));
+        // Malformed children inside a well-delimited root are still rejected
+        // (second review round): a dangling open tag, stray text, an
+        // unclosed child, or nested markup is not a tombstone.
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration>stray text</LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><A><Rule/></A></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><Marker/></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>&bogus;</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<evil:LifecycleConfiguration/>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration><Marker/>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>&bogus;"));
+    }
+
+    #[test]
+    fn test_lifecycle_merge_holds_metadata_transaction_across_read_and_write() {
+        let source = include_str!("site_replication.rs");
+        let apply = source
+            .split("async fn apply_bucket_meta_item")
+            .nth(1)
+            .and_then(|rest| rest.split("fn group_info_requires_upsert").next())
+            .expect("apply_bucket_meta_item source");
+        let acquire = apply
+            .find("acquire_bucket_metadata_transaction_lock_for_incarnation")
+            .expect("lifecycle merge transaction acquisition");
+        let read = apply.find("get_config_from_disk").expect("fresh lifecycle config read");
+        let write = apply
+            .find("update_under_transaction_lock")
+            .expect("lifecycle config write under transaction");
+
+        assert!(
+            acquire < read && read < write,
+            "the transaction must span the lifecycle read, merge, and write"
+        );
+    }
+
+    /// The staleness axis an incoming lc-config item must beat: the expiry
+    /// axis when present; the whole-config write time only for deleted or
+    /// legacy-with-expiry state; epoch for a transition-only config (its
+    /// whole-config time moves on transition edits and must not shadow
+    /// independent peer expiry updates — review finding).
+    #[test]
+    fn test_local_lifecycle_staleness_axis_selection() {
+        let whole = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let axis_ts = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+
+        let mut with_axis = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        with_axis.expiry_updated_at = Some(s3s::dto::Timestamp::from(axis_ts));
+        assert_eq!(local_lifecycle_staleness_axis(Some(&with_axis), whole), axis_ts);
+
+        let legacy_with_expiry = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        assert_eq!(local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole), whole);
+
+        let transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&transition_only), whole),
+            OffsetDateTime::UNIX_EPOCH,
+            "a transition-only config has no expiry state to protect"
+        );
+
+        assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
+    }
+
+    /// Sender-side filter: only the expiry subset leaves this site. MinIO
+    /// peers install incoming rules verbatim, so a full document would plant
+    /// this site's transition rules there.
+    #[test]
+    fn test_lifecycle_expiry_subset_xml_strips_transitions() {
+        let full = serialize(&lc_config(vec![lc_rule("mixed", Some(1), Some(30)), lc_rule("t-only", None, Some(7))]))
+            .expect("serialize full config");
+
+        let subset = lifecycle_expiry_subset_xml(&full).expect("expiry subset should remain");
+        let parsed: s3s::dto::BucketLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
+        assert_eq!(rule_ids(&parsed), vec!["mixed"]);
+        assert!(parsed.rules[0].transitions.is_none(), "transition side must not travel");
+
+        let transition_only =
+            serialize(&lc_config(vec![lc_rule("t-only", None, Some(7))])).expect("serialize transition-only config");
+        assert!(
+            lifecycle_expiry_subset_xml(&transition_only).is_none(),
+            "a transition-only config states 'no expiry rules' (delete semantics)"
+        );
+        assert!(lifecycle_expiry_subset_xml(b"").is_none());
+    }
+
+    /// A local parse failure must forward the document unfiltered — mapping
+    /// it to `None` would delete the peers' replicated expiry rules.
+    #[test]
+    fn test_lifecycle_expiry_subset_xml_forwards_unparseable_config() {
+        let garbage = b"<LifecycleConfiguration><Rule></Broken>";
+        assert_eq!(lifecycle_expiry_subset_xml(garbage).as_deref(), Some(garbage.as_slice()));
+    }
+
     // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
     // drop only a sender-owned site-replication ARN, never an operator's own role — the same
     // rule the merge path applies, so both paths agree on what is ours to rewrite.
@@ -14575,7 +16492,10 @@ mod tests {
         assert!(!target.secure);
         assert_eq!(target.target_bucket, "photos");
         assert_eq!(target.deployment_id, "remote");
-        assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        // Freshly minted ARNs use the `minio` partition so madmin-go tooling
+        // can parse them; legacy `arn:rustfs:` targets are preserved as-is
+        // (see the MinIO-era preservation test below).
+        assert_eq!(target.arn, "arn:minio:replication::remote:photos");
         assert_eq!(target.region, "us-east-1");
         let credentials = target
             .credentials
@@ -16434,17 +18354,31 @@ mod tests {
     async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
         publish_ready_iam_context().await;
 
+        const ROUNDS: usize = 8;
         let seed = SiteReplicationState {
             pending_rotation: Some(PendingRotation {
                 id: "rot-1".to_string(),
                 access_key: "svc-account".to_string(),
                 ..Default::default()
             }),
+            // Retry events are only recorded for current peers; seed them so
+            // the concurrency assertion below exercises the persist path.
+            peers: (0..ROUNDS)
+                .map(|round| {
+                    let deployment_id = format!("peer-{round}-deployment");
+                    (
+                        deployment_id.clone(),
+                        PeerInfo {
+                            endpoint: format!("https://peer-{round}.example:9000"),
+                            deployment_id,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
             ..Default::default()
         };
         save_site_replication_state(&seed).await.expect("seed state");
-
-        const ROUNDS: usize = 8;
         for round in 0..ROUNDS {
             let peer = PeerInfo {
                 endpoint: format!("https://peer-{round}.example:9000"),

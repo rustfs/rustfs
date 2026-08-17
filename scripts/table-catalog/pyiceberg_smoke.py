@@ -1207,6 +1207,7 @@ def smoke_view_request(args: argparse.Namespace, view_name: str, version_id: int
             "schema-id": 0,
             "timestamp-ms": int(time.time() * 1000),
             "summary": {"operation": "replace"},
+            "default-namespace": [args.namespace],
             "representations": [
                 {
                     "type": "sql",

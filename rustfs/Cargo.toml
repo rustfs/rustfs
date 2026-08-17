@@ -278,6 +278,8 @@ rustfs-signer.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
+snap.workspace = true
+zstd.workspace = true
 
 # Cryptography and Security
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
@@ -355,7 +357,6 @@ rcgen = { workspace = true }
 rustfs-test-utils.workspace = true
 # diagnose_e2e fixtures (archives are generated in-test, never checked in)
 zip = { workspace = true }
-zstd = { workspace = true }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }

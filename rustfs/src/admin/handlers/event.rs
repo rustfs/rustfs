@@ -43,7 +43,7 @@ use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use tracing::{Span, error, info, warn};
+use tracing::{error, info, warn};
 
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 
@@ -333,8 +333,6 @@ pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
         let context = app_context_from_req(&req);
 
@@ -401,8 +399,6 @@ pub struct ListNotificationTargets {}
 #[async_trait::async_trait]
 impl Operation for ListNotificationTargets {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         refresh_persisted_module_switches_from_store().await.map_err(|err| {
             warn!(
@@ -439,8 +435,6 @@ pub struct ListTargetsArns {}
 #[async_trait::async_trait]
 impl Operation for ListTargetsArns {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason(
             "querying notification target ARNs for bucket associations from the console",
@@ -485,8 +479,6 @@ pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
         let context = app_context_from_req(&req);
 
@@ -1005,6 +997,13 @@ mod tests {
         let arns_block =
             extract_block_between_markers(src, "impl Operation for ListTargetsArns", "pub struct RemoveNotificationTarget");
         let delete_block = extract_block_between_markers(src, "impl Operation for RemoveNotificationTarget", "fn extract_param");
+
+        for block in [put_block, list_block, arns_block, delete_block] {
+            assert!(
+                !block.contains(".enter()"),
+                "async notification handlers must rely on request-future instrumentation instead of holding span guards across awaits"
+            );
+        }
 
         assert!(
             put_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),

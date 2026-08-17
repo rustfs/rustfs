@@ -135,10 +135,7 @@ impl FileMeta {
         let i = buf.len() as u64;
 
         // check version, buf = buf[8..]
-        let (buf, _, _) = Self::check_xl2_v1(buf).map_err(|e| {
-            error!("failed to check XL2 v1 format: {}", e);
-            e
-        })?;
+        let (buf, _, _) = Self::check_xl2_v1(buf)?;
 
         if buf.len() < 5 {
             error!(

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
+use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use jiff::Timestamp;
 use rmp_serde::Deserializer;

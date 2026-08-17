@@ -38,7 +38,10 @@ pub enum Rotation {
     Minutely,
     Hourly,
     Daily,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "constructed only by this file's rolling-appender tests; the lib target cannot see them (backlog#1823)"
+    )]
     Never,
 }
 
