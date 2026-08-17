@@ -2385,6 +2385,8 @@ impl HealManager {
             snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
             snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
             snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
+            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
+            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
             snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
             snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
             snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);

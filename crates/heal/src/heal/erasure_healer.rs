@@ -23,7 +23,7 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
-use metrics::gauge;
+use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::{
@@ -50,6 +50,17 @@ enum HealObjectOutcome {
 
 fn result_object_size_u64(result: &HealResultItem) -> u64 {
     u64::try_from(result.object_size).unwrap_or(u64::MAX)
+}
+
+const NEW_VERSION_SKIP_GRACE_SECS: u64 = 60;
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+fn should_skip_new_version(mod_time_unix_nanos: Option<i128>, started_at_secs: u64) -> bool {
+    let Some(mod_time_unix_nanos) = mod_time_unix_nanos else {
+        return false;
+    };
+    let cutoff_secs = started_at_secs.saturating_add(NEW_VERSION_SKIP_GRACE_SECS);
+    mod_time_unix_nanos > i128::from(cutoff_secs).saturating_mul(NANOS_PER_SECOND)
 }
 
 struct PageConcurrencyGuard {
@@ -497,6 +508,7 @@ impl ErasureSetHealer {
                     &mut skipped_objects,
                     resume_manager,
                     checkpoint_manager,
+                    state.start_time,
                 )
                 .await;
 
@@ -663,6 +675,7 @@ impl ErasureSetHealer {
         skipped_objects: &mut u64,
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
+        started_at_secs: u64,
     ) -> Result<()> {
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -724,6 +737,7 @@ impl ErasureSetHealer {
         // which stays the default.
         let use_disk_walk =
             matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
+        let lifecycle_expiry_context = self.storage.load_heal_lifecycle_expiry_context(bucket).await?;
 
         loop {
             self.verify_replacement_identity_fence("page scan").await?;
@@ -742,6 +756,7 @@ impl ErasureSetHealer {
             let page_resume_index = *current_object_index;
             let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
             let mut page_tasks = FuturesUnordered::new();
+            let mut completed_in_page = 0usize;
 
             // Capture the last version identity of this page for the anti-loop guard.
             let page_last = objects.last().map(|item| (item.name.clone(), item.version_id.clone()));
@@ -754,6 +769,75 @@ impl ErasureSetHealer {
                 // Per-version dedup identity — the single canonical key.
                 let key = compose_key(&item.name, item.version_id.as_deref());
                 if checkpoint.processed_objects.contains(&key) || checkpoint.skipped_objects.contains(&key) {
+                    continue;
+                }
+
+                if should_skip_new_version(item.mod_time_unix_nanos, started_at_secs) {
+                    checkpoint_manager.add_processed_object(key).await?;
+                    *processed_objects = processed_objects.saturating_add(1);
+                    completed_in_page = completed_in_page.saturating_add(1);
+                    counter!("rustfs_heal_skipped_new_versions_total").increment(1);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.record_skipped_new_version();
+                        progress.set_current_object(Some(format!("skipped_new: {bucket}/{}", item.name)));
+                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                    }
+                    debug!(
+                        target: "rustfs::heal::erasure_healer",
+                        event = EVENT_HEAL_ERASURE_OBJECT_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                        set_disk_id,
+                        bucket,
+                        object = %item.name,
+                        version_id = ?item.version_id,
+                        state = "skipped_new_version",
+                        "Erasure set object version skipped because it was written after heal started"
+                    );
+                    if completed_in_page.is_multiple_of(100) {
+                        checkpoint_manager.update_position(bucket_index, page_resume_index).await?;
+                    }
+                    continue;
+                }
+
+                if let Some(context) = lifecycle_expiry_context.as_ref()
+                    && self
+                        .storage
+                        .enqueue_heal_lifecycle_expiry(
+                            context,
+                            bucket,
+                            &item.name,
+                            item.version_id.as_deref(),
+                            item.lifecycle_object_info.as_ref(),
+                        )
+                        .await?
+                {
+                    checkpoint_manager.add_processed_object(key).await?;
+                    *processed_objects = processed_objects.saturating_add(1);
+                    completed_in_page = completed_in_page.saturating_add(1);
+                    counter!("rustfs_heal_skipped_ilm_expired_total").increment(1);
+                    {
+                        let mut progress = self.progress.write().await;
+                        progress.record_skipped_ilm_expired();
+                        progress.set_current_object(Some(format!("skipped_ilm: {bucket}/{}", item.name)));
+                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                    }
+                    debug!(
+                        target: "rustfs::heal::erasure_healer",
+                        event = EVENT_HEAL_ERASURE_OBJECT_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                        set_disk_id,
+                        bucket,
+                        object = %item.name,
+                        version_id = ?item.version_id,
+                        state = "skipped_ilm_expired",
+                        "Erasure set object version skipped because lifecycle expiry was queued"
+                    );
+                    if completed_in_page.is_multiple_of(100) {
+                        checkpoint_manager.update_position(bucket_index, page_resume_index).await?;
+                    }
                     continue;
                 }
 
@@ -861,7 +945,6 @@ impl ErasureSetHealer {
                 });
             }
 
-            let mut completed_in_page = 0usize;
             while let Some((key, object, version_id, result)) = page_tasks.next().await {
                 let (object_size, result) = result;
                 match result {
@@ -1169,13 +1252,15 @@ mod resume_loop_tests {
     //! that emits programmable multi-version pages. These exercise the real loop
     //! logic (cursor seeding, per-version dedup, anti-loop guard, absence
     //! handling) — not merely a mock's own output.
-    use super::{ErasureSetHealer, target_outcomes_complete};
+    use super::{
+        ErasureSetHealer, NANOS_PER_SECOND, NEW_VERSION_SKIP_GRACE_SECS, should_skip_new_version, target_outcomes_complete,
+    };
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
         CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
         compose_key,
     };
-    use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
+    use crate::heal::storage::{DiskStatus, HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
         BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, RUSTFS_META_BUCKET, new_disk,
@@ -1183,7 +1268,7 @@ mod resume_loop_tests {
     use crate::{Error, Result};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1194,8 +1279,35 @@ mod resume_loop_tests {
         HealListItem {
             name: name.to_string(),
             version_id: version.map(str::to_string),
+            mod_time_unix_nanos: None,
+            lifecycle_object_info: None,
             is_delete_marker: delete_marker,
         }
+    }
+
+    fn item_with_mod_time(name: &str, version: Option<&str>, mod_time_secs: u64) -> HealListItem {
+        HealListItem {
+            name: name.to_string(),
+            version_id: version.map(str::to_string),
+            mod_time_unix_nanos: Some(i128::from(mod_time_secs).saturating_mul(NANOS_PER_SECOND)),
+            lifecycle_object_info: None,
+            is_delete_marker: false,
+        }
+    }
+
+    #[test]
+    fn new_version_filter_respects_grace_boundary() {
+        let started_at = 1_700_000_000;
+
+        assert!(!should_skip_new_version(None, started_at));
+        assert!(!should_skip_new_version(
+            Some(i128::from(started_at + NEW_VERSION_SKIP_GRACE_SECS).saturating_mul(NANOS_PER_SECOND)),
+            started_at,
+        ));
+        assert!(should_skip_new_version(
+            Some(i128::from(started_at + NEW_VERSION_SKIP_GRACE_SECS + 1).saturating_mul(NANOS_PER_SECOND)),
+            started_at,
+        ));
     }
 
     #[test]
@@ -1280,6 +1392,7 @@ mod resume_loop_tests {
         /// Target-specific physical readback evidence per `compose_key`; the
         /// fake models a healthy backend unless a test explicitly revokes it.
         replacement_commit_evidence: Mutex<HashMap<String, ReplacementCommitEvidence>>,
+        lifecycle_expired: Mutex<HashSet<String>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
@@ -1307,6 +1420,9 @@ mod resume_loop_tests {
                 .lock()
                 .unwrap()
                 .insert(compose_key(name, version), ReplacementCommitEvidence::Error(message.to_string()));
+        }
+        fn set_lifecycle_expired(&self, name: &str, version: Option<&str>) {
+            self.lifecycle_expired.lock().unwrap().insert(compose_key(name, version));
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
@@ -1363,6 +1479,23 @@ mod resume_loop_tests {
         }
         async fn get_object_checksum(&self, _b: &str, _o: &str) -> Result<Option<String>> {
             Ok(None)
+        }
+        async fn load_heal_lifecycle_expiry_context(&self, _bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+            Ok((!self.lifecycle_expired.lock().unwrap().is_empty()).then(HealLifecycleExpiryContext::test))
+        }
+        async fn enqueue_heal_lifecycle_expiry(
+            &self,
+            _context: &HealLifecycleExpiryContext,
+            _bucket: &str,
+            object: &str,
+            version_id: Option<&str>,
+            _object_info: Option<&HealObjectInfo>,
+        ) -> Result<bool> {
+            Ok(self
+                .lifecycle_expired
+                .lock()
+                .unwrap()
+                .contains(&compose_key(object, version_id)))
         }
         async fn heal_object(
             &self,
@@ -1510,6 +1643,7 @@ mod resume_loop_tests {
 
     /// Drive one bucket heal pass; returns (processed, successful, failed, skipped, result).
     async fn run(env: &Env) -> (u64, u64, u64, u64, Result<()>) {
+        let state = env.resume.get_state().await;
         let mut current_object_index = 0usize;
         let mut processed = 0u64;
         let mut successful = 0u64;
@@ -1528,6 +1662,7 @@ mod resume_loop_tests {
                 &mut skipped,
                 &env.resume,
                 &env.checkpoint,
+                state.start_time,
             )
             .await;
         (processed, successful, failed, skipped, result)
@@ -1593,6 +1728,7 @@ mod resume_loop_tests {
         let mut successful = 0;
         let mut failed = 0;
         let mut skipped = 0;
+        let started_at = env.resume.get_state().await.start_time;
 
         let error = healer
             .heal_bucket_with_resume(
@@ -1606,6 +1742,7 @@ mod resume_loop_tests {
                 &mut skipped,
                 &env.resume,
                 &env.checkpoint,
+                started_at,
             )
             .await
             .expect_err("a remounted target must not begin a new page scan");
@@ -1716,6 +1853,65 @@ mod resume_loop_tests {
         assert_eq!(progress.objects_failed, 0);
         assert_eq!(progress.bytes_processed, 3072);
         assert!(matches!(progress.current_object.as_deref(), Some("b/first" | "b/second")));
+    }
+
+    #[tokio::test]
+    async fn erasure_set_skips_versions_written_after_heal_started() {
+        let env = make_env().await;
+        let started_at = env.resume.get_state().await.start_time;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![
+                    item_with_mod_time("old", Some("v1"), started_at + NEW_VERSION_SKIP_GRACE_SECS),
+                    item_with_mod_time("new", Some("v2"), started_at + NEW_VERSION_SKIP_GRACE_SECS + 1),
+                ],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+
+        result.expect("page heal should succeed");
+        assert_eq!(processed, 2);
+        assert_eq!(successful, 1);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+        assert_eq!(env.storage.calls(), vec![("old".to_string(), Some("v1".to_string()))]);
+        let progress = env.healer.progress.read().await;
+        assert_eq!(progress.skipped_new_versions, 1);
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.objects_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn erasure_set_skips_versions_queued_for_lifecycle_expiry() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("expired", Some("v1"), false), item("kept", Some("v2"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_lifecycle_expired("expired", Some("v1"));
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+
+        result.expect("page heal should succeed");
+        assert_eq!(processed, 2);
+        assert_eq!(successful, 1);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+        assert_eq!(env.storage.calls(), vec![("kept".to_string(), Some("v2".to_string()))]);
+        let progress = env.healer.progress.read().await;
+        assert_eq!(progress.skipped_ilm_expired, 1);
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.objects_failed, 0);
     }
 
     #[tokio::test]

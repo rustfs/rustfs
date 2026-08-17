@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::storage_api::owner::EcstoreHealLifecycleExpiryContext;
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
@@ -33,6 +34,31 @@ pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 pub struct HealBucketUsageBaseline {
     pub objects_count: u64,
     pub bytes: u64,
+}
+
+pub struct HealLifecycleExpiryContext {
+    inner: HealLifecycleExpiryContextInner,
+}
+
+enum HealLifecycleExpiryContextInner {
+    Ecstore(EcstoreHealLifecycleExpiryContext),
+    #[allow(dead_code)]
+    Test,
+}
+
+impl HealLifecycleExpiryContext {
+    fn ecstore(inner: EcstoreHealLifecycleExpiryContext) -> Self {
+        Self {
+            inner: HealLifecycleExpiryContextInner::Ecstore(inner),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test() -> Self {
+        Self {
+            inner: HealLifecycleExpiryContextInner::Test,
+        }
+    }
 }
 
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -278,6 +304,10 @@ pub struct HealListItem {
     pub name: String,
     /// normalized version id (`None` when the version is nil/absent)
     pub version_id: Option<String>,
+    /// version modification time as Unix nanoseconds
+    pub mod_time_unix_nanos: Option<i128>,
+    /// object snapshot for lifecycle evaluation
+    pub lifecycle_object_info: Option<HealObjectInfo>,
     /// whether this version is a delete marker (observability only)
     pub is_delete_marker: bool,
 }
@@ -338,6 +368,23 @@ pub trait HealStorageAPI: Send + Sync {
     /// Aggregate usage-cache baselines for the requested buckets.
     async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         Ok(None)
+    }
+
+    /// Load per-bucket lifecycle expiry context for heal skips.
+    async fn load_heal_lifecycle_expiry_context(&self, _bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        Ok(None)
+    }
+
+    /// Queue lifecycle expiry for a version that heal can skip.
+    async fn enqueue_heal_lifecycle_expiry(
+        &self,
+        _context: &HealLifecycleExpiryContext,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _object_info: Option<&HealObjectInfo>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Fix bucket metadata
@@ -1053,6 +1100,64 @@ impl HealStorageAPI for ECStoreHealStorage {
         Ok(Some(baseline))
     }
 
+    async fn load_heal_lifecycle_expiry_context(&self, bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        match self.ecstore.load_heal_lifecycle_expiry_context(bucket).await {
+            Ok(Some(context)) => Ok(Some(HealLifecycleExpiryContext::ecstore(context))),
+            Ok(None) => Ok(None),
+            Err(err) => {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "load_heal_lifecycle_expiry_context",
+                    bucket,
+                    result = "failed",
+                    error = %err,
+                    "Heal storage lifecycle expiry context load failed"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn enqueue_heal_lifecycle_expiry(
+        &self,
+        context: &HealLifecycleExpiryContext,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        object_info: Option<&HealObjectInfo>,
+    ) -> Result<bool> {
+        let context = match &context.inner {
+            HealLifecycleExpiryContextInner::Ecstore(context) => context,
+            HealLifecycleExpiryContextInner::Test => return Ok(false),
+        };
+        match self
+            .ecstore
+            .enqueue_heal_lifecycle_expiry(context, bucket, object, version_id, object_info)
+            .await
+        {
+            Ok(queued) => Ok(queued),
+            Err(err) => {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "enqueue_heal_lifecycle_expiry",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    result = "failed",
+                    error = %err,
+                    "Heal storage lifecycle expiry check failed"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1554,10 +1659,15 @@ impl HealStorageAPI for ECStoreHealStorage {
         let page_objects: Vec<HealListItem> = list_info
             .objects
             .into_iter()
-            .map(|obj| HealListItem {
-                name: obj.name,
-                version_id: obj.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string()),
-                is_delete_marker: obj.delete_marker,
+            .map(|mut obj| {
+                obj.version_id = obj.version_id.filter(|u| !u.is_nil());
+                HealListItem {
+                    name: obj.name.clone(),
+                    version_id: obj.version_id.map(|u| u.to_string()),
+                    mod_time_unix_nanos: obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos()),
+                    lifecycle_object_info: Some(obj.clone()),
+                    is_delete_marker: obj.delete_marker,
+                }
             })
             .collect();
         let page_count = page_objects.len();
@@ -1646,6 +1756,8 @@ impl HealStorageAPI for ECStoreHealStorage {
             .map(|v| HealListItem {
                 name: v.name,
                 version_id: v.version_id,
+                mod_time_unix_nanos: v.mod_time_unix_nanos,
+                lifecycle_object_info: v.lifecycle_object_info,
                 is_delete_marker: v.is_delete_marker,
             })
             .collect();

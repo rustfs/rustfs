@@ -24,6 +24,10 @@ pub struct HealProgress {
     pub objects_healed: u64,
     /// Objects failed
     pub objects_failed: u64,
+    /// Versions skipped because they were written after this heal started
+    pub skipped_new_versions: u64,
+    /// Versions skipped because lifecycle already selected them for expiry
+    pub skipped_ilm_expired: u64,
     /// Baseline object count from the latest complete usage snapshot
     pub objects_total_count: u64,
     /// Baseline object bytes from the latest complete usage snapshot
@@ -70,13 +74,34 @@ impl HealProgress {
         self.refresh_estimated_completion_time();
     }
 
+    pub fn record_skipped_new_version(&mut self) {
+        self.skipped_new_versions = self.skipped_new_versions.saturating_add(1);
+        self.last_update_time = Some(SystemTime::now());
+        self.refresh_progress_percentage();
+        self.refresh_estimated_completion_time();
+    }
+
+    pub fn record_skipped_ilm_expired(&mut self) {
+        self.skipped_ilm_expired = self.skipped_ilm_expired.saturating_add(1);
+        self.last_update_time = Some(SystemTime::now());
+        self.refresh_progress_percentage();
+        self.refresh_estimated_completion_time();
+    }
+
+    fn completed_for_baseline(&self) -> u64 {
+        self.objects_healed
+            .saturating_add(self.objects_failed)
+            .saturating_add(self.skipped_new_versions)
+            .saturating_add(self.skipped_ilm_expired)
+    }
+
     pub(crate) fn refresh_progress_percentage(&mut self) {
         if self.objects_total_size > 0 {
             self.progress_percentage = ((self.bytes_processed as f64 / self.objects_total_size as f64) * 100.0).min(100.0);
             return;
         }
         if self.objects_total_count > 0 {
-            let completed = self.objects_healed.saturating_add(self.objects_failed);
+            let completed = self.completed_for_baseline();
             self.progress_percentage = ((completed as f64 / self.objects_total_count as f64) * 100.0).min(100.0);
             return;
         }
@@ -214,6 +239,8 @@ mod tests {
         assert_eq!(progress.objects_scanned, 0);
         assert_eq!(progress.objects_healed, 0);
         assert_eq!(progress.objects_failed, 0);
+        assert_eq!(progress.skipped_new_versions, 0);
+        assert_eq!(progress.skipped_ilm_expired, 0);
         assert_eq!(progress.objects_total_count, 0);
         assert_eq!(progress.objects_total_size, 0);
         assert_eq!(progress.bytes_processed, 0);
@@ -270,6 +297,18 @@ mod tests {
         progress.update_progress(100, 3, 2, 0);
 
         assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_heal_progress_counts_skipped_versions_for_object_baseline() {
+        let mut progress = HealProgress::new();
+        progress.set_total_baseline(10, 0);
+
+        progress.update_progress(100, 3, 2, 0);
+        progress.record_skipped_new_version();
+
+        assert_eq!(progress.skipped_new_versions, 1);
+        assert!((progress.progress_percentage - 60.0).abs() < 0.001);
     }
 
     #[test]
@@ -364,6 +403,8 @@ mod tests {
         assert_eq!(json["objectsScanned"], 10);
         assert_eq!(json["objectsHealed"], 8);
         assert_eq!(json["objectsFailed"], 2);
+        assert_eq!(json["skippedNewVersions"], 0);
+        assert_eq!(json["skippedIlmExpired"], 0);
         assert_eq!(json["bytesProcessed"], 1024);
         assert_eq!(json["currentObject"], "test-bucket/test-object");
         assert!(json["progressPercentage"].is_number());

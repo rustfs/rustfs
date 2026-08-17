@@ -3292,6 +3292,8 @@ mod tests {
         HealListItem {
             name: name.to_string(),
             version_id: None,
+            mod_time_unix_nanos: None,
+            lifecycle_object_info: None,
             is_delete_marker: false,
         }
     }
