@@ -1611,7 +1611,7 @@ impl HealTask {
             let (objects, next_token, is_truncated) = self
                 .await_with_control(
                     self.storage
-                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref()),
+                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false),
                 )
                 .await?;
 
@@ -3704,6 +3704,7 @@ mod tests {
             bucket: &str,
             prefix: &str,
             continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
             self.listed_prefixes.lock().unwrap().push(prefix.to_string());
             if *self.truncate_without_token.lock().unwrap() {

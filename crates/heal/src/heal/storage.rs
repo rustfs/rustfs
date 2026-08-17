@@ -467,6 +467,7 @@ pub trait HealStorageAPI: Send + Sync {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
 
     /// List versions for healing via a per-erasure-set DISK-WALK union enumerator
@@ -485,8 +486,10 @@ pub trait HealStorageAPI: Send + Sync {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
-        self.list_objects_for_heal_page(bucket, prefix, continuation_token).await
+        self.list_objects_for_heal_page(bucket, prefix, continuation_token, include_lifecycle_object_info)
+            .await
     }
 
     /// Get disk for resume functionality.
@@ -1573,7 +1576,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         loop {
             let (page_objects, next_token, is_truncated) = self
-                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref())
+                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false)
                 .await?;
 
             all_objects.extend(page_objects);
@@ -1608,6 +1611,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1661,12 +1665,16 @@ impl HealStorageAPI for ECStoreHealStorage {
             .into_iter()
             .map(|mut obj| {
                 obj.version_id = obj.version_id.filter(|u| !u.is_nil());
+                let version_id = obj.version_id.map(|u| u.to_string());
+                let mod_time_unix_nanos = obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos());
+                let is_delete_marker = obj.delete_marker;
+                let lifecycle_object_info = include_lifecycle_object_info.then(|| obj.clone());
                 HealListItem {
-                    name: obj.name.clone(),
-                    version_id: obj.version_id.map(|u| u.to_string()),
-                    mod_time_unix_nanos: obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos()),
-                    lifecycle_object_info: Some(obj.clone()),
-                    is_delete_marker: obj.delete_marker,
+                    name: obj.name,
+                    version_id,
+                    mod_time_unix_nanos,
+                    lifecycle_object_info,
+                    is_delete_marker,
                 }
             })
             .collect();
@@ -1704,6 +1712,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         // Per-page bounds for the disk-walk union enumerator. Objects are atomic
         // (never split across pages), so version_budget only bounds how many
@@ -1732,7 +1741,16 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         let (versions, next_forward, is_truncated) = self
             .ecstore
-            .heal_walk_versions_page(pool_idx, set_idx, bucket, prefix, forward_to.as_deref(), BATCH_OBJECTS, VERSION_BUDGET)
+            .heal_walk_versions_page(
+                pool_idx,
+                set_idx,
+                bucket,
+                prefix,
+                forward_to.as_deref(),
+                BATCH_OBJECTS,
+                VERSION_BUDGET,
+                include_lifecycle_object_info,
+            )
             .await
             .map_err(|e| {
                 error!(

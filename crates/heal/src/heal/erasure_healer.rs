@@ -738,17 +738,24 @@ impl ErasureSetHealer {
         let use_disk_walk =
             matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
         let lifecycle_expiry_context = self.storage.load_heal_lifecycle_expiry_context(bucket).await?;
+        let include_lifecycle_object_info = lifecycle_expiry_context.is_some();
 
         loop {
             self.verify_replacement_identity_fence("page scan").await?;
             // Get one page of object versions
             let (objects, next_token, is_truncated) = if use_disk_walk {
                 self.storage
-                    .list_versions_for_heal_page_disk_walk(set_disk_id, bucket, "", continuation_token.as_deref())
+                    .list_versions_for_heal_page_disk_walk(
+                        set_disk_id,
+                        bucket,
+                        "",
+                        continuation_token.as_deref(),
+                        include_lifecycle_object_info,
+                    )
                     .await?
             } else {
                 self.storage
-                    .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
+                    .list_objects_for_heal_page(bucket, "", continuation_token.as_deref(), include_lifecycle_object_info)
                     .await?
             };
             let page_is_empty = objects.is_empty();
@@ -1395,6 +1402,7 @@ mod resume_loop_tests {
         lifecycle_expired: Mutex<HashSet<String>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
+        list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         fail_listing: AtomicBool,
     }
@@ -1426,6 +1434,9 @@ mod resume_loop_tests {
         }
         fn calls(&self) -> Vec<(String, Option<String>)> {
             self.heal_calls.lock().unwrap().clone()
+        }
+        fn list_include_lifecycle_object_info_calls(&self) -> Vec<bool> {
+            self.list_include_lifecycle_object_info.lock().unwrap().clone()
         }
         fn fail_listing(&self) {
             self.fail_listing.store(true, Ordering::SeqCst);
@@ -1553,7 +1564,12 @@ mod resume_loop_tests {
             _bucket: &str,
             _prefix: &str,
             continuation_token: Option<&str>,
+            include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+            self.list_include_lifecycle_object_info
+                .lock()
+                .unwrap()
+                .push(include_lifecycle_object_info);
             if self.fail_listing.load(Ordering::SeqCst) {
                 return Err(Error::other("injected listing failure"));
             }
@@ -1907,6 +1923,7 @@ mod resume_loop_tests {
         assert_eq!(failed, 0);
         assert_eq!(skipped, 0);
         assert_eq!(env.storage.calls(), vec![("kept".to_string(), Some("v2".to_string()))]);
+        assert_eq!(env.storage.list_include_lifecycle_object_info_calls(), vec![true]);
         let progress = env.healer.progress.read().await;
         assert_eq!(progress.skipped_ilm_expired, 1);
         assert_eq!(progress.objects_scanned, 2);
