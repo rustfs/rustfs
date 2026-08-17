@@ -9825,14 +9825,19 @@ name = "rustfs-madmin"
 version = "1.0.0-rc.2"
 dependencies = [
  "hotpath",
+ "http 1.5.0",
  "humantime",
  "hyper",
  "jiff",
+ "reqwest",
  "rmp-serde",
+ "rustfs-signer",
+ "s3s",
  "serde",
  "serde_json",
  "sysinfo",
  "time",
+ "tokio",
 ]
 
 [[package]]
