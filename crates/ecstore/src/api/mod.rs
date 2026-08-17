@@ -380,7 +380,7 @@ pub mod erasure {
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook, send_event};
 }
 
 pub mod global {

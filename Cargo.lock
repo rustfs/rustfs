@@ -10251,6 +10251,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-lock",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-utils",
  "s3s",
