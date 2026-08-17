@@ -157,11 +157,130 @@ fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<St
     comparable
 }
 
+/// Runtime half of the P1-19 version-identity contract (the explicit probe
+/// lives in replication-check's VersionFidelity phase): every replication PUT
+/// response reveals whether the target adopted the source version id. A
+/// target minting its own ids silently breaks version-addressed deletes and
+/// heal, so surface it — once per target — instead of letting the divergence
+/// accumulate unseen.
+/// Pure drift judgment: the contract only applies when the source addressed a
+/// real (non-nil) version uuid, and drift means the target answered with
+/// anything else — including nothing at all.
+pub fn version_identity_drifted(source_version_id: &str, assigned_version_id: Option<&str>) -> bool {
+    if source_version_id.is_empty() {
+        return false;
+    }
+    // A nil source uuid travels as the literal "null" (unversioned-source
+    // semantics); no identity contract applies to it.
+    if uuid::Uuid::parse_str(source_version_id)
+        .map(|uuid| uuid.is_nil())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    assigned_version_id != Some(source_version_id)
+}
+
+const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
+    "dispatch failure",
+    "timeouterror",
+    "timed out",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "connection aborted",
+    "broken pipe",
+    "dns error",
+    "failed to lookup address",
+    "name or service not known",
+    "deadline has elapsed",
+    "tcp connect error",
+];
+
+/// True when a target operation error reads as a network/transport failure —
+/// the only class of error that should mark a replication target offline.
+pub fn is_replication_target_offline_error(err: &(impl std::fmt::Display + ?Sized)) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    REPLICATION_TARGET_OFFLINE_ERROR_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Whether a replication target preserves the SSE-C passthrough transport
+/// headers (`X-Rustfs-Replication-*`) end to end.
+///
+/// A target that silently drops those headers (MinIO, generic S3) stores the
+/// forwarded ciphertext without its decryption material — an unreadable
+/// replica that used to report COMPLETED. The replication worker audits the
+/// first passthrough PUT per target (HEAD-back for SSE-C evidence) and caches
+/// the verdict; a fresh `Unsupported` fails SSE-C replication closed before
+/// any PUT is sent. The verdict cache (per-ARN map, lifecycle, and TTL) is
+/// owned by the runtime's bucket target system; this crate owns only the
+/// verdict vocabulary and the gate policy below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SsecPassthroughCapability {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+/// Fail-closed decision for an SSE-C passthrough replication attempt, derived
+/// from the target's cached [`SsecPassthroughCapability`]. Pure so the policy
+/// can migrate with the worker (M2) without dragging the cache along; the
+/// caller computes `expired` from the cache record's age (see the runtime's
+/// `SSEC_PASSTHROUGH_CAPABILITY_TTL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsecPassthroughGate {
+    /// Not an SSE-C object, or the target has a fresh proof that it preserves
+    /// the passthrough transport headers: replicate without a HEAD-back audit.
+    Proceed,
+    /// No usable verdict — first SSE-C attempt since the target was (re)built,
+    /// or the recorded verdict (in either direction) aged out: PUT, then HEAD
+    /// the replica back and require SSE-C evidence before reporting COMPLETED.
+    ProceedWithAudit,
+    /// The target was recently proven to drop the passthrough headers: do not
+    /// send the PUT, report FAILED (the object stays on the normal MRF retry
+    /// channel and re-audits once the verdict expires).
+    FailClosed,
+}
+
+pub fn ssec_passthrough_gate(ssec: bool, capability: SsecPassthroughCapability, expired: bool) -> SsecPassthroughGate {
+    if !ssec {
+        return SsecPassthroughGate::Proceed;
+    }
+    // An expired verdict — Supported or Unsupported — must be re-earned: a
+    // stale Unsupported would otherwise stick forever after a target upgrade,
+    // and a stale Supported would fail open after a backend swap behind the
+    // same endpoint.
+    if expired {
+        return SsecPassthroughGate::ProceedWithAudit;
+    }
+    match capability {
+        SsecPassthroughCapability::Supported => SsecPassthroughGate::Proceed,
+        SsecPassthroughCapability::Unknown => SsecPassthroughGate::ProceedWithAudit,
+        SsecPassthroughCapability::Unsupported => SsecPassthroughGate::FailClosed,
+    }
+}
+
+/// True when a replication-check HEAD of the replica proves the SSE-C
+/// material survived passthrough: a RustFS target restores the transport
+/// headers into the stored SSE-C keys and its HEAD echoes
+/// `x-amz-server-side-encryption-customer-algorithm` (the replication-check
+/// exemption skips key validation but not the metadata echo). A target that
+/// dropped the headers stored a plain object and echoes nothing. The caller
+/// extracts the echoed customer-algorithm value from its HEAD response type.
+pub fn ssec_passthrough_evidence_present(sse_customer_algorithm: Option<&str>) -> bool {
+    sse_customer_algorithm.is_some_and(|algo| !algo.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
-        replication_etags_match, target_is_newer_than_source_null_version,
+        ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
+        content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
+        ssec_passthrough_evidence_present, ssec_passthrough_gate, target_is_newer_than_source_null_version,
+        version_identity_drifted,
     };
     use crate::filemeta::{ReplicationAction, ReplicationType};
     use crate::http::AMZ_OBJECT_LOCK_MODE;
@@ -266,6 +385,96 @@ mod tests {
         assert_eq!(
             replication_action_for_target(&source, &changed_metadata, ReplicationType::ExistingObject),
             ReplicationAction::Metadata
+        );
+    }
+
+    /// P1-19 runtime spot-check exemption matrix: drift only applies when the
+    /// source addressed a real version uuid.
+    #[test]
+    fn test_version_identity_drift_judgment() {
+        let source = "6fa459ea-ee8a-3ca4-894e-db77e160355e";
+        for (sent, got, expected) in [
+            (source, Some(source), false),
+            (source, Some("0e304ce5-33e9-4b8a-9b12-9e40a53e6ded"), true),
+            (source, None, true),
+            ("", None, false),
+            ("null", Some("anything"), false),
+            ("00000000-0000-0000-0000-000000000000", Some("anything"), false),
+        ] {
+            assert_eq!(
+                version_identity_drifted(sent, got),
+                expected,
+                "sent {sent:?} got {got:?} must judge drift = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn replication_target_offline_error_classifier_is_network_scoped() {
+        assert!(is_replication_target_offline_error("put_object dispatch failure: connector error"));
+        assert!(is_replication_target_offline_error("request TimeoutError after retry"));
+        assert!(is_replication_target_offline_error("tcp connect error: connection refused"));
+        assert!(!is_replication_target_offline_error("put_object failed: AccessDenied: denied"));
+        assert!(!is_replication_target_offline_error("put_object failed: NoSuchBucket"));
+    }
+
+    /// N2 fail-closed policy: SSE-C replication may only proceed silently
+    /// against a target with a FRESH proof that it preserves the passthrough
+    /// transport headers. Unknown targets must be audited; freshly-flagged
+    /// dropping targets must never receive the PUT; an expired verdict in
+    /// EITHER direction must be re-earned through the audit — a sticky
+    /// Unsupported would outlive a target upgrade, and a sticky Supported
+    /// would fail open after a backend swap behind the same endpoint.
+    #[test]
+    fn ssec_passthrough_gate_is_fail_closed_and_ttl_bounded() {
+        for capability in [
+            SsecPassthroughCapability::Unknown,
+            SsecPassthroughCapability::Supported,
+            SsecPassthroughCapability::Unsupported,
+        ] {
+            for expired in [false, true] {
+                assert_eq!(
+                    ssec_passthrough_gate(false, capability, expired),
+                    SsecPassthroughGate::Proceed,
+                    "non-SSE-C objects must never be gated on the passthrough capability"
+                );
+            }
+        }
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Supported, false),
+            SsecPassthroughGate::Proceed
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unknown, false),
+            SsecPassthroughGate::ProceedWithAudit
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unsupported, false),
+            SsecPassthroughGate::FailClosed
+        );
+        // Expiry flips both directions back to the audit.
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unsupported, true),
+            SsecPassthroughGate::ProceedWithAudit,
+            "an expired Unsupported verdict must allow a re-audit (upgraded target recovers without operator action)"
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Supported, true),
+            SsecPassthroughGate::ProceedWithAudit,
+            "an expired Supported verdict must be re-proven (backend swap behind the same endpoint must not fail open)"
+        );
+    }
+
+    #[test]
+    fn ssec_passthrough_evidence_requires_customer_algorithm_echo() {
+        assert!(ssec_passthrough_evidence_present(Some("AES256")));
+        assert!(
+            !ssec_passthrough_evidence_present(Some("")),
+            "an empty echo is not evidence of preserved SSE-C material"
+        );
+        assert!(
+            !ssec_passthrough_evidence_present(None),
+            "a plain HEAD response must classify the target as having dropped the material"
         );
     }
 

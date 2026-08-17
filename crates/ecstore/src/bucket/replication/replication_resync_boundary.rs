@@ -22,7 +22,8 @@ use super::replication_filemeta_boundary::MrfReplicateEntry;
 pub(crate) use rustfs_replication::should_count_head_proxy_failure;
 pub use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus};
 pub(crate) use rustfs_replication::{
-    is_version_id_mismatch, resync_state_accepts_update, sanitize_resync_error_detail, should_auto_resume_resync,
+    is_version_id_mismatch, resync_state_accepts_update, resync_status_duration, sanitize_resync_error_detail,
+    should_auto_resume_resync,
 };
 
 #[allow(
