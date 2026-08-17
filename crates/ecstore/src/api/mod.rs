@@ -32,7 +32,7 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            TargetClient, append_version_id_query,
+            SsecPassthroughCapability, TargetClient, append_version_id_query,
         };
     }
 

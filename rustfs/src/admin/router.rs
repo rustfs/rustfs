@@ -17,7 +17,8 @@ use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
-    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient, append_version_id_query,
+    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, SsecPassthroughCapability, TargetClient,
+    append_version_id_query,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -67,6 +68,9 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
+use rustfs_utils::http::object_encryption_keys::{
+    REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+};
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -210,6 +214,13 @@ const REPLICATION_CHECK_ERROR_MAX_BYTES: usize = 512;
 /// RustFS extension code (no madmin analogue): the target does not adopt the
 /// source version id, breaking the version-identity replication contract.
 const REPLICATION_CHECK_CODE_VERSION_MISMATCH: &str = "BucketRemoteTargetVersionMismatch";
+/// RustFS extension code (no madmin analogue): the target drops the
+/// `X-Rustfs-Replication-*` SSE-C passthrough headers, so an SSE-C replica
+/// would lose its decryption material (N2 fail-closed).
+const REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH: &str = "BucketRemoteSsecPassthroughUnsupported";
+/// Syntactically valid stand-in SSE-C key MD5 for the passthrough probe (the
+/// probe object is never decrypted; it only has to round-trip the metadata).
+const REPLICATION_CHECK_SSEC_PROBE_KEY_MD5: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct ReplicationCheckResponse {
@@ -251,6 +262,8 @@ struct ReplicationCheckPhases {
     put: ReplicationCheckPhaseStatus,
     #[serde(rename = "VersionFidelity")]
     version_fidelity: ReplicationCheckPhaseStatus,
+    #[serde(rename = "SsecPassthrough")]
+    ssec_passthrough: ReplicationCheckPhaseStatus,
     #[serde(rename = "DeleteMarker")]
     delete_marker: ReplicationCheckPhaseStatus,
     #[serde(rename = "VersionDelete")]
@@ -1853,7 +1866,7 @@ fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatu
     let data = serde_json::to_vec(&ReplicationCheckResponse {
         status: status.to_string(),
         active_mutation: true,
-        mutation_description: "Writes a probe object, creates a delete marker, deletes the probe version, and cleans up all probe artifacts on each target.",
+        mutation_description: "Writes probe objects (including an SSE-C passthrough probe), creates a delete marker, deletes the probe versions, and cleans up all probe artifacts on each target.",
         probe_namespace: REPLICATION_CHECK_PROBE_PREFIX,
         targets,
     })
@@ -2070,6 +2083,25 @@ async fn check_replication_target(
         time: OffsetDateTime::now_utc(),
     };
     execute_replication_probe(&mut result, &mut operations).await;
+
+    // Sync the probe verdict into the runtime capability cache: the
+    // replication worker then fails SSE-C replication closed on a flagged
+    // target (or skips its own HEAD-back audit on a proven one) without
+    // re-learning what the probe just established.
+    match (result.phases.ssec_passthrough.status, result.phases.ssec_passthrough.code) {
+        ("OK", _) => {
+            BucketTargetSys::get()
+                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Supported)
+                .await;
+        }
+        ("FAILED", Some(REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH)) => {
+            BucketTargetSys::get()
+                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Unsupported)
+                .await;
+        }
+        _ => {}
+    }
+
     result
 }
 
@@ -2086,6 +2118,15 @@ fn fail_replication_check_target(result: &mut ReplicationCheckTargetStatus, erro
 struct ReplicationProbePutOutcome {
     sent_version_id: String,
     response_version_id: Option<String>,
+}
+
+/// Outcome of the SSE-C passthrough probe: whether the HEAD-back of the probe
+/// replica echoed SSE-C evidence (the customer-algorithm header a RustFS
+/// target restores from the passthrough transport headers), plus the version
+/// the target assigned so cleanup can address it.
+struct ReplicationSsecProbeOutcome {
+    evidence_present: bool,
+    version_id: Option<String>,
 }
 
 struct ReplicationProbeMultipartError {
@@ -2110,9 +2151,14 @@ trait ReplicationProbeOperations {
     /// there: a target can adopt PutObject version ids and still mint its own
     /// for CreateMultipartUpload.
     async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError>;
+    /// PUT a probe version carrying the SSE-C passthrough transport headers,
+    /// HEAD it back through the replication-check channel, and report whether
+    /// the SSE-C evidence survived. Cleanup of the created version is the
+    /// caller's job (the outcome carries its version id).
+    async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError>;
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
     async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String>;
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String>;
 }
 
 struct RemoteReplicationProbeOperations<'a> {
@@ -2130,6 +2176,10 @@ impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
 
     async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
         multipart_put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+        ssec_passthrough_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
@@ -2155,7 +2205,7 @@ impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
         .map(|_| ())
     }
 
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String> {
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String> {
         cleanup_replication_probe(self.client, self.bucket, self.key, known_version_ids).await
     }
 }
@@ -2176,6 +2226,7 @@ fn version_fidelity_error(api: &str, outcome: &ReplicationProbePutOutcome) -> Op
 async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, operations: &mut impl ReplicationProbeOperations) {
     let mut probe_version_id = None;
     let mut multipart_probe_version_id = None;
+    let mut ssec_probe_version_id = None;
     let mut delete_marker_version_id = None;
     let mut cleanup_required = true;
     let mut multipart_cleanup_error = None;
@@ -2231,6 +2282,38 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
+    // N2: probe SSE-C passthrough with the same transport headers live
+    // replication sends. A target that drops them (MinIO, generic S3) stores
+    // the probe as a plain object and echoes no SSE-C evidence on the
+    // HEAD-back; SSE-C replicas there would silently lose their decryption
+    // material, so the target must be flagged with a machine-readable code.
+    // Deliberately unlike VersionFidelity, a failed SsecPassthrough phase
+    // does NOT fail the target overall: version-identity drift breaks the
+    // replication contract for every object, while dropped SSE-C passthrough
+    // headers only limit a capability — a plaintext-only deployment against a
+    // MinIO target is perfectly healthy and must not turn red. The phase's
+    // own FAILED + machine-readable Code remains for madmin consumers (and
+    // the verdict still reaches the runtime capability cache).
+    if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
+        match operations.ssec_passthrough_probe().await {
+            Ok(outcome) => {
+                ssec_probe_version_id = outcome.version_id;
+                if outcome.evidence_present {
+                    result.phases.ssec_passthrough = ReplicationCheckPhaseStatus::passed();
+                } else {
+                    let error = "target drops SSE-C passthrough replication headers; \
+                         SSE-C replicas would lose their decryption material on this target";
+                    result.phases.ssec_passthrough =
+                        ReplicationCheckPhaseStatus::failed_with_code(error, REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH);
+                }
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+                result.phases.ssec_passthrough = ReplicationCheckPhaseStatus::failed(&error);
+            }
+        }
+    }
+
     if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
         match operations.create_delete_marker(probe_version_id.as_deref()).await {
             Ok(version_id) => {
@@ -2259,6 +2342,7 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
             .cleanup([
                 probe_version_id.as_deref(),
                 multipart_probe_version_id.as_deref(),
+                ssec_probe_version_id.as_deref(),
                 delete_marker_version_id.as_deref(),
             ])
             .await
@@ -2550,6 +2634,72 @@ async fn put_replication_probe_object(
     Ok(ReplicationProbePutOutcome {
         sent_version_id,
         response_version_id: response.version_id().map(ToOwned::to_owned),
+    })
+}
+
+/// PUT a fresh probe version carrying the SSE-C passthrough transport headers
+/// (the wire shape live SSE-C replication uses), then HEAD it back through the
+/// worker channel (replication-check exemption + proxy suppression). A RustFS
+/// target restores the transport headers into stored SSE-C metadata and its
+/// HEAD echoes `x-amz-server-side-encryption-customer-algorithm`; a target
+/// that dropped the headers echoes nothing. The probe body is never SSE-C
+/// encrypted — only the metadata round-trip matters — and the version is
+/// deleted by the shared probe cleanup.
+async fn ssec_passthrough_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let mut headers = build_replication_probe_headers(&options);
+    // These are full wire names (not x-rustfs/x-minio suffixes), so they must
+    // be inserted verbatim — `insert_header` would mangle them.
+    for (name, value) in [
+        (REPLICATION_SSEC_ALGORITHM_HEADER, "AES256"),
+        (REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_CHECK_SSEC_PROBE_KEY_MD5),
+        (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "8"),
+    ] {
+        let name = name
+            .parse::<HeaderName>()
+            .map_err(|err| S3ClientError::new(format!("invalid ssec probe header name: {err}")))?;
+        let value =
+            HeaderValue::from_str(value).map_err(|err| S3ClientError::new(format!("invalid ssec probe header value: {err}")))?;
+        headers.insert(name, value);
+    }
+
+    let query_version_id = sent_version_id.clone();
+    let response = target_client
+        .client
+        .put_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            let uri = append_version_id_query(req.uri(), &query_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map_err(S3ClientError::from)?;
+    let version_id = response.version_id().map(ToOwned::to_owned);
+
+    let head_version = version_id.clone().or_else(|| Some(sent_version_id.clone()));
+    let head = target_client
+        .head_object(target_bucket, probe_key, head_version)
+        .await
+        .map_err(S3ClientError::from)?;
+
+    Ok(ReplicationSsecProbeOutcome {
+        evidence_present: head.sse_customer_algorithm().is_some_and(|algorithm| !algorithm.is_empty()),
+        version_id,
     })
 }
 
@@ -3723,6 +3873,12 @@ mod tests {
         /// Same, for the multipart leg: a target may mirror PutObject ids and
         /// still mint its own at CreateMultipartUpload.
         minted_multipart_version_id: Option<&'static str>,
+        /// Transport failure of the SSE-C passthrough probe itself.
+        ssec_probe_error: Option<&'static str>,
+        /// Models a MinIO-like target that drops the SSE-C passthrough
+        /// headers: the probe HEAD-back echoes no SSE-C evidence. The default
+        /// (false) models a RustFS target that preserves them.
+        ssec_evidence_missing: bool,
         delete_marker_error: Option<&'static str>,
         version_delete_error: Option<&'static str>,
         cleanup_error: Option<&'static str>,
@@ -3760,6 +3916,17 @@ mod tests {
             })
         }
 
+        async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+            self.calls.push("ssec-probe");
+            match self.ssec_probe_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(ReplicationSsecProbeOutcome {
+                    evidence_present: !self.ssec_evidence_missing,
+                    version_id: Some("ssec-version".to_string()),
+                }),
+            }
+        }
+
         async fn create_delete_marker(&mut self, _version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
             self.calls.push("delete-marker");
             match self.delete_marker_error {
@@ -3776,7 +3943,7 @@ mod tests {
             }
         }
 
-        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 3]) -> Result<(), String> {
+        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String> {
             self.calls.push("cleanup");
             self.cleanup_ids = known_version_ids
                 .into_iter()
@@ -3811,8 +3978,9 @@ mod tests {
         assert_eq!(result.phases.version_fidelity.code, Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH));
         assert_eq!(result.phases.delete_marker.status, "SKIPPED");
         assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.ssec_passthrough.status, "SKIPPED");
         assert_eq!(result.phases.cleanup.status, "OK");
-        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None, None]);
+        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None, None, None]);
     }
 
     #[tokio::test]
@@ -3825,6 +3993,70 @@ mod tests {
         assert_eq!(result.status, "OK");
         assert_eq!(result.phases.version_fidelity.status, "OK");
         assert_eq!(result.phases.version_fidelity.code, None);
+        assert_eq!(result.phases.ssec_passthrough.status, "OK");
+        assert_eq!(result.phases.ssec_passthrough.code, None);
+    }
+
+    /// N2: a target that drops the SSE-C passthrough transport headers must
+    /// fail the SsecPassthrough phase with the machine-readable code while the
+    /// target overall stays OK — deliberately unlike VersionFidelity: this is
+    /// a capability limit, not a broken replication contract, and a
+    /// plaintext-only deployment against such a target must not turn red. The
+    /// other mutation phases keep running and the probe version is cleaned up.
+    #[tokio::test]
+    async fn replication_probe_flags_ssec_passthrough_dropping_target_without_failing_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            ssec_evidence_missing: true,
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
+        assert_eq!(result.status, "OK", "a capability-only failure must not fail the target overall");
+        assert_eq!(result.error, None);
+        assert_eq!(result.phases.ssec_passthrough.status, "FAILED");
+        assert_eq!(result.phases.ssec_passthrough.code, Some(REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH));
+        assert_eq!(
+            operations.cleanup_ids,
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
+                Some("marker-version".to_string())
+            ]
+        );
+    }
+
+    /// A transport failure of the SSE-C probe is not evidence of a dropping
+    /// target: the phase fails without the capability code (the runtime cache
+    /// stays Unknown and the worker keeps auditing), and the target overall
+    /// stays OK.
+    #[tokio::test]
+    async fn replication_probe_ssec_transport_failure_carries_no_capability_code() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            ssec_probe_error: Some("InternalError"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.phases.ssec_passthrough.status, "FAILED");
+        assert_eq!(result.phases.ssec_passthrough.code, None);
+        assert_eq!(operations.cleanup_ids[2], None, "a failed ssec probe leaves no version to clean");
     }
 
     #[tokio::test]
@@ -3855,12 +4087,23 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "multipart-put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
         assert_eq!(
             operations.cleanup_ids,
             [
                 Some("object-version".to_string()),
                 Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
                 None
             ]
         );
@@ -3880,12 +4123,23 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "multipart-put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
         assert_eq!(
             operations.cleanup_ids,
             [
                 Some("object-version".to_string()),
                 Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
                 Some("marker-version".to_string())
             ]
         );

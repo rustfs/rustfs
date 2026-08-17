@@ -299,9 +299,51 @@ struct TargetClientBuildProbe {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// Whether a replication target preserves the SSE-C passthrough transport
+/// headers (`X-Rustfs-Replication-*`) end to end.
+///
+/// A target that silently drops those headers (MinIO, generic S3) stores the
+/// forwarded ciphertext without its decryption material — an unreadable
+/// replica that used to report COMPLETED. The replication worker audits the
+/// first passthrough PUT per target (HEAD-back for SSE-C evidence) and caches
+/// the verdict here; a fresh `Unsupported` fails SSE-C replication closed
+/// before any PUT is sent. Entries follow the `arn_remotes_map` lifecycle
+/// (rebuilding or removing a target resets its capability to `Unknown`) and
+/// additionally expire after [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], after which
+/// the next attempt re-audits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SsecPassthroughCapability {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+/// How long an audited SSE-C passthrough verdict stays authoritative.
+///
+/// Trade-off: without a TTL a verdict is sticky for the process lifetime —
+/// an `Unsupported` target that gets upgraded (or re-probed only via
+/// replication-check) would keep failing SSE-C replication forever, and the
+/// fail-open twin: a `Supported` verdict would outlive a backend swapped
+/// behind the same endpoint/ARN. With the TTL, a bad target costs at most
+/// one wasted PUT+HEAD audit per TTL window, and a changed backend is
+/// re-discovered within the same window.
+pub const SSEC_PASSTHROUGH_CAPABILITY_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// A recorded SSE-C passthrough verdict plus when it was recorded, so reads
+/// can report staleness against [`SSEC_PASSTHROUGH_CAPABILITY_TTL`].
+#[derive(Debug, Clone, Copy)]
+struct SsecPassthroughRecord {
+    capability: SsecPassthroughCapability,
+    recorded_at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct BucketTargetSys {
     pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
+    /// SSE-C passthrough capability verdicts keyed by target ARN. See
+    /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
+    ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
@@ -322,6 +364,7 @@ impl BucketTargetSys {
     fn new() -> Self {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
+            ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
@@ -585,16 +628,56 @@ impl BucketTargetSys {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
+        // then ssec_passthrough_map (always last; also taken standalone by the
+        // capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
 
         if let Some(targets) = targets_map.remove(bucket) {
+            let mut ssec_map = self.ssec_passthrough_map.write().await;
             for target in targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
+                ssec_map.remove(&target.arn);
             }
+        }
+    }
+
+    /// Cached SSE-C passthrough capability for a target ARN, plus whether the
+    /// verdict is older than [`SSEC_PASSTHROUGH_CAPABILITY_TTL`]. `(Unknown,
+    /// false)` when no verdict has been recorded since the target was built.
+    /// Staleness is computed here so the gate policy stays a pure function.
+    pub async fn ssec_passthrough_capability(&self, arn: &str) -> (SsecPassthroughCapability, bool) {
+        match self.ssec_passthrough_map.read().await.get(arn) {
+            Some(record) => (record.capability, record.recorded_at.elapsed() >= SSEC_PASSTHROUGH_CAPABILITY_TTL),
+            None => (SsecPassthroughCapability::Unknown, false),
+        }
+    }
+
+    /// Record an audited SSE-C passthrough verdict for a target ARN. Written by
+    /// the replication worker's HEAD-back audit and by the replication-check
+    /// SsecPassthrough probe phase.
+    pub async fn record_ssec_passthrough_capability(&self, arn: &str, capability: SsecPassthroughCapability) {
+        self.ssec_passthrough_map.write().await.insert(
+            arn.to_string(),
+            SsecPassthroughRecord {
+                capability,
+                recorded_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Test hook: age an existing verdict so TTL expiry is observable without
+    /// waiting out the real window.
+    #[cfg(test)]
+    pub(crate) async fn backdate_ssec_passthrough_capability(&self, arn: &str, age: Duration) {
+        let backdated = Instant::now()
+            .checked_sub(age)
+            .expect("system uptime must exceed the backdate age");
+        if let Some(record) = self.ssec_passthrough_map.write().await.get_mut(arn) {
+            record.recorded_at = backdated;
         }
     }
 
@@ -953,15 +1036,21 @@ impl BucketTargetSys {
             }
         }
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
+        // then ssec_passthrough_map (always last; also taken standalone by the
+        // capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
+            let mut ssec_map = self.ssec_passthrough_map.write().await;
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
+                // A rebuilt/edited target may point at a different service:
+                // the SSE-C passthrough verdict must be re-audited from Unknown.
+                ssec_map.remove(&target.arn);
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -1455,7 +1544,7 @@ fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
 /// RustFS represents the null version internally as the nil UUID while the S3
 /// API addresses it as the literal "null" (same mapping as
 /// [`resolve_put_api_version_id`]); empty means "no version requested".
-fn resolve_read_api_version_id(version_id: Option<String>) -> Option<String> {
+pub(crate) fn resolve_read_api_version_id(version_id: Option<String>) -> Option<String> {
     let version_id = version_id?;
     let trimmed = version_id.trim();
     if trimmed.is_empty() {
@@ -2674,6 +2763,57 @@ mod tests {
         assert_eq!(health.offline_count, 2);
         assert_eq!(health.offline_duration, Duration::from_millis(75));
         assert_eq!(health.last_online, Some(now));
+    }
+
+    /// N2 TTL contract, both flip directions: a recorded verdict is fresh
+    /// until [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], then reads as expired; a
+    /// re-audit that records the OPPOSITE verdict replaces it as fresh. The
+    /// worker gate maps expired verdicts to ProceedWithAudit (pinned in
+    /// `replication_target_boundary`), so together this proves an Unsupported
+    /// target recovers to Supported through the audit once its verdict ages
+    /// out — and a stale Supported one is re-proven rather than trusted.
+    #[tokio::test]
+    async fn ssec_passthrough_capability_ttl_expires_and_reaudit_flips_verdict() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:ssec-ttl";
+        let expired_age = SSEC_PASSTHROUGH_CAPABILITY_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unknown, false),
+            "an unrecorded target must read Unknown and never expired"
+        );
+
+        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Unsupported)
+            .await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unsupported, false)
+        );
+
+        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unsupported, true),
+            "an aged-out Unsupported verdict must read expired so the gate re-audits"
+        );
+
+        // The re-audit against an upgraded target records Supported afresh.
+        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Supported)
+            .await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Supported, false),
+            "a fresh Supported verdict replaces the expired Unsupported one"
+        );
+
+        // And the fail-open twin: Supported also ages out.
+        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Supported, true),
+            "an aged-out Supported verdict must read expired so the gate re-proves it"
+        );
     }
 
     #[tokio::test]
