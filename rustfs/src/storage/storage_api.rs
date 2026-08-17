@@ -569,6 +569,10 @@ pub(crate) mod ecstore_erasure {
     pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
 }
 
+/// Startup bitrot algorithm self-test (rustfs/backlog#1873), re-exported for
+/// the root facade's background-startup section.
+pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
+
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
