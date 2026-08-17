@@ -9280,6 +9280,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
+ "smallvec",
  "tokio",
  "tonic",
  "tracing",
