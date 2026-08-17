@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::data_usage::DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME;
+pub(crate) use rustfs_ecstore::api::data_usage::{
+    DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME,
+    load_admin_data_usage_from_backend_cached as ecstore_load_admin_data_usage_from_backend_cached,
+};
 pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
 pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
 pub(crate) use rustfs_ecstore::api::disk::{
@@ -37,7 +40,7 @@ pub(crate) mod owner {
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
         EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError,
         EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreHealLifecycleExpiryContext,
-        EcstoreStorageError, EcstoreStore, ecstore_local_disk_map_read,
+        EcstoreStorageError, EcstoreStore, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
     };
 
     #[cfg(test)]

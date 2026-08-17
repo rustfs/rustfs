@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::storage_api::owner::EcstoreHealLifecycleExpiryContext;
+use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
@@ -1084,7 +1084,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             return Ok(None);
         }
 
-        let info = match rustfs_ecstore::api::data_usage::load_admin_data_usage_from_backend_cached(self.ecstore.clone()).await {
+        let info = match ecstore_load_admin_data_usage_from_backend_cached(self.ecstore.clone()).await {
             Ok(info) if info.is_complete_bucket_usage_snapshot() => info,
             Ok(_) | Err(_) => return Ok(None),
         };
