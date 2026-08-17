@@ -2057,11 +2057,42 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         Err(Error::DiskNotFound)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the set layer
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
+    #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        let _write_lock_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
+        } else {
+            None
+        };
+
+        let removed = if opts.dry_run {
+            self.dry_run_reclaim_orphan_data_dirs(bucket, object).await?
+        } else {
+            self.reclaim_orphan_data_dirs(bucket, object).await?
+        };
+
+        if removed > 0 {
+            trace!(
+                event = "heal_abandoned_parts",
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                state = if opts.dry_run { "dry_run_matched" } else { "reclaimed" },
+                result = "ok",
+                bucket,
+                object,
+                dry_run = opts.dry_run,
+                data_dirs = removed,
+                "Heal abandoned parts checked object data directories"
+            );
+        }
+
+        Ok(())
     }
 }
 

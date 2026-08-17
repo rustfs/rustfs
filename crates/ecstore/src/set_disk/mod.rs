@@ -6999,6 +6999,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_abandoned_parts_dry_run_counts_without_deleting() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        let object_dir = dir.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        fs::create_dir_all(object_dir.join(orphan.to_string()))
+            .await
+            .expect("orphan data dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                dry_run: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dry-run abandoned-parts check should succeed");
+
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(object_dir.join(orphan.to_string()).exists(), "dry-run must not remove orphaned data dir");
+
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("abandoned-parts check should reclaim stale data dir");
+
+        assert!(
+            object_dir.join(live.to_string()).exists(),
+            "referenced data dir must remain after reclaim"
+        );
+        assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
+    }
+
+    #[tokio::test]
     async fn reclaim_orphan_data_dirs_recovers_deferred_cleanup_after_restart() {
         let (dir, disk) = make_single_local_disk().await;
         let live = Uuid::new_v4();
@@ -12233,11 +12282,18 @@ mod tests {
             .expect_err("unsupported copy_object_part should return a typed error");
         assert!(matches!(copy_part_err, StorageError::NotImplemented));
 
-        let abandoned_err = set_disks
-            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+        set_disks
+            .check_abandoned_parts(
+                "bucket",
+                "object",
+                &HealOpts {
+                    dry_run: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
-            .expect_err("abandoned-parts check should stay in the upper reconciliation layer");
-        assert!(matches!(abandoned_err, StorageError::NotImplemented));
+            .expect("abandoned-parts check should be callable on empty disk sets");
     }
 
     #[tokio::test]
