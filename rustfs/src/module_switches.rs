@@ -33,6 +33,8 @@ pub(crate) const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 pub(crate) const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 pub(crate) const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 pub(crate) const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+pub(crate) const ENV_BITROT_SELFTEST_ENABLE: &str = "RUSTFS_BITROT_SELFTEST_ENABLE";
+pub(crate) const ENV_BITROT_SELFTEST_STRICT: &str = "RUSTFS_BITROT_SELFTEST_STRICT";
 
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
@@ -45,6 +47,18 @@ pub(crate) fn scanner_enabled_from_env() -> bool {
 /// Whether background heal is enabled, defaulting to on.
 pub(crate) fn heal_enabled_from_env() -> bool {
     get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true)
+}
+
+/// Whether the startup bitrot algorithm self-test runs, defaulting to on
+/// (rustfs/backlog#1873).
+pub(crate) fn bitrot_selftest_enabled_from_env() -> bool {
+    rustfs_utils::get_env_bool(ENV_BITROT_SELFTEST_ENABLE, true)
+}
+
+/// Whether a failed bitrot self-test aborts startup instead of only logging
+/// and exposing a failed status, defaulting to off.
+pub(crate) fn bitrot_selftest_strict_from_env() -> bool {
+    rustfs_utils::get_env_bool(ENV_BITROT_SELFTEST_STRICT, false)
 }
 
 /// Last published audit-module state.

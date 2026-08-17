@@ -417,6 +417,13 @@ struct SystemAdminDiscovery {
 struct ServerInfoResponse {
     info: InfoMessage,
     admin_discovery: SystemAdminDiscovery,
+    /// Startup bitrot algorithm self-test outcome (rustfs/backlog#1873):
+    /// `passed` (algorithms verified at boot), `failed` (a drifted hash
+    /// implementation — the process is serving with degraded integrity
+    /// checking unless `RUSTFS_BITROT_SELFTEST_STRICT` aborted it), or
+    /// `unknown` (not yet run or disabled).
+    #[serde(rename = "bitrotSelftest")]
+    bitrot_selftest: &'static str,
 }
 
 #[derive(Serialize)]
@@ -430,6 +437,14 @@ fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
         cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
         extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
+}
+
+fn bitrot_selftest_status_str() -> &'static str {
+    match crate::bitrot_selftest::bitrot_selftest_passed() {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None => "unknown",
     }
 }
 
@@ -464,6 +479,7 @@ impl Operation for ServerInfoHandler {
         let response = ServerInfoResponse {
             info,
             admin_discovery: system_admin_discovery(&usecase),
+            bitrot_selftest: bitrot_selftest_status_str(),
         };
 
         let data = serde_json::to_vec(&response).map_err(|e| {
@@ -1535,6 +1551,18 @@ mod tests {
         );
     }
 
+    /// The startup bitrot self-test outcome must surface in server info as one
+    /// of three closed-set strings, never an internal enum or a null
+    /// (rustfs/backlog#1873). This test pins the string mapping; whether the
+    /// process-global cell holds Some(true)/Some(false)/None is owned by
+    /// `crate::bitrot_selftest`'s own tests.
+    #[test]
+    fn bitrot_selftest_status_str_is_a_closed_set_of_operators_strings() {
+        let rendered = super::bitrot_selftest_status_str();
+        assert!(matches!(rendered, "passed" | "failed" | "unknown"));
+        assert_eq!(super::bitrot_selftest_status_str(), rendered);
+    }
+
     #[test]
     fn server_info_response_exposes_admin_discovery_paths() {
         let usecase = DefaultAdminUsecase::without_context();
@@ -1556,6 +1584,7 @@ mod tests {
                 pools: None,
             },
             admin_discovery: system_admin_discovery(&usecase),
+            bitrot_selftest: super::bitrot_selftest_status_str(),
         };
 
         let value = serde_json::to_value(response).expect("server info response should serialize");
