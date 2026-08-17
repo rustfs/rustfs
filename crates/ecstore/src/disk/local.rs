@@ -6562,7 +6562,7 @@ impl LocalDisk {
         Ok(f)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
     }
