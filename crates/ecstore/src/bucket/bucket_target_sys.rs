@@ -27,10 +27,15 @@ use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::delete_object_tagging::{DeleteObjectTaggingError, DeleteObjectTaggingOutput};
+use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+use aws_sdk_s3::operation::get_object_tagging::{GetObjectTaggingError, GetObjectTaggingOutput};
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
 };
@@ -57,8 +62,8 @@ use rustfs_utils::http::{
     is_rustfs_header, is_standard_header, is_storageclass_header,
 };
 use rustfs_utils::http::{
-    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
     insert_header,
 };
@@ -1446,6 +1451,43 @@ fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
     }
 }
 
+/// Resolve the S3 `versionId` for a proxied read against a remote target.
+/// RustFS represents the null version internally as the nil UUID while the S3
+/// API addresses it as the literal "null" (same mapping as
+/// [`resolve_put_api_version_id`]); empty means "no version requested".
+fn resolve_read_api_version_id(version_id: Option<String>) -> Option<String> {
+    let version_id = version_id?;
+    let trimmed = version_id.trim();
+    if trimmed.is_empty() {
+        None
+    } else if Uuid::parse_str(trimmed).is_ok_and(|uuid| uuid.is_nil()) {
+        Some(rustfs_filemeta::NULL_VERSION_ID.to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Outbound header set for a proxied read: the caller-provided passthrough
+/// headers (client SSE-C key family, conditional headers) plus the anti-loop
+/// `source-proxy-request` marker in both the x-rustfs- and x-minio- prefixes
+/// (a MinIO target only understands the latter). Never adds
+/// `source-replication-check`: that exemption channel belongs exclusively to
+/// the replication worker's HEAD.
+fn proxy_outbound_headers(mut extra_headers: HeaderMap) -> HeaderMap {
+    insert_header(&mut extra_headers, SUFFIX_SOURCE_PROXY_REQUEST, "true");
+    extra_headers
+}
+
+/// Copy `headers` onto an SDK request inside `customize().map_request` (runs
+/// before signing, so the headers join the SigV4 canonical request).
+fn apply_extra_headers(mut req: HttpRequest, headers: &HeaderMap) -> Result<HttpRequest, std::convert::Infallible> {
+    for (k, v) in headers.iter() {
+        req.headers_mut()
+            .insert(k.as_str().to_string(), v.to_str().unwrap_or("").to_string());
+    }
+    Ok(req)
+}
+
 /// Append `versionId=<id>` to an already-built request URI. aws-sdk-s3's
 /// `PutObjectInput` / `CreateMultipartUploadInput` expose no version id
 /// member, so the query is spliced in via `map_request`, which runs at
@@ -1851,6 +1893,13 @@ impl TargetClient {
         // worker cannot hold; otherwise SSE-C replicas never converge on HEAD.
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+        // `source-proxy-request: false` (MinIO `ProxyHeaderSet` semantics):
+        // the header's mere presence tells the receiver to answer LOCALLY
+        // instead of proxying the miss back to us. Without it, a not-found on
+        // the target gets read-proxied back to this source, echoes the source
+        // object with an identical ETag, and the worker concludes the object
+        // already converged — so it never actually replicates it.
+        insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "false");
         match self
             .client
             .head_object()
@@ -1873,6 +1922,129 @@ impl TargetClient {
             Ok(res) => Ok(res),
             Err(e) => Err(e),
         }
+    }
+
+    /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
+    /// replicated locally, MinIO `proxyHeadToRepTarget`).
+    ///
+    /// Deliberately different from [`TargetClient::head_object`]: it must NOT
+    /// send `source-replication-check` — that header is the replication
+    /// worker's SSE-C metadata exemption channel. A proxied client request
+    /// instead forwards the client's own SSE-C headers (`extra_headers`) so
+    /// the target performs the real SSE-C validation/decryption. The
+    /// `source-proxy-request` marker is always added so the target does not
+    /// proxy the request onward (anti-loop).
+    pub async fn head_object_for_proxy(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        range: Option<String>,
+        part_number: Option<i32>,
+        extra_headers: HeaderMap,
+    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+        let headers = proxy_outbound_headers(extra_headers);
+        self.client
+            .head_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .set_range(range)
+            .set_part_number(part_number)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// GET used by the read-proxy path (MinIO `proxyGetToReplicationTarget`).
+    /// Returns the streaming SDK output; callers must forward the body without
+    /// buffering it. Same header contract as [`Self::head_object_for_proxy`]:
+    /// anti-loop marker on, replication-check never sent, client SSE-C /
+    /// conditional headers forwarded verbatim via `extra_headers`.
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        range: Option<String>,
+        part_number: Option<i32>,
+        extra_headers: HeaderMap,
+    ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
+        let headers = proxy_outbound_headers(extra_headers);
+        self.client
+            .get_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .set_range(range)
+            .set_part_number(part_number)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// GetObjectTagging for the tagging read-proxy path
+    /// (MinIO `proxyGetTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn get_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+    ) -> Result<GetObjectTaggingOutput, SdkError<GetObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// PutObjectTagging for the tagging proxy path
+    /// (MinIO `proxyTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn put_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        tagging: SdkTagging,
+    ) -> Result<PutObjectTaggingOutput, SdkError<PutObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .tagging(tagging)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// DeleteObjectTagging for the tagging proxy path
+    /// (MinIO `proxyTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn delete_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+    ) -> Result<DeleteObjectTaggingOutput, SdkError<DeleteObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .delete_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
     }
 
     /// On success returns the version id the target assigned (from

@@ -8417,3 +8417,304 @@ async fn test_scanner_never_compensates_when_existing_object_replication_disable
 
     Ok(())
 }
+
+/// Shared setup for the P1-5 read-proxy scenarios (backlog#1675): a RustFS
+/// source with an enabled replication rule pointing at the fake target, and
+/// an object seeded DIRECTLY on the target — it exists remotely but not
+/// locally, exactly the active-active replication-lag window the read proxy
+/// serves.
+async fn start_read_proxy_lab(
+    source_bucket: &str,
+    target_bucket: &str,
+) -> Result<(FakeS3Target, RustFSTestEnvironment, Client, Client), Box<dyn Error + Send + Sync>> {
+    let target = FakeS3Target::start().await?;
+    target.create_bucket(target_bucket);
+    target.assign_own_version_ids(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut process_env = replication_fast_env();
+    process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUST_LOG", "error"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &process_env).await?;
+
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let target_client = Client::from_conf(crate::common::build_test_s3_config(
+        target.endpoint(),
+        FAKE_ACCESS_KEY,
+        FAKE_SECRET_KEY,
+        None,
+        "read-proxy-e2e",
+    ));
+
+    Ok((target, source_env, source_client, target_client))
+}
+
+/// P1-5 (backlog#1675): during the active-active replication lag window a
+/// GET/HEAD for an object the local site does not have yet is proxied to the
+/// replication target. Pins the wire contract: the anti-loop
+/// `source-proxy-request` marker is sent, the replication worker's
+/// `source-replication-check` SSE-C exemption is NEVER sent, client SSE-C
+/// headers are forwarded verbatim, and an inbound request that was itself
+/// proxied is answered locally (404) without touching the target.
+#[tokio::test]
+#[serial]
+async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> TestResult {
+    init_logging();
+
+    let source_bucket = "proxy-read-src";
+    let target_bucket = "proxy-read-dst";
+    let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
+
+    let payload = b"proxy payload".to_vec();
+    target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-only")
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+    target.take_requests();
+
+    // a. GET of the locally-missing object is served through the proxy.
+    let got = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .send()
+        .await
+        .map_err(|err| format!("proxied GET failed: {}", err.into_service_error()))?;
+    assert_eq!(got.content_length, Some(payload.len() as i64));
+    let body = got.body.collect().await?.into_bytes();
+    assert_eq!(body.as_ref(), payload.as_slice(), "proxied GET must stream the target's body");
+
+    let get_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied GET")?;
+    assert_eq!(
+        get_record.proxy_headers.source_proxy_request.as_deref(),
+        Some("true"),
+        "proxied GET must carry the anti-loop source-proxy-request marker"
+    );
+    assert!(
+        get_record.proxy_headers.replication_check.is_none(),
+        "proxied GET must never carry the replication worker's source-replication-check exemption"
+    );
+    assert!(
+        get_record.proxy_headers.ssec_algorithm.is_none() && !get_record.proxy_headers.ssec_key_present,
+        "no client SSE-C headers were sent, so none may be forwarded"
+    );
+
+    // a2. Client SSE-C headers travel verbatim to the target (the target owns
+    // the real SSE-C decryption; the plaintext fake simply ignores them).
+    target.take_requests();
+    let ssec_key = "01234567890123456789012345678901";
+    let ssec_key_b64 = BASE64_STANDARD.encode(ssec_key);
+    let ssec_key_md5 = sse_customer_key_md5_base64(ssec_key);
+    let _ = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&ssec_key_b64)
+        .sse_customer_key_md5(&ssec_key_md5)
+        .send()
+        .await
+        .map_err(|err| format!("proxied SSE-C GET failed: {}", err.into_service_error()))?;
+    let ssec_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied SSE-C GET")?;
+    assert_eq!(ssec_record.proxy_headers.ssec_algorithm.as_deref(), Some("AES256"));
+    assert!(ssec_record.proxy_headers.ssec_key_present, "SSE-C key header must be forwarded verbatim");
+    assert_eq!(ssec_record.proxy_headers.ssec_key_md5.as_deref(), Some(ssec_key_md5.as_str()));
+    assert!(ssec_record.proxy_headers.replication_check.is_none());
+
+    // b. HEAD of the locally-missing object is served through the proxy.
+    target.take_requests();
+    let head = source_client
+        .head_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .send()
+        .await
+        .map_err(|err| format!("proxied HEAD failed: {}", err.into_service_error()))?;
+    assert_eq!(head.content_length, Some(payload.len() as i64));
+    let head_record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::HeadObject && record.key.as_deref() == Some("proxy-only"))
+        .ok_or("fake target never received the proxied HEAD")?;
+    assert_eq!(head_record.proxy_headers.source_proxy_request.as_deref(), Some("true"));
+    assert!(head_record.proxy_headers.replication_check.is_none());
+
+    // c. Anti-loop: an inbound request that already carries the proxy marker
+    // is answered locally with 404 and never forwarded to the target.
+    target.take_requests();
+    let err = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-minio-source-proxy-request", "true");
+        })
+        .send()
+        .await
+        .expect_err("anti-loop GET must fail locally instead of proxying");
+    let service_err = err.into_service_error();
+    assert!(service_err.is_no_such_key(), "anti-loop GET must 404, got: {service_err}");
+    assert!(
+        !target
+            .requests()
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::GetObject),
+        "anti-loop GET must not reach the replication target; journal: {:?}",
+        target.requests()
+    );
+
+    // c2. MinIO ProxyHeaderSet parity: the header's mere PRESENCE disables
+    // proxying — "false" is exactly what a peer's replication worker sends on
+    // its convergence HEADs, and proxying that miss back would fake
+    // convergence.
+    target.take_requests();
+    let err = source_client
+        .get_object()
+        .bucket(source_bucket)
+        .key("proxy-only")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-minio-source-proxy-request", "false");
+        })
+        .send()
+        .await
+        .expect_err("proxy-header-set GET must fail locally instead of proxying");
+    let service_err = err.into_service_error();
+    assert!(service_err.is_no_such_key(), "proxy-header-set GET must 404, got: {service_err}");
+    assert!(
+        !target
+            .requests()
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::GetObject),
+        "proxy-header-set GET must not reach the replication target; journal: {:?}",
+        target.requests()
+    );
+
+    // d. The replication worker's own convergence HEAD against the target
+    // must carry `source-proxy-request: false` (never proxied back) and the
+    // replication-check exemption. Trigger real replication and inspect the
+    // fake journal.
+    target.take_requests();
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("worker-replicated")
+        .body(ByteStream::from_static(b"worker payload"))
+        .send()
+        .await?;
+    wait_for_target_request_version_id(&target, FakeTargetOperation::PutObject, "worker-replicated").await?;
+    let worker_head = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::HeadObject && record.key.as_deref() == Some("worker-replicated"))
+        .ok_or_else(|| format!("replication worker never HEAD-ed the target; journal: {:?}", target.requests()))?;
+    assert_eq!(
+        worker_head.proxy_headers.source_proxy_request.as_deref(),
+        Some("false"),
+        "worker convergence HEAD must send source-proxy-request: false so the target answers locally"
+    );
+    assert_eq!(
+        worker_head.proxy_headers.replication_check.as_deref(),
+        Some("true"),
+        "worker convergence HEAD keeps the replication-check exemption"
+    );
+
+    drop(source_env);
+    target.shutdown().await;
+    Ok(())
+}
+
+/// P1-5 (backlog#1675): GetObjectTagging for an object missing locally is
+/// proxied to the replication target with the anti-loop marker, mirroring
+/// MinIO `proxyGetTaggingToRepTarget`.
+#[tokio::test]
+#[serial]
+async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_target() -> TestResult {
+    init_logging();
+
+    let source_bucket = "proxy-tag-src";
+    let target_bucket = "proxy-tag-dst";
+    let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
+
+    target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"tagged payload"))
+        .send()
+        .await?;
+    target_client
+        .put_object_tagging()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key("team").value("storage").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    target.take_requests();
+
+    let tags = source_client
+        .get_object_tagging()
+        .bucket(source_bucket)
+        .key("proxy-tagged")
+        .send()
+        .await
+        .map_err(|err| format!("proxied GetObjectTagging failed: {}", err.into_service_error()))?;
+    assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
+    assert_eq!(tags.tag_set[0].key.as_str(), "team");
+    assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+
+    let record = target
+        .requests()
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::GetObjectTagging && record.key.as_deref() == Some("proxy-tagged"))
+        .ok_or("fake target never received the proxied GetObjectTagging")?;
+    assert_eq!(
+        record.proxy_headers.source_proxy_request.as_deref(),
+        Some("true"),
+        "proxied tagging read must carry the anti-loop marker"
+    );
+    assert!(record.proxy_headers.replication_check.is_none());
+
+    drop(source_env);
+    target.shutdown().await;
+    Ok(())
+}

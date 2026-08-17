@@ -30,10 +30,12 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput, ETag,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput,
+    DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectInput, GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput,
     HeadObjectInput, HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ObjectVersionId, PutObjectInput,
-    PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
+    PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::validation::{AwsNameValidation, NameValidation};
@@ -103,6 +105,9 @@ pub enum Operation {
     GetObject,
     HeadObject,
     DeleteObject,
+    GetObjectTagging,
+    PutObjectTagging,
+    DeleteObjectTagging,
     ListObjectVersions,
     CreateMultipartUpload,
     UploadPart,
@@ -149,6 +154,35 @@ impl ReplicationTimestampHeaders {
     }
 }
 
+/// Read-proxy related headers observed on a request, journaled so proxy
+/// tests can assert the exact wire contract: the anti-loop marker present,
+/// the replication-check exemption absent, and the client SSE-C key family
+/// forwarded verbatim. The SSE-C key value itself is never retained — only
+/// its presence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyHeaderSnapshot {
+    pub source_proxy_request: Option<String>,
+    pub replication_check: Option<String>,
+    pub ssec_algorithm: Option<String>,
+    pub ssec_key_present: bool,
+    pub ssec_key_md5: Option<String>,
+}
+
+impl ProxyHeaderSnapshot {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            source_proxy_request: header_value(headers, &["x-rustfs-source-proxy-request", "x-minio-source-proxy-request"])
+                .map(bounded_journal_value),
+            replication_check: header_value(headers, &["x-rustfs-source-replication-check", "x-minio-source-replication-check"])
+                .map(bounded_journal_value),
+            ssec_algorithm: header_value(headers, &["x-amz-server-side-encryption-customer-algorithm"])
+                .map(bounded_journal_value),
+            ssec_key_present: headers.contains_key("x-amz-server-side-encryption-customer-key"),
+            ssec_key_md5: header_value(headers, &["x-amz-server-side-encryption-customer-key-md5"]).map(bounded_journal_value),
+        }
+    }
+}
+
 /// Credential-free request metadata retained for deterministic assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestRecord {
@@ -163,6 +197,7 @@ pub struct RequestRecord {
     pub content_length: Option<u64>,
     pub consumed_bytes: Option<usize>,
     pub replication_timestamps: ReplicationTimestampHeaders,
+    pub proxy_headers: ProxyHeaderSnapshot,
     pub fault: Option<FaultAction>,
 }
 
@@ -199,6 +234,9 @@ struct ObjectVersion {
     delete_marker: bool,
     content_type: Option<String>,
     metadata: Option<HashMap<String, String>>,
+    /// Object tags as ordered key/value pairs (PutObjectTagging replaces the
+    /// whole set, DeleteObjectTagging clears it).
+    tags: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -569,6 +607,7 @@ impl S3Access for FaultAccess {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
         let replication_timestamps = ReplicationTimestampHeaders::from_headers(context.headers());
+        let proxy_headers = ProxyHeaderSnapshot::from_headers(context.headers());
         let fault = record_request(
             &self.control,
             operation,
@@ -576,6 +615,7 @@ impl S3Access for FaultAccess {
             parsed,
             content_length,
             replication_timestamps,
+            proxy_headers,
         );
         if let Some(RequestFault {
             action: FaultAction::Status(status),
@@ -615,6 +655,9 @@ fn operation_from_s3_name(name: &str) -> Operation {
         "GetObject" => Operation::GetObject,
         "HeadObject" => Operation::HeadObject,
         "DeleteObject" => Operation::DeleteObject,
+        "GetObjectTagging" => Operation::GetObjectTagging,
+        "PutObjectTagging" => Operation::PutObjectTagging,
+        "DeleteObjectTagging" => Operation::DeleteObjectTagging,
         "CreateMultipartUpload" => Operation::CreateMultipartUpload,
         "UploadPart" => Operation::UploadPart,
         "CompleteMultipartUpload" => Operation::CompleteMultipartUpload,
@@ -630,6 +673,7 @@ fn record_request(
     parsed: ParsedRequest,
     content_length: Option<u64>,
     replication_timestamps: ReplicationTimestampHeaders,
+    proxy_headers: ProxyHeaderSnapshot,
 ) -> Option<RequestFault> {
     let mut state = lock(control);
     let action = parsed
@@ -655,6 +699,7 @@ fn record_request(
         content_length,
         consumed_bytes: None,
         replication_timestamps,
+        proxy_headers,
         fault: action.clone(),
     });
     action.map(|action| RequestFault { sequence, action })
@@ -721,6 +766,15 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
         (&Method::POST, true) if query.contains_key("uploads") => Operation::CreateMultipartUpload,
         (&Method::POST, true) if upload_id.is_some() => Operation::CompleteMultipartUpload,
         (&Method::DELETE, true) if upload_id.is_some() => Operation::AbortMultipartUpload,
+        (&Method::GET, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::GetObjectTagging
+        }
+        (&Method::PUT, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::PutObjectTagging
+        }
+        (&Method::DELETE, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::DeleteObjectTagging
+        }
         // A replication PUT addresses the source version via `?versionId=`.
         (&Method::PUT, true) if only_query_keys(&["versionId"]) => Operation::PutObject,
         (&Method::GET, true) if only_query_keys(&["versionId"]) => Operation::GetObject,
@@ -1135,6 +1189,33 @@ fn find_version(state: &StoreState, bucket: &str, key: &str, version_id: Option<
     Ok(version.clone())
 }
 
+/// Replace (or clear, with an empty vec) the tag set of the addressed
+/// version, returning its version id. Mirrors `find_version` addressing:
+/// explicit version id or the latest version, delete markers rejected.
+fn set_version_tags(
+    state: &mut StoreState,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    tags: Vec<(String, String)>,
+) -> S3Result<String> {
+    // Resolve first (immutable) so the error paths match find_version.
+    let resolved = find_version(state, bucket, key, version_id)?.version_id;
+    let versions = state
+        .buckets
+        .get_mut(bucket)
+        .expect("bucket existence checked by find_version")
+        .objects
+        .get_mut(key)
+        .expect("key existence checked by find_version");
+    let version = versions
+        .iter_mut()
+        .find(|version| version.version_id == resolved)
+        .expect("version existence checked by find_version");
+    version.tags = tags;
+    Ok(resolved)
+}
+
 #[async_trait]
 impl S3 for FakeBackend {
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
@@ -1248,6 +1329,7 @@ impl S3 for FakeBackend {
             delete_marker: false,
             content_type: input.content_type,
             metadata: input.metadata,
+            tags: Vec::new(),
         };
         upsert_version(&mut lock(&self.store), &input.bucket, input.key, version)?;
         Ok(apply_response_fault(
@@ -1300,6 +1382,72 @@ impl S3 for FakeBackend {
                 last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
                 ..Default::default()
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version = {
+            let state = lock(&self.store);
+            find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?
+        };
+        let tag_set: TagSet = version
+            .tags
+            .into_iter()
+            .map(|(key, value)| Tag {
+                key: Some(key),
+                value: Some(value),
+            })
+            .collect();
+        Ok(apply_response_fault(
+            S3Response::new(GetObjectTaggingOutput {
+                tag_set,
+                version_id: Some(ObjectVersionId::from(version.version_id)),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let tags = input
+            .tagging
+            .tag_set
+            .into_iter()
+            .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+            .collect();
+        let version_id = {
+            let mut state = lock(&self.store);
+            set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), tags)?
+        };
+        Ok(apply_response_fault(
+            S3Response::new(PutObjectTaggingOutput {
+                version_id: Some(ObjectVersionId::from(version_id)),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version_id = {
+            let mut state = lock(&self.store);
+            set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), Vec::new())?
+        };
+        Ok(apply_response_fault(
+            S3Response::new(DeleteObjectTaggingOutput {
+                version_id: Some(ObjectVersionId::from(version_id)),
             }),
             fault.as_ref(),
         ))
@@ -1381,6 +1529,7 @@ impl S3 for FakeBackend {
                 delete_marker: true,
                 content_type: None,
                 metadata: None,
+                tags: Vec::new(),
             },
         )?;
         Ok(apply_response_fault(
@@ -1583,6 +1732,7 @@ impl S3 for FakeBackend {
             delete_marker: false,
             content_type: upload.content_type,
             metadata: upload.metadata,
+            tags: Vec::new(),
         };
         let mut state = lock(&self.store);
         let current = state
@@ -3074,6 +3224,7 @@ mod tests {
                     },
                     Some(0),
                     ReplicationTimestampHeaders::default(),
+                    ProxyHeaderSnapshot::default(),
                 );
             }
             let records = lock(&control).requests.clone();
@@ -3096,6 +3247,7 @@ mod tests {
                 },
                 None,
                 ReplicationTimestampHeaders::default(),
+                ProxyHeaderSnapshot::default(),
             );
             {
                 let bounded_records = lock(&bounded_control);

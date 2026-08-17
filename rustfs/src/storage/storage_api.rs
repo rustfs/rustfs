@@ -805,6 +805,10 @@ impl StorageReplicationStatsHandle {
             proxy_head_failed: metrics.proxied.head_failed,
             proxy_put_tag_total: metrics.proxied.put_tag_total,
             proxy_put_tag_failed: metrics.proxied.put_tag_failed,
+            proxy_get_tag_total: metrics.proxied.get_tag_total,
+            proxy_get_tag_failed: metrics.proxied.get_tag_failed,
+            proxy_delete_tag_total: metrics.proxied.delete_tag_total,
+            proxy_delete_tag_failed: metrics.proxied.delete_tag_failed,
             replica_size: metrics.replica_size,
             replica_count: metrics.replica_count,
         }
@@ -841,6 +845,10 @@ pub(crate) struct ReplicationSiteMetricsSnapshot {
     pub(crate) proxy_head_failed: i64,
     pub(crate) proxy_put_tag_total: i64,
     pub(crate) proxy_put_tag_failed: i64,
+    pub(crate) proxy_get_tag_total: i64,
+    pub(crate) proxy_get_tag_failed: i64,
+    pub(crate) proxy_delete_tag_total: i64,
+    pub(crate) proxy_delete_tag_failed: i64,
     pub(crate) replica_size: i64,
     pub(crate) replica_count: i64,
 }
@@ -1487,12 +1495,6 @@ pub(crate) async fn get_bucket_object_lock_config(
     ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_replication_config(
-    bucket: &str,
-) -> Result<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_replication_config(bucket).await
-}
-
 pub(crate) async fn persist_force_delete_intent(
     api: Arc<ECStore>,
     entry: ecstore_bucket::replication::MrfReplicateEntry,
@@ -1836,18 +1838,6 @@ pub(crate) async fn all_local_disk_path() -> Vec<String> {
 
 pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     ecstore_storage::find_local_disk_by_ref(disk_ref).await
-}
-
-pub(crate) trait StorageReplicationConfigExt {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
-}
-
-impl StorageReplicationConfigExt for s3s::dto::ReplicationConfiguration {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_active_rules(
-            self, prefix, recursive,
-        )
-    }
 }
 
 pub(crate) trait StorageVersioningConfigExt {
