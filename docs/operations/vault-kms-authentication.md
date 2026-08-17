@@ -59,7 +59,7 @@ Deliver the SecretID out of band — a secrets-manager-mounted file, an init-con
 
 The secret_id file is re-read on every login attempt, so rotating the SecretID is a two-step operation with no restart: generate a new SecretID (`vault write -f auth/approle/role/rustfs-kms/secret-id`), atomically replace the file, then revoke the old SecretID accessor. The already-issued token keeps renewing; the new SecretID is only needed at the next full re-login.
 
-An empty or missing secret_id file fails the login attempt immediately (no Vault round trip) and is retried on the normal refresh cadence, so repairing the file heals the backend without a restart.
+An empty or missing secret_id file fails the login attempt immediately (no Vault round trip). At startup the error is fatal — provider construction fails and the process exits — so a file missing at boot is recovered by restarting the process, not by an in-process retry. Once RustFS is running, the same failure is retried on the normal refresh cadence, so repairing the file mid-run heals the backend without a restart.
 
 ## Kubernetes authentication
 
@@ -96,7 +96,7 @@ RUSTFS_KMS_VAULT_KUBERNETES_ROLE=rustfs
 
 RustFS logs in at startup and renews the token at half its TTL, falling back to a fresh login exactly as AppRole does. The ServiceAccount token is re-read from disk on every login rather than cached, so a projected token the kubelet rotates is picked up without a restart.
 
-A missing or empty token file fails the login attempt immediately (no Vault round trip) and is retried on the normal refresh cadence, so a token projected late — during a slow pod start, for example — heals the backend on its own.
+A missing or empty token file fails the login attempt immediately (no Vault round trip). At startup the error is fatal — provider construction fails and the process exits — so a token projected late during a slow pod start is recovered by the pod restart loop, not by an in-process retry. Once RustFS is running, a token file that goes missing or turns empty is retried on the normal refresh cadence and heals the backend on its own.
 
 ## Vault Agent token file
 
