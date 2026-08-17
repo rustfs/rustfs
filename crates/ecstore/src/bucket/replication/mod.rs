@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod datatypes;
 mod replication_bandwidth_boundary;
 mod replication_config_boundary;
 mod replication_config_store;
@@ -44,7 +43,6 @@ pub(crate) mod replication_timing;
 mod replication_versioning_boundary;
 mod runtime_boundary;
 
-pub use datatypes::ResyncStatusType;
 pub use replication_config_boundary::{
     ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
     REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
@@ -80,6 +78,7 @@ pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
     ReplicationPriority, ReplicationQueueAdmission,
 };
+pub use replication_resync_boundary::ResyncStatusType;
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
