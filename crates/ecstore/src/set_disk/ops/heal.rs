@@ -16,6 +16,7 @@ use super::super::*;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -2059,6 +2060,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        let started_at = std::time::Instant::now();
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             Some(
@@ -2076,6 +2078,24 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         } else {
             self.reclaim_orphan_data_dirs(bucket, object).await?
         };
+        let state = if opts.dry_run && removed > 0 {
+            "dry_run_matched"
+        } else if removed > 0 {
+            "reclaimed"
+        } else {
+            "checked"
+        };
+        let data_dirs = u64::try_from(removed).unwrap_or(u64::MAX);
+
+        trace_emit(|| {
+            TraceEvent::new(TraceKind::Heal, TraceFunc::HealCheckAbandonedParts)
+                .with_bucket(bucket)
+                .with_object(object)
+                .with_duration(started_at.elapsed())
+                .with_attr("state", state)
+                .with_attr("dry_run", opts.dry_run)
+                .with_attr("data_dirs", data_dirs)
+        });
 
         if removed > 0 {
             trace!(
