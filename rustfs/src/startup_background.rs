@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
+use crate::bitrot_selftest::run_startup_bitrot_self_test;
+use crate::module_switches::{
+    bitrot_selftest_enabled_from_env, bitrot_selftest_strict_from_env, heal_enabled_from_env, scanner_enabled_from_env,
+};
 use crate::storage_api::startup::background::{ECStore, set_workload_admission_snapshot_provider};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
@@ -27,6 +30,12 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
+    // Pin the bitrot algorithms before anything can write or verify a shard:
+    // the check costs well under a millisecond, and in strict mode a drifted
+    // build must abort here rather than after it has touched data
+    // (rustfs/backlog#1873).
+    run_startup_bitrot_self_test(bitrot_selftest_enabled_from_env(), bitrot_selftest_strict_from_env()).await?;
+
     let _ = create_ahm_services_cancel_token();
 
     let enable_scanner = scanner_enabled_from_env();

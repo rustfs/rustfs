@@ -76,6 +76,7 @@ pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
+pub(crate) mod bitrot_selftest;
 pub mod capacity;
 pub mod cluster_snapshot;
 pub mod config;

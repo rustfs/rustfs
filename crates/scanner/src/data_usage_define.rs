@@ -28,7 +28,8 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
-    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, TierStats, hash_path,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
+    PrefixUsageQuery, PrefixUsageSummary, TierStats, hash_path, prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -430,6 +431,13 @@ pub(crate) enum DataUsageCachePrepareOutcome {
 }
 
 impl DataUsageCache {
+    /// Prefix-level usage query over this (writer-side) cache; see
+    /// [`prefix_usage_in_cache`] for the semantics
+    /// (rustfs/backlog#1872).
+    pub fn prefix_usage(&self, bucket: &str, prefix: &str, max_entries: usize) -> Option<PrefixUsageQuery> {
+        prefix_usage_in_cache(&self.cache, bucket, prefix, max_entries)
+    }
+
     pub(crate) fn prepare_for_scan(
         &mut self,
         name: &str,

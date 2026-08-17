@@ -1074,7 +1074,7 @@ where
 }
 
 impl futures::Stream for MemoryTrackedBytesStream {
-    type Item = std::io::Result<Bytes>;
+    type Item = Result<Bytes, S3StdError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -1105,7 +1105,8 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
-            ))));
+            )
+            .into())));
         }
 
         let Some(bytes) = this.bytes.take() else {
@@ -1129,6 +1130,16 @@ impl futures::Stream for MemoryTrackedBytesStream {
             );
         }
         Poll::Ready(Some(Ok(bytes)))
+    }
+}
+
+impl ByteStream for MemoryTrackedBytesStream {
+    fn remaining_length(&self) -> RemainingLength {
+        if self.emitted || self.bytes.is_none() {
+            RemainingLength::new_exact(0)
+        } else {
+            RemainingLength::new_exact(self.expected)
+        }
     }
 }
 
@@ -4149,7 +4160,7 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -12882,7 +12893,10 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("a short memory body must fail the stream instead of serving a truncated body");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
         assert!(stream.next().await.is_none(), "stream must terminate after the error");
     }
 
@@ -12901,7 +12915,22 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn memory_blob_preserves_exact_remaining_length() {
+        let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            GetObjectBodyLifecycle::disabled(),
+        );
+
+        assert_eq!(blob.remaining_length().exact(), Some(5));
     }
 
     #[tokio::test]
