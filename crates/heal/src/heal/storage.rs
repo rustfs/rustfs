@@ -29,6 +29,12 @@ use super::storage_api::storage::{
 use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealBucketUsageBaseline {
+    pub objects_count: u64,
+    pub bytes: u64,
+}
+
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_HEAL_STORAGE_OBJECT_IO: &str = "heal_storage_object_io";
@@ -328,6 +334,11 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
+
+    /// Aggregate usage-cache baselines for the requested buckets.
+    async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+        Ok(None)
+    }
 
     /// Fix bucket metadata
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()>;
@@ -1019,6 +1030,27 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::other(e))
             }
         }
+    }
+
+    async fn erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+        if buckets.is_empty() {
+            return Ok(None);
+        }
+
+        let info = match rustfs_ecstore::api::data_usage::load_admin_data_usage_from_backend_cached(self.ecstore.clone()).await {
+            Ok(info) if info.is_complete_bucket_usage_snapshot() => info,
+            Ok(_) | Err(_) => return Ok(None),
+        };
+
+        let mut baseline = HealBucketUsageBaseline::default();
+        for bucket in buckets {
+            if let Some(usage) = info.buckets_usage.get(bucket) {
+                baseline.objects_count = baseline.objects_count.saturating_add(usage.objects_count);
+                baseline.bytes = baseline.bytes.saturating_add(usage.size);
+            }
+        }
+
+        Ok(Some(baseline))
     }
 
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()> {

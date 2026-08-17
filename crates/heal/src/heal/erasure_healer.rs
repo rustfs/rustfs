@@ -30,6 +30,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, warn};
 
@@ -45,6 +46,10 @@ enum HealObjectOutcome {
     Transient,
     /// A real heal failure that should be recorded as failed.
     Failed,
+}
+
+fn result_object_size_u64(result: &HealResultItem) -> u64 {
+    u64::try_from(result.object_size).unwrap_or(u64::MAX)
 }
 
 struct PageConcurrencyGuard {
@@ -710,6 +715,7 @@ impl ErasureSetHealer {
         // The end-of-pass summary reports the full failed/skipped counts.
         let mut transient_skip_samples_logged = 0_u64;
         let mut failure_samples_logged = 0_u64;
+        let mut bytes_processed = self.progress.read().await.bytes_processed;
 
         // backlog#920: select the per-erasure-set DISK-WALK union enumerator when
         // the scan is Deep OR the request came from AutoHeal — these are the paths
@@ -777,7 +783,7 @@ impl ErasureSetHealer {
 
                     let _permit = match permit {
                         Ok(permit) => permit,
-                        Err(err) => return (dedup_key, object_name, version_id, Err(err)),
+                        Err(err) => return (dedup_key, object_name, version_id, (0, Err(err))),
                     };
 
                     let _in_flight_guard = PageConcurrencyGuard::new(in_flight, set_label);
@@ -788,7 +794,7 @@ impl ErasureSetHealer {
                     // recorded as skipped-ok rather than failed. The delete-marker
                     // vs data path is chosen internally in ops/heal.rs.
                     let result = if cancel_token.is_cancelled() {
-                        Err(Error::TaskCancelled)
+                        (0, Err(Error::TaskCancelled))
                     } else {
                         match storage
                             .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
@@ -797,8 +803,9 @@ impl ErasureSetHealer {
                             Ok((result, None))
                                 if target_outcomes_complete(&result, &target_endpoints) =>
                             {
+                                let object_size = result_object_size_u64(&result);
                                 if !replacement_commit_evidence_required {
-                                    Ok(true)
+                                    (object_size, Ok(true))
                                 } else {
                                     match storage
                                         .replacement_targets_have_version(
@@ -810,27 +817,42 @@ impl ErasureSetHealer {
                                         )
                                         .await
                                     {
-                                        Ok(true) => Ok(true),
-                                        Ok(false) => Err(Error::transient_skip(format!(
+                                        Ok(true) => (object_size, Ok(true)),
+                                        Ok(false) => (object_size, Err(Error::transient_skip(format!(
                                             "Skipped heal for {bucket_name}/{object_name} because replacement target readback did not confirm the committed version"
-                                        ))),
-                                        Err(err) => Err(Error::transient_skip(format!(
+                                        )))),
+                                        Err(err) => (object_size, Err(Error::transient_skip(format!(
                                             "Skipped heal for {bucket_name}/{object_name} because replacement target readback failed: {err}"
-                                        ))),
+                                        )))),
                                     }
                                 }
-                            }
-                            Ok((_result, None)) if !target_endpoints.is_empty() => Err(Error::transient_skip(format!(
-                                "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
-                            ))),
-                            Ok((_result, None)) => Ok(true),
-                            Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
-                            Ok((_, Some(err))) | Err(err) => match Self::classify_heal_object_error(&err) {
-                                HealObjectOutcome::Absent => Ok(false),
-                                HealObjectOutcome::Transient => Err(Error::transient_skip(format!(
-                                    "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                            },
+                            Ok((result, None)) if !target_endpoints.is_empty() => (
+                                result_object_size_u64(&result),
+                                Err(Error::transient_skip(format!(
+                                    "Skipped heal for {bucket_name}/{object_name} because a replacement target was not committed"
                                 ))),
-                                HealObjectOutcome::Failed => Err(err),
+                            ),
+                            Ok((result, None)) => (result_object_size_u64(&result), Ok(true)),
+                            Ok((result, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => {
+                                (result_object_size_u64(&result), Ok(false))
+                            }
+                            Ok((result, Some(err))) => {
+                                let object_size = result_object_size_u64(&result);
+                                match Self::classify_heal_object_error(&err) {
+                                    HealObjectOutcome::Absent => (object_size, Ok(false)),
+                                    HealObjectOutcome::Transient => (object_size, Err(Error::transient_skip(format!(
+                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                    )))),
+                                    HealObjectOutcome::Failed => (object_size, Err(err)),
+                                }
+                            }
+                            Err(err) => match Self::classify_heal_object_error(&err) {
+                                HealObjectOutcome::Absent => (0, Ok(false)),
+                                HealObjectOutcome::Transient => (0, Err(Error::transient_skip(format!(
+                                    "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                )))),
+                                HealObjectOutcome::Failed => (0, Err(err)),
                             },
                         }
                     };
@@ -841,9 +863,11 @@ impl ErasureSetHealer {
 
             let mut completed_in_page = 0usize;
             while let Some((key, object, version_id, result)) = page_tasks.next().await {
+                let (object_size, result) = result;
                 match result {
                     Ok(true) => {
                         *successful_objects += 1;
+                        bytes_processed = bytes_processed.saturating_add(object_size);
                         checkpoint_manager.add_processed_object(key).await?;
                         debug!(
                             target: "rustfs::heal::erasure_healer",
@@ -861,6 +885,7 @@ impl ErasureSetHealer {
                     Ok(false) => {
                         checkpoint_manager.add_processed_object(key).await?;
                         *successful_objects += 1;
+                        bytes_processed = bytes_processed.saturating_add(object_size);
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -877,6 +902,7 @@ impl ErasureSetHealer {
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(Error::TransientSkip { message }) => {
                         *skipped_objects += 1;
+                        bytes_processed = bytes_processed.saturating_add(object_size);
                         checkpoint_manager.add_skipped_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -893,6 +919,7 @@ impl ErasureSetHealer {
                     }
                     Err(err) => {
                         *failed_objects += 1;
+                        bytes_processed = bytes_processed.saturating_add(object_size);
                         checkpoint_manager.add_failed_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -911,6 +938,11 @@ impl ErasureSetHealer {
 
                 *processed_objects += 1;
                 completed_in_page += 1;
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.set_current_object(Some(format!("{bucket}/{object}")));
+                    progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                }
 
                 if completed_in_page.is_multiple_of(100) {
                     checkpoint_manager.update_position(bucket_index, page_resume_index).await?;
@@ -964,7 +996,9 @@ impl ErasureSetHealer {
         progress.objects_scanned = state.total_objects;
         progress.objects_healed = state.successful_objects;
         progress.objects_failed = state.failed_objects;
-        progress.bytes_processed = 0; // set to 0 for now, can be extended later
+        progress.bytes_processed = 0; // Resume state tracks object counts, not byte counters.
+        progress.start_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.start_time));
+        progress.last_update_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.last_update));
         progress.set_current_object(state.current_object.clone());
     }
 }
@@ -1639,6 +1673,49 @@ mod resume_loop_tests {
         assert_eq!(successful, 0);
         assert_eq!(failed, 0);
         assert_eq!(skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn erasure_set_progress_accumulates_healed_object_bytes() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("first", Some("v1"), false), item("second", Some("v2"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_result(
+            "first",
+            Some("v1"),
+            HealResultItem {
+                object_size: 1024,
+                ..Default::default()
+            },
+        );
+        env.storage.set_result(
+            "second",
+            Some("v2"),
+            HealResultItem {
+                object_size: 2048,
+                ..Default::default()
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+
+        result.expect("page heal should succeed");
+        assert_eq!(processed, 2);
+        assert_eq!(successful, 2);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+        let progress = env.healer.progress.read().await;
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_healed, 2);
+        assert_eq!(progress.objects_failed, 0);
+        assert_eq!(progress.bytes_processed, 3072);
+        assert!(matches!(progress.current_object.as_deref(), Some("b/first" | "b/second")));
     }
 
     #[tokio::test]

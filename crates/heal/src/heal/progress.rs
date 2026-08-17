@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +24,10 @@ pub struct HealProgress {
     pub objects_healed: u64,
     /// Objects failed
     pub objects_failed: u64,
+    /// Baseline object count from the latest complete usage snapshot
+    pub objects_total_count: u64,
+    /// Baseline object bytes from the latest complete usage snapshot
+    pub objects_total_size: u64,
     /// Bytes processed
     pub bytes_processed: u64,
     /// Current object
@@ -54,10 +58,35 @@ impl HealProgress {
         self.bytes_processed = bytes;
         self.last_update_time = Some(SystemTime::now());
 
-        // calculate progress percentage
-        let total = scanned + healed + failed;
+        self.refresh_progress_percentage();
+        self.refresh_estimated_completion_time();
+    }
+
+    pub fn set_total_baseline(&mut self, objects_total_count: u64, objects_total_size: u64) {
+        self.objects_total_count = objects_total_count;
+        self.objects_total_size = objects_total_size;
+        self.last_update_time = Some(SystemTime::now());
+        self.refresh_progress_percentage();
+        self.refresh_estimated_completion_time();
+    }
+
+    pub(crate) fn refresh_progress_percentage(&mut self) {
+        if self.objects_total_size > 0 {
+            self.progress_percentage = ((self.bytes_processed as f64 / self.objects_total_size as f64) * 100.0).min(100.0);
+            return;
+        }
+        if self.objects_total_count > 0 {
+            let completed = self.objects_healed.saturating_add(self.objects_failed);
+            self.progress_percentage = ((completed as f64 / self.objects_total_count as f64) * 100.0).min(100.0);
+            return;
+        }
+
+        let total = self
+            .objects_scanned
+            .saturating_add(self.objects_healed)
+            .saturating_add(self.objects_failed);
         if total > 0 {
-            self.progress_percentage = (healed as f64 / total as f64) * 100.0;
+            self.progress_percentage = (self.objects_healed as f64 / total as f64) * 100.0;
         }
     }
 
@@ -66,9 +95,36 @@ impl HealProgress {
         self.last_update_time = Some(SystemTime::now());
     }
 
+    pub fn refresh_estimated_completion_time(&mut self) {
+        let Some(start_time) = self.start_time else {
+            self.estimated_completion_time = None;
+            return;
+        };
+        if self.is_completed() || !(0.0..100.0).contains(&self.progress_percentage) || self.bytes_processed == 0 {
+            self.estimated_completion_time = None;
+            return;
+        }
+
+        let elapsed = match SystemTime::now().duration_since(start_time) {
+            Ok(elapsed) if !elapsed.is_zero() => elapsed,
+            _ => {
+                self.estimated_completion_time = None;
+                return;
+            }
+        };
+        let estimated_total_secs = elapsed.as_secs_f64() * 100.0 / self.progress_percentage;
+        self.estimated_completion_time = start_time.checked_add(Duration::from_secs_f64(estimated_total_secs));
+    }
+
     pub fn is_completed(&self) -> bool {
-        self.progress_percentage >= 100.0
-            || self.objects_scanned > 0 && self.objects_healed + self.objects_failed >= self.objects_scanned
+        if self.progress_percentage >= 100.0 {
+            return true;
+        }
+        if self.objects_total_count > 0 || self.objects_total_size > 0 {
+            return false;
+        }
+
+        self.objects_scanned > 0 && self.objects_healed.saturating_add(self.objects_failed) >= self.objects_scanned
     }
 
     pub fn get_success_rate(&self) -> f64 {
@@ -158,6 +214,8 @@ mod tests {
         assert_eq!(progress.objects_scanned, 0);
         assert_eq!(progress.objects_healed, 0);
         assert_eq!(progress.objects_failed, 0);
+        assert_eq!(progress.objects_total_count, 0);
+        assert_eq!(progress.objects_total_size, 0);
         assert_eq!(progress.bytes_processed, 0);
         assert_eq!(progress.progress_percentage, 0.0);
         assert!(progress.start_time.is_some());
@@ -179,6 +237,61 @@ mod tests {
         // healed/total = 8/20 = 0.4 = 40%
         assert!((progress.progress_percentage - 40.0).abs() < 0.001);
         assert!(progress.last_update_time.is_some());
+    }
+
+    #[test]
+    fn test_heal_progress_estimates_completion_time_from_progress() {
+        let mut progress = HealProgress::new();
+        progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+
+        progress.update_progress(100, 25, 0, 4096);
+
+        let eta = progress
+            .estimated_completion_time
+            .expect("partial byte progress should estimate completion");
+        assert!(eta > SystemTime::now());
+    }
+
+    #[test]
+    fn test_heal_progress_uses_byte_baseline_for_percentage() {
+        let mut progress = HealProgress::new();
+        progress.set_total_baseline(10, 8192);
+
+        progress.update_progress(100, 25, 0, 4096);
+
+        assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_heal_progress_uses_object_baseline_when_bytes_unknown() {
+        let mut progress = HealProgress::new();
+        progress.set_total_baseline(10, 0);
+
+        progress.update_progress(100, 3, 2, 0);
+
+        assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_heal_progress_does_not_estimate_completion_without_bytes() {
+        let mut progress = HealProgress::new();
+        progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+
+        progress.update_progress(100, 25, 0, 0);
+
+        assert!(progress.estimated_completion_time.is_none());
+    }
+
+    #[test]
+    fn test_heal_progress_with_baseline_is_not_completed_by_processed_count() {
+        let mut progress = HealProgress::new();
+        progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+        progress.set_total_baseline(10, 8192);
+
+        progress.update_progress(1, 1, 0, 1024);
+
+        assert!(!progress.is_completed());
+        assert!(progress.estimated_completion_time.is_some());
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::heal::{
     resume::{
         CheckpointManager, ReplacementPhase, ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match,
     },
-    storage::{HealStorageAPI, next_heal_listing_token},
+    storage::{HealBucketUsageBaseline, HealStorageAPI, next_heal_listing_token},
 };
 use crate::{Error, Result};
 use metrics::{counter, histogram};
@@ -1697,6 +1697,23 @@ impl HealTask {
         Ok(())
     }
 
+    async fn apply_erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<()> {
+        let baseline = match self
+            .await_with_control(self.storage.erasure_set_usage_baseline(buckets))
+            .await
+        {
+            Ok(Some(baseline)) => baseline,
+            Ok(None) => return Ok(()),
+            Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+            Err(_) => return Ok(()),
+        };
+
+        let HealBucketUsageBaseline { objects_count, bytes } = baseline;
+        let mut progress = self.progress.write().await;
+        progress.set_total_baseline(objects_count, bytes);
+        Ok(())
+    }
+
     async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
         debug!(
             target: "rustfs::heal::task",
@@ -2298,6 +2315,8 @@ impl HealTask {
             None
         };
 
+        self.apply_erasure_set_usage_baseline(&buckets).await?;
+
         let healing_marker = format!("{set_disk_id}:{}", self.id);
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
             let state = resume_manager.get_state().await;
@@ -2602,7 +2621,8 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(4, 4, 0, 0);
+            let bytes_processed = progress.bytes_processed;
+            progress.update_progress(4, 4, 0, bytes_processed);
         }
 
         match result {
@@ -3203,6 +3223,8 @@ mod tests {
         block_heal_object: Mutex<bool>,
         resume_disk: Mutex<Option<DiskStore>>,
         replacement_resume_disk: Mutex<Option<DiskStore>>,
+        usage_baseline: Mutex<Option<HealBucketUsageBaseline>>,
+        usage_baseline_error: Mutex<bool>,
     }
 
     #[test]
@@ -3355,6 +3377,13 @@ mod tests {
                 name: bucket.to_string(),
                 ..Default::default()
             }))
+        }
+
+        async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+            if *self.usage_baseline_error.lock().unwrap() {
+                return Err(Error::Other("usage baseline unavailable".to_string()));
+            }
+            Ok(*self.usage_baseline.lock().unwrap())
         }
 
         async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
@@ -4652,6 +4681,73 @@ mod tests {
         assert!(error.to_string().contains("injected bucket prepass failure"));
         assert_eq!(storage.bucket_heal_calls.lock().unwrap().as_slice(), ["bucket-a".to_string()]);
         assert!(storage.object_heal_opts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_applies_usage_baseline_to_progress() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
+                objects_count: 10,
+                bytes: 8,
+            })),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("erasure set heal should complete");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 10);
+        assert_eq!(progress.objects_total_size, 8);
+        assert_eq!(progress.bytes_processed, 2);
+        assert!((progress.progress_percentage - 25.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_ignores_usage_baseline_errors() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline_error: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("usage baseline failures should not fail erasure set heal");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 0);
+        assert_eq!(progress.objects_total_size, 0);
     }
 
     #[tokio::test]
