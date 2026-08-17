@@ -38,7 +38,10 @@ pub const XXHASH_3_HEADER_NAME: &str = "x-amz-checksum-xxhash3";
 pub const XXHASH_64_HEADER_NAME: &str = "x-amz-checksum-xxhash64";
 pub const XXHASH_128_HEADER_NAME: &str = "x-amz-checksum-xxhash128";
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Content-MD5 wire name, resolved by header_name() below and asserted by this crate's tests (backlog#1823)"
+)]
 pub(crate) static MD5_HEADER_NAME: &str = "content-md5";
 
 pub const CHECKSUM_ALGORITHMS_IN_PRIORITY_ORDER: [&str; 5] =

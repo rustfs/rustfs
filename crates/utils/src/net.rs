@@ -431,7 +431,6 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
     Ok(resolved_addr)
 }
 
-#[allow(dead_code)]
 pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
