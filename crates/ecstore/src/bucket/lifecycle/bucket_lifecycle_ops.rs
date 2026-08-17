@@ -456,16 +456,23 @@ impl<'a> LifecycleExpiryTrace<'a> {
     }
 }
 
-#[allow(dead_code)]
 impl ExpiryStats {
     pub fn missed_tasks(&self) -> i64 {
         self.missed_expiry_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_free_vers_tasks(&self) -> i64 {
         self.missed_freevers_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_tier_journal_tasks(&self) -> i64 {
         self.missed_tier_journal_tasks.load(Ordering::SeqCst)
     }

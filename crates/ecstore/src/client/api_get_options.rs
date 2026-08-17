@@ -27,7 +27,6 @@ use tracing::warn;
 use crate::client::api_error_response::err_invalid_argument;
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct AdvancedGetOptions {
     pub replication_delete_marker: bool,
     pub is_replication_ready_for_delete_marker: bool,

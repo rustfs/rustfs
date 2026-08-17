@@ -1996,11 +1996,11 @@ impl PoolMeta {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self, pools: Vec<Arc<Sets>>) -> Result<bool> {
         struct PoolInfo {
             position: usize,
             completed: bool,
+            #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
             decom_started: bool,
         }
 
@@ -4958,13 +4958,19 @@ fn is_disk_online_state(state: &str) -> bool {
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_total_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_total_capacity_dedup(disks)
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_free_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_free_capacity_dedup(disks)
 }
