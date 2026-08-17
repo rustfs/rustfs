@@ -1158,10 +1158,10 @@ impl Operation for RuntimeCapabilitiesHandler {
     }
 }
 
-/// Authorization gate for GET datausageinfo: any-of the dedicated admin action
-/// OR the bucket listing action. Pinned by a unit test so the gate cannot
-/// silently narrow or widen (rustfs/backlog#1306).
-fn data_usage_info_gate_actions() -> Vec<Action> {
+/// Authorization gate for GET datausageinfo (and prefix usage): any-of the
+/// dedicated admin action OR the bucket listing action. Pinned by a unit test
+/// so the gate cannot silently narrow or widen (rustfs/backlog#1306).
+pub(crate) fn data_usage_info_gate_actions() -> Vec<Action> {
     vec![
         Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
         Action::S3Action(S3Action::ListBucketAction),

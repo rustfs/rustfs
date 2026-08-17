@@ -231,6 +231,10 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
+    // A write invalidates this bucket's prefix-usage answers on the spot so
+    // admin/console consumers never ride the full TTL after a change
+    // (rustfs/backlog#1872).
+    crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
