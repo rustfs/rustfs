@@ -41,6 +41,7 @@ use rustfs_common::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
@@ -430,6 +431,113 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+fn trace_start_instant() -> Option<Instant> {
+    (trace_subscriber_count() > 0).then(Instant::now)
+}
+
+fn emit_scanner_folder_trace(root: &str, folder: &str, objects: u64, started_at: Option<Instant>, state: &'static str) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    trace_emit(|| {
+        let (bucket, prefix) = path2_bucket_object_with_base_path(root, folder);
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerFolder)
+            .with_bucket(bucket)
+            .with_object(prefix)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("objects", objects)
+    });
+}
+
+fn emit_scanner_ilm_action_trace(
+    bucket: &str,
+    object: &str,
+    action: IlmAction,
+    count: u64,
+    queued: bool,
+    started_at: Option<Instant>,
+) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    let state = if queued { "queued" } else { "not_queued" };
+    trace_emit(|| {
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+            .with_bucket(bucket)
+            .with_object(object)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("action", action.as_str())
+            .with_attr("count", count)
+            .with_attr("queued", queued)
+    });
+}
+
+struct ScannerHealCandidateTraceContext {
+    bucket: String,
+    object: Option<String>,
+    version_id: Option<String>,
+    scan_mode: Option<HealScanMode>,
+    started_at: Instant,
+}
+
+fn scanner_heal_candidate_trace_context(request: &HealChannelRequest) -> Option<ScannerHealCandidateTraceContext> {
+    let started_at = trace_start_instant()?;
+    Some(ScannerHealCandidateTraceContext {
+        bucket: request.bucket.clone(),
+        object: request.object_prefix.clone(),
+        version_id: request.object_version_id.clone(),
+        scan_mode: request.scan_mode,
+        started_at,
+    })
+}
+
+struct ScannerHealCandidateTrace<'a> {
+    candidate_type: &'static str,
+    bucket: &'a str,
+    object: Option<&'a str>,
+    version_id: Option<&'a str>,
+    priority: HealChannelPriority,
+    scan_mode: Option<HealScanMode>,
+    result: Result<HealAdmissionResult, &'a str>,
+    started_at: Instant,
+}
+
+fn emit_scanner_heal_candidate_trace(trace: ScannerHealCandidateTrace<'_>) {
+    trace_emit(|| {
+        let (state, admission, error) = match trace.result {
+            Ok(result) if result.is_admitted() => ("admitted", describe_heal_admission(result), None),
+            Ok(result) => ("not_admitted", describe_heal_admission(result), None),
+            Err(error) => ("submit_failed", "channel_error".to_string(), Some(error)),
+        };
+        let mut event = TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
+            .with_bucket(trace.bucket)
+            .with_duration(trace.started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("candidate_type", trace.candidate_type)
+            .with_attr("priority", heal_priority_label(trace.priority))
+            .with_attr("admission", admission);
+
+        if let Some(object) = trace.object {
+            event = event.with_object(object);
+        }
+        if let Some(version_id) = trace.version_id {
+            event = event.with_attr("version_id", version_id);
+        }
+        if let Some(scan_mode) = trace.scan_mode {
+            event = event.with_attr("scan_mode", scan_mode.as_str());
+        }
+        if let Some(error) = error {
+            event = event.with_attr("error", error);
+        }
+
+        event
+    });
+}
+
 fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
     into.size = into.size.saturating_add(summary.total_size);
     into.versions = into.versions.saturating_add(summary.versions);
@@ -677,9 +785,22 @@ async fn send_scanner_heal_request(
     request: HealChannelRequest,
 ) -> Result<HealAdmissionResult, ScannerError> {
     let priority = request.priority;
+    let trace_context = scanner_heal_candidate_trace_context(&request);
     match send_heal_request_with_admission(request).await {
         Ok(result) => {
             record_heal_candidate_admission(candidate_type, priority, result);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Ok(result),
+                    started_at: trace_context.started_at,
+                });
+            }
             Ok(result)
         }
         Err(err) => {
@@ -690,6 +811,18 @@ async fn send_scanner_heal_request(
                 "result" => "channel_error".to_string()
             )
             .increment(1);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Err(err.as_str()),
+                    started_at: trace_context.started_at,
+                });
+            }
             Err(ScannerError::Other(err))
         }
     }
@@ -905,7 +1038,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             remaining_versions = 0;
@@ -957,7 +1092,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
@@ -995,7 +1132,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                         }
@@ -1019,7 +1158,21 @@ impl ScannerItem {
             let action = event.action;
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
+            let trace_started_at = trace_start_instant();
             let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
+            if let Some(trace_started_at) = trace_started_at {
+                let state = if queued { "queued" } else { "not_queued" };
+                trace_emit(|| {
+                    TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+                        .with_bucket(self.bucket.as_str())
+                        .with_object(self.object_path())
+                        .with_duration(trace_started_at.elapsed())
+                        .with_attr("state", state)
+                        .with_attr("action", action.as_str())
+                        .with_attr("count", count)
+                        .with_attr("queued", queued)
+                });
+            }
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
@@ -1830,6 +1983,7 @@ impl FolderScanner {
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
+        let trace_started_at = trace_start_instant();
 
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2895,6 +3049,8 @@ impl FolderScanner {
         }
 
         done_folder();
+        let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
+        emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
         Ok(())
     }
@@ -4398,6 +4554,104 @@ mod tests {
             )),
             "dropped:queue_full"
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_trace_helpers_emit_expected_events() {
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+
+        emit_scanner_folder_trace(
+            "/tmp/rustfs-scanner-trace",
+            "/tmp/rustfs-scanner-trace/bucket-a/folder-a",
+            7,
+            Some(Instant::now()),
+            "completed",
+        );
+        let folder = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerFolder,
+            Some("bucket-a"),
+            Some("folder-a"),
+            Some("completed"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&folder, "objects").as_deref(), Some("7"));
+
+        emit_scanner_ilm_action_trace("bucket-a", "object-a", IlmAction::DeleteAction, 2, true, Some(Instant::now()));
+        let ilm = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerIlmAction,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("queued"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&ilm, "action").as_deref(), Some("delete"));
+        assert_eq!(trace_attr_string(&ilm, "count").as_deref(), Some("2"));
+        assert_eq!(trace_attr_string(&ilm, "queued").as_deref(), Some("true"));
+
+        emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+            candidate_type: "object",
+            bucket: "bucket-a",
+            object: Some("object-a"),
+            version_id: Some("version-a"),
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Deep),
+            result: Ok(HealAdmissionResult::Merged),
+            started_at: Instant::now(),
+        });
+        let heal_candidate = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerHealCandidate,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("admitted"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&heal_candidate, "candidate_type").as_deref(), Some("object"));
+        assert_eq!(trace_attr_string(&heal_candidate, "priority").as_deref(), Some("high"));
+        assert_eq!(trace_attr_string(&heal_candidate, "scan_mode").as_deref(), Some("deep"));
+        assert_eq!(trace_attr_string(&heal_candidate, "version_id").as_deref(), Some("version-a"));
+        assert_eq!(trace_attr_string(&heal_candidate, "admission").as_deref(), Some("merged"));
+    }
+
+    async fn recv_scanner_trace_event(
+        trace: &mut rustfs_common::trace_bus::TraceSubscription,
+        func: TraceFunc,
+        bucket: Option<&str>,
+        object: Option<&str>,
+        state: Option<&str>,
+    ) -> TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
+                .await
+                .expect("scanner trace event should arrive")
+                .expect("trace bus should stay open");
+            if event.kind == TraceKind::Scanner
+                && event.func == func
+                && event.bucket.as_deref() == bucket
+                && event.object.as_deref() == object
+                && state.is_none_or(|state| trace_attr_string(&event, "state").as_deref() == Some(state))
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected scanner trace event {func:?} for bucket {bucket:?} object {object:?}");
+    }
+
+    fn trace_attr_string(event: &TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                rustfs_common::trace_bus::TraceVal::Bool(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::U64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::I64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::Str(value) => value.to_string(),
+            })
+        })
     }
 
     #[test]
