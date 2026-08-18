@@ -3511,7 +3511,7 @@ mod heal_result_report_tests {
             "final current version must be the last committed overwrite"
         );
         assert_eq!(
-            final_info.etag.clone().unwrap_or_default(),
+            final_info.etag.unwrap_or_default(),
             last_etag,
             "the racing heal loop must never leave a stale or resurrected current version"
         );
