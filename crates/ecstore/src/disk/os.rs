@@ -676,6 +676,18 @@ pub(crate) async fn fsync_dst_dir_group_commit(dir: impl AsRef<Path>) -> io::Res
     fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled()).await
 }
 
+pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
+    dir: impl AsRef<Path>,
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+) -> io::Result<()> {
+    if dst_dir_fsync_group_commit_enabled() {
+        fsync_dst_dir_group_commit_with_enabled(dir, true).await
+    } else {
+        fsync_dir_with_namespace_file_sync_limit(dir, lease, admission).await
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn fsync_dst_dir_group_commit_for_test(dir: impl AsRef<Path>, enabled: bool) -> io::Result<()> {
     fsync_dst_dir_group_commit_with_enabled(dir, enabled).await
