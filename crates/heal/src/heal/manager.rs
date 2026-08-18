@@ -270,6 +270,7 @@ pub struct HealSourceCounts {
     pub auto_heal: u64,
     pub internal: u64,
     pub read_repair: u64,
+    pub mrf: u64,
 }
 
 impl HealSourceCounts {
@@ -280,6 +281,7 @@ impl HealSourceCounts {
             HealRequestSource::AutoHeal => self.auto_heal += 1,
             HealRequestSource::Internal => self.internal += 1,
             HealRequestSource::ReadRepair => self.read_repair += 1,
+            HealRequestSource::Mrf => self.mrf += 1,
         }
     }
 }
