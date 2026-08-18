@@ -242,6 +242,7 @@ fn test_heal_task_status_atomic_update() {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<HealListItem>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
@@ -385,6 +386,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }

@@ -4860,6 +4860,14 @@ impl SetDisks {
     /// is best-effort maintenance: individual delete failures are logged and
     /// skipped rather than propagated.
     pub(crate) async fn reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, false).await
+    }
+
+    pub(crate) async fn dry_run_reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, true).await
+    }
+
+    async fn reclaim_orphan_data_dirs_inner(&self, bucket: &str, object: &str, dry_run: bool) -> disk::error::Result<usize> {
         let disks = self.get_disks_internal().await;
 
         // Phase 1 (read-only): build the referenced-data-dir union and record the
@@ -4967,6 +4975,20 @@ impl SetDisks {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
+                if dry_run {
+                    removed += 1;
+                    debug!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = "heal_abandoned_parts",
+                        component = "ecstore",
+                        subsystem = "heal",
+                        state = "dry_run_matched",
+                        result = "matched",
+                        bucket, object, data_dir = %dir,
+                        "Heal abandoned parts dry-run matched orphaned data directory"
+                    );
+                    continue;
+                }
                 match disk
                     .delete(
                         bucket,
