@@ -31,7 +31,7 @@ HTTP request
       → storage/ecfs (erasure coding, encryption, checksums)
         → ecstore (disk pool selection, data distribution)
           → rio (reader pipeline: encrypt → compress → hash → write)
-            → io-core (zero-copy I/O, buffer pool, direct I/O)
+            → io-core (buffer pool, storage profiling, admission control)
               → local disk / remote disk via RPC
 ```
 
@@ -55,7 +55,7 @@ rustfs/                      # Workspace root (virtual manifest)
 ├── crates/                  # library crates (authoritative list: Cargo.toml [workspace].members)
 │   ├── ecstore/             # Erasure-coded storage engine
 │   ├── rio/                 # Reader I/O pipeline (encrypt, compress, hash)
-│   ├── io-core/             # Zero-copy I/O, scheduling, buffer pool
+│   ├── io-core/             # Buffer pool, storage profiling, admission control
 │   ├── io-metrics/          # I/O metrics collection
 │   ├── common/              # Shared runtime state, globals, data usage types
 │   ├── config/              # Configuration types and parsing
@@ -302,7 +302,7 @@ The binary (`main.rs`) boots in this order:
               │                  │                  │
         ┌─────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐
         │  ecstore   │    │     rio     │    │   io-core   │
-        │   (core)   │    │  (readers)  │    │ (zero-copy) │
+        │   (core)   │    │  (readers)  │    │ (buffers)   │
         └─────┬──────┘    └─────────────┘    └─────────────┘
               │
      ┌─────┬──┼──┬─────┬──────┐
@@ -314,7 +314,7 @@ The binary (`main.rs`) boots in this order:
 
 - **"Where does S3 PutObject go?"**
   `server/` routes → `app/object_usecase` validates → `storage/ecfs` encodes →
-  `ecstore` distributes → `rio` encrypts/compresses → `io-core` writes
+  `ecstore` distributes → `rio` encrypts/compresses → `io-core` supplies buffers
 
 - **"Where are bucket policies enforced?"**
   `app/bucket_usecase` calls into `crates/policy/`

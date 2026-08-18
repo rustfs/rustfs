@@ -9613,7 +9613,6 @@ version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "hotpath",
- "memmap2",
  "rustfs-io-metrics",
  "thiserror 2.0.20",
  "tokio",
