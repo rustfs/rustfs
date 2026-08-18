@@ -26,7 +26,6 @@ pub enum StorageMedia {
 }
 
 impl StorageMedia {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Nvme => "nvme",
@@ -60,7 +59,6 @@ pub enum AccessPattern {
 }
 
 impl AccessPattern {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Sequential => "sequential",
@@ -71,25 +69,21 @@ impl AccessPattern {
     }
 
     /// Check if this is a sequential access pattern.
-    #[allow(dead_code)]
     pub fn is_sequential(&self) -> bool {
         matches!(self, Self::Sequential)
     }
 
     /// Check if this is a random access pattern.
-    #[allow(dead_code)]
     pub fn is_random(&self) -> bool {
         matches!(self, Self::Random)
     }
 
     /// Check if this is a mixed access pattern.
-    #[allow(dead_code)]
     pub fn is_mixed(&self) -> bool {
         matches!(self, Self::Mixed)
     }
 
     /// Check if this pattern is unknown.
-    #[allow(dead_code)]
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
