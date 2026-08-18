@@ -612,7 +612,8 @@ impl HealChannelProcessor {
             HealRequestSource::Admin
             | HealRequestSource::AutoHeal
             | HealRequestSource::Internal
-            | HealRequestSource::ReadRepair => true,
+            | HealRequestSource::ReadRepair
+            | HealRequestSource::Mrf => true,
         });
 
         // Build HealOptions with all available fields

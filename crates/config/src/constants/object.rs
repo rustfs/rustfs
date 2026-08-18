@@ -234,6 +234,31 @@ pub const ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP: &str = "RUSTFS_OBJECT_DISK_WRITE_A
 /// Default absolute per-object erasure write cap in seconds (`0` = disabled).
 pub const DEFAULT_OBJECT_DISK_WRITE_ABSOLUTE_CAP: u64 = 0;
 
+/// Enable foreground PutObject request admission.
+///
+/// This is an experimental, default-off foreground write backpressure gate for
+/// strict commit tail investigations. When disabled, PUTs follow the legacy
+/// path and only the existing request counters are updated.
+pub const ENV_PUT_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE: bool = false;
+
+/// Maximum foreground PutObject requests admitted concurrently per process.
+///
+/// The limit is used only when [`ENV_PUT_FOREGROUND_ADMISSION_ENABLE`] is true.
+/// A value of `0` disables the gate even when the enable flag is present, so a
+/// partially configured rollout cannot reject every PUT.
+pub const ENV_PUT_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_LIMIT: usize = 0;
+
+/// Time in milliseconds a foreground PutObject waits for an admission permit.
+///
+/// Once this timeout expires the request fails before body ingest/storage
+/// mutation with S3 `SlowDown`/503. `0` means fail fast when the limit is full.
+pub const ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 0;
+
+const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
+
 /// Environment variable for minimum GetObject timeout in seconds.
 ///
 /// When dynamic timeout calculation is enabled, this is the minimum timeout
