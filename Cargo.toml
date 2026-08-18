@@ -290,7 +290,7 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "d7028511a53f69d41ed3c69f36899f9b1aede647" }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "161f19d40e96c4285af974598627746f138f29cd" }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
