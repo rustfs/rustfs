@@ -177,3 +177,12 @@ pub const DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: usize = 80;
 
 /// Default foreground pressure recheck delay for heal scheduler, in milliseconds.
 pub const DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS: u64 = 250;
+
+/// Environment variable selecting how admin heal starts behave when the
+/// requested path overlaps an already running or queued heal: `merge`
+/// (default, keep today's dedup/merge semantics) or `minio_error` (return a
+/// typed already-running / overlapping-paths rejection like madmin).
+pub const ENV_HEAL_OVERLAP_POLICY: &str = "RUSTFS_HEAL_OVERLAP_POLICY";
+
+/// Default overlap policy: merge duplicate/overlapping requests.
+pub const DEFAULT_HEAL_OVERLAP_POLICY: &str = "merge";

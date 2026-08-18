@@ -220,6 +220,11 @@ struct CompletedHealStatus {
     result_items: Vec<HealResultItem>,
     result_items_truncated: bool,
     completed_at: SystemTime,
+    /// Sequence-stamped retained window, archived with the completion so
+    /// incremental consumers keep their cursor across the transition (HS-06).
+    seqed_items: Vec<(u64, HealResultItem)>,
+    next_seq: u64,
+    min_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +245,65 @@ pub struct HealTaskReport {
     pub result_items: Vec<HealResultItem>,
     pub result_items_truncated: bool,
     pub progress: Option<HealProgress>,
+    /// Cursor for incremental consumption: sequence number of the next item
+    /// to be produced. `0` on reports from sources without sequencing.
+    pub next_seq: u64,
+    /// Oldest sequence still retained (`0` together with `next_seq` when
+    /// sequencing is unavailable).
+    pub min_seq: u64,
+}
+
+/// Report from a live task, honoring the client's incremental cursor.
+async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskReport {
+    let window = task.get_result_items_since(since).await;
+    HealTaskReport {
+        status: task.get_status().await,
+        result_items: window.items,
+        // The legacy flag stays set once anything was evicted; a lagging
+        // incremental cursor additionally marks this response truncated so
+        // the client knows to restart from `min_seq`.
+        result_items_truncated: task.result_items_truncated() || window.lagged,
+        progress: Some(task.get_progress().await),
+        next_seq: window.next_seq,
+        min_seq: window.min_seq,
+    }
+}
+
+fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
+    HealTaskReport {
+        status,
+        result_items: Vec::new(),
+        result_items_truncated: false,
+        progress: None,
+        next_seq: 0,
+        min_seq: 0,
+    }
+}
+
+fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) -> HealTaskReport {
+    let mut lagged = false;
+    let result_items = match since {
+        None => completed.result_items.clone(),
+        Some(cursor) => {
+            if cursor + 1 < completed.min_seq {
+                lagged = true;
+            }
+            completed
+                .seqed_items
+                .iter()
+                .filter(|(seq, _)| *seq > cursor)
+                .map(|(_, item)| item.clone())
+                .collect()
+        }
+    };
+    HealTaskReport {
+        status: completed.status.clone(),
+        result_items,
+        result_items_truncated: completed.result_items_truncated || lagged,
+        progress: None,
+        next_seq: completed.next_seq,
+        min_seq: completed.min_seq,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -528,6 +592,11 @@ impl PriorityHealQueue {
         self.dedup_keys.contains_key(&key)
     }
 
+    /// Iterate queued requests (used by the admin overlap check).
+    fn requests(&self) -> impl Iterator<Item = &HealRequest> {
+        self.heap.iter().map(|item| &item.request)
+    }
+
     fn contains_request_id(&self, request_id: &str) -> bool {
         self.heap.iter().any(|item| item.request.id == request_id)
     }
@@ -686,6 +755,80 @@ fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
 }
 
 /// Heal config
+/// HS-06 admin overlap policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealOverlapPolicy {
+    /// Default: overlapping admin starts merge into the existing task
+    /// (today's dedup semantics).
+    #[default]
+    Merge,
+    /// Return a typed already-running / overlapping-paths rejection like
+    /// madmin's ErrHealAlreadyRunning / ErrHealOverlappingPaths.
+    MinioError,
+}
+
+/// Path view of a heal type for overlap comparison: a bucket plus a
+/// prefix/object path inside it (`None` bucket = cluster-wide, overlaps
+/// everything).
+fn heal_type_path_view(heal_type: &HealType) -> (Option<&str>, &str) {
+    match heal_type {
+        HealType::Cluster => (None, ""),
+        HealType::Bucket { bucket } => (Some(bucket), ""),
+        HealType::Prefix { bucket, prefix } => (Some(bucket), prefix),
+        HealType::Object { bucket, object, .. }
+        | HealType::Metadata { bucket, object }
+        | HealType::ECDecode { bucket, object, .. } => (Some(bucket), object),
+        // MRF/MetaPath heal keys on a meta path; treat the whole set of
+        // buckets as one namespace so it only overlaps itself exactly.
+        HealType::MRF { meta_path } => (Some("\u{0}mrf"), meta_path),
+        // Erasure-set heal: the set id is the overlap dimension.
+        HealType::ErasureSet { set_disk_id, .. } => (Some("\u{0}set"), set_disk_id),
+    }
+}
+
+/// How two heal paths relate for the admin overlap check (HS-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlapVerdict {
+    /// Distinct targets: no conflict.
+    Disjoint,
+    /// Same target: an identical heal is already in flight.
+    SameTarget,
+    /// One target contains the other.
+    Overlapping,
+}
+
+fn prefix_paths_overlap(a: &str, b: &str) -> OverlapVerdict {
+    if a == b {
+        return OverlapVerdict::SameTarget;
+    }
+    if a.is_empty() || b.is_empty() || a.starts_with(b) || b.starts_with(a) {
+        return OverlapVerdict::Overlapping;
+    }
+    OverlapVerdict::Disjoint
+}
+
+fn heal_types_overlap(left: &HealType, right: &HealType) -> OverlapVerdict {
+    let (left_bucket, left_path) = heal_type_path_view(left);
+    let (right_bucket, right_path) = heal_type_path_view(right);
+    match (left_bucket, right_bucket) {
+        // Cluster-wide overlaps everything (but an exact cluster match is
+        // SameTarget).
+        (None, _) | (_, None) => {
+            if matches!(left, HealType::Cluster) && matches!(right, HealType::Cluster) {
+                OverlapVerdict::SameTarget
+            } else {
+                OverlapVerdict::Overlapping
+            }
+        }
+        (Some(lb), Some(rb)) => {
+            if lb != rb {
+                return OverlapVerdict::Disjoint;
+            }
+            prefix_paths_overlap(left_path, right_path)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HealConfig {
     /// Whether to enable auto heal
@@ -706,6 +849,9 @@ pub struct HealConfig {
     pub low_priority_drop_when_full: bool,
     /// Whether notify-driven scheduler wakeups are enabled.
     pub event_driven_scheduler_enable: bool,
+    /// How admin heal starts behave on path overlap (HS-06): merge into the
+    /// existing task (default) or return a typed already-running rejection.
+    pub overlap_policy: HealOverlapPolicy,
     /// Whether per-set bulkhead scheduling is enabled.
     pub set_bulkhead_enable: bool,
     /// Whether erasure-set page parallelism is enabled.
@@ -754,6 +900,14 @@ impl Default for HealConfig {
             rustfs_config::ENV_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
             rustfs_config::DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
         );
+        let overlap_policy =
+            match rustfs_utils::get_env_str(rustfs_config::ENV_HEAL_OVERLAP_POLICY, rustfs_config::DEFAULT_HEAL_OVERLAP_POLICY)
+                .to_lowercase()
+                .as_str()
+            {
+                "minio_error" => HealOverlapPolicy::MinioError,
+                _ => HealOverlapPolicy::Merge,
+            };
         let set_bulkhead_enable = rustfs_utils::get_env_bool(
             rustfs_config::ENV_HEAL_SET_BULKHEAD_ENABLE,
             rustfs_config::DEFAULT_HEAL_SET_BULKHEAD_ENABLE,
@@ -790,6 +944,7 @@ impl Default for HealConfig {
             low_priority_merge_enable,
             low_priority_drop_when_full,
             event_driven_scheduler_enable,
+            overlap_policy,
             set_bulkhead_enable,
             page_parallel_enable,
             mainline_throttle_enable,
@@ -1756,6 +1911,50 @@ impl HealManager {
         request: HealRequest,
         preserve_alias: bool,
     ) -> Result<HealAdmissionReceipt> {
+        // HS-06 forceStart semantics (admin only): MinIO stops the old task
+        // first and then starts the new one. Cancel any active admin task
+        // overlapping this request's path before entering admission, so the
+        // fresh task is never merged into the one being replaced.
+        if request.source == HealRequestSource::Admin && request.force_start {
+            let overlapping: Vec<String> = {
+                let active_heals = self.active_heals.lock().await;
+                active_heals
+                    .iter()
+                    .filter(|(task_id, task)| {
+                        task.source == HealRequestSource::Admin
+                            && heal_types_overlap(&request.heal_type, &task.heal_type) != OverlapVerdict::Disjoint
+                            && *task_id != &request.id
+                    })
+                    .map(|(task_id, _)| task_id.clone())
+                    .collect()
+            };
+            for task_id in overlapping {
+                match self.cancel_task(&task_id).await {
+                    Ok(_) => info!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        cancelled_task_id = %task_id,
+                        result = "force_start_cancelled_overlap",
+                        "Admin forceStart cancelled an overlapping heal task"
+                    ),
+                    Err(err) => warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        cancelled_task_id = %task_id,
+                        error = %err,
+                        result = "force_start_cancel_failed",
+                        "Admin forceStart failed to cancel an overlapping heal task"
+                    ),
+                }
+            }
+        }
+
         let config = self.config.read().await;
         let dedup_key = PriorityHealQueue::make_dedup_key(&request);
 
@@ -1778,7 +1977,15 @@ impl HealManager {
                 .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
         });
         if let Some((merged_task_id, duplicate_state)) = duplicate.flatten() {
-            let admission = Self::duplicate_admission_for_request(&request, &config);
+            // HS-06: under the minio_error overlap policy an exact duplicate
+            // admin start reports the typed AlreadyRunning rejection instead
+            // of the silent merge (MinIO's ErrHealAlreadyRunning).
+            let admission =
+                if request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError {
+                    HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+                } else {
+                    Self::duplicate_admission_for_request(&request, &config)
+                };
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
@@ -1822,6 +2029,62 @@ impl HealManager {
                 result: admission,
                 task_id: merged_task_id,
             });
+        }
+
+        // HS-06 typed overlap rejection (admin only, minio_error policy):
+        // paths containing or contained by an active/queued task reject with
+        // AlreadyRunning / OverlappingPaths instead of merging. Exact
+        // duplicates already merged above; scanner/autoheal/read-repair
+        // sources never take this path.
+        if request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError {
+            let mut rejection = None;
+            for (task_id, task) in active_heals.iter() {
+                match heal_types_overlap(&request.heal_type, &task.heal_type) {
+                    OverlapVerdict::SameTarget => {
+                        rejection = Some((HealAdmissionDropReason::AlreadyRunning, task_id.clone()));
+                        break;
+                    }
+                    OverlapVerdict::Overlapping => {
+                        rejection = Some((HealAdmissionDropReason::OverlappingPaths, task_id.clone()));
+                    }
+                    OverlapVerdict::Disjoint => {}
+                }
+            }
+            if rejection.is_none() {
+                for queued in queue.requests() {
+                    match heal_types_overlap(&request.heal_type, &queued.heal_type) {
+                        OverlapVerdict::SameTarget => {
+                            rejection = Some((HealAdmissionDropReason::AlreadyRunning, queued.id.clone()));
+                            break;
+                        }
+                        OverlapVerdict::Overlapping => {
+                            rejection = Some((HealAdmissionDropReason::OverlappingPaths, queued.id.clone()));
+                        }
+                        OverlapVerdict::Disjoint => {}
+                    }
+                }
+            }
+            if let Some((reason, overlap_task_id)) = rejection {
+                drop(retrying_heals);
+                drop(queue);
+                drop(active_heals);
+                Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request.id,
+                    overlap_task_id = %overlap_task_id,
+                    reason = reason.as_str(),
+                    result = "overlap_rejected",
+                    "Admin heal start rejected by overlap policy"
+                );
+                return Ok(HealAdmissionReceipt {
+                    result: HealAdmissionResult::Dropped(reason),
+                    task_id: overlap_task_id,
+                });
+            }
         }
 
         let mut task_id = request.id.clone();
@@ -1896,28 +2159,25 @@ impl HealManager {
     }
 
     pub async fn get_task_report(&self, task_id: &str) -> Result<HealTaskReport> {
+        self.get_task_report_since(task_id, None).await
+    }
+
+    /// Incremental variant of [`Self::get_task_report`] (HS-06): `since` is
+    /// the client's last seen sequence number; `None` keeps the legacy
+    /// full-snapshot semantics.
+    pub async fn get_task_report_since(&self, task_id: &str, since: Option<u64>) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         {
             let active_heals = self.active_heals.lock().await;
             if let Some(task) = active_heals.get(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: task.get_status().await,
-                    result_items: task.get_result_items().await,
-                    result_items_truncated: task.result_items_truncated(),
-                    progress: Some(task.get_progress().await),
-                });
+                return Ok(active_task_report(task, since).await);
             }
         }
 
         {
             let retrying_heals = self.retrying_heals.lock().await;
             if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: retrying.status(),
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
+                return Ok(empty_task_report(retrying.status()));
             }
         }
 
@@ -1927,36 +2187,21 @@ impl HealManager {
             if let Some(completed) = completed_heals.get(&canonical_task_id)
                 && completed_status_is_retrying(&completed.status)
             {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
+                return Ok(completed_task_report(completed, since));
             }
         }
 
         {
             let queue = self.heal_queue.lock().await;
             if queue.contains_request_id(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: HealTaskStatus::Pending,
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
+                return Ok(empty_task_report(HealTaskStatus::Pending));
             }
         }
 
         let mut completed_heals = self.completed_heals.lock().await;
         prune_completed_heal_statuses(&mut completed_heals);
         if let Some(completed) = completed_heals.get(&canonical_task_id) {
-            return Ok(HealTaskReport {
-                status: completed.status.clone(),
-                result_items: completed.result_items.clone(),
-                result_items_truncated: completed.result_items_truncated,
-                progress: None,
-            });
+            return Ok(completed_task_report(completed, since));
         }
 
         Err(Error::TaskNotFound {
@@ -1965,18 +2210,23 @@ impl HealManager {
     }
 
     pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
+        self.get_task_report_for_path_since(heal_path, task_id, None).await
+    }
+
+    /// Incremental variant of [`Self::get_task_report_for_path`] (HS-06).
+    pub async fn get_task_report_for_path_since(
+        &self,
+        heal_path: &str,
+        task_id: &str,
+        since: Option<u64>,
+    ) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
         {
             let active_heals = self.active_heals.lock().await;
             if let Some(task) = active_heals.get(&canonical_task_id)
                 && heal_type_matches_path(&task.heal_type, heal_path)
             {
-                return Ok(HealTaskReport {
-                    status: task.get_status().await,
-                    result_items: task.get_result_items().await,
-                    result_items_truncated: task.result_items_truncated(),
-                    progress: Some(task.get_progress().await),
-                });
+                return Ok(active_task_report(task, since).await);
             }
         }
 
@@ -1985,12 +2235,7 @@ impl HealManager {
             if let Some(retrying) = retrying_heals.get(&canonical_task_id)
                 && heal_type_matches_path(&retrying.request.heal_type, heal_path)
             {
-                return Ok(HealTaskReport {
-                    status: retrying.status(),
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
+                return Ok(empty_task_report(retrying.status()));
             }
         }
 
@@ -2001,24 +2246,14 @@ impl HealManager {
                 && heal_type_matches_path(&completed.heal_type, heal_path)
                 && completed_status_is_retrying(&completed.status)
             {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
+                return Ok(completed_task_report(completed, since));
             }
         }
 
         {
             let queue = self.heal_queue.lock().await;
             if queue.contains_request_id_matching_path(&canonical_task_id, heal_path) {
-                return Ok(HealTaskReport {
-                    status: HealTaskStatus::Pending,
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
+                return Ok(empty_task_report(HealTaskStatus::Pending));
             }
         }
 
@@ -2028,12 +2263,7 @@ impl HealManager {
             if let Some(completed) = completed_heals.get(&canonical_task_id)
                 && heal_type_matches_path(&completed.heal_type, heal_path)
             {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
+                return Ok(completed_task_report(completed, since));
             }
         }
 
@@ -3228,12 +3458,16 @@ impl HealManager {
                             completed_task.get_status().await
                         };
                         let completed_progress = completed_task.get_progress().await;
+                        let final_window = completed_task.get_result_items_since(None).await;
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
-                            result_items: completed_task.get_result_items().await,
+                            result_items: final_window.items.clone(),
                             result_items_truncated: completed_task.result_items_truncated(),
                             completed_at: SystemTime::now(),
+                            seqed_items: completed_task.get_seqed_result_items().await,
+                            next_seq: final_window.next_seq,
+                            min_seq: final_window.min_seq,
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
                         prune_completed_heal_statuses(&mut completed_heals_guard);
@@ -5005,6 +5239,9 @@ mod tests {
                 },
                 result_items: Vec::new(),
                 result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
                 completed_at: SystemTime::now(),
             },
         );
@@ -5284,6 +5521,136 @@ mod tests {
         assert_eq!(snapshot.queued_by_source.admin, 1);
         assert_eq!(snapshot.queued_by_source.auto_heal, 1);
         assert_eq!(snapshot.queued_by_source.internal, 0);
+    }
+
+    // HS-06 (backlog#1870): overlap policy + forceStart semantics.
+    fn manager_with_policy(policy: HealOverlapPolicy) -> HealManager {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        HealManager::new(
+            storage,
+            Some(HealConfig {
+                overlap_policy: policy,
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn admin_prefix_request(bucket: &str, prefix: &str) -> HealRequest {
+        let mut request = HealRequest::new(
+            HealType::Prefix {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        request
+    }
+
+    async fn insert_active_task(manager: &HealManager, request: HealRequest) -> String {
+        let task = Arc::new(HealTask::from_request(request, manager.storage.clone()));
+        let task_id = task.id.clone();
+        manager.active_heals.lock().await.insert(task_id.clone(), task);
+        task_id
+    }
+
+    #[tokio::test]
+    async fn overlap_policy_minio_error_rejects_same_and_containing_paths() {
+        let manager = manager_with_policy(HealOverlapPolicy::MinioError);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        // Same target: typed AlreadyRunning.
+        let same = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            same,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning),
+            "an identical target must reject with already-running"
+        );
+
+        // Contained path: typed OverlappingPaths.
+        let nested = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/app/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            nested,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
+            "a path inside the active task's path must reject with overlapping-paths"
+        );
+
+        // Containing path (bucket-wide vs nested active): also overlapping.
+        let wide = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", ""))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            wide,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
+            "a bucket-wide start overlapping a nested active heal must reject"
+        );
+
+        // Disjoint bucket: unaffected.
+        let disjoint = manager
+            .submit_heal_request(admin_prefix_request("bucket-b", "logs/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(disjoint, HealAdmissionResult::Accepted);
+    }
+
+    #[tokio::test]
+    async fn overlap_policy_default_merge_keeps_today_semantics() {
+        let manager = manager_with_policy(HealOverlapPolicy::Merge);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        // Different-dedup-key overlap still merges under the default policy:
+        // the nested path dedups to its own key but nothing rejects it.
+        let nested = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/app/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(nested, HealAdmissionResult::Accepted, "default policy must not reject overlaps");
+
+        // Non-admin sources never get overlap rejections even under minio_error.
+        let manager = manager_with_policy(HealOverlapPolicy::MinioError);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+        let mut scanner_request = admin_prefix_request("bucket-a", "logs/app/");
+        scanner_request.source = HealRequestSource::Scanner;
+        let admitted = manager
+            .submit_heal_request(scanner_request)
+            .await
+            .expect("admission must decide");
+        assert_eq!(admitted, HealAdmissionResult::Accepted, "scanner sources must never be overlap-rejected");
+    }
+
+    #[tokio::test]
+    async fn admin_force_start_cancels_overlapping_active_task_first() {
+        let manager = manager_with_policy(HealOverlapPolicy::Merge);
+        let old_id = insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        let mut replacement = admin_prefix_request("bucket-a", "logs/");
+        replacement.force_start = true;
+        let receipt = manager
+            .submit_heal_request_with_receipt(replacement)
+            .await
+            .expect("force-start submission must decide");
+
+        assert!(receipt.result.is_admitted(), "the new task must be admitted (Accepted or Merged)");
+        let old_task_gone = {
+            let active_heals = manager.active_heals.lock().await;
+            !active_heals.contains_key(&old_id)
+        };
+        assert!(
+            old_task_gone,
+            "the overlapping admin task must be cancelled (removed from the active table) before the new one starts"
+        );
+        assert!(
+            matches!(manager.get_task_status(&old_id).await, Err(Error::TaskNotFound { .. })),
+            "a cancelled task must no longer resolve as an active heal"
+        );
     }
 
     #[tokio::test]
@@ -5588,6 +5955,9 @@ mod tests {
                 status: HealTaskStatus::Completed,
                 result_items: Vec::new(),
                 result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
                 completed_at: SystemTime::now(),
             },
         );
@@ -5622,6 +5992,9 @@ mod tests {
                     ..Default::default()
                 }],
                 result_items_truncated: true,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
                 completed_at: SystemTime::now(),
             },
         );
