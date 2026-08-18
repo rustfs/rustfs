@@ -1161,6 +1161,31 @@ mod tests {
         assert!(all.contains_key("proxy-only-bucket"));
     }
 
+    /// Pins the read-proxy metric contract (backlog#1675 P1-5): the API
+    /// strings the GET/HEAD/Tagging proxy paths record map onto the
+    /// get/head/tagging totals, and only unexpected failures raise the
+    /// failed counters.
+    #[tokio::test]
+    async fn test_proxy_stats_map_read_proxy_apis_to_totals() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-bucket", "GetObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObject", true).await;
+        stats.inc_proxy("proxy-bucket", "HeadObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "PutObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "DeleteObjectTagging", true).await;
+
+        let metric = stats.get_proxy_stats("proxy-bucket").await;
+        assert_eq!(metric.get_total, 2);
+        assert_eq!(metric.get_failed, 1);
+        assert_eq!(metric.head_total, 1);
+        assert_eq!(metric.head_failed, 0);
+        assert_eq!(metric.get_tag_total, 1);
+        assert_eq!(metric.put_tag_total, 1);
+        assert_eq!(metric.delete_tag_total, 1);
+        assert_eq!(metric.delete_tag_failed, 1);
+    }
+
     #[tokio::test]
     async fn test_calculate_bucket_replication_stats_merges_resync_metrics() {
         let stats = ReplicationStats::new();

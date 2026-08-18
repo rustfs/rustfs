@@ -415,6 +415,7 @@ impl VaultTransitKmsClient {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
             attempt_timeout: kms_config.effective_timeout(),
+            skip_tls_verify: config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(

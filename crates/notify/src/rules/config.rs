@@ -40,7 +40,10 @@ impl RuleEvents for RuleView {
 #[derive(Debug)]
 struct CompiledRules {
     // Keep RulesMap (can be used later if you want to make more complex judgments during the snapshot reading phase)
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "speculative retention: the comment above keeps it for richer snapshot-time judgements that no code performs yet (backlog#1823)"
+    )]
     rules_map: RulesMap,
     // for RulesContainer::iter_rules
     rule_views: Vec<RuleView>,

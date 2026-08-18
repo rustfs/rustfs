@@ -273,6 +273,7 @@ proptest = "1"
 rcgen.workspace = true
 insta = { workspace = true, features = ["yaml", "json"] }
 rustfs-crypto = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }

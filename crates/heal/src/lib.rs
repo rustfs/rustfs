@@ -158,6 +158,10 @@ pub async fn init_heal_manager_with_workload_provider(
             return Err(err);
         }
 
+        // Start the MRF intent consumer (error-path repair intents + durable
+        // journal replay) now that the manager can accept submissions.
+        heal::mrf_queue::spawn_mrf_consumer(heal_manager.clone());
+
         #[cfg(test)]
         test_hook_after_manager_start().await;
 
@@ -445,6 +449,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool), Error> {
             Ok((Vec::new(), None, false))
         }

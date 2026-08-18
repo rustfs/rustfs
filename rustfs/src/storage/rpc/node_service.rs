@@ -571,8 +571,12 @@ async fn execute_heal_control_envelope_with_manager(
                 admission: receipt.result.into(),
             }
         }
-        rustfs_protos::heal_control::ExecutableCommand::Query { heal_path, client_token } => {
-            let response = timeout(remaining, processor.execute_query_request(heal_path, client_token))
+        rustfs_protos::heal_control::ExecutableCommand::Query {
+            heal_path,
+            client_token,
+            since_seq,
+        } => {
+            let response = timeout(remaining, processor.execute_query_request_since(heal_path, client_token, since_seq))
                 .await
                 .map_err(|_| Status::deadline_exceeded("heal control query expired before execution"))?
                 .map_err(|_| Status::internal("heal control query failed"))?;
@@ -2420,6 +2424,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -2516,6 +2521,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token.clone(),
+            None,
         )
         .unwrap();
         let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
@@ -2554,6 +2560,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token,
+            None,
         )
         .unwrap();
         let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))

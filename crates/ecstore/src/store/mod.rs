@@ -216,6 +216,16 @@ impl std::fmt::Debug for ECStore {
 /// These delegate to the process-global statics. No local state — the globals
 /// remain the single source of truth until the migration is complete.
 impl ECStore {
+    /// Every erasure set across all pools, pool-major order.
+    ///
+    /// Read-only queries that must consult each set's own copy of a
+    /// per-bucket object (e.g. the scanner's `.usage-cache.bin`) iterate
+    /// this instead of the hash-routed store path, which would always land
+    /// on one set (rustfs/backlog#1872).
+    pub fn all_set_disks(&self) -> Vec<Arc<crate::set_disk::SetDisks>> {
+        self.pools.iter().flat_map(|pool| pool.disk_set.iter().cloned()).collect()
+    }
+
     /// Get server configuration (delegates to global)
     pub fn get_server_config(&self) -> Option<Config> {
         runtime_sources::server_config()

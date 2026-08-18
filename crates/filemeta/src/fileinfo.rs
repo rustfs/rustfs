@@ -42,6 +42,9 @@ const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
 const FILEINFO_PART_BITMAP_WORDS: usize = MAX_FILEINFO_PARTS.div_ceil(FILEINFO_PART_BITMAP_WORD_BITS);
 
 // Additional constants from Go version
+// Intentionally duplicated (S3 wire literal): rustfs-replication and
+// rustfs-object-data-cache carry their own independent "null" constants so
+// they stay free of a rustfs-filemeta dependency. Keep all three in sync.
 pub const NULL_VERSION_ID: &str = "null";
 // pub const RUSTFS_ERASURE_UPGRADED: &str = "x-rustfs-internal-erasure-upgraded";
 

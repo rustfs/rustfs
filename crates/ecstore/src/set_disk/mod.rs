@@ -6998,6 +6998,100 @@ mod tests {
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
     }
 
+    async fn recv_abandoned_parts_trace(
+        trace: &mut rustfs_common::trace_bus::TraceSubscription,
+        bucket: &str,
+        object: &str,
+        state: &str,
+    ) -> rustfs_common::trace_bus::TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), trace.recv())
+                .await
+                .expect("abandoned-parts trace event should arrive")
+                .expect("trace bus should stay open");
+            if event.kind == rustfs_common::trace_bus::TraceKind::Heal
+                && event.func == rustfs_common::trace_bus::TraceFunc::HealCheckAbandonedParts
+                && event.bucket.as_deref() == Some(bucket)
+                && event.object.as_deref() == Some(object)
+                && trace_attr_string(&event, "state").as_deref() == Some(state)
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected abandoned-parts trace state {state} for {bucket}/{object}");
+    }
+
+    fn trace_attr_string(event: &rustfs_common::trace_bus::TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                rustfs_common::trace_bus::TraceVal::Bool(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::U64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::I64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn check_abandoned_parts_dry_run_counts_without_deleting() {
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        let object_dir = dir.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        fs::create_dir_all(object_dir.join(orphan.to_string()))
+            .await
+            .expect("orphan data dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                dry_run: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dry-run abandoned-parts check should succeed");
+        let dry_run_trace = recv_abandoned_parts_trace(&mut trace, "bucket", "obj", "dry_run_matched").await;
+        assert_eq!(trace_attr_string(&dry_run_trace, "dry_run").as_deref(), Some("true"));
+        assert_eq!(trace_attr_string(&dry_run_trace, "data_dirs").as_deref(), Some("1"));
+
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(object_dir.join(orphan.to_string()).exists(), "dry-run must not remove orphaned data dir");
+
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("abandoned-parts check should reclaim stale data dir");
+        let reclaim_trace = recv_abandoned_parts_trace(&mut trace, "bucket", "obj", "reclaimed").await;
+        assert_eq!(trace_attr_string(&reclaim_trace, "dry_run").as_deref(), Some("false"));
+        assert_eq!(trace_attr_string(&reclaim_trace, "data_dirs").as_deref(), Some("1"));
+
+        assert!(
+            object_dir.join(live.to_string()).exists(),
+            "referenced data dir must remain after reclaim"
+        );
+        assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
+    }
+
     #[tokio::test]
     async fn reclaim_orphan_data_dirs_recovers_deferred_cleanup_after_restart() {
         let (dir, disk) = make_single_local_disk().await;
@@ -12233,11 +12327,18 @@ mod tests {
             .expect_err("unsupported copy_object_part should return a typed error");
         assert!(matches!(copy_part_err, StorageError::NotImplemented));
 
-        let abandoned_err = set_disks
-            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+        set_disks
+            .check_abandoned_parts(
+                "bucket",
+                "object",
+                &HealOpts {
+                    dry_run: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
-            .expect_err("abandoned-parts check should stay in the upper reconciliation layer");
-        assert!(matches!(abandoned_err, StorageError::NotImplemented));
+            .expect("abandoned-parts check should be callable on empty disk sets");
     }
 
     #[tokio::test]

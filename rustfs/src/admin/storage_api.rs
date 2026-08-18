@@ -196,6 +196,7 @@ pub(crate) mod bucket_target_sys {
     pub(crate) type PutObjectOptions = super::ecstore_bucket::bucket_target_sys::PutObjectOptions;
     pub(crate) type RemoveObjectOptions = super::ecstore_bucket::bucket_target_sys::RemoveObjectOptions;
     pub(crate) type S3ClientError = super::ecstore_bucket::bucket_target_sys::S3ClientError;
+    pub(crate) type SsecPassthroughCapability = super::ecstore_bucket::bucket_target_sys::SsecPassthroughCapability;
     pub(crate) type TargetClient = super::ecstore_bucket::bucket_target_sys::TargetClient;
 }
 
@@ -948,6 +949,10 @@ pub(crate) mod runtime {
 
     #[cfg(test)]
     pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+    /// Test-only: the process instance context, so a handler test can publish
+    /// the endpoint topology that server startup normally installs.
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_runtime::bootstrap_ctx;
 }
 
 pub(crate) mod s3 {

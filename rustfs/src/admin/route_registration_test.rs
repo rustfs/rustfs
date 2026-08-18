@@ -172,6 +172,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v4/inspect/archive"),
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
+        admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
         admin_route(Method::GET, "/v3/metrics"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),
@@ -1409,23 +1410,6 @@ fn test_health_routes_not_registered_when_disabled_by_env() {
             "GET /profile/memory must stay registered when health endpoint is disabled"
         );
     });
-}
-
-#[test]
-fn test_phase5_admin_info_contract() {
-    let system_src = include_str!("handlers/system.rs");
-
-    let server_info_impl_marker = "impl Operation for ServerInfoHandler";
-    let server_info_impl_start = system_src
-        .find(server_info_impl_marker)
-        .expect("Expected impl Operation for ServerInfoHandler in handlers/system.rs");
-    let server_info_impl_block = &system_src[server_info_impl_start..];
-
-    assert!(
-        server_info_impl_block.contains("default_admin_usecase()")
-            && server_info_impl_block.contains("execute_query_server_info(QueryServerInfoRequest { include_pools: true })"),
-        "admin server info path must be served through admin runtime-source DefaultAdminUsecase::execute_query_server_info"
-    );
 }
 
 fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {

@@ -64,6 +64,7 @@ mod target_descriptor;
 pub mod tier;
 pub mod tls_debug;
 pub mod trace;
+pub mod usage_prefix;
 pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;

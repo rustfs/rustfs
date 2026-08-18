@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod datatypes;
 mod replication_bandwidth_boundary;
 mod replication_config_boundary;
 mod replication_config_store;
@@ -29,6 +28,7 @@ mod replication_object_bridge;
 mod replication_object_config;
 mod replication_object_decision_boundary;
 pub(crate) mod replication_pool;
+mod replication_proxy;
 mod replication_queue_boundary;
 mod replication_resync_boundary;
 mod replication_resyncer;
@@ -43,7 +43,6 @@ pub(crate) mod replication_timing;
 mod replication_versioning_boundary;
 mod runtime_boundary;
 
-pub use datatypes::ResyncStatusType;
 pub use replication_config_boundary::{
     ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
     REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
@@ -74,13 +73,16 @@ pub use replication_pool::{
     get_global_replication_pool, get_global_replication_stats, init_background_replication, persist_force_delete_intent,
     read_durable_mrf_backlog, resync_start_conflict_id,
 };
+pub use replication_proxy::get_proxy_targets;
 pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
     ReplicationPriority, ReplicationQueueAdmission,
 };
+pub use replication_resync_boundary::ResyncStatusType;
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
+pub use replication_target_boundary::SsecPassthroughCapability;
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;

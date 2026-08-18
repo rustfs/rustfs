@@ -585,6 +585,7 @@ mod tests {
         let decoded = decode_node_heal_status(&encoded).expect("fixed v1 fixture should decode");
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
+        assert_eq!(decoded.operations.queued_by_source.mrf, 0);
     }
 
     #[test]

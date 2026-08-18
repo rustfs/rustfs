@@ -228,9 +228,9 @@ atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.10.1" }
 aws-credential-types = { version = "1.3.0" }
-aws-sdk-kms = { default-features = false, version = "1.114.0" }
-aws-sdk-s3 = { default-features = false, version = "1.141.0" }
-aws-sdk-sts = { default-features = false, version = "1.110.0" }
+aws-sdk-kms = { default-features = false, version = "1.115.0" }
+aws-sdk-s3 = { default-features = false, version = "1.142.0" }
+aws-sdk-sts = { default-features = false, version = "1.111.0" }
 aws-smithy-http-client = { default-features = false, version = "1.3.0" }
 aws-smithy-runtime-api = { version = "1.14.0" }
 aws-smithy-types = { version = "1.6.2" }
@@ -284,13 +284,13 @@ rayon = "1.12.0"
 reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.2" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
-rumqttc = { package = "rumqttc-next", version = "0.33.3" }
-redis = { version = "1.5.0" }
+rumqttc = { package = "rumqttc-next", version = "0.34.0" }
+redis = { version = "1.6.0" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "d7028511a53f69d41ed3c69f36899f9b1aede647" }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "d358a68783096df1db0c3e314127f2704603b29e" }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
@@ -313,7 +313,7 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.24.0" }
+uuid = { version = "1.24.1" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
@@ -341,7 +341,7 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.62.6" }
+russh = { version = "0.62.7" }
 russh-sftp = "2.4.0"
 
 # WebDAV
@@ -350,7 +350,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 mimalloc = { version = "0.1.52", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11" }
 libmimalloc-sys = { version = "0.1.49", git = "https://github.com/xonatius/mimalloc_rust.git", rev = "6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11", features = ["extended"] }
-hotpath = { version = "0.23.2", default-features = false }
+hotpath = { version = "0.23.3", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 

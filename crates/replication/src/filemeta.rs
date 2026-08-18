@@ -27,6 +27,11 @@ use uuid::Uuid;
 pub const REPLICATION_RESET: &str = "replication-reset";
 pub const REPLICATION_STATUS: &str = "replication-status";
 
+/// The S3 wire spelling of the unversioned ("null") version id. Owned here as
+/// part of the replication wire contracts; `rustfs-filemeta` keeps its own
+/// copy of the same literal (the crates are intentionally independent).
+pub const NULL_VERSION_ID: &str = "null";
+
 // ReplicateQueued - replication being queued trail
 pub const REPLICATE_QUEUED: &str = "replicate:queue";
 

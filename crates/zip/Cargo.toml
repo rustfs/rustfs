@@ -20,17 +20,13 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 homepage.workspace = true
-description = "ZIP file handling for RustFS, providing support for reading and writing ZIP archives."
+description = "Archive format detection and async stream decoders for RustFS."
 keywords = ["zip", "compression", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "compression"]
 documentation = "https://docs.rs/rustfs-zip/latest/rustfs_zip/"
 
 [lib]
 doctest = false
-
-[[bench]]
-name = "zip_benchmark"
-harness = false
 
 [features]
 default = []
@@ -48,16 +44,8 @@ async-compression = { workspace = true, features = [
     "zstd",
     "xz",
 ] }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
-tokio-stream = { workspace = true }
-astral-tokio-tar = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 thiserror = { workspace = true }
-zip = { workspace = true }
-
-[dev-dependencies]
-criterion = { workspace = true, features = ["html_reports"] }
-tempfile = { workspace = true }
-
 
 [lints]
 workspace = true

@@ -37,16 +37,17 @@ pub struct PutObjReader {
     //pub sealMD5Fn: SealMD5CurrFn,
 }
 
-#[allow(dead_code)]
 impl PutObjReader {
     pub fn new(reader: HashReader) -> Self {
         Self { reader }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn md5_current_hex_string(&self) -> String {
         self.reader.checksum().map(|v| v.encoded).unwrap_or_default()
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn with_encryption(&mut self, enc_reader: HashReader) -> Result<(), std::io::Error> {
         self.reader = enc_reader;
 

@@ -19,9 +19,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
     SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
-    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, SUFFIX_TAGGING_TIMESTAMP, get_header,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
+    SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
     insert_header_map, insert_str,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
@@ -275,6 +276,19 @@ pub async fn get_opts(
     // Optionally skip per-shard bitrot hash verification on reads to save CPU.
     // Background scanner still performs full integrity checks asynchronously.
     opts.skip_verify_bitrot = get_skip_verify_bitrot();
+
+    // Anti-loop markers for the replication read proxy
+    // (`{x-rustfs-,x-minio-}source-proxy-request` header family).
+    // MinIO semantics: the header being PRESENT at all (`ProxyHeaderSet`)
+    // disables proxying, whatever its value — a peer's replication worker
+    // sends "false" on its convergence HEADs so the receiver answers locally
+    // instead of proxying the miss back (a proxied echo would fake
+    // convergence and the object would never replicate). Deliberately not
+    // gated on replication authorization: the header only disables proxying
+    // (it grants nothing).
+    let proxy_header = get_header(headers, SUFFIX_SOURCE_PROXY_REQUEST);
+    opts.proxy_header_set = proxy_header.is_some();
+    opts.proxy_request = proxy_header.map(|v| v.as_ref() == "true").unwrap_or_default();
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
@@ -2543,5 +2557,81 @@ mod tests {
                 Err(_) => prop_assert!(false, "parse_copy_source_range panicked for input {:?}", input),
             }
         }
+    }
+
+    /// The replication read-proxy anti-loop markers must be honored under
+    /// both interop prefixes (a MinIO peer sends x-minio-, a RustFS peer
+    /// sends both). `proxy_request` is set only for the literal value
+    /// "true", while `proxy_header_set` (MinIO `ProxyHeaderSet`) is set by
+    /// the header's mere presence — "false" (the replication worker's
+    /// convergence-HEAD marker) and arbitrary values included — so the
+    /// selector refuses to proxy either way.
+    #[tokio::test]
+    async fn test_get_opts_parses_source_proxy_request_under_both_prefixes() {
+        for header_name in ["x-rustfs-source-proxy-request", "x-minio-source-proxy-request"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header_name, HeaderValue::from_static("true"));
+            let opts = get_opts("test-bucket", "test-object", None, None, &headers)
+                .await
+                .expect("get_opts should succeed");
+            assert!(opts.proxy_request, "{header_name} must set opts.proxy_request");
+            assert!(opts.proxy_header_set, "{header_name} must set opts.proxy_header_set");
+        }
+
+        let opts = get_opts("test-bucket", "test-object", None, None, &HeaderMap::new())
+            .await
+            .expect("get_opts should succeed");
+        assert!(!opts.proxy_request, "absent header must leave proxy_request off");
+        assert!(!opts.proxy_header_set, "absent header must leave proxy_header_set off");
+
+        for (header_name, value) in [
+            ("x-minio-source-proxy-request", "false"),
+            ("x-rustfs-source-proxy-request", "false"),
+            ("x-minio-source-proxy-request", "anything-else"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header_name, HeaderValue::from_static(value));
+            let opts = get_opts("test-bucket", "test-object", None, None, &headers)
+                .await
+                .expect("get_opts should succeed");
+            assert!(!opts.proxy_request, "{header_name}: non-'true' value must leave proxy_request off");
+            assert!(
+                opts.proxy_header_set,
+                "{header_name}: value {value:?} must still set proxy_header_set (presence disables proxying)"
+            );
+        }
+    }
+
+    /// Pin that the source-proxy-request transport family cannot be
+    /// materialized as bare stored metadata via an `x-*-meta-` disguise: the
+    /// reserved-key namespacing (`x-rustfs-source-` / `x-minio-source-`
+    /// prefixes in `is_reserved_user_metadata_key`) must keep covering it.
+    #[test]
+    fn test_source_proxy_request_family_is_reserved_user_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-x-minio-source-proxy-request", HeaderValue::from_static("true"));
+        headers.insert("x-rustfs-meta-x-rustfs-source-proxy-request", HeaderValue::from_static("true"));
+        // The bare transport header itself is not a user-metadata prefix and
+        // must never land in stored metadata at all.
+        headers.insert("x-minio-source-proxy-request", HeaderValue::from_static("true"));
+
+        let metadata = extract_metadata(&headers);
+
+        assert!(
+            !metadata.contains_key("x-minio-source-proxy-request"),
+            "bare source-proxy-request key must not be storable: {metadata:?}"
+        );
+        assert!(
+            !metadata.contains_key("x-rustfs-source-proxy-request"),
+            "bare source-proxy-request key must not be storable: {metadata:?}"
+        );
+        assert!(
+            metadata.contains_key("x-amz-meta-x-minio-source-proxy-request"),
+            "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
+        );
+        assert!(
+            metadata.contains_key("x-amz-meta-x-rustfs-source-proxy-request"),
+            "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
+        );
     }
 }

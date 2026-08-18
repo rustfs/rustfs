@@ -36,11 +36,15 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub(crate) use crate::bucket::bucket_target_sys::{
-    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient, resolve_read_api_version_id,
 };
 #[cfg(test)]
 pub(crate) use crate::bucket::target::BucketTarget;
 pub(crate) use crate::bucket::target::BucketTargets;
+pub use rustfs_replication::SsecPassthroughCapability;
+pub(crate) use rustfs_replication::{
+    SsecPassthroughGate, is_replication_target_offline_error, ssec_passthrough_gate, version_identity_drifted,
+};
 
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result};
@@ -65,6 +69,8 @@ static STANDARD_HEADERS: &[&str] = &[
 ];
 
 const ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED: &str = "replication source contains unsupported encryption metadata";
+pub(crate) const ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED: &str = "replication target does not support SSE-C passthrough: the replica would lose its decryption material \
+     (run ?replication-check to re-probe)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationSourceEncryption {
@@ -146,6 +152,13 @@ pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String
     rustfs_replication::is_ssec_encrypted(user_defined)
 }
 
+/// HeadObjectOutput adapter over the pure SSE-C passthrough evidence
+/// judgment owned by `rustfs-replication`: extract the echoed
+/// customer-algorithm header and let the crate-owned policy decide.
+pub(crate) fn ssec_passthrough_evidence_present(head: &HeadObjectOutput) -> bool {
+    rustfs_replication::ssec_passthrough_evidence_present(head.sse_customer_algorithm.as_deref())
+}
+
 pub(crate) struct ReplicationTargetStore;
 
 impl ReplicationTargetStore {
@@ -163,6 +176,17 @@ impl ReplicationTargetStore {
 
     pub(crate) async fn mark_target_offline(target_client: &Arc<TargetClient>) {
         BucketTargetSys::get().mark_target_offline(target_client).await
+    }
+
+    /// Returns the cached verdict and whether it has outlived its TTL.
+    pub(crate) async fn ssec_passthrough_capability(arn: &str) -> (SsecPassthroughCapability, bool) {
+        BucketTargetSys::get().ssec_passthrough_capability(arn).await
+    }
+
+    pub(crate) async fn record_ssec_passthrough_capability(arn: &str, capability: SsecPassthroughCapability) {
+        BucketTargetSys::get()
+            .record_ssec_passthrough_capability(arn, capability)
+            .await
     }
 
     #[cfg(test)]
@@ -896,6 +920,27 @@ mod tests {
             assert!(err.to_string().contains(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
             assert!(!err.to_string().contains("sealed-envelope"));
         }
+    }
+
+    /// Pins the HeadObjectOutput field extraction feeding the crate-owned
+    /// evidence judgment (the gate/evidence policy matrix itself is pinned in
+    /// `rustfs-replication`'s object tests).
+    #[test]
+    fn ssec_passthrough_evidence_requires_customer_algorithm_echo() {
+        let with_evidence = HeadObjectOutput::builder().sse_customer_algorithm("AES256").build();
+        assert!(ssec_passthrough_evidence_present(&with_evidence));
+
+        let empty_algorithm = HeadObjectOutput::builder().sse_customer_algorithm("").build();
+        assert!(
+            !ssec_passthrough_evidence_present(&empty_algorithm),
+            "an empty echo is not evidence of preserved SSE-C material"
+        );
+
+        let without_evidence = HeadObjectOutput::builder().e_tag("\"abc\"").content_length(8).build();
+        assert!(
+            !ssec_passthrough_evidence_present(&without_evidence),
+            "a plain HEAD response must classify the target as having dropped the material"
+        );
     }
 
     #[test]
