@@ -3383,17 +3383,19 @@ mod tests {
         audience: String,
         disk_info_calls: Arc<AtomicU32>,
         read_all_calls: Arc<AtomicU32>,
-        read_all_disks: Arc<StdMutex<Vec<String>>>,
+        object_read_all_disks: Arc<StdMutex<Vec<String>>>,
+        format_data: Bytes,
         read_all_data: Bytes,
     }
 
     impl AuthenticatedReadPeer {
-        fn new(audience: String, read_all_data: Bytes) -> Self {
+        fn new(audience: String, format_data: Bytes, read_all_data: Bytes) -> Self {
             Self {
                 audience,
                 disk_info_calls: Arc::new(AtomicU32::new(0)),
                 read_all_calls: Arc::new(AtomicU32::new(0)),
-                read_all_disks: Arc::default(),
+                object_read_all_disks: Arc::default(),
+                format_data,
                 read_all_data,
             }
         }
@@ -3406,8 +3408,11 @@ mod tests {
             self.read_all_calls.load(Ordering::Acquire)
         }
 
-        fn read_all_disks(&self) -> Vec<String> {
-            self.read_all_disks.lock().expect("read_all disk list lock poisoned").clone()
+        fn object_read_all_disks(&self) -> Vec<String> {
+            self.object_read_all_disks
+                .lock()
+                .expect("object read_all disk list lock poisoned")
+                .clone()
         }
 
         fn verify_auth<T>(&self, request: &Request<T>, path: &str) -> std::result::Result<(), Status> {
@@ -3497,14 +3502,20 @@ mod tests {
                             Box::pin(async move {
                                 peer.verify_auth(&request, "/node_service.NodeService/ReadAll")?;
                                 let request = request.into_inner();
+                                let disk = request.disk;
                                 peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
-                                peer.read_all_disks
-                                    .lock()
-                                    .expect("read_all disk list lock poisoned")
-                                    .push(request.disk);
+                                let data = if request.path.ends_with("format.json") {
+                                    peer.format_data.clone()
+                                } else {
+                                    peer.object_read_all_disks
+                                        .lock()
+                                        .expect("object read_all disk list lock poisoned")
+                                        .push(disk);
+                                    peer.read_all_data.clone()
+                                };
                                 Ok(Response::new(ReadAllResponse {
                                     success: true,
-                                    data: peer.read_all_data.clone(),
+                                    data,
                                     error: None,
                                 }))
                             })
@@ -3538,7 +3549,7 @@ mod tests {
     }
 
     impl TestGrpcPeer {
-        async fn spawn(read_all_data: Bytes) -> Option<Self> {
+        async fn spawn(format_data: Bytes, read_all_data: Bytes) -> Option<Self> {
             let listener = match TcpListener::bind("127.0.0.1:0").await {
                 Ok(listener) => listener,
                 Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
@@ -3548,7 +3559,7 @@ mod tests {
             let addr = format!("http://{socket_addr}");
             let audience = crate::cluster::rpc::normalize_tonic_rpc_audience(&socket_addr.to_string())
                 .expect("test audience should normalize");
-            let peer = AuthenticatedReadPeer::new(audience, read_all_data);
+            let peer = AuthenticatedReadPeer::new(audience, format_data, read_all_data);
             let service = AuthenticatedReadPeerService { peer: peer.clone() };
             let shutdown = CancellationToken::new();
             let shutdown_for_task = shutdown.clone();
@@ -4746,7 +4757,11 @@ mod tests {
     #[serial(remote_disk_recovery_probe)]
     async fn recovery_monitor_restores_online_then_real_reads_use_replacement_handle() {
         runtime_sources::ensure_test_rpc_secret();
-        let Some(peer) = TestGrpcPeer::spawn(Bytes::from_static(b"replacement-data")).await else {
+        let mut format = crate::layout::format::FormatV3::new(1, 1);
+        let disk_id = format.erasure.sets[0][0];
+        format.erasure.this = disk_id;
+        let format_data = Bytes::from(format.to_json().expect("test format should serialize"));
+        let Some(peer) = TestGrpcPeer::spawn(format_data, Bytes::from_static(b"replacement-data")).await else {
             return;
         };
         let url = url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("endpoint should parse");
@@ -4800,35 +4815,49 @@ mod tests {
                 let recovered_read = disk.read_all("bucket", "object").await.expect("recovered handle should read");
                 assert_eq!(recovered_read, Bytes::from_static(b"replacement-data"));
 
-                let replacement = RemoteDisk::new(
+                let old_disk = crate::disk::new_disk(
                     &endpoint,
                     &DiskOption {
                         cleanup: false,
                         health_check: false,
                     },
-                    Arc::new(TcpHttpInternodeDataTransport),
                 )
                 .await
-                .expect("replacement remote disk should construct");
-                let replacement_id = Uuid::new_v4();
-                replacement
-                    .set_disk_id(Some(replacement_id))
-                    .await
-                    .expect("replacement disk id should set");
+                .expect("old slot disk should construct");
+                let set_disks = crate::set_disk::SetDisks::new(
+                    "remote-recovery-test".to_string(),
+                    Arc::new(tokio::sync::RwLock::new(vec![Some(old_disk.clone())])),
+                    1,
+                    0,
+                    0,
+                    0,
+                    vec![endpoint.clone()],
+                    format.clone(),
+                    Vec::new(),
+                )
+                .await;
+                set_disks.disks.write().await[0] = None;
+                set_disks.renew_disk(&endpoint).await;
+
+                let slots = set_disks.disks.read().await;
+                let replacement = slots[0]
+                    .as_ref()
+                    .expect("renew_disk should publish the replacement slot")
+                    .clone();
+                drop(slots);
+                assert!(!Arc::ptr_eq(&replacement, &old_disk), "renew_disk must replace the stale slot handle");
                 let replacement_read = replacement
                     .read_all("bucket", "object")
                     .await
-                    .expect("replacement handle should route real reads");
-
+                    .expect("production slot should route real reads through the replacement");
                 assert_eq!(replacement_read, Bytes::from_static(b"replacement-data"));
-                assert_eq!(peer.peer.read_all_calls(), 2);
-                assert_eq!(
-                    peer.peer.read_all_disks(),
-                    vec![endpoint.to_string(), replacement_id.to_string()],
-                    "real reads must use the current handle's disk reference"
-                );
+                let object_reads = peer.peer.object_read_all_disks();
+                assert_eq!(object_reads.len(), 2, "standalone and production-slot reads should both reach the peer");
+                assert_eq!(object_reads[1], disk_id.to_string(), "production slot must use the renewed disk identity");
+                assert!(peer.peer.read_all_calls() >= 3, "renewal must read format metadata before the slot read");
                 disk.cancel_token.cancel();
-                replacement.cancel_token.cancel();
+                old_disk.close().await.expect("old slot disk should close");
+                replacement.close().await.expect("replacement slot disk should close");
             },
         )
         .await;
