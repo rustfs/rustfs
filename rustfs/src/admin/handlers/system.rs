@@ -1541,6 +1541,84 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
+    /// `ServerInfoHandler` must answer an authorized admin request with the
+    /// per-pool erasure-set topology (rustfs/backlog#1839). That map is only
+    /// filled when the server-info query is issued with pools included, so a
+    /// handler that stopped asking for them would still return 200 with an
+    /// empty `pools` object instead of failing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_info_response_carries_pool_topology() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use crate::admin::storage_api::runtime::bootstrap_ctx;
+        use http_body_util::BodyExt as _;
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+        use std::sync::Arc;
+
+        const ROOT_ACCESS_KEY: &str = "SERVERINFOROOTACCESSKEY";
+        const ROOT_SECRET_KEY: &str = "serverInfoRootSecret123";
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("admin_server_info_pools")
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        // Server startup owns this write in production; the test bootstrap
+        // stops short of it, and without a topology the server-info query
+        // returns before it ever looks at drives.
+        bootstrap_ctx().set_endpoints(env.endpoint_pools.clone());
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+
+        let request = S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v3/info"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: ROOT_ACCESS_KEY.to_string(),
+                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let (status, body) = super::ServerInfoHandler {}
+            .call(request, Params::new())
+            .await
+            .expect("root admin credentials must be served server info")
+            .output;
+        assert_eq!(status, hyper::StatusCode::OK);
+
+        let bytes = body.collect().await.expect("server info body should read").to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("server info must be json");
+        let pools = payload["info"]["pools"]
+            .as_object()
+            .expect("server info must carry a pools object");
+        assert!(
+            pools.contains_key("0"),
+            "server info must report the erasure-set topology of pool 0, got {pools:?}"
+        );
+    }
+
     /// Authorization denial for this exact action is pinned to AccessDenied by
     /// `crate::admin::auth::tests::non_admin_credential_is_denied`.
     #[test]
