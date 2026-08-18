@@ -20,6 +20,7 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderName, HeaderValue};
+use rustfs_utils::http::headers::AMZ_CHECKSUM_MODE;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -76,7 +77,7 @@ impl GetObjectOptions {
             }
         }
         if self.checksum {
-            headers.insert(HeaderName::from_static("x-amz-checksum-mode"), HeaderValue::from_static("ENABLED"));
+            headers.insert(HeaderName::from_static(AMZ_CHECKSUM_MODE), HeaderValue::from_static("ENABLED"));
         }
         headers
     }

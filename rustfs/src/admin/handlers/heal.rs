@@ -330,6 +330,7 @@ fn add_source_counts(total: &mut rustfs_heal::HealSourceCounts, next: rustfs_hea
     total.auto_heal = total.auto_heal.saturating_add(next.auto_heal);
     total.internal = total.internal.saturating_add(next.internal);
     total.read_repair = total.read_repair.saturating_add(next.read_repair);
+    total.mrf = total.mrf.saturating_add(next.mrf);
 }
 
 fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_heal::HealOperationsSnapshot) {
@@ -2375,6 +2376,7 @@ mod tests {
             auto_heal: value,
             internal: value,
             read_repair: value,
+            mrf: value,
         };
         let operations = |value| rustfs_heal::HealOperationsSnapshot {
             queue_length: value,

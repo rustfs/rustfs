@@ -1783,7 +1783,7 @@ impl TransitionState {
                                 .await;
                             }
                             global_metrics().record_scanner_transition_failed(1);
-                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
+                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) {
                                 error!(
                                     event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
                                     component = LOG_COMPONENT_ECSTORE,

@@ -67,6 +67,9 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
+use rustfs_utils::http::headers::{
+    AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_SHA1, AMZ_CHECKSUM_SHA256, AMZ_CHECKSUM_TYPE,
+};
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -1031,28 +1034,24 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         )?;
     }
     if let Some(checksum_crc32) = &output.checksum_crc32 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32"), checksum_crc32.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC32), checksum_crc32.clone())?;
     }
     if let Some(checksum_crc32c) = &output.checksum_crc32c {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32c"), checksum_crc32c.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC32C), checksum_crc32c.clone())?;
     }
     if let Some(checksum_crc64nvme) = &output.checksum_crc64nvme {
-        insert_string_header(
-            &mut headers,
-            HeaderName::from_static("x-amz-checksum-crc64nvme"),
-            checksum_crc64nvme.clone(),
-        )?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC64NVME), checksum_crc64nvme.clone())?;
     }
     if let Some(checksum_sha1) = &output.checksum_sha1 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha1"), checksum_sha1.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_SHA1), checksum_sha1.clone())?;
     }
     if let Some(checksum_sha256) = &output.checksum_sha256 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha256"), checksum_sha256.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_SHA256), checksum_sha256.clone())?;
     }
     if let Some(checksum_type) = &output.checksum_type {
         insert_string_header(
             &mut headers,
-            HeaderName::from_static("x-amz-checksum-type"),
+            HeaderName::from_static(AMZ_CHECKSUM_TYPE),
             checksum_type.as_str().to_string(),
         )?;
     }
@@ -1114,12 +1113,12 @@ fn clear_object_lambda_variant_headers(headers: &mut HeaderMap) {
         http::header::ETAG,
         http::header::LAST_MODIFIED,
         http::header::EXPIRES,
-        HeaderName::from_static("x-amz-checksum-crc32"),
-        HeaderName::from_static("x-amz-checksum-crc32c"),
-        HeaderName::from_static("x-amz-checksum-crc64nvme"),
-        HeaderName::from_static("x-amz-checksum-sha1"),
-        HeaderName::from_static("x-amz-checksum-sha256"),
-        HeaderName::from_static("x-amz-checksum-type"),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC32),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC32C),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC64NVME),
+        HeaderName::from_static(AMZ_CHECKSUM_SHA1),
+        HeaderName::from_static(AMZ_CHECKSUM_SHA256),
+        HeaderName::from_static(AMZ_CHECKSUM_TYPE),
         HeaderName::from_static("x-amz-tagging-count"),
         HeaderName::from_static("x-amz-request-route"),
         HeaderName::from_static("x-amz-request-token"),
