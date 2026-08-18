@@ -270,6 +270,8 @@ pub struct HealSourceCounts {
     pub auto_heal: u64,
     pub internal: u64,
     pub read_repair: u64,
+    #[serde(default)]
+    pub mrf: u64,
 }
 
 impl HealSourceCounts {
@@ -280,6 +282,7 @@ impl HealSourceCounts {
             HealRequestSource::AutoHeal => self.auto_heal += 1,
             HealRequestSource::Internal => self.internal += 1,
             HealRequestSource::ReadRepair => self.read_repair += 1,
+            HealRequestSource::Mrf => self.mrf += 1,
         }
     }
 }
@@ -2385,8 +2388,27 @@ impl HealManager {
             snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
             snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
             snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
+            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
+            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
+            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
+            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
             snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
+            snapshot.start_time = match (snapshot.start_time, progress.start_time) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
+                (Some(current), Some(next)) => Some(current.max(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            if progress.current_object.is_some() {
+                snapshot.current_object = progress.current_object;
+            }
         }
+        snapshot.refresh_progress_percentage();
+        snapshot.refresh_estimated_completion_time();
         Some(snapshot)
     }
 
@@ -3208,6 +3230,7 @@ impl HealManager {
                         } else {
                             completed_task.get_status().await
                         };
+                        let completed_progress = completed_task.get_progress().await;
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
@@ -3223,6 +3246,7 @@ impl HealManager {
                         match completed_status {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
+                                stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);
                             }
                             HealTaskStatus::Retrying { .. } => {}
                             _ => {
@@ -3749,6 +3773,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -5396,6 +5421,8 @@ mod tests {
         ));
         {
             let mut progress = first.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(20));
+            progress.set_total_baseline(12, 8192);
             progress.update_progress(7, 3, 1, 4096);
         }
 
@@ -5405,6 +5432,8 @@ mod tests {
         ));
         {
             let mut progress = second.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+            progress.set_total_baseline(8, 4096);
             progress.update_progress(11, 5, 2, 2048);
         }
 
@@ -5419,7 +5448,11 @@ mod tests {
         assert_eq!(progress.objects_scanned, 18);
         assert_eq!(progress.objects_healed, 8);
         assert_eq!(progress.objects_failed, 3);
+        assert_eq!(progress.objects_total_count, 20);
+        assert_eq!(progress.objects_total_size, 12288);
         assert_eq!(progress.bytes_processed, 6144);
+        assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+        assert!(progress.estimated_completion_time.is_some());
     }
 
     #[tokio::test]

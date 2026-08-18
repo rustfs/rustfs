@@ -1559,6 +1559,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/object-zip-downloads",
         DeferredRoutePolicyReason::S3Action,

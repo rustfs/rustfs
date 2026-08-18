@@ -108,6 +108,9 @@ temp-env = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+# Test-only: pins the emitted scanner alert wire names against the canonical
+# EventName string forms subscribers configure (rustfs/backlog#1868).
+rustfs-s3-types.workspace = true
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }

@@ -16,7 +16,6 @@
 
 mod audit;
 pub mod com;
-#[allow(dead_code)]
 pub mod heal;
 mod notify;
 mod oidc;

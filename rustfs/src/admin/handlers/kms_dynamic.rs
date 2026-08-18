@@ -22,6 +22,7 @@ use crate::admin::runtime_sources::{
     current_object_store_handle_for_context, current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::error::StorageError;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
@@ -278,8 +279,11 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
             }
         },
         Err(e) => {
-            // Config not found is normal on first run
-            if e.to_string().contains("ConfigNotFound") || e.to_string().contains("not found") {
+            // Config not found is normal on first run: `read_config` maps a missing or
+            // empty config object to `ConfigNotFound`, so that variant is the only
+            // "absent" signal reaching here. Every other not-found variant (disk,
+            // volume, bucket) means degraded storage and must stay a warning.
+            if matches!(e, StorageError::ConfigNotFound) {
                 info!(
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_KMS,

@@ -13,12 +13,10 @@
 // limitations under the License.
 
 pub mod access;
-pub mod backpressure;
 pub mod concurrency;
 pub mod deadlock_detector;
 pub mod ecfs;
 pub(crate) mod helper;
-pub mod lock_optimizer;
 pub mod options;
 pub mod request_context;
 pub mod rpc;
