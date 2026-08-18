@@ -109,6 +109,17 @@ pub fn put_stage_timer() -> Option<std::time::Instant> {
     put_stage_metrics_enabled().then(std::time::Instant::now)
 }
 
+pub const PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT: &str = "set_disk_rename_quorum_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT: &str = "set_disk_rename_file_sync_permit_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT: &str = "set_disk_rename_global_file_sync_permit_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC: &str = "set_disk_rename_file_fdatasync";
+pub const PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC: &str = "set_disk_rename_src_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC: &str = "set_disk_rename_dst_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC: &str = "set_disk_rename_backup_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC: &str = "set_disk_rename_ancestor_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rename_syscall";
+
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
     GET_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
@@ -2618,6 +2629,7 @@ mod tests {
     use super::*;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier, Mutex};
 
     // Serialize tests that mutate the process-global PUT_STAGE_METRICS_ENABLED flag.
@@ -2859,6 +2871,63 @@ mod tests {
         record_put_object_diagnostics("zero_copy_eager", "eligible", 32 * 1024 * 1024, 256 * 1024, true);
         assert!(put_stage_metrics_enabled());
         set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn put_stage_sync_tail_labels_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stages = [
+            PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC,
+            PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+        ];
+        let unique = stages.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), stages.len());
+        assert!(
+            stages
+                .iter()
+                .all(|stage| stage.starts_with("set_disk_rename_") && !stage.contains('/') && !stage.contains('{'))
+        );
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            for stage in stages {
+                record_put_object_stage_duration(stage, 1.0);
+            }
+            set_put_stage_metrics_enabled(true);
+            for stage in stages {
+                record_put_object_stage_duration(stage, 1.0);
+            }
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let recorded = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded.len(), stages.len());
+        assert!(stages.iter().all(|stage| recorded.contains(*stage)));
     }
 
     #[test]

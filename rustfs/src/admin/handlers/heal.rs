@@ -66,6 +66,9 @@ struct HealInitParams {
     client_token: String,
     force_start: bool,
     force_stop: bool,
+    /// Incremental result cursor (HS-06): only result items with a sequence
+    /// greater than this are returned; absent means full snapshot.
+    since_seq: Option<u64>,
 }
 
 fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
@@ -97,6 +100,16 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
                         return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
                     }
                     hip.force_stop = parse_heal_query_bool(value.as_ref())?;
+                }
+                "sinceSeq" => {
+                    if !seen.insert("sinceSeq") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.since_seq = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| s3_error!(InvalidArgument, "sinceSeq must be a non-negative integer"))?,
+                    );
                 }
                 _ => return Err(s3_error!(InvalidArgument, "unknown heal query parameter")),
             }
@@ -978,7 +991,15 @@ fn reject_heal_admission(result: rustfs_common::heal_channel::HealAdmissionResul
             result.result_label(),
             result.reason_label()
         ),
-        HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => s3_error!(
+        // Overlap rejections (HS-06) share this arm: the s3s footprint
+        // ratchet forbids new s3_error! sites, and the typed reason is
+        // preserved through reason_label() ("already_running" /
+        // "overlapping_paths") so madmin-style clients can distinguish.
+        HealAdmissionResult::Dropped(
+            HealAdmissionDropReason::PolicyDropped
+            | HealAdmissionDropReason::AlreadyRunning
+            | HealAdmissionDropReason::OverlappingPaths,
+        ) => s3_error!(
             OperationAborted,
             "heal request not admitted: admission={}, reason={}",
             result.result_label(),
@@ -1403,6 +1424,7 @@ impl Operation for HealHandler {
                 new_heal_control_metadata(&route)?,
                 heal_path,
                 client_token.clone(),
+                hip.since_seq,
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
             let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;

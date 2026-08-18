@@ -177,16 +177,38 @@ impl StartCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    Start { request: StartCommand },
-    Query { heal_path: String, client_token: String },
-    Cancel { heal_path: String, client_token: String },
+    Start {
+        request: StartCommand,
+    },
+    Query {
+        heal_path: String,
+        client_token: String,
+        /// Incremental result cursor (HS-06): only items with a sequence
+        /// greater than this are returned. Absent = legacy full snapshot.
+        /// Optional + defaulted so older peers stay wire-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_seq: Option<u64>,
+    },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+    },
 }
 
 #[derive(Debug)]
 pub enum ExecutableCommand {
-    Start { request: HealChannelRequest },
-    Query { heal_path: String, client_token: String },
-    Cancel { heal_path: String, client_token: String },
+    Start {
+        request: HealChannelRequest,
+    },
+    Query {
+        heal_path: String,
+        client_token: String,
+        since_seq: Option<u64>,
+    },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,8 +249,22 @@ impl Envelope {
         )
     }
 
-    pub fn query(request_id: String, metadata: RequestMetadata, heal_path: String, client_token: String) -> Result<Self, String> {
-        Self::new(request_id, metadata, Command::Query { heal_path, client_token })
+    pub fn query(
+        request_id: String,
+        metadata: RequestMetadata,
+        heal_path: String,
+        client_token: String,
+        since_seq: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::new(
+            request_id,
+            metadata,
+            Command::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            },
+        )
     }
 
     pub fn cancel(
@@ -286,7 +322,15 @@ impl Envelope {
             Command::Start { request } => ExecutableCommand::Start {
                 request: request.into_channel_request(self.request_id.clone())?,
             },
-            Command::Query { heal_path, client_token } => ExecutableCommand::Query { heal_path, client_token },
+            Command::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            } => ExecutableCommand::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            },
             Command::Cancel { heal_path, client_token } => ExecutableCommand::Cancel { heal_path, client_token },
         };
         Ok((self.request_id, self.coordinator_epoch, command))
@@ -305,6 +349,11 @@ pub enum Admission {
     Full,
     DroppedQueueFull,
     DroppedPolicy,
+    /// HS-06: admin start rejected because the same target is already being
+    /// healed (RUSTFS_HEAL_OVERLAP_POLICY=minio_error only).
+    DroppedAlreadyRunning,
+    /// HS-06: admin start rejected because its path overlaps an active heal.
+    DroppedOverlappingPaths,
 }
 
 impl From<HealAdmissionResult> for Admission {
@@ -315,6 +364,8 @@ impl From<HealAdmissionResult> for Admission {
             HealAdmissionResult::Full => Self::Full,
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull) => Self::DroppedQueueFull,
             HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => Self::DroppedPolicy,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning) => Self::DroppedAlreadyRunning,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths) => Self::DroppedOverlappingPaths,
         }
     }
 }
@@ -331,6 +382,8 @@ impl Admission {
             Self::Full => HealAdmissionResult::Full,
             Self::DroppedQueueFull => HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
             Self::DroppedPolicy => HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
+            Self::DroppedAlreadyRunning => HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning),
+            Self::DroppedOverlappingPaths => HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
         }
     }
 }
@@ -592,6 +645,7 @@ mod tests {
             metadata(2, 7),
             "bucket/prefix".to_string(),
             "token".to_string(),
+            None,
         )
         .unwrap();
         let cancel = Envelope::cancel(
@@ -667,6 +721,7 @@ mod tests {
             RequestMetadata::new([0x11; 16], 1_700_000_000_000, 1_700_000_030_000, 9),
             "bucket/prefix".to_string(),
             "client-token".to_string(),
+            None,
         )
         .unwrap();
         let cancel = Envelope::cancel(
@@ -749,7 +804,7 @@ mod tests {
         assert!(Envelope::start(test_request(request_id.clone()), metadata(0, 7)).is_err());
         assert!(Envelope::start(test_request(request_id.clone()), metadata(1, 0)).is_err());
         assert!(Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 1_000, 31_001, 7),).is_err());
-        assert!(Envelope::query(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_err());
+        assert!(Envelope::query(request_id.clone(), metadata(1, 7), String::new(), String::new(), None).is_err());
         assert!(Envelope::cancel(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_ok());
 
         let mut noncanonical_request = test_request(request_id.to_uppercase());
@@ -782,6 +837,7 @@ mod tests {
             metadata(1, 7),
             "x".repeat(ENVELOPE_MAX_SIZE),
             "token".to_string(),
+            None,
         )
         .unwrap();
         let error = super::encode_envelope(&oversized).unwrap_err();

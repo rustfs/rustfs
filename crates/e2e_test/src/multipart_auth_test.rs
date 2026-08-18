@@ -30,7 +30,6 @@ use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Cursor;
@@ -356,7 +355,6 @@ async fn run_post_object_policy_case(
 /// smuggles one extra field the policy never declared, and the upload must be
 /// rejected with 403 AccessDenied naming the offending field.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_fields_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -484,7 +482,6 @@ async fn test_anonymous_post_object_rejects_fields_missing_from_policy_condition
 /// sends a different one, and the upload must be rejected with 400
 /// InvalidPolicyDocument naming the field.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_exact_condition_policy_mismatches()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -689,7 +686,6 @@ async fn test_anonymous_post_object_rejects_exact_condition_policy_mismatches()
 /// one of them with a different value, and the upload must be rejected with
 /// 400 InvalidPolicyDocument naming the mismatched field.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_policy_mismatches() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -757,7 +753,6 @@ async fn test_anonymous_post_object_rejects_object_lock_policy_mismatches() -> R
 /// exact values, the form sends a different parameter value, and the upload
 /// must be rejected with 400 InvalidPolicyDocument naming the parameter.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_kms_policy_mismatches() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -839,7 +834,6 @@ async fn test_anonymous_post_object_rejects_sse_kms_policy_mismatches() -> Resul
 /// NotImplemented (SSE-KMS POST uploads are not implemented), not with a
 /// policy error.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_kms_params_outside_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -894,7 +888,6 @@ async fn test_anonymous_post_object_rejects_sse_kms_params_outside_policy_condit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -968,7 +961,6 @@ async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1002,7 +994,6 @@ async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_honors_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1066,7 +1057,6 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1139,7 +1129,6 @@ async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1185,7 +1174,6 @@ async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1232,7 +1220,6 @@ async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1290,7 +1277,6 @@ async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1363,7 +1349,6 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1437,7 +1422,6 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1488,7 +1472,6 @@ async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_sse_s3_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1552,7 +1535,6 @@ async fn test_anonymous_post_object_accepts_sse_s3_missing_from_policy_condition
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1606,7 +1588,6 @@ async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1657,7 +1638,6 @@ async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_co
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_storage_class_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -1709,7 +1689,6 @@ async fn test_anonymous_post_object_rejects_invalid_storage_class_value() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_algorithm_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1765,7 +1744,6 @@ async fn test_anonymous_post_object_rejects_checksum_algorithm_missing_from_poli
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_algorithm_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1822,7 +1800,6 @@ async fn test_anonymous_post_object_rejects_checksum_algorithm_policy_mismatch()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_auxiliary_fields_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1886,7 +1863,6 @@ async fn test_anonymous_post_object_rejects_checksum_auxiliary_fields_missing_fr
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1963,7 +1939,6 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -2022,7 +1997,6 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_duplicate_key_form_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -2072,7 +2046,6 @@ async fn test_anonymous_post_object_rejects_duplicate_key_form_values() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -2120,7 +2093,6 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2168,7 +2140,6 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2223,7 +2194,6 @@ async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_cond
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2280,7 +2250,6 @@ async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_condit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -2335,7 +2304,6 @@ async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_content_length_range_violation()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2388,7 +2356,6 @@ async fn test_anonymous_post_object_rejects_content_length_range_violation()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_success_action_status_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2445,7 +2412,6 @@ async fn test_anonymous_post_object_accepts_success_action_status_exact_policy_m
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_success_action_redirect_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2502,7 +2468,6 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_policy_misma
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_success_action_redirect_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2568,7 +2533,6 @@ async fn test_anonymous_post_object_accepts_success_action_redirect_exact_policy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2621,7 +2585,6 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_metadata_field_covered_by_starts_with()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2676,7 +2639,6 @@ async fn test_anonymous_post_object_accepts_metadata_field_covered_by_starts_wit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_type_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2734,7 +2696,6 @@ async fn test_anonymous_post_object_accepts_content_type_field_exact_policy_matc
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_type_field_covered_by_starts_with()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2792,7 +2753,6 @@ async fn test_anonymous_post_object_accepts_content_type_field_covered_by_starts
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_disposition_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2850,7 +2810,6 @@ async fn test_anonymous_post_object_accepts_content_disposition_field_exact_poli
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2908,7 +2867,6 @@ async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_mat
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2966,7 +2924,6 @@ async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_encoding_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3024,7 +2981,6 @@ async fn test_anonymous_post_object_accepts_content_encoding_field_exact_policy_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_website_redirect_location_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3082,7 +3038,6 @@ async fn test_anonymous_post_object_accepts_website_redirect_location_exact_poli
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3140,7 +3095,6 @@ async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_retention_without_permission()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3196,7 +3150,6 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_without_permis
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3256,7 +3209,6 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_p
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_without_permission()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3309,7 +3261,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_without_permi
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3368,7 +3319,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_policy_mismat
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3426,7 +3376,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_missing_from_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3492,7 +3441,6 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_metadata_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3551,7 +3499,6 @@ async fn test_anonymous_post_object_accepts_metadata_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3604,7 +3551,6 @@ async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_condit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -3657,7 +3603,6 @@ async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -3712,7 +3657,6 @@ async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_multiple_bucket_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -3764,7 +3708,6 @@ async fn test_anonymous_post_object_rejects_multiple_bucket_values() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3820,7 +3763,6 @@ async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3891,7 +3833,6 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_objects()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3956,7 +3897,6 @@ async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4004,7 +3944,6 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4047,7 +3986,6 @@ async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4083,7 +4021,6 @@ async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4137,7 +4074,6 @@ async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_error_body()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4176,7 +4112,6 @@ async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_put_object_write_offset_bytes_returns_minio_compatible_error_body()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4235,7 +4170,6 @@ async fn test_anonymous_put_object_write_offset_bytes_returns_minio_compatible_e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4300,7 +4234,6 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4356,7 +4289,6 @@ async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4421,7 +4353,6 @@ async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_object_lock_legal_hold() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -4476,7 +4407,6 @@ async fn test_signed_put_object_extract_preserves_object_lock_legal_hold() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -4536,7 +4466,6 @@ async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_pax_retention_overrides_request_retention()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4600,7 +4529,6 @@ async fn test_signed_put_object_extract_pax_retention_overrides_request_retentio
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4634,7 +4562,6 @@ async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4670,7 +4597,6 @@ async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4724,7 +4650,6 @@ async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retention_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5034,7 +4959,6 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_accepts_compat_header() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5076,7 +5000,6 @@ async fn test_signed_put_object_extract_accepts_compat_header() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_directory_markers_by_default()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5137,7 +5060,6 @@ async fn test_signed_put_object_extract_preserves_directory_markers_by_default()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tar_gz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5189,7 +5111,6 @@ async fn test_signed_put_object_extract_expands_tar_gz_archive() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tgz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5241,7 +5162,6 @@ async fn test_signed_put_object_extract_expands_tgz_archive() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tbz2_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5293,7 +5213,6 @@ async fn test_signed_put_object_extract_expands_tbz2_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_txz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5345,7 +5264,6 @@ async fn test_signed_put_object_extract_expands_txz_archive() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5419,7 +5337,6 @@ async fn test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_normalizes_prefix_header_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5462,7 +5379,6 @@ async fn test_signed_put_object_extract_normalizes_prefix_header_value() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5514,7 +5430,6 @@ async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -5548,7 +5463,6 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_invalid_tar_gz_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
