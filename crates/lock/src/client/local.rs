@@ -464,7 +464,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(11)).await;
 
         assert!(
-            !client.refresh(&lock_id).await.expect("expired refresh should return a result"),
+            !client
+                .refresh(&lock_id)
+                .await
+                .expect("expired refresh should return a result"),
             "an expired guard must not be refreshed"
         );
         assert!(
