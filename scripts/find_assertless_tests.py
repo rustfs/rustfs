@@ -28,8 +28,15 @@ called helper. Known false-positive classes are excluded up front:
   parameters; the assert lives in the shared body — still scanned, but a
   body that asserts is not flagged anyway; the exclusion covers wrappers
   that only delegate to a suite runner).
-- Functions whose body calls a helper with `assert`, `verify`, `check`,
-  `expect`, `run_` or `_case` in its name (suite-delegation pattern).
+- Functions whose body calls a helper *named* like a shared check or suite
+  runner: an `assert_`/`verify_`/`check_`/`expect_`/`ensure_`/`run_` prefix,
+  or a `_case`/`_cases`/`_harness`/`_roundtrip` suffix. The name must carry
+  the token as its own leading or trailing segment — matching it anywhere
+  inside the identifier hid whole test bodies behind an unrelated domain
+  call such as `record_get_object_bitrot_verify_duration(..)`.
+- Functions whose body only defines an unused inner `fn _name(..)`: that is
+  the compile-time shape check (exhaustive match, signature pin), where the
+  type system is the assertion.
 
 Usage:
     scripts/find_assertless_tests.py [path ...]     # default: crates rustfs/src
@@ -45,7 +52,11 @@ VERIFY_SIGNALS = re.compile(
     r"assert!|assert_eq!|assert_ne!|debug_assert|panic!\(|\.expect\(|\.unwrap\(|"
     r"unreachable!|matches!\(|insta::|proptest!|\.await\?|\)\?|\?;|should_panic"
 )
-DELEGATION = re.compile(r"\b[a-z0-9_]*(?:assert|verify|check|expect|run_case|_case|harness|round_trip|roundtrip)[a-z0-9_]*\s*\(")
+DELEGATION = re.compile(
+    r"\b(?:assert|verify|check|expect|ensure|run)_[a-z0-9_]*\s*\(|"
+    r"\b[a-z0-9_]+_(?:case|cases|harness|roundtrip|round_trip)\s*\("
+)
+COMPILE_TIME_CHECK = re.compile(r"\bfn\s+_[a-zA-Z0-9_]*\s*(?:<[^>]*>)?\s*\(")
 TEST_ATTR = re.compile(r"#\[(?:tokio::)?test[\](]")
 TEST_CASE_ATTR = re.compile(r"#\[test_case")
 FN_LINE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)")
@@ -94,7 +105,7 @@ def scan_file(path: Path):
                 break
             k += 1
         text = "\n".join(body)
-        if not VERIFY_SIGNALS.search(text) and not DELEGATION.search(text):
+        if not VERIFY_SIGNALS.search(text) and not DELEGATION.search(text) and not COMPILE_TIME_CHECK.search(text):
             print(f"{path}:{j + 1}: {name}")
         i = k + 1
 
