@@ -1460,6 +1460,16 @@ fn managed_sse_domain(sse_type: SSEType) -> &'static str {
     }
 }
 
+/// The public `x-amz-server-side-encryption` value a managed scheme reports.
+fn managed_sse_public_header(sse_type: SSEType) -> &'static str {
+    match sse_type {
+        SSEType::SseKms => ServerSideEncryption::AWS_KMS,
+        // SSE-C never reaches the managed path; reporting AES256 keeps this
+        // total without inventing a third public value.
+        SSEType::SseS3 | SSEType::SseC => ServerSideEncryption::AES256,
+    }
+}
+
 fn canonical_kms_bucket_path(bucket: &str, key: &str) -> String {
     path_join_buf(&[bucket, key])
 }
@@ -2445,19 +2455,41 @@ async fn apply_managed_decryption_material_inner(
 ) -> Result<Option<DecryptionMaterial>, ApiError> {
     #[cfg(not(feature = "rio-v2"))]
     let _ = (bucket, key);
-    if !contains_managed_encryption_metadata(metadata) || !metadata.contains_key("x-amz-server-side-encryption") {
+    if !contains_managed_encryption_metadata(metadata) {
         return Ok(None);
     }
 
-    // Safe: presence is guaranteed by the contains_key check above.
-    let server_side_encryption = metadata.get("x-amz-server-side-encryption").cloned().unwrap_or_default();
-    let normalized_metadata = normalize_managed_metadata(metadata, Some(recode_minio_kms_context));
-
-    let encryption_type = match server_side_encryption.as_str() {
-        ServerSideEncryption::AES256 => SSEType::SseS3,
-        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
-        _ => SSEType::SseS3,
+    let encryption_type = match metadata.get("x-amz-server-side-encryption").map(String::as_str) {
+        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(_) => SSEType::SseS3,
+        // MinIO never persists the public scheme header: `crypto.S3.CreateMetadata`
+        // writes only the `X-Minio-Internal-*` family and the public header is
+        // synthesized onto the response by `DecryptObjectInfo`. Requiring it here
+        // is what made every MinIO-encrypted object unreadable (backlog#1638).
+        //
+        // Inferring from the sealed-key slot is self-consistent by construction:
+        // the slot decides which header the unseal reads AND which domain string
+        // the sealing key is derived under, so a scheme that disagrees with the
+        // slot cannot silently derive a wrong key — it finds no key at all.
+        // Inferring from the KMS key id would NOT be safe: MinIO writes
+        // `-S3-Kms-Key-Id` on SSE-S3 objects too.
+        #[cfg(feature = "rio-v2")]
+        None => match infer_minio_managed_sse_type(metadata) {
+            Some(sse_type) => sse_type,
+            // Still fail-closed, and deliberately not an error raised here: the
+            // read plan independently classifies the object as encrypted from
+            // its markers and refuses to serve it without material, so an
+            // object whose scheme cannot be established never degrades into a
+            // plaintext read.
+            None => return Ok(None),
+        },
+        // Without the rio-v2 reader there is no MinIO-format read path to serve
+        // such an object with, so it stays on the fail-closed branch.
+        #[cfg(not(feature = "rio-v2"))]
+        None => return Ok(None),
     };
+
+    let normalized_metadata = normalize_managed_metadata(metadata, Some(recode_minio_kms_context));
 
     // Extract KMS key ID from metadata (optional, used for provider context)
     let kms_key_id = normalized_metadata
@@ -2556,8 +2588,19 @@ async fn apply_managed_decryption_material_inner(
     } else {
         get_local_sse_dek_provider().await?
     };
+    // A MinIO sealed key alone does not mean MinIO wrote the object: RustFS's own
+    // writer fills MinIO's metadata slots too, while still storing a RustFS
+    // envelope in them, so neither the slot nor the header name distinguishes the
+    // two. The data key's own shape does. RustFS envelopes are strictly-parsed
+    // JSON; MinIO's builtin-KMS ciphertext is opaque bytes that match neither, so
+    // recognizing RustFS positively — and treating only the remainder as MinIO —
+    // keeps a RustFS envelope from ever reaching MinIO's decoder.
     #[cfg(feature = "rio-v2")]
-    let decrypted_data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+    let decrypted_data_key = if minio_sealed_key.is_some() && !is_rustfs_managed_data_key(&encrypted_data_key) {
+        provider
+            .decrypt_minio_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+            .await
+    } else if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
         provider
             .decrypt_legacy_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
             .await
@@ -2592,7 +2635,11 @@ async fn apply_managed_decryption_material_inner(
 
     Ok(Some(DecryptionMaterial {
         sse_type: encryption_type,
-        server_side_encryption: ServerSideEncryption::from(server_side_encryption),
+        // Synthesized from the resolved scheme rather than read back from
+        // metadata: a MinIO-written object has no stored scheme header, which is
+        // exactly why the gate above had to infer it. MinIO synthesizes the same
+        // header onto its own responses.
+        server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(encryption_type).to_string()),
         kms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
         algorithm,
         customer_key_md5: None,
@@ -2658,6 +2705,29 @@ pub trait SseDekProvider: Send + Sync {
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError> {
         self.decrypt_sse_dek(encrypted_dek, kms_key_id, context).await
+    }
+
+    /// Unwrap a data key that MinIO's builtin KMS sealed.
+    ///
+    /// A separate entry point rather than a shape sniff inside
+    /// [`Self::decrypt_sse_dek`]: the caller already knows the object carries a
+    /// MinIO sealed key, and MinIO's raw ciphertext is unstructured bytes that
+    /// no parser can reliably tell apart from anything else. Routing on the
+    /// caller's knowledge keeps a RustFS envelope from ever reaching MinIO's
+    /// decoder, and vice versa.
+    ///
+    /// Defaults to refusing: only a provider holding the MinIO master secret
+    /// can serve these, and a provider that cannot must fail rather than fall
+    /// back to a decoder that would misread the bytes.
+    async fn decrypt_minio_sse_dek(
+        &self,
+        _encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        _context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        Err(ApiError::from(StorageError::other(
+            "This KMS provider cannot unwrap a data key sealed by MinIO's builtin KMS",
+        )))
     }
 }
 
@@ -2796,6 +2866,163 @@ pub(crate) struct LocalSseDekProvider {
 }
 
 const LOCAL_SSE_DEK_FORMAT_VERSION: u8 = 1;
+
+#[cfg(feature = "rio-v2")]
+/// Returns true when a managed-SSE data key is one RustFS itself wrote.
+///
+/// Both RustFS envelope shapes are strict JSON — the KMS envelope
+/// ([`rustfs_kms::is_data_key_envelope`]) and the local provider's
+/// [`LocalSseDekEnvelope`], whose `deny_unknown_fields` keeps it from accepting
+/// anything else. Recognition is deliberately positive: an unrecognized payload
+/// is left to MinIO's decoder rather than guessed at, and neither decoder is
+/// ever handed the other's format.
+fn is_rustfs_managed_data_key(encrypted_dek: &[u8]) -> bool {
+    if rustfs_kms::is_data_key_envelope(encrypted_dek) {
+        return true;
+    }
+    std::str::from_utf8(encrypted_dek)
+        .ok()
+        .is_some_and(|text| serde_json::from_str::<LocalSseDekEnvelope<'_>>(text).is_ok())
+}
+
+#[cfg(feature = "rio-v2")]
+/// Associated data MinIO binds when sealing a data key.
+///
+/// MinIO passes the object's encryption context as the AEAD's associated data,
+/// serialized as canonical JSON with sorted keys — the same canonicalization
+/// [`rustfs_kms::context_aad`] performs, which is why the context RustFS
+/// already rebuilds for the read can be reused verbatim. For SSE-S3 that
+/// context is `{bucket: "bucket/object"}`; for SSE-KMS it is whatever the
+/// request supplied, recovered from the stored MinIO context header.
+fn minio_kms_associated_data(context: &ObjectEncryptionContext) -> Result<Vec<u8>, ApiError> {
+    let mut ctx = context.encryption_context.clone();
+    ctx.entry(context.bucket.clone())
+        .or_insert_with(|| canonical_kms_bucket_path(&context.bucket, &context.object_key));
+    rustfs_kms::context_aad(&ctx)
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to canonicalize MinIO KMS context: {e}"))))
+}
+
+#[cfg(feature = "rio-v2")]
+/// MinIO's builtin-KMS ciphertext in its JSON encoding.
+///
+/// Deliberately its own type rather than a relaxation of
+/// [`LocalSseDekEnvelope`]: widening that envelope's `deny_unknown_fields`
+/// to admit this shape would also admit malformed RustFS envelopes, which
+/// backlog#1567 requires to keep failing closed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MinioKmsCiphertextJson {
+    aead: String,
+    #[allow(
+        dead_code,
+        reason = "present in MinIO's encoding; the key is identified by metadata instead"
+    )]
+    #[serde(default)]
+    id: String,
+    iv: String,
+    nonce: String,
+    bytes: String,
+}
+
+/// Bytes of trailing randomness every MinIO builtin-KMS ciphertext carries:
+/// a 16-byte IV followed by a 12-byte nonce, *after* the sealed bytes.
+#[cfg(feature = "rio-v2")]
+const MINIO_KMS_RANDOM_LEN: usize = 28;
+#[cfg(feature = "rio-v2")]
+const MINIO_KMS_IV_LEN: usize = 16;
+
+#[cfg(feature = "rio-v2")]
+const MINIO_KMS_AEAD_AES_GCM: &str = "AES-256-GCM-HMAC-SHA-256";
+#[cfg(feature = "rio-v2")]
+const MINIO_KMS_AEAD_CHACHA20: &str = "ChaCha20Poly1305";
+
+#[cfg(feature = "rio-v2")]
+/// Unwrap a data key sealed by MinIO's builtin (static-secret) KMS.
+///
+/// The wire format is `sealed_bytes || iv[16] || nonce[12]` — the randomness
+/// trails the ciphertext rather than leading it, and MinIO's own decoder
+/// normalizes its legacy JSON encoding into exactly that byte order before
+/// opening it (`internal/kms/secret-key.go`, `parseCiphertext`). A raw
+/// (non-JSON) ciphertext is AES-256-GCM by definition there; the JSON form
+/// names its algorithm.
+///
+/// The sealing key is derived per ciphertext rather than being the master key:
+/// `HMAC-SHA256(master, iv)` for AES-256-GCM, `HChaCha20(master, iv)` for
+/// ChaCha20-Poly1305. The encryption context is bound as associated data.
+fn decrypt_minio_kms_data_key(encrypted_dek: &[u8], master_key: &[u8; 32], aad: &[u8]) -> Result<[u8; 32], ApiError> {
+    let (body, algorithm) = match std::str::from_utf8(encrypted_dek) {
+        // MinIO only treats a payload as JSON when it both starts and ends like
+        // an object, and falls back to the raw layout when it does not parse —
+        // mirrored here so a ciphertext that merely looks like JSON is not
+        // rejected outright.
+        Ok(text)
+            if text.starts_with('{')
+                && text.ends_with('}')
+                && let Ok(json) = serde_json::from_str::<MinioKmsCiphertextJson>(text) =>
+        {
+            let decode = |what: &str, value: &str| -> Result<Vec<u8>, ApiError> {
+                BASE64_STANDARD
+                    .decode(value)
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid MinIO KMS {what}: {e}"))))
+            };
+            let mut body = decode("ciphertext", &json.bytes)?;
+            body.extend_from_slice(&decode("iv", &json.iv)?);
+            body.extend_from_slice(&decode("nonce", &json.nonce)?);
+            (body, json.aead)
+        }
+        _ => (encrypted_dek.to_vec(), MINIO_KMS_AEAD_AES_GCM.to_string()),
+    };
+
+    if body.len() <= MINIO_KMS_RANDOM_LEN {
+        return Err(ApiError::from(StorageError::other(
+            "MinIO KMS ciphertext is too short to carry its IV and nonce",
+        )));
+    }
+    let (sealed, random) = body.split_at(body.len() - MINIO_KMS_RANDOM_LEN);
+    let (iv, nonce) = random.split_at(MINIO_KMS_IV_LEN);
+
+    let plaintext = match algorithm.as_str() {
+        MINIO_KMS_AEAD_AES_GCM => {
+            use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+            let mut mac = HmacSha256::new_from_slice(master_key)
+                .map_err(|_| ApiError::from(StorageError::other("MinIO KMS sealing key derivation failed")))?;
+            mac.update(iv);
+            let sealing_key: [u8; 32] = mac.finalize().into_bytes().into();
+            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
+                .map_err(|_| ApiError::from(StorageError::other("MinIO KMS sealing key is not a valid AES-256 key")))?;
+            let nonce = aes_gcm::Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("MinIO KMS nonce is not 12 bytes")))?;
+            cipher.decrypt(&nonce, aes_gcm::aead::Payload { msg: sealed, aad })
+        }
+        MINIO_KMS_AEAD_CHACHA20 => {
+            use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
+            // MinIO derives this branch's key with HChaCha20 over the 16-byte
+            // IV, which is exactly XChaCha20-Poly1305's own construction, so the
+            // extended-nonce cipher does the derivation rather than hand-rolling it.
+            let mut extended = Vec::with_capacity(MINIO_KMS_IV_LEN + nonce.len());
+            extended.extend_from_slice(iv);
+            extended.extend_from_slice(nonce);
+            let cipher = XChaCha20Poly1305::new_from_slice(master_key)
+                .map_err(|_| ApiError::from(StorageError::other("MinIO KMS master key is not a valid ChaCha20 key")))?;
+            let nonce = chacha20poly1305::XNonce::try_from(extended.as_slice())
+                .map_err(|_| ApiError::from(StorageError::other("MinIO KMS extended nonce is not 24 bytes")))?;
+            cipher.decrypt(&nonce, chacha20poly1305::aead::Payload { msg: sealed, aad })
+        }
+        other => {
+            return Err(ApiError::from(StorageError::other(format!(
+                "Unsupported MinIO KMS AEAD algorithm: {other}"
+            ))));
+        }
+    }
+    // An AEAD failure here is authentication, not a decode slip: a wrong master
+    // key, a tampered ciphertext, and an encryption context that does not match
+    // what sealed it all land here and must all fail closed.
+    .map_err(|_| ApiError::from(StorageError::other("MinIO KMS data key failed authentication")))?;
+
+    plaintext.try_into().map_err(|value: Vec<u8>| {
+        ApiError::from(StorageError::other(format!("MinIO KMS data key must be 32 bytes, got {}", value.len())))
+    })
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3013,6 +3240,17 @@ impl SseDekProvider for LocalSseDekProvider {
         let dek = Self::decrypt_dek(encrypted_dek_str, self.master_key)?;
         Ok(dek)
     }
+
+    #[cfg(feature = "rio-v2")]
+    async fn decrypt_minio_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        let aad = minio_kms_associated_data(context)?;
+        decrypt_minio_kms_data_key(encrypted_dek, &self.master_key, &aad)
+    }
 }
 
 // ============================================================================
@@ -3199,6 +3437,23 @@ fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool
         && metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
         && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
         && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
+}
+
+#[cfg(feature = "rio-v2")]
+#[cfg(feature = "rio-v2")]
+/// Infer the managed SSE scheme from the MinIO sealed-key slot that is present.
+///
+/// Returns `None` when no managed MinIO slot is present, which keeps callers on
+/// their fail-closed path. SSE-C is not a managed scheme and is handled by the
+/// SSE-C read path, so its slot is not considered here.
+fn infer_minio_managed_sse_type(metadata: &HashMap<String, String>) -> Option<SSEType> {
+    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER) {
+        Some(SSEType::SseS3)
+    } else if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER) {
+        Some(SSEType::SseKms)
+    } else {
+        None
+    }
 }
 
 #[cfg(feature = "rio-v2")]
