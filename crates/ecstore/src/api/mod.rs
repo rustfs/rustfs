@@ -32,7 +32,7 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            TargetClient, append_version_id_query,
+            SsecPassthroughCapability, TargetClient, append_version_id_query,
         };
     }
 
@@ -198,12 +198,13 @@ pub mod bucket {
             ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
             VersionPurgeStatusType, XferStats, commit_force_delete_intent, complete_force_delete_intent,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
-            get_global_replication_stats, init_background_replication, invalid_replication_config_status_field,
-            persist_force_delete_intent, read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta,
-            replication_statuses_map, replication_target_arns, resync_start_conflict_id, should_remove_replication_target,
-            should_schedule_delete_replication, should_use_existing_delete_replication_info,
-            should_use_existing_delete_replication_source, unsupported_replication_config_field,
-            validate_replication_config_structure, validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            get_global_replication_stats, get_proxy_targets, init_background_replication,
+            invalid_replication_config_status_field, persist_force_delete_intent, read_durable_mrf_backlog,
+            replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map, replication_target_arns,
+            resync_start_conflict_id, should_remove_replication_target, should_schedule_delete_replication,
+            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
+            version_purge_status_to_filemeta,
         };
     }
 

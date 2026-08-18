@@ -36,7 +36,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub(crate) use crate::bucket::bucket_target_sys::{
-    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, SsecPassthroughCapability, TargetClient,
+    resolve_read_api_version_id,
 };
 #[cfg(test)]
 pub(crate) use crate::bucket::target::BucketTarget;
@@ -65,6 +66,8 @@ static STANDARD_HEADERS: &[&str] = &[
 ];
 
 const ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED: &str = "replication source contains unsupported encryption metadata";
+pub(crate) const ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED: &str = "replication target does not support SSE-C passthrough: the replica would lose its decryption material \
+     (run ?replication-check to re-probe)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationSourceEncryption {
@@ -146,6 +149,54 @@ pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String
     rustfs_replication::is_ssec_encrypted(user_defined)
 }
 
+/// Fail-closed decision for an SSE-C passthrough replication attempt, derived
+/// from the target's cached [`SsecPassthroughCapability`]. Pure so the policy
+/// can migrate with the worker (M2) without dragging the cache along; the
+/// caller computes `expired` from the cache record's age (see
+/// `SSEC_PASSTHROUGH_CAPABILITY_TTL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SsecPassthroughGate {
+    /// Not an SSE-C object, or the target has a fresh proof that it preserves
+    /// the passthrough transport headers: replicate without a HEAD-back audit.
+    Proceed,
+    /// No usable verdict — first SSE-C attempt since the target was (re)built,
+    /// or the recorded verdict (in either direction) aged out: PUT, then HEAD
+    /// the replica back and require SSE-C evidence before reporting COMPLETED.
+    ProceedWithAudit,
+    /// The target was recently proven to drop the passthrough headers: do not
+    /// send the PUT, report FAILED (the object stays on the normal MRF retry
+    /// channel and re-audits once the verdict expires).
+    FailClosed,
+}
+
+pub(crate) fn ssec_passthrough_gate(ssec: bool, capability: SsecPassthroughCapability, expired: bool) -> SsecPassthroughGate {
+    if !ssec {
+        return SsecPassthroughGate::Proceed;
+    }
+    // An expired verdict — Supported or Unsupported — must be re-earned: a
+    // stale Unsupported would otherwise stick forever after a target upgrade,
+    // and a stale Supported would fail open after a backend swap behind the
+    // same endpoint.
+    if expired {
+        return SsecPassthroughGate::ProceedWithAudit;
+    }
+    match capability {
+        SsecPassthroughCapability::Supported => SsecPassthroughGate::Proceed,
+        SsecPassthroughCapability::Unknown => SsecPassthroughGate::ProceedWithAudit,
+        SsecPassthroughCapability::Unsupported => SsecPassthroughGate::FailClosed,
+    }
+}
+
+/// True when a replication-check HEAD of the replica proves the SSE-C
+/// material survived passthrough: a RustFS target restores the transport
+/// headers into the stored SSE-C keys and its HEAD echoes
+/// `x-amz-server-side-encryption-customer-algorithm` (the replication-check
+/// exemption skips key validation but not the metadata echo). A target that
+/// dropped the headers stored a plain object and echoes nothing.
+pub(crate) fn ssec_passthrough_evidence_present(head: &HeadObjectOutput) -> bool {
+    head.sse_customer_algorithm.as_deref().is_some_and(|algo| !algo.is_empty())
+}
+
 pub(crate) struct ReplicationTargetStore;
 
 impl ReplicationTargetStore {
@@ -163,6 +214,17 @@ impl ReplicationTargetStore {
 
     pub(crate) async fn mark_target_offline(target_client: &Arc<TargetClient>) {
         BucketTargetSys::get().mark_target_offline(target_client).await
+    }
+
+    /// Returns the cached verdict and whether it has outlived its TTL.
+    pub(crate) async fn ssec_passthrough_capability(arn: &str) -> (SsecPassthroughCapability, bool) {
+        BucketTargetSys::get().ssec_passthrough_capability(arn).await
+    }
+
+    pub(crate) async fn record_ssec_passthrough_capability(arn: &str, capability: SsecPassthroughCapability) {
+        BucketTargetSys::get()
+            .record_ssec_passthrough_capability(arn, capability)
+            .await
     }
 
     #[cfg(test)]
@@ -896,6 +958,71 @@ mod tests {
             assert!(err.to_string().contains(ERR_REPLICATION_ENCRYPTION_METADATA_UNSUPPORTED));
             assert!(!err.to_string().contains("sealed-envelope"));
         }
+    }
+
+    /// N2 fail-closed policy: SSE-C replication may only proceed silently
+    /// against a target with a FRESH proof that it preserves the passthrough
+    /// transport headers. Unknown targets must be audited; freshly-flagged
+    /// dropping targets must never receive the PUT; an expired verdict in
+    /// EITHER direction must be re-earned through the audit — a sticky
+    /// Unsupported would outlive a target upgrade, and a sticky Supported
+    /// would fail open after a backend swap behind the same endpoint.
+    #[test]
+    fn ssec_passthrough_gate_is_fail_closed_and_ttl_bounded() {
+        for capability in [
+            SsecPassthroughCapability::Unknown,
+            SsecPassthroughCapability::Supported,
+            SsecPassthroughCapability::Unsupported,
+        ] {
+            for expired in [false, true] {
+                assert_eq!(
+                    ssec_passthrough_gate(false, capability, expired),
+                    SsecPassthroughGate::Proceed,
+                    "non-SSE-C objects must never be gated on the passthrough capability"
+                );
+            }
+        }
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Supported, false),
+            SsecPassthroughGate::Proceed
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unknown, false),
+            SsecPassthroughGate::ProceedWithAudit
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unsupported, false),
+            SsecPassthroughGate::FailClosed
+        );
+        // Expiry flips both directions back to the audit.
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Unsupported, true),
+            SsecPassthroughGate::ProceedWithAudit,
+            "an expired Unsupported verdict must allow a re-audit (upgraded target recovers without operator action)"
+        );
+        assert_eq!(
+            ssec_passthrough_gate(true, SsecPassthroughCapability::Supported, true),
+            SsecPassthroughGate::ProceedWithAudit,
+            "an expired Supported verdict must be re-proven (backend swap behind the same endpoint must not fail open)"
+        );
+    }
+
+    #[test]
+    fn ssec_passthrough_evidence_requires_customer_algorithm_echo() {
+        let with_evidence = HeadObjectOutput::builder().sse_customer_algorithm("AES256").build();
+        assert!(ssec_passthrough_evidence_present(&with_evidence));
+
+        let empty_algorithm = HeadObjectOutput::builder().sse_customer_algorithm("").build();
+        assert!(
+            !ssec_passthrough_evidence_present(&empty_algorithm),
+            "an empty echo is not evidence of preserved SSE-C material"
+        );
+
+        let without_evidence = HeadObjectOutput::builder().e_tag("\"abc\"").content_length(8).build();
+        assert!(
+            !ssec_passthrough_evidence_present(&without_evidence),
+            "a plain HEAD response must classify the target as having dropped the material"
+        );
     }
 
     #[test]

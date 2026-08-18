@@ -36,6 +36,7 @@ use super::replication_object_decision_boundary::{
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
+#[cfg(test)]
 use super::replication_resync_boundary::should_count_head_proxy_failure;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
@@ -48,10 +49,12 @@ use super::replication_storage_boundary::{
     ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
 };
 use super::replication_target_boundary::{
-    PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
+    ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore,
+    SsecPassthroughCapability, SsecPassthroughGate, TargetClient, replication_action_for_target_head,
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
     replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
-    replication_put_object_options, replication_target_head_is_newer_null_version,
+    replication_put_object_options, replication_target_head_is_newer_null_version, resolve_read_api_version_id,
+    ssec_passthrough_evidence_present, ssec_passthrough_gate,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -234,32 +237,18 @@ fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &
     }
 }
 
-fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
-    let (is_not_found, code) = err
-        .as_service_error()
-        .map(|service_err| (service_err.is_not_found(), service_err.code()))
-        .unwrap_or((false, None));
-    let raw_status = err.raw_response().map(|resp| resp.status().as_u16());
-    should_count_head_proxy_failure(is_not_found, code, raw_status)
-}
-
-async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
-    if let Some(stats) = runtime_sources::replication_stats() {
-        stats.inc_proxy(bucket, api, is_err).await;
-    }
-}
-
-async fn head_object_with_proxy_stats(
-    source_bucket: &str,
+/// HEAD against a replication target on behalf of the replication worker
+/// (resync/heal/delete convergence checks). This is NOT a client read proxy:
+/// it must not touch the proxy metrics — those count only real GET/HEAD/
+/// Tagging requests proxied for clients (see `replication_proxy.rs` /
+/// `TargetClient::head_object_for_proxy`).
+async fn head_object_for_worker(
     target_client: &TargetClient,
     target_bucket: &str,
     object: &str,
     version_id: Option<String>,
 ) -> std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>> {
-    let result = target_client.head_object(target_bucket, object, version_id).await;
-    let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
-    record_proxy_request(source_bucket, "HeadObject", is_err).await;
-    result
+    target_client.head_object(target_bucket, object, version_id).await
 }
 
 fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
@@ -282,14 +271,121 @@ async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetCli
 }
 
 async fn head_object_fallback(
-    source_bucket: &str,
     tgt_client: &TargetClient,
     object: &str,
 ) -> std::result::Result<Option<HeadObjectOutput>, SdkError<HeadObjectError>> {
-    match head_object_with_proxy_stats(source_bucket, tgt_client, &tgt_client.bucket, object, None).await {
+    match head_object_for_worker(tgt_client, &tgt_client.bucket, object, None).await {
         Ok(oi) => Ok(Some(oi)),
         Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Resolve the N2 fail-closed gate for an SSE-C passthrough attempt against
+/// this target. Returns `Some(audit_required)` when replication may proceed;
+/// on a freshly-flagged header-dropping target it settles `rinfo` as FAILED
+/// (no PUT is ever sent — the object stays on the normal MRF retry channel
+/// and re-audits once the verdict's TTL expires or replication-check
+/// re-probes the target) and returns `None`.
+async fn resolve_ssec_passthrough_gate(
+    ssec: bool,
+    tgt_client: &TargetClient,
+    bucket: &str,
+    object: &str,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> Option<bool> {
+    let (capability, expired) = ReplicationTargetStore::ssec_passthrough_capability(&tgt_client.arn).await;
+    match ssec_passthrough_gate(ssec, capability, expired) {
+        SsecPassthroughGate::Proceed => Some(false),
+        SsecPassthroughGate::ProceedWithAudit => Some(true),
+        SsecPassthroughGate::FailClosed => {
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED.to_string());
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                operation = "ssec_passthrough_gate",
+                error = ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED,
+                "Replication target operation failed"
+            );
+            None
+        }
+    }
+}
+
+/// Judge SSE-C passthrough evidence on a HEAD of the replica and record the
+/// capability verdict for the target. Returns true when the SSE-C material
+/// provably survived; otherwise records `Unsupported` and settles `rinfo` as
+/// FAILED so the attempt never reports a silently unreadable COMPLETED.
+async fn settle_ssec_passthrough_evidence(
+    head: &HeadObjectOutput,
+    tgt_client: &TargetClient,
+    bucket: &str,
+    object: &str,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> bool {
+    if ssec_passthrough_evidence_present(head) {
+        ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Supported).await;
+        return true;
+    }
+    ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Unsupported).await;
+    rinfo.replication_status = ReplicationStatusType::Failed;
+    rinfo.error = Some(ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED.to_string());
+    warn!(
+        event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+        bucket = %bucket,
+        object = %object,
+        arn = %tgt_client.arn,
+        endpoint = %tgt_client.endpoint,
+        operation = "ssec_passthrough_audit",
+        error = ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED,
+        "Replication target operation failed"
+    );
+    false
+}
+
+/// Post-PUT HEAD-back audit for an SSE-C passthrough replica, over the worker
+/// HEAD channel (replication-check exemption plus the `source-proxy-request:
+/// false` suppression header, so the target answers locally without a
+/// customer key). A HEAD transport failure leaves the capability `Unknown`
+/// but still fails this attempt: an unverifiable SSE-C replica must not
+/// report COMPLETED.
+async fn audit_ssec_passthrough_replica(
+    tgt_client: &Arc<TargetClient>,
+    bucket: &str,
+    object: &str,
+    version_id: Option<String>,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> bool {
+    // Address the replica the way the PUT named it: a nil source version id
+    // (versioning-suspended / null-version objects) maps to the "null"
+    // version, so the audit HEAD does not 4xx-loop on those objects.
+    let version_id = resolve_read_api_version_id(version_id);
+    match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, version_id).await {
+        Ok(head) => settle_ssec_passthrough_evidence(&head, tgt_client, bucket, object, rinfo).await,
+        Err(e) => {
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(format!("SSE-C passthrough audit HEAD failed: {e}"));
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                operation = "ssec_passthrough_audit_head",
+                error = %e,
+                "Replication target operation failed"
+            );
+            mark_replication_target_offline_if_needed(tgt_client, &e).await;
+            false
+        }
     }
 }
 
@@ -1186,7 +1282,7 @@ async fn verify_resync_head_result(
             // (400). Re-verify without the versionId before
             // concluding the object failed to replicate, instead
             // of counting a well-replicated object as failed.
-            match head_object_fallback(&roi.bucket, target_client.as_ref(), &roi.name).await {
+            match head_object_fallback(target_client.as_ref(), &roi.name).await {
                 Ok(Some(_)) => {
                     st.replicated_count += 1;
                     st.replicated_size += roi.size;
@@ -1236,8 +1332,7 @@ async fn resync_worker_process_object<S: ReplicationStorage>(
 
     let reset_id = target_client.reset_id.clone();
 
-    let head_result = head_object_with_proxy_stats(
-        bucket_name,
+    let head_result = head_object_for_worker(
         target_client.as_ref(),
         &target_client.bucket,
         &roi.name,
@@ -2521,8 +2616,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     let version_id = target_delete_version_id(version_id, is_version_purge);
 
     if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
-        match head_object_with_proxy_stats(
-            &dobj.bucket,
+        match head_object_for_worker(
             tgt_client.as_ref(),
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
@@ -2888,6 +2982,21 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
+        // N2 fail-closed: never PUT SSE-C ciphertext at a target known to drop
+        // the passthrough transport headers, and never trust a convergence HEAD
+        // against such a target — a previous broken replica matches by ETag.
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        else {
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: self.to_object_info(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return rinfo;
+        };
+
         let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
         let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
 
@@ -2985,18 +3094,20 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         let mut replication_action = replication_action;
-        match head_object_with_proxy_stats(
-            &bucket,
-            tgt_client.as_ref(),
-            &tgt_client.bucket,
-            &object,
-            self.version_id.map(|v| v.to_string()),
-        )
-        .await
+        match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
+            .await
         {
             Ok(oi) => {
                 replication_action = replication_action_for_target_head(&object_info, &oi, self.op_type);
                 if replication_action == ReplicationAction::None {
+                    // An SSE-C replica only counts as converged when the same
+                    // HEAD proves its decryption material survived; a broken
+                    // ciphertext copy from an earlier attempt matches by ETag.
+                    if ssec_audit_required
+                        && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
+                    {
+                        return rinfo;
+                    }
                     rinfo.replication_status = ReplicationStatusType::Completed;
                     rinfo.replication_resynced = true;
                     rinfo.replication_action = ReplicationAction::None;
@@ -3009,8 +3120,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Object not on target yet → fall through to PUT.
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
-                    match head_object_fallback(&bucket, &tgt_client, &object).await {
+                    match head_object_fallback(&tgt_client, &object).await {
                         Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
+                            if ssec_audit_required
+                                && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
+                            {
+                                return rinfo;
+                            }
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
@@ -3085,7 +3201,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        let has_tagging_replication = !put_opts.user_tags.is_empty();
         if let Some(err) = if is_multipart {
             drop(gr);
             let result = replicate_object_with_multipart(MultipartReplicationContext {
@@ -3100,10 +3215,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 put_opts,
             })
             .await;
-            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
-            if has_tagging_replication {
-                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
-            }
             result.err()
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
@@ -3119,10 +3230,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     )
                 })
                 .map_err(|e| std::io::Error::other(e.to_string()));
-            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
-            if has_tagging_replication {
-                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
-            }
             result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
@@ -3141,6 +3248,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             );
 
             mark_replication_target_offline_if_needed(&tgt_client, &err).await;
+            return rinfo;
+        }
+
+        // First SSE-C passthrough PUT against this target: verify the replica
+        // kept its decryption material before reporting COMPLETED.
+        if ssec_audit_required
+            && !audit_ssec_passthrough_replica(&tgt_client, &bucket, &object, self.version_id.map(|v| v.to_string()), &mut rinfo)
+                .await
+        {
             return rinfo;
         }
 
@@ -3165,6 +3281,21 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             note_replicate_all_target_offline(self, &bucket, &tgt_client);
             return rinfo;
         }
+
+        // N2 fail-closed: see the gate in `replicate_object` — the same policy
+        // applies to the metadata/existing-object transport.
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        else {
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: self.to_object_info(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
+        };
 
         let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
         let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
@@ -3204,8 +3335,19 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         let _sopts = replicate_all_stat_options(&object_info, &bucket, &tgt_client);
 
-        let Some((replication_action, object_info)) =
-            resolve_replicate_all_action(self, &tgt_client, &bucket, &object, object_info, start_time, &mut rinfo).await
+        let Some((replication_action, object_info)) = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: self,
+                tgt_client: &tgt_client,
+                bucket: &bucket,
+                object: &object,
+                start_time,
+                ssec_audit_required,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await
         else {
             return rinfo;
         };
@@ -3257,6 +3399,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             fail_replicate_all_put_object(&mut rinfo, &tgt_client, &bucket, &object, &err, start_time).await;
+            return rinfo;
+        }
+
+        // First SSE-C passthrough PUT against this target: verify the replica
+        // kept its decryption material before reporting COMPLETED.
+        if ssec_audit_required
+            && !audit_ssec_passthrough_replica(&tgt_client, &bucket, &object, self.version_id.map(|v| v.to_string()), &mut rinfo)
+                .await
+        {
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
             return rinfo;
         }
 
@@ -3472,33 +3624,49 @@ fn apply_replication_resync_timestamp(rinfo: &mut ReplicatedTargetInfo, reset_id
     rinfo.replication_resynced = true;
 }
 
+/// Borrowed inputs for [`resolve_replicate_all_action`].
+struct ReplicateAllActionContext<'a> {
+    roi: &'a ReplicateObjectInfo,
+    tgt_client: &'a Arc<TargetClient>,
+    bucket: &'a str,
+    object: &'a str,
+    start_time: OffsetDateTime,
+    /// N2: the target's SSE-C passthrough capability is still `Unknown`, so a
+    /// converged-looking replica must additionally prove its SSE-C material
+    /// survived before the comparison may settle COMPLETED.
+    ssec_audit_required: bool,
+}
+
 /// Compare the source object against the target via HEAD and decide which
 /// replication action is still required. Returns `None` after fully settling
 /// `rinfo` when replication must stop here — either because the target already
 /// matches or because the comparison failed.
 async fn resolve_replicate_all_action(
-    roi: &ReplicateObjectInfo,
-    tgt_client: &Arc<TargetClient>,
-    bucket: &str,
-    object: &str,
+    ctx: ReplicateAllActionContext<'_>,
     object_info: ObjectInfo,
-    start_time: OffsetDateTime,
     rinfo: &mut ReplicatedTargetInfo,
 ) -> Option<(ReplicationAction, ObjectInfo)> {
-    let replication_action;
-    match head_object_with_proxy_stats(
+    let ReplicateAllActionContext {
+        roi,
+        tgt_client,
         bucket,
-        tgt_client.as_ref(),
-        &tgt_client.bucket,
         object,
-        roi.version_id.map(|v| v.to_string()),
-    )
-    .await
-    {
+        start_time,
+        ssec_audit_required,
+    } = ctx;
+    let replication_action;
+    match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, roi.version_id.map(|v| v.to_string())).await {
         Ok(oi) => {
             replication_action = replication_action_for_target_head(&object_info, &oi, roi.op_type);
             rinfo.replication_status = ReplicationStatusType::Completed;
             if replication_action == ReplicationAction::None {
+                // An SSE-C replica only counts as converged when the same HEAD
+                // proves its decryption material survived; a broken ciphertext
+                // copy from an earlier attempt matches by ETag.
+                if ssec_audit_required && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await {
+                    rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                    return None;
+                }
                 if roi.op_type == ReplicationType::ExistingObject
                     && replication_target_head_is_newer_null_version(&object_info, &oi)
                 {
@@ -3545,9 +3713,15 @@ async fn resolve_replicate_all_action(
         Err(e) => {
             if is_version_id_format_mismatch(&e) {
                 // Version-ID format mismatch: retry without versionId and compare ETags.
-                match head_object_fallback(bucket, tgt_client, object).await {
+                match head_object_fallback(tgt_client, object).await {
                     Ok(Some(oi)) => {
                         replication_action = if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) {
+                            if ssec_audit_required
+                                && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await
+                            {
+                                rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                                return None;
+                            }
                             ReplicationAction::None
                         } else {
                             ReplicationAction::All
@@ -3668,7 +3842,6 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
     ctx: ReplicateAllPayloadContext<'_, S>,
     mut gr: GetObjectReader,
 ) -> Option<std::io::Error> {
-    let has_tagging_replication = !ctx.put_opts.user_tags.is_empty();
     if ctx.is_multipart {
         drop(gr);
         let result = replicate_object_with_multipart(MultipartReplicationContext {
@@ -3683,10 +3856,6 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
             put_opts: ctx.put_opts,
         })
         .await;
-        record_proxy_request(ctx.bucket, "PutObject", result.is_err()).await;
-        if has_tagging_replication {
-            record_proxy_request(ctx.bucket, "PutObjectTagging", result.is_err()).await;
-        }
         result.err()
     } else {
         gr.stream = wrap_with_bandwidth_monitor(gr.stream, &ctx.put_opts, ctx.bucket, ctx.arn);
@@ -3703,10 +3872,6 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
                 )
             })
             .map_err(|e| std::io::Error::other(e.to_string()));
-        record_proxy_request(ctx.bucket, "PutObject", result.is_err()).await;
-        if has_tagging_replication {
-            record_proxy_request(ctx.bucket, "PutObjectTagging", result.is_err()).await;
-        }
         result.err()
     }
 }

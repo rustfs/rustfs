@@ -29,6 +29,7 @@ mod replication_object_bridge;
 mod replication_object_config;
 mod replication_object_decision_boundary;
 pub(crate) mod replication_pool;
+mod replication_proxy;
 mod replication_queue_boundary;
 mod replication_resync_boundary;
 mod replication_resyncer;
@@ -74,6 +75,7 @@ pub use replication_pool::{
     get_global_replication_pool, get_global_replication_stats, init_background_replication, persist_force_delete_intent,
     read_durable_mrf_backlog, resync_start_conflict_id,
 };
+pub use replication_proxy::get_proxy_targets;
 pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationBatchAdmission, ReplicationHealQueueResult, ReplicationOperation,
     ReplicationPriority, ReplicationQueueAdmission,

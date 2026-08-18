@@ -4586,7 +4586,10 @@ async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
             head_failed_total: non_negative_u64(node.proxy_head_failed),
             put_tag_total: non_negative_u64(node.proxy_put_tag_total),
             put_tag_failed_total: non_negative_u64(node.proxy_put_tag_failed),
-            ..Default::default()
+            get_tag_total: non_negative_u64(node.proxy_get_tag_total),
+            get_tag_failed_total: non_negative_u64(node.proxy_get_tag_failed),
+            remove_tag_total: non_negative_u64(node.proxy_delete_tag_total),
+            remove_tag_failed_total: non_negative_u64(node.proxy_delete_tag_failed),
         },
         metrics,
         uptime: node.uptime,
