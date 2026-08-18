@@ -87,6 +87,13 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the default-off dst-dir fsync group-commit tests. They use
+# process-global test hooks/registry to deterministically freeze fsync batches;
+# no retries, just one at a time under nextest too.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(dst_dir_fsync_group_commit)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
@@ -186,6 +193,10 @@ test-group = 'ecstore-serial-flaky'
 # too (see the matching default-profile override near the top). No retries.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & (test(bucket_delete_waits_for_config_mutation_fence) | test(stale_config_request_cannot_mutate_a_recreated_bucket) | test(disk_incarnation_read_detects_stale_cache_until_peer_reload) | test(lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata) | test(expiry_configs_are_resolved_from_the_owning_store))'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(dst_dir_fsync_group_commit)'
 test-group = 'ecstore-serial-flaky'
 
 # ---------------------------------------------------------------------------
