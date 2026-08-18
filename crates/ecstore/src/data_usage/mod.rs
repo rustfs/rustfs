@@ -19,7 +19,7 @@ pub mod local_snapshot;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
     list::{ListOperations as _, StorageListObjectVersionsInfo},
-    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
+    object::{EcstoreObjectIO, HTTPPreconditions, ObjectOperations as _},
 };
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
@@ -2009,80 +2009,105 @@ pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageIn
 }
 
 // Helper functions for DataUsageCache operations
-pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str) -> crate::error::Result<DataUsageCache> {
-    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+
+/// How many times `load_data_usage_cache` tries a read that failed for a
+/// transient reason before giving up.
+const DATA_USAGE_CACHE_LOAD_ATTEMPTS: usize = 5;
+const DATA_USAGE_CACHE_LOAD_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const DATA_USAGE_CACHE_LOAD_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// Result of one attempt at reading a data-usage cache object.
+enum DataUsageCacheRead {
+    Loaded(DataUsageCache),
+    /// The object is definitively not there, so retrying cannot turn the read
+    /// into a hit.
+    Absent,
+}
+
+/// True when the error means the cache object does not exist, as opposed to a
+/// transient failure that is worth another attempt.
+fn is_data_usage_cache_absent(err: &Error) -> bool {
+    matches!(err, Error::FileNotFound | Error::VolumeNotFound)
+}
+
+async fn read_data_usage_cache_object<S>(store: &S, key: &str) -> crate::error::Result<DataUsageCacheRead>
+where
+    S: rustfs_storage_api::ObjectIO<
+            Error = Error,
+            RangeSpec = rustfs_storage_api::HTTPRangeSpec,
+            HeaderMap = http::HeaderMap,
+            ObjectOptions = crate::object_api::ObjectOptions,
+            GetObjectReader = crate::object_api::GetObjectReader,
+        >,
+{
+    use crate::disk::RUSTFS_META_BUCKET;
     use crate::object_api::ObjectOptions;
     use http::HeaderMap;
-    use rand::RngExt;
-    use std::path::Path;
-    use std::time::Duration;
-    use tokio::time::sleep;
 
-    let mut d = DataUsageCache::default();
-    let mut retries = 0;
-    while retries < 5 {
-        let path = Path::new(BUCKET_META_PREFIX).join(name);
-        match store
-            .get_object_reader(
-                RUSTFS_META_BUCKET,
-                path.to_str().unwrap(),
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(mut reader) => {
-                if let Ok(info) = DataUsageCache::unmarshal(&reader.read_all().await?) {
-                    d = info
-                }
-                break;
-            }
-            Err(err) => match err {
-                Error::FileNotFound | Error::VolumeNotFound => {
-                    match store
-                        .get_object_reader(
-                            RUSTFS_META_BUCKET,
-                            name,
-                            None,
-                            HeaderMap::new(),
-                            &ObjectOptions {
-                                no_lock: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        Ok(mut reader) => {
-                            if let Ok(info) = DataUsageCache::unmarshal(&reader.read_all().await?) {
-                                d = info
-                            }
-                            break;
-                        }
-                        Err(_) => match err {
-                            Error::FileNotFound | Error::VolumeNotFound => {
-                                break;
-                            }
-                            _ => {}
-                        },
-                    }
-                }
-                _ => {
-                    break;
-                }
+    match store
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            key,
+            None,
+            HeaderMap::new(),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
             },
-        }
-        retries += 1;
-        let dur = {
-            let mut rng = rand::rng();
-            rng.random_range(0..1_000)
-        };
-        sleep(Duration::from_millis(dur)).await;
+        )
+        .await
+    {
+        // A cache object that fails to decode is treated as absent rather than
+        // as an error: a corrupt cache should not stall the caller, and the
+        // next scanner pass rewrites it.
+        Ok(mut reader) => Ok(DataUsageCache::unmarshal(&reader.read_all().await?)
+            .map(DataUsageCacheRead::Loaded)
+            .unwrap_or(DataUsageCacheRead::Absent)),
+        Err(err) if is_data_usage_cache_absent(&err) => Ok(DataUsageCacheRead::Absent),
+        Err(err) => Err(err),
     }
-    Ok(d)
+}
+
+/// Load a data-usage cache, preferring the prefixed key and falling back to the
+/// legacy unprefixed one.
+///
+/// A cache that is absent under both keys yields an empty cache; a transient
+/// read failure is retried with capped, jittered backoff and surfaces as an
+/// error once the attempts are exhausted.
+pub async fn load_data_usage_cache<S>(store: &S, name: &str) -> crate::error::Result<DataUsageCache>
+where
+    S: rustfs_storage_api::ObjectIO<
+            Error = Error,
+            RangeSpec = rustfs_storage_api::HTTPRangeSpec,
+            HeaderMap = http::HeaderMap,
+            ObjectOptions = crate::object_api::ObjectOptions,
+            GetObjectReader = crate::object_api::GetObjectReader,
+        >,
+{
+    use crate::disk::BUCKET_META_PREFIX;
+    use std::path::Path;
+
+    let prefixed = Path::new(BUCKET_META_PREFIX).join(name);
+    let prefixed = prefixed
+        .to_str()
+        .ok_or_else(|| Error::other("data usage cache path is not valid UTF-8"))?
+        .to_owned();
+
+    rustfs_utils::retry::retry_with_backoff(
+        || async {
+            match read_data_usage_cache_object(store, &prefixed).await? {
+                DataUsageCacheRead::Loaded(cache) => Ok(cache),
+                DataUsageCacheRead::Absent => match read_data_usage_cache_object(store, name).await? {
+                    DataUsageCacheRead::Loaded(cache) => Ok(cache),
+                    DataUsageCacheRead::Absent => Ok(DataUsageCache::default()),
+                },
+            }
+        },
+        DATA_USAGE_CACHE_LOAD_ATTEMPTS,
+        DATA_USAGE_CACHE_LOAD_BASE_DELAY,
+        DATA_USAGE_CACHE_LOAD_MAX_DELAY,
+    )
+    .await
 }
 
 /// Persist the current in-memory compression total to the backend.
@@ -2220,6 +2245,7 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_api_contracts::object::ObjectIO as _;
     use rustfs_data_usage::BucketUsageInfo;
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
@@ -2450,6 +2476,128 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Minimal ObjectIO backing `load_data_usage_cache` tests: records the keys
+    /// read and fails the first N reads with a transient (non-absence) error.
+    #[derive(Debug, Default)]
+    struct UsageCacheReadStore {
+        transient_failures: Mutex<usize>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl UsageCacheReadStore {
+        fn failing_first(n: usize) -> Self {
+            Self {
+                transient_failures: Mutex::new(n),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn read_keys(&self) -> Vec<String> {
+            self.reads.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for UsageCacheReadStore {
+        type Error = Error;
+        type RangeSpec = crate::storage_api_contracts::range::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            object: &str,
+            _range: Option<Self::RangeSpec>,
+            _h: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::GetObjectReader, Self::Error> {
+            self.reads.lock().await.push(object.to_string());
+            let mut remaining = self.transient_failures.lock().await;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(Error::other("transient read failure"));
+            }
+            Err(Error::FileNotFound)
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut Self::PutObjectReader,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            unimplemented!("load_data_usage_cache never writes")
+        }
+    }
+
+    fn prefixed_usage_key(name: &str) -> String {
+        std::path::Path::new(crate::disk::BUCKET_META_PREFIX)
+            .join(name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn load_data_usage_cache_treats_absence_as_an_empty_cache_without_retrying() {
+        let name = "usage-cache";
+        let store = UsageCacheReadStore::default();
+
+        let cache = load_data_usage_cache(&store, name).await.expect("absence is not an error");
+
+        assert!(cache.cache.is_empty());
+        assert_eq!(
+            store.read_keys().await,
+            vec![prefixed_usage_key(name), name.to_string()],
+            "the prefixed key is tried first, then the legacy one, and neither absence is retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_data_usage_cache_retries_a_transient_failure() {
+        let name = "usage-cache";
+        // Two transient failures, then the object reads as absent.
+        let store = UsageCacheReadStore::failing_first(2);
+
+        let cache = load_data_usage_cache(&store, name)
+            .await
+            .expect("retry should reach the absent read");
+
+        assert!(cache.cache.is_empty());
+        assert_eq!(
+            store.read_keys().await,
+            vec![
+                prefixed_usage_key(name),
+                prefixed_usage_key(name),
+                prefixed_usage_key(name),
+                name.to_string(),
+            ],
+            "a transient failure retries the prefixed read rather than falling through"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_data_usage_cache_surfaces_a_persistent_failure() {
+        let name = "usage-cache";
+        let store = UsageCacheReadStore::failing_first(usize::MAX);
+
+        let err = load_data_usage_cache(&store, name)
+            .await
+            .expect_err("an exhausted retry must not be reported as an empty cache");
+
+        assert!(err.to_string().contains("transient read failure"));
+        assert_eq!(
+            store.read_keys().await.len(),
+            DATA_USAGE_CACHE_LOAD_ATTEMPTS,
+            "every attempt is used before giving up"
+        );
     }
 
     async fn clear_usage_memory_cache_for_test() {
