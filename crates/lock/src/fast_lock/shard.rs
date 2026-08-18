@@ -544,6 +544,13 @@ impl LockShard {
     /// holder. Entries for objects that are tracked but not currently locked
     /// (e.g. pooled-but-idle state) are skipped.
     pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        self.list_locks_with_holder_counts()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    pub(crate) fn list_locks_with_holder_counts(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32)> {
         let objects = self.objects.read();
         let mut infos = Vec::new();
         for (key, state) in objects.iter() {
@@ -558,14 +565,17 @@ impl LockShard {
                             .acquired_at
                             .checked_add(info.lock_timeout)
                             .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: info.owner,
-                            acquired_at: info.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: info.owner,
+                                acquired_at: info.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            1,
+                        ));
                     }
                 }
                 LockMode::Shared => {
@@ -574,14 +584,17 @@ impl LockShard {
                             .acquired_at
                             .checked_add(entry.lock_timeout)
                             .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: entry.owner.clone(),
-                            acquired_at: entry.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: entry.owner.clone(),
+                                acquired_at: entry.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            entry.count,
+                        ));
                     }
                 }
             }
