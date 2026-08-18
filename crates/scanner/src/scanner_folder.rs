@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
@@ -32,6 +32,7 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
+use crate::storage_api::owner::{EcstoreEventArgs, ecstore_send_event};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
@@ -98,6 +99,101 @@ const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders
 const METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL: &str = "rustfs_scanner_pending_heal_prune_total";
 const METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL: &str = "rustfs_scanner_pending_heal_malformed_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
+
+// --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
+//
+// The excess-versions / excess-version-size / excess-folders alerts were
+// metrics-and-logs only; subscribers (consoles, external auditors) had no way
+// to hear them. MinIO emits s3:ObjectManyVersions / s3:ObjectLargeVersions /
+// s3:PrefixManyFolders for the same conditions — RustFS carries those as
+// EventName::Scanner* with the wire names below. Without a cooldown a single
+// over-threshold object would re-emit on every scan cycle (~a minute), so
+// emissions are edge-held per (kind, bucket, object) for 24h.
+
+/// `s3:Scanner:ManyVersions` (MinIO `s3:ObjectManyVersions`).
+pub const EVENT_SCANNER_MANY_VERSIONS: &str = "s3:Scanner:ManyVersions";
+/// `s3:Scanner:LargeVersions` (MinIO `s3:ObjectLargeVersions`).
+pub const EVENT_SCANNER_LARGE_VERSIONS: &str = "s3:Scanner:LargeVersions";
+/// `s3:Scanner:BigPrefix` (MinIO `s3:PrefixManyFolders`).
+pub const EVENT_SCANNER_BIG_PREFIX: &str = "s3:Scanner:BigPrefix";
+const ENV_SCANNER_ALERT_COOLDOWN_SECS: &str = "RUSTFS_SCANNER_ALERT_COOLDOWN_SECS";
+const DEFAULT_SCANNER_ALERT_COOLDOWN_SECS: u64 = 86_400;
+/// Hard cap on distinct cooldown keys; a pathological number of over-threshold
+/// objects clears the map wholesale instead of growing without bound (the
+/// worst case is one re-emission per still-hot key per scan cycle).
+const MAX_SCANNER_ALERT_COOLDOWN_KEYS: usize = 4096;
+
+/// Distinct alert kinds sharing one cooldown map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScannerAlertKind {
+    ManyVersions,
+    LargeVersions,
+    BigPrefix,
+}
+
+type ScannerAlertCooldownKey = (ScannerAlertKind, String, String);
+type ScannerAlertCooldownMap = HashMap<ScannerAlertCooldownKey, Instant>;
+
+static SCANNER_ALERT_EMISSION_COOLDOWN: Mutex<Option<ScannerAlertCooldownMap>> = Mutex::new(None);
+
+fn scanner_alert_cooldown() -> Duration {
+    let raw = std::env::var(ENV_SCANNER_ALERT_COOLDOWN_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    Duration::from_secs(raw.unwrap_or(DEFAULT_SCANNER_ALERT_COOLDOWN_SECS))
+}
+
+/// Edge-held emission gate: returns `true` (and records the cooldown) only
+/// when this (kind, bucket, object) last fired longer than the cooldown ago —
+/// or never. Metrics and logs stay level-triggered every cycle; only the
+/// notification events are held back.
+fn scanner_alert_emission_allows(kind: ScannerAlertKind, bucket: &str, object: &str, cooldown: Duration) -> bool {
+    let key = (kind, bucket.to_string(), object.to_string());
+    let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let guard = guard.get_or_insert_with(ScannerAlertCooldownMap::new);
+    let now = Instant::now();
+    // Expired entries leave first; the cap is still exceeded only when live
+    // keys alone overflow it, in which case a wholesale clear trades one
+    // extra emission per hot key for a hard memory bound.
+    if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+        guard.retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+            guard.clear();
+        }
+    }
+    match guard.get(&key) {
+        Some(fired_at) if now.duration_since(*fired_at) < cooldown => false,
+        _ => {
+            guard.insert(key, now);
+            true
+        }
+    }
+}
+
+/// Emit a scanner alert as an S3 notification event through the standard
+/// dispatch pipeline. Fire-and-forget: the notify layer owns delivery,
+/// retry, and target filtering; the scanner never waits on it.
+fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: i64, details: &[(&str, String)]) {
+    let mut req_params = HashMap::with_capacity(details.len());
+    for (key, value) in details {
+        req_params.insert((*key).to_string(), value.clone());
+    }
+    ecstore_send_event(EcstoreEventArgs {
+        event_name: event_name.to_string(),
+        bucket_name: bucket.to_string(),
+        object: crate::ScannerObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size,
+            ..Default::default()
+        },
+        req_params,
+        user_agent: "Scanner".to_string(),
+        ..Default::default()
+    });
+}
 const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 
 static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
@@ -1350,6 +1446,7 @@ impl ScannerItem {
     fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
+        let object_path = self.object_path();
         if too_many_versions {
             global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
             counter!(
@@ -1357,13 +1454,26 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, &self.bucket, &object_path, scanner_alert_cooldown())
+            {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_MANY_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("threshold", scanner_excess_versions_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 threshold = scanner_excess_versions_threshold(),
                 state = "excess_versions",
@@ -1377,13 +1487,31 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(
+                ScannerAlertKind::LargeVersions,
+                &self.bucket,
+                &object_path,
+                scanner_alert_cooldown(),
+            ) {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_LARGE_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("cumulativeSize", cumulative_size.to_string()),
+                        ("threshold", scanner_excess_version_size_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 cumulative_size,
                 threshold = scanner_excess_version_size_threshold(),
@@ -1764,6 +1892,15 @@ impl FolderScanner {
             "root" => self.root.clone()
         )
         .increment(1);
+        if scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, &self.root, folder, scanner_alert_cooldown()) {
+            emit_scanner_alert_event(
+                EVENT_SCANNER_BIG_PREFIX,
+                &self.root,
+                folder,
+                0,
+                &[("folders", total_folders.to_string()), ("threshold", threshold.to_string())],
+            );
+        }
         warn!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_ALERT_STATE,
@@ -3232,6 +3369,90 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Mutex;
+
+    /// Reset the process-global alert cooldown map; test-only.
+    fn reset_alert_cooldowns() {
+        *SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(ScannerAlertCooldownMap::new());
+    }
+
+    /// The emitted event-name strings must be exactly what `EventName`
+    /// serializes, or a bucket notification subscribed to the documented name
+    /// would silently never match (rustfs/backlog#1868).
+    #[test]
+    fn scanner_alert_wire_names_match_canonical_event_names() {
+        use rustfs_s3_types::EventName;
+        assert_eq!(EVENT_SCANNER_MANY_VERSIONS, EventName::ScannerManyVersions.to_string());
+        assert_eq!(EVENT_SCANNER_LARGE_VERSIONS, EventName::ScannerLargeVersions.to_string());
+        assert_eq!(EVENT_SCANNER_BIG_PREFIX, EventName::ScannerBigPrefix.to_string());
+    }
+
+    fn cooldown_map_len() -> usize {
+        SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Backdate every recorded cooldown so the next check fires again.
+    fn expire_all_alert_cooldowns(cooldown: Duration) {
+        let now = Instant::now();
+        let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(map) = guard.as_mut() {
+            for fired_at in map.values_mut() {
+                if let Some(expired) = now.checked_sub(cooldown + Duration::from_secs(1)) {
+                    *fired_at = expired;
+                }
+            }
+        }
+    }
+
+    /// The emission gate is the only thing standing between an over-threshold
+    /// object and one S3 event per scan cycle, so its edge semantics get
+    /// pinned directly. All scenarios share one #[test] because the cooldown
+    /// map is process-global and parallel tests would read each other's
+    /// firings.
+    #[test]
+    fn scanner_alert_emission_is_edge_held_per_key_and_bounded() {
+        reset_alert_cooldowns();
+        let cooldown = Duration::from_secs(3600);
+
+        // First firing allows, an immediate re-check is held.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+        assert!(!scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // Different kind, object, and bucket are independent keys.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::LargeVersions, "bkt", "obj", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "other", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "other", "obj", cooldown));
+        assert_eq!(cooldown_map_len(), 4);
+
+        // After the cooldown elapses the same key fires again.
+        expire_all_alert_cooldowns(cooldown);
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // A zero cooldown degenerates to always-emit (operators may want that).
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+
+        // Hard bound: overflow the cap with zero-cooldown keys and confirm the
+        // map clears rather than growing past it.
+        reset_alert_cooldowns();
+        for index in 0..=(MAX_SCANNER_ALERT_COOLDOWN_KEYS + 8) {
+            let _ = scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", &format!("dir-{index}"), Duration::ZERO);
+        }
+        assert!(
+            cooldown_map_len() <= MAX_SCANNER_ALERT_COOLDOWN_KEYS,
+            "cooldown map must stay bounded, got {}",
+            cooldown_map_len()
+        );
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
     use tracing_subscriber::fmt::MakeWriter;
