@@ -295,12 +295,23 @@ impl LockClient for LocalClient {
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
         let shard = self.get_shard(lock_id);
-        let mut guards = shard.write().await;
-        if let Some(entry) = guards.get_mut(lock_id) {
-            entry.refresh();
-            Ok(true)
-        } else {
+        let expired_entry = {
+            let mut guards = shard.write().await;
+            if guards.get(lock_id).is_some_and(LocalGuardEntry::is_expired) {
+                guards.remove(lock_id)
+            } else if let Some(entry) = guards.get_mut(lock_id) {
+                entry.refresh();
+                None
+            } else {
+                return Ok(false);
+            }
+        };
+
+        if let Some(entry) = expired_entry {
+            Self::release_reclaimed_guards(vec![entry], Some(&lock_id.resource));
             Ok(false)
+        } else {
+            Ok(true)
         }
     }
 
@@ -426,6 +437,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
         assert!(client.check_status(&lock_id).await.unwrap().is_some());
         wait_until_reaped(&client, &lock_id).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_after_expiry_releases_guard_without_reviving_it() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        let lock_request = request(
+            crate::ObjectKey::new("bucket", "refresh-after-expiry"),
+            "owner-a",
+            Duration::from_secs(10),
+        );
+        let lock_id = lock_request.lock_id.clone();
+
+        assert!(client.acquire_lock(&lock_request).await.unwrap().success);
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        assert!(!client.refresh(&lock_id).await.unwrap(), "an expired guard must not be refreshed");
+        assert!(
+            client.check_status(&lock_id).await.unwrap().is_none(),
+            "expired guard should be removed after refresh"
+        );
+
+        let contender = request(
+            crate::ObjectKey::new("bucket", "refresh-after-expiry"),
+            "owner-b",
+            Duration::from_secs(10),
+        );
+        assert!(
+            client.acquire_lock(&contender).await.unwrap().success,
+            "released guard must be acquirable by a new owner"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
