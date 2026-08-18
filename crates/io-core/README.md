@@ -23,66 +23,19 @@
 
 ## Overview
 
-**rustfs-io-core** is the core I/O scheduling module for [RustFS](https://rustfs.com), a distributed object storage system. It provides:
+**rustfs-io-core** holds the shared I/O primitives for [RustFS](https://rustfs.com), a distributed object storage system. It provides:
 
-- **I/O Scheduler**: Adaptive buffer size calculation and load management
-- **Priority Queue**: Request priority scheduling with starvation prevention
+- **Buffer Pool**: Tiered `BytesPool` for buffer reuse
+- **Storage Profiling**: Storage-media and access-pattern model (`io_profile`)
+- **Scheduler Configuration**: The `IoSchedulerConfig` / `IoPriorityQueueConfig` shapes the storage layer projects into
 - **Backpressure Control**: System overload protection with graceful degradation
 - **Deadlock Detection**: Wait-for graph based deadlock detection algorithm
 - **Lock Optimizer**: Adaptive spin lock optimization
-- **Timeout Wrapper**: Dynamic timeout calculation and operation progress tracking
+- **Progress Tracking**: Byte progress and staleness for long-running operations
+
+The scheduling algorithm itself lives in `rustfs/src/storage/concurrency/io_schedule.rs`; this crate carries the configuration shapes it projects into, not a second implementation.
 
 ## Features
-
-### I/O Scheduler
-
-Adaptive I/O scheduling with dynamic buffer size calculation based on file size, access pattern, and system load:
-
-```rust
-use rustfs_io_core::{IoScheduler, IoSchedulerConfig, IoLoadLevel};
-use rustfs_io_core::io_profile::{StorageMedia, AccessPattern};
-
-// Create scheduler
-let config = IoSchedulerConfig {
-    max_concurrent_reads: 64,
-    base_buffer_size: 64 * 1024,  // 64 KB
-    max_buffer_size: 1024 * 1024, // 1 MB
-    ..Default::default()
-};
-let scheduler = IoScheduler::new(config);
-
-// Calculate optimal buffer size
-let buffer_size = calculate_optimal_buffer_size(
-    10 * 1024 * 1024,  // 10 MB file
-    64 * 1024,         // base buffer
-    true,              // sequential access
-    4,                 // concurrent requests
-    StorageMedia::Ssd,
-    IoLoadLevel::Low,
-);
-```
-
-### Priority Queue
-
-Priority queue with starvation prevention:
-
-```rust
-use rustfs_io_core::{IoPriorityQueue, IoPriority, IoQueueStatus};
-
-let queue = IoPriorityQueue::<()>::new(100);
-
-// Enqueue request
-let request_id = queue.enqueue(IoPriority::High, (), 1024);
-
-// Dequeue request
-if let Some((priority, data)) = queue.dequeue() {
-    println!("Processing priority {:?} request", priority);
-}
-
-// Check queue status
-let status = queue.status();
-println!("High priority waiting: {}", status.high_priority_waiting);
-```
 
 ### Backpressure Control
 
@@ -148,70 +101,22 @@ let stats = optimizer.stats();
 println!("Locks acquired: {}", stats.total_acquired());
 ```
 
-### Timeout Wrapper
+### Progress Tracking
 
-Dynamic timeout calculation:
+Byte progress and staleness for long-running operations:
 
 ```rust
-use rustfs_io_core::{RequestTimeoutWrapper, TimeoutConfig};
+use rustfs_io_core::OperationProgress;
 use std::time::Duration;
 
-let config = TimeoutConfig {
-    base_timeout: Duration::from_secs(5),
-    timeout_per_mb: Duration::from_millis(100),
-    max_timeout: Duration::from_secs(300),
-    ..Default::default()
-};
-let wrapper = RequestTimeoutWrapper::new(config);
+let progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
 
-// Calculate operation timeout
-let timeout = wrapper.calculate_timeout(10 * 1024 * 1024);  // 10 MB
-```
-
-## Buffer Size Calculation
-
-Multiple buffer size calculation functions are provided:
-
-```rust
-use rustfs_io_core::{
-    get_concurrency_aware_buffer_size,
-    get_advanced_buffer_size,
-    get_buffer_size_for_media,
-    calculate_optimal_buffer_size,
-    KI_B, MI_B,
-};
-use rustfs_io_core::io_profile::StorageMedia;
-
-// Basic calculation
-let size1 = get_concurrency_aware_buffer_size(1024 * 1024, 64 * 1024);
-
-// Advanced calculation (considering access pattern)
-let size2 = get_advanced_buffer_size(10 * 1024 * 1024, 64 * 1024, true);
-
-// Media type optimization
-let size3 = get_buffer_size_for_media(64 * 1024, StorageMedia::Ssd);
-
-// Comprehensive calculation
-let size4 = calculate_optimal_buffer_size(
-    100 * 1024 * 1024,  // 100 MB file
-    64 * 1024,          // base buffer
-    true,               // sequential access
-    4,                  // concurrent requests
-    StorageMedia::Nvme,
-    IoLoadLevel::Low,
-);
+progress.update(500);
+assert_eq!(progress.progress_percent(), Some(50.0));
+assert!(!progress.is_stale());
 ```
 
 ## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RUSTFS_MAX_CONCURRENT_READS` | Max concurrent reads | 64 |
-| `RUSTFS_BASE_BUFFER_SIZE` | Base buffer size | 65536 |
-| `RUSTFS_MAX_BUFFER_SIZE` | Max buffer size | 1048576 |
-| `RUSTFS_IO_TIMEOUT_SECS` | I/O timeout seconds | 30 |
 
 ### Code Configuration
 
@@ -240,12 +145,11 @@ rustfs-io-core/
 ├── src/
 │   ├── lib.rs              # Module entry
 │   ├── config.rs           # Configuration types
-│   ├── scheduler.rs        # I/O scheduler
-│   ├── io_priority_queue.rs # Priority queue
+│   ├── pool.rs             # Tiered buffer pool
 │   ├── backpressure.rs     # Backpressure control
 │   ├── deadlock_detector.rs # Deadlock detection
 │   ├── lock_optimizer.rs   # Lock optimization
-│   ├── timeout_wrapper.rs  # Timeout wrapper
+│   ├── progress.rs         # Operation progress tracking
 │   └── io_profile.rs       # I/O profile
 └── Cargo.toml
 ```
@@ -254,21 +158,15 @@ rustfs-io-core/
 
 ```bash
 # Run all tests
-cargo test --package rustfs-io-core
+cargo nextest run --package rustfs-io-core
 
 # Run specific tests
-cargo test --package rustfs-io-core --lib scheduler
-
-# Run benchmarks
-cargo bench --package rustfs-io-core
+cargo nextest run --package rustfs-io-core -E 'test(backpressure)'
 ```
 
 ## Documentation
 
 - [API Documentation](https://docs.rs/rustfs-io-core)
-- [I/O Scheduler Design](./docs/scheduler-design.md)
-- [Backpressure Control Design](./docs/backpressure-design.md)
-- [Deadlock Detection Algorithm](./docs/deadlock-detection.md)
 
 ## Related Modules
 

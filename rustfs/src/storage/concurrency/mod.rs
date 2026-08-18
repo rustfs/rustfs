@@ -66,8 +66,6 @@ pub use rustfs_io_core::{
     BackpressureMonitor,
     // Deadlock detection types
     DeadlockDetector,
-    // Scheduler types
-    IoScheduler,
     // Lock optimization types
     LockOptimizer,
 };
@@ -92,12 +90,6 @@ pub fn reset_active_get_requests() {
 #[allow(dead_code)]
 pub fn reset_active_put_requests() {
     io_schedule::ACTIVE_PUT_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Create a new I/O scheduler with default configuration.
-#[allow(dead_code)]
-pub fn create_io_scheduler() -> IoScheduler {
-    IoScheduler::with_defaults()
 }
 
 /// Create a new backpressure monitor with default configuration.
