@@ -2478,6 +2478,15 @@ impl FolderScanner {
                         }
 
                         if let GetSizeFailureAction::HealMetadata { object } = failure_action {
+                            // MRF journal intent: durable High-priority Metadata
+                            // heal across restarts (HS-01); the scanner heal
+                            // request below stays as the immediate path.
+                            rustfs_common::mrf_channel::try_send_mrf_intent(
+                                rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+                                &item.bucket,
+                                &object,
+                                None,
+                            );
                             self.send_required_scanner_heal_request(
                                 PendingScannerHealKind::Object,
                                 item.bucket.clone(),
