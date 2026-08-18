@@ -2557,7 +2557,7 @@ mod tests {
 
     fn production_source(source: &'static str, file_name: &str) -> &'static str {
         source
-            .split("\n#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
     }
