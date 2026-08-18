@@ -54,7 +54,7 @@ pub use io_schedule::{
 pub use request_guard::{GetObjectGuard, PutObjectGuard};
 
 // Concurrency manager
-pub use manager::{ConcurrencyManager, DiskReadAdmission};
+pub use manager::{ConcurrencyManager, DiskReadAdmission, PutObjectAdmission};
 
 // ============================================
 // New Module Re-exports (for gradual migration)
