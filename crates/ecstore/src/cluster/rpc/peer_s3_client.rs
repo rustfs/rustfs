@@ -220,6 +220,8 @@ fn pool_write_quorum(participant_count: usize) -> usize {
 /// buckets `Error::Io` by kind plus rendered message, so any per-peer detail (address,
 /// timing) would split one shared failure into single-count buckets and downgrade a real
 /// dominant error into `ErasureWriteQuorum`.
+///
+/// `peer_rest_client` carries the same helper over `StorageError` for the same response shape.
 fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
     match bucket {
         Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),

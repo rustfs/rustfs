@@ -46,9 +46,10 @@ use super::storage_api::object_usecase::bucket::{
     replication::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        force_delete_target_set, has_active_delete_rule, load_delete_config_snapshot, must_replicate_object,
-        persist_force_delete_intent, schedule_object_replication, schedule_replication_delete, schedule_replication_deletes,
-        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, load_delete_config_snapshot,
+        must_replicate_object, persist_force_delete_intent, record_replication_proxy, schedule_object_replication,
+        schedule_replication_delete, schedule_replication_deletes, set_deleted_object_replication_state,
+        should_schedule_delete_replication, should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -782,6 +783,7 @@ const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
+const ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE: &str = "RUSTFS_GET_SMALL_BODY_ONCE_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
 const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
 const GET_READER_STREAM_POLL_PENDING: &str = "pending";
@@ -811,6 +813,18 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_small_body_once_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false))
+    }
 }
 
 fn is_get_seek_buffer_enabled() -> bool {
@@ -930,6 +944,30 @@ struct MemoryTrackedBytesStream {
     source: &'static str,
     _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     lifecycle: GetObjectBodyLifecycle,
+}
+
+struct MemoryOnceBodyOwner {
+    bytes: Bytes,
+    _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    // Body::Once has no poll hook, so this opt-in path only holds the request
+    // guard until the bytes are dropped; the result status remains unknown.
+    _lifecycle: GetObjectBodyLifecycle,
+}
+
+impl MemoryOnceBodyOwner {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>, lifecycle: GetObjectBodyLifecycle) -> Self {
+        Self {
+            bytes,
+            _guard: guard,
+            _lifecycle: lifecycle,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MemoryOnceBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -4160,7 +4198,12 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = if is_get_small_body_once_enabled() && bytes_len == remaining {
+            let owner = MemoryOnceBodyOwner::new(bytes, guard, lifecycle);
+            StreamingBlob::from_bytes(Bytes::from_owner(owner))
+        } else {
+            StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle))
+        };
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -6620,6 +6663,226 @@ impl DefaultObjectUsecase {
         })
     }
 
+    /// Headers a proxied read forwards verbatim to the replication target:
+    /// only the client's SSE-C key family, so the target performs the real
+    /// SSE-C decryption (never the replication-check exemption). HTTP
+    /// conditional headers (If-Match & co.) are deliberately NOT forwarded —
+    /// MinIO does not forward them either, and a remote 304/412 would leak a
+    /// conditional evaluation against a replica the local site never saw.
+    /// Range and part-number travel as typed SDK parameters instead.
+    fn proxy_read_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
+        const FORWARDED: &[&str] = &[
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ];
+        let mut forwarded = HeaderMap::new();
+        for name in FORWARDED {
+            if let Ok(header_name) = http::HeaderName::from_str(name)
+                && let Some(value) = headers.get(&header_name)
+            {
+                forwarded.insert(header_name, value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// True when a proxied SDK call failed because the target does not have
+    /// the object either (service-level not-found or a raw 404, which also
+    /// covers NoSuchVersion): the caller tries the next target silently.
+    fn proxy_sdk_error_is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+        err.raw_response().is_some_and(|resp| resp.status().as_u16() == 404)
+    }
+
+    /// Serve a GET whose local read failed with not-found by proxying to the
+    /// bucket's replication targets (MinIO `proxyGetToReplicationTarget`,
+    /// backlog#1675 P1-5). Returns None when no target can serve the object;
+    /// the caller then returns the original local error.
+    async fn proxy_get_object_to_replication_targets(
+        req: &S3Request<GetObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<GetObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .get_object(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt
+                    // (targets were available), one failed when no target
+                    // served it — never per target.
+                    record_replication_proxy(bucket, "GetObject", false).await;
+                    return Some(Self::proxy_sdk_get_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: GET against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "GetObject", true).await;
+        None
+    }
+
+    /// Serve a HEAD whose local lookup failed with not-found by proxying to
+    /// the bucket's replication targets (MinIO `proxyHeadToRepTarget`).
+    async fn proxy_head_object_to_replication_targets(
+        req: &S3Request<HeadObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<HeadObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .head_object_for_proxy(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "HeadObject", false).await;
+                    return Some(Self::proxy_sdk_head_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: HEAD against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "HeadObject", true).await;
+        None
+    }
+
+    /// Translate a proxied SDK GET response into the s3s output, forwarding
+    /// the body as a stream (no buffering, no local persistence).
+    fn proxy_sdk_get_output_to_s3s(remote: aws_sdk_s3::operation::get_object::GetObjectOutput) -> GetObjectOutput {
+        let body = remote.body;
+        let body_stream = tokio_util::io::ReaderStream::with_capacity(body.into_async_read(), 64 * 1024);
+        GetObjectOutput {
+            body: Some(StreamingBlob::wrap(body_stream)),
+            content_length: remote.content_length,
+            content_range: remote.content_range,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            tag_count: remote.tag_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
+    }
+
+    /// Translate a proxied SDK HEAD response into the s3s output.
+    ///
+    /// Known gaps: the SDK's HeadObjectOutput does not model 206/Content-Range
+    /// for a ranged HEAD (the SDK exposes no content_range member on HEAD),
+    /// and s3s' typed HeadObjectOutput has no tag_count field (the local path
+    /// injects x-amz-tagging-count as a raw header) — both are dropped for
+    /// proxied HEADs.
+    fn proxy_sdk_head_output_to_s3s(remote: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> HeadObjectOutput {
+        HeadObjectOutput {
+            content_length: remote.content_length,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
+    }
+
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         self.execute_get_object_boxed(req).await
@@ -6745,6 +7008,19 @@ impl DefaultObjectUsecase {
         {
             Ok(prepared_read) => prepared_read,
             Err(err) => {
+                // Active-active replication lag window: an object missing
+                // locally (and only missing — other errors keep their
+                // semantics) may still be served by proxying the GET to a
+                // replication target (backlog#1675 P1-5).
+                if matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
+                    && let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await
+                {
+                    lifecycle.finish_ok();
+                    let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    let result = Ok(response);
+                    let _ = helper.version_id(version_id_for_event).complete(&result);
+                    return result;
+                }
                 lifecycle.finish_err();
                 return Err(err);
             }
@@ -8653,6 +8929,17 @@ impl DefaultObjectUsecase {
                         };
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
+                    // Active-active replication lag window: an object missing
+                    // locally may still be served by proxying the HEAD to a
+                    // replication target (backlog#1675 P1-5).
+                    if let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                        let result = Ok(response);
+                        let _ = helper
+                            .version_id(req.input.version_id.clone().unwrap_or_default())
+                            .complete(&result);
+                        return result;
                     }
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
@@ -12953,6 +13240,46 @@ mod tests {
         );
 
         assert_eq!(blob.remaining_length().exact(), Some(5));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_holds_guard_until_bytes_drop() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let initial = GetObjectGuard::concurrent_count();
+            let guard = GetObjectGuard::new();
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"hello"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::tracked(guard),
+            );
+            let mut body = s3s::Body::from(blob);
+            let bytes = body.take_bytes().expect("opt-in exact memory body should stay on Body::Once");
+
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+            drop(bytes);
+            assert_eq!(GetObjectGuard::concurrent_count(), initial);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_rejects_length_mismatch() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"test"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::disabled(),
+            );
+            let mut body = s3s::Body::from(blob);
+
+            assert!(body.take_bytes().is_none(), "mismatched memory body must keep the guarded stream path");
+        });
     }
 
     #[tokio::test]

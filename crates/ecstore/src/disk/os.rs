@@ -343,6 +343,7 @@ pub(crate) async fn acquire_rename_data_mutation_lease(
 /// this order uniform prevents one slow disk from reserving global capacity
 /// while it waits for its own concurrency slot.
 async fn acquire_file_sync_permits(disk_permits: Arc<Semaphore>) -> io::Result<(OwnedSemaphorePermit, SemaphorePermit<'static>)> {
+    let wait_started = rustfs_io_metrics::put_stage_timer();
     let disk_permit = disk_permits
         .acquire_owned()
         .await
@@ -351,6 +352,10 @@ async fn acquire_file_sync_permits(disk_permits: Arc<Semaphore>) -> io::Result<(
         .acquire()
         .await
         .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT,
+        wait_started,
+    );
     Ok((disk_permit, global_permit))
 }
 
@@ -551,9 +556,19 @@ pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
     file.sync_data()
 }
 
+fn sync_file_with_put_stage_metric(path: &Path) -> io::Result<()> {
+    let sync_started = rustfs_io_metrics::put_stage_timer();
+    let result = sync_file(path);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC,
+        sync_started,
+    );
+    result
+}
+
 fn sync_files(paths: &[PathBuf]) -> io::Result<()> {
     for path in paths {
-        sync_file(path)?;
+        sync_file_with_put_stage_metric(path)?;
     }
     Ok(())
 }
@@ -599,7 +614,13 @@ pub(crate) async fn sync_dir_files_with_limiter(dir: impl AsRef<Path>, disk_perm
         let files = regular_files(&scan_dir)?;
         if files.len() < PARALLEL_FILE_SYNC_THRESHOLD {
             sync_files(&files)?;
-            fsync_dir_std(scan_dir)?;
+            let fsync_started = rustfs_io_metrics::put_stage_timer();
+            let result = fsync_dir_std(scan_dir);
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+                fsync_started,
+            );
+            result?;
             return Ok(None);
         }
         Ok::<_, io::Error>(Some(files))
@@ -612,10 +633,19 @@ pub(crate) async fn sync_dir_files_with_limiter(dir: impl AsRef<Path>, disk_perm
     futures::stream::iter(files.into_iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(MAX_PARALLEL_FILE_SYNCS, |path| {
             let disk_permits = disk_permits.clone();
-            async move { run_file_sync_blocking(disk_permits, move || sync_file(&path)).await }
+            async move { run_file_sync_blocking(disk_permits, move || sync_file_with_put_stage_metric(&path)).await }
         })
         .await?;
-    run_file_sync_blocking(disk_permits, move || fsync_dir_std(dir)).await
+    run_file_sync_blocking(disk_permits, move || {
+        let fsync_started = rustfs_io_metrics::put_stage_timer();
+        let result = fsync_dir_std(dir);
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+            fsync_started,
+        );
+        result
+    })
+    .await
 }
 
 /// Check if the given disk path is the root disk.
@@ -1174,10 +1204,15 @@ pub(crate) struct FileSyncAdmission {
 }
 
 pub(crate) async fn acquire_file_sync_admission(disk_permits: Arc<Semaphore>) -> io::Result<FileSyncAdmission> {
+    let wait_started = rustfs_io_metrics::put_stage_timer();
     let disk_permit = disk_permits
         .acquire_owned()
         .await
         .map_err(|_| io::Error::other("disk file sync concurrency limiter closed"))?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT,
+        wait_started,
+    );
     Ok(FileSyncAdmission {
         disk_permit: Arc::new(disk_permit),
     })
@@ -1200,10 +1235,15 @@ async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'stati
     global_permits: &Semaphore,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    let wait_started = rustfs_io_metrics::put_stage_timer();
     let global_permit = global_permits
         .acquire()
         .await
         .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT,
+        wait_started,
+    );
     let disk_permit = admission.disk_permit.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _lease = lease;
@@ -1420,7 +1460,13 @@ fn rename_into_existing_parent(
     use rustix::fs::{Mode, OFlags, open, renameat};
 
     let Some(parent_guard) = parent_guard else {
-        return super::fs::rename_std(src_file_path, dst_file_path);
+        let rename_started = rustfs_io_metrics::put_stage_timer();
+        let result = super::fs::rename_std(src_file_path, dst_file_path);
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+            rename_started,
+        );
+        return result;
     };
     let src_parent = src_file_path
         .parent()
@@ -1441,7 +1487,13 @@ fn rename_into_existing_parent(
         .last()
         .ok_or_else(|| io::Error::other("rename destination parent guard is empty"))?;
 
-    renameat(&src_parent, src_name, dst_parent, dst_name).map_err(io::Error::from)
+    let rename_started = rustfs_io_metrics::put_stage_timer();
+    let result = renameat(&src_parent, src_name, dst_parent, dst_name).map_err(io::Error::from);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+        rename_started,
+    );
+    result
 }
 
 #[cfg(windows)]
@@ -2890,6 +2942,7 @@ pub fn is_dir_not_empty_error(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_metrics::CapturingRecorder;
     use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -2908,6 +2961,42 @@ mod tests {
             assert!(common.pop(), "test paths must share an absolute root");
         }
         PublicationRoot::new(&common).expect("test publication root should open")
+    }
+
+    #[test]
+    #[serial_test::serial(file_sync_metrics)]
+    fn sync_file_with_put_stage_metric_records_fdatasync_only_when_enabled() {
+        let previous_gate = rustfs_io_metrics::put_stage_metrics_enabled();
+        rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("part.1");
+        std::fs::write(&path, b"payload").expect("test file should be written");
+        let recorder = CapturingRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            sync_file_with_put_stage_metric(&path).expect("disabled metric sync_file should succeed");
+            assert_eq!(
+                recorder.histogram_sample_count("rustfs_s3_put_object_stage_duration_ms"),
+                0,
+                "disabled PUT stage metrics must not emit fdatasync samples"
+            );
+
+            rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+            sync_file_with_put_stage_metric(&path).expect("enabled metric sync_file should succeed");
+            rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+        });
+
+        assert_eq!(
+            recorder
+                .histogram_values(
+                    "rustfs_s3_put_object_stage_duration_ms",
+                    &[("stage", rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC)]
+                )
+                .len(),
+            1,
+            "enabled PUT stage metrics must emit one fdatasync sample"
+        );
+        rustfs_io_metrics::set_put_stage_metrics_enabled(previous_gate);
     }
 
     async fn rename_all(

@@ -53,6 +53,8 @@ Suggested boilerplate when the topic cannot be avoided:
 
 `README.md` and `CHANGELOG.md` currently contain no FIPS-related wording; `scripts/check_fips_wording.sh` is the grep guard for that public baseline. Any future occurrence of the banned strings in either file should be treated as a defect and either removed or brought under the qualifier rule above. This document intentionally contains the terminology needed to define the policy and is not part of that narrow outward-material scan.
 
+The same script carries a second block for the adjacent over-claim: no file under `crates/kms` may describe the Vault KV2 backend as wrapping key material through Vault's Transit engine. `KmsBackend::VaultKv2` stores RustFS-wrapped key material in Vault's KV v2 engine and never calls Transit, so that wording would tell an operator their key material is cryptographically isolated inside Vault when it is not. Use the `VaultTransit` backend when that isolation is the requirement.
+
 ## The `rustfs-crypto` `fips` feature: what it actually does
 
 `crates/crypto/Cargo.toml` declares `default = ["crypto", "fips"]`, so the feature is on in every normal build. Its entire effect is **which algorithm the write path selects**; the implementation is RustCrypto either way.

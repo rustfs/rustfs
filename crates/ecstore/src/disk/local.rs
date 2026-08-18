@@ -5618,11 +5618,37 @@ impl LocalDisk {
     }
 
     fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        local_disk_object_path(self.io_root(), bucket, key)
+        self.local_disk_object_path(self.io_root(), bucket, key)
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        local_disk_bucket_path(self.io_root(), bucket)
+        self.local_disk_bucket_path(self.io_root(), bucket)
+    }
+
+    fn local_disk_object_path(&self, root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+        let (bucket_path, path) = build_local_disk_object_path(root, bucket, key);
+        #[cfg(target_os = "linux")]
+        {
+            check_local_disk_valid_object_path_at(root, &self.mount_lease, &bucket_path, &path)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            check_local_disk_valid_object_path(root, &bucket_path, &path)?;
+        }
+        Ok(path)
+    }
+
+    fn local_disk_bucket_path(&self, root: &Path, bucket: &str) -> Result<PathBuf> {
+        let bucket_path = build_local_disk_bucket_path(root, bucket);
+        #[cfg(target_os = "linux")]
+        {
+            check_local_disk_valid_path_at(root, &self.mount_lease, &bucket_path)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            check_local_disk_valid_path(root, &bucket_path)?;
+        }
+        Ok(bucket_path)
     }
 
     // Check if a path is valid
@@ -5631,7 +5657,14 @@ impl LocalDisk {
         reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
     )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        check_local_disk_valid_path(self.io_root(), path)
+        #[cfg(target_os = "linux")]
+        {
+            check_local_disk_valid_path_at(self.io_root(), &self.mount_lease, path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            check_local_disk_valid_path(self.io_root(), path)
+        }
     }
 
     #[allow(
@@ -5639,7 +5672,14 @@ impl LocalDisk {
         reason = "method wrapper over the live free function reject_local_disk_symlink_components; no caller in this port (backlog#1823)"
     )]
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
-        reject_local_disk_symlink_components(self.io_root(), path)
+        #[cfg(target_os = "linux")]
+        {
+            reject_local_disk_symlink_components_at(self.io_root(), &self.mount_lease, path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            reject_local_disk_symlink_components(self.io_root(), path)
+        }
     }
 
     // Batch path generation with single lock acquisition
@@ -7323,6 +7363,12 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
 }
 
 fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    let (bucket_path, path) = build_local_disk_object_path(root, bucket, key);
+    check_local_disk_valid_object_path(root, &bucket_path, &path)?;
+    Ok(path)
+}
+
+fn build_local_disk_object_path(root: &Path, bucket: &str, key: &str) -> (PathBuf, PathBuf) {
     let cache_key = if key.is_empty() {
         bucket.to_string()
     } else {
@@ -7330,22 +7376,41 @@ fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBu
     };
 
     #[cfg(windows)]
+    let bucket_path = root.join(bucket.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let bucket_path = root.join(bucket);
+
+    #[cfg(windows)]
     let path = root.join(cache_key.replace('/', "\\"));
     #[cfg(not(windows))]
     let path = root.join(cache_key);
 
-    check_local_disk_valid_path(root, &path)?;
-    Ok(path)
+    (bucket_path, path)
 }
 
 fn local_disk_bucket_path(root: &Path, bucket: &str) -> Result<PathBuf> {
+    let bucket_path = build_local_disk_bucket_path(root, bucket);
+    check_local_disk_valid_path(root, &bucket_path)?;
+    Ok(bucket_path)
+}
+
+fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
     #[cfg(windows)]
     let bucket_path = root.join(bucket.replace('/', "\\"));
     #[cfg(not(windows))]
     let bucket_path = root.join(bucket);
 
-    check_local_disk_valid_path(root, &bucket_path)?;
-    Ok(bucket_path)
+    bucket_path
+}
+
+fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
+    let bucket_path = normalize_path_components(bucket_path);
+    let path = normalize_path_components(path);
+    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+        return Err(DiskError::InvalidPath);
+    }
+
+    reject_local_disk_symlink_components(root, &path)
 }
 
 fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
@@ -7355,6 +7420,80 @@ fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()
     }
 
     reject_local_disk_symlink_components(root, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn check_local_disk_valid_object_path_at(root: &Path, root_fd: &std::fs::File, bucket_path: &Path, path: &Path) -> Result<()> {
+    let bucket_path = normalize_path_components(bucket_path);
+    let path = normalize_path_components(path);
+    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+        return Err(DiskError::InvalidPath);
+    }
+
+    reject_local_disk_symlink_components_at(root, root_fd, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: impl AsRef<Path>) -> Result<()> {
+    let path = normalize_path_components(path);
+    if !path.starts_with(root) {
+        return Err(DiskError::InvalidPath);
+    }
+
+    reject_local_disk_symlink_components_at(root, root_fd, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_local_disk_symlink_components_at(root: &Path, root_fd: &std::fs::File, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    match validate_existing_local_disk_prefix_at(root_fd, relative) {
+        Ok(()) => Ok(()),
+        Err(LocalDiskPathValidationAtError::Unsupported) => reject_local_disk_symlink_components(root, path),
+        Err(LocalDiskPathValidationAtError::InvalidPath) => Err(DiskError::InvalidPath),
+        Err(LocalDiskPathValidationAtError::Io(err)) => Err(to_file_error(err).into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum LocalDiskPathValidationAtError {
+    Unsupported,
+    InvalidPath,
+    Io(std::io::Error),
+}
+
+#[cfg(target_os = "linux")]
+fn validate_existing_local_disk_prefix_at(
+    root_fd: &std::fs::File,
+    relative: &Path,
+) -> core::result::Result<(), LocalDiskPathValidationAtError> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let mut candidate = relative.to_path_buf();
+    loop {
+        match openat2(
+            root_fd,
+            &candidate,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(Errno::NOSYS) => return Err(LocalDiskPathValidationAtError::Unsupported),
+            Err(Errno::LOOP | Errno::XDEV) => return Err(LocalDiskPathValidationAtError::InvalidPath),
+            Err(Errno::NOENT) => {
+                let Some(parent) = candidate.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+                    return Ok(());
+                };
+                candidate = parent.to_path_buf();
+            }
+            Err(err) => return Err(LocalDiskPathValidationAtError::Io(err.into())),
+        }
+    }
 }
 
 fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> {
@@ -9264,17 +9403,27 @@ impl DiskAPI for LocalDisk {
             // accept that window (documented in docs/operations/durability-modes.md).
             if durability.syncs_commit_metadata()
                 && let Some(parent) = dst_file_path.parent()
-                && let Err(err) = os::fsync_dir(parent).await
             {
-                rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
-                    .map_err(to_file_error)?;
-                // The commit rename changed the dst part inodes before this fsync
-                // failed and rolled them back; drop any fd cached during that
-                // window so readers re-open the restored inode (rustfs/backlog#1177).
-                for part_path in &invalidate_part_paths {
-                    self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                let fsync_started = rustfs_io_metrics::put_stage_timer();
+                if let Err(err) = os::fsync_dir(parent).await {
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                        fsync_started,
+                    );
+                    rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
+                        .map_err(to_file_error)?;
+                    // The commit rename changed the dst part inodes before this fsync
+                    // failed and rolled them back; drop any fd cached during that
+                    // window so readers re-open the restored inode (rustfs/backlog#1177).
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(to_file_error(err).into());
                 }
-                return Err(to_file_error(err).into());
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                    fsync_started,
+                );
             }
 
             // First PUT of an object creates its directory (and any missing prefix
@@ -9293,7 +9442,12 @@ impl DiskAPI for LocalDisk {
                     if !dir.starts_with(&dst_volume_dir) {
                         break;
                     }
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
                     if let Err(err) = os::fsync_dir(dir).await {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                            fsync_started,
+                        );
                         rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                             .map_err(to_file_error)?;
                         // Same post-commit rollback window as above — drop cached
@@ -9304,6 +9458,10 @@ impl DiskAPI for LocalDisk {
                         }
                         return Err(to_file_error(err).into());
                     }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                        fsync_started,
+                    );
                     if dir == dst_volume_dir.as_path() {
                         break;
                     }
@@ -9532,10 +9690,21 @@ impl DiskAPI for LocalDisk {
                 }
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(backup_parent) = backup_path.parent()
-                    && let Err(err) =
-                        os::fsync_dir_with_namespace_file_sync_limit(backup_parent, mutation_lease.clone(), admission).await
                 {
-                    return Err(DiskError::from(to_file_error(err)));
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
+                    if let Err(err) =
+                        os::fsync_dir_with_namespace_file_sync_limit(backup_parent, mutation_lease.clone(), admission).await
+                    {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+                            fsync_started,
+                        );
+                        return Err(DiskError::from(to_file_error(err)));
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+                        fsync_started,
+                    );
                 }
                 local_rollback_path = None;
             }
@@ -9573,11 +9742,22 @@ impl DiskAPI for LocalDisk {
                 // Persist the commit rename's directory entry across power loss.
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(dst_parent) = dst_file_path.parent()
-                    && let Err(err) =
-                        os::fsync_dir_with_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission).await
                 {
-                    rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
-                    return Err(err);
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
+                    if let Err(err) =
+                        os::fsync_dir_with_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission).await
+                    {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                            fsync_started,
+                        );
+                        rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
+                        return Err(err);
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                        fsync_started,
+                    );
                 }
 
                 // Same power-loss gap as the non-inline path (rustfs/backlog#922
@@ -9595,9 +9775,14 @@ impl DiskAPI for LocalDisk {
                         if !ancestor_dir.starts_with(&dst_volume_dir) {
                             break;
                         }
+                        let fsync_started = rustfs_io_metrics::put_stage_timer();
                         if let Err(err) =
                             os::fsync_dir_with_namespace_file_sync_limit(ancestor_dir, mutation_lease.clone(), admission).await
                         {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                                fsync_started,
+                            );
                             rollback_inline_metadata_commit_std(
                                 &dst_file_path,
                                 rollback_data_dir,
@@ -9605,6 +9790,10 @@ impl DiskAPI for LocalDisk {
                             )?;
                             return Err(err);
                         }
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                            fsync_started,
+                        );
                         if ancestor_dir == dst_volume_dir.as_path() {
                             break;
                         }
@@ -18020,6 +18209,22 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn get_bucket_path_for_io_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let outside_dir = tempfile::tempdir().expect("outside temp dir should be created");
+        let link_path = root_dir.path().join("escape-bucket");
+        symlink(outside_dir.path(), &link_path).expect("bucket symlink should be created");
+
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(matches!(disk.get_bucket_path_for_io("escape-bucket"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_get_object_path_rejects_symlink_component_escape() {
         use std::os::unix::fs::symlink;
         use tempfile::tempdir;
@@ -18035,6 +18240,199 @@ mod test {
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         assert!(matches!(disk.get_object_path("bucket", "escape/object.txt"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_object_path_for_io_rejects_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let outside_file = root_dir.path().join("outside-file");
+        fs::write(&outside_file, b"outside")
+            .await
+            .expect("outside file should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("bucket should be created");
+        symlink(&outside_file, root_dir.path().join("bucket/object")).expect("object symlink should be created");
+
+        assert!(matches!(disk.get_object_path_for_io("bucket", "object"), Err(DiskError::InvalidPath)));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_rejects_key_traversal_out_of_bucket() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(matches!(disk.get_object_path("bucket", "../outside"), Err(DiskError::InvalidPath)));
+        assert!(matches!(
+            disk.get_object_path("bucket", "prefix/../../outside"),
+            Err(DiskError::InvalidPath)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_accepts_missing_leaf_under_existing_bucket() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("bucket should be created");
+
+        let object_path = disk
+            .get_object_path("bucket", "missing-object")
+            .expect("missing leaf under a valid bucket should resolve");
+
+        assert_eq!(object_path, disk.root.join("bucket/missing-object"));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_for_io_rejects_key_traversal_out_of_bucket() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(matches!(disk.get_object_path_for_io("bucket", "../outside"), Err(DiskError::InvalidPath)));
+        assert!(matches!(
+            disk.get_object_path_for_io("bucket", "prefix/../../outside"),
+            Err(DiskError::InvalidPath)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_for_io_accepts_missing_leaf_under_existing_bucket() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("bucket should be created");
+
+        let object_path = disk
+            .get_object_path_for_io("bucket", "missing-object")
+            .expect("missing leaf under a valid I/O bucket should resolve");
+
+        assert!(object_path.ends_with("bucket/missing-object"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_object_path_rejects_symlink_component_after_prior_valid_lookup() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let outside_dir = tempfile::tempdir().expect("outside temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let prefix = root_dir.path().join("bucket/prefix");
+        fs::create_dir_all(&prefix).await.expect("prefix should be created");
+
+        disk.get_object_path("bucket", "prefix/object")
+            .expect("initial lookup should validate the real prefix");
+        fs::remove_dir(&prefix).await.expect("prefix should be removable");
+        symlink(outside_dir.path(), &prefix).expect("prefix should be replaced by a symlink");
+
+        assert!(matches!(disk.get_object_path("bucket", "prefix/object"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_object_path_for_io_rejects_symlink_component_after_prior_valid_lookup() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let outside_dir = tempfile::tempdir().expect("outside temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let prefix = root_dir.path().join("bucket/prefix");
+        fs::create_dir_all(&prefix).await.expect("prefix should be created");
+
+        disk.get_object_path_for_io("bucket", "prefix/object")
+            .expect("initial I/O lookup should validate the real prefix");
+        fs::remove_dir(&prefix).await.expect("prefix should be removable");
+        symlink(outside_dir.path(), &prefix).expect("prefix should be replaced by a symlink");
+
+        assert!(matches!(
+            disk.get_object_path_for_io("bucket", "prefix/object"),
+            Err(DiskError::InvalidPath)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_accepts_parent_recreated_after_prior_valid_lookup() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let prefix = root_dir.path().join("bucket/prefix");
+        fs::create_dir_all(&prefix).await.expect("prefix should be created");
+
+        disk.get_object_path("bucket", "prefix/object")
+            .expect("initial lookup should validate the real prefix");
+        fs::remove_dir(&prefix).await.expect("prefix should be removable");
+        fs::create_dir(&prefix).await.expect("prefix should be recreated");
+
+        let object_path = disk
+            .get_object_path("bucket", "prefix/object")
+            .expect("recreated non-symlink parent should validate");
+        assert_eq!(object_path, disk.root.join("bucket/prefix/object"));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_for_io_accepts_parent_recreated_after_prior_valid_lookup() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let prefix = root_dir.path().join("bucket/prefix");
+        fs::create_dir_all(&prefix).await.expect("prefix should be created");
+
+        disk.get_object_path_for_io("bucket", "prefix/object")
+            .expect("initial I/O lookup should validate the real prefix");
+        fs::remove_dir(&prefix).await.expect("prefix should be removable");
+        fs::create_dir(&prefix).await.expect("prefix should be recreated");
+
+        let object_path = disk
+            .get_object_path_for_io("bucket", "prefix/object")
+            .expect("recreated non-symlink parent should validate for I/O");
+        assert!(object_path.ends_with("bucket/prefix/object"));
+    }
+
+    #[tokio::test]
+    async fn get_object_path_handles_many_unique_missing_prefixes_without_state_growth() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("bucket should be created");
+
+        for index in 0..5000 {
+            let object_path = disk
+                .get_object_path("bucket", &format!("prefix-{index}/object"))
+                .expect("unique missing prefix should validate without shared state");
+            assert!(object_path.ends_with(format!("bucket/prefix-{index}/object")));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_object_path_concurrent_validation_keeps_paths_under_bucket() {
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        disk.make_volume("bucket").await.expect("bucket should be created");
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = Vec::with_capacity(32);
+
+        for index in 0..32 {
+            let disk = disk.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                disk.get_object_path("bucket", &format!("object-{index}"))
+                    .expect("concurrent validation should resolve object path")
+            }));
+        }
+
+        for task in tasks {
+            let object_path = task.await.expect("validation task should complete");
+            assert!(object_path.starts_with(disk.root.join("bucket")));
+        }
     }
 
     #[tokio::test]

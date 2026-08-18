@@ -9465,6 +9465,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tonic-prost",
  "tower",
  "tracing",
  "tracing-core",
@@ -9538,6 +9539,8 @@ version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "crc-fast",
  "futures",
  "hotpath",
  "http 1.5.0",
@@ -9610,7 +9613,6 @@ version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "hotpath",
- "memmap2",
  "rustfs-io-metrics",
  "thiserror 2.0.20",
  "tokio",
@@ -10487,15 +10489,10 @@ dependencies = [
 name = "rustfs-zip"
 version = "1.0.0-rc.2"
 dependencies = [
- "astral-tokio-tar",
  "async-compression",
- "criterion",
  "hotpath",
- "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
- "zip",
 ]
 
 [[package]]
@@ -10681,7 +10678,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=d7028511a53f69d41ed3c69f36899f9b1aede647#d7028511a53f69d41ed3c69f36899f9b1aede647"
+source = "git+https://github.com/rustfs/s3s.git?rev=d358a68783096df1db0c3e314127f2704603b29e#d358a68783096df1db0c3e314127f2704603b29e"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10709,6 +10706,7 @@ dependencies = [
  "numeric_cast",
  "pin-project-lite",
  "quick-xml",
+ "regex",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -11812,7 +11810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -3389,8 +3389,15 @@ impl SetDisks {
                         // A no-op immediately-ready future in production.
                         Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                        disk.rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
-                            .await
+                        let disk_wait_started = rustfs_io_metrics::put_stage_timer();
+                        let result = disk
+                            .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                            .await;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                            disk_wait_started,
+                        );
+                        result
                     })
                     .catch_unwind()
                 });
@@ -3403,7 +3410,13 @@ impl SetDisks {
         let mut cleanup_data_dirs = vec![None; disk_count];
         let mut old_current_sizes = vec![None; disk_count];
 
-        let (results, mut file_infos) = fanout.await.map_err(|_| DiskError::Unexpected)?;
+        let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
+        let fanout_result = fanout.await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
+            quorum_wait_started,
+        );
+        let (results, mut file_infos) = fanout_result.map_err(|_| DiskError::Unexpected)?;
 
         for (idx, result) in results.iter().enumerate() {
             match result {

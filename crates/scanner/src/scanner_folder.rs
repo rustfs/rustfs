@@ -1770,6 +1770,13 @@ impl FolderScanner {
             HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => {
                 self.clear_pending_scanner_heal(kind, bucket, object, version_id);
             }
+            // Admin-only overlap rejections (HS-06); the scanner never sees
+            // them, but if it ever does, treat them as terminal like any
+            // other policy drop rather than endlessly retrying.
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+            | HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths) => {
+                self.clear_pending_scanner_heal(kind, bucket, object, version_id);
+            }
         }
     }
 

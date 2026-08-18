@@ -4574,7 +4574,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
         // 120s with ±10% jitter should stay clearly above the historic 30s cap.
         let delay = randomized_cycle_delay_for(Duration::from_secs(120));
@@ -4593,7 +4592,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_uses_configured_start_delay() {
         let delay = initial_scanner_delay_for(Some(120));
         assert!(delay >= Duration::from_secs(108));
@@ -4613,14 +4611,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
         assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
         let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
         assert!(delay >= Duration::from_secs(108));
@@ -4628,14 +4624,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
         assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
         // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
         // from a crash are healed on the first cycle, not after a 27-33 min sleep.
@@ -4644,7 +4638,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
         // Active replication but no buckets → no objects to scan, keep normal delay.
         let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
@@ -7399,7 +7392,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn clean_idle_cap_allows_policy_max_when_bitrot_is_disabled() {
         let config = ScannerRuntimeConfig {
             bitrot_cycle: None,
@@ -7515,7 +7507,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_randomized_cycle_delay_handles_small_start_delay() {
         // 0 is treated as minimum 1 second before jitter, with lower bound preserved.
         let delay = randomized_cycle_delay_for(Duration::from_secs(0));
@@ -8174,7 +8165,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_scan_complete_marks_deep_idle() {
         let started_at = Utc::now();
         let info = BackgroundHealInfo {
@@ -8192,7 +8182,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_scan_complete_leaves_normal_scan_unchanged() {
         let info = BackgroundHealInfo {
             bitrot_start_time: Some(Utc::now()),
@@ -8204,7 +8193,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
         let info = BackgroundHealInfo {
             bitrot_start_time: Some(Utc::now()),

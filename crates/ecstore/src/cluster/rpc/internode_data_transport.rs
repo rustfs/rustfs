@@ -233,10 +233,16 @@ pub struct NsScannerCapabilityRequest {
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
+    async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+        self.open_read(request).await
+    }
     /// Opens an owned-chunk stream when this transport can retain receive-buffer
     /// ownership. `None` preserves the established `open_read` fallback.
     async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
         Ok(None)
+    }
+    async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        self.open_read_chunks(request).await
     }
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
@@ -269,12 +275,31 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
         ))
     }
 
+    async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Box::new(
+            HttpReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        ))
+    }
+
     async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
         let url = build_read_file_stream_url(&request);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
         Ok(Some(Box::new(
             HttpChunkReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        )))
+    }
+
+    async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Some(Box::new(
+            HttpChunkReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout)
+                .await?,
         )))
     }
 
