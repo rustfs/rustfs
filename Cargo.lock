@@ -9539,6 +9539,8 @@ version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "crc-fast",
  "futures",
  "hotpath",
  "http 1.5.0",
@@ -10488,15 +10490,10 @@ dependencies = [
 name = "rustfs-zip"
 version = "1.0.0-rc.2"
 dependencies = [
- "astral-tokio-tar",
  "async-compression",
- "criterion",
  "hotpath",
- "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
- "zip",
 ]
 
 [[package]]
