@@ -428,7 +428,6 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
     Ok(ParsedURL(uu))
 }
 
-#[allow(dead_code)]
 pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     let u = parse_url(s)?;
     match u.0.scheme() {
@@ -437,7 +436,6 @@ pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     }
 }
 
-#[allow(dead_code)]
 pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return !expect_timeouts;
@@ -449,12 +447,10 @@ pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> b
         || err_str.contains("use of closed network connection")
 }
 
-#[allow(dead_code)]
 pub fn is_conn_reset_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection reset by peer") || matches!(err.raw_os_error(), Some(libc::ECONNRESET))
 }
 
-#[allow(dead_code)]
 pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection refused") || matches!(err.raw_os_error(), Some(libc::ECONNREFUSED))
 }

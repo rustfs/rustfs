@@ -55,18 +55,22 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    future::Future,
     io::Cursor,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::time;
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
+    task::{JoinError, JoinHandle},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -84,6 +88,7 @@ const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 const REMOTE_DISK_OPEN_READ_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_READ_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const REMOTE_READ_TIMEOUT_PARTS: u32 = 3;
 const NS_SCANNER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
 const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
@@ -214,8 +219,419 @@ where
     }
 }
 
+fn is_retryable_remote_body_error(error: &io::Error) -> bool {
+    if error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustfs_rio::BodyStalled>())
+        .is_some()
+    {
+        return true;
+    }
+
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn resumed_read_request(request: &ReadStreamRequest, emitted: usize) -> io::Result<ReadStreamRequest> {
+    let offset = request
+        .offset
+        .checked_add(emitted)
+        .ok_or_else(|| io::Error::other("remote read resume offset overflow"))?;
+    let length = if request.length == 0 {
+        0
+    } else {
+        request
+            .length
+            .checked_sub(emitted)
+            .ok_or_else(|| io::Error::other("remote read resume offset exceeds requested length"))?
+    };
+    Ok(ReadStreamRequest {
+        offset,
+        length,
+        ..request.clone()
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RemoteReadTimeouts {
+    body_stall: Option<Duration>,
+    initial_read: Option<Duration>,
+    recovery: Option<Duration>,
+}
+
+fn remote_read_timeouts(read_timeout: Duration) -> RemoteReadTimeouts {
+    let Some(recovery) = read_timeout
+        .checked_div(REMOTE_READ_TIMEOUT_PARTS)
+        .filter(|timeout| !timeout.is_zero())
+    else {
+        return RemoteReadTimeouts {
+            body_stall: None,
+            initial_read: None,
+            recovery: None,
+        };
+    };
+    RemoteReadTimeouts {
+        body_stall: Some(recovery),
+        initial_read: Some(read_timeout.saturating_sub(recovery)),
+        recovery: Some(recovery),
+    }
+}
+
+async fn with_remote_read_recovery_timeout<T, F>(recovery_timeout: Option<Duration>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match recovery_timeout {
+        Some(recovery_timeout) => match time::timeout(recovery_timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(DiskError::Timeout),
+        },
+        None => future.await,
+    }
+}
+
+struct AbortOnDropTask<T>(JoinHandle<T>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
+
+impl<T> Future for AbortOnDropTask<T>
+where
+    T: Send + 'static,
+{
+    type Output = std::result::Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn retry_cutoff_elapsed(
+    initial_read_timeout: &mut Option<Duration>,
+    cutoff: &mut Option<Pin<Box<time::Sleep>>>,
+    cx: &mut Context<'_>,
+) -> bool {
+    if cutoff.is_none()
+        && let Some(timeout) = initial_read_timeout.take()
+    {
+        *cutoff = Some(Box::pin(time::sleep(timeout)));
+    }
+    cutoff.as_mut().is_some_and(|cutoff| cutoff.as_mut().poll(cx).is_ready())
+}
+
+type ReadResumeFuture = AbortOnDropTask<Result<FileReader>>;
+
+struct RetryingRemoteReader {
+    reader: Option<FileReader>,
+    transport: Arc<dyn InternodeDataTransport>,
+    request: ReadStreamRequest,
+    emitted: usize,
+    retried: bool,
+    initial_read_timeout: Option<Duration>,
+    retry_cutoff: Option<Pin<Box<time::Sleep>>>,
+    recovery_timeout: Option<Duration>,
+    resume: Option<ReadResumeFuture>,
+}
+
+impl RetryingRemoteReader {
+    fn new_with_timeouts(
+        reader: FileReader,
+        transport: Arc<dyn InternodeDataTransport>,
+        request: ReadStreamRequest,
+        initial_read_timeout: Option<Duration>,
+        recovery_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            reader: Some(reader),
+            transport,
+            request,
+            emitted: 0,
+            retried: false,
+            initial_read_timeout,
+            retry_cutoff: None,
+            recovery_timeout,
+            resume: None,
+        }
+    }
+
+    fn start_resume(&mut self) -> io::Result<()> {
+        if self.request.length != 0 && self.emitted >= self.request.length {
+            self.reader = None;
+            return Ok(());
+        }
+        let request = resumed_read_request(&self.request, self.emitted)?;
+        let recovery_timeout = self.recovery_timeout;
+        let transport = Arc::clone(&self.transport);
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
+            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_fresh(request)).await
+        })));
+        Ok(())
+    }
+
+    fn retry_cutoff_elapsed(&mut self, cx: &mut Context<'_>) -> bool {
+        retry_cutoff_elapsed(&mut self.initial_read_timeout, &mut self.retry_cutoff, cx)
+    }
+}
+
+impl AsyncRead for RetryingRemoteReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        loop {
+            // After the absolute cutoff, let initial progress win over a stale fresh-open.
+            let resume_pending = if let Some(resume) = self.resume.as_mut() {
+                match Pin::new(resume).poll(cx) {
+                    Poll::Pending => true,
+                    Poll::Ready(Ok(Ok(reader))) => {
+                        self.resume = None;
+                        self.reader = Some(reader);
+                        false
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.resume = None;
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.resume = None;
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
+
+            if !self.retried && self.retry_cutoff_elapsed(cx) {
+                self.retried = true;
+                if let Err(resume_error) = self.start_resume() {
+                    return Poll::Ready(Err(resume_error));
+                }
+                continue;
+            }
+
+            let Some(reader) = self.reader.as_mut() else {
+                if resume_pending {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Ok(()));
+            };
+            let before = buf.filled().len();
+            match Pin::new(reader).poll_read(cx, buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    let produced = buf.filled().len() - before;
+                    self.emitted = match self.emitted.checked_add(produced) {
+                        Some(emitted) => emitted,
+                        None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
+                    };
+                    if resume_pending {
+                        if produced == 0 && (self.request.length == 0 || self.emitted >= self.request.length) {
+                            self.resume = None;
+                        } else if produced == 0 {
+                            self.reader = None;
+                            continue;
+                        } else {
+                            self.resume = None;
+                        }
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
+                    self.retried = true;
+                    self.reader = None;
+                    if let Err(resume_error) = self.start_resume() {
+                        return Poll::Ready(Err(resume_error));
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(error)) if resume_pending && is_retryable_remote_body_error(&error) => {
+                    self.reader = None;
+                    continue;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+type ChunkResumeFuture = AbortOnDropTask<Result<Option<rustfs_rio::ChunkReaderBox>>>;
+
+struct RetryingRemoteChunkReader {
+    reader: Option<rustfs_rio::ChunkReaderBox>,
+    transport: Arc<dyn InternodeDataTransport>,
+    request: ReadStreamRequest,
+    emitted: usize,
+    retried: bool,
+    initial_read_timeout: Option<Duration>,
+    retry_cutoff: Option<Pin<Box<time::Sleep>>>,
+    recovery_timeout: Option<Duration>,
+    resume: Option<ChunkResumeFuture>,
+}
+
+impl RetryingRemoteChunkReader {
+    fn new_with_timeouts(
+        reader: rustfs_rio::ChunkReaderBox,
+        transport: Arc<dyn InternodeDataTransport>,
+        request: ReadStreamRequest,
+        initial_read_timeout: Option<Duration>,
+        recovery_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            reader: Some(reader),
+            transport,
+            request,
+            emitted: 0,
+            retried: false,
+            initial_read_timeout,
+            retry_cutoff: None,
+            recovery_timeout,
+            resume: None,
+        }
+    }
+
+    fn start_resume(&mut self) -> io::Result<()> {
+        if self.request.length != 0 && self.emitted >= self.request.length {
+            self.reader = None;
+            return Ok(());
+        }
+        let request = resumed_read_request(&self.request, self.emitted)?;
+        let recovery_timeout = self.recovery_timeout;
+        let transport = Arc::clone(&self.transport);
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
+            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_chunks_fresh(request)).await
+        })));
+        Ok(())
+    }
+
+    fn retry_cutoff_elapsed(&mut self, cx: &mut Context<'_>) -> bool {
+        retry_cutoff_elapsed(&mut self.initial_read_timeout, &mut self.retry_cutoff, cx)
+    }
+}
+
+impl AsyncRead for RetryingRemoteChunkReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        match rustfs_rio::ChunkReader::poll_read_chunk(self.as_mut(), cx, buf.remaining()) {
+            Poll::Ready(Ok(Some(chunk))) => {
+                buf.put_slice(&chunk);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
+    fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+        loop {
+            let resume_pending = if let Some(resume) = self.resume.as_mut() {
+                match Pin::new(resume).poll(cx) {
+                    Poll::Pending => true,
+                    Poll::Ready(Ok(Ok(Some(reader)))) => {
+                        self.resume = None;
+                        self.reader = Some(reader);
+                        false
+                    }
+                    Poll::Ready(Ok(Ok(None))) => {
+                        self.resume = None;
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other("remote resume transport did not provide a chunk reader")));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.resume = None;
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.resume = None;
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
+
+            if !self.retried && self.retry_cutoff_elapsed(cx) {
+                self.retried = true;
+                if let Err(resume_error) = self.start_resume() {
+                    return Poll::Ready(Err(resume_error));
+                }
+                continue;
+            }
+
+            let Some(reader) = self.reader.as_mut() else {
+                if resume_pending {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Ok(None));
+            };
+            match rustfs_rio::ChunkReader::poll_read_chunk(Pin::new(reader.as_mut()), cx, max) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(Some(chunk))) => {
+                    self.emitted = match self.emitted.checked_add(chunk.len()) {
+                        Some(emitted) => emitted,
+                        None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
+                    };
+                    if resume_pending {
+                        self.resume = None;
+                    }
+                    return Poll::Ready(Ok(Some(chunk)));
+                }
+                Poll::Ready(Ok(None)) if resume_pending => {
+                    self.reader = None;
+                    continue;
+                }
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
+                Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
+                    self.retried = true;
+                    self.reader = None;
+                    if let Err(resume_error) = self.start_resume() {
+                        return Poll::Ready(Err(resume_error));
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(error)) if resume_pending && is_retryable_remote_body_error(&error) => {
+                    self.reader = None;
+                    continue;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RemoteDisk {
+    /// Stable identity for this handle instance; replacement handles receive a new identity.
+    handle_id: Uuid,
     pub id: Mutex<Option<Uuid>>,
     pub addr: String,
     endpoint: Endpoint,
@@ -226,7 +642,36 @@ pub struct RemoteDisk {
     health: Arc<DiskHealthTracker>,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    recovery_monitor_active: Arc<AtomicBool>,
+    #[cfg(test)]
+    recovery_monitor_start_count: Arc<AtomicU32>,
+    #[cfg(test)]
+    recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     data_transport: Arc<dyn InternodeDataTransport>,
+}
+
+struct RecoveryMonitorLease {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for RecoveryMonitorLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RecoveryMonitorTeardownHook {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RecoveryMonitorTestState {
+    start_count: Arc<AtomicU32>,
+    teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
 }
 
 // ── Connection lifecycle (grpc-optimization P3) ──
@@ -368,14 +813,15 @@ impl RemoteDisk {
             .await
     }
 
-    fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
+    fn recovery_monitor_span(addr: &str, endpoint: &Endpoint, handle_id: Uuid) -> tracing::Span {
         tracing::info_span!(
             "recovery-monitor",
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
             kind = "remote_disk",
             endpoint = %endpoint,
-            addr = %addr
+            addr = %addr,
+            handle_id = %handle_id
         )
     }
 
@@ -411,6 +857,7 @@ impl RemoteDisk {
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let disk = Self {
+            handle_id: Uuid::new_v4(),
             id: Mutex::new(None),
             addr,
             endpoint: ep.clone(),
@@ -418,6 +865,11 @@ impl RemoteDisk {
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
+            recovery_monitor_active: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            recovery_monitor_start_count: Arc::new(AtomicU32::new(0)),
+            #[cfg(test)]
+            recovery_monitor_teardown_hook: Arc::new(tokio::sync::Mutex::new(None)),
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
@@ -433,6 +885,16 @@ impl RemoteDisk {
 
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         self.health.runtime_state()
+    }
+
+    #[cfg(test)]
+    fn recovery_monitor_is_active(&self) -> bool {
+        self.recovery_monitor_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn recovery_monitor_start_count(&self) -> u32 {
+        self.recovery_monitor_start_count.load(Ordering::Acquire)
     }
 
     pub fn offline_duration_secs(&self) -> Option<u64> {
@@ -573,13 +1035,62 @@ impl RemoteDisk {
             return;
         }
 
-        let addr = self.addr.clone();
-        let endpoint = self.endpoint.clone();
-        let health = Arc::clone(&self.health);
-        let cancel_token = self.cancel_token.clone();
-        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        Self::schedule_recovery_monitor(
+            self.addr.clone(),
+            self.endpoint.clone(),
+            self.handle_id,
+            Arc::clone(&self.health),
+            self.cancel_token.clone(),
+            Arc::clone(&self.recovery_monitor_active),
+            #[cfg(test)]
+            RecoveryMonitorTestState {
+                start_count: Arc::clone(&self.recovery_monitor_start_count),
+                teardown_hook: Arc::clone(&self.recovery_monitor_teardown_hook),
+            },
+        );
+    }
+
+    fn schedule_recovery_monitor(
+        addr: String,
+        endpoint: Endpoint,
+        handle_id: Uuid,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+        active: Arc<AtomicBool>,
+        #[cfg(test)] test_state: RecoveryMonitorTestState,
+    ) {
+        if active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let span = Self::recovery_monitor_span(&addr, &endpoint, handle_id);
         super::spawn_background_monitor(span, async move {
-            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+            #[cfg(test)]
+            test_state.start_count.fetch_add(1, Ordering::AcqRel);
+            let lease = RecoveryMonitorLease {
+                active: Arc::clone(&active),
+            };
+            Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
+            #[cfg(test)]
+            if let Some(hook) = test_state.teardown_hook.lock().await.take() {
+                hook.arrived.notify_one();
+                hook.release.notified().await;
+            }
+            drop(lease);
+            if !cancel_token.is_cancelled() && health.runtime_state() != RuntimeDriveHealthState::Online {
+                Self::schedule_recovery_monitor(
+                    addr,
+                    endpoint,
+                    handle_id,
+                    health,
+                    cancel_token,
+                    active,
+                    #[cfg(test)]
+                    test_state,
+                );
+            }
         });
     }
 
@@ -588,7 +1099,7 @@ impl RemoteDisk {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let endpoint = self.endpoint.clone();
         let addr = self.addr.clone();
-        let span = Self::recovery_monitor_span(&addr, &endpoint);
+        let span = Self::recovery_monitor_span(&addr, &endpoint, self.handle_id);
         super::spawn_background_monitor(span, async move {
             warn!(
                 event = EVENT_REMOTE_DISK_HEALTH,
@@ -619,9 +1130,23 @@ impl RemoteDisk {
         let cancel_token = self.cancel_token.clone();
         let addr = self.addr.clone();
         let endpoint = self.endpoint.clone();
+        let handle_id = self.handle_id;
+        let recovery_monitor_active = Arc::clone(&self.recovery_monitor_active);
+        #[cfg(test)]
+        let recovery_monitor_teardown_hook = Arc::clone(&self.recovery_monitor_teardown_hook);
 
         tokio::spawn(async move {
-            Self::monitor_remote_disk_health(addr, endpoint, health, cancel_token).await;
+            Self::monitor_remote_disk_health(
+                addr,
+                endpoint,
+                handle_id,
+                health,
+                cancel_token,
+                recovery_monitor_active,
+                #[cfg(test)]
+                recovery_monitor_teardown_hook,
+            )
+            .await;
         });
     }
 
@@ -629,8 +1154,11 @@ impl RemoteDisk {
     async fn monitor_remote_disk_health(
         addr: String,
         endpoint: Endpoint,
+        handle_id: Uuid,
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
+        recovery_monitor_active: Arc<AtomicBool>,
+        #[cfg(test)] recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     ) {
         let mut interval = time::interval(get_drive_active_check_interval());
 
@@ -655,11 +1183,19 @@ impl RemoteDisk {
             let addr_clone = addr.clone();
             let endpoint_clone = endpoint.clone();
             let cancel_clone = cancel_token.clone();
-            let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
-
-            super::spawn_background_monitor(span, async move {
-                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-            });
+            Self::schedule_recovery_monitor(
+                addr_clone,
+                endpoint_clone,
+                handle_id,
+                health_clone,
+                cancel_clone,
+                Arc::clone(&recovery_monitor_active),
+                #[cfg(test)]
+                RecoveryMonitorTestState {
+                    start_count: Arc::new(AtomicU32::new(0)),
+                    teardown_hook: Arc::clone(&recovery_monitor_teardown_hook),
+                },
+            );
         }
 
         loop {
@@ -718,11 +1254,19 @@ impl RemoteDisk {
                         let addr_clone = addr.clone();
                         let endpoint_clone = endpoint.clone();
                         let cancel_clone = cancel_token.clone();
-                        let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
-
-                        super::spawn_background_monitor(span, async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                        });
+                        Self::schedule_recovery_monitor(
+                            addr_clone,
+                            endpoint_clone,
+                            handle_id,
+                            health_clone,
+                            cancel_clone,
+                            Arc::clone(&recovery_monitor_active),
+                            #[cfg(test)]
+                            RecoveryMonitorTestState {
+                                start_count: Arc::new(AtomicU32::new(0)),
+                                teardown_hook: Arc::clone(&recovery_monitor_teardown_hook),
+                            },
+                        );
                     }
                 }
             }
@@ -973,6 +1517,7 @@ impl RemoteDisk {
                 subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
                 endpoint = %self.endpoint,
                 addr = %self.addr,
+                handle_id = %self.handle_id,
                 op,
                 state = "faulty_short_circuit",
                 "Remote disk operation short-circuited by faulty state"
@@ -2483,17 +3028,24 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        let stall_timeout = get_object_disk_read_timeout();
-        self.open_read_with_retry(ReadStreamRequest {
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
+        let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
             volume: volume.to_string(),
             path: path.to_string(),
             offset,
             length,
-            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
-        })
-        .await
+            stall_timeout: timeouts.body_stall,
+        };
+        let reader = self.open_read_with_retry(request.clone()).await?;
+        Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
+            reader,
+            Arc::clone(&self.data_transport),
+            request,
+            timeouts.initial_read,
+            timeouts.recovery,
+        )))
     }
 
     async fn read_file_stream_chunks(
@@ -2507,17 +3059,26 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        let stall_timeout = get_object_disk_read_timeout();
-        self.open_read_chunks_with_retry(ReadStreamRequest {
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
+        let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
             volume: volume.to_string(),
             path: path.to_string(),
             offset,
             length,
-            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
-        })
-        .await
+            stall_timeout: timeouts.body_stall,
+        };
+        let reader = self.open_read_chunks_with_retry(request.clone()).await?;
+        Ok(reader.map(|reader| {
+            Box::new(RetryingRemoteChunkReader::new_with_timeouts(
+                reader,
+                Arc::clone(&self.data_transport),
+                request,
+                timeouts.initial_read,
+                timeouts.recovery,
+            )) as rustfs_rio::ChunkReaderBox
+        }))
     }
 
     /// Buffered read for remote disks.
@@ -3115,16 +3676,26 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
+    use crate::erasure::coding::{BitrotReader, Erasure, decode::ParallelReader};
+    use crate::io_support::bitrot::ShardReader;
     use crate::runtime::sources as runtime_sources;
+    use rustfs_protos::proto_gen::node_service::{DiskInfoResponse, ReadAllResponse};
     use serde_json::Value;
     use serial_test::serial;
+    use std::convert::Infallible;
+    use std::future::Future;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex, Mutex as StdMutex, Once};
+    use std::sync::{Arc, Mutex, Mutex as StdMutex, Once, atomic::AtomicUsize};
     use std::task::{Context, Poll};
     use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
-    use tonic::transport::Endpoint as TonicEndpoint;
+    use tonic::transport::{Endpoint as TonicEndpoint, Server};
+    use tonic::{Response, Status};
+    use tonic::{
+        codegen::{Body as HttpBody, BoxFuture, StdError, http},
+        server::NamedService,
+    };
     use tracing::Level;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
     use uuid::Uuid;
@@ -3282,6 +3853,218 @@ mod tests {
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthenticatedReadPeer {
+        audience: String,
+        disk_info_calls: Arc<AtomicU32>,
+        read_all_calls: Arc<AtomicU32>,
+        object_read_all_disks: Arc<StdMutex<Vec<String>>>,
+        format_data: Bytes,
+        read_all_data: Bytes,
+    }
+
+    impl AuthenticatedReadPeer {
+        fn new(audience: String, format_data: Bytes, read_all_data: Bytes) -> Self {
+            Self {
+                audience,
+                disk_info_calls: Arc::new(AtomicU32::new(0)),
+                read_all_calls: Arc::new(AtomicU32::new(0)),
+                object_read_all_disks: Arc::default(),
+                format_data,
+                read_all_data,
+            }
+        }
+
+        fn disk_info_calls(&self) -> u32 {
+            self.disk_info_calls.load(Ordering::Acquire)
+        }
+
+        fn read_all_calls(&self) -> u32 {
+            self.read_all_calls.load(Ordering::Acquire)
+        }
+
+        fn object_read_all_disks(&self) -> Vec<String> {
+            self.object_read_all_disks
+                .lock()
+                .expect("object read_all disk list lock poisoned")
+                .clone()
+        }
+
+        fn verify_auth<T>(&self, request: &Request<T>, path: &str) -> std::result::Result<(), Status> {
+            let headers = request.metadata().clone().into_headers();
+            crate::cluster::rpc::verify_tonic_rpc_signature(&self.audience, path, &headers)
+                .map_err(|err| Status::unauthenticated(err.to_string()))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthenticatedReadPeerService {
+        peer: AuthenticatedReadPeer,
+    }
+
+    impl NamedService for AuthenticatedReadPeerService {
+        const NAME: &'static str = "node_service.NodeService";
+    }
+
+    impl<B> tower::Service<http::Request<B>> for AuthenticatedReadPeerService
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            match request.uri().path() {
+                "/node_service.NodeService/DiskInfo" => {
+                    #[derive(Clone)]
+                    struct DiskInfoSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<DiskInfoRequest> for DiskInfoSvc {
+                        type Response = DiskInfoResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<DiskInfoRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/DiskInfo")?;
+                                let request = request.into_inner();
+                                let opts = serde_json::from_str::<DiskInfoOptions>(&request.opts)
+                                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
+                                if !opts.noop {
+                                    return Err(Status::invalid_argument("recovery probe must use noop disk_info"));
+                                }
+                                peer.disk_info_calls.fetch_add(1, Ordering::AcqRel);
+                                let disk_info = serde_json::to_string(&DiskInfo {
+                                    total: 1,
+                                    free: 1,
+                                    endpoint: request.disk,
+                                    ..Default::default()
+                                })
+                                .map_err(|err| Status::internal(err.to_string()))?;
+                                Ok(Response::new(DiskInfoResponse {
+                                    success: true,
+                                    disk_info,
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = DiskInfoSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/ReadAll" => {
+                    #[derive(Clone)]
+                    struct ReadAllSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<ReadAllRequest> for ReadAllSvc {
+                        type Response = ReadAllResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<ReadAllRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/ReadAll")?;
+                                let request = request.into_inner();
+                                let is_format_read = request.volume == crate::disk::RUSTFS_META_BUCKET
+                                    && request.path == crate::disk::FORMAT_CONFIG_FILE;
+                                let disk = request.disk;
+                                peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
+                                let data = if is_format_read {
+                                    peer.format_data.clone()
+                                } else {
+                                    peer.object_read_all_disks
+                                        .lock()
+                                        .expect("object read_all disk list lock poisoned")
+                                        .push(disk);
+                                    peer.read_all_data.clone()
+                                };
+                                Ok(Response::new(ReadAllResponse {
+                                    success: true,
+                                    data,
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = ReadAllSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(tonic::Status::GRPC_STATUS, (tonic::Code::Unimplemented as i32).into());
+                    headers.insert(http::header::CONTENT_TYPE, tonic::metadata::GRPC_CONTENT_TYPE);
+                    Ok(response)
+                }),
+            }
+        }
+    }
+
+    struct TestGrpcPeer {
+        addr: String,
+        peer: AuthenticatedReadPeer,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestGrpcPeer {
+        async fn spawn(format_data: Bytes, read_all_data: Bytes) -> Option<Self> {
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+                Err(err) => panic!("test gRPC listener should bind: {err}"),
+            };
+            let socket_addr = listener.local_addr().expect("listener local address should be available");
+            let addr = format!("http://{socket_addr}");
+            let audience = crate::cluster::rpc::normalize_tonic_rpc_audience(&socket_addr.to_string())
+                .expect("test audience should normalize");
+            let peer = AuthenticatedReadPeer::new(audience, format_data, read_all_data);
+            let service = AuthenticatedReadPeerService { peer: peer.clone() };
+            let shutdown = CancellationToken::new();
+            let shutdown_for_task = shutdown.clone();
+            let incoming = futures_util::stream::unfold(listener, |listener| async {
+                Some((listener.accept().await.map(|(stream, _)| stream), listener))
+            });
+            let task = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(incoming, shutdown_for_task.cancelled_owned())
+                    .await
+                    .expect("test gRPC peer should serve");
+            });
+
+            Some(Self {
+                addr,
+                peer,
+                shutdown,
+                task,
+            })
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let _ = self.task.await;
+        }
     }
 
     impl RecordingInternodeDataTransport {
@@ -4138,6 +4921,735 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    enum ResumeReadStep {
+        PartialThenReset(Vec<u8>),
+        Data(Vec<u8>),
+    }
+
+    #[derive(Debug, Default)]
+    struct ResumeTransport {
+        read_steps: Mutex<Vec<ResumeReadStep>>,
+        chunk_steps: Mutex<Vec<ResumeReadStep>>,
+        read_requests: Mutex<Vec<ReadStreamRequest>>,
+        chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_read_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+    }
+
+    impl ResumeTransport {
+        fn with_read_steps(read_steps: Vec<ResumeReadStep>) -> Self {
+            Self {
+                read_steps: Mutex::new(read_steps),
+                ..Self::default()
+            }
+        }
+
+        fn with_chunk_steps(chunk_steps: Vec<ResumeReadStep>) -> Self {
+            Self {
+                chunk_steps: Mutex::new(chunk_steps),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChunkPartialThenErrorReader {
+        data: Option<Bytes>,
+        error: Option<io::Error>,
+    }
+
+    impl rustfs_rio::ChunkReader for ChunkPartialThenErrorReader {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            if let Some(mut data) = self.data.take() {
+                let take = data.len().min(max);
+                let chunk = data.split_to(take);
+                if !data.is_empty() {
+                    self.data = Some(data);
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            if let Some(error) = self.error.take() {
+                return Poll::Ready(Err(error));
+            }
+            Poll::Ready(Ok(None))
+        }
+    }
+
+    impl AsyncRead for ChunkPartialThenErrorReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("chunk reader must use chunk handoff")))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BodyStallTestReader {
+        data: Option<Bytes>,
+        next_data: Option<(Bytes, Pin<Box<time::Sleep>>)>,
+        initial_delay: Option<Pin<Box<time::Sleep>>>,
+        timeout: Duration,
+        stall_timer: Option<Pin<Box<time::Sleep>>>,
+    }
+
+    impl BodyStallTestReader {
+        fn new(data: Bytes, initial_delay: Duration, timeout: Option<Duration>) -> Self {
+            let timeout = timeout.expect("parallel resume test requires a body stall timeout");
+            Self {
+                data: Some(data),
+                next_data: None,
+                initial_delay: Some(Box::pin(time::sleep(initial_delay))),
+                timeout,
+                stall_timer: None,
+            }
+        }
+
+        fn with_next_data(
+            data: Bytes,
+            initial_delay: Duration,
+            next_data: Bytes,
+            next_delay: Duration,
+            timeout: Option<Duration>,
+        ) -> Self {
+            let mut reader = Self::new(data, initial_delay, timeout);
+            reader.next_data = Some((next_data, Box::pin(time::sleep(next_delay))));
+            reader
+        }
+
+        fn poll_chunk(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            if let Some(delay) = self.initial_delay.as_mut() {
+                if delay.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.initial_delay = None;
+            }
+            if let Some(mut data) = self.data.take() {
+                let chunk = data.split_to(data.len().min(max));
+                if !data.is_empty() {
+                    self.data = Some(data);
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            if let Some((_, delay)) = self.next_data.as_mut()
+                && delay.as_mut().poll(cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+            if let Some((mut data, _)) = self.next_data.take() {
+                let chunk = data.split_to(data.len().min(max));
+                if !data.is_empty() {
+                    self.next_data = Some((data, Box::pin(time::sleep(Duration::ZERO))));
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            let timer = self.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(self.timeout)));
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    std_io::ErrorKind::TimedOut,
+                    rustfs_rio::BodyStalled { timeout: self.timeout },
+                ))),
+            }
+        }
+    }
+
+    impl AsyncRead for BodyStallTestReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.poll_chunk(cx, buf.remaining()) {
+                Poll::Ready(Ok(Some(chunk))) => {
+                    buf.put_slice(&chunk);
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl rustfs_rio::ChunkReader for BodyStallTestReader {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            self.poll_chunk(cx, max)
+        }
+    }
+
+    struct CountOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ParallelResumeTransport {
+        initial_data: Bytes,
+        resumed_data: Bytes,
+        initial_delay: Duration,
+        fresh_delay: Duration,
+        fresh_read_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+        initial_next_data: Option<(Bytes, Duration)>,
+    }
+
+    impl ParallelResumeTransport {
+        fn new(initial_delay: Duration, fresh_delay: Duration) -> Self {
+            Self {
+                initial_data: Bytes::from_static(b"da"),
+                resumed_data: Bytes::from_static(b"ta"),
+                initial_delay,
+                fresh_delay,
+                fresh_read_requests: Mutex::new(Vec::new()),
+                fresh_chunk_requests: Mutex::new(Vec::new()),
+                initial_next_data: None,
+            }
+        }
+
+        fn with_initial_next_data(initial_delay: Duration, next_delay: Duration, fresh_delay: Duration) -> Self {
+            let mut transport = Self::new(initial_delay, fresh_delay);
+            transport.initial_next_data = Some((Bytes::from_static(b"ta"), next_delay));
+            transport
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for ParallelResumeTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            let reader = match self.initial_next_data.as_ref() {
+                Some((next_data, next_delay)) => BodyStallTestReader::with_next_data(
+                    self.initial_data.clone(),
+                    self.initial_delay,
+                    next_data.clone(),
+                    *next_delay,
+                    request.stall_timeout,
+                ),
+                None => BodyStallTestReader::new(self.initial_data.clone(), self.initial_delay, request.stall_timeout),
+            };
+            Ok(Box::new(reader))
+        }
+
+        async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .push(request);
+            time::sleep(self.fresh_delay).await;
+            Ok(Box::new(Cursor::new(self.resumed_data.clone())))
+        }
+
+        async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            let reader = match self.initial_next_data.as_ref() {
+                Some((next_data, next_delay)) => BodyStallTestReader::with_next_data(
+                    self.initial_data.clone(),
+                    self.initial_delay,
+                    next_data.clone(),
+                    *next_delay,
+                    request.stall_timeout,
+                ),
+                None => BodyStallTestReader::new(self.initial_data.clone(), self.initial_delay, request.stall_timeout),
+            };
+            Ok(Some(Box::new(reader)))
+        }
+
+        async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .push(request);
+            time::sleep(self.fresh_delay).await;
+            Ok(Some(Box::new(ChunkPartialThenErrorReader {
+                data: Some(self.resumed_data.clone()),
+                error: None,
+            })))
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in parallel resume tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in parallel resume tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "parallel-resume-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingFreshOpenTransport {
+        fresh_read_drops: Arc<AtomicUsize>,
+        fresh_chunk_drops: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for PendingFreshOpenTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            Ok(Box::new(PartialThenErrorReader {
+                cursor: Cursor::new(Vec::new()),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }))
+        }
+
+        async fn open_read_fresh(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            let _drop = CountOnDrop(Arc::clone(&self.fresh_read_drops));
+            std::future::pending().await
+        }
+
+        async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            Ok(Some(Box::new(ChunkPartialThenErrorReader {
+                data: None,
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            })))
+        }
+
+        async fn open_read_chunks_fresh(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            let _drop = CountOnDrop(Arc::clone(&self.fresh_chunk_drops));
+            std::future::pending().await
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in fresh open cancellation tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in fresh open cancellation tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "pending-fresh-open-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    fn resume_step_reader(step: ResumeReadStep) -> FileReader {
+        match step {
+            ResumeReadStep::PartialThenReset(data) => Box::new(PartialThenErrorReader {
+                cursor: Cursor::new(data),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }),
+            ResumeReadStep::Data(data) => Box::new(Cursor::new(data)),
+        }
+    }
+
+    fn resume_step_chunk_reader(step: ResumeReadStep) -> rustfs_rio::ChunkReaderBox {
+        match step {
+            ResumeReadStep::PartialThenReset(data) => Box::new(ChunkPartialThenErrorReader {
+                data: Some(Bytes::from(data)),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }),
+            ResumeReadStep::Data(data) => Box::new(ChunkPartialThenErrorReader {
+                data: Some(Bytes::from(data)),
+                error: None,
+            }),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for ResumeTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .push(request);
+            let step = self
+                .read_steps
+                .lock()
+                .expect("read steps lock should not be poisoned")
+                .remove(0);
+            Ok(resume_step_reader(step))
+        }
+
+        async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .push(request.clone());
+            self.open_read(request).await
+        }
+
+        async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.chunk_requests
+                .lock()
+                .expect("chunk request lock should not be poisoned")
+                .push(request);
+            let step = self
+                .chunk_steps
+                .lock()
+                .expect("chunk steps lock should not be poisoned")
+                .remove(0);
+            Ok(Some(resume_step_chunk_reader(step)))
+        }
+
+        async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .push(request.clone());
+            self.open_read_chunks(request).await
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in remote read resume tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in remote read resume tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "resume-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    fn resume_request(length: usize) -> ReadStreamRequest {
+        ReadStreamRequest {
+            endpoint: "http://remote".to_string(),
+            disk: "disk".to_string(),
+            volume: "volume".to_string(),
+            path: "path".to_string(),
+            offset: 7,
+            length,
+            stall_timeout: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_reader_resumes_from_emitted_bytes_without_duplicates() {
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
+        let request = resume_request(10);
+        let reader = resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteReader::new_with_timeouts(reader, transport.clone(), request, None, None);
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("one body reset should be resumed");
+
+        assert_eq!(output, b"0123456789");
+        let requests = transport
+            .read_requests
+            .lock()
+            .expect("read request lock should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 11);
+        assert_eq!(requests[0].length, 6);
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_resumes_from_emitted_bytes_without_duplicates() {
+        let transport = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
+        let request = resume_request(10);
+        let reader = resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(reader, transport.clone(), request, None, None);
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("chunk body reset should be resumed");
+
+        assert_eq!(output, b"0123456789");
+        let requests = transport
+            .chunk_requests
+            .lock()
+            .expect("chunk request lock should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 11);
+        assert_eq!(requests[0].length, 6);
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum ParallelResumePath {
+        Regular,
+        Chunk,
+    }
+
+    async fn assert_parallel_resume_case(
+        path: ParallelResumePath,
+        initial_delay: Duration,
+        initial_next_delay: Option<Duration>,
+        fresh_delay: Duration,
+        expect_success: bool,
+    ) {
+        const DATA: &[u8] = b"data";
+        let transport = Arc::new(match initial_next_delay {
+            Some(next_delay) => ParallelResumeTransport::with_initial_next_data(initial_delay, next_delay, fresh_delay),
+            None => ParallelResumeTransport::new(initial_delay, fresh_delay),
+        });
+        let remote_disk = new_remote_disk_with_transport(transport.clone()).await;
+        let erasure = Erasure::new(1, 1, DATA.len());
+        let (buffers, errors) = match path {
+            ParallelResumePath::Regular => {
+                let reader = remote_disk
+                    .read_file_stream("bucket", "object/part.1", 0, DATA.len())
+                    .await
+                    .expect("initial remote reader should open");
+                let readers = vec![
+                    Some(BitrotReader::new(reader, DATA.len(), rustfs_utils::HashAlgorithm::None, false)),
+                    None,
+                ];
+                ParallelReader::new_with_metrics_path_and_reconstruction_verification(readers, erasure, 0, DATA.len(), None)
+                    .read()
+                    .await
+            }
+            ParallelResumePath::Chunk => {
+                let reader = remote_disk
+                    .read_file_stream_chunks("bucket", "object/part.1", 0, DATA.len())
+                    .await
+                    .expect("initial remote chunk reader should open")
+                    .expect("chunk transport should return a reader");
+                let readers = vec![
+                    Some(BitrotReader::new(
+                        ShardReader::Chunked(reader),
+                        DATA.len(),
+                        rustfs_utils::HashAlgorithm::None,
+                        false,
+                    )),
+                    None,
+                ];
+                ParallelReader::new_with_metrics_path_and_reconstruction_verification(readers, erasure, 0, DATA.len(), None)
+                    .read()
+                    .await
+            }
+        };
+
+        if expect_success {
+            assert_eq!(buffers[0].as_deref(), Some(DATA));
+            assert!(errors[0].is_none());
+        } else {
+            assert!(buffers[0].is_none());
+            assert!(matches!(errors[0], Some(DiskError::Timeout)));
+        }
+        let requests = match path {
+            ParallelResumePath::Regular => transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned"),
+            ParallelResumePath::Chunk => transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned"),
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 2);
+        assert_eq!(requests[0].length, 2);
+    }
+
+    async fn assert_parallel_resume_path(path: ParallelResumePath) {
+        assert_parallel_resume_case(path, Duration::ZERO, None, Duration::from_millis(100), true).await;
+        assert_parallel_resume_case(path, Duration::from_millis(500), None, Duration::from_millis(100), true).await;
+        assert_parallel_resume_case(path, Duration::ZERO, None, Duration::from_millis(500), false).await;
+        assert_parallel_resume_case(
+            path,
+            Duration::from_millis(650),
+            Some(Duration::from_millis(700)),
+            Duration::from_millis(500),
+            true,
+        )
+        .await;
+    }
+
+    async fn assert_retry_drop_cancels_fresh_open(path: ParallelResumePath) {
+        let transport = Arc::new(PendingFreshOpenTransport::default());
+        let remote_disk = new_remote_disk_with_transport(transport.clone()).await;
+        let mut output = [0_u8; 1];
+        match path {
+            ParallelResumePath::Regular => {
+                let mut reader = remote_disk
+                    .read_file_stream("bucket", "object/part.1", 0, 1)
+                    .await
+                    .expect("initial remote reader should open");
+                assert!(
+                    time::timeout(Duration::from_millis(20), reader.read(&mut output))
+                        .await
+                        .is_err()
+                );
+                drop(reader);
+            }
+            ParallelResumePath::Chunk => {
+                let mut reader = remote_disk
+                    .read_file_stream_chunks("bucket", "object/part.1", 0, 1)
+                    .await
+                    .expect("initial remote chunk reader should open")
+                    .expect("chunk transport should return a reader");
+                assert!(
+                    time::timeout(Duration::from_millis(20), reader.read(&mut output))
+                        .await
+                        .is_err()
+                );
+                drop(reader);
+            }
+        }
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drops = match path {
+                    ParallelResumePath::Regular => transport.fresh_read_drops.load(Ordering::Relaxed),
+                    ParallelResumePath::Chunk => transport.fresh_chunk_drops.load(Ordering::Relaxed),
+                };
+                if drops == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the retrying reader should cancel the pending fresh open");
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_reader_recovers_body_stall_through_parallel_reader() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            assert_parallel_resume_path(ParallelResumePath::Regular).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_chunk_reader_recovers_body_stall_through_parallel_reader() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            assert_parallel_resume_path(ParallelResumePath::Chunk).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_reader_drop_cancels_pending_fresh_open() {
+        assert_retry_drop_cancels_fresh_open(ParallelResumePath::Regular).await;
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_drop_cancels_pending_fresh_open() {
+        assert_retry_drop_cancels_fresh_open(ParallelResumePath::Chunk).await;
+    }
+
+    #[tokio::test]
+    async fn remote_reader_treats_error_after_requested_length_as_eof() {
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteReader::new_with_timeouts(reader, transport.clone(), resume_request(4), None, None);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("error after the requested bytes should not trigger a redundant resume");
+        assert_eq!(output, b"0123");
+        assert!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_treats_error_after_requested_length_as_eof() {
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(reader, transport.clone(), resume_request(4), None, None);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("error after the requested bytes should not trigger a redundant chunk resume");
+        assert_eq!(output, b"0123");
+        assert!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_reader_retries_at_most_once_and_preserves_non_retryable_errors() {
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::PartialThenReset(b"456".to_vec())]));
+        let mut reader = RetryingRemoteReader::new_with_timeouts(
+            resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec())),
+            transport.clone(),
+            resume_request(7),
+            None,
+            None,
+        );
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("second reset must not retry");
+        assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            transport
+                .read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = PartialThenErrorReader {
+            cursor: Cursor::new(b"data".to_vec()),
+            error: Some(io::Error::new(std_io::ErrorKind::PermissionDenied, "permission denied")),
+        };
+        let mut reader =
+            RetryingRemoteReader::new_with_timeouts(Box::new(reader), transport.clone(), resume_request(4), None, None);
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("non-retryable errors must not retry");
+        assert_eq!(error.kind(), std_io::ErrorKind::PermissionDenied);
+        assert!(
+            transport
+                .read_requests
+                .lock()
+                .expect("read request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resumed_read_request_checks_large_offsets() {
+        let request = ReadStreamRequest {
+            offset: usize::MAX - 1,
+            length: 0,
+            ..resume_request(0)
+        };
+        assert!(resumed_read_request(&request, 2).is_err());
+
+        let request = resume_request(4);
+        assert!(resumed_read_request(&request, 5).is_err());
+    }
+
     fn init_tracing(filter_level: Level) {
         INIT.call_once(|| {
             let _ = tracing_subscriber::fmt()
@@ -4398,6 +5910,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn faulty_handle_runs_only_one_recovery_monitor() {
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").expect("endpoint should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        if !disk.health_check {
+            return;
+        }
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        disk.spawn_recovery_monitor_if_needed();
+        disk.spawn_recovery_monitor_if_needed();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.recovery_monitor_start_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery monitor should start");
+
+        assert!(disk.recovery_monitor_is_active(), "only one recovery monitor should own the handle");
+        assert_eq!(
+            disk.recovery_monitor_start_count(),
+            1,
+            "the failed compare-exchange path must not start a second monitor"
+        );
+
+        disk.cancel_token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.recovery_monitor_is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled recovery monitor should release its single-flight state");
+        assert!(!disk.recovery_monitor_is_active());
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn recovery_monitor_rearms_if_disk_fails_during_teardown() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some(peer) = TestGrpcPeer::spawn(Bytes::new(), Bytes::new()).await else {
+            return;
+        };
+        let endpoint = Endpoint {
+            url: url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("endpoint should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        if !disk.health_check {
+            peer.stop().await;
+            return;
+        }
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        let hook = Arc::new(RecoveryMonitorTeardownHook::default());
+        *disk.recovery_monitor_teardown_hook.lock().await = Some(Arc::clone(&hook));
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                disk.spawn_recovery_monitor_if_needed();
+                tokio::time::timeout(Duration::from_secs(5), hook.arrived.notified())
+                    .await
+                    .expect("first recovery monitor should reach teardown");
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+
+                disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                hook.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while disk.recovery_monitor_start_count() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("teardown failure should re-arm recovery monitoring");
+                assert!(
+                    disk.recovery_monitor_is_active(),
+                    "re-armed monitor should retain single-flight ownership"
+                );
+
+                disk.cancel_token.cancel();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while disk.recovery_monitor_is_active() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cancelled re-armed monitor should release single-flight state");
+            },
+        )
+        .await;
+
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn recovery_monitor_restores_online_then_real_reads_use_replacement_handle() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut format = crate::layout::format::FormatV3::new(1, 1);
+        let disk_id = format.erasure.sets[0][0];
+        format.erasure.this = disk_id;
+        let format_data = Bytes::from(format.to_json().expect("test format should serialize"));
+        let Some(peer) = TestGrpcPeer::spawn(format_data, Bytes::from_static(b"replacement-data")).await else {
+            return;
+        };
+        let url = url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("endpoint should parse");
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("3")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                let monitor = tokio::spawn(RemoteDisk::monitor_remote_disk_recovery(
+                    disk.addr.clone(),
+                    endpoint.clone(),
+                    Arc::clone(&disk.health),
+                    disk.cancel_token.clone(),
+                ));
+
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while disk.runtime_state() != RuntimeDriveHealthState::Online {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("three authenticated recovery probes should restore the disk online");
+                monitor.await.expect("recovery monitor should exit after restoring Online");
+
+                assert_eq!(
+                    peer.peer.disk_info_calls(),
+                    3,
+                    "RemoteDisk recovery requires the configured three successful disk_info probes"
+                );
+                let recovered_read = disk.read_all("bucket", "object").await.expect("recovered handle should read");
+                assert_eq!(recovered_read, Bytes::from_static(b"replacement-data"));
+
+                let old_disk = crate::disk::new_disk(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("old slot disk should construct");
+                let set_disks = crate::set_disk::SetDisks::new(
+                    "remote-recovery-test".to_string(),
+                    Arc::new(tokio::sync::RwLock::new(vec![Some(old_disk.clone())])),
+                    1,
+                    0,
+                    0,
+                    0,
+                    vec![endpoint.clone()],
+                    format,
+                    Vec::new(),
+                )
+                .await;
+                set_disks.disks.write().await[0] = None;
+                set_disks.renew_disk(&endpoint).await;
+
+                let slots = set_disks.disks.read().await;
+                let replacement = slots[0]
+                    .as_ref()
+                    .expect("renew_disk should publish the replacement slot")
+                    .clone();
+                drop(slots);
+                assert!(!Arc::ptr_eq(&replacement, &old_disk), "renew_disk must replace the stale slot handle");
+                let replacement_read = replacement
+                    .read_all("bucket", "object")
+                    .await
+                    .expect("production slot should route real reads through the replacement");
+                assert_eq!(replacement_read, Bytes::from_static(b"replacement-data"));
+                let object_reads = peer.peer.object_read_all_disks();
+                assert_eq!(object_reads.len(), 2, "standalone and production-slot reads should both reach the peer");
+                assert_eq!(object_reads[1], disk_id.to_string(), "production slot must use the renewed disk identity");
+                assert!(peer.peer.read_all_calls() >= 3, "renewal must read format metadata before the slot read");
+                disk.cancel_token.cancel();
+                old_disk.close().await.expect("old slot disk should close");
+                replacement.close().await.expect("replacement slot disk should close");
+            },
+        )
+        .await;
+
+        peer.stop().await;
+    }
+
+    #[tokio::test]
     async fn test_copy_stream_with_buffer_copies_full_payload() {
         let payload = b"walk-dir-stream".repeat(1024);
         let expected = payload.clone();
@@ -4509,7 +6260,7 @@ mod tests {
                     assert_eq!(request.path, "object/part.1");
                     assert_eq!(request.offset, 7);
                     assert_eq!(request.length, 11);
-                    assert_eq!(request.stall_timeout, Some(get_object_disk_read_timeout()));
+                    assert_eq!(request.stall_timeout, remote_read_timeouts(get_object_disk_read_timeout()).body_stall);
                 }
                 other => panic!("expected read transport call, got {other:?}"),
             }
@@ -5963,6 +7714,20 @@ mod tests {
         )
         .await
         .expect("remote disk should construct");
+        let replacement = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("replacement remote disk should construct");
+        assert_ne!(
+            remote_disk.handle_id, replacement.handle_id,
+            "replacement handles need distinct log identities"
+        );
 
         let span = tracing::info_span!("request-span", request_id = "req-remote-disk");
         let _entered = span.enter();
@@ -5978,11 +7743,24 @@ mod tests {
 
         assert_eq!(log["span"]["name"], Value::String("recovery-monitor".to_string()));
         assert_eq!(log["span"]["kind"], Value::String("remote_disk".to_string()));
+        assert_eq!(log["span"]["handle_id"], Value::String(remote_disk.handle_id.to_string()));
         let spans = log["spans"].as_array().expect("spans should be present");
         assert!(spans.iter().any(|span| {
             span.get("name").and_then(Value::as_str) == Some("request-span")
                 && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk")
         }));
+
+        remote_disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        remote_disk
+            .execute_with_timeout(|| async { Ok::<(), Error>(()) }, Duration::from_secs(1))
+            .await
+            .expect_err("faulty handle should short-circuit");
+        let faulty_log = logs
+            .lines()
+            .into_iter()
+            .find(|value| value.get("state").and_then(Value::as_str) == Some("faulty_short_circuit"))
+            .expect("expected faulty short-circuit log");
+        assert_eq!(faulty_log["handle_id"], Value::String(remote_disk.handle_id.to_string()));
     }
 
     #[tokio::test(flavor = "current_thread")]

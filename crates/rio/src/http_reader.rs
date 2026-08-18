@@ -715,6 +715,13 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
     Ok(cached.client_for(disable_proxy))
 }
 
+async fn get_fresh_http_client(url: &str) -> io::Result<Client> {
+    let tuning = internode_http_client_tuning();
+    let disable_proxy = should_disable_proxy_for_url(url, tuning);
+    let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
+    build_http_client(disable_proxy, tuning, &outbound_tls).await
+}
+
 fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
     let target = reqwest::Url::parse(url)
         .ok()
@@ -962,6 +969,28 @@ impl HttpReader {
         Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, stall_timeout).await
     }
 
+    pub async fn new_fresh_connection_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, true).await?;
+        Ok(Self {
+            inner: StreamReader::new(init.stream),
+            url,
+            method,
+            headers,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+        })
+    }
+
     /// Create a new HttpReader from a URL. The request is performed immediately.
     pub async fn with_capacity(
         url: String,
@@ -981,7 +1010,7 @@ impl HttpReader {
         _read_buf_size: usize,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let init = Self::open(&url, &method, &headers, body, stall_timeout).await?;
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, false).await?;
         Ok(Self {
             inner: StreamReader::new(init.stream),
             url,
@@ -1002,10 +1031,16 @@ impl HttpReader {
         headers: &HeaderMap,
         body: Option<Vec<u8>>,
         stall_timeout: Option<Duration>,
+        force_fresh_connection: bool,
     ) -> io::Result<HttpReaderInit> {
         let track_internode_metrics = is_internode_rpc_url(url);
         let internode_operation = internode_rpc_operation(url);
-        let client = get_http_client(url).await.inspect_err(|_| {
+        let client = if force_fresh_connection {
+            get_fresh_http_client(url).await
+        } else {
+            get_http_client(url).await
+        }
+        .inspect_err(|_| {
             record_internode_error(track_internode_metrics, internode_operation);
         })?;
         let mut request: RequestBuilder = client.request(method.clone(), url).headers(headers.clone());
@@ -1121,7 +1156,28 @@ impl HttpChunkReader {
         body: Option<Vec<u8>>,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout).await?;
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, false).await?;
+        Ok(Self {
+            inner: init.stream,
+            current: None,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+            consecutive_empty_chunks: 0,
+        })
+    }
+
+    pub async fn new_fresh_connection_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, true).await?;
         Ok(Self {
             inner: init.stream,
             current: None,

@@ -14,17 +14,15 @@
 
 //! Integration tests for concurrent request fix.
 //!
-//! These tests verify that the timeout, backpressure, and deadlock detection
-//! mechanisms work correctly under high concurrency scenarios.
+//! These tests verify that the timeout and deadlock detection mechanisms work
+//! correctly under high concurrency scenarios.
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::backpressure::{BackpressureMonitor, BackpressureState, ObjectPipeBackpressurePolicy};
     use crate::storage::concurrency::{IoLoadLevel, IoPriority};
     use crate::storage::deadlock_detector::{
         DeadlockDetector, LockInfo, LockType, RequestHangDetectionPolicy, RequestResourceTracker,
     };
-    use crate::storage::lock_optimizer::{LockOptimizeConfig, LockOptimizer, LockStats};
     use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper, TimedGetObjectResult};
     use std::time::Duration;
 
@@ -112,82 +110,6 @@ mod tests {
             TimedGetObjectResult::Success(value) => assert_eq!(value, 42),
             _ => panic!("Expected Success when timeout disabled, got {:?}", result),
         }
-    }
-
-    // ============================================
-    // Backpressure Tests
-    // ============================================
-
-    #[test]
-    fn test_backpressure_config_defaults() {
-        let config = ObjectPipeBackpressurePolicy::default();
-        assert_eq!(config.buffer_size, 4 * 1024 * 1024); // 4MB
-        assert_eq!(config.high_watermark, 80);
-        assert_eq!(config.low_watermark, 50);
-    }
-
-    #[test]
-    fn test_backpressure_monitor_state_transitions() {
-        let config = ObjectPipeBackpressurePolicy {
-            buffer_size: 1000,
-            high_watermark: 80,
-            low_watermark: 50,
-        };
-        let monitor = BackpressureMonitor::with_config(config);
-
-        // Initially normal
-        assert_eq!(monitor.state(), BackpressureState::Normal);
-
-        // Write to reach high watermark
-        let state = monitor.on_write(850);
-        assert_eq!(state, BackpressureState::HighWatermark);
-
-        // Read to go below low watermark
-        let state = monitor.on_read(400);
-        assert_eq!(state, BackpressureState::Normal);
-    }
-
-    #[test]
-    fn test_backpressure_usage_percent() {
-        let config = ObjectPipeBackpressurePolicy {
-            buffer_size: 1000,
-            high_watermark: 80,
-            low_watermark: 50,
-        };
-        let monitor = BackpressureMonitor::with_config(config);
-
-        monitor.on_write(500);
-        assert!((monitor.usage_percent() - 50.0).abs() < 1.0);
-    }
-
-    // ============================================
-    // Lock Optimizer Tests
-    // ============================================
-
-    #[test]
-    fn test_lock_optimize_config_defaults() {
-        let config = LockOptimizeConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.acquire_timeout, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_lock_stats_tracking() {
-        let stats = LockStats::new();
-
-        stats.record_acquire();
-        stats.record_early_release(Duration::from_millis(100));
-        stats.record_early_release(Duration::from_millis(200));
-
-        assert_eq!(stats.locks_acquired.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(stats.locks_released_early.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(stats.max_hold_time(), Duration::from_millis(200));
-    }
-
-    #[test]
-    fn test_lock_optimizer_creation() {
-        let optimizer = LockOptimizer::new();
-        assert!(optimizer.is_enabled());
     }
 
     // ============================================
