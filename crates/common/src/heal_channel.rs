@@ -287,6 +287,9 @@ pub enum HealRequestSource {
     Scanner,
     AutoHeal,
     ReadRepair,
+    /// Mission Repair Feed: intents delivered by error paths and replayed
+    /// from the durable MRF journal.
+    Mrf,
 }
 
 impl HealRequestSource {
@@ -297,6 +300,7 @@ impl HealRequestSource {
             Self::Scanner => "scanner",
             Self::AutoHeal => "auto_heal",
             Self::ReadRepair => "read_repair",
+            Self::Mrf => "mrf",
         }
     }
 }
