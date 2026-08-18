@@ -9539,6 +9539,8 @@ version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "crc-fast",
  "futures",
  "hotpath",
  "http 1.5.0",
@@ -10682,7 +10684,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=161f19d40e96c4285af974598627746f138f29cd#161f19d40e96c4285af974598627746f138f29cd"
+source = "git+https://github.com/rustfs/s3s.git?rev=8c80e742f8249c9f5d0b2f5a5344bd6b012f8aa2#8c80e742f8249c9f5d0b2f5a5344bd6b012f8aa2"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10710,6 +10712,7 @@ dependencies = [
  "numeric_cast",
  "pin-project-lite",
  "quick-xml",
+ "regex",
  "serde",
  "serde_json",
  "serde_urlencoded",
