@@ -326,6 +326,97 @@ impl fmt::Debug for AppRoleLogin {
     }
 }
 
+/// Token source for [`VaultAuthMethod::Kubernetes`]: exchanges the pod's
+/// projected ServiceAccount token for a lease-bound Vault token.
+///
+/// The JWT is re-read on every login because the kubelet rotates a projected
+/// token well inside the pod's lifetime; caching it would strand the source on
+/// an expired assertion once the current Vault token can no longer be renewed.
+///
+/// Unlike [`TokenFileSource`], the file mode is not checked: the kubelet owns
+/// the projected token and mounts it world-readable by default, so rejecting
+/// group/other bits would refuse every standard pod rather than catch a
+/// deployment error.
+pub(crate) struct KubernetesLogin {
+    /// Unauthenticated client used only for the login exchange.
+    login_client: VaultClient,
+    mount: String,
+    role: String,
+    jwt_path: PathBuf,
+}
+
+impl KubernetesLogin {
+    pub(crate) fn new(settings: &VaultConnectionSettings, mount: String, role: String, jwt_path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            login_client: settings.build_login_client()?,
+            mount,
+            role,
+            jwt_path,
+        })
+    }
+
+    /// Read the ServiceAccount token for one login attempt.
+    ///
+    /// Mirrors [`AppRoleLogin::resolve_secret_id`]: a read failure is fatal for
+    /// the attempt but the refresh loop keeps retrying, so a token the kubelet
+    /// has not projected yet heals the source without a restart.
+    async fn resolve_jwt(&self) -> AttemptResult<SecretString> {
+        let mut raw = tokio::fs::read_to_string(&self.jwt_path)
+            .await
+            .map_err(|error| AttemptError {
+                class: ErrorClass::Fatal,
+                error: KmsError::configuration_error(format!(
+                    "Failed to read Kubernetes ServiceAccount token {}: {error}",
+                    self.jwt_path.display()
+                )),
+            })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            raw.zeroize();
+            return Err(AttemptError {
+                class: ErrorClass::Fatal,
+                error: KmsError::configuration_error(format!(
+                    "Kubernetes ServiceAccount token {} is empty",
+                    self.jwt_path.display()
+                )),
+            });
+        }
+        let jwt = SecretString::new(trimmed.to_string());
+        raw.zeroize();
+        Ok(jwt)
+    }
+}
+
+#[async_trait]
+impl TokenSource for KubernetesLogin {
+    async fn acquire(&self) -> AttemptResult<TokenLease> {
+        let jwt = self.resolve_jwt().await?;
+        let auth = vaultrs::auth::kubernetes::login(&self.login_client, &self.mount, &self.role, jwt.expose())
+            .await
+            .map_err(|error| attempt_error("Kubernetes login", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+
+    async fn renew(&self, client: &VaultClient) -> AttemptResult<TokenLease> {
+        let auth = vaultrs::token::renew_self(client, None)
+            .await
+            .map_err(|error| attempt_error("token renewal", error))?;
+        Ok(TokenLease::from_auth(auth))
+    }
+}
+
+impl fmt::Debug for KubernetesLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The login client embeds Vault client settings and must stay out of
+        // Debug output; the role name is not a secret, and the JWT is never held.
+        f.debug_struct("KubernetesLogin")
+            .field("mount", &self.mount)
+            .field("role", &self.role)
+            .field("jwt_path", &self.jwt_path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Token source for [`VaultAuthMethod::TokenFile`]: reads an agent-managed
 /// token file (for example a Vault Agent auto-auth sink).
 ///
@@ -464,6 +555,9 @@ pub(crate) fn token_source_for(
             secret_id.clone(),
             secret_id_file.clone(),
         )?)),
+        VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } => Ok(Box::new(KubernetesLogin::new(settings, mount.clone(), role.clone(), jwt_path.clone())?)),
         VaultAuthMethod::TokenFile {
             path,
             poll_interval_secs,
@@ -486,6 +580,9 @@ pub(crate) struct VaultConnectionSettings {
     pub(crate) namespace: Option<String>,
     /// Per-attempt HTTP timeout applied to the underlying reqwest client.
     pub(crate) attempt_timeout: Duration,
+    /// Whether to accept an unverified Vault server certificate. Gated on
+    /// `allow_insecure_dev_defaults` by `KmsConfig::validate`.
+    pub(crate) skip_tls_verify: bool,
 }
 
 impl VaultConnectionSettings {
@@ -499,6 +596,11 @@ impl VaultConnectionSettings {
         // operation-level retry policy.
         settings_builder.timeout(Some(self.attempt_timeout));
         settings_builder.token(token);
+        // Always set explicitly: left unset, vaultrs derives this from its own
+        // VAULT_SKIP_VERIFY variable, so a stray value in the environment would
+        // disable certificate verification behind the KMS configuration and its
+        // insecure-defaults gate.
+        settings_builder.verify(!self.skip_tls_verify);
 
         if let Some(namespace) = &self.namespace {
             settings_builder.namespace(Some(namespace.clone()));
@@ -551,6 +653,10 @@ impl VaultCredentialPolicy {
                 refresh_safety_window_secs: Some(secs),
                 ..
             }
+            | VaultAuthMethod::Kubernetes {
+                refresh_safety_window_secs: Some(secs),
+                ..
+            }
             | VaultAuthMethod::TokenFile {
                 refresh_safety_window_secs: Some(secs),
                 ..
@@ -584,15 +690,25 @@ pub(crate) struct VaultClientHandle {
 
 impl VaultClientHandle {
     /// Absolute expiry of this generation's token.
+    ///
+    /// `lease.ttl` is built from the `lease_duration` the Vault server sent, so
+    /// a value too large to add to `issued_at` would panic on the bare `+`. A
+    /// TTL that cannot be represented is indistinguishable from no expiry, so it
+    /// collapses to `None` — the same answer already given for the zero-lease
+    /// tokens Vault issues, which keeps the token in use and still fully
+    /// validated by Vault on every call.
     fn expires_at(&self) -> Option<Instant> {
-        self.lease.map(|lease| self.issued_at + lease.ttl)
+        self.lease.and_then(|lease| self.issued_at.checked_add(lease.ttl))
     }
 
     /// When the renewal task should refresh this generation: half the TTL,
     /// leaving the second half as budget for retries before the fail-closed
     /// window is reached.
+    ///
+    /// Unrepresentable TTLs collapse to `None` as in [`Self::expires_at`],
+    /// leaving a token that never expires with nothing to renew.
     fn renew_at(&self) -> Option<Instant> {
-        self.lease.map(|lease| self.issued_at + lease.ttl / 2)
+        self.lease.and_then(|lease| self.issued_at.checked_add(lease.ttl / 2))
     }
 }
 
@@ -662,7 +778,7 @@ impl VaultCredentialProvider {
         let handle = self.current.load_full();
         if let Some(expires_at) = handle.expires_at() {
             let now = Instant::now();
-            if now + self.policy.safety_window >= expires_at {
+            if self.inside_safety_window(now, expires_at) {
                 return Err(KmsError::credentials_unavailable(format!(
                     "Vault token (generation {}) is within {:?} of expiry and has not been refreshed; refusing to use it",
                     handle.generation, self.policy.safety_window
@@ -670,6 +786,18 @@ impl VaultCredentialProvider {
             }
         }
         Ok(handle)
+    }
+
+    /// Whether the token expiring at `expires_at` is close enough to refuse.
+    ///
+    /// `safety_window` reaches here from persisted configuration, so it is not
+    /// guaranteed to have passed this version's validation: a window too large
+    /// to add to the current instant would panic on the bare `+`. Such a window
+    /// means every token is always inside it, so saturating to "refuse" is both
+    /// the fail-closed answer and the one the arithmetic was reaching for.
+    fn inside_safety_window(&self, now: Instant, expires_at: Instant) -> bool {
+        now.checked_add(self.policy.safety_window)
+            .is_none_or(|deadline| deadline >= expires_at)
     }
 
     /// Publish the credential gauges for the generation currently installed.
@@ -683,7 +811,7 @@ impl VaultCredentialProvider {
         let fail_closed = match handle.expires_at() {
             Some(expires_at) => {
                 metrics::gauge!(METRIC_TOKEN_TTL_SECONDS).set(expires_at.saturating_duration_since(now).as_secs_f64());
-                now + self.policy.safety_window >= expires_at
+                self.inside_safety_window(now, expires_at)
             }
             // A generation without an expiry has no remaining TTL to report
             // and can never lapse, so it can never fail closed either.
@@ -860,7 +988,7 @@ impl Drop for CredentialTaskHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::REDACTED_SECRET;
+    use crate::config::{DEFAULT_VAULT_KUBERNETES_MOUNT, REDACTED_SECRET};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     const TEST_TOKEN: &str = "vault-token-debug-leak-canary";
@@ -871,6 +999,7 @@ mod tests {
             address: "http://127.0.0.1:8200".to_string(),
             namespace: Some("team-namespace".to_string()),
             attempt_timeout: Duration::from_secs(30),
+            skip_tls_verify: false,
         }
     }
 
@@ -1055,6 +1184,143 @@ mod tests {
             .expect("approle auth must map to a login source");
 
         assert!(format!("{source:?}").contains("AppRoleLogin"));
+    }
+
+    #[tokio::test]
+    async fn test_kubernetes_auth_method_maps_to_login_source() {
+        let settings = test_settings();
+        let source = token_source_for(&VaultAuthMethod::kubernetes("rustfs".to_string()), &settings)
+            .expect("kubernetes auth must map to a login source");
+
+        assert!(format!("{source:?}").contains("KubernetesLogin"));
+    }
+
+    /// `refresh_safety_window_secs` is operator-supplied and reaches the request
+    /// path from persisted configuration, so the fail-closed comparison must
+    /// survive a window too large to add to the current instant. Before the
+    /// checked arithmetic this panicked with "overflow when adding duration to
+    /// instant" on the first request after a lease-bearing login.
+    #[tokio::test]
+    async fn test_current_refuses_rather_than_panics_on_an_unrepresentable_safety_window() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(60),
+            true,
+            test_policy(Duration::from_secs(u64::MAX), Duration::from_secs(5)),
+        )
+        .await;
+
+        let error = provider
+            .current()
+            .expect_err("a window wider than any lease must refuse the token");
+        assert!(
+            matches!(error, KmsError::CredentialsUnavailable { .. }),
+            "expected CredentialsUnavailable, got {error:?}"
+        );
+    }
+
+    /// `lease_duration` is a bare u64 straight off the Vault response and forms
+    /// the other side of the same comparison, so an absurd one must not panic
+    /// either. It is indistinguishable from a non-expiring token, which is how
+    /// the zero-lease case already behaves.
+    #[tokio::test]
+    async fn test_an_unrepresentable_lease_is_treated_as_non_expiring() {
+        let (provider, _state) = scripted_provider(
+            Duration::from_secs(u64::MAX),
+            true,
+            test_policy(Duration::from_secs(30), Duration::from_secs(5)),
+        )
+        .await;
+
+        provider
+            .current()
+            .expect("a token whose expiry cannot be represented must stay usable");
+    }
+
+    /// The configured flag has to reach the HTTP client, not just the config
+    /// struct: every generation (authenticated and login) builds its own client,
+    /// and a Vault with a self-signed certificate fails the handshake unless
+    /// each one carries the setting.
+    #[test]
+    fn test_skip_tls_verify_reaches_every_vault_client_generation() {
+        for skip_tls_verify in [false, true] {
+            let settings = VaultConnectionSettings {
+                address: "https://vault.example.com:8200".to_string(),
+                namespace: None,
+                attempt_timeout: Duration::from_secs(30),
+                skip_tls_verify,
+            };
+
+            let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
+            assert_eq!(authenticated.settings.verify, !skip_tls_verify);
+
+            let login = settings.build_login_client().expect("login client must build");
+            assert_eq!(login.settings.verify, !skip_tls_verify);
+        }
+    }
+
+    /// vaultrs derives `verify` from its own VAULT_SKIP_VERIFY variable when the
+    /// builder leaves it unset, which would disable certificate verification
+    /// without passing the KMS insecure-defaults gate.
+    #[test]
+    fn test_vaultrs_skip_verify_env_cannot_override_the_configured_setting() {
+        temp_env::with_var("VAULT_SKIP_VERIFY", Some("true"), || {
+            let client = test_settings().build_client(TEST_TOKEN).expect("client must build");
+            assert!(
+                client.settings.verify,
+                "a stray VAULT_SKIP_VERIFY must not disable verification behind the KMS configuration"
+            );
+        });
+    }
+
+    /// The projected token is read fresh per login attempt and trimmed, so a
+    /// kubelet rotation is picked up without a restart and a trailing newline
+    /// does not corrupt the assertion sent to Vault.
+    #[tokio::test]
+    async fn test_kubernetes_login_rereads_and_trims_the_service_account_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        tokio::fs::write(&path, "  first-jwt\n").await.expect("write token");
+
+        let login = KubernetesLogin::new(
+            &test_settings(),
+            DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(),
+            "rustfs".to_string(),
+            path.clone(),
+        )
+        .expect("login source must build");
+
+        assert_eq!(login.resolve_jwt().await.expect("first read").expose(), "first-jwt");
+
+        tokio::fs::write(&path, "rotated-jwt").await.expect("rotate token");
+        assert_eq!(
+            login.resolve_jwt().await.expect("second read").expose(),
+            "rotated-jwt",
+            "a rotated projected token must be picked up without a restart"
+        );
+    }
+
+    /// The ServiceAccount token is re-read per attempt, so an unreadable or
+    /// empty one fails that attempt without reaching Vault; the refresh loop
+    /// keeps retrying, which is what lets a late projection heal the source.
+    #[tokio::test]
+    async fn test_kubernetes_login_rejects_an_unusable_service_account_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent-token");
+        let empty = dir.path().join("empty-token");
+        tokio::fs::write(&empty, "  \n").await.expect("write empty token");
+
+        for (path, expected) in [(missing, "Failed to read"), (empty, "is empty")] {
+            let login =
+                KubernetesLogin::new(&test_settings(), DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(), "rustfs".to_string(), path)
+                    .expect("login source must build");
+
+            let error = login
+                .acquire()
+                .await
+                .expect_err("an unusable ServiceAccount token must fail the attempt");
+            assert!(matches!(error.class, ErrorClass::Fatal));
+            assert!(error.error.to_string().contains(expected), "got {}", error.error);
+        }
     }
 
     #[tokio::test(start_paused = true)]

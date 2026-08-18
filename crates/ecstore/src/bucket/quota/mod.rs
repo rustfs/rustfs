@@ -13,38 +13,98 @@
 // limitations under the License.
 
 pub mod checker;
+pub(crate) mod reservation;
 
 use crate::error::Result;
 use rustfs_config::{
     QUOTA_API_PATH, QUOTA_EXCEEDED_ERROR_CODE, QUOTA_INTERNAL_ERROR_CODE, QUOTA_INVALID_CONFIG_ERROR_CODE,
     QUOTA_NOT_FOUND_ERROR_CODE,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum QuotaType {
-    /// Hard quota: reject immediately when exceeded
+    /// Hard quota accounting.
     #[default]
     #[serde(alias = "HARD", alias = "hard")]
     Hard,
 }
 
+pub(crate) const QUOTA_RESERVATION_PROTOCOL_V1: u32 = 1;
+
 /// Bucket quota configuration. quota_type defaults to Hard when omitted.
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct BucketQuota {
-    #[serde(default)]
     pub quota: Option<u64>,
     /// Defaults to Hard when missing.
-    #[serde(default)]
     pub quota_type: QuotaType,
+    /// Optional durable reservation protocol. The wire format gives older
+    /// nodes a zero hard quota so a mixed-version fleet fails closed.
+    pub reservation_protocol: Option<u32>,
     /// Timestamp when this quota configuration was set (for audit purposes)
-    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
     /// Accept updated_at for compatibility; not used.
-    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BucketQuotaWire {
+    #[serde(default)]
+    quota: Option<u64>,
+    #[serde(default)]
+    quota_type: QuotaType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation_protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation_quota: Option<u64>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    created_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    updated_at: Option<OffsetDateTime>,
+}
+
+impl Serialize for BucketQuota {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let durable = self.uses_durable_reservations();
+        BucketQuotaWire {
+            quota: if durable { Some(0) } else { self.quota },
+            quota_type: self.quota_type.clone(),
+            reservation_protocol: self.reservation_protocol,
+            reservation_quota: if durable { self.quota } else { None },
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketQuota {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BucketQuotaWire::deserialize(deserializer)?;
+        let quota = if wire.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1) {
+            Some(
+                wire.reservation_quota
+                    .ok_or_else(|| D::Error::custom("reservation_quota is required for reservation protocol v1"))?,
+            )
+        } else {
+            wire.quota
+        };
+        Ok(Self {
+            quota,
+            quota_type: wire.quota_type,
+            reservation_protocol: wire.reservation_protocol,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 impl BucketQuota {
@@ -63,6 +123,7 @@ impl BucketQuota {
         Self {
             quota,
             quota_type: QuotaType::Hard,
+            reservation_protocol: quota.map(|_| QUOTA_RESERVATION_PROTOCOL_V1),
             created_at: Some(now),
             updated_at: None,
         }
@@ -72,7 +133,19 @@ impl BucketQuota {
         self.quota
     }
 
+    pub fn uses_durable_reservations(&self) -> bool {
+        self.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1)
+    }
+
+    pub fn has_unsupported_reservation_protocol(&self) -> bool {
+        self.reservation_protocol
+            .is_some_and(|version| version != QUOTA_RESERVATION_PROTOCOL_V1)
+    }
+
     pub fn check_operation_allowed(&self, current_usage: u64, operation_size: u64) -> bool {
+        if operation_size == 0 {
+            return true;
+        }
         if let Some(quota_limit) = self.quota {
             current_usage.saturating_add(operation_size) <= quota_limit
         } else {
@@ -94,6 +167,7 @@ pub struct QuotaCheckResult {
     pub quota_limit: Option<u64>,
     pub operation_size: u64,
     pub remaining: Option<u64>,
+    pub uses_durable_reservations: bool,
 }
 
 #[derive(Debug)]
@@ -119,6 +193,7 @@ pub enum QuotaError {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub struct QuotaErrorResponse {
     #[serde(rename = "Code")]
     pub code: String,
@@ -134,6 +209,7 @@ pub struct QuotaErrorResponse {
 }
 
 impl QuotaErrorResponse {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn new(quota_error: &QuotaError, request_id: &str, host_id: &str) -> Self {
         match quota_error {
             QuotaError::QuotaExceeded { .. } => Self {
@@ -210,7 +286,57 @@ mod tests {
         let buf = q.marshal_msg().expect("marshal");
         let restored = BucketQuota::unmarshal(&buf).expect("unmarshal");
         assert_eq!(q.quota, restored.quota);
-        assert_eq!(q.quota_type, restored.quota_type);
+        assert_eq!(restored.quota_type, QuotaType::Hard);
+        assert_eq!(restored.reservation_protocol, Some(QUOTA_RESERVATION_PROTOCOL_V1));
+    }
+
+    #[test]
+    fn clearing_quota_keeps_the_legacy_compatible_type() {
+        let quota = BucketQuota::new(None);
+
+        assert_eq!(quota.quota_type, QuotaType::Hard);
+        assert_eq!(quota.reservation_protocol, None);
+        assert!(!quota.uses_durable_reservations());
+    }
+
+    #[test]
+    fn durable_quota_makes_legacy_nodes_fail_closed() {
+        let json = serde_json::to_vec(&BucketQuota::new(Some(2048))).expect("durable quota should serialize");
+        let quota: BucketQuota = serde_json::from_slice(&json).expect("current quota version should parse");
+        assert!(quota.uses_durable_reservations());
+        assert_eq!(quota.quota, Some(2048));
+
+        #[derive(Deserialize)]
+        enum LegacyQuotaType {
+            Hard,
+        }
+        #[derive(Deserialize)]
+        struct LegacyBucketQuota {
+            quota: Option<u64>,
+            quota_type: LegacyQuotaType,
+        }
+        let legacy = serde_json::from_slice::<LegacyBucketQuota>(&json)
+            .expect("legacy readers should ignore the reservation protocol field");
+        assert_eq!(legacy.quota, Some(0));
+        assert!(matches!(legacy.quota_type, LegacyQuotaType::Hard));
+    }
+
+    #[test]
+    fn unknown_reservation_protocol_does_not_activate_v1() {
+        let quota: BucketQuota =
+            serde_json::from_str(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":2,"reservation_quota":2048}"#)
+                .expect("future protocol should remain parseable");
+
+        assert!(!quota.uses_durable_reservations());
+        assert!(quota.has_unsupported_reservation_protocol());
+    }
+
+    #[test]
+    fn reservation_protocol_v1_requires_reservation_quota() {
+        let err = serde_json::from_str::<BucketQuota>(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":1}"#)
+            .expect_err("v1 without its authoritative quota must fail closed");
+
+        assert!(err.to_string().contains("reservation_quota is required"));
     }
 
     /// unmarshal accepts format without quota_type

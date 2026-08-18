@@ -241,6 +241,40 @@ pub fn get_drive_list_dir_timeout() -> Duration {
     )
 }
 
+pub(crate) trait DiskStoreRenameDataExt {
+    async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp>;
+}
+
+impl DiskStoreRenameDataExt for LocalDiskWrapper {
+    async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        self.track_disk_health_mutation(
+            "rename_data",
+            DiskMetricMutation::Write,
+            || async {
+                self.disk
+                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+}
+
 pub fn get_drive_walkdir_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS,
@@ -603,14 +637,23 @@ impl Default for DiskOperationMetrics {
 }
 
 impl DiskOperationMetrics {
+    #[allow(
+        dead_code,
+        reason = "internal metrics recorder reached only from record() below (backlog#1823)"
+    )]
     fn record_call(&mut self) {
         self.lifetime_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(
+        dead_code,
+        reason = "internal metrics recorder reached only from record() below (backlog#1823)"
+    )]
     fn record_latency(&mut self, now_sec: u64, elapsed: Duration) {
         self.record_latency_atomic(now_sec, elapsed);
     }
 
+    #[allow(dead_code, reason = "metrics roll-up with no caller in this port (backlog#1823)")]
     fn record(&mut self, now_sec: u64, elapsed: Duration) {
         self.record_call();
         self.record_latency(now_sec, elapsed);
@@ -736,6 +779,7 @@ impl DiskHealthTracker {
     }
 
     /// Set disk as faulty
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn set_faulty(&self) {
         self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
     }
@@ -816,6 +860,7 @@ impl DiskHealthTracker {
         became_offline
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn mark_offline(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
         let current = self.runtime_state();
         if current == RuntimeDriveHealthState::Offline {
@@ -946,11 +991,13 @@ impl DiskHealthTracker {
     }
 
     /// Get waiting operations count
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn waiting_count(&self) -> u32 {
         self.waiting.load(Ordering::Relaxed)
     }
 
     /// Get last success timestamp
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn last_success(&self) -> i64 {
         self.last_success.load(Ordering::Acquire)
     }
@@ -992,21 +1039,6 @@ impl Default for DiskHealthTracker {
     }
 }
 
-/// Health check context key for tracking disk operations
-#[derive(Debug, Clone)]
-struct HealthDiskCtxKey;
-
-#[derive(Debug)]
-struct HealthDiskCtxValue {
-    last_success: Arc<AtomicI64>,
-}
-
-impl HealthDiskCtxValue {
-    fn log_success(&self) {
-        self.last_success.store(current_unix_nanos(), Ordering::Relaxed);
-    }
-}
-
 /// LocalDiskWrapper wraps a DiskStore with health tracking capabilities.
 /// This is similar to Go's xlStorageDiskIDCheck.
 #[derive(Debug, Clone)]
@@ -1036,10 +1068,6 @@ impl LocalDiskWrapper {
             Arc::new(DiskHealthTracker::new()),
             Arc::new(DiskHealthMetricEpoch::default()),
         )
-    }
-
-    pub(crate) fn new_with_health(disk: Arc<LocalDisk>, health_check: bool, health: Arc<DiskHealthTracker>) -> Self {
-        Self::new_with_health_and_metrics(disk, health_check, health, Arc::new(DiskHealthMetricEpoch::default()))
     }
 
     pub(crate) fn new_with_reconnect_state(
@@ -1402,20 +1430,6 @@ impl LocalDiskWrapper {
                 }
             }
         }
-    }
-
-    async fn check_id(&self, want_id: Option<Uuid>) -> Result<()> {
-        if want_id.is_none() {
-            return Ok(());
-        }
-
-        let stored_disk_id = self.disk.get_disk_id().await?;
-
-        if stored_disk_id != want_id {
-            return Err(Error::other(format!("Disk ID mismatch wanted {want_id:?}, got {stored_disk_id:?}")));
-        }
-
-        Ok(())
     }
 
     /// Check if disk ID is stale
@@ -1985,13 +1999,8 @@ impl DiskAPI for LocalDiskWrapper {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.track_disk_health_mutation(
-            "rename_data",
-            DiskMetricMutation::Write,
-            || async { self.disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {

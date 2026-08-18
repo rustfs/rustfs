@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// MetricType - Indicates the type of indicator
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricType {
     Counter,
@@ -23,7 +22,6 @@ pub enum MetricType {
 
 impl MetricType {
     /// convert the metric type to a string representation
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Counter => "counter",
@@ -34,7 +32,6 @@ impl MetricType {
 
     /// Convert the metric type to the Prometheus value type
     /// In a Rust implementation, this might return the corresponding Prometheus Rust client type
-    #[allow(dead_code)]
     pub fn as_prom(&self) -> &'static str {
         match self {
             Self::Counter => "counter.",

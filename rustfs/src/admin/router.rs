@@ -1548,7 +1548,8 @@ async fn build_replication_metrics_response(
     let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
-    let body = serialize_replication_metrics_body(&bucket_stats, route)?;
+    let node_name = crate::runtime_sources::current_local_node_name().await.unwrap_or_default();
+    let body = serialize_replication_metrics_body(&bucket_stats, route, &node_name)?;
 
     let mut resp = S3Response::with_status(Body::from(body), StatusCode::OK);
     resp.headers
@@ -1608,12 +1609,24 @@ fn apply_replication_metrics_runtime_fields(
     bucket_stats
 }
 
-fn serialize_replication_metrics_body(bucket_stats: &BucketStats, route: ReplicationExtRoute) -> S3Result<Vec<u8>> {
+/// Serialize the metrics body in the minio-go wire shapes
+/// (`replication.Metrics` for v1, `replication.MetricsV2` for v2). The
+/// internal `BucketStats` serde names are the intra-cluster peer-RPC wire
+/// format and must never appear here — see
+/// `crate::admin::replication_metrics_wire`.
+fn serialize_replication_metrics_body(
+    bucket_stats: &BucketStats,
+    route: ReplicationExtRoute,
+    node_name: &str,
+) -> S3Result<Vec<u8>> {
+    use crate::admin::replication_metrics_wire::{MetricsV2Wire, MetricsWire};
     match route {
         ReplicationExtRoute::MetricsV1 => {
-            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))
+            serde_json::to_vec(&MetricsWire::from(&bucket_stats.replication_stats)).map_err(|e| s3_error!(InternalError, "{e}"))
         }
-        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(bucket_stats).map_err(|e| s3_error!(InternalError, "{e}")),
+        ReplicationExtRoute::MetricsV2 => {
+            serde_json::to_vec(&MetricsV2Wire::from_stats(bucket_stats, node_name)).map_err(|e| s3_error!(InternalError, "{e}"))
+        }
         ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Err(s3_error!(InternalError, "invalid route for metrics response"))
         }
@@ -2901,7 +2914,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
             let usecase = default_object_usecase();
-            let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
+            let get_resp = usecase.execute_get_object(get_req).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {
@@ -4147,22 +4160,37 @@ mod tests {
         assert!(err.message().unwrap_or_default().contains("rule-stale"));
     }
 
+    /// The v1 body must decode into minio-go `replication.Metrics` (exact
+    /// json tags); Go's decoder matches case-insensitively but does not
+    /// ignore underscores, so the internal snake_case names read as all-zero.
     #[test]
-    fn serialize_replication_metrics_body_v1_returns_replication_stats_only() {
+    fn serialize_replication_metrics_body_v1_returns_minio_go_metrics_shape() {
         let mut stats = BucketStats {
             uptime: 99,
             ..Default::default()
         };
         stats.replication_stats.replica_count = 7;
+        stats.replication_stats.replicated_size = 2048;
+        stats
+            .replication_stats
+            .stats
+            .entry("arn:minio:replication::t:b".to_string())
+            .or_default()
+            .replicated_count = 5;
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1).expect("metrics v1 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1, "node-1:9000")
+            .expect("metrics v1 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
-        assert_eq!(payload["replica_count"], 7);
+        assert_eq!(payload["replicaCount"], 7);
+        assert_eq!(payload["completedReplicationSize"], 2048);
+        assert_eq!(payload["Stats"]["arn:minio:replication::t:b"]["replicationCount"], 5);
         assert!(payload.get("uptime").is_none());
         assert!(payload.get("proxy_stats").is_none());
+        // The internal snake_case names must not leak into the wire body.
+        assert!(payload.get("replica_count").is_none());
+        assert!(payload.get("q_stat").is_none());
     }
 
     #[test]
@@ -4248,22 +4276,48 @@ mod tests {
         assert_eq!(target.current_bandwidth_bytes_per_sec, 3000.0);
     }
 
+    /// The v2 body must decode into minio-go `replication.MetricsV2`
+    /// (`uptime`/`currStats`/`queueStats`); `mc replicate status` reads
+    /// `currStats` and `queueStats.nodes` and silently shows zeros when the
+    /// keys do not match.
     #[test]
-    fn serialize_replication_metrics_body_v2_returns_full_bucket_stats() {
+    fn serialize_replication_metrics_body_v2_returns_minio_go_metrics_v2_shape() {
         let mut stats = BucketStats {
             uptime: 99,
             ..Default::default()
         };
         stats.replication_stats.replica_count = 7;
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_count
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_bytes
+            .store(1200, std::sync::atomic::Ordering::Relaxed);
+        stats.replication_stats.q_stat = stats.replication_stats.q_stat.snapshot();
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2).expect("metrics v2 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2, "node-1:9000")
+            .expect("metrics v2 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
         assert_eq!(payload["uptime"], 99);
-        assert_eq!(payload["replication_stats"]["replica_count"], 7);
-        assert_eq!(payload["proxy_stats"]["put_total"], 3);
+        assert_eq!(payload["currStats"]["replicaCount"], 7);
+        assert_eq!(payload["currStats"]["queued"]["curr"]["count"], 4.0);
+        // The queue snapshot must surface at least one node: mc derives the
+        // worker/queue panels from queueStats.nodes and treats an empty list
+        // as "no data".
+        assert_eq!(payload["queueStats"]["nodes"][0]["queueStats"]["curr"]["count"], 4.0);
+        assert_eq!(payload["queueStats"]["nodes"][0]["uptime"], 99);
+        // The internal snake_case names must not leak into the wire body.
+        assert!(payload.get("replication_stats").is_none());
+        assert!(payload.get("queue_stats").is_none());
+        assert!(payload.get("proxy_stats").is_none());
     }
 
     #[test]

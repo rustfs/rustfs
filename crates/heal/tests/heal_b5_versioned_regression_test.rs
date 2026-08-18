@@ -176,7 +176,7 @@ async fn enumerate_all_versions(heal_storage: &Arc<ECStoreHealStorage>, bucket: 
     let mut token: Option<String> = None;
     loop {
         let (page, next, truncated) = heal_storage
-            .list_objects_for_heal_page(bucket, "", token.as_deref())
+            .list_objects_for_heal_page(bucket, "", token.as_deref(), false)
             .await
             .expect("list_objects_for_heal_page failed");
         items.extend(page);

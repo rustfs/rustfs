@@ -31,6 +31,13 @@ pub const ENV_DISK_COMPRESSION_MIME_TYPES: &str = "RUSTFS_COMPRESSION_MIME_TYPES
 // Environment variable for additional extensions to exclude from compression (comma-separated, e.g. ".foo,.bar")
 pub const ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS: &str = "RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS";
 
+// Environment variable to additionally enable disk compression for multipart uploads.
+// Default off: nodes from before the resumable decompressor fix fail transient reads of
+// compressed objects, so multipart compression stays dark until the operator confirms the
+// fleet has converged on a fixed build.
+// RUSTFS_COMPAT_TODO(multipart-compression-default-off-window): staged rollout switch for restored multipart compression, flipping the default to enabled on retirement. Remove after the minimum supported direct-upgrade release ships the resumable DecompressReader.
+pub const ENV_DISK_COMPRESSION_MULTIPART_ENABLED: &str = "RUSTFS_COMPRESSION_MULTIPART_ENABLED";
+
 pub const DEFAULT_DISK_COMPRESS_EXTENSIONS: &str = ".txt,.log,.csv,.json,.tar,.xml,.bin";
 pub const DEFAULT_DISK_COMPRESS_MIME_TYPES: &str = "text/*,application/json,application/xml,binary/octet-stream";
 
@@ -169,6 +176,21 @@ pub fn is_disk_compressible(headers: &http::HeaderMap, object_name: &str) -> boo
 
 pub fn is_disk_compression_enabled() -> bool {
     DISK_COMPRESSION_CONFIG.get_or_init(parse_disk_compression_config).enabled
+}
+
+// Parsed once at first use, mirroring DISK_COMPRESSION_CONFIG.
+static MULTIPART_DISK_COMPRESSION_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Whether multipart uploads may advertise disk compression. Requires the
+/// regular disk-compression gates to pass as well; this is the staged-rollout
+/// switch that keeps multipart compression dark during rolling upgrades from
+/// builds whose decompressor was not yet resumable.
+pub fn is_multipart_disk_compression_enabled() -> bool {
+    *MULTIPART_DISK_COMPRESSION_ENABLED.get_or_init(|| {
+        env::var(ENV_DISK_COMPRESSION_MULTIPART_ENABLED)
+            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "on" | "1"))
+            .unwrap_or(false)
+    })
 }
 
 fn is_disk_compressible_with_config(headers: &http::HeaderMap, object_name: &str, config: &DiskCompressionConfig) -> bool {

@@ -131,16 +131,19 @@ pub mod bucket {
     }
 
     pub mod metadata_sys {
+        #[cfg(feature = "test-util")]
+        pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
             BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
-            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
+            acquire_bucket_metadata_transaction_lock_for_incarnation, capture_bucket_metadata_incarnation, delete,
+            delete_if_incarnation, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
             get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
             get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
             set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
-            update_under_transaction_lock,
+            update_quota_if_incarnation, update_under_transaction_lock,
         };
     }
 
@@ -182,17 +185,18 @@ pub mod bucket {
             mrf_backlog_observability_snapshot,
         };
         pub use crate::bucket::replication::{
-            BucketReplicationResyncStatus, BucketReplicationStats, BucketStats, DeleteReplicationConfigSnapshot,
-            DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, MrfOpKind, MrfReplicateEntry,
-            MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
-            REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION,
-            REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo,
-            ReplicationBatchAdmission, ReplicationConfig, ReplicationConfigStructureError, ReplicationConfigurationExt,
-            ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge,
-            ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission,
-            ReplicationScannerBridge, ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage,
-            ReplicationTargetValidationError, ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog,
-            TargetReplicationResyncStatus, VersionPurgeStatusType, commit_force_delete_intent, complete_force_delete_intent,
+            BucketReplicationResyncStatus, BucketReplicationStat, BucketReplicationStats, BucketStats,
+            DeleteReplicationConfigSnapshot, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, InQueueMetric,
+            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION,
+            REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE,
+            REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+            ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
+            ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
+            ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
+            ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
+            ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
+            VersionPurgeStatusType, XferStats, commit_force_delete_intent, complete_force_delete_intent,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
             get_global_replication_stats, init_background_replication, invalid_replication_config_status_field,
             persist_force_delete_intent, read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta,
@@ -276,7 +280,9 @@ pub mod cluster {
 }
 
 pub mod compression {
-    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled};
+    pub use crate::io_support::compress::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub mod config {
@@ -316,7 +322,7 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
         invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
-        load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached,
+        load_compression_total_from_memory, load_data_usage_from_backend, load_data_usage_from_backend_cached, quota_object_size,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
         record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
@@ -367,14 +373,14 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
-        calc_shard_size, calc_shard_size_legacy,
+        BitrotReader, BitrotSelfTestError, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError,
+        ReedSolomonEncoder, bitrot_self_test, calc_shard_size, calc_shard_size_legacy,
     };
 }
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook, send_event};
 }
 
 pub mod global {
@@ -403,8 +409,11 @@ pub mod metrics {
 }
 
 pub mod notification {
+    #[cfg(any(test, feature = "test-util"))]
+    pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
+        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
         start_remote_version_state_fleet_probe,
     };
 }
@@ -464,7 +473,8 @@ pub mod set_disk {
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
-        pub use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
     }
 }
 
@@ -473,6 +483,7 @@ pub mod store_list {
 }
 
 pub mod storage {
+    pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,

@@ -95,7 +95,6 @@ impl TransitionClient {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct GetRequest {
     pub buffer: Vec<u8>,
     pub offset: i64,
@@ -107,11 +106,12 @@ pub struct GetRequest {
     pub setting_object_info: bool,
 }
 
-#[allow(dead_code)]
 pub struct GetResponse {
     pub size: i64,
     //pub error:       error,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     pub did_read: bool,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     pub object_info: ObjectInfo,
 }
 
@@ -135,6 +135,10 @@ impl Object {
         Self { ..Default::default() }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity reader surface with no caller in this port (backlog#1823)"
+    )]
     fn do_get_request(&self, request: &GetRequest) -> Result<GetResponse, std::io::Error> {
         let _ = request.did_offset_change;
         let _ = request.offset;
@@ -150,12 +154,20 @@ impl Object {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn set_offset(&mut self, bytes_read: i64) -> Result<(), std::io::Error> {
         self.curr_offset += bytes_read;
 
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn read(&mut self, b: &[u8]) -> Result<i64, std::io::Error> {
         let mut read_req = GetRequest {
             is_read_op: true,
@@ -180,6 +192,10 @@ impl Object {
         Ok(response.size)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn stat(&self) -> Result<ObjectInfo, std::io::Error> {
         if !self.is_started || !self.object_info_set {
             let _ = self.do_get_request(&GetRequest {
@@ -192,6 +208,10 @@ impl Object {
         Ok(self.object_info.clone())
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn read_at(&mut self, b: &[u8], offset: i64) -> Result<i64, std::io::Error> {
         self.curr_offset = offset;
 
@@ -219,6 +239,10 @@ impl Object {
         Ok(response.size)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn seek(&mut self, offset: i64, whence: i64) -> Result<i64, std::io::Error> {
         if !self.is_started || !self.object_info_set {
             let seek_req = GetRequest {
@@ -253,6 +277,10 @@ impl Object {
         Ok(self.curr_offset)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity Object reader method with no caller in this port (backlog#1823)"
+    )]
     fn close(&mut self) -> Result<(), std::io::Error> {
         self.is_closed = true;
         Ok(())

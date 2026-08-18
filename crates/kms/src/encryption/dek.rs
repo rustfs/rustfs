@@ -18,8 +18,6 @@
 //! data encryption keys using master keys. It abstracts the encryption
 //! operations so that different backends can share the same encryption logic.
 
-#![allow(dead_code)] // Trait methods may be used by implementations
-
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use async_trait::async_trait;

@@ -340,6 +340,10 @@ impl ReplicationStats {
     }
 
     /// Site replication update replica statistics
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     fn sr_update_replica_stat(&self, size: i64) {
         self.sr_stats.replica_size.fetch_add(size, Ordering::Relaxed);
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);
@@ -704,6 +708,12 @@ impl ReplicationStats {
         } else {
             BucketReplicationStats::new()
         };
+        // Stamp the serializable failure windows from the live samples: the
+        // samples themselves do not cross the peer-RPC wire, so this snapshot
+        // is what cluster aggregation and the metrics endpoints see.
+        for stat in replication_stats.stats.values_mut() {
+            stat.fail_stats.refresh_windows();
+        }
         let uptime = if cache.contains_key(bucket) {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

@@ -26,5 +26,15 @@ spec:
           - name: {{ include "rustfs.fullname" $ }}-tls
             kind: Secret
   {{- end }}
+  {{- if .tls.enabled }}
+    - name: {{ .tls.name }}
+      port: {{ .tls.port }}
+      protocol: TLS
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+  {{- end }}
   {{- end }}
 {{- end }}

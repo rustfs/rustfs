@@ -172,6 +172,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v4/inspect/archive"),
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
+        admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
         admin_route(Method::GET, "/v3/metrics"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),

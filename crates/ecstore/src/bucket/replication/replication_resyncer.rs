@@ -122,6 +122,10 @@ const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
     "tcp connect error",
 ];
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+)]
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
@@ -328,6 +332,10 @@ fn bounded_resync_max_jobs(value: usize) -> usize {
 #[derive(Debug)]
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     pub worker_size: usize,
     pub(crate) cancel_tokens: Arc<RwLock<HashMap<ResyncCancelKey, CancellationToken>>>,
     resync_admission: Arc<Semaphore>,
@@ -544,6 +552,10 @@ impl ReplicationResyncer {
             .is_some_and(|status| status.failed_count > 0)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     pub async fn persist_to_disk<S>(&self, cancel_token: CancellationToken, api: Arc<S>)
     where
         S: ReplicationObjectIO,

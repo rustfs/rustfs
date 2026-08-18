@@ -277,6 +277,12 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
+    /// Source-cluster LWW timestamps carried by an authorized replication
+    /// request; None when the source never modified the category. Only the
+    /// replication-authorized options builders may set these.
+    pub replication_tagging_timestamp: Option<OffsetDateTime>,
+    pub replication_retention_timestamp: Option<OffsetDateTime>,
+    pub replication_legalhold_timestamp: Option<OffsetDateTime>,
     /// Authorized SSE-C replication passthrough: the body is already
     /// ciphertext, so the write path must not encrypt or compress it and
     /// stores the restored encryption metadata verbatim. Only the

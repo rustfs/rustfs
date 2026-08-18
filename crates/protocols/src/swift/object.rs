@@ -67,20 +67,65 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
 const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
 const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
+const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
 /// Maximum object size in bytes (5GB - Swift default)
 const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
+
+fn stored_swift_user_metadata_key(key: &str) -> String {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-amz-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        format!("{USER_METADATA_PREFIX}{key}")
+    } else {
+        key.to_string()
+    }
+}
+
+pub(super) fn swift_response_user_metadata_key(key: &str) -> Option<&str> {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        return None;
+    }
+    if let Some(unescaped) = key.strip_prefix(USER_METADATA_PREFIX)
+        && (rustfs_utils::http::is_internal_key(unescaped)
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-amz-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-rustfs-encryption-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-minio-encryption-"))
+    {
+        return Some(unescaped);
+    }
+    Some(key)
+}
+
+fn swift_user_metadata(headers: &HeaderMap) -> Option<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    let mut present = false;
+    for (header_name, header_value) in headers.iter() {
+        let header_name = header_name.as_str().to_lowercase();
+        let Some(key) = header_name.strip_prefix("x-object-meta-") else {
+            continue;
+        };
+        present = true;
+        if let Ok(value) = header_value.to_str() {
+            metadata.insert(stored_swift_user_metadata_key(key), value.to_string());
+        }
+    }
+    present.then_some(metadata)
+}
 
 /// Object key translator for Swift object names
 ///
 /// Handles URL encoding/decoding and path normalization for Swift object keys.
 /// Swift object names can contain any UTF-8 characters except null bytes.
-#[allow(dead_code)] // Used in: object operations
 pub struct ObjectKeyMapper;
 
 impl ObjectKeyMapper {
     /// Create a new object key mapper
-    #[allow(dead_code)] // Used in: object operations
     pub fn new() -> Self {
         Self
     }
@@ -93,7 +138,6 @@ impl ObjectKeyMapper {
     /// - Not contain null bytes
     /// - Not contain '..' path segments (directory traversal)
     /// - Not start with '/' (leading slash handled by routing)
-    #[allow(dead_code)] // Used in: object operations
     pub fn validate_object_name(object: &str) -> SwiftResult<()> {
         if object.is_empty() {
             return Err(SwiftError::BadRequest("Object name cannot be empty".to_string()));
@@ -136,7 +180,6 @@ impl ObjectKeyMapper {
     /// Example:
     /// - Swift: "photos/vacation/beach photo.jpg"
     /// - S3: "photos/vacation/beach photo.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn swift_to_s3_key(object: &str) -> SwiftResult<String> {
         Self::validate_object_name(object)?;
         Ok(object.to_string())
@@ -146,7 +189,6 @@ impl ObjectKeyMapper {
     ///
     /// This is essentially an identity transformation since we store
     /// Swift object names as-is in S3.
-    #[allow(dead_code)] // Used in: object operations
     pub fn s3_to_swift_name(key: &str) -> String {
         key.to_string()
     }
@@ -161,7 +203,6 @@ impl ObjectKeyMapper {
     /// - Object: "vacation/beach.jpg"
     /// - Bucket: "abc123:photos"
     /// - Key: "vacation/beach.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn build_s3_key(object: &str) -> SwiftResult<String> {
         Self::swift_to_s3_key(object)
     }
@@ -173,7 +214,6 @@ impl ObjectKeyMapper {
     ///
     /// Example URL: /v1/AUTH_abc/container/path%2Fto%2Ffile.txt
     /// Decoded: "path/to/file.txt"
-    #[allow(dead_code)] // Used in: object operations
     pub fn decode_object_from_url(encoded: &str) -> SwiftResult<String> {
         // Decode percent-encoding
         let decoded = urlencoding::decode(encoded).map_err(|e| SwiftError::BadRequest(format!("Invalid URL encoding: {}", e)))?;
@@ -186,7 +226,6 @@ impl ObjectKeyMapper {
     ///
     /// When constructing URLs (e.g., for redirect responses), we need to
     /// percent-encode object names.
-    #[allow(dead_code)] // Used in: object operations
     pub fn encode_object_for_url(object: &str) -> String {
         urlencoding::encode(object).to_string()
     }
@@ -194,7 +233,6 @@ impl ObjectKeyMapper {
     /// Check if object name represents a directory (pseudo-directory)
     ///
     /// In Swift, objects ending with '/' are treated as directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn is_directory_marker(object: &str) -> bool {
         object.ends_with('/')
     }
@@ -203,7 +241,6 @@ impl ObjectKeyMapper {
     ///
     /// Removes redundant slashes and normalizes the path while preserving
     /// trailing slashes for directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn normalize_path(object: &str) -> String {
         // Split by '/', filter out empty segments (except if it's the end)
         let has_trailing_slash = object.ends_with('/');
@@ -277,7 +314,6 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 /// # Returns
 /// * `Ok(etag)` - Object ETag on success
 /// * `Err(SwiftError)` - Error if validation fails or upload fails
-#[allow(dead_code)] // Handler integration: PUT object
 pub async fn put_object<R>(
     account: &str,
     container: &str,
@@ -303,15 +339,7 @@ where
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Extract Swift metadata from X-Object-Meta-* headers
-    let mut user_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            user_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut user_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 6. Extract Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -406,7 +434,6 @@ where
 ///
 /// Similar to put_object, but allows directly specifying metadata instead of extracting from headers.
 /// This is used internally for storing SLO manifests and marker objects.
-#[allow(dead_code)] // Used by SLO implementation
 pub async fn put_object_with_metadata<R>(
     account: &str,
     container: &str,
@@ -510,7 +537,6 @@ where
 /// - `bytes=1000-1999` - Bytes 1000-1999
 /// - `bytes=1000-` - From byte 1000 to end
 /// - `bytes=-500` - Last 500 bytes
-#[allow(dead_code)] // Handler integration: GET object
 pub async fn get_object(
     account: &str,
     container: &str,
@@ -569,7 +595,6 @@ pub async fn get_object(
 /// # Returns
 /// * `Ok(object_info)` - Object metadata (ObjectInfo)
 /// * `Err(SwiftError)` - Error if validation fails or object not found
-#[allow(dead_code)] // Handler integration: HEAD object
 pub async fn head_object(
     account: &str,
     container: &str,
@@ -632,7 +657,6 @@ pub async fn head_object(
 /// # Returns
 /// * `Ok(())` - Object deleted successfully (or didn't exist)
 /// * `Err(SwiftError)` - Error if validation fails or deletion fails
-#[allow(dead_code)] // Handler integration: DELETE object
 pub async fn delete_object(account: &str, container: &str, object: &str, credentials: &Credentials) -> SwiftResult<()> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -693,7 +717,6 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
 /// # Returns
 /// * `Ok(())` - Metadata updated successfully
 /// * `Err(SwiftError)` - Error if validation fails, object not found, or update fails
-#[allow(dead_code)] // Handler integration: POST object
 pub async fn update_object_metadata(
     account: &str,
     container: &str,
@@ -739,15 +762,7 @@ pub async fn update_object_metadata(
     }
 
     // 8. Extract new metadata from X-Object-Meta-* headers
-    let mut new_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            new_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut new_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 9. Also update Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -815,7 +830,6 @@ pub async fn update_object_metadata(
 /// # Handler Integration Note
 /// The current handler architecture needs to be updated to pass headers through
 /// to support COPY method and X-Copy-From header detection. See handler.rs for details.
-#[allow(dead_code)] // Handler integration: COPY object
 #[allow(clippy::too_many_arguments)] // Necessary for full copy functionality
 pub async fn copy_object(
     src_account: &str,
@@ -889,19 +903,8 @@ pub async fn copy_object(
     let mut new_metadata = (*src_info.user_defined).clone();
 
     // 11. If custom metadata headers provided, use those instead (Swift behavior)
-    let mut has_custom_meta = false;
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-") {
-            if !has_custom_meta {
-                // First custom meta header - clear source metadata
-                new_metadata.clear();
-                has_custom_meta = true;
-            }
-            if let Ok(value_str) = header_value.to_str() {
-                new_metadata.insert(meta_key.to_string(), value_str.to_string());
-            }
-        }
+    if let Some(custom_metadata) = swift_user_metadata(headers) {
+        new_metadata = custom_metadata;
     }
 
     // 12. Also check for Content-Type override
@@ -959,7 +962,6 @@ pub async fn copy_object(
 /// assert_eq!(container, "my-container");
 /// assert_eq!(object, "path/to/file.txt");
 /// ```
-#[allow(dead_code)] // Handler integration: COPY method
 pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, String)> {
     let destination = destination.trim_start_matches('/');
     let parts: Vec<&str> = destination.splitn(2, '/').collect();
@@ -993,7 +995,6 @@ pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, Strin
 /// # Returns
 /// * `Ok((container, object))` - Parsed container and object names
 /// * `Err(SwiftError)` - Error if format is invalid
-#[allow(dead_code)] // Handler integration: X-Copy-From
 pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> {
     // Same parsing logic as Destination header
     parse_destination_header(copy_from)
@@ -1022,7 +1023,6 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.start, 0);
 /// assert_eq!(range.end, 1023);
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
 pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
@@ -1104,7 +1104,6 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
 /// let header = format_content_range(0, 1023, 5000);
 /// assert_eq!(header, "bytes 0-1023/5000");
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
 pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
     format!("bytes {}-{}/{}", start, end, total)
 }
@@ -1121,6 +1120,36 @@ mod tests {
         assert!(ObjectKeyMapper::validate_object_name("file with spaces.pdf").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("special-chars_@#$.txt").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("unicode-文件.txt").is_ok());
+    }
+
+    #[test]
+    fn swift_user_metadata_cannot_materialize_internal_storage_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-object-meta-x-rustfs-internal-actual-size", "1".parse().expect("valid metadata value"));
+        headers.insert("x-object-meta-description", "safe".parse().expect("valid metadata value"));
+        let metadata = swift_user_metadata(&headers).expect("custom metadata should be detected");
+
+        assert_eq!(metadata.get("x-amz-meta-x-rustfs-internal-actual-size").map(String::as_str), Some("1"));
+        assert_eq!(metadata.get("description").map(String::as_str), Some("safe"));
+        assert!(!metadata.contains_key("x-rustfs-internal-actual-size"));
+        assert_eq!(
+            stored_swift_user_metadata_key("x-minio-encryption-original-size"),
+            "x-amz-meta-x-minio-encryption-original-size"
+        );
+        assert_eq!(stored_swift_user_metadata_key("description"), "description");
+    }
+
+    #[test]
+    fn swift_user_metadata_response_mapping_is_reversible_and_filters_internal_keys() {
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-internal-actual-size"),
+            Some("x-rustfs-internal-actual-size")
+        );
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-x-amz-checksum"), Some("x-amz-checksum"));
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-description"), Some("x-amz-meta-description"));
+        assert_eq!(swift_response_user_metadata_key("description"), Some("description"));
+        assert_eq!(swift_response_user_metadata_key("x-rustfs-internal-actual-size"), None);
+        assert_eq!(swift_response_user_metadata_key("x-minio-internal-actual-size"), None);
     }
 
     #[test]

@@ -673,6 +673,12 @@ fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(Hea
     Some((request, delay, error))
 }
 
+async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
+    let (_, delay, error) = retry_request_for_result(task, result)?;
+    let request = task.retry_request_with_remaining_timeout().await.ok()?;
+    Some((request, delay, error))
+}
+
 fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
     let retry_attempt = retry_attempt.clamp(1, 5);
     let delay = Duration::from_secs(2_u64.saturating_pow(retry_attempt));
@@ -690,7 +696,7 @@ pub struct HealConfig {
     pub max_concurrent_heals: usize,
     /// Maximum concurrent heal tasks allowed for a single erasure set
     pub max_concurrent_per_set: usize,
-    /// Task timeout
+    /// Aggregate task execution timeout across recoverable retries
     pub task_timeout: Duration,
     /// Queue size
     pub queue_size: usize,
@@ -2379,8 +2385,27 @@ impl HealManager {
             snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
             snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
             snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
+            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
+            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
+            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
+            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
             snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
+            snapshot.start_time = match (snapshot.start_time, progress.start_time) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
+                (Some(current), Some(next)) => Some(current.max(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            if progress.current_object.is_some() {
+                snapshot.current_object = progress.current_object;
+            }
         }
+        snapshot.refresh_progress_percentage();
+        snapshot.refresh_estimated_completion_time();
         Some(snapshot)
     }
 
@@ -3106,7 +3131,7 @@ impl HealManager {
                         "Heal scheduler task started"
                     );
                     let result = task.execute().await;
-                    let retry_request = retry_request_for_result(task.as_ref(), &result);
+                    let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
                     match &result {
                         Ok(_) => {
                             debug!(
@@ -3202,6 +3227,7 @@ impl HealManager {
                         } else {
                             completed_task.get_status().await
                         };
+                        let completed_progress = completed_task.get_progress().await;
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
@@ -3217,6 +3243,7 @@ impl HealManager {
                         match completed_status {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
+                                stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);
                             }
                             HealTaskStatus::Retrying { .. } => {}
                             _ => {
@@ -3743,6 +3770,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -4537,6 +4565,25 @@ mod tests {
         assert_eq!(retry_request.priority, task.priority);
         assert!(retry_delay > Duration::ZERO);
         assert!(retry_error.contains("Lock acquisition timeout"));
+    }
+
+    #[tokio::test]
+    async fn retry_request_for_result_preserves_remaining_timeout_budget() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+        request.options.timeout = Some(Duration::from_secs(60));
+        let task = HealTask::from_request(request, storage);
+        let result = task.execute().await;
+
+        let (retry_request, _, _) = retry_request_for_result_with_budget(&task, &result)
+            .await
+            .expect("read quorum failure should retain the unused timeout budget");
+        let remaining = retry_request
+            .options
+            .timeout
+            .expect("configured timeout should remain present");
+        assert!(remaining < Duration::from_secs(60));
+        assert!(remaining > Duration::from_secs(59));
     }
 
     #[test]
@@ -5371,6 +5418,8 @@ mod tests {
         ));
         {
             let mut progress = first.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(20));
+            progress.set_total_baseline(12, 8192);
             progress.update_progress(7, 3, 1, 4096);
         }
 
@@ -5380,6 +5429,8 @@ mod tests {
         ));
         {
             let mut progress = second.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+            progress.set_total_baseline(8, 4096);
             progress.update_progress(11, 5, 2, 2048);
         }
 
@@ -5394,7 +5445,11 @@ mod tests {
         assert_eq!(progress.objects_scanned, 18);
         assert_eq!(progress.objects_healed, 8);
         assert_eq!(progress.objects_failed, 3);
+        assert_eq!(progress.objects_total_count, 20);
+        assert_eq!(progress.objects_total_size, 12288);
         assert_eq!(progress.bytes_processed, 6144);
+        assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+        assert!(progress.estimated_completion_time.is_some());
     }
 
     #[tokio::test]
@@ -6054,7 +6109,7 @@ mod tests {
         process_manager_queue_once(&manager).await;
         let defaulted_status = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Ok(status @ HealTaskStatus::Retrying { .. }) = manager.get_task_status(&defaulted_id).await {
+                if let Ok(status @ HealTaskStatus::Timeout) = manager.get_task_status(&defaulted_id).await {
                     break status;
                 }
                 tokio::task::yield_now().await;
@@ -6062,23 +6117,8 @@ mod tests {
         })
         .await
         .expect("configured timeout should finish the task");
-        assert!(matches!(defaulted_status, HealTaskStatus::Retrying { .. }));
-        assert_eq!(
-            manager
-                .retrying_heals
-                .lock()
-                .await
-                .get(&defaulted_id)
-                .expect("timed out task should retain its retry request")
-                .request
-                .options
-                .timeout,
-            Some(Duration::ZERO)
-        );
-        manager
-            .cancel_task(&defaulted_id)
-            .await
-            .expect("retrying timeout task should be cancelled");
+        assert_eq!(defaulted_status, HealTaskStatus::Timeout);
+        assert!(manager.retrying_heals.lock().await.get(&defaulted_id).is_none());
 
         let mut explicit = bucket_request("explicit-timeout", HealPriority::Normal, HealRequestSource::Admin);
         explicit.options.timeout = Some(Duration::from_secs(60));

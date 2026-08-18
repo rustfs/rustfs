@@ -40,7 +40,7 @@ use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use tracing::{Span, error, info, warn};
+use tracing::{error, info, warn};
 
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 const LOG_SUBSYSTEM_AUDIT_TARGET: &str = "audit_target";
@@ -278,8 +278,6 @@ pub struct AuditTargetConfig {}
 #[async_trait::async_trait]
 impl Operation for AuditTargetConfig {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
@@ -345,8 +343,6 @@ pub struct ListAuditTargets {}
 #[async_trait::async_trait]
 impl Operation for ListAuditTargets {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         authorize_audit_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
 
         let mut runtime_statuses = HashMap::new();
@@ -370,8 +366,6 @@ pub struct RemoveAuditTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveAuditTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
@@ -837,6 +831,13 @@ mod tests {
         let list_block =
             extract_block_between_markers(src, "impl Operation for ListAuditTargets", "pub struct RemoveAuditTarget");
         let delete_block = extract_block_between_markers(src, "impl Operation for RemoveAuditTarget", "#[cfg(test)]");
+
+        for block in [put_block, list_block, delete_block] {
+            assert!(
+                !block.contains(".enter()"),
+                "async audit handlers must rely on request-future instrumentation instead of holding span guards across awaits"
+            );
+        }
 
         assert!(
             put_block.contains("authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),

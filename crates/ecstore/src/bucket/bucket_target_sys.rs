@@ -58,7 +58,9 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
+    insert_header,
 };
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
@@ -80,7 +82,6 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
@@ -1476,9 +1477,12 @@ impl Default for AdvancedPutOptions {
             replication_status: ReplicationStatusType::Pending,
             source_mtime: OffsetDateTime::now_utc(),
             replication_request: false,
-            retention_timestamp: OffsetDateTime::now_utc(),
-            tagging_timestamp: OffsetDateTime::now_utc(),
-            legalhold_timestamp: OffsetDateTime::now_utc(),
+            // UNIX_EPOCH means "never modified": header() must not emit a
+            // timestamp header for it, otherwise a receiver would treat an
+            // unset category as a modification made right now.
+            retention_timestamp: OffsetDateTime::UNIX_EPOCH,
+            tagging_timestamp: OffsetDateTime::UNIX_EPOCH,
+            legalhold_timestamp: OffsetDateTime::UNIX_EPOCH,
             replication_validity_check: false,
         }
     }
@@ -1545,8 +1549,8 @@ impl Default for PutObjectOptions {
     }
 }
 
-#[allow(dead_code)]
 impl PutObjectOptions {
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1557,6 +1561,7 @@ impl PutObjectOptions {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1675,6 +1680,16 @@ impl PutObjectOptions {
             );
         }
 
+        for (suffix, timestamp) in [
+            (SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, self.internal.tagging_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, self.internal.retention_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, self.internal.legalhold_timestamp),
+        ] {
+            if timestamp.unix_timestamp() != 0 {
+                insert_header(&mut header, suffix, timestamp.format(&Rfc3339).unwrap_or_default());
+            }
+        }
+
         if self.internal.replication_request {
             insert_header(&mut header, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
@@ -1682,6 +1697,7 @@ impl PutObjectOptions {
         header
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn validate(&self, _c: Arc<TargetClient>) -> Result<(), std::io::Error> {
         //if self.checksum.is_set() {
         /*if !self.trailing_header_support {
@@ -2840,6 +2856,57 @@ mod tests {
             Some("etag-1"),
             "replication targets need the source etag for idempotency checks"
         );
+    }
+
+    #[test]
+    fn put_object_headers_carry_replication_timestamp_headers() {
+        // MinIO receivers resolve concurrent tag/retention/legal-hold edits by
+        // last-writer-wins on these headers (object-api-options.go parses them
+        // as RFC3339); a replica without them loses every conflict resolution.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        let tagging = OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("valid timestamp");
+        let retention = OffsetDateTime::from_unix_timestamp(1_700_000_002).expect("valid timestamp");
+        let legalhold = OffsetDateTime::from_unix_timestamp(1_700_000_003).expect("valid timestamp");
+        opts.internal.tagging_timestamp = tagging;
+        opts.internal.retention_timestamp = retention;
+        opts.internal.legalhold_timestamp = legalhold;
+
+        let header = opts.header();
+        for (suffix, expected) in [
+            ("source-replication-tagging-timestamp", tagging),
+            ("source-replication-retention-timestamp", retention),
+            ("source-replication-legalhold-timestamp", legalhold),
+        ] {
+            assert_eq!(
+                rustfs_utils::http::get_header(&header, suffix).as_deref(),
+                Some(expected.format(&Rfc3339).expect("RFC3339 timestamp").as_str()),
+                "replication put requests must carry the {suffix} header"
+            );
+        }
+    }
+
+    #[test]
+    fn put_object_headers_omit_unset_replication_timestamps() {
+        // UNIX_EPOCH means "never modified on the source"; sending it would
+        // make the receiver treat an unset category as a fresh modification.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        opts.internal.tagging_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.retention_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.legalhold_timestamp = OffsetDateTime::UNIX_EPOCH;
+
+        let header = opts.header();
+        for suffix in [
+            "source-replication-tagging-timestamp",
+            "source-replication-retention-timestamp",
+            "source-replication-legalhold-timestamp",
+        ] {
+            assert!(
+                rustfs_utils::http::get_header(&header, suffix).is_none(),
+                "unset {suffix} must not be sent to replication targets"
+            );
+        }
     }
 
     #[tokio::test]

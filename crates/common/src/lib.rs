@@ -19,6 +19,7 @@ pub mod last_minute;
 pub mod metrics;
 mod readiness;
 pub mod table_catalog;
+pub mod trace_bus;
 
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};
