@@ -46,6 +46,7 @@ Two rules keep this directory healthy:
 - [s3-tables-support-matrix.md](s3-tables-support-matrix.md)
 - [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md)
 - [minio-file-format-compat.md](minio-file-format-compat.md)
+- [minio-scanner-compat.md](minio-scanner-compat.md) — MinIO data-scanner parity: cycle/heal/ILM/usage gaps and improvement contracts
 
 ## Inventories & baselines (snapshots that feed migration work)
 

@@ -4,6 +4,8 @@ RustFS Scanner 是后台维护扫描循环，负责用量统计、生命周期�
 
 面向运维人员的运行时控制项、状态字段和调参流程，请参考
 [Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md)。
+与 MinIO `data-scanner` 的对照和补齐约定请参考
+[MinIO Scanner Compatibility](../../docs/architecture/minio-scanner-compat.md)。
 可复现的 scanner 压力验证流程请参考
 [Scanner Benchmark Runbook](../../docs/operations/scanner-benchmark-runbook.md)。
 
