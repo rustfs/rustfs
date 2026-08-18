@@ -2610,17 +2610,20 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await?;
-    assert_eq!(payload["Status"], "OK");
+    assert_eq!(payload["Status"], "OK", "{payload}");
     assert_eq!(payload["ActiveMutation"], true);
     assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
-    assert_eq!(payload["Targets"][0]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK", "{payload}");
     // A RustFS target adopts the source version id, so the P1-19
     // version-identity probe passes.
-    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
-    assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionFidelity"]["Status"], "OK", "{payload}");
+    // A RustFS target preserves the SSE-C passthrough transport headers and
+    // echoes the customer algorithm on the replication-check HEAD (N2).
+    assert_eq!(payload["Targets"][0]["Phases"]["SsecPassthrough"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
+    assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     let target_client = target_env.create_s3_client();
     let versions = target_client
@@ -4645,6 +4648,410 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     let replica_versions: Vec<_> = versions.versions().iter().filter(|v| v.key() == Some(key)).collect();
     assert_eq!(replica_versions.len(), 1, "SSE-C replica must not accumulate versions");
     assert_eq!(replica_versions[0].version_id().map(str::to_string), replica_version_id);
+
+    Ok(())
+}
+
+/// N2 (backlog#1675 P1-22): SSE-C passthrough replication to a target that
+/// silently drops the `X-Rustfs-Replication-*` transport headers (MinIO-like
+/// behavior, modeled by the fake target's drop mode) used to report COMPLETED
+/// while the replica had irrecoverably lost its decryption material — the red
+/// light this test was born failing on. Fail-closed contract now under test:
+/// the first attempt PUTs, HEAD-backs the replica, finds no SSE-C evidence,
+/// records the target Unsupported and reports FAILED; a second SSE-C object
+/// fails without any PUT reaching the target (capability cache, proven from
+/// the target journal); plaintext objects still replicate COMPLETED.
+#[tokio::test]
+#[serial]
+async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_headers() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "ssec-drop-dst";
+    target.create_bucket(target_bucket);
+    target.drop_unlisted_replication_headers(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "ssec-drop-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let put_ssec = |key: &'static str| {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"ssec fail-closed payload"))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+    };
+
+    // First SSE-C object: the audit must catch the dropped material.
+    put_ssec("ssec-first.txt").await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "ssec-first.txt", "FAILED", true).await?;
+
+    let requests = target.take_requests();
+    let first_put = requests
+        .iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject && record.key.as_deref() == Some("ssec-first.txt"))
+        .ok_or("the first SSE-C object must have been PUT (capability was Unknown)")?;
+    assert!(
+        first_put.proxy_headers.ssec_transport_present,
+        "the replication PUT must have shipped the SSE-C transport headers the target then dropped"
+    );
+    assert!(
+        requests.iter().any(|record| {
+            record.operation == FakeTargetOperation::HeadObject
+                && record.key.as_deref() == Some("ssec-first.txt")
+                && record.sequence > first_put.sequence
+                && record.proxy_headers.replication_check.as_deref() == Some("true")
+        }),
+        "the post-PUT HEAD-back audit must have run through the replication-check channel; journal: {requests:?}"
+    );
+
+    // Second SSE-C object: the cached Unsupported verdict fails it closed
+    // before any PUT — including MRF retries of the first object.
+    put_ssec("ssec-second.txt").await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "ssec-second.txt", "FAILED", true).await?;
+    assert!(
+        !target.requests().iter().any(|record| {
+            record.operation == FakeTargetOperation::PutObject
+                && record.key.as_deref() != Some("plain-control.txt")
+                && record.proxy_headers.ssec_transport_present
+        }),
+        "no further SSE-C ciphertext may reach a target recorded Unsupported; journal: {:?}",
+        target.requests()
+    );
+
+    // The gate is scoped to SSE-C: plaintext replication keeps working.
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("plain-control.txt")
+        .body(ByteStream::from_static(b"plaintext control payload"))
+        .send()
+        .await?;
+    wait_for_source_replication_status(&source_client, source_bucket, "plain-control.txt", "COMPLETED", false).await?;
+    assert!(target.has_object(target_bucket, "plain-control.txt"));
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// N2 (backlog#1675 P1-22): the admin replication-check must expose the same
+/// verdict operators would otherwise only learn from failing SSE-C objects —
+/// an SsecPassthrough probe phase that fails with the machine-readable
+/// `BucketRemoteSsecPassthroughUnsupported` code against a header-dropping
+/// target, with no probe residue left behind. The target's overall status
+/// stays OK: unlike version-identity drift, dropped passthrough headers are
+/// a capability limit, and a plaintext-only deployment against a MinIO-like
+/// target must not turn red.
+#[tokio::test]
+#[serial]
+async fn test_replication_check_flags_ssec_passthrough_dropping_target() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "ssec-check-dst";
+    target.create_bucket(target_bucket);
+    target.drop_unlisted_replication_headers(true);
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+
+    let source_bucket = "ssec-check-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await?;
+
+    assert_eq!(
+        payload["Status"], "OK",
+        "a capability-only SSE-C failure must not fail the check overall: {payload}"
+    );
+    let target_report = &payload["Targets"][0];
+    assert_eq!(target_report["Status"], "OK", "{payload}");
+    let ssec = &target_report["Phases"]["SsecPassthrough"];
+    assert_eq!(ssec["Status"], "FAILED", "SsecPassthrough phase must fail: {payload}");
+    assert_eq!(
+        ssec["Code"], "BucketRemoteSsecPassthroughUnsupported",
+        "the failure must carry the machine-readable code: {payload}"
+    );
+    // Basic replication of plaintext objects works on this target: every other
+    // phase passes, so the code is the discriminator operators branch on.
+    assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionFidelity"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
+
+    // The SSE-C probe PUT must have shipped the real transport header names —
+    // a mangled or missing header set would fail the phase for the wrong
+    // reason and mask a working target.
+    let requests = target.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::PutObject && record.proxy_headers.ssec_transport_present),
+        "the SSE-C probe PUT must carry the X-Rustfs-Replication-* transport headers; journal: {requests:?}"
+    );
+
+    // No probe residue, including the SSE-C probe version.
+    let probe_put = requests
+        .into_iter()
+        .find(|record| record.operation == FakeTargetOperation::PutObject)
+        .ok_or("the probe PUT never reached the fake target")?;
+    let probe_key = probe_put.key.ok_or("probe PUT journal record has no key")?;
+    assert!(
+        target.stored_versions(target_bucket, &probe_key).is_empty(),
+        "all probe versions must be cleaned up"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// C1 (backlog#1675 P1-22): heal-path convergence for SSE-C. An SSE-C object
+/// whose live replication failed during a target outage must converge through
+/// the scanner/heal compensation once the target returns — passing the N2
+/// HEAD-back audit against the recovered RustFS target — and the replica must
+/// be readable with the customer key.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult {
+    init_logging();
+
+    let (source_env, mut target_env, source_bucket, target_bucket) =
+        build_sse_replication_pair("ssec-heal", false, false).await?;
+    let source_client = source_env.create_s3_client();
+    let key = "ssec-heal-contract.txt";
+    let body = b"repl-22 ssec heal payload".to_vec();
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+
+    // Target outage: the SSE-C write cannot replicate.
+    target_env.stop_server();
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    // The failure is observable on the source (SSE-C HEAD needs the key).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let head = source_client
+            .head_object()
+            .bucket(&source_bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        match head.replication_status().map(|status| status.as_str()) {
+            Some("PENDING") | Some("FAILED") => break,
+            other => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("source SSE-C object never reported PENDING/FAILED; last status={other:?}").into());
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    // Recover the target in place; the source scanner re-drives the failure.
+    target_env
+        .restart_server_preserving_data(vec![], &[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")])
+        .await?;
+
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "COMPLETED", true).await?;
+
+    // The healed replica is a REPLICA (status surfaces on HEAD) readable with
+    // the customer key.
+    let target_client = target_env.create_s3_client();
+    let replica_head = target_client
+        .head_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(
+        replica_head.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "the healed copy must carry REPLICA status"
+    );
+    let replica = target_client
+        .get_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    Ok(())
+}
+
+/// C1 (backlog#1675 P1-22): existing-object resync for SSE-C. An SSE-C object
+/// written BEFORE any replication config must reach the RustFS target through
+/// the existing-object resync (`replicate_all` transport, N2-audited), land as
+/// a REPLICA, and read back with the customer key.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("HTTP_PROXY", ""),
+            ("HTTPS_PROXY", ""),
+        ])
+        .await?;
+
+    let source_bucket = "ssec-existing-src";
+    let target_bucket = "ssec-existing-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    // The SSE-C object exists before any replication wiring.
+    let key = "ssec-existing-contract.txt";
+    let body = b"repl-22 ssec existing-object payload".to_vec();
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    // Wire replication (existing-object enabled) and drive a resync.
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+    let (reset_arn, reset_id) = start_bucket_replication_reset(&source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let terminal = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |status| {
+        status.reset_id == reset_id && matches!(status.status.as_str(), "Completed" | "Failed")
+    })
+    .await?;
+    assert_eq!(terminal.status, "Completed", "SSE-C existing-object resync must complete");
+    assert!(terminal.replicated_count >= 1, "the existing SSE-C object must have been resynced");
+
+    // The replica is a REPLICA (status surfaces on HEAD) readable with the
+    // customer key.
+    let replica_head = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(
+        replica_head.replication_status().map(|status| status.as_str()),
+        Some("REPLICA"),
+        "the resynced copy must carry REPLICA status"
+    );
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(replica.sse_customer_algorithm(), Some("AES256"));
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    // No plaintext leak: the replica stays unreadable without the key.
+    assert!(
+        target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .send()
+            .await
+            .is_err(),
+        "SSE-C replica must not be readable without the customer key"
+    );
 
     Ok(())
 }

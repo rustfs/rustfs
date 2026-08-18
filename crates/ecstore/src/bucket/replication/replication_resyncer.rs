@@ -49,10 +49,12 @@ use super::replication_storage_boundary::{
     ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
 };
 use super::replication_target_boundary::{
-    PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
+    ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore,
+    SsecPassthroughCapability, SsecPassthroughGate, TargetClient, replication_action_for_target_head,
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
     replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
-    replication_put_object_options, replication_target_head_is_newer_null_version,
+    replication_put_object_options, replication_target_head_is_newer_null_version, resolve_read_api_version_id,
+    ssec_passthrough_evidence_present, ssec_passthrough_gate,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -276,6 +278,114 @@ async fn head_object_fallback(
         Ok(oi) => Ok(Some(oi)),
         Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Resolve the N2 fail-closed gate for an SSE-C passthrough attempt against
+/// this target. Returns `Some(audit_required)` when replication may proceed;
+/// on a freshly-flagged header-dropping target it settles `rinfo` as FAILED
+/// (no PUT is ever sent — the object stays on the normal MRF retry channel
+/// and re-audits once the verdict's TTL expires or replication-check
+/// re-probes the target) and returns `None`.
+async fn resolve_ssec_passthrough_gate(
+    ssec: bool,
+    tgt_client: &TargetClient,
+    bucket: &str,
+    object: &str,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> Option<bool> {
+    let (capability, expired) = ReplicationTargetStore::ssec_passthrough_capability(&tgt_client.arn).await;
+    match ssec_passthrough_gate(ssec, capability, expired) {
+        SsecPassthroughGate::Proceed => Some(false),
+        SsecPassthroughGate::ProceedWithAudit => Some(true),
+        SsecPassthroughGate::FailClosed => {
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED.to_string());
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                operation = "ssec_passthrough_gate",
+                error = ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED,
+                "Replication target operation failed"
+            );
+            None
+        }
+    }
+}
+
+/// Judge SSE-C passthrough evidence on a HEAD of the replica and record the
+/// capability verdict for the target. Returns true when the SSE-C material
+/// provably survived; otherwise records `Unsupported` and settles `rinfo` as
+/// FAILED so the attempt never reports a silently unreadable COMPLETED.
+async fn settle_ssec_passthrough_evidence(
+    head: &HeadObjectOutput,
+    tgt_client: &TargetClient,
+    bucket: &str,
+    object: &str,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> bool {
+    if ssec_passthrough_evidence_present(head) {
+        ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Supported).await;
+        return true;
+    }
+    ReplicationTargetStore::record_ssec_passthrough_capability(&tgt_client.arn, SsecPassthroughCapability::Unsupported).await;
+    rinfo.replication_status = ReplicationStatusType::Failed;
+    rinfo.error = Some(ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED.to_string());
+    warn!(
+        event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+        bucket = %bucket,
+        object = %object,
+        arn = %tgt_client.arn,
+        endpoint = %tgt_client.endpoint,
+        operation = "ssec_passthrough_audit",
+        error = ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED,
+        "Replication target operation failed"
+    );
+    false
+}
+
+/// Post-PUT HEAD-back audit for an SSE-C passthrough replica, over the worker
+/// HEAD channel (replication-check exemption plus the `source-proxy-request:
+/// false` suppression header, so the target answers locally without a
+/// customer key). A HEAD transport failure leaves the capability `Unknown`
+/// but still fails this attempt: an unverifiable SSE-C replica must not
+/// report COMPLETED.
+async fn audit_ssec_passthrough_replica(
+    tgt_client: &Arc<TargetClient>,
+    bucket: &str,
+    object: &str,
+    version_id: Option<String>,
+    rinfo: &mut ReplicatedTargetInfo,
+) -> bool {
+    // Address the replica the way the PUT named it: a nil source version id
+    // (versioning-suspended / null-version objects) maps to the "null"
+    // version, so the audit HEAD does not 4xx-loop on those objects.
+    let version_id = resolve_read_api_version_id(version_id);
+    match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, version_id).await {
+        Ok(head) => settle_ssec_passthrough_evidence(&head, tgt_client, bucket, object, rinfo).await,
+        Err(e) => {
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(format!("SSE-C passthrough audit HEAD failed: {e}"));
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                operation = "ssec_passthrough_audit_head",
+                error = %e,
+                "Replication target operation failed"
+            );
+            mark_replication_target_offline_if_needed(tgt_client, &e).await;
+            false
+        }
     }
 }
 
@@ -2872,6 +2982,21 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
+        // N2 fail-closed: never PUT SSE-C ciphertext at a target known to drop
+        // the passthrough transport headers, and never trust a convergence HEAD
+        // against such a target — a previous broken replica matches by ETag.
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        else {
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: self.to_object_info(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return rinfo;
+        };
+
         let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
         let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
 
@@ -2975,6 +3100,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             Ok(oi) => {
                 replication_action = replication_action_for_target_head(&object_info, &oi, self.op_type);
                 if replication_action == ReplicationAction::None {
+                    // An SSE-C replica only counts as converged when the same
+                    // HEAD proves its decryption material survived; a broken
+                    // ciphertext copy from an earlier attempt matches by ETag.
+                    if ssec_audit_required
+                        && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
+                    {
+                        return rinfo;
+                    }
                     rinfo.replication_status = ReplicationStatusType::Completed;
                     rinfo.replication_resynced = true;
                     rinfo.replication_action = ReplicationAction::None;
@@ -2989,6 +3122,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&tgt_client, &object).await {
                         Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
+                            if ssec_audit_required
+                                && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
+                            {
+                                return rinfo;
+                            }
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
@@ -3113,6 +3251,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
+        // First SSE-C passthrough PUT against this target: verify the replica
+        // kept its decryption material before reporting COMPLETED.
+        if ssec_audit_required
+            && !audit_ssec_passthrough_replica(&tgt_client, &bucket, &object, self.version_id.map(|v| v.to_string()), &mut rinfo)
+                .await
+        {
+            return rinfo;
+        }
+
         rinfo.replication_status = ReplicationStatusType::Completed;
 
         rinfo
@@ -3134,6 +3281,21 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             note_replicate_all_target_offline(self, &bucket, &tgt_client);
             return rinfo;
         }
+
+        // N2 fail-closed: see the gate in `replicate_object` — the same policy
+        // applies to the metadata/existing-object transport.
+        let Some(ssec_audit_required) = resolve_ssec_passthrough_gate(self.ssec, &tgt_client, &bucket, &object, &mut rinfo).await
+        else {
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: self.to_object_info(),
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
+        };
 
         let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
         let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
@@ -3173,8 +3335,19 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         let _sopts = replicate_all_stat_options(&object_info, &bucket, &tgt_client);
 
-        let Some((replication_action, object_info)) =
-            resolve_replicate_all_action(self, &tgt_client, &bucket, &object, object_info, start_time, &mut rinfo).await
+        let Some((replication_action, object_info)) = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: self,
+                tgt_client: &tgt_client,
+                bucket: &bucket,
+                object: &object,
+                start_time,
+                ssec_audit_required,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await
         else {
             return rinfo;
         };
@@ -3226,6 +3399,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             fail_replicate_all_put_object(&mut rinfo, &tgt_client, &bucket, &object, &err, start_time).await;
+            return rinfo;
+        }
+
+        // First SSE-C passthrough PUT against this target: verify the replica
+        // kept its decryption material before reporting COMPLETED.
+        if ssec_audit_required
+            && !audit_ssec_passthrough_replica(&tgt_client, &bucket, &object, self.version_id.map(|v| v.to_string()), &mut rinfo)
+                .await
+        {
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
             return rinfo;
         }
 
@@ -3441,25 +3624,49 @@ fn apply_replication_resync_timestamp(rinfo: &mut ReplicatedTargetInfo, reset_id
     rinfo.replication_resynced = true;
 }
 
+/// Borrowed inputs for [`resolve_replicate_all_action`].
+struct ReplicateAllActionContext<'a> {
+    roi: &'a ReplicateObjectInfo,
+    tgt_client: &'a Arc<TargetClient>,
+    bucket: &'a str,
+    object: &'a str,
+    start_time: OffsetDateTime,
+    /// N2: the target's SSE-C passthrough capability is still `Unknown`, so a
+    /// converged-looking replica must additionally prove its SSE-C material
+    /// survived before the comparison may settle COMPLETED.
+    ssec_audit_required: bool,
+}
+
 /// Compare the source object against the target via HEAD and decide which
 /// replication action is still required. Returns `None` after fully settling
 /// `rinfo` when replication must stop here — either because the target already
 /// matches or because the comparison failed.
 async fn resolve_replicate_all_action(
-    roi: &ReplicateObjectInfo,
-    tgt_client: &Arc<TargetClient>,
-    bucket: &str,
-    object: &str,
+    ctx: ReplicateAllActionContext<'_>,
     object_info: ObjectInfo,
-    start_time: OffsetDateTime,
     rinfo: &mut ReplicatedTargetInfo,
 ) -> Option<(ReplicationAction, ObjectInfo)> {
+    let ReplicateAllActionContext {
+        roi,
+        tgt_client,
+        bucket,
+        object,
+        start_time,
+        ssec_audit_required,
+    } = ctx;
     let replication_action;
     match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, roi.version_id.map(|v| v.to_string())).await {
         Ok(oi) => {
             replication_action = replication_action_for_target_head(&object_info, &oi, roi.op_type);
             rinfo.replication_status = ReplicationStatusType::Completed;
             if replication_action == ReplicationAction::None {
+                // An SSE-C replica only counts as converged when the same HEAD
+                // proves its decryption material survived; a broken ciphertext
+                // copy from an earlier attempt matches by ETag.
+                if ssec_audit_required && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await {
+                    rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                    return None;
+                }
                 if roi.op_type == ReplicationType::ExistingObject
                     && replication_target_head_is_newer_null_version(&object_info, &oi)
                 {
@@ -3509,6 +3716,12 @@ async fn resolve_replicate_all_action(
                 match head_object_fallback(tgt_client, object).await {
                     Ok(Some(oi)) => {
                         replication_action = if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) {
+                            if ssec_audit_required
+                                && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await
+                            {
+                                rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                                return None;
+                            }
                             ReplicationAction::None
                         } else {
                             ReplicationAction::All
