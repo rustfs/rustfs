@@ -791,11 +791,6 @@ impl DiskHealthTracker {
         unpack_health_state(self.state_snapshot.load(Ordering::Acquire)).1 == DISK_HEALTH_FAULTY
     }
 
-    pub fn health_state_snapshot(&self) -> (RuntimeDriveHealthState, bool) {
-        let (runtime_state, status) = unpack_health_state(self.state_snapshot.load(Ordering::Acquire));
-        (runtime_state, status == DISK_HEALTH_FAULTY)
-    }
-
     fn publish_state(&self, runtime_state: RuntimeDriveHealthState, status: u32) {
         self.state_snapshot
             .store(pack_health_state(runtime_state, status), Ordering::Release);
