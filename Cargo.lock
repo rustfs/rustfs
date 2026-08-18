@@ -10678,7 +10678,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=d7028511a53f69d41ed3c69f36899f9b1aede647#d7028511a53f69d41ed3c69f36899f9b1aede647"
+source = "git+https://github.com/rustfs/s3s.git?rev=ff8106f46098b60fce8ee88518f34974fbfbec4b#ff8106f46098b60fce8ee88518f34974fbfbec4b"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10706,6 +10706,7 @@ dependencies = [
  "numeric_cast",
  "pin-project-lite",
  "quick-xml",
+ "regex",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -11809,7 +11810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
