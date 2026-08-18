@@ -290,6 +290,12 @@ jobs:
           Homepage: https://rustfs.com
           EOF
 
+          # Declare /etc/default/rustfs as a conffile so dpkg preserves user
+          # modifications on upgrade instead of silently overwriting them.
+          cat > "${PKG_DIR}/DEBIAN/conffiles" << 'CONFFILES'
+          /etc/default/rustfs
+          CONFFILES
+
           cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
           #!/bin/bash
           set -e

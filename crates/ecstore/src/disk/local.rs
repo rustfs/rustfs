@@ -9405,7 +9405,7 @@ impl DiskAPI for LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) = os::fsync_dir(parent).await {
+                if let Err(err) = os::fsync_dst_dir_group_commit(parent).await {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
@@ -13019,6 +13019,76 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&backup_parent),
             "old-metadata rollback backup must keep fsyncing its parent dir"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn rename_data_non_inline_uses_dst_dir_fsync_group_commit_when_enabled() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let bucket = "grouped-dst-fsync-bucket";
+        let object = "dir/object";
+        let (disk, _dir) = commit_new_object(DurabilityMode::Strict, bucket, object).await;
+        let dst_meta_parent = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("dst meta path should resolve")
+            .parent()
+            .expect("dst meta should have a parent")
+            .to_path_buf();
+
+        assert_eq!(
+            os::fsync_dir_recorder::grouped_batch_sizes(&dst_meta_parent),
+            vec![1],
+            "enabled non-inline rename_data must route the dst parent fsync through the group commit coordinator"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn rename_data_non_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
+        use tempfile::tempdir;
+
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "grouped-dst-fsync-failure-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-grouped-dst-fsync-failure";
+        let version_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("version id should parse");
+        let new_data_dir = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("data dir should parse");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+        let dst_meta_parent = dir.path().join(bucket).join(object);
+        os::fsync_dir_recorder::set_grouped_failure(&dst_meta_parent, io::ErrorKind::PermissionDenied);
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect_err("grouped dst dir fsync failure must fail the fresh PUT");
+
+        assert_eq!(err, DiskError::FileAccessDenied);
+        assert!(
+            !dst_meta_parent.join(STORAGE_FORMAT_FILE).exists(),
+            "fresh PUT rollback must remove the committed xl.meta after grouped dst dir fsync failure"
+        );
+        assert!(
+            !dst_meta_parent.join(new_data_dir.to_string()).exists(),
+            "fresh PUT rollback must remove the committed data dir after grouped dst dir fsync failure"
         );
     }
 
