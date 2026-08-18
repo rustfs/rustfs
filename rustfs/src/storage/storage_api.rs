@@ -185,8 +185,9 @@ pub(crate) mod options_consumer {
         copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
         extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
         get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
-        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
-        preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
+        has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        parse_copy_source_range, preserve_unclassified_user_metadata, put_opts_with_replication_authorization,
+        validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {
@@ -409,7 +410,9 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use rustfs_ecstore::api::compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod ecstore_cluster {
@@ -565,6 +568,10 @@ pub(crate) mod ecstore_set_disk {
 pub(crate) mod ecstore_erasure {
     pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
 }
+
+/// Startup bitrot algorithm self-test (rustfs/backlog#1873), re-exported for
+/// the root facade's background-startup section.
+pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
 pub(crate) mod ecstore_storage {
     #[cfg(test)]

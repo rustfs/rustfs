@@ -148,7 +148,6 @@ mod heal_walk;
 pub use heal_walk::HealWalkVersion;
 mod init;
 pub(crate) mod init_format;
-mod list;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
@@ -217,6 +216,16 @@ impl std::fmt::Debug for ECStore {
 /// These delegate to the process-global statics. No local state — the globals
 /// remain the single source of truth until the migration is complete.
 impl ECStore {
+    /// Every erasure set across all pools, pool-major order.
+    ///
+    /// Read-only queries that must consult each set's own copy of a
+    /// per-bucket object (e.g. the scanner's `.usage-cache.bin`) iterate
+    /// this instead of the hash-routed store path, which would always land
+    /// on one set (rustfs/backlog#1872).
+    pub fn all_set_disks(&self) -> Vec<Arc<crate::set_disk::SetDisks>> {
+        self.pools.iter().flat_map(|pool| pool.disk_set.iter().cloned()).collect()
+    }
+
     /// Get server configuration (delegates to global)
     pub fn get_server_config(&self) -> Option<Config> {
         runtime_sources::server_config()
@@ -601,7 +610,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         start_after: Option<String>,
         incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
-        self.handle_list_objects_v2(
+        self.inner_list_objects_v2(
             bucket,
             prefix,
             continuation_token,
@@ -624,7 +633,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        self.handle_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
     }
 
@@ -636,7 +645,7 @@ impl crate::storage_api_contracts::list::ListOperations for ECStore {
         result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
         opts: WalkOptions,
     ) -> Result<()> {
-        self.handle_walk(rx, bucket, prefix, result, opts).await
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
 

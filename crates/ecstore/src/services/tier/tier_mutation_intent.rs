@@ -305,6 +305,10 @@ impl TierMutationIntent {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "intent-record persistence asserted by store::init tests (backlog#1823)"
+)]
 pub(crate) fn tier_mutation_intent_record_object_name(mutation_id: Uuid) -> Result<String> {
     tier_mutation_intent_record_object_name_with_prefix(TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id)
 }
@@ -317,6 +321,10 @@ fn tier_mutation_intent_record_object_name_with_prefix(prefix: &str, mutation_id
     Ok(format!("{}/{}/{}/{}.json", prefix, &mutation_key[..2], &mutation_key[2..4], mutation_key))
 }
 
+#[allow(
+    dead_code,
+    reason = "intent-record persistence asserted by store::init tests (backlog#1823)"
+)]
 pub(crate) fn tier_mutation_intent_id_from_record_object_name(object: &str) -> Result<Uuid> {
     tier_mutation_intent_id_from_record_object_name_with_prefix(TIER_MUTATION_INTENT_RECORD_PREFIX, object)
 }
@@ -355,6 +363,10 @@ fn tier_mutation_intent_id_from_record_object_name_with_prefix(prefix: &str, obj
     Uuid::parse_str(mutation_key).map_err(|_| TierMutationIntentError::Corrupt("intent record path has invalid uuid"))
 }
 
+#[allow(
+    dead_code,
+    reason = "intent-record persistence asserted by store::init tests (backlog#1823)"
+)]
 pub(crate) async fn save_tier_mutation_intent_record<S>(api: Arc<S>, intent: &TierMutationIntent) -> EcstoreResult<()>
 where
     S: EcstoreObjectIO,
@@ -446,6 +458,10 @@ where
     Ok((intent, etag))
 }
 
+#[allow(
+    dead_code,
+    reason = "intent-record persistence asserted by store::init tests (backlog#1823)"
+)]
 pub(crate) async fn save_tier_mutation_intent_record_if_current<S>(
     api: Arc<S>,
     intent: &TierMutationIntent,

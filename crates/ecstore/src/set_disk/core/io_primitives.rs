@@ -32,15 +32,22 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID,
     GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
-    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
-    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
-    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
-    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
-    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK,
-    GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED,
+    GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, GET_METADATA_EARLY_STOP_REASON_ERROR,
+    GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, GET_METADATA_EARLY_STOP_REASON_NOT_FOUND,
+    GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND,
+    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
+    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
+    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
+    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
     GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
     GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
@@ -173,11 +180,13 @@ pub(in crate::set_disk) enum GetCodecStreamingReaderBuildOutcome {
     Fallback(GetCodecStreamingFallbackReason),
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) struct MultipartCodecStreamingReader {
     pub(in crate::set_disk) readers: VecDeque<Box<dyn AsyncRead + Unpin + Send + Sync>>,
 }
 
 impl MultipartCodecStreamingReader {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) fn new(readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>>) -> Self {
         Self {
             readers: VecDeque::from(readers),
@@ -652,36 +661,15 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.erasure.distribution == right.erasure.distribution
 }
 
-pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
+pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     bucket: &str,
     object: &str,
     candidate: &FileInfo,
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
-) -> bool {
-    if !candidate.inline_data()
-        || candidate.is_compressed()
-        || candidate
-            .metadata
-            .keys()
-            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
-        || candidate.is_remote()
-        || candidate.deleted
-        || candidate.size <= 0
-        || candidate.parts.len() != 1
-        || !candidate.has_valid_erasure_geometry()
-    {
-        return false;
-    }
-
-    let Ok(object_size) = usize::try_from(candidate.size) else {
-        return false;
-    };
-    if candidate.parts.first().is_none_or(|part| part.size != object_size) {
-        return false;
-    }
-    if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
-        return false;
+) -> Option<&'static str> {
+    if let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(candidate) {
+        return Some(reason);
     }
 
     let Ok(erasure) = coding::Erasure::try_new_with_options(
@@ -690,18 +678,21 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
         candidate.erasure.block_size,
         candidate.uses_legacy_checksum,
     ) else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
     };
-    let Some(data_files) =
-        collect_inline_data_shard_fileinfos_by_index(parts_metadata, candidate, erasure.data_shards, |index| {
+    let data_files =
+        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
             disks.get(index).is_some_and(Option::is_some)
-        })
-    else {
-        return false;
-    };
+        }) {
+            Ok(data_files) => data_files,
+            Err(reason) => return Some(reason),
+        };
 
     let Some(part) = candidate.parts.first() else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    };
+    let Ok(object_size) = usize::try_from(candidate.size) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     };
     let checksum_info = candidate.erasure.get_checksum_info(part.number);
     let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -721,12 +712,111 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_verified(
     let Ok(mut readers) =
         build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
     else {
-        return false;
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
 
-    try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size)
-        .await
-        .is_some_and(|body| body.len() == object_size)
+    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
+        Some(body) if body.len() == object_size => None,
+        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    }
+}
+
+fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Option<&'static str> {
+    // `inline_data` excludes remote objects; this diagnostic reports them separately.
+    if !rustfs_utils::http::contains_key_str(&candidate.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA) {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE);
+    }
+    if candidate.is_compressed()
+        || candidate
+            .metadata
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+    {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED);
+    }
+    if candidate.is_remote() {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE);
+    }
+    if candidate.deleted {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED);
+    }
+    if candidate.size <= 0 {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    }
+    if candidate.parts.len() != 1 {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    }
+    if !candidate.has_valid_erasure_geometry() {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+    }
+
+    let Ok(object_size) = usize::try_from(candidate.size) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    };
+    if candidate.parts.first().is_none_or(|part| part.size != object_size) {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    }
+    if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    }
+    None
+}
+
+fn data_read_inline_missing_shards_are_pending(
+    candidate: &FileInfo,
+    parts_metadata: &[FileInfo],
+    errors: &[Option<DiskError>],
+    disks: &[Option<DiskStore>],
+    fanout_order: &[usize],
+    scheduled_fanout_len: usize,
+) -> bool {
+    let Ok(erasure) = coding::Erasure::try_new_with_options(
+        candidate.erasure.data_blocks,
+        candidate.erasure.parity_blocks,
+        candidate.erasure.block_size,
+        candidate.uses_legacy_checksum,
+    ) else {
+        return false;
+    };
+    let distribution = &candidate.erasure.distribution;
+    let mut data_shards_seen_or_pending = vec![false; erasure.data_shards];
+    let mut missing_pending_data_shards = 0usize;
+
+    for (disk_index, file_info) in parts_metadata.iter().enumerate() {
+        let Some(&block_index) = distribution.get(disk_index) else {
+            return false;
+        };
+        if block_index == 0 || block_index > erasure.data_shards {
+            continue;
+        }
+        if !disks.get(disk_index).is_some_and(Option::is_some) {
+            return false;
+        }
+
+        let data_slot = block_index - 1;
+        if file_info.name.is_empty() {
+            let scheduled_and_not_failed = fanout_order
+                .get(..scheduled_fanout_len)
+                .is_some_and(|scheduled_disks| scheduled_disks.contains(&disk_index))
+                && errors.get(disk_index).is_some_and(Option::is_none);
+            if scheduled_and_not_failed {
+                data_shards_seen_or_pending[data_slot] = true;
+                missing_pending_data_shards = missing_pending_data_shards.saturating_add(1);
+                continue;
+            }
+            return false;
+        }
+        if file_info.erasure.index != block_index
+            || !file_info.has_valid_erasure_geometry()
+            || !metadata_early_stop_candidate_matches(file_info, candidate)
+            || file_info.data.as_ref().is_none_or(|data| data.is_empty())
+        {
+            return false;
+        }
+        data_shards_seen_or_pending[data_slot] = true;
+    }
+
+    missing_pending_data_shards > 0 && data_shards_seen_or_pending.into_iter().all(|seen_or_pending| seen_or_pending)
 }
 
 pub(in crate::set_disk) fn classify_metadata_response_error(err: &DiskError) -> &'static str {
@@ -1758,6 +1848,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
@@ -2048,6 +2139,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     setup
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -2364,6 +2456,7 @@ impl SetDisks {
         let bucket: Arc<str> = Arc::from(bucket);
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let task_opts = opts;
@@ -2371,10 +2464,14 @@ impl SetDisks {
             let bucket = bucket.clone();
             let object = object.clone();
             let version_id = version_id.clone();
+            let slowtail_fault = slowtail_fault.clone();
             tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
+                    if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
+                        tokio::time::sleep(delay).await;
+                    }
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                         .await
                 } else {
@@ -2469,6 +2566,8 @@ impl SetDisks {
         let mut next_fanout_index = 0usize;
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
+        let mut final_miss_reason_override = None;
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
                 let task_opts = opts;
@@ -2476,6 +2575,7 @@ impl SetDisks {
                 let bucket = bucket.clone();
                 let object = object.clone();
                 let version_id = version_id.clone();
+                let slowtail_fault = slowtail_fault.clone();
                 join_set.spawn(async move {
                     let response_start = Instant::now();
                     let result = if let Some(disk) = disk {
@@ -2484,6 +2584,9 @@ impl SetDisks {
                         Self::record_read_version_call(&object, index);
                         #[cfg(test)]
                         Self::read_version_fanout_barrier(&object, index).await;
+                        if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
+                            tokio::time::sleep(delay).await;
+                        }
                         disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                             .await
                     } else {
@@ -2511,11 +2614,20 @@ impl SetDisks {
         }
 
         while let Some(result) = join_set.join_next().await {
+            let mut defer_pending_inline_data_shard = false;
             match result {
                 Ok((index, res, elapsed)) => match res {
                     Ok(file_info) => {
                         observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
                         accumulator.observe_file_info(&file_info);
+                        if bounded_fanout
+                            && read_data
+                            && !force_full_wait
+                            && let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(&file_info)
+                        {
+                            force_full_wait = true;
+                            final_miss_reason_override.get_or_insert(reason);
+                        }
                         if let Some(slot) = ress.get_mut(index) {
                             *slot = file_info;
                         }
@@ -2541,17 +2653,43 @@ impl SetDisks {
                     .or_else(|| accumulator.version_early_stop_decision())
             {
                 let should_return_early = if read_data {
-                    let allow_data_read_early_stop = match accumulator.candidate.as_ref() {
-                        Some(candidate) => {
-                            data_read_early_stop_inline_body_verified(bucket.as_ref(), object.as_ref(), candidate, &ress, disks)
-                                .await
+                    match accumulator.candidate.as_ref() {
+                        Some(candidate) => match data_read_early_stop_inline_body_miss_reason(
+                            bucket.as_ref(),
+                            object.as_ref(),
+                            candidate,
+                            &ress,
+                            disks,
+                        )
+                        .await
+                        {
+                            None => true,
+                            Some(reason) => {
+                                final_miss_reason_override = Some(reason);
+                                if bounded_fanout
+                                    && reason == GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD
+                                    && data_read_inline_missing_shards_are_pending(
+                                        candidate,
+                                        &ress,
+                                        &errors,
+                                        disks,
+                                        &fanout_order,
+                                        next_fanout_index,
+                                    )
+                                {
+                                    defer_pending_inline_data_shard = true;
+                                } else {
+                                    force_full_wait = true;
+                                }
+                                false
+                            }
+                        },
+                        None => {
+                            force_full_wait = true;
+                            final_miss_reason_override = Some(GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM);
+                            false
                         }
-                        None => false,
-                    };
-                    if !allow_data_read_early_stop {
-                        force_full_wait = true;
                     }
-                    allow_data_read_early_stop
                 } else {
                     true
                 };
@@ -2588,6 +2726,7 @@ impl SetDisks {
             let pending_responses = join_set.len();
             let should_hedge_single_pending_data_read = read_data
                 && !force_full_wait
+                && !defer_pending_inline_data_shard
                 && pending_responses == 1
                 && accumulator.can_still_reach_early_stop_with_pending(pending_responses);
             if bounded_fanout && force_full_wait {
@@ -2600,6 +2739,7 @@ impl SetDisks {
                     next_fanout_index = next_fanout_index.saturating_add(1);
                 }
             } else if bounded_fanout
+                && !defer_pending_inline_data_shard
                 && next_fanout_index < disks.len()
                 && (!accumulator.can_still_reach_early_stop_with_pending(pending_responses)
                     || should_hedge_single_pending_data_read)
@@ -2613,7 +2753,12 @@ impl SetDisks {
             }
         }
 
-        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(metrics_path, accumulator.final_miss_reason());
+        let accumulator_miss_reason = accumulator.final_miss_reason();
+        let final_miss_reason = match (final_miss_reason_override, accumulator_miss_reason) {
+            (Some(reason), GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM) => reason,
+            _ => accumulator_miss_reason,
+        };
+        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(metrics_path, final_miss_reason);
         rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(metrics_path, 0);
         rustfs_io_metrics::record_get_object_metadata_fanout_lifecycle(metrics_path, scheduled_count, scheduled_count, 0);
         let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
@@ -2842,6 +2987,7 @@ impl SetDisks {
         (meta_file_infos, errs)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn read_multiple_files(
         disks: &[Option<DiskStore>],
         req: ReadMultipleReq,
@@ -2875,13 +3021,10 @@ impl SetDisks {
             });
         }
 
-        let (ress, errors) = match collect_read_multiple_results(futures, read_quorum).await {
+        let (ress, _errors) = match collect_read_multiple_results(futures, read_quorum).await {
             Ok(collected) => collected,
             Err(()) => return empty_quorum_result(),
         };
-
-        // debug!("ReadMultipleResp ress {:?}", ress);
-        // debug!("ReadMultipleResp errors {:?}", errors);
 
         let mut ret = Vec::with_capacity(req.files.len());
 
@@ -3021,6 +3164,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) committed_file_info: FileInfo,
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
     RenameConvergence,
@@ -3030,6 +3174,7 @@ type RenameDataLegacyTuple = (
 );
 
 impl RenameDataCommit {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn into_legacy_tuple(self) -> RenameDataLegacyTuple {
         (
             self.online_disks,
@@ -3148,6 +3293,7 @@ impl SetDisks {
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -4714,6 +4860,14 @@ impl SetDisks {
     /// is best-effort maintenance: individual delete failures are logged and
     /// skipped rather than propagated.
     pub(crate) async fn reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, false).await
+    }
+
+    pub(crate) async fn dry_run_reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, true).await
+    }
+
+    async fn reclaim_orphan_data_dirs_inner(&self, bucket: &str, object: &str, dry_run: bool) -> disk::error::Result<usize> {
         let disks = self.get_disks_internal().await;
 
         // Phase 1 (read-only): build the referenced-data-dir union and record the
@@ -4821,6 +4975,20 @@ impl SetDisks {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
+                if dry_run {
+                    removed += 1;
+                    debug!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = "heal_abandoned_parts",
+                        component = "ecstore",
+                        subsystem = "heal",
+                        state = "dry_run_matched",
+                        result = "matched",
+                        bucket, object, data_dir = %dir,
+                        "Heal abandoned parts dry-run matched orphaned data directory"
+                    );
+                    continue;
+                }
                 match disk
                     .delete(
                         bucket,
@@ -4960,6 +5128,7 @@ fn is_cleanup_not_found(e: &DiskError) -> bool {
 /// normalized to `DiskNotFound`: a panic is not a "disk absent" condition and
 /// must not be silently swallowed as an ignorable error (fixes the historical
 /// `Unexpected`/`DiskNotFound` misclassification).
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn map_cleanup_join_result(joined: std::result::Result<Option<DiskError>, tokio::task::JoinError>) -> Option<DiskError> {
     match joined {
         Ok(res) => res,
@@ -5184,6 +5353,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier_phase {
     /// The per-disk old-data-dir cleanup phase of the commit fan-out.
     pub const CLEANUP: &str = "cleanup";
     /// The per-disk `read_version` phase of metadata read fan-out.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub const READ_VERSION: &str = "read_version";
 }
 
@@ -5621,6 +5791,130 @@ mod tests {
         (dirs, disks)
     }
 
+    #[test]
+    fn metadata_slowtail_fault_delay_parses_and_filters_request() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some("bench-bucket")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            || {
+                assert_eq!(
+                    get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, true),
+                    Some(Duration::from_millis(25))
+                );
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 2, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("other-bucket", "objects/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "other/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, false).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_slowtail_fault_delay_disables_invalid_disk_list() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,nope")),
+            ],
+            || {
+                assert!(get_metadata_slowtail_fault_delay("bucket", "object", 1, true).is_none());
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_only_data_read_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-fault-bucket";
+        let object = "objects/metadata-slowtail-fault-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let read_without_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", false, false, false, true, 2);
+                tokio::time::timeout(Duration::from_millis(100), read_without_data)
+                    .await
+                    .expect("non-data metadata fanout must not be delayed by the data-read slowtail hook")
+                    .expect("metadata fanout without read_data should resolve");
+
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "data-read metadata fanout must wait for the injected slow read_version response"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected slowtail should eventually complete")
+                    .expect("data-read metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_early_stop_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-early-stop-bucket";
+        let object = "objects/metadata-slowtail-early-stop-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "early-stop metadata fanout must still wait for the injected slow response after fallback to full wait"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected early-stop slowtail should eventually complete")
+                    .expect("early-stop metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
     /// Demo / regression guard for the backlog#1325 per-disk call counters.
     ///
     /// The metadata fan-out issues each `read_version` inside its own
@@ -5753,8 +6047,19 @@ mod tests {
         payload: &[u8],
         uses_legacy_checksum: bool,
     ) -> Vec<FileInfo> {
+        inline_metadata_fanout_fileinfos_with_geometry(bucket, object, payload, uses_legacy_checksum, 2, 2).await
+    }
+
+    async fn inline_metadata_fanout_fileinfos_with_geometry(
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+        uses_legacy_checksum: bool,
+        data_shards: usize,
+        parity_shards: usize,
+    ) -> Vec<FileInfo> {
         let distribution_key = metadata_distribution_key(bucket, object);
-        let mut base = FileInfo::new(&distribution_key, 2, 2);
+        let mut base = FileInfo::new(&distribution_key, data_shards, parity_shards);
         base.volume = bucket.to_string();
         base.name = object.to_string();
         base.size = i64::try_from(payload.len()).expect("test payload should fit i64");
@@ -5813,6 +6118,21 @@ mod tests {
         mutate: impl FnOnce(&mut [FileInfo]),
     ) {
         let mut files = inline_metadata_fanout_fileinfos(bucket, object, payload).await;
+        mutate(&mut files);
+        install_inline_metadata_fanout_files(disks, bucket, object, files).await;
+    }
+
+    async fn install_inline_metadata_fanout_fileinfo_with_geometry(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+        data_shards: usize,
+        parity_shards: usize,
+        mutate: impl FnOnce(&mut [FileInfo]),
+    ) {
+        let mut files =
+            inline_metadata_fanout_fileinfos_with_geometry(bucket, object, payload, false, data_shards, parity_shards).await;
         mutate(&mut files);
         install_inline_metadata_fanout_files(disks, bucket, object, files).await;
     }
@@ -6037,6 +6357,118 @@ mod tests {
         drop(dirs);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_metadata_early_stop_waits_for_pending_inline_data_shard() {
+        const DISKS: usize = 6;
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        let bucket = "bounded-inline-data-get-pending-shard-bucket";
+        let object =
+            object_with_initial_data_shards(bucket, "bounded-inline-data-get-pending-shard-object", DATA_SHARDS, DATA_SHARDS);
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_inline_metadata_fanout_fileinfo_with_geometry(
+            &disks,
+            bucket,
+            &object,
+            b"verified inline payload",
+            DATA_SHARDS,
+            PARITY_SHARDS,
+            |_| {},
+        )
+        .await;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let fanout_order = bounded_metadata_fanout_order(bucket, &object, DISKS, PARITY_SHARDS);
+                let distribution_key = metadata_distribution_key(bucket, &object);
+                let distribution = FileInfo::new(&distribution_key, DATA_SHARDS, PARITY_SHARDS)
+                    .erasure
+                    .distribution;
+                let paused_data_disk = *fanout_order
+                    .iter()
+                    .take(DATA_SHARDS)
+                    .find(|disk_index| {
+                        distribution
+                            .get(**disk_index)
+                            .is_some_and(|block_index| (1..=DATA_SHARDS).contains(block_index))
+                    })
+                    .expect("initial fanout should include a data shard to pause");
+                let hedged_parity_disk = fanout_order[DATA_SHARDS];
+                let unscheduled_parity_disk = fanout_order[DATA_SHARDS + 1];
+
+                let barrier = rename_fanout_barrier::arm(&object, paused_data_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                let tracker = rename_fanout_barrier::observe_tasks(&object);
+                let calls = disk_call_counters::observe(&object);
+                let disks_for_read = disks.clone();
+                let object_for_read = object.clone();
+                let mut read = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed(
+                        &disks_for_read,
+                        bucket,
+                        bucket,
+                        &object_for_read,
+                        "",
+                        true,
+                        false,
+                        false,
+                        true,
+                        PARITY_SHARDS,
+                    )
+                    .await
+                });
+
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                    .await
+                    .expect("initial data shard should pause before returning");
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    while calls.for_disk(disk_call_counters::KIND_READ_VERSION, hedged_parity_disk) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("bounded fanout should hedge one parity disk while the data shard is pending");
+
+                assert!(
+                    tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await.is_err(),
+                    "inline data-read early-stop must wait for a scheduled missing data shard instead of forcing full wait"
+                );
+
+                barrier.release();
+                let (parts_metadata, errs, diagnostics) = read
+                    .await
+                    .expect("metadata read task should not panic")
+                    .expect("pending data shard should let the inline verifier finish");
+
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    5,
+                    "pending data-shard defer should not schedule the final parity disk"
+                );
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_READ_VERSION, unscheduled_parity_disk),
+                    0,
+                    "the remaining parity disk must stay unissued when pending data verification succeeds"
+                );
+                assert_eq!(
+                    tracker.running(),
+                    0,
+                    "early-stop should drain spawned read_version tasks before returning"
+                );
+                assert_eq!(diagnostics.total_responses(), 5);
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), 5);
+                assert!(errs.iter().all(Option::is_none));
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
     #[tokio::test]
     async fn data_read_early_stop_verifies_legacy_inline_checksum_payload() {
         let bucket = "legacy-inline-data-get-fanout-bucket";
@@ -6067,8 +6499,130 @@ mod tests {
             .clone();
 
         assert!(
-            data_read_early_stop_inline_body_verified(bucket, object, &candidate, &parts_metadata, &disks).await,
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &parts_metadata, &disks)
+                .await
+                .is_none(),
             "legacy inline metadata must use the legacy bitrot shard sizing and checksum algorithm"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_read_early_stop_reports_inline_miss_reasons() {
+        let bucket = "inline-data-get-miss-reason-bucket";
+        let object = "inline-data-get-miss-reason-object";
+        let payload = b"verified inline payload";
+        let (_dirs, disks) = call_counter_local_disks(bucket, 4).await;
+        let files = inline_metadata_fanout_fileinfos_with_mode(bucket, object, payload, false).await;
+        let distribution = files
+            .first()
+            .map(|file| file.erasure.distribution.clone())
+            .expect("fixture should include metadata");
+        let order = bounded_metadata_fanout_order(bucket, object, 4, 2);
+        let mut parts_metadata = vec![FileInfo::default(); 4];
+        for disk_index in order.into_iter().take(3) {
+            let block_index = distribution
+                .get(disk_index)
+                .copied()
+                .expect("fixture distribution should cover every disk");
+            parts_metadata[disk_index] = files
+                .get(block_index.checked_sub(1).expect("erasure block indexes are one-based"))
+                .expect("fixture should include every distributed shard")
+                .clone();
+        }
+        let candidate = parts_metadata
+            .iter()
+            .find(|file| file.name == object)
+            .expect("fixture should include observed metadata")
+            .clone();
+        let data_disk = distribution
+            .iter()
+            .position(|block_index| *block_index == 1)
+            .expect("fixture distribution should include first data shard");
+
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &parts_metadata, &disks).await,
+            None
+        );
+
+        let mut not_inline = candidate.clone();
+        rustfs_utils::http::remove_str(&mut not_inline.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA);
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &not_inline, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE)
+        );
+
+        let mut remote = candidate.clone();
+        remote.transition_status = TRANSITION_COMPLETE.to_string();
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &remote, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE)
+        );
+
+        let mut transformed = candidate.clone();
+        rustfs_utils::http::insert_str(&mut transformed.metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &transformed, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED)
+        );
+
+        let mut deleted = candidate.clone();
+        deleted.deleted = true;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &deleted, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED)
+        );
+
+        let mut zero_size = candidate.clone();
+        zero_size.size = 0;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &zero_size, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE)
+        );
+
+        let mut multipart = candidate.clone();
+        multipart.parts.push(multipart.parts[0].clone());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &multipart, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE)
+        );
+
+        let mut invalid_geometry = candidate.clone();
+        invalid_geometry.erasure.data_blocks = 0;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &invalid_geometry, &parts_metadata, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY)
+        );
+
+        let mut missing_shard = parts_metadata.clone();
+        missing_shard[data_disk] = FileInfo::default();
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &missing_shard, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD)
+        );
+
+        let mut missing_payload = parts_metadata.clone();
+        missing_payload[data_disk].data = None;
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &missing_payload, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD)
+        );
+
+        let mut identity_mismatch = parts_metadata.clone();
+        identity_mismatch[data_disk].version_id = Some(Uuid::new_v4());
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &identity_mismatch, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH)
+        );
+
+        let mut corrupt = parts_metadata.clone();
+        if let Some(data) = corrupt[data_disk].data.as_mut() {
+            let mut corrupt_data = data.to_vec();
+            corrupt_data[0] ^= 0x01;
+            *data = Bytes::from(corrupt_data);
+        }
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &corrupt, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
         );
     }
 
@@ -6161,7 +6715,7 @@ mod tests {
                 &[
                     ("path", GET_OBJECT_PATH_INTERNAL_META),
                     ("decision", "miss"),
-                    ("reason", GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM),
+                    ("reason", GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
                 ],
             ),
             1,
@@ -6173,7 +6727,7 @@ mod tests {
                 &[
                     ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
                     ("decision", "miss"),
-                    ("reason", GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM),
+                    ("reason", GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
                 ],
             ),
             0,
@@ -6708,7 +7262,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bounded_non_inline_data_get_hedges_then_waits_for_full_fanout() {
+    async fn bounded_non_inline_data_get_immediately_forces_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-hedge-bucket";
         let object = "bounded-data-get-hedge-object";
@@ -6739,7 +7293,7 @@ mod tests {
                     }
                 })
                 .await
-                .expect("bounded data-read fanout should hedge by starting the spare disk");
+                .expect("bounded non-inline data-read fanout should immediately schedule the spare disk");
 
                 let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
                 assert!(
@@ -6755,7 +7309,7 @@ mod tests {
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "bounded data-read fanout should issue the paused disk plus one spare hedge"
+                    "bounded non-inline data-read fanout should issue the paused disk plus the remaining spare"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
@@ -6768,7 +7322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_metadata_early_stop_defaults_keep_data_get_full_fanout() {
+    async fn bounded_metadata_early_stop_defaults_keep_non_inline_data_get_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-default-bucket";
         let object = "bounded-data-get-default-object";
@@ -6782,16 +7336,42 @@ mod tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
             ],
             async {
+                let barrier = rename_fanout_barrier::arm(object, 2, rename_fanout_barrier::PHASE_READ_VERSION);
                 let calls = disk_call_counters::observe(object);
-                let (parts_metadata, errs, diagnostics) =
-                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2)
+                let disks_for_read = disks.clone();
+                let mut read = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed(&disks_for_read, bucket, bucket, object, "", true, false, false, true, 2)
                         .await
-                        .expect("default data-read metadata should resolve");
+                });
+
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                    .await
+                    .expect("default bounded non-inline read should schedule the paused metadata task");
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    while calls.for_disk(disk_call_counters::KIND_READ_VERSION, 3) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect(
+                    "default bounded non-inline read should immediately force full fanout after the first non-inline response",
+                );
+
+                let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
+                assert!(
+                    pending.is_err(),
+                    "default non-inline data reads must not return before the paused metadata response"
+                );
+                barrier.release();
+                let (parts_metadata, errs, diagnostics) = read
+                    .await
+                    .expect("metadata read task should not panic")
+                    .expect("default data-read metadata should resolve");
 
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "default GET data-read metadata must keep full fanout for read-failure tolerance"
+                    "default non-inline GET data-read metadata must keep full fanout without waiting for a quorum miss first"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);

@@ -195,6 +195,13 @@ IFS= read -r -d '' expected_docker_automatic_guard <<'EOF' || true
 EOF
 expected_docker_automatic_guard=${expected_docker_automatic_guard%$'\n'}
 require_job_if "$docker_workflow" "build-check" "$expected_docker_automatic_guard"
+require_line "$docker_workflow" '      source_ref: ${{ steps.check.outputs.source_ref }}' "Docker source ref output"
+require_line "$docker_workflow" '            source_ref="$HEAD_SHA"' "automatic Docker source ref"
+require_line "$docker_workflow" '              source_ref="$tag_ref"' "manual Docker source ref"
+require_line "$docker_workflow" '          ref: ${{ needs.build-check.outputs.source_ref }}' "Docker release source checkout"
+require_line "$docker_workflow" '          SOURCE_REVISION="$(git rev-parse HEAD)"' "Docker source revision resolution"
+require_line "$docker_workflow" '          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"' "Docker revision label"
+require_absent "$docker_workflow" 'org.opencontainers.image.revision=${{ github.sha }}' "Docker revision must not use the workflow branch SHA"
 
 docker_manual_guard=$(awk '
   $0 == "              *-preview*)" { in_preview = 1 }

@@ -27,6 +27,7 @@ use super::storage_api::multipart_usecase::bucket::{
     replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
+use super::storage_api::multipart_usecase::compression::{is_disk_compressible, is_multipart_disk_compression_enabled};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
@@ -39,12 +40,12 @@ use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_n
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
-    get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, parse_copy_source_range,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
+    parse_copy_source_range, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
@@ -208,6 +209,28 @@ fn create_multipart_upload_metadata(
     }
 
     metadata
+}
+
+/// A multipart session advertises disk compression only when the staged-rollout
+/// switch (`RUSTFS_COMPRESSION_MULTIPART_ENABLED`) is on, the object key/headers
+/// qualify, AND the session is not an SSE-C ciphertext-passthrough replication
+/// session, which must preserve source bytes verbatim.
+///
+/// The rollout switch defaults to off so a rolling upgrade never creates new
+/// compressed multipart objects while pre-fix nodes (whose decompressor is not
+/// resumable) may still serve reads. Enable it once the fleet has converged on a
+/// fixed build; the default flips per the `multipart-compression-default-off-window`
+/// entry in docs/architecture/compat-cleanup-register.md.
+///
+/// Each part is compressed as an independent stream; the GET path decodes across part
+/// boundaries (see `ReadTransform::Compressed`), so the session may advertise
+/// object-level compression again.
+///
+/// Unlike single PUT there is no `MIN_DISK_COMPRESSIBLE_SIZE` floor here: the total
+/// object size is unknown at CreateMultipartUpload time, so tiny multipart objects pay
+/// the (harmless) framing overhead. This is a deliberate trade-off, not a bug.
+fn should_advertise_session_compression(multipart_enabled: bool, ciphertext_passthrough: bool, disk_compressible: bool) -> bool {
+    multipart_enabled && !ciphertext_passthrough && disk_compressible
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -754,7 +777,9 @@ impl DefaultMultipartUsecase {
 
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
 
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, replication_authorized);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
@@ -837,8 +862,17 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        // Multipart parts are independent physical streams. Advertising object-level
-        // compression here would make GET decode the completed object as one stream.
+        if should_advertise_session_compression(
+            is_multipart_disk_compression_enabled(),
+            ciphertext_passthrough,
+            is_disk_compressible(&req.headers, &key),
+        ) {
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_COMPRESSION,
+                compression_metadata_value(CompressionAlgorithm::default()),
+            );
+        }
 
         let mt2 = metadata.clone();
         let mut opts: ObjectOptions =
@@ -1630,6 +1664,31 @@ mod tests {
 
     fn make_usecase() -> DefaultMultipartUsecase {
         DefaultMultipartUsecase::without_context()
+    }
+
+    #[test]
+    fn session_compression_is_advertised_only_for_non_passthrough_compressible_uploads() {
+        // (multipart_enabled, ciphertext_passthrough, disk_compressible, expected)
+        let cases = [
+            (true, false, false, false),
+            (true, false, true, true),
+            (true, true, false, false),
+            (true, true, true, false),
+            // The staged-rollout switch keeps multipart compression dark by
+            // default regardless of the other gates.
+            (false, false, true, false),
+            (false, false, false, false),
+            (false, true, true, false),
+            (false, true, false, false),
+        ];
+
+        for (multipart_enabled, ciphertext_passthrough, disk_compressible, expected) in cases {
+            assert_eq!(
+                should_advertise_session_compression(multipart_enabled, ciphertext_passthrough, disk_compressible),
+                expected,
+                "multipart_enabled={multipart_enabled} ciphertext_passthrough={ciphertext_passthrough} disk_compressible={disk_compressible}"
+            );
+        }
     }
 
     #[test]

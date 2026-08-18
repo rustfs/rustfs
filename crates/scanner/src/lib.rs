@@ -53,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;
 pub mod error;
+pub mod prefix_usage;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
@@ -64,6 +65,7 @@ pub(crate) mod storage_api;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,

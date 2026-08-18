@@ -15,6 +15,7 @@
 use crate::disk::disk_store::{get_drive_walkdir_peek_timeout, get_drive_walkdir_stall_timeout};
 use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
+use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{
@@ -655,6 +656,7 @@ async fn list_path_raw_inner(
             errs.push(None);
         }
         let mut pending_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
+        let mut peek_outcomes: Vec<Option<PeekOutcome>> = std::iter::repeat_with(|| None).take(readers.len()).collect();
 
         loop {
             let mut current = MetaCacheEntry::default();
@@ -676,6 +678,21 @@ async fn list_path_raw_inner(
             let mut has_err = 0;
             let mut agree = 0;
 
+            // Start every missing head read in the same round so one stalled
+            // disk cannot multiply the wait budget by the erasure-set width.
+            // Outcomes are still consumed below in stable disk-index order.
+            let concurrent_peeks = readers.iter_mut().enumerate().filter_map(|(i, reader)| {
+                if errs[i].is_some() || pending_entries[i].is_some() {
+                    return None;
+                }
+
+                let cancel = &revjob_rx;
+                Some(async move { (i, peek_with_timeout(cancel, reader, peek_timeout).await) })
+            });
+            for (i, outcome) in join_all(concurrent_peeks).await {
+                peek_outcomes[i] = Some(outcome);
+            }
+
             for (i, r) in readers.iter_mut().enumerate() {
                 if errs[i].is_some() {
                     has_err += 1;
@@ -685,7 +702,10 @@ async fn list_path_raw_inner(
                 let entry = if let Some(entry) = pending_entries[i].take() {
                     entry
                 } else {
-                    match peek_with_timeout(&revjob_rx, r, peek_timeout).await {
+                    let Some(outcome) = peek_outcomes[i].take() else {
+                        return Err(DiskError::Unexpected);
+                    };
+                    match outcome {
                         PeekOutcome::Ready(res) => {
                             if let Some(entry) = res {
                                 // info!("read entry disk: {}, name: {}", i, entry.name);
@@ -1293,6 +1313,36 @@ mod tests {
         .expect_err("stalled reader should fail when read quorum cannot be met");
 
         assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_path_raw_bounds_multiple_stalled_readers_by_one_peek_deadline() {
+        let peek_timeout = Duration::from_millis(20);
+        let started = tokio::time::Instant::now();
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Stall,
+                    TestReaderBehavior::Stall,
+                    TestReaderBehavior::Stall,
+                    TestReaderBehavior::Stall,
+                ],
+                peek_timeout: Some(peek_timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("all stalled readers should fail the listing");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(
+            started.elapsed(),
+            peek_timeout,
+            "reader deadlines must overlap instead of accumulating once per disk"
+        );
     }
 
     #[tokio::test]

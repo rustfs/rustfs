@@ -82,8 +82,8 @@ impl Error {
     /// Whether a heal operation can be retried without changing its inputs.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
-            Error::TaskCancelled => false,
-            Error::TaskTimeout | Error::TransientSkip { .. } => true,
+            Error::TaskCancelled | Error::TaskTimeout => false,
+            Error::TransientSkip { .. } => true,
             Error::Storage(err) => {
                 err.is_quorum_error()
                     || matches!(
@@ -164,5 +164,10 @@ mod tests {
         assert!(Error::Disk(DiskError::DiskNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::DiskNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
+    }
+
+    #[test]
+    fn task_timeout_is_terminal() {
+        assert!(!Error::TaskTimeout.is_recoverable_heal());
     }
 }

@@ -22,7 +22,7 @@ use crate::bucket::replication::{
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
-use crate::io_support::rio::{HashReader, LimitReader};
+use crate::io_support::rio::{HardLimitReader, HashReader};
 use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
     range::HTTPRangeSpec,

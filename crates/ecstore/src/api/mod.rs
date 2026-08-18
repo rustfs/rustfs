@@ -135,7 +135,8 @@ pub mod bucket {
         pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
             BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
-            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, get, get_accelerate_config, get_bucket_policy,
+            acquire_bucket_metadata_transaction_lock_for_incarnation, capture_bucket_metadata_incarnation, delete,
+            delete_if_incarnation, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
@@ -184,17 +185,18 @@ pub mod bucket {
             mrf_backlog_observability_snapshot,
         };
         pub use crate::bucket::replication::{
-            BucketReplicationResyncStatus, BucketReplicationStats, BucketStats, DeleteReplicationConfigSnapshot,
-            DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, MrfOpKind, MrfReplicateEntry,
-            MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
-            REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION,
-            REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo,
-            ReplicationBatchAdmission, ReplicationConfig, ReplicationConfigStructureError, ReplicationConfigurationExt,
-            ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge,
-            ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission,
-            ReplicationScannerBridge, ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage,
-            ReplicationTargetValidationError, ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog,
-            TargetReplicationResyncStatus, VersionPurgeStatusType, commit_force_delete_intent, complete_force_delete_intent,
+            BucketReplicationResyncStatus, BucketReplicationStat, BucketReplicationStats, BucketStats,
+            DeleteReplicationConfigSnapshot, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, InQueueMetric,
+            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION,
+            REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE,
+            REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+            ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
+            ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
+            ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
+            ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
+            ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
+            ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
+            VersionPurgeStatusType, XferStats, commit_force_delete_intent, complete_force_delete_intent,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
             get_global_replication_stats, init_background_replication, invalid_replication_config_status_field,
             persist_force_delete_intent, read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta,
@@ -278,7 +280,9 @@ pub mod cluster {
 }
 
 pub mod compression {
-    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled};
+    pub use crate::io_support::compress::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub mod config {
@@ -369,14 +373,14 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
-        calc_shard_size, calc_shard_size_legacy,
+        BitrotReader, BitrotSelfTestError, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError,
+        ReedSolomonEncoder, bitrot_self_test, calc_shard_size, calc_shard_size_legacy,
     };
 }
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook, send_event};
 }
 
 pub mod global {
@@ -479,6 +483,7 @@ pub mod store_list {
 }
 
 pub mod storage {
+    pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,

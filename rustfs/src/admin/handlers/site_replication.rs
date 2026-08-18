@@ -35,7 +35,9 @@ use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetT
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use crate::admin::storage_api::config::{delete_admin_config, read_admin_config, save_admin_config};
+use crate::admin::storage_api::config::read_admin_config;
+#[cfg(test)]
+use crate::admin::storage_api::config::save_admin_config;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
@@ -112,13 +114,13 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
-#[cfg(test)]
-use crate::admin::site_replication_state::with_site_replication_state_object_lock;
-use crate::admin::site_replication_state::{
-    SITE_REPLICATION_STATE_PATH, site_replication_state_process_guard, with_site_replication_state_lock,
-};
+use crate::admin::site_replication_state::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock};
 const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
 const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
+// Serializes peer-join admission (staleness check -> IAM upsert -> state
+// commit) across every node of this site; see admit_peer_join. Never an
+// actual object — only a namespace-lock key, like the repair execution lock.
+const SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH: &str = "config/site-replication/join-admission.lock";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
 const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from cluster replication successfully.";
@@ -354,8 +356,11 @@ impl TryFrom<&PeerSite> for PeerConnection {
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
 // Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
-// The state mutex lives in crate::admin::site_replication_state and is
-// taken through site_replication_state_process_guard (P1-15).
+// "state" is the distributed state-object lock in
+// crate::admin::site_replication_state, entered through
+// update_site_replication_state (P1-15). There is no process-local state
+// mutex any more: it could not order two nodes of one site, and the call
+// sites that needed ordering carry a generation fence instead.
 static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
@@ -469,11 +474,10 @@ struct SiteReplicationState {
     #[serde(default)]
     sync_state_initialized: bool,
     /// Fencing token for peer-edit delivery, allocated inside the state
-    /// transaction (process mutex + distributed state-object lock). Two nodes
-    /// of THIS site that accept admin edits concurrently therefore get
-    /// strictly ordered generations even though the process mutex cannot
-    /// serialize them, and a delivery that stalls can be recognised as stale
-    /// by the receiving site.
+    /// transaction (the distributed state-object lock). Two nodes of THIS
+    /// site that accept admin edits concurrently therefore get strictly
+    /// ordered generations, and a delivery that stalls can be recognised as
+    /// stale by the receiving site.
     #[serde(default)]
     edit_generation: u64,
     /// Per-origin high-water mark of the peer edits already applied here,
@@ -1063,9 +1067,13 @@ fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicationState> {
     state.peers = normalize_peer_map_by_identity(state.peers);
     // A peer-edit high-water mark only fences a CURRENT peer. A site that
     // leaves drops below two peers, which clears its own state object and
-    // restarts its generation counter at zero — a mark left over from the
-    // previous membership would then reject every edit it sends after it
-    // rejoins. Dropping departed origins on load also keeps the map bounded.
+    // restarts its generation counter — a mark left over from the previous
+    // membership must not reject the edits it sends after it rejoins. This
+    // pruning covers departures THIS site observed; an origin removed
+    // unilaterally elsewhere stays in this peer map with its mark, and the
+    // wall-clock floor in `next_peer_edit_generation` is what lifts its
+    // restarted counter over that mark. Dropping departed origins on load
+    // also keeps the map bounded.
     state
         .applied_edit_generations
         .retain(|origin, _| state.peers.contains_key(origin));
@@ -1123,44 +1131,49 @@ async fn persist_site_replication_state_no_lock(store: Arc<ECStore>, mut state: 
     }
 }
 
-/// A second node's view of the same transaction: identical production code
-/// path minus the process mutex, which is per process and therefore cannot
-/// serialize anything across nodes. Used by the separate-nodes regression
-/// test so that removing the distributed lock breaks it.
-#[cfg(test)]
-async fn update_site_replication_state_as_separate_node<T, F>(update: F) -> S3Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
-{
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    let lock_store = store.clone();
-    with_site_replication_state_object_lock(lock_store, move || async move {
-        let mut state = load_site_replication_state_no_lock(store.clone()).await?;
-        let result = update(&mut state)?;
-        persist_site_replication_state_no_lock(store, state).await?;
-        Ok(result)
-    })
-    .await
+/// What a state transaction closure decided to do with the state it was
+/// handed. `Unchanged` skips the write entirely: the ack markers and the
+/// pending-clearing paths run on every retry and mostly find their pending id
+/// already gone, and the retry queue shares this object — rewriting it byte
+/// for byte only makes those misses contend with the writers that do have
+/// something to say.
+enum StateCommit<T> {
+    Changed(T),
+    Unchanged(T),
 }
 
 /// The site-replication state RMW transaction: load, mutate, persist — all
-/// under the process mutex plus the distributed state-object write lock
-/// (see crate::admin::site_replication_state). No peer network calls and no
-/// other config locks inside `update`.
+/// under the distributed state-object write lock (see
+/// crate::admin::site_replication_state). No peer network calls and no other
+/// config locks inside `update`; anything that has to talk to a peer belongs
+/// between two transactions, with the precondition re-checked inside the
+/// second one.
 async fn update_site_replication_state<T, F>(update: F) -> S3Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
 {
+    update_site_replication_state_when_changed(move |state| update(state).map(StateCommit::Changed)).await
+}
+
+/// [`update_site_replication_state`] for closures that may find nothing to
+/// do — see [`StateCommit`].
+async fn update_site_replication_state_when_changed<T, F>(update: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut SiteReplicationState) -> S3Result<StateCommit<T>> + Send + 'static,
+{
     with_site_replication_state_lock(move || async move {
         let store = current_object_store_handle()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
         let mut state = load_site_replication_state_no_lock(store.clone()).await?;
-        let result = update(&mut state)?;
-        persist_site_replication_state_no_lock(store, state).await?;
-        Ok(result)
+        match update(&mut state)? {
+            StateCommit::Changed(result) => {
+                persist_site_replication_state_no_lock(store, state).await?;
+                Ok(result)
+            }
+            StateCommit::Unchanged(result) => Ok(result),
+        }
     })
     .await
 }
@@ -1216,6 +1229,11 @@ where
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock repair state failed: {e}")))?
 }
 
+/// Test-only seeding of the state object. Every production write goes through
+/// [`update_site_replication_state`] — this helper is `cfg(test)` so a new
+/// call site cannot reintroduce the pre-P1-15 shape (load through one object
+/// lock, save through another, with the mutation in between unprotected).
+#[cfg(test)]
 async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1230,27 +1248,6 @@ async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<(
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("save state failed: {e}")))?;
     Ok(())
-}
-
-async fn clear_site_replication_state() -> S3Result<()> {
-    let Some(store) = current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-    };
-
-    match delete_admin_config(store, SITE_REPLICATION_STATE_PATH).await {
-        Ok(()) | Err(StorageError::ConfigNotFound) => Ok(()),
-        Err(err) => Err(S3Error::with_message(S3ErrorCode::InternalError, format!("clear state failed: {err}"))),
-    }
-}
-
-async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
-    let mut normalized = state.clone();
-    normalized.peers = normalize_peer_map_by_identity(normalized.peers);
-    if normalized.peers.len() <= 1 && normalized.pending_rotation.is_none() && normalized.pending_remove.is_none() {
-        clear_site_replication_state().await
-    } else {
-        save_site_replication_state(&normalized).await
-    }
 }
 
 fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsState) -> S3Result<reqwest::Client> {
@@ -1668,7 +1665,14 @@ fn stored_peer_tls_settings(stored_peer: Option<&PeerInfo>) -> (bool, String) {
 }
 
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
-    let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+    local_peer_at_endpoint(site_replication_local_endpoint(&req.uri, &req.headers), state)
+}
+
+/// The local peer record as the given state describes it. Split out of
+/// [`current_local_peer`] so a state transaction can rebuild it against the
+/// state it just loaded: the request the endpoint came from cannot cross into
+/// the transaction closure, but the endpoint itself can.
+fn local_peer_at_endpoint(endpoint: String, state: &SiteReplicationState) -> PeerInfo {
     let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
     let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
@@ -1695,30 +1699,7 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
 }
 
 fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
-    let endpoint = current_local_runtime_endpoint();
-    let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
-    let stored_peer = state.peers.get(&deployment_id);
-    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
-
-    PeerInfo {
-        endpoint: endpoint.clone(),
-        name: if state.name.is_empty() {
-            stored_peer
-                .map(|peer| peer.name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| infer_site_name(&endpoint))
-        } else {
-            state.name.clone()
-        },
-        deployment_id,
-        sync_state: stored_peer.map(|peer| peer.sync_state.clone()).unwrap_or(SyncStatus::Unknown),
-        default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
-        replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
-        object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
-        skip_tls_verify,
-        ca_cert_pem,
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-    }
+    local_peer_at_endpoint(current_local_runtime_endpoint(), state)
 }
 
 fn normalize_peer_map_by_identity(peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
@@ -2342,18 +2323,31 @@ fn append_bootstrap_bucket_items(
         },
     )?;
     if replicate_ilm_expiry {
-        append_bootstrap_bucket_item(
-            &mut plan.bucket_items,
-            bucket,
-            "lc-config",
-            bucket.expiry_lc_config.clone(),
-            bucket.expiry_lc_config_updated_at,
-            |item, value| {
-                item.expiry_lc_config = Some(value);
-                item.expiry_updated_at = item.updated_at;
-                Ok(())
-            },
-        )?;
+        if bucket.expiry_lc_config.is_some() {
+            append_bootstrap_bucket_item(
+                &mut plan.bucket_items,
+                bucket,
+                "lc-config",
+                bucket.expiry_lc_config.clone(),
+                bucket.expiry_lc_config_updated_at,
+                |item, value| {
+                    item.expiry_lc_config = Some(value);
+                    // `updated_at` here is the entry's expiry axis (see the
+                    // SRBucketInfo construction), not the wall clock.
+                    item.expiry_updated_at = item.updated_at;
+                    Ok(())
+                },
+            )?;
+        } else if bucket.expiry_lc_config_updated_at.is_some() {
+            // Expiry rules were removed at this axis (lifecycle_expiry_statement):
+            // an explicit timestamped delete item, so a peer that missed the
+            // live delete converges on bootstrap/repair instead of keeping
+            // stale expiry rules. The receiver's staleness guard protects a
+            // peer whose expiry state is newer.
+            let mut item = bootstrap_bucket_meta_item(bucket, "lc-config", bucket.expiry_lc_config_updated_at);
+            item.expiry_updated_at = item.updated_at;
+            plan.bucket_items.push(item);
+        }
     }
     append_bootstrap_bucket_item(
         &mut plan.bucket_items,
@@ -2533,6 +2527,51 @@ fn initialize_join_peer_sync_state(peers: &mut BTreeMap<String, PeerInfo>, defer
     if !defer_sync_state_enable {
         mark_unknown_peer_sync_enabled(peers);
     }
+}
+
+/// Whether an incoming peer join carries a snapshot this site has already
+/// moved past — an unstamped join against a configured site, or one whose
+/// `updated_at` is not newer. Applying it would roll the local view back to
+/// the older topology, so the join is answered as a no-op (MinIO-compatible
+/// behaviour, kept verbatim from the pre-transaction handler).
+fn join_request_is_superseded(state: &SiteReplicationState, incoming_updated_at: Option<OffsetDateTime>) -> bool {
+    let Some(current_updated_at) = state.updated_at else {
+        return false;
+    };
+    incoming_updated_at.is_none_or(|incoming_updated_at| incoming_updated_at <= current_updated_at)
+}
+
+/// Adopt an accepted peer join: the sending site's snapshot replaces the local
+/// topology wholesale.
+///
+/// The peer-edit high-water marks are deliberately KEPT. Wiping them here
+/// would reopen the exact window the fence closes: every join fan-out (adds
+/// AND service-account rotations deliver `SRPeerJoin` to existing peers)
+/// would discard live marks, letting a stalled older edit from a peer that
+/// never left roll a record back. The one case a kept mark misfences — a
+/// site removed while unreachable rejoining with a restarted generation
+/// counter — already misfences its ordinary edits identically (pre-existing
+/// since the fence landed) and needs an epoch in the fence to fix, not a
+/// blanket reset. Marks of origins that left AND were observed leaving are
+/// dropped on load by `parse_site_replication_state`.
+fn apply_peer_join(
+    state: &mut SiteReplicationState,
+    local_peer: &PeerInfo,
+    join_req: SRPeerJoinReq,
+    defer_sync_state_enable: bool,
+) {
+    state.service_account_access_key = join_req.svc_acct_access_key;
+    state.service_account_parent = join_req.svc_acct_parent;
+    state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
+    state.peers = normalize_join_peers_for_local(local_peer, join_req.peers);
+    initialize_join_peer_sync_state(&mut state.peers, defer_sync_state_enable);
+    state.sync_state_initialized = true;
+    state.name = state
+        .peers
+        .get(&local_peer.deployment_id)
+        .map(|peer| peer.name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| local_peer.name.clone());
 }
 
 fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_peer: PeerInfo) -> SiteReplicationState {
@@ -2736,7 +2775,8 @@ fn is_missing_service_account_error(err: &rustfs_iam::error::Error) -> bool {
 /// disables every control-plane push while `replicate info` still reports the site enabled.
 /// Both used to require deleting and recreating the account by hand.
 async fn reconcile_site_replicator_service_account() -> S3Result<()> {
-    let _state_guard = site_replication_state_process_guard().await;
+    // Read-only against the state: `load_site_replication_state` takes the
+    // object read lock on its own, and everything after it is IAM work.
     let state = load_site_replication_state().await?;
     if !state.enabled() || state.service_account_access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
         return Ok(());
@@ -2946,6 +2986,18 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
             return;
         };
 
+        if let Err(err) = migrate_collapsed_retry_queue_paths().await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "retry_queue_migration_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+            return;
+        }
+
         match load_site_replication_state().await {
             Ok(state) => {
                 if state.pending_endpoint_refresh.is_some() || state.pending_remove.is_some() || state.pending_rotation.is_some()
@@ -2977,6 +3029,9 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
+        // Failed peer deliveries recorded in the retry queue; runs behind the
+        // same lifecycle guard and pending_* gates as the reconcilers above.
+        drain_site_replication_retry_queue().await;
     })
 }
 
@@ -3908,29 +3963,30 @@ async fn persist_site_replication_repair_task(
 ) -> S3Result<()> {
     persist_site_replication_repair_operation(operation).await?;
 
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut latest = load_site_replication_state().await?;
     let family_status = operation
         .sites
         .get(&peer.deployment_id)
         .and_then(|site| site.families.get(family))
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair task status is missing".to_string()))?;
-    if family_status.failed > 0 {
-        upsert_site_replication_retry_event(
-            &mut latest.retry_queue,
-            peer,
-            path,
-            family_status
-                .errors
-                .first()
-                .map(String::as_str)
-                .unwrap_or("remote-operation-failed"),
-            None,
-        );
-    } else {
-        dequeue_site_replication_retry_events(&mut latest.retry_queue, peer, path);
-    }
-    persist_site_replication_state(&latest).await
+    let failure = (family_status.failed > 0).then(|| {
+        family_status
+            .errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "remote-operation-failed".to_string())
+    });
+    let peer = peer.clone();
+    let path = path.to_string();
+    update_site_replication_state(move |state| {
+        match failure.as_deref() {
+            Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
+            None => {
+                dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn admit_site_replication_repair_operation(
@@ -3986,14 +4042,10 @@ async fn execute_site_replication_repair(
 async fn execute_site_replication_repair_locked(
     request: SiteReplicationRepairExecutionRequest,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let state = {
-        let _state_guard = site_replication_state_process_guard().await;
-        let state = load_site_replication_state().await?;
-        if !state.enabled() || state.service_account_access_key.is_empty() {
-            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
-        }
-        state
-    };
+    let state = load_site_replication_state().await?;
+    if !state.enabled() || state.service_account_access_key.is_empty() {
+        return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+    }
     let info = build_sr_info(&state, &request.local_peer).await?;
     let plan = site_replication_bootstrap_plan(&info)?;
     let plan_token = site_replication_repair_plan_token(&state, &plan)?;
@@ -4110,7 +4162,11 @@ async fn execute_site_replication_repair_locked(
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
     let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
     let runtime = {
-        let _state_guard = site_replication_state_process_guard().await;
+        // The bucket-op lock is what orders this against add/remove. The
+        // state is only read here (through the runtime snapshot), and the
+        // bucket setup below writes bucket metadata, never the state object —
+        // holding the state transaction across it would put local metadata
+        // IO inside a distributed lock for nothing.
         let Some(runtime) = runtime_site_replication_targets().await? else {
             return Ok(());
         };
@@ -4192,12 +4248,22 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
     broadcast_site_replication_json(&path, &serde_json::json!({})).await
 }
 
-pub async fn site_replication_bucket_meta_hook(item: SRBucketMeta) -> S3Result<()> {
+pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
     if item.r#type == "lc-config" && !site_replication_state_replicates_ilm_expiry(&runtime.state) {
         return Ok(());
+    }
+    if item.r#type == "lc-config" {
+        // Only the expiry subset travels (MinIO peers install incoming rules
+        // verbatim, so transition rules must never leave this site). An empty
+        // subset becomes a delete, which the receiver merges with the empty
+        // set — local transition rules there survive.
+        item.expiry_lc_config = item
+            .expiry_lc_config
+            .and_then(|raw| lifecycle_expiry_subset_xml(raw.as_bytes()))
+            .map(|data| String::from_utf8_lossy(&data).into_owned());
     }
     broadcast_site_replication_json_with_runtime(
         &runtime,
@@ -4291,7 +4357,14 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
             entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
             entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
-            entry.expiry_lc_config = raw_config_to_base64(&metadata.lifecycle_config_xml);
+            // Expiry subset only: this entry feeds both the bootstrap/repair
+            // plan (peers must not receive transition rules) and cross-site
+            // consistency views (transition rules are site-local and would
+            // read as false mismatches). A deleted expiry state is a `None`
+            // value with the deletion's axis so repair can converge peers
+            // that missed the live delete.
+            let expiry_statement = lifecycle_expiry_statement(&metadata);
+            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
             entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
             entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
             entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
@@ -4300,7 +4373,11 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
             entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
             entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            entry.expiry_lc_config_updated_at = maybe_time(metadata.lifecycle_config_updated_at);
+            // The expiry axis, not the whole-config write time: local
+            // transition-only edits inflate the latter, and a repair item
+            // stamped with it could out-rank a newer real expiry edit on a
+            // third site.
+            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
             entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
             entry.replication_targets_online =
                 Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
@@ -5306,6 +5383,29 @@ fn internal_endpoint_refresh_already_committed(state: &SiteReplicationState, inc
             .is_some_and(|committed| peer_connection_settings_match(committed, incoming))
 }
 
+/// An admin add/edit's precondition, re-evaluated inside the transaction that
+/// is about to commit: the topology must still be the one the operation was
+/// planned against, and the endpoint refresh must still be the same one (or
+/// still absent). The planning snapshot is taken before peer probes and
+/// fan-outs, none of which may hold the state-object lock, so only the check
+/// inside the committing closure binds — the same check between network
+/// stages is advisory, fencing the common race off the side-effect path.
+/// `stage` names what was in flight for the operator; a rejected commit is
+/// safe to re-run.
+fn ensure_edit_precondition(
+    state: &SiteReplicationState,
+    expected_updated_at: Option<OffsetDateTime>,
+    expected_pending_id: Option<&String>,
+    stage: &str,
+) -> S3Result<()> {
+    if state.updated_at != expected_updated_at
+        || pending_endpoint_refresh(state).as_ref().map(|pending| &pending.id) != expected_pending_id
+    {
+        return Err(s3_error!(InvalidRequest, "site replication state changed during {stage}"));
+    }
+    Ok(())
+}
+
 fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: PendingEndpointRefresh) -> S3Result<()> {
     state
         .retry_queue
@@ -5888,11 +5988,54 @@ fn summarize_peer_error_detail(detail: &str) -> String {
     summary
 }
 
-/// Allocate the next peer-edit generation. Called inside the state
-/// transaction, so the counter is handed out under the distributed
-/// state-object lock and two nodes of this site can never take the same one.
+/// The wall clock in unix nanoseconds, clamped into u64. A pre-1970 (or
+/// post-2554) clock yields 0, which makes the hybrid allocation below
+/// degrade to the plain `previous + 1` counter — monotone, never panicking.
+fn edit_generation_wall_clock() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0)
+}
+
+/// Allocate the next peer-edit generation as a hybrid logical clock:
+/// `max(wall clock in unix nanoseconds, previous + 1)`. Called inside the
+/// state transaction, so the value is handed out under the distributed
+/// state-object lock and two nodes of this site can never take the same one
+/// (`previous + 1` keeps the sequence strictly increasing even when two
+/// allocations land in one clock tick, and keeps it monotone on a node
+/// whose clock stepped backwards mid-lifetime).
+///
+/// The wall-clock floor is what survives the counter's death. A site
+/// removed while unreachable — the receiver never dropped it from its peer
+/// map, so the load-time mark pruning in `parse_site_replication_state`
+/// never fired — that later rejoins recreates its state object with the
+/// counter back at zero. A plain counter would then hand out generations
+/// below the receiver's stale high-water mark and every delivery would be
+/// silently fenced until the counter caught up. Jumping to wall time clears
+/// that mark: every value the deleted lifetime handed out was capped by the
+/// wall clock at its own allocation (or by a prior lifetime's cap, applied
+/// inductively), so the recreated lifetime's first allocation exceeds them
+/// all — while a pre-removal delivery still in flight stays below the new
+/// floor and remains correctly fenced. Marks recorded by pre-hybrid
+/// receivers (small plain-counter values) sit far below any wall-clock
+/// value, so a restarted origin passes those too — the fix needs only the
+/// sender upgraded, nothing on the wire or in the receiver changed.
+///
+/// A wall clock that regresses across a delete/recreate (the recreating
+/// node's clock behind the clock that fed the previous lifetime) mints
+/// below the stale mark and the origin stays fenced — but only until real
+/// time passes the previous lifetime's last allocation, because every later
+/// allocation takes the wall-clock floor again (and never longer than
+/// [`PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS`]: a regression past the window
+/// leaves the mark implausibly distant and the origin runs unfenced
+/// immediately). Bounded by the skew,
+/// self-healing, and no rollback window beyond the plain counter's: a
+/// delivery applies only at or above the receiver's mark, so the one
+/// cross-lifetime interleaving that can apply stale content — a
+/// pre-removal delivery whose generation lands above everything the
+/// regressed new lifetime has minted — required the same straggler landing
+/// above the mark under the plain counter, where the recreated counter's
+/// low restart made it strictly easier to hit.
 fn next_peer_edit_generation(state: &mut SiteReplicationState) -> u64 {
-    state.edit_generation = state.edit_generation.saturating_add(1);
+    state.edit_generation = edit_generation_wall_clock().max(state.edit_generation.saturating_add(1));
     state.edit_generation
 }
 
@@ -5923,18 +6066,95 @@ fn peer_edit_fence(queries: &HashMap<String, String>) -> Option<(String, u64)> {
     Some((origin.clone(), generation))
 }
 
+/// How far below the recorded high-water mark a delivery may sit and still
+/// be fenced as stale. The distance a GENUINE superseded delivery can trail
+/// its origin's mark is small: retransmissions re-run the sender flow and
+/// mint a fresh generation (the retry queue keys on the bare path and never
+/// replays a fenced URL), so only an in-flight straggler of the losing
+/// fan-out race trails the mark, by delivery latency — minutes at the
+/// outside. A mark further above than this window cannot be explained by
+/// any genuine race, only by a forged fence (the shared service account
+/// lets any peer stamp any origin) or by a persisted clock excursion the
+/// origin has since left behind — and fencing on it would silently drop the
+/// origin's real edits, so the stale check ignores it instead.
+const PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// Whether an incoming fence may be honoured, as far as this site can vouch
+/// for it. The sender's identity is unverifiable (shared service account),
+/// so the check runs over what the receiving state knows: the claimed origin
+/// must be a site this state currently replicates with — the same membership
+/// rule the load-time mark pruning applies, so every mark recorded behind
+/// this check is one a reload would keep — and not this site itself, which
+/// never delivers edits to itself. The caller IGNORES an inadmissible fence
+/// rather than failing the request: the delivery applies exactly as an
+/// unstamped (pre-fence) delivery would, no high-water mark is read or
+/// written, and the worst a forged fence achieves is forfeiting an ordering
+/// guarantee its sender was never owed. The generation itself is NOT
+/// bounded here: a genuine origin whose hybrid clock persisted a wall-clock
+/// excursion allocates arbitrarily far in the future, and refusing to
+/// record its marks would strip the ordering fence from exactly the
+/// deliveries that still race — the staleness window on the read side is
+/// what defuses forged marks instead.
+fn peer_edit_fence_is_admissible(state: &SiteReplicationState, local_deployment_id: &str, fence: &(String, u64)) -> bool {
+    let (origin, generation) = fence;
+    if origin != local_deployment_id && state.peers.contains_key(origin) {
+        return true;
+    }
+    warn!(
+        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+        result = "fence_origin_not_a_remote_peer",
+        origin = %origin,
+        generation = *generation,
+        "ignoring inadmissible peer-edit fence"
+    );
+    false
+}
+
 /// True when a strictly newer edit from the same origin site already landed
-/// here. The process mutex on the sending node cannot order deliveries issued
-/// by two nodes of that site, so ordering is decided here, on the generation
-/// the sender allocated under the distributed lock. Equal generations are NOT
+/// here. No lock on the sending side can order deliveries issued by two
+/// nodes of that site, so ordering is decided here, on the generation the
+/// sender allocated under the distributed lock. Equal generations are NOT
 /// stale: one edit legitimately fans out several deliveries under a single
 /// generation (the ILM-expiry edit sends every peer's record), and a replay of
 /// an applied delivery re-applies the same edit idempotently.
+///
+/// A mark more than [`PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS`] above the
+/// delivery is implausible and does NOT fence: the shared service account
+/// means any peer can stamp any origin, so a forged `u64::MAX`-scale mark
+/// would otherwise silently swallow the origin's genuine edits for good.
+/// Bounding the fence by distance instead of by an absolute ceiling keeps
+/// ordering intact wherever the origin's clock actually operates — two
+/// racing deliveries trail each other by seconds whether the hybrid clock
+/// tracks wall time or persists a long-gone excursion far ahead of it —
+/// while a mark no genuine race can explain merely downgrades the origin to
+/// unfenced (pre-fence) delivery instead of dropping its edits. (One genuine
+/// shape does land out here: a plain-counter straggler arriving after its
+/// origin's first hybrid-clock edit. It gets the same downgrade — applied
+/// unfenced — once, at upgrade time; fencing it instead would silence the
+/// mirror case, a hybrid-clock origin downgraded back to the plain counter.)
 fn peer_edit_delivery_is_stale(state: &SiteReplicationState, origin: &str, generation: u64) -> bool {
-    state
-        .applied_edit_generations
-        .get(origin)
-        .is_some_and(|applied| *applied > generation)
+    let Some(applied) = state.applied_edit_generations.get(origin) else {
+        return false;
+    };
+    if *applied <= generation {
+        return false;
+    }
+    if *applied - generation > PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "fence_mark_beyond_staleness_window",
+            origin,
+            generation,
+            applied_mark = *applied,
+            "ignoring implausibly distant peer-edit high-water mark"
+        );
+        return false;
+    }
+    true
 }
 
 fn record_applied_peer_edit_generation(state: &mut SiteReplicationState, origin: &str, generation: u64) {
@@ -5946,8 +6166,94 @@ fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path:
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
 }
 
+const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
+const SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH: &str = "internal:retry-snapshot:bucket-metadata";
+
+fn collapsed_retry_queue_path(path: &str) -> Option<&'static str> {
+    let base_path = path.split_once('?').map(|(base, _)| base).unwrap_or(path);
+    match base_path {
+        "/rustfs/admin/v3/site-replication/peer/iam-item" | SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => {
+            Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
+        }
+        "/rustfs/admin/v3/site-replication/peer/bucket-meta" | SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => {
+            Some(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_collapsed_retry_queue_paths(queue: &mut Vec<SiteReplicationRetryEvent>) -> bool {
+    let mut changed = false;
+    let mut normalized: Vec<SiteReplicationRetryEvent> = Vec::with_capacity(queue.len());
+    for mut event in queue.drain(..) {
+        if let Some(path) = collapsed_retry_queue_path(&event.path)
+            && event.path != path
+        {
+            event.path = path.to_string();
+            changed = true;
+        }
+
+        let duplicate = normalized.iter().position(|existing| {
+            existing.path == event.path
+                && (existing.peer_deployment_id == event.peer_deployment_id || existing.peer_endpoint == event.peer_endpoint)
+        });
+        let Some(index) = duplicate else {
+            normalized.push(event);
+            continue;
+        };
+
+        changed = true;
+        let existing = &mut normalized[index];
+        let event_is_newer = match (event.updated_at, existing.updated_at) {
+            (Some(event), Some(existing)) => event >= existing,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if event_is_newer {
+            let retry_count = existing.retry_count.max(event.retry_count);
+            *existing = event;
+            existing.retry_count = retry_count;
+        } else {
+            existing.retry_count = existing.retry_count.max(event.retry_count);
+        }
+        existing.failed = existing.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
+    }
+    *queue = normalized;
+    changed
+}
+
+async fn migrate_collapsed_retry_queue_paths() -> S3Result<()> {
+    update_site_replication_state_when_changed(|state| {
+        Ok(if normalize_collapsed_retry_queue_paths(&mut state.retry_queue) {
+            StateCommit::Changed(())
+        } else {
+            StateCommit::Unchanged(())
+        })
+    })
+    .await
+}
+
+#[cfg(test)]
 fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
     settle_site_replication_retry_events(queue, peer, path, None)
+}
+
+/// Repair-path settlement: also clears snapshot-escalated entries. Running a
+/// repair is the operator's explicit accountability transfer for the
+/// possibly-unreplayed deletion the marker records; ordinary delivery
+/// successes must not clear it (see [`settle_site_replication_retry_events`]).
+fn dequeue_site_replication_retry_events_including_escalated(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+) -> usize {
+    let before = queue.len();
+    let collapsed_path = collapsed_retry_queue_path(path);
+    queue.retain(|event| {
+        !retry_event_matches(event, peer, path)
+            && !collapsed_path.is_some_and(|collapsed_path| retry_event_matches(event, peer, collapsed_path))
+    });
+    before.saturating_sub(queue.len())
 }
 
 /// Remove the retry events for (peer, path) that `generation` is entitled to
@@ -5965,8 +6271,22 @@ fn settle_site_replication_retry_events(
     generation: Option<u64>,
 ) -> usize {
     let before = queue.len();
+    let collapsed_path = collapsed_retry_queue_path(path);
     queue.retain(|event| {
         if !retry_event_matches(event, peer, path) {
+            return true;
+        }
+        // A wire-path success identifies no IAM or bucket-metadata entity.
+        // This also protects legacy rows until the startup migration moves
+        // them under their internal snapshot path.
+        if collapsed_path.is_some() {
+            return true;
+        }
+        // A snapshot-escalated entry records a possibly-unreplayed deletion.
+        // Collapsed paths are shared by every entity, so a later successful
+        // delivery of a DIFFERENT item proves nothing about the deleted one —
+        // only a repair settles it (dequeue_..._including_escalated).
+        if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
             return true;
         }
         match (generation, event.edit_generation) {
@@ -5984,6 +6304,7 @@ fn upsert_site_replication_retry_event(
     error: &str,
     generation: Option<u64>,
 ) {
+    let path = collapsed_retry_queue_path(path).unwrap_or(path);
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
@@ -6046,7 +6367,12 @@ async fn enqueue_site_replication_retry_event_for_generation(
     let path_owned = path.to_string();
     let error_text = error.to_string();
     let result = update_site_replication_state(move |state| {
-        upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        // A peer that left the state can never drain its entries again
+        // (remove_sites already pruned them); recording a late failure for it
+        // would only pollute retry_stats until the queue cap evicts it.
+        if state.peers.contains_key(&peer_owned.deployment_id) {
+            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+        }
         Ok(())
     })
     .await;
@@ -6078,6 +6404,595 @@ fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool 
         retry_bucket_operation(&event.path).as_deref(),
         Some(SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION)
     )
+}
+
+/// Exponential backoff base for the background retry drain, aligned with the
+/// reconcile cadence (`site_replication_reconcile::RECONCILE_INTERVAL`).
+const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
+/// Backoff ceiling: a permanently failed peer is still probed daily.
+const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
+
+/// What the background drain may do for one retry event. Everything not
+/// representable here is operator territory (manual repair).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryDrainAction {
+    /// Constant-path IAM item deliveries collapse into one queue entry per
+    /// peer and their bodies are not persisted; the only faithful replay is
+    /// the current IAM snapshot from the bootstrap plan.
+    IamSnapshot,
+    /// Same collapse for bucket-meta deliveries: replay the bucket metadata
+    /// snapshot from the bootstrap plan.
+    BucketMetadataSnapshot,
+    /// A self-contained bucket op the bootstrap plan can re-derive for its
+    /// bucket (`make-with-versioning` / `configure-replication`).
+    BucketOpReplay { operation: String, bucket: String },
+    /// Re-send the current peer records under a fresh edit generation.
+    PeerEdit,
+}
+
+#[derive(Clone)]
+enum RetrySnapshot {
+    Iam(Vec<SRIAMItem>),
+    BucketMetadata(Vec<SRBucketMeta>),
+}
+
+impl RetrySnapshot {
+    fn from_plan(action: &RetryDrainAction, plan: &SiteReplicationBootstrapPlan) -> Option<Self> {
+        match action {
+            RetryDrainAction::IamSnapshot => Some(Self::Iam(plan.iam_items.clone())),
+            RetryDrainAction::BucketMetadataSnapshot => Some(Self::BucketMetadata(plan.bucket_items.clone())),
+            _ => None,
+        }
+    }
+
+    fn fingerprint(&self) -> S3Result<Vec<Vec<u8>>> {
+        let mut payloads = match self {
+            Self::Iam(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+            Self::BucketMetadata(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+        }
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry snapshot failed: {err}")))?;
+        payloads.sort_unstable();
+        Ok(payloads)
+    }
+
+    fn replay_after_change(previous: &Self, fresh: &Self, observed_at: OffsetDateTime) -> Self {
+        match (previous, fresh) {
+            (Self::Iam(previous), Self::Iam(fresh)) => {
+                let fresh_keys: HashSet<IamSnapshotKey> = fresh.iter().filter_map(iam_snapshot_key).collect();
+                let mut replay = fresh.clone();
+                for item in previous {
+                    if iam_snapshot_key(item).is_some_and(|key| !fresh_keys.contains(&key)) {
+                        replay.extend(iam_snapshot_tombstones(item, observed_at));
+                    }
+                }
+                Self::Iam(replay)
+            }
+            (Self::BucketMetadata(previous), Self::BucketMetadata(fresh)) => {
+                let fresh_keys: HashSet<(&str, &str)> = fresh
+                    .iter()
+                    .map(|item| (item.bucket.as_str(), item.r#type.as_str()))
+                    .collect();
+                let mut replay = fresh.clone();
+                for item in previous {
+                    if !fresh_keys.contains(&(item.bucket.as_str(), item.r#type.as_str())) {
+                        replay.push(bucket_metadata_snapshot_tombstone(item, observed_at));
+                    }
+                }
+                Self::BucketMetadata(replay)
+            }
+            _ => fresh.clone(),
+        }
+    }
+
+    async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<()> {
+        match self {
+            Self::Iam(items) => {
+                for item in items {
+                    SiteReplicationRepairTask::Iam(item)
+                        .send(transport, access_key, secret_key)
+                        .await?;
+                }
+            }
+            Self::BucketMetadata(items) => {
+                for item in items {
+                    SiteReplicationRepairTask::BucketMetadata(item)
+                        .send(transport, access_key, secret_key)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum IamSnapshotKey {
+    Policy(String),
+    User(String),
+    Group(String),
+    PolicyMapping { target: String, user_type: i64, is_group: bool },
+}
+
+fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
+    match item.r#type.as_str() {
+        "policy" => Some(IamSnapshotKey::Policy(item.name.clone())),
+        "iam-user" => item
+            .iam_user
+            .as_ref()
+            .map(|user| IamSnapshotKey::User(user.access_key.clone())),
+        "group-info" => item
+            .group_info
+            .as_ref()
+            .map(|group| IamSnapshotKey::Group(group.update_req.group.clone())),
+        "policy-mapping" => item.policy_mapping.as_ref().map(|mapping| IamSnapshotKey::PolicyMapping {
+            target: mapping.user_or_group.clone(),
+            user_type: mapping.user_type,
+            is_group: mapping.is_group,
+        }),
+        _ => None,
+    }
+}
+
+fn iam_snapshot_tombstones(item: &SRIAMItem, observed_at: OffsetDateTime) -> Vec<SRIAMItem> {
+    let mut tombstone = item.clone();
+    tombstone.updated_at = Some(observed_at);
+    match item.r#type.as_str() {
+        "policy" => tombstone.policy = None,
+        "iam-user" => {
+            if let Some(user) = tombstone.iam_user.as_mut() {
+                user.is_delete_req = true;
+                user.user_req = None;
+            }
+        }
+        "group-info" => {
+            let Some(group) = tombstone.group_info.as_mut() else {
+                return Vec::new();
+            };
+            group.update_req.is_remove = true;
+            if group.update_req.members.is_empty() {
+                return vec![tombstone];
+            }
+            let mut delete = tombstone.clone();
+            if let Some(group) = delete.group_info.as_mut() {
+                group.update_req.members.clear();
+            }
+            return vec![tombstone, delete];
+        }
+        "policy-mapping" => {
+            if let Some(mapping) = tombstone.policy_mapping.as_mut() {
+                mapping.policy.clear();
+            }
+        }
+        _ => return Vec::new(),
+    }
+    vec![tombstone]
+}
+
+fn bucket_metadata_snapshot_tombstone(item: &SRBucketMeta, observed_at: OffsetDateTime) -> SRBucketMeta {
+    SRBucketMeta {
+        r#type: item.r#type.clone(),
+        bucket: item.bucket.clone(),
+        updated_at: Some(observed_at),
+        expiry_updated_at: Some(observed_at),
+        api_version: item.api_version.clone(),
+        ..Default::default()
+    }
+}
+
+const SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS: usize = 3;
+
+fn classify_site_replication_retry_event(event: &SiteReplicationRetryEvent) -> Option<RetryDrainAction> {
+    let snapshot_action = match event.path.as_str() {
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH => Some(RetryDrainAction::IamSnapshot),
+        SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH => Some(RetryDrainAction::BucketMetadataSnapshot),
+        _ => None,
+    };
+    if snapshot_action.is_some() && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        return snapshot_action;
+    }
+    if event.path.starts_with("internal:") {
+        // Marker records store payloads in `last_error` (legacy
+        // pending-endpoint-refresh backup and snapshot liabilities); they are
+        // not drainable delivery failures.
+        return None;
+    }
+    if event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        // Already snapshot-replayed once for this failure episode; a possible
+        // deletion cannot be replayed from a snapshot, so re-sending daily
+        // proves nothing. A new hook failure overwrites the marker.
+        return None;
+    }
+    let base_path = event.path.split_once('?').map(|(base, _)| base).unwrap_or(&event.path);
+    match base_path {
+        "/rustfs/admin/v3/site-replication/peer/iam-item" => Some(RetryDrainAction::IamSnapshot),
+        "/rustfs/admin/v3/site-replication/peer/bucket-meta" => Some(RetryDrainAction::BucketMetadataSnapshot),
+        SITE_REPLICATION_PEER_EDIT_PATH => Some(RetryDrainAction::PeerEdit),
+        SITE_REPLICATION_PEER_BUCKET_OPS_PATH => {
+            let operation = retry_bucket_operation(&event.path)?;
+            if !matches!(
+                operation.as_str(),
+                SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION
+            ) {
+                // Destructive ops (delete-bucket / force-delete-bucket) are
+                // operator territory: replaying them against a peer whose
+                // bucket was since recreated is irreversible.
+                return None;
+            }
+            let bucket = retry_bucket_name(&event.path)?;
+            Some(RetryDrainAction::BucketOpReplay { operation, bucket })
+        }
+        _ => None,
+    }
+}
+
+fn retry_bucket_name(path: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    form_urlencoded::parse(query.as_bytes())
+        .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
+}
+
+/// A collapsed retry event after a stable snapshot resend is escalated with
+/// this marker instead of being cleared: the snapshot contains no task for a
+/// failed deletion, so remote absence remains operator-visible. Collapsed
+/// failures use an internal queue path so ordinary successes and older nodes
+/// cannot settle an unrelated entity's liability.
+const SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER: &str = "snapshot replayed; a failed deletion cannot be replayed from a snapshot — run site replication repair or re-deliver to settle";
+
+/// Escalate a collapsed retry event after its snapshot resend succeeded,
+/// unless a newer failure was recorded after `snapshot_updated_at` (that
+/// failure belongs to a newer local commit the snapshot did not contain and
+/// must keep the entry drain-eligible).
+fn escalate_site_replication_retry_events_up_to(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    snapshot_updated_at: Option<OffsetDateTime>,
+) -> usize {
+    let Some(marker_path) = collapsed_retry_queue_path(path) else {
+        return 0;
+    };
+
+    if path != marker_path {
+        queue.retain(|event| {
+            if !retry_event_matches(event, peer, path) {
+                return true;
+            }
+            matches!((event.updated_at, snapshot_updated_at), (Some(current), Some(seen)) if current > seen)
+                || matches!((event.updated_at, snapshot_updated_at), (Some(_), None))
+        });
+    }
+
+    let marker_index = queue.iter().position(|event| retry_event_matches(event, peer, marker_path));
+    let marker_index = marker_index.unwrap_or_else(|| {
+        queue.push(SiteReplicationRetryEvent {
+            id: Uuid::new_v4().to_string(),
+            peer_deployment_id: peer.deployment_id.clone(),
+            peer_endpoint: peer.endpoint.clone(),
+            path: marker_path.to_string(),
+            updated_at: snapshot_updated_at,
+            ..Default::default()
+        });
+        queue.len() - 1
+    });
+    let event = &mut queue[marker_index];
+    let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
+        (Some(current), Some(seen)) => current > seen,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if newer_failure_recorded && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        return 0;
+    }
+    event.failed = true;
+    event.retry_count = event.retry_count.max(SITE_REPLICATION_RETRY_FAILED_AFTER);
+    event.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
+    event.updated_at = Some(OffsetDateTime::now_utc());
+    1
+}
+
+async fn escalate_site_replication_retry_event_up_to(peer: &PeerInfo, path: &str, snapshot_updated_at: Option<OffsetDateTime>) {
+    let peer_owned = peer.clone();
+    let path_owned = path.to_string();
+    let result = update_site_replication_state(move |state| {
+        escalate_site_replication_retry_events_up_to(&mut state.retry_queue, &peer_owned, &path_owned, snapshot_updated_at);
+        Ok(())
+    })
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = %peer.endpoint,
+            deployment_id = %peer.deployment_id,
+            path,
+            error = ?err,
+            "failed to escalate site replication retry event"
+        );
+    }
+}
+
+/// Whether the drain may attempt this event now.
+fn site_replication_retry_backoff_elapsed(event: &SiteReplicationRetryEvent, now: OffsetDateTime) -> bool {
+    let Some(updated_at) = event.updated_at else {
+        return true;
+    };
+    // 600 * 2^8 already exceeds the daily ceiling; capping the shift keeps
+    // the arithmetic overflow-free for any persisted retry_count.
+    let exponent = event.retry_count.saturating_sub(1).min(8);
+    let delay = (SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS << exponent).min(SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS);
+    now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= delay
+}
+
+/// The subset of the retry queue the background drain is allowed to touch.
+fn actionable_site_replication_retry_events(state: &SiteReplicationState, now: OffsetDateTime) -> Vec<SiteReplicationRetryEvent> {
+    state
+        .retry_queue
+        .iter()
+        .filter(|event| classify_site_replication_retry_event(event).is_some())
+        .filter(|event| state.peers.contains_key(&event.peer_deployment_id))
+        .filter(|event| site_replication_retry_backoff_elapsed(event, now))
+        .cloned()
+        .collect()
+}
+
+/// Background consumer for the retry queue, run from the reconcile tick.
+///
+/// Scope: this settles "delivered once and failed" entries whose replay is
+/// faithful (bucket ops, peer edits). Collapsed iam-item / bucket-meta
+/// entries are snapshot-resent and then *escalated*, not cleared — a failed
+/// deletion leaves no task in the snapshot, so remote absence stays unproven
+/// until a later delivery or a manual repair. A hook that never fired (crash
+/// between the local commit and the send) leaves no entry at all, so the
+/// drain is not a full cross-site diff-heal; manual repair remains the
+/// authoritative catch-all.
+async fn drain_site_replication_retry_queue() {
+    if let Err(err) = drain_site_replication_retry_queue_inner().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+    }
+}
+
+async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    let actionable = actionable_site_replication_retry_events(&runtime.state, OffsetDateTime::now_utc());
+    if actionable.is_empty() {
+        return Ok(());
+    }
+    let Some(store) = current_object_store_handle() else {
+        return Ok(());
+    };
+    if runtime.state.pending_endpoint_refresh.is_some()
+        || runtime.state.pending_remove.is_some()
+        || runtime.state.pending_rotation.is_some()
+    {
+        // The tick-level gate ran before the reconcilers; a multi-step flow
+        // (endpoint refresh commits its pending marker without the lifecycle
+        // guard) may have started since. Re-check on the fresh state.
+        return Ok(());
+    }
+    // Serialize against operator repair execution. This does NOT close the
+    // dry-run -> execute window (dry-run takes no lock): a drain settling a
+    // replayable bucket-op entry in that window changes the preflight token
+    // and execute fails safe with "preflight is stale" — the operator
+    // re-runs the dry-run. Lock order matches repair: lifecycle guard (held
+    // by the reconcile tick) -> repair execution lock -> state object lock
+    // inside the send bookkeeping. An operator repair holding the lock makes
+    // this tick skip after the lock-acquire timeout.
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        drain_site_replication_retry_queue_locked(runtime, actionable).await
+    })
+    .await
+    .map_err(ApiError::from)?
+}
+
+async fn drain_site_replication_retry_queue_locked(
+    runtime: SiteReplicationRuntime,
+    events: Vec<SiteReplicationRetryEvent>,
+) -> S3Result<()> {
+    let needs_plan = events
+        .iter()
+        .any(|event| !matches!(classify_site_replication_retry_event(event), Some(RetryDrainAction::PeerEdit)));
+    // The plan is a full local snapshot (buckets + IAM); build it once per
+    // tick and only when a snapshot resend is actually due.
+    let plan = if needs_plan {
+        let info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
+        Some(site_replication_bootstrap_plan(&info)?)
+    } else {
+        None
+    };
+
+    let mut events_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
+    for event in events {
+        events_by_peer
+            .entry(event.peer_deployment_id.clone())
+            .or_default()
+            .push(event);
+    }
+
+    let mut settled = 0usize;
+    let mut failures = 0usize;
+    for (deployment_id, peer_events) in events_by_peer {
+        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
+            continue;
+        };
+        if deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            continue;
+        }
+        let transport = match PeerTransport::for_runtime_peer(peer).await {
+            Ok(transport) => transport,
+            Err(err) => {
+                // Record the attempt so backoff advances for an unreachable
+                // peer instead of re-dialing it every tick.
+                for event in &peer_events {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                }
+                failures += peer_events.len();
+                continue;
+            }
+        };
+        for event in peer_events {
+            let Some(action) = classify_site_replication_retry_event(&event) else {
+                continue;
+            };
+            match drain_one_site_replication_retry_event(&runtime, peer, &transport, &event, action, plan.as_ref()).await {
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(_) => failures += 1,
+            }
+        }
+    }
+
+    if settled > 0 || failures > 0 {
+        info!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_settled",
+            settled,
+            failures,
+            "admin site replication state"
+        );
+    }
+    Ok(())
+}
+
+/// Replay one retry event against its peer. Returns `Ok(true)` when the
+/// event was settled (delivered, or provably stale), `Ok(false)` when it was
+/// skipped, and `Err` after a failed delivery (already re-queued with an
+/// incremented retry count).
+async fn drain_one_site_replication_retry_event(
+    runtime: &SiteReplicationRuntime,
+    peer: &PeerInfo,
+    transport: &PeerTransport,
+    event: &SiteReplicationRetryEvent,
+    action: RetryDrainAction,
+    plan: Option<&SiteReplicationBootstrapPlan>,
+) -> S3Result<bool> {
+    let access_key = &runtime.state.service_account_access_key;
+    let secret_key = &runtime.service_account_secret_key;
+    match action.clone() {
+        RetryDrainAction::IamSnapshot | RetryDrainAction::BucketMetadataSnapshot => {
+            let Some(plan) = plan else {
+                return Ok(false);
+            };
+            let mut current_snapshot = RetrySnapshot::from_plan(&action, plan).expect("snapshot action has a snapshot");
+            let mut replay = current_snapshot.clone();
+            for _ in 0..SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS {
+                let current_fingerprint = current_snapshot.fingerprint()?;
+                if let Err(err) = replay.send(transport, access_key, secret_key).await {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                    return Err(err);
+                }
+                let fresh_info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
+                let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
+                let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
+                if fresh_snapshot.fingerprint()? == current_fingerprint {
+                    escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
+                    return Ok(true);
+                }
+                replay = RetrySnapshot::replay_after_change(&current_snapshot, &fresh_snapshot, OffsetDateTime::now_utc());
+                current_snapshot = fresh_snapshot;
+            }
+            Ok(false)
+        }
+        RetryDrainAction::BucketOpReplay { operation, bucket } => {
+            let Some(plan) = plan else {
+                return Ok(false);
+            };
+            // Replay from the CURRENT plan, never the recorded path: the
+            // recorded query can carry an expired one-shot bootstrap token or
+            // a stale createdAt.
+            let make_op = operation == SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING;
+            let paths = if make_op {
+                &plan.bucket_make_ops
+            } else {
+                &plan.bucket_configure_ops
+            };
+            let tasks: Vec<SiteReplicationRepairTask<'_>> = paths
+                .iter()
+                .filter(|path| retry_bucket_name(path).as_deref() == Some(bucket.as_str()))
+                .map(|path| {
+                    if make_op {
+                        SiteReplicationRepairTask::BucketMake(path)
+                    } else {
+                        SiteReplicationRepairTask::Replication(path)
+                    }
+                })
+                .collect();
+            if tasks.is_empty() {
+                // The bucket left the plan (deleted, or replication no longer
+                // configured): the recorded intent is stale, settle it.
+                dequeue_site_replication_retry_event(peer, &event.path).await;
+                return Ok(true);
+            }
+            for task in &tasks {
+                if let Err(err) = task.send(transport, access_key, secret_key).await {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                    return Err(err);
+                }
+            }
+            dequeue_site_replication_retry_event(peer, &event.path).await;
+            Ok(true)
+        }
+        RetryDrainAction::PeerEdit => {
+            // The recorded generation is stale by definition — the receiver
+            // fences it. Allocate a fresh generation and re-send the current
+            // peer records (a superset of the failed body; the receiver
+            // upserts), all inside one state transaction so the fence and the
+            // bodies agree.
+            let target_id = peer.deployment_id.clone();
+            let (generation, bodies) = update_site_replication_state(move |state| {
+                if !state.peers.contains_key(&target_id) {
+                    return Ok((None, Vec::new()));
+                }
+                Ok((Some(next_peer_edit_generation(state)), state.peers.values().cloned().collect::<Vec<_>>()))
+            })
+            .await?;
+            let Some(generation) = generation else {
+                // Peer left between the snapshot and now; the queue entry was
+                // already pruned by remove_sites.
+                return Ok(false);
+            };
+            let local_deployment_id = Some(runtime.local_peer.deployment_id.as_str()).filter(|id| !id.is_empty());
+            let edit_path = peer_edit_path_with_fence(local_deployment_id, generation);
+            let delivery_fence = local_deployment_id.is_some().then_some(generation);
+            for body in &bodies {
+                if let Err(err) = send_peer_admin_request_with_client(
+                    &transport.client,
+                    &transport.connection,
+                    &edit_path,
+                    access_key,
+                    secret_key,
+                    body,
+                )
+                .await
+                {
+                    enqueue_site_replication_retry_event_for_generation(
+                        peer,
+                        SITE_REPLICATION_PEER_EDIT_PATH,
+                        &err,
+                        delivery_fence,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+            dequeue_site_replication_retry_event_for_generation(peer, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence).await;
+            Ok(true)
+        }
+    }
 }
 
 /// Remove a retry event for (peer, path) from the queue on successful delivery.
@@ -6206,15 +7121,15 @@ async fn record_pending_rotation_secret_candidate(rotation_id: &str, secret: Str
         return Ok(());
     }
 
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    if let Some(pending) = state.pending_rotation.as_mut()
-        && pending.id == rotation_id
-    {
+    let rotation_id = rotation_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state.pending_rotation.as_mut().filter(|pending| pending.id == rotation_id) else {
+            return Ok(StateCommit::Unchanged(()));
+        };
         push_unique_secret_candidate(&mut pending.secret_candidates, secret);
-        save_site_replication_state(&state).await?;
-    }
-    Ok(())
+        Ok(StateCommit::Changed(()))
+    })
+    .await
 }
 
 async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String) -> S3Result<()> {
@@ -6222,27 +7137,26 @@ async fn record_pending_remove_secret_candidate(remove_id: &str, secret: String)
         return Ok(());
     }
 
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    if let Some(pending) = state.pending_remove.as_mut()
-        && pending.id == remove_id
-    {
+    let remove_id = remove_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state.pending_remove.as_mut().filter(|pending| pending.id == remove_id) else {
+            return Ok(StateCommit::Unchanged(()));
+        };
         push_unique_secret_candidate(&mut pending.secret_candidates, secret);
-        save_site_replication_state(&state).await?;
-    }
-    Ok(())
+        Ok(StateCommit::Changed(()))
+    })
+    .await
 }
 
 async fn mark_pending_rotation_peer_acked(rotation_id: &str, deployment_id: &str) -> S3Result<()> {
     let rotation_id = rotation_id.to_string();
     let deployment_id = deployment_id.to_string();
-    update_site_replication_state(move |state| {
-        if let Some(pending) = state.pending_rotation.as_mut()
-            && pending.id == rotation_id
-        {
-            pending.acked_deployment_ids.insert(deployment_id);
-        }
-        Ok(())
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state.pending_rotation.as_mut().filter(|pending| pending.id == rotation_id) else {
+            return Ok(StateCommit::Unchanged(()));
+        };
+        pending.acked_deployment_ids.insert(deployment_id);
+        Ok(StateCommit::Changed(()))
     })
     .await
 }
@@ -6250,37 +7164,37 @@ async fn mark_pending_rotation_peer_acked(rotation_id: &str, deployment_id: &str
 async fn mark_pending_remove_peer_acked(remove_id: &str, deployment_id: &str) -> S3Result<()> {
     let remove_id = remove_id.to_string();
     let deployment_id = deployment_id.to_string();
-    update_site_replication_state(move |state| {
-        if let Some(pending) = state.pending_remove.as_mut()
-            && pending.id == remove_id
-        {
-            pending.acked_deployment_ids.insert(deployment_id);
-        }
-        Ok(())
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state.pending_remove.as_mut().filter(|pending| pending.id == remove_id) else {
+            return Ok(StateCommit::Unchanged(()));
+        };
+        pending.acked_deployment_ids.insert(deployment_id);
+        Ok(StateCommit::Changed(()))
     })
     .await
 }
 
 async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    let Some(pending) = state.pending_rotation.as_ref() else {
-        return Ok(true);
-    };
-    if pending.id != rotation_id {
-        return Ok(false);
-    }
-    if !pending_all_remote_peers_acked(&pending.peers, local_peer, &pending.acked_deployment_ids) {
-        return Ok(false);
-    }
+    let rotation_id = rotation_id.to_string();
+    let local_peer = local_peer.clone();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state.pending_rotation.as_ref() else {
+            return Ok(StateCommit::Unchanged(true));
+        };
+        if pending.id != rotation_id {
+            return Ok(StateCommit::Unchanged(false));
+        }
+        if !pending_all_remote_peers_acked(&pending.peers, &local_peer, &pending.acked_deployment_ids) {
+            return Ok(StateCommit::Unchanged(false));
+        }
 
-    state.pending_rotation = None;
-    persist_site_replication_state(&state).await?;
-    Ok(true)
+        state.pending_rotation = None;
+        Ok(StateCommit::Changed(true))
+    })
+    .await
 }
 
 async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
-    let _state_guard = site_replication_state_process_guard().await;
     let state = load_site_replication_state().await?;
     let Some(pending) = state.pending_remove.as_ref() else {
         return Ok(None);
@@ -6296,18 +7210,15 @@ async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo
 }
 
 async fn clear_pending_remove(remove_id: &str) -> S3Result<()> {
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    if state
-        .pending_remove
-        .as_ref()
-        .map(|pending| pending.id.as_str() == remove_id)
-        .unwrap_or(false)
-    {
+    let remove_id = remove_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        if state.pending_remove.as_ref().is_none_or(|pending| pending.id != remove_id) {
+            return Ok(StateCommit::Unchanged(()));
+        }
         state.pending_remove = None;
-        persist_site_replication_state(&state).await?;
-    }
-    Ok(())
+        Ok(StateCommit::Changed(()))
+    })
+    .await
 }
 
 fn removed_deployment_ids_for_pending_remove(pending: &PendingRemove, local_peer: &PeerInfo) -> HashSet<String> {
@@ -6758,6 +7669,300 @@ fn merge_incoming_replication_config(
     };
 
     Some(ReplicationConfiguration { role, rules })
+}
+
+/// Merge a peer's ILM expiry document into the local lifecycle config.
+///
+/// Mirrors MinIO's `mergeWithCurrentLCConfig` with one hardening: incoming
+/// site-local fields (transitions, abort-multipart, del-marker expiration —
+/// exactly what MinIO's `CloneNonTransition` sender never emits) are
+/// discarded outright at the trust boundary, whatever the peer sends. Local
+/// site-local fields always survive; a delete (`incoming == None`) therefore
+/// merges with the empty set instead of dropping the whole config.
+fn merge_incoming_lifecycle_config(
+    incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
+    local: Option<s3s::dto::BucketLifecycleConfiguration>,
+    updated_at: Option<OffsetDateTime>,
+) -> Option<s3s::dto::BucketLifecycleConfiguration> {
+    // Incoming rules reduced to their traveling expiry side. Rules with no
+    // expiry semantics after the strip are not installed.
+    let mut incoming_by_id: HashMap<String, s3s::dto::LifecycleRule> = HashMap::new();
+    let mut incoming_order: Vec<String> = Vec::new();
+    for mut rule in incoming.into_iter().flat_map(|config| config.rules) {
+        strip_site_local_lifecycle_fields(&mut rule);
+        if !lifecycle_rule_has_expiry(&rule) {
+            continue;
+        }
+        let id = rule.id.clone().unwrap_or_default();
+        if incoming_by_id.insert(id.clone(), rule).is_none() {
+            incoming_order.push(id);
+        }
+    }
+
+    // Local order first, incoming-new appended: repeated delivery of the same
+    // document is byte-stable, so bucket metadata is written once, not on
+    // every broadcast.
+    let local_expiry_updated_at = local.as_ref().and_then(|config| config.expiry_updated_at.clone());
+    let mut rules: Vec<s3s::dto::LifecycleRule> = Vec::new();
+    for mut rule in local.into_iter().flat_map(|config| config.rules) {
+        let id = rule.id.clone().unwrap_or_default();
+        if let Some(mut incoming_rule) = incoming_by_id.remove(&id) {
+            incoming_order.retain(|pending| pending != &id);
+            // The incoming expiry side wins; the local site-local side is
+            // authoritative (MinIO CloneNonTransition + restore).
+            incoming_rule.transitions = rule.transitions.take();
+            incoming_rule.noncurrent_version_transitions = rule.noncurrent_version_transitions.take();
+            incoming_rule.abort_incomplete_multipart_upload = rule.abort_incomplete_multipart_upload.take();
+            incoming_rule.del_marker_expiration = rule.del_marker_expiration.take();
+            rules.push(incoming_rule);
+        } else if lifecycle_rule_has_expiry(&rule) {
+            // Expiry rule dropped upstream: strip only the traveling expiry
+            // side; the rule survives while any site-local action remains.
+            rule.expiration = None;
+            rule.noncurrent_version_expiration = None;
+            if lifecycle_rule_has_transition(&rule)
+                || rule.abort_incomplete_multipart_upload.is_some()
+                || rule.del_marker_expiration.is_some()
+            {
+                rules.push(rule);
+            }
+        } else {
+            // No traveling expiry semantics (transition-only / abort-mpu-only
+            // / del-marker-only): not managed by expiry replication, keep
+            // untouched.
+            rules.push(rule);
+        }
+    }
+    for id in incoming_order {
+        if let Some(rule) = incoming_by_id.remove(&id) {
+            rules.push(rule);
+        }
+    }
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    Some(s3s::dto::BucketLifecycleConfiguration {
+        rules,
+        // Record the expiry axis the staleness guard compares on. (The PUT
+        // path stamps `expiry_updated_at` only when the expiry subset
+        // changes, so this axis is not inflated by transition-only edits.)
+        expiry_updated_at: updated_at.map(s3s::dto::Timestamp::from).or(local_expiry_updated_at),
+    })
+}
+
+/// True when the rule carries the expiry semantics that `replicateILMExpiry`
+/// propagates. Del-marker expiration and abort-multipart are deliberately
+/// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
+/// both), so treating them as traveling state would let a MinIO peer's
+/// broadcast delete this site's del-marker-only rules.
+fn lifecycle_rule_has_expiry(rule: &s3s::dto::LifecycleRule) -> bool {
+    rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
+}
+
+fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
+    rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty())
+        || rule
+            .noncurrent_version_transitions
+            .as_ref()
+            .is_some_and(|transitions| !transitions.is_empty())
+}
+
+/// Remove the fields that never travel between sites (MinIO
+/// `CloneNonTransition` parity).
+fn strip_site_local_lifecycle_fields(rule: &mut s3s::dto::LifecycleRule) {
+    rule.transitions = None;
+    rule.noncurrent_version_transitions = None;
+    rule.abort_incomplete_multipart_upload = None;
+    rule.del_marker_expiration = None;
+}
+
+/// Reduce a lifecycle XML document to the expiry subset that is allowed to
+/// travel between sites (what MinIO's sender emits): transition fields are
+/// stripped and rules left with no expiry semantics are dropped. Returns
+/// `None` when nothing remains — the receiver then merges with the empty set,
+/// which is exactly the "no expiry rules here" statement. A document that
+/// fails to parse is forwarded unfiltered (`Some(original)`): the receiver
+/// merge strips it anyway, and turning a local parse error into a `None`
+/// would delete the peers' replicated expiry rules.
+fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let config: s3s::dto::BucketLifecycleConfiguration = match deserialize(raw) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!("failed to parse local lifecycle config for expiry replication; forwarding unfiltered: {err}");
+            return Some(raw.to_vec());
+        }
+    };
+    let expiry_updated_at = config.expiry_updated_at.clone();
+    let rules: Vec<s3s::dto::LifecycleRule> = config
+        .rules
+        .into_iter()
+        .filter_map(|mut rule| {
+            strip_site_local_lifecycle_fields(&mut rule);
+            lifecycle_rule_has_expiry(&rule).then_some(rule)
+        })
+        .collect();
+    if rules.is_empty() {
+        return None;
+    }
+    let subset = s3s::dto::BucketLifecycleConfiguration {
+        rules,
+        expiry_updated_at,
+    };
+    match serialize(&subset) {
+        Ok(data) => Some(data),
+        Err(err) => {
+            warn!("failed to serialize lifecycle expiry subset; forwarding unfiltered: {err}");
+            Some(raw.to_vec())
+        }
+    }
+}
+
+/// The expiry replication axis persisted in a lifecycle XML document, if any.
+/// Used for the SRInfo bucket entry so bootstrap/repair items carry the
+/// expiry axis instead of the whole-config write time (which local
+/// transition-only edits inflate).
+fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> {
+    if raw.is_empty() {
+        return None;
+    }
+    deserialize::<s3s::dto::BucketLifecycleConfiguration>(raw)
+        .ok()
+        .and_then(|config| config.expiry_updated_at)
+        .map(OffsetDateTime::from)
+}
+
+/// The timestamp an incoming lc-config item must beat to be applied.
+///
+/// - Present config with the expiry axis: the axis itself.
+/// - Present legacy config that has expiry rules but predates the axis
+///   field: the whole-config write time bounds its last expiry edit.
+/// - Present transition-only config without the axis: `UNIX_EPOCH` — there
+///   is no local expiry state to protect, and the whole-config time moves on
+///   transition edits, which must not shadow independent peer expiry updates.
+/// - Absent config: the whole-config write time — it survives deletion in
+///   bucket metadata as the deletion's lower bound, so a delayed stale
+///   broadcast cannot resurrect deleted expiry rules.
+fn local_lifecycle_staleness_axis(
+    local: Option<&s3s::dto::BucketLifecycleConfiguration>,
+    whole_config_axis: OffsetDateTime,
+) -> OffsetDateTime {
+    match local {
+        Some(config) => match config.expiry_updated_at.clone() {
+            Some(axis) => OffsetDateTime::from(axis),
+            None if config.rules.iter().any(lifecycle_rule_has_expiry) => whole_config_axis,
+            None => OffsetDateTime::UNIX_EPOCH,
+        },
+        None => whole_config_axis,
+    }
+}
+
+/// Recognize MinIO's zero-rule lifecycle tombstone (its delete /
+/// transition-only state marshals `<LifecycleConfiguration>` with no `<Rule>`
+/// child, which the strict s3s deserializer rejects). Only a well-delimited
+/// document qualifies as the "no expiry rules here" statement; truncated or
+/// otherwise malformed payloads are rejected rather than treated as a delete
+/// that would erase local expiry rules.
+fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Tombstone {
+        #[serde(rename = "@xmlns")]
+        _xmlns: Option<String>,
+        #[serde(rename = "ExpiryUpdatedAt")]
+        _expiry_updated_at: Option<s3s::dto::Timestamp>,
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(raw);
+    let mut depth = 0usize;
+    let mut seen_root = false;
+    let mut closed_root = false;
+    let mut seen_declaration = false;
+    let well_formed_document = loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                }
+                depth += 1;
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                if depth == 0 {
+                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                        break false;
+                    }
+                    seen_root = true;
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                if depth == 0 {
+                    break false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    closed_root = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Decl(_)) => {
+                if seen_declaration || seen_root || depth != 0 {
+                    break false;
+                }
+                seen_declaration = true;
+            }
+            Ok(quick_xml::events::Event::DocType(_)) => break false,
+            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+                break false;
+            }
+            Ok(quick_xml::events::Event::Text(_)) => {}
+            Ok(quick_xml::events::Event::CData(_)) if depth == 0 => break false,
+            Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
+            Ok(quick_xml::events::Event::Eof) => break seen_root && closed_root && depth == 0,
+            Ok(_) if depth == 0 => break false,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+
+    well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
+}
+
+/// The ILM expiry statement this site contributes to its SRInfo bucket entry
+/// (feeding bootstrap/repair and consistency views), if any.
+/// `Some((subset_b64, axis))` — a `None` subset means "expiry rules were
+/// removed at `axis`" and travels as an explicit timestamped delete item, so
+/// a peer that missed the live delete still converges on repair.
+fn lifecycle_expiry_statement(
+    metadata: &crate::admin::storage_api::bucket::metadata::BucketMetadata,
+) -> Option<(Option<String>, OffsetDateTime)> {
+    if metadata.lifecycle_config_xml.is_empty() {
+        // Deleted vs never configured: the whole-config write time survives
+        // deletion in bucket metadata and strictly exceeds the created-time
+        // backfill only after a real write.
+        return (metadata.lifecycle_config_updated_at > metadata.created).then_some((None, metadata.lifecycle_config_updated_at));
+    }
+    let axis = lifecycle_expiry_updated_at(&metadata.lifecycle_config_xml);
+    match lifecycle_expiry_subset_xml(&metadata.lifecycle_config_xml) {
+        Some(subset) => {
+            // Legacy documents predate the axis field; their whole-config
+            // write time bounds the last expiry edit.
+            let axis = axis.unwrap_or(metadata.lifecycle_config_updated_at);
+            Some((raw_config_to_base64(&subset), axis))
+        }
+        // Transition-only config: with an expiry axis the site once had
+        // expiry rules and properly removed them — the delete travels at
+        // that axis. Without one there is nothing to say (a delete stamped
+        // off the whole-config time would let a local transition edit erase
+        // newer peer expiry state).
+        None => axis.map(|axis| (None, axis)),
+    }
 }
 
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
@@ -7375,7 +8580,8 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
             .await
             .map_err(ApiError::from)?;
-        let _state_guard = site_replication_state_process_guard().await;
+        // Read-only per bucket: the pending refresh is re-read (and re-checked)
+        // every round, and the writes below are bucket metadata, not state.
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -7696,27 +8902,36 @@ async fn refresh_site_resync_status(mut status: SRResyncOpStatus, peer: &PeerInf
 }
 
 async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    if state
-        .resync_status
-        .get(peer_id)
-        .is_some_and(|current| current.resync_id != status.resync_id || current.generation != status.generation)
-    {
-        return Err(s3_error!(InvalidRequest, "site replication resync state changed"));
-    }
-    state.resync_status.insert(peer_id.to_string(), status.clone());
-    save_site_replication_state(&state).await
+    let peer_id = peer_id.to_string();
+    let status = status.clone();
+    update_site_replication_state(move |state| {
+        // The run identity is checked inside the transaction: a cancel or a
+        // newer run that committed while this progress snapshot was being
+        // built must not be overwritten by it.
+        if state
+            .resync_status
+            .get(&peer_id)
+            .is_some_and(|current| current.resync_id != status.resync_id || current.generation != status.generation)
+        {
+            return Err(s3_error!(InvalidRequest, "site replication resync state changed"));
+        }
+        state.resync_status.insert(peer_id, status);
+        Ok(())
+    })
+    .await
 }
 
 async fn persist_new_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
-    let _state_guard = site_replication_state_process_guard().await;
-    let mut state = load_site_replication_state().await?;
-    if state.resync_status.get(peer_id).is_some_and(site_resync_is_active) {
-        return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
-    }
-    state.resync_status.insert(peer_id.to_string(), status.clone());
-    save_site_replication_state(&state).await
+    let peer_id = peer_id.to_string();
+    let status = status.clone();
+    update_site_replication_state(move |state| {
+        if state.resync_status.get(&peer_id).is_some_and(site_resync_is_active) {
+            return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
+        }
+        state.resync_status.insert(peer_id, status);
+        Ok(())
+    })
+    .await
 }
 
 fn apply_state_edit_req(mut state: SiteReplicationState, body: SRStateEditReq) -> SiteReplicationState {
@@ -7831,7 +9046,12 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     } else {
         None
     };
-    if let Ok(bucket_meta) = metadata_sys::get(&item.bucket).await {
+    // lc-config staleness is judged on the expiry axis inside its merge block
+    // below: `lifecycle_config_updated_at` moves on local transition-only
+    // edits too, which would shadow newer peer expiry updates.
+    if item.r#type != "lc-config"
+        && let Ok(bucket_meta) = metadata_sys::get(&item.bucket).await
+    {
         let local_updated_at = bucket_meta_local_updated_at(&bucket_meta, config_file);
         if is_stale_update(local_updated_at, incoming_updated_at) {
             return Ok(());
@@ -7873,6 +9093,72 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             None
         };
 
+    let (merged_lifecycle_config, lifecycle_guard) = if item.r#type == "lc-config" {
+        // Receiver-side gate, symmetric with the sender hook: a peer must not
+        // install expiry rules here while `replicateILMExpiry` is off. When
+        // the state cannot be read, fall through and apply (pre-gate
+        // behavior) rather than silently dropping a legitimate update. Note
+        // the gate acks with 200 — the sender treats the item as delivered
+        // and will not retry; items skipped inside the enable-flag
+        // propagation window are healed by repair, not by retry.
+        if let Ok(state) = load_site_replication_state().await
+            && !site_replication_state_replicates_ilm_expiry(&state)
+        {
+            return Ok(());
+        }
+
+        let incoming = match item.expiry_lc_config.as_ref() {
+            Some(raw) => {
+                let data = decode_bucket_meta_wire_value(raw);
+                match deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data) {
+                    Ok(config) => Some(config),
+                    // MinIO's delete tombstone / transition-only state is a
+                    // zero-rule document the strict deserializer rejects; it
+                    // means "no expiry rules here" (delete semantics). Any
+                    // other malformed payload is rejected — treating it as a
+                    // delete would let a bad payload erase local expiry rules.
+                    Err(_) if is_zero_rule_lifecycle_tombstone(&data) => None,
+                    Err(e) => return Err(s3_error!(InvalidRequest, "invalid lifecycle config: {e}")),
+                }
+            }
+            None => None,
+        };
+        let lifecycle_guard =
+            metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(&item.bucket, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
+        let local_metadata = metadata_sys::get_config_from_disk(&item.bucket)
+            .await
+            .map_err(ApiError::from)?;
+        let local = if local_metadata.lifecycle_config_xml.is_empty() {
+            None
+        } else {
+            Some(
+                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&local_metadata.lifecycle_config_xml).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}"))
+                })?,
+            )
+        };
+        let whole_config_axis = local_metadata.lifecycle_config_updated_at;
+        if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
+            return Ok(());
+        }
+        let local_absent = local.is_none();
+        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
+            Some(config) => Some(
+                serialize(&config)
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?,
+            ),
+            None => {
+                skip_config_write = local_absent;
+                None
+            }
+        };
+        (merged, Some(lifecycle_guard))
+    } else {
+        (None, None)
+    };
+
     let data = match item.r#type.as_str() {
         "policy" => item
             .policy
@@ -7889,7 +9175,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         "object-lock-config" => decode_bucket_meta_wire_option(item.object_lock_config),
         "sse-config" => decode_bucket_meta_wire_option(item.sse_config),
         "replication-config" => merged_replication_config,
-        "lc-config" => decode_bucket_meta_wire_option(item.expiry_lc_config),
+        "lc-config" => merged_lifecycle_config,
         "cors-config" => decode_bucket_meta_wire_option(item.cors),
         _ => unreachable!(),
     };
@@ -7921,16 +9207,29 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                         .map_err(ApiError::from)?;
                 }
             } else {
-                metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                if let Some(guard) = lifecycle_guard.as_ref() {
+                    metadata_sys::update_under_transaction_lock(guard, &item.bucket, config_file, data)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
+            }
+        } else {
+            if let Some(guard) = lifecycle_guard.as_ref() {
+                metadata_sys::delete_under_transaction_lock(guard, &item.bucket, config_file)
+                    .await
+                    .map_err(ApiError::from)?;
+            } else {
+                metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
                     .await
                     .map_err(ApiError::from)?;
             }
-        } else {
-            metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
-                .await
-                .map_err(ApiError::from)?;
         }
     }
+    drop(lifecycle_guard);
     drop(targets_guard);
 
     if item.r#type == "replication-config" {
@@ -8352,7 +9651,10 @@ impl Operation for SiteReplicationAddHandler {
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
-        let state_guard = site_replication_state_process_guard().await;
+        // Everything up to the commit below is preflight: peer probes, IAM
+        // work and the join fan-out all talk to the network, so none of it may
+        // run inside the state transaction. The snapshot read here is what the
+        // `updated_at` CAS in the commit validates.
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -8373,13 +9675,14 @@ impl Operation for SiteReplicationAddHandler {
         }
         validate_add_preflight_topology(&preflight_infos, &local_peer)?;
         let expected_updated_at = current_state.updated_at;
-        drop(state_guard);
         require_add_peer_tls_capability(&sites, &local_peer).await?;
-        let _state_guard = site_replication_state_process_guard().await;
+        // Early exit on a state that moved under the preflight probes, BEFORE
+        // the IAM write and the join fan-out change anything remote. Advisory
+        // only — the binding check is the CAS inside the commit — but it fences
+        // the common race off the side-effect path and refreshes the merge
+        // base so the CAS window is only the join round trips.
         let latest_state = load_site_replication_state().await?;
-        if latest_state.updated_at != expected_updated_at || pending_endpoint_refresh(&latest_state).is_some() {
-            return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
-        }
+        ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
         let current_state = latest_state;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
@@ -8454,13 +9757,63 @@ impl Operation for SiteReplicationAddHandler {
         }
 
         mark_unknown_peer_sync_enabled(&mut state.peers);
-        persist_site_replication_state(&state).await?;
 
-        // The finalize fan-out below delivers peer-edit payloads, so it stays
-        // under the state guard: ordering against a concurrent edit matters
-        // and the peer edit handler has no generation fence. It uses the
-        // plain transport (no retry-event bookkeeping), so nothing re-enters
-        // the state transaction while the guard is held.
+        // Commit. The CAS runs inside the transaction, against the state the
+        // transaction itself loaded — the peer round trips above took however
+        // long they took, and only this check can tell whether the topology
+        // this add was planned against is still the current one. The error
+        // says so: by this point the remote sites already accepted their
+        // joins, and re-running the add is what reconverges the local side.
+        let next_state = state;
+        let (state, edit_generation) = update_site_replication_state(move |state| {
+            if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
+                ));
+            }
+            // Adopt only the fields this add computed. Everything else is
+            // owned by writers that commit without touching `updated_at`
+            // (retry events, peer-edit generations, resync progress, the
+            // acks/clears of an already pending rotation or removal), so the
+            // CAS above cannot vouch for them — they keep the freshly loaded
+            // value. The exhaustive destructure makes adding a state field a
+            // compile error here until it is classified.
+            let SiteReplicationState {
+                name,
+                service_account_access_key,
+                service_account_secret_key: _,
+                service_account_parent,
+                peers,
+                updated_at,
+                resync_status: _,
+                pending_rotation: _,
+                pending_remove: _,
+                pending_endpoint_refresh: _,
+                retry_queue: _,
+                sync_state_initialized,
+                edit_generation: _,
+                applied_edit_generations: _,
+            } = next_state;
+            state.name = name;
+            state.service_account_access_key = service_account_access_key;
+            state.service_account_parent = service_account_parent;
+            state.peers = peers;
+            state.updated_at = updated_at;
+            state.sync_state_initialized = sync_state_initialized;
+            let edit_generation = next_peer_edit_generation(state);
+            Ok((state.clone(), edit_generation))
+        })
+        .await?;
+
+        // The finalize fan-out delivers peer-edit payloads, so it carries the
+        // generation allocated in the commit above: the receiving site orders
+        // it against any edit that follows instead of applying whichever
+        // delivery happens to arrive last. It runs outside the transaction —
+        // holding the state-object lock across peer traffic would block every
+        // node of this site, including this add's own retry bookkeeping.
+        let local_deployment_id = current_deployment_id();
+        let finalize_edit_path = peer_edit_path_with_fence(local_deployment_id.as_deref(), edit_generation);
         for target in state.peers.values() {
             if target.deployment_id == local_peer.deployment_id || same_identity_endpoint(&target.endpoint, &local_peer.endpoint)
             {
@@ -8477,7 +9830,7 @@ impl Operation for SiteReplicationAddHandler {
                 if let Err(err) = send_peer_admin_request_with_client(
                     &transport.client,
                     &transport.connection,
-                    SITE_REPLICATION_PEER_EDIT_PATH,
+                    &finalize_edit_path,
                     &state.service_account_access_key,
                     &service_account_secret_key,
                     peer,
@@ -8489,12 +9842,6 @@ impl Operation for SiteReplicationAddHandler {
                 }
             }
         }
-
-        // Bootstrap and back-fill send bucket-ops, not peer edits, so their
-        // ordering is not state-sensitive — and their transports do record
-        // retry events, which re-enter the state transaction. Release the
-        // guard before them.
-        drop(_state_guard);
 
         initial_sync_errors.extend(bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await);
 
@@ -8521,39 +9868,49 @@ impl Operation for SiteReplicationRemoveHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        // The request body is read before the bucket-op guard and the state
+        // transaction: a client that stalls mid-body must hold neither the
+        // state-object lock nor the write half of the bucket-op RwLock (which
+        // would starve every bucket-operation hook in the meantime).
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state_guard = site_replication_state_process_guard().await;
-            let current_state = load_site_replication_state().await?;
-            if pending_endpoint_refresh(&current_state).is_some() {
-                return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-            }
-            if current_state.pending_rotation.is_some() {
-                return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
-            }
-            let local_peer = current_local_peer(&req, &current_state);
-            let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+            update_site_replication_state_when_changed(move |state| {
+                if pending_endpoint_refresh(state).is_some() {
+                    return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
+                }
+                if state.pending_rotation.is_some() {
+                    return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
+                }
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
 
-            if let Some(pending) = current_state.pending_remove.clone() {
-                (pending, local_peer)
-            } else {
-                validate_remove_sites_req(&current_state, &remove_req)?;
-                let mut next_state = remove_sites(current_state.clone(), remove_req.clone());
-                let mut peer_remove_req = remove_req;
+                // Resuming: the peers were already told about this pending
+                // removal, so re-persisting the same record buys nothing.
+                if let Some(pending) = state.pending_remove.clone() {
+                    return Ok(StateCommit::Unchanged((pending, local_peer)));
+                }
+
+                validate_remove_sites_req(state, &remove_req)?;
+                let service_account_access_key = state.service_account_access_key.clone();
+                let secret_candidates = legacy_site_replicator_state_secret(state).into_iter().collect();
+                let original_peers = state.peers.clone();
+                let mut peer_remove_req = remove_req.clone();
                 peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
+                *state = remove_sites(std::mem::take(state), remove_req);
                 let pending = PendingRemove {
                     id: Uuid::new_v4().to_string(),
                     req: peer_remove_req,
-                    service_account_access_key: current_state.service_account_access_key.clone(),
-                    secret_candidates: legacy_site_replicator_state_secret(&current_state).into_iter().collect(),
-                    original_peers: current_state.peers.clone(),
+                    service_account_access_key,
+                    secret_candidates,
+                    original_peers,
                     acked_deployment_ids: BTreeSet::new(),
-                    updated_at: next_state.updated_at,
+                    updated_at: state.updated_at,
                 };
-                next_state.pending_remove = Some(pending.clone());
-                persist_site_replication_state(&next_state).await?;
-                (pending, local_peer)
-            }
+                state.pending_remove = Some(pending.clone());
+                Ok(StateCommit::Changed((pending, local_peer)))
+            })
+            .await?
         };
 
         let mut peer_errors = Vec::new();
@@ -8724,102 +10081,186 @@ impl Operation for SiteReplicationNetPerfHandler {
 
 pub struct SRPeerJoinHandler {}
 
+/// What the join admission decided about an incoming peer join. The verdict —
+/// and the committed state the back-fill afterwards needs — travel out of
+/// [`admit_peer_join`] instead of being answered where they are decided.
+enum PeerJoinOutcome {
+    Applied(Box<SiteReplicationState>, PeerInfo),
+    /// A newer join already landed here; the sender is answered with the local
+    /// peer record and nothing is written.
+    Superseded(PeerInfo),
+}
+
+/// The serialized half of an accepted peer join: staleness check, IAM apply,
+/// state commit.
+///
+/// Two locks, two scopes. The lifecycle guard (process-local) keeps the
+/// admission mutually exclusive with this node's add / remove / rotate /
+/// reconciler. The distributed join-admission lock then serializes the
+/// admission CLUSTER-WIDE — the IAM write and the state commit cannot share
+/// a transaction, so without it two joins accepted by different nodes of
+/// this site interleave as "A checks for older T1, B applies secret B and
+/// commits newer T2, A overwrites IAM with secret A, A's commit is refused
+/// as superseded" — leaving the persisted state advertising B's contract
+/// while IAM only accepts A's secret. Under the admission lock the
+/// staleness check runs against a load taken INSIDE the lock, before
+/// `apply_iam` changes anything, so a superseded join exits without
+/// touching IAM at all. Crash safety is the lock subsystem's lease expiry
+/// (same pattern as the repair execution lock); the closing transaction
+/// still re-checks staleness for defence in depth and for old-version nodes
+/// that do not take the admission lock during a rolling upgrade.
+///
+/// Lock order: lifecycle -> join admission -> state object lock (the repair
+/// path nests config-object locks the same way: repair execution -> state).
+///
+/// `apply_iam` is injected so the interleaving regression tests can gate it
+/// mid-flight; production passes the real service-account upsert.
+async fn admit_peer_join<F, Fut>(
+    local_endpoint: String,
+    join_req: SRPeerJoinReq,
+    defer_sync_state_enable: bool,
+    apply_iam: F,
+) -> S3Result<PeerJoinOutcome>
+where
+    F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
+{
+    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+    admit_peer_join_across_nodes(local_endpoint, join_req, defer_sync_state_enable, apply_iam).await
+}
+
+/// [`admit_peer_join`] minus the process-local lifecycle guard: the
+/// distributed admission lock plus the fenced sequence under it. This is
+/// exactly what a second node of this site runs concurrently — the lifecycle
+/// guard cannot reach it — so the separate-nodes regression test drives this
+/// function directly, and removing the admission lock breaks it.
+async fn admit_peer_join_across_nodes<F, Fut>(
+    local_endpoint: String,
+    join_req: SRPeerJoinReq,
+    defer_sync_state_enable: bool,
+    apply_iam: F,
+) -> S3Result<PeerJoinOutcome>
+where
+    F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
+{
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    with_config_object_write_lock(store, SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(), move || async move {
+        let fresh = load_site_replication_state().await?;
+        let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+        if join_request_is_superseded(&fresh, join_req.updated_at) {
+            let peer = fresh
+                .peers
+                .get(&fresh_local_peer.deployment_id)
+                .cloned()
+                .unwrap_or(fresh_local_peer);
+            return Ok(PeerJoinOutcome::Superseded(peer));
+        }
+
+        apply_iam(join_req.clone()).await?;
+
+        let incoming_updated_at = join_req.updated_at;
+        update_site_replication_state_when_changed(move |state| {
+            let local_peer = local_peer_at_endpoint(local_endpoint, state);
+            if join_request_is_superseded(state, incoming_updated_at) {
+                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+            }
+            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+        })
+        .await
+    })
+    .await
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication join admission failed: {e}")))?
+}
+
+/// Upsert the replication service account a peer join carries. No-op when the
+/// join brings no credentials.
+async fn apply_peer_join_service_account(join_req: SRPeerJoinReq) -> S3Result<()> {
+    if join_req.svc_acct_access_key.is_empty() || join_req.svc_acct_secret_key.is_empty() {
+        return Ok(());
+    }
+    let Some(iam_sys) = current_iam_handle() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+
+    if iam_sys.get_service_account(&join_req.svc_acct_access_key).await.is_ok() {
+        iam_sys
+            .update_service_account(
+                &join_req.svc_acct_access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+                        Some(site_replicator_service_account_policy()?)
+                    } else {
+                        None
+                    },
+                    secret_key: Some(join_req.svc_acct_secret_key.clone()),
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: None,
+                    parent_user: None,
+                    allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+    } else {
+        iam_sys
+            .new_service_account(
+                &join_req.svc_acct_parent,
+                None,
+                NewServiceAccountOpts {
+                    session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+                        Some(site_replicator_service_account_policy()?)
+                    } else {
+                        None
+                    },
+                    access_key: join_req.svc_acct_access_key.clone(),
+                    secret_key: join_req.svc_acct_secret_key.clone(),
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
+                    claims: None,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         let bootstrap_token = site_replication_bootstrap_token(&req.uri);
-        let _state_guard = site_replication_state_process_guard().await;
-        let mut state = load_site_replication_state().await?;
-        let local_peer = current_local_peer(&req, &state);
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        // The body is fully read before the admission takes the lifecycle
+        // guard: a sender that stalls mid-body must not block this node's
+        // add/remove/rotate/reconciler.
         let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
         let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
         let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
-        if let Some(current_updated_at) = state.updated_at {
-            let Some(incoming_updated_at) = join_req.updated_at else {
+        let committed =
+            admit_peer_join(local_endpoint, join_req, defer_sync_state_enable, apply_peer_join_service_account).await?;
+        // Committed; the reverse-reachability probe and the bucket back-fill
+        // run outside the transaction — their transport helpers' retry-event
+        // bookkeeping re-enters it (P1-15).
+        let (state, local_peer) = match committed {
+            PeerJoinOutcome::Applied(state, local_peer) => (*state, local_peer),
+            PeerJoinOutcome::Superseded(peer) => {
                 return json_response(&SRPeerJoinResponse {
-                    peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
-                    ..Default::default()
-                });
-            };
-            if incoming_updated_at <= current_updated_at {
-                return json_response(&SRPeerJoinResponse {
-                    peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                    peer,
                     ..Default::default()
                 });
             }
-        }
-
-        if !join_req.svc_acct_access_key.is_empty() && !join_req.svc_acct_secret_key.is_empty() {
-            let Some(iam_sys) = current_iam_handle() else {
-                return Err(s3_error!(InvalidRequest, "iam not init"));
-            };
-
-            if iam_sys.get_service_account(&join_req.svc_acct_access_key).await.is_ok() {
-                iam_sys
-                    .update_service_account(
-                        &join_req.svc_acct_access_key,
-                        UpdateServiceAccountOpts {
-                            session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
-                                Some(site_replicator_service_account_policy()?)
-                            } else {
-                                None
-                            },
-                            secret_key: Some(join_req.svc_acct_secret_key.clone()),
-                            name: None,
-                            description: None,
-                            expiration: None,
-                            status: None,
-                            parent_user: None,
-                            allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-            } else {
-                iam_sys
-                    .new_service_account(
-                        &join_req.svc_acct_parent,
-                        None,
-                        NewServiceAccountOpts {
-                            session_policy: if join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
-                                Some(site_replicator_service_account_policy()?)
-                            } else {
-                                None
-                            },
-                            access_key: join_req.svc_acct_access_key.clone(),
-                            secret_key: join_req.svc_acct_secret_key.clone(),
-                            name: None,
-                            description: None,
-                            expiration: None,
-                            allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                            claims: None,
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-            }
-        }
-
-        state.service_account_access_key = join_req.svc_acct_access_key;
-        state.service_account_parent = join_req.svc_acct_parent;
-        state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
-        state.peers = normalize_join_peers_for_local(&local_peer, join_req.peers);
-        initialize_join_peer_sync_state(&mut state.peers, defer_sync_state_enable);
-        state.sync_state_initialized = true;
-        state.name = state
-            .peers
-            .get(&local_peer.deployment_id)
-            .map(|peer| peer.name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| local_peer.name.clone());
-        persist_site_replication_state(&state).await?;
-        // Committed; release the state lock before the reverse-reachability
-        // probe and bucket back-fill — their transport helpers' retry-event
-        // bookkeeping re-enters the state transaction (P1-15).
-        drop(_state_guard);
+        };
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
         // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
@@ -9005,7 +10446,10 @@ impl Operation for SiteReplicationEditHandler {
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let body = read_site_replication_body(req, &cred.secret_key, true).await?;
         let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
-        let mut state_guard = Some(site_replication_state_process_guard().await);
+        // Planning snapshot: every commit below re-loads the state inside its
+        // transaction and re-checks the `updated_at` / pending-refresh
+        // precondition there, because the peer probes and fan-outs in between
+        // must not run under the state-object lock.
         let current_state = load_site_replication_state().await?;
         apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
@@ -9027,6 +10471,11 @@ impl Operation for SiteReplicationEditHandler {
                 acked_deployment_ids: BTreeSet::new(),
             })
         });
+        // The precondition every commit below re-checks: the topology this
+        // edit was planned against, and the endpoint refresh it either
+        // continues or requires the absence of.
+        let expected_updated_at = current_state.updated_at;
+        let expected_pending_id = persisted_pending.as_ref().map(|pending| pending.id.clone());
         let local_peer = current_local_runtime_peer(&current_state);
         let existing_peer = existing_peer_for_edit(&current_state, &incoming);
         let tls_capability_required = edit_peer_tls_capability_required(existing_peer, &incoming);
@@ -9037,8 +10486,6 @@ impl Operation for SiteReplicationEditHandler {
                 return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
             }
             let secret = site_replicator_service_account_secret(&current_state.service_account_access_key).await?;
-            let expected_updated_at = current_state.updated_at;
-            drop(state_guard.take());
             if tls_capability_required {
                 require_edit_peer_tls_capability(
                     &current_state,
@@ -9052,38 +10499,29 @@ impl Operation for SiteReplicationEditHandler {
             if tls_transport_probe_required {
                 probe_proposed_peer_tls_transport(&incoming, &current_state.service_account_access_key, &secret).await?;
             }
-            state_guard = Some(site_replication_state_process_guard().await);
+            // Early exit on a state that moved under the probe. Advisory only:
+            // the binding check is the CAS inside whichever commit follows.
             let latest_state = load_site_replication_state().await?;
-            if latest_state.updated_at != expected_updated_at
-                || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
-                    != persisted_pending.as_ref().map(|pending| &pending.id)
-            {
-                return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
-            }
+            ensure_edit_precondition(&latest_state, expected_updated_at, expected_pending_id.as_ref(), "capability probe")?;
             service_account_secret_key = Some(secret);
         }
-        let mut state = if endpoint_refresh_requested {
-            current_state.clone()
-        } else {
-            edit_state(current_state.clone(), incoming.clone(), ilm_expiry_override)
-        };
-
         if endpoint_refresh_requested && current_state.service_account_access_key.is_empty() {
             return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
         }
         if current_state.service_account_access_key.is_empty() {
-            save_site_replication_state(&state).await?;
+            // No peers to notify: the edit is the whole operation, so it is
+            // computed and committed in one transaction.
+            let incoming = incoming.clone();
+            update_site_replication_state(move |state| {
+                ensure_edit_precondition(state, expected_updated_at, expected_pending_id.as_ref(), "the edit")?;
+                *state = edit_state(std::mem::take(state), incoming, ilm_expiry_override);
+                Ok(())
+            })
+            .await?;
         } else {
             let service_account_secret_key = match service_account_secret_key {
                 Some(secret) => secret,
                 None => site_replicator_service_account_secret(&current_state.service_account_access_key).await?,
-            };
-            let peers_to_send: Vec<PeerInfo> = if let Some(pending) = pending.as_ref() {
-                vec![pending.peer.clone()]
-            } else if ilm_expiry_override.is_some() {
-                state.peers.values().cloned().collect()
-            } else {
-                vec![normalize_peer_info(incoming)]
             };
             let routing_peers = pending
                 .as_ref()
@@ -9096,8 +10534,6 @@ impl Operation for SiteReplicationEditHandler {
                 let pending = pending.clone().ok_or_else(|| {
                     S3Error::with_message(S3ErrorCode::InternalError, "endpoint refresh state is missing".to_string())
                 })?;
-                let expected_updated_at = current_state.updated_at;
-                drop(state_guard.take());
                 let probes = futures::future::join_all(remote_targets.iter().map(|target| {
                     send_endpoint_refresh_admin_request_raw(
                         target,
@@ -9124,24 +10560,23 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                state_guard = Some(site_replication_state_process_guard().await);
-                let latest_state = load_site_replication_state().await?;
-                if latest_state.updated_at != expected_updated_at
-                    || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
-                        != persisted_pending.as_ref().map(|pending| &pending.id)
-                {
-                    return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
-                }
-                state = latest_state;
                 let pending_id = pending.id.clone();
                 let refresh_request = EndpointRefreshRequest {
                     id: pending.id.clone(),
                     peer: pending.peer.clone(),
                 };
-                let pending = merge_pending_endpoint_refresh(&state, &pending, std::iter::empty::<String>())?;
-                set_pending_endpoint_refresh(&mut state, pending.clone())?;
-                save_site_replication_state(&state).await?;
-                drop(state_guard.take());
+                // Announce the pending refresh. The CAS sits in the same
+                // transaction as the write it guards, so a topology change
+                // that landed during the capability probes above cannot be
+                // overwritten by this snapshot.
+                let expected_pending_id = expected_pending_id.clone();
+                let pending = update_site_replication_state(move |state| {
+                    ensure_edit_precondition(state, expected_updated_at, expected_pending_id.as_ref(), "capability probe")?;
+                    let pending = merge_pending_endpoint_refresh(state, &pending, std::iter::empty::<String>())?;
+                    set_pending_endpoint_refresh(state, pending.clone())?;
+                    Ok(pending)
+                })
+                .await?;
                 let responses = futures::future::join_all(remote_targets.iter().map(|target| async {
                     if legacy_deployment_ids.contains(&target.deployment_id) {
                         refresh_legacy_peer_bucket_targets(
@@ -9177,51 +10612,63 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
-                let _state_guard = site_replication_state_process_guard().await;
-                let mut state = load_site_replication_state().await?;
-                let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
-                    return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
-                };
-                let pending = merge_pending_endpoint_refresh(&state, &pending, acked_deployment_ids)?;
-                set_pending_endpoint_refresh(&mut state, pending)?;
-                save_site_replication_state(&state).await?;
+                let acked_pending_id = pending_id.clone();
+                let service_account_access_key = update_site_replication_state(move |state| {
+                    let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == acked_pending_id) else {
+                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                    };
+                    let pending = merge_pending_endpoint_refresh(state, &pending, acked_deployment_ids)?;
+                    set_pending_endpoint_refresh(state, pending)?;
+                    Ok(state.service_account_access_key.clone())
+                })
+                .await?;
                 if let Some(err) = refresh_error {
                     return Err(err);
                 }
-                let service_account_secret_key =
-                    site_replicator_service_account_secret(&state.service_account_access_key).await?;
-                drop(_state_guard);
+                let service_account_secret_key = site_replicator_service_account_secret(&service_account_access_key).await?;
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-                let _state_guard = site_replication_state_process_guard().await;
-                let mut state = load_site_replication_state().await?;
-                let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
-                    return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
-                };
-                state = edit_state(state, pending.peer, ilm_expiry_override);
-                clear_pending_endpoint_refresh(&mut state);
-                save_site_replication_state(&state).await?;
+                update_site_replication_state(move |state| {
+                    let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
+                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                    };
+                    *state = edit_state(std::mem::take(state), pending.peer, ilm_expiry_override);
+                    clear_pending_endpoint_refresh(state);
+                    Ok(())
+                })
+                .await?;
             } else {
                 // Commit before the peer fan-out (mirrors the add/join
                 // handlers): a failed notification is recorded as a retry
                 // event and converges from the committed local state —
                 // fanning out first meant the retry event pointed at a state
-                // the local site had not saved. The generation is allocated in
-                // the same commit, i.e. under the state-object lock, so it
-                // orders this edit against one another node accepts
-                // concurrently — the process guard below cannot.
-                let edit_generation = next_peer_edit_generation(&mut state);
-                save_site_replication_state(&state).await?;
+                // the local site had not saved. The edit itself is applied to
+                // the state the transaction loads, under the CAS, so a
+                // topology change that slipped past the planning snapshot
+                // fails the edit instead of being overwritten by it. The
+                // generation is allocated in that same commit, i.e. under the
+                // state-object lock, so it orders this edit against one
+                // another node of this site accepts concurrently.
+                let incoming = incoming.clone();
+                let (edit_generation, peers_to_send) = update_site_replication_state(move |state| {
+                    ensure_edit_precondition(state, expected_updated_at, expected_pending_id.as_ref(), "the edit")?;
+                    *state = edit_state(std::mem::take(state), incoming.clone(), ilm_expiry_override);
+                    let peers_to_send: Vec<PeerInfo> = if ilm_expiry_override.is_some() {
+                        state.peers.values().cloned().collect()
+                    } else {
+                        vec![normalize_peer_info(incoming)]
+                    };
+                    Ok((next_peer_edit_generation(state), peers_to_send))
+                })
+                .await?;
                 let edit_path = peer_edit_path_with_fence(local_deployment_id.as_deref(), edit_generation);
                 let delivery_fence = local_deployment_id.is_some().then_some(edit_generation);
 
-                // The fan-out stays UNDER the state guard so deliveries issued
-                // by THIS node keep their commit order; the generation fence
-                // above is what covers the cross-node case, where the peer
-                // rejects a delivery an older edit is still trying to make.
-                // The retry-event bookkeeping is what cannot run under the
-                // guard — it re-enters the state transaction (P1-15) — so
-                // deliver with the plain transport here and settle the retry
-                // queue after the guard is released.
+                // The fan-out runs outside the transaction — peer traffic
+                // under the state-object lock would stall every writer of this
+                // site, and the retry bookkeeping below re-enters it (P1-15).
+                // Ordering is the generation fence's job: a delivery this
+                // fan-out is still retrying is rejected by the receiver once a
+                // newer generation from this site has landed there.
                 let mut delivered: Vec<PeerInfo> = Vec::new();
                 let mut failure: Option<(PeerInfo, S3Error)> = None;
                 'fanout: for target in remote_targets {
@@ -9243,7 +10690,6 @@ impl Operation for SiteReplicationEditHandler {
                     }
                     delivered.push(target.clone());
                 }
-                drop(state_guard.take());
 
                 // Settle only what this generation is entitled to: a newer
                 // edit that committed and failed its own delivery while this
@@ -9293,6 +10739,20 @@ impl Operation for SRPeerEditCapabilitiesHandler {
 
 pub struct SRPeerEditHandler {}
 
+/// What the peer-edit transaction decided about an incoming delivery. The
+/// checks and the write share one transaction, so the verdict has to travel
+/// out of the closure instead of being answered where it is taken.
+enum PeerEditOutcome {
+    /// Applied; carries the service account access key the follow-up
+    /// endpoint-refresh work needs from the committed state.
+    Applied(String),
+    /// Nothing to do — a superseded delivery or one this site already
+    /// committed. Answered as success so the sender stops retrying.
+    Acked,
+    /// Refused, with the detail the sender is told.
+    Rejected(&'static str),
+}
+
 #[async_trait::async_trait]
 impl Operation for SRPeerEditHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -9300,101 +10760,112 @@ impl Operation for SRPeerEditHandler {
         let queries = query_pairs(&req.uri);
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
-        let delivery_fence = peer_edit_fence(&queries);
-        let state_guard = site_replication_state_process_guard().await;
-        let state = load_site_replication_state().await?;
-        // Ordering fence: the sending site allocates the generation under its
-        // state-object lock, so a delivery that lost the race carries a
-        // generation this site has already passed. Applying it would roll the
-        // peer back to the older edit. Ack it — the newer edit already landed,
-        // so the sender has nothing to retry.
-        if let Some((origin, generation)) = delivery_fence.as_ref()
-            && peer_edit_delivery_is_stale(&state, origin, *generation)
-        {
-            return json_response(&ReplicateEditStatus {
-                success: true,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            });
-        }
-        if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
-            return json_response(&ReplicateEditStatus {
-                success: false,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                err_detail: "another site replication operation is pending".to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            });
-        }
-        let local_peer = current_local_peer(&req, &state);
-        let (refresh_id, mut incoming) = if endpoint_refresh_requested {
+        let commit_fence = peer_edit_fence(&queries);
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let (refresh_id, incoming) = if endpoint_refresh_requested {
             let refresh: EndpointRefreshRequest = read_site_replication_json(req, "", false).await?;
             (Some(refresh.id), refresh.peer)
         } else {
             (None, read_site_replication_json(req, "", false).await?)
         };
-        if same_identity_endpoint(&incoming.endpoint, &local_peer.endpoint) {
-            incoming.deployment_id = local_peer.deployment_id.clone();
-            if incoming.name.is_empty() {
-                incoming.name = local_peer.name.clone();
-            }
-        }
-        align_peer_edit_deployment_id(&state, &mut incoming);
-        if endpoint_refresh_requested
-            && pending_endpoint_refresh(&state).is_some_and(|pending| refresh_id.as_deref() != Some(&pending.id))
-        {
-            return json_response(&ReplicateEditStatus {
-                success: false,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                err_detail: "another endpoint target refresh is pending".to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            });
-        }
-        if endpoint_refresh_requested
-            && (refresh_id.as_ref().is_none_or(String::is_empty) || !peer_endpoint_edit_requested(&state, &incoming))
-        {
-            return json_response(&ReplicateEditStatus {
-                success: false,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                err_detail: "peer endpoint was not found".to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            });
-        }
-        if endpoint_refresh_requested && internal_endpoint_refresh_already_committed(&state, &incoming) {
-            return json_response(&ReplicateEditStatus {
-                success: true,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            });
-        }
 
-        let mut state = if endpoint_refresh_requested {
-            validate_proposed_peer(&incoming)?;
-            state
-        } else {
-            apply_internal_peer_edit(state, &local_peer, incoming.clone(), ilm_expiry_override)?
+        // Everything the delivery is checked against — the fence, the pending
+        // operations, the peer it names — is read inside the transaction that
+        // applies it. Checking against a state loaded before the lock would
+        // let the check pass on one snapshot and the write land on another.
+        let commit_endpoint = local_endpoint.clone();
+        let commit_refresh_id = refresh_id.clone();
+        let outcome = update_site_replication_state_when_changed(move |state| {
+            let mut incoming = incoming;
+            let local_peer = local_peer_at_endpoint(commit_endpoint, state);
+            // The fence is self-reported — the shared service account means
+            // the sender cannot be identified — so it is honoured only after
+            // the admissibility check, against the same state it will gate.
+            let commit_fence =
+                commit_fence.filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence));
+            // Ordering fence: the sending site allocates the generation under
+            // its state-object lock, so a delivery that lost the race carries
+            // a generation this site has already passed. Applying it would
+            // roll the peer back to the older edit. Ack it — the newer edit
+            // already landed, so the sender has nothing to retry.
+            if let Some((origin, generation)) = commit_fence.as_ref()
+                && peer_edit_delivery_is_stale(state, origin, *generation)
+            {
+                return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked));
+            }
+            if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
+                return Ok(StateCommit::Unchanged(PeerEditOutcome::Rejected(
+                    "another site replication operation is pending",
+                )));
+            }
+            if same_identity_endpoint(&incoming.endpoint, &local_peer.endpoint) {
+                incoming.deployment_id = local_peer.deployment_id.clone();
+                if incoming.name.is_empty() {
+                    incoming.name = local_peer.name.clone();
+                }
+            }
+            align_peer_edit_deployment_id(state, &mut incoming);
+            if endpoint_refresh_requested
+                && pending_endpoint_refresh(state).is_some_and(|pending| commit_refresh_id.as_deref() != Some(&pending.id))
+            {
+                return Ok(StateCommit::Unchanged(PeerEditOutcome::Rejected(
+                    "another endpoint target refresh is pending",
+                )));
+            }
+            if endpoint_refresh_requested
+                && (commit_refresh_id.as_ref().is_none_or(String::is_empty) || !peer_endpoint_edit_requested(state, &incoming))
+            {
+                return Ok(StateCommit::Unchanged(PeerEditOutcome::Rejected("peer endpoint was not found")));
+            }
+            if endpoint_refresh_requested && internal_endpoint_refresh_already_committed(state, &incoming) {
+                return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked));
+            }
+
+            if endpoint_refresh_requested {
+                validate_proposed_peer(&incoming)?;
+                set_pending_endpoint_refresh(
+                    state,
+                    PendingEndpointRefresh {
+                        id: commit_refresh_id.unwrap_or_default(),
+                        peer: incoming,
+                        remote_peers: BTreeMap::new(),
+                        acked_deployment_ids: BTreeSet::new(),
+                    },
+                )?;
+            } else {
+                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, incoming, ilm_expiry_override)?;
+            }
+            // Raise the origin's high-water mark in the same commit as the
+            // edit it fences: a crash between the two would let the superseded
+            // delivery apply on the next attempt.
+            if let Some((origin, generation)) = commit_fence.as_ref() {
+                record_applied_peer_edit_generation(state, origin, *generation);
+            }
+            Ok(StateCommit::Changed(PeerEditOutcome::Applied(state.service_account_access_key.clone())))
+        })
+        .await?;
+
+        let service_account_access_key = match outcome {
+            PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
+            PeerEditOutcome::Acked => {
+                return json_response(&ReplicateEditStatus {
+                    success: true,
+                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                });
+            }
+            PeerEditOutcome::Rejected(err_detail) => {
+                return json_response(&ReplicateEditStatus {
+                    success: false,
+                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                    err_detail: err_detail.to_string(),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                });
+            }
         };
         if endpoint_refresh_requested {
-            set_pending_endpoint_refresh(
-                &mut state,
-                PendingEndpointRefresh {
-                    id: refresh_id.clone().unwrap_or_default(),
-                    peer: incoming.clone(),
-                    remote_peers: BTreeMap::new(),
-                    acked_deployment_ids: BTreeSet::new(),
-                },
-            )?;
-        }
-        // Raise the origin's high-water mark in the same commit as the edit it
-        // fences: a crash between the two would let the superseded delivery
-        // apply on the next attempt.
-        if let Some((origin, generation)) = delivery_fence.as_ref() {
-            record_applied_peer_edit_generation(&mut state, origin, *generation);
-        }
-        save_site_replication_state(&state).await?;
-        if endpoint_refresh_requested {
-            if state.service_account_access_key.is_empty() {
+            if service_account_access_key.is_empty() {
                 return json_response(&ReplicateEditStatus {
                     success: false,
                     status: SITE_REPL_EDIT_SUCCESS.to_string(),
@@ -9402,23 +10873,29 @@ impl Operation for SRPeerEditHandler {
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 });
             }
-            let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
+            let service_account_secret_key = site_replicator_service_account_secret(&service_account_access_key).await?;
             let pending_id = refresh_id.unwrap_or_default();
-            drop(state_guard);
+            // The bucket-target rewrite talks to the store for every bucket;
+            // it runs between the two transactions, never inside one.
             refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
-            let _state_guard = site_replication_state_process_guard().await;
-            let mut state = load_site_replication_state().await?;
-            let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
+            let committed = update_site_replication_state_when_changed(move |state| {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
+                    return Ok(StateCommit::Unchanged(false));
+                };
+                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, pending.peer, ilm_expiry_override)?;
+                clear_pending_endpoint_refresh(state);
+                Ok(StateCommit::Changed(true))
+            })
+            .await?;
+            if !committed {
                 return json_response(&ReplicateEditStatus {
                     success: false,
                     status: SITE_REPL_EDIT_SUCCESS.to_string(),
                     err_detail: "endpoint target refresh state changed during update".to_string(),
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 });
-            };
-            state = apply_internal_peer_edit(state, &local_peer, pending.peer, ilm_expiry_override)?;
-            clear_pending_endpoint_refresh(&mut state);
-            save_site_replication_state(&state).await?;
+            }
             return json_response(&ReplicateEditStatus {
                 success: true,
                 status: SITE_REPL_EDIT_SUCCESS.to_string(),
@@ -9439,19 +10916,19 @@ impl Operation for SRPeerRemoveHandler {
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-        let _state_guard = site_replication_state_process_guard().await;
-        let current_state = load_site_replication_state().await?;
-        if pending_endpoint_refresh(&current_state).is_some() {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-        }
-        if current_state.pending_rotation.is_some() {
-            return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
-        }
+        let removed_deployment_ids = update_site_replication_state(move |state| {
+            if pending_endpoint_refresh(state).is_some() {
+                return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
+            }
+            if state.pending_rotation.is_some() {
+                return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
+            }
 
-        let removed_deployment_ids = removed_deployment_ids_for_remove_req(&current_state, &remove_req);
-
-        let state = remove_sites(current_state, remove_req);
-        persist_site_replication_state(&state).await?;
+            let removed_deployment_ids = removed_deployment_ids_for_remove_req(state, &remove_req);
+            *state = remove_sites(std::mem::take(state), remove_req);
+            Ok(removed_deployment_ids)
+        })
+        .await?;
 
         // Clean up bucket targets and replication rules that referenced removed peers.
         if !removed_deployment_ids.is_empty()
@@ -9483,7 +10960,6 @@ impl Operation for SiteReplicationResyncOpHandler {
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (peer, existing_status) = {
-            let _state_guard = site_replication_state_process_guard().await;
             let state = load_site_replication_state().await?;
             let local_peer = current_local_runtime_peer(&state);
             let requested_peer = normalize_peer_info(requested_peer);
@@ -9644,9 +11120,11 @@ impl Operation for SRStateEditHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
-        let _state_guard = site_replication_state_process_guard().await;
-        let state = apply_state_edit_req(load_site_replication_state().await?, body);
-        save_site_replication_state(&state).await?;
+        update_site_replication_state(move |state| {
+            *state = apply_state_edit_req(std::mem::take(state), body);
+            Ok(())
+        })
+        .await?;
         Ok(empty_response(StatusCode::OK))
     }
 }
@@ -9658,15 +11136,11 @@ impl Operation for SiteReplicationRepairHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let (state, local_peer) = {
-            let _state_guard = site_replication_state_process_guard().await;
-            let state = load_site_replication_state().await?;
-            if !state.enabled() || state.service_account_access_key.is_empty() {
-                return Err(s3_error!(InvalidRequest, "site replication is not configured"));
-            }
-            let local_peer = current_local_peer(&req, &state);
-            (state, local_peer)
-        };
+        let state = load_site_replication_state().await?;
+        if !state.enabled() || state.service_account_access_key.is_empty() {
+            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+        }
+        let local_peer = current_local_peer(&req, &state);
         let body: SiteReplicationRepairRequest = read_site_replication_json(req, "", false).await?;
         let info = build_sr_info(&state, &local_peer).await?;
         let plan = site_replication_bootstrap_plan(&info)?;
@@ -9769,44 +11243,55 @@ impl Operation for SRRotateServiceAccountHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let (pending_rotation, local_peer, previous_access_key) = {
-            let _state_guard = site_replication_state_process_guard().await;
-            let mut state = load_site_replication_state().await?;
+        // The lifecycle guard is what keeps the rotation's IAM writes and the
+        // background service-account reconciler apart: the reconciler runs
+        // its whole repair under a lifecycle try-acquire, and its
+        // pending-rotation precheck is only sound if a rotation cannot start
+        // mid-repair and race its own IAM write against the reconciler's
+        // stale one. (The removed process mutex used to provide this
+        // exclusion as a side effect.)
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let rotation_parent = cred.access_key.clone();
+        let (pending_rotation, local_peer, previous_access_key) = update_site_replication_state_when_changed(move |state| {
             if !state.enabled() {
                 return Err(s3_error!(InvalidRequest, "site replication is not configured"));
             }
-            if pending_endpoint_refresh(&state).is_some() {
+            if pending_endpoint_refresh(state).is_some() {
                 return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
             }
             if state.pending_remove.is_some() {
                 return Err(s3_error!(InvalidRequest, "site replication remove is pending"));
             }
-            let local_peer = current_local_peer(&req, &state);
+            let local_peer = local_peer_at_endpoint(local_endpoint, state);
             let previous_access_key = state.service_account_access_key.clone();
 
+            // Resuming a rotation another attempt already recorded must
+            // not rewrite the state: the pending record is the contract
+            // the peers were told about.
             if let Some(pending) = state.pending_rotation.clone() {
-                (pending, local_peer, previous_access_key)
-            } else {
-                let new_secret_key = rustfs_credentials::gen_secret_key(40)
-                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?;
-                state.service_account_access_key = SITE_REPLICATOR_SERVICE_ACCOUNT.to_string();
-                state.service_account_parent = cred.access_key.clone();
-                state.updated_at = Some(OffsetDateTime::now_utc());
-                let pending = PendingRotation {
-                    id: Uuid::new_v4().to_string(),
-                    access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
-                    parent: cred.access_key.clone(),
-                    new_secret_key,
-                    secret_candidates: legacy_site_replicator_state_secret(&state).into_iter().collect(),
-                    peers: state.peers.clone(),
-                    acked_deployment_ids: BTreeSet::new(),
-                    updated_at: state.updated_at,
-                };
-                state.pending_rotation = Some(pending.clone());
-                save_site_replication_state(&state).await?;
-                (pending, local_peer, previous_access_key)
+                return Ok(StateCommit::Unchanged((pending, local_peer, previous_access_key)));
             }
-        };
+
+            let new_secret_key = rustfs_credentials::gen_secret_key(40)
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("generate secret key failed: {e}")))?;
+            state.service_account_access_key = SITE_REPLICATOR_SERVICE_ACCOUNT.to_string();
+            state.service_account_parent = rotation_parent.clone();
+            state.updated_at = Some(OffsetDateTime::now_utc());
+            let pending = PendingRotation {
+                id: Uuid::new_v4().to_string(),
+                access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                parent: rotation_parent,
+                new_secret_key,
+                secret_candidates: legacy_site_replicator_state_secret(state).into_iter().collect(),
+                peers: state.peers.clone(),
+                acked_deployment_ids: BTreeSet::new(),
+                updated_at: state.updated_at,
+            };
+            state.pending_rotation = Some(pending.clone());
+            Ok(StateCommit::Changed((pending, local_peer, previous_access_key)))
+        })
+        .await?;
 
         if !previous_access_key.is_empty()
             && let Ok(previous_iam_secret) = site_replicator_service_account_secret(&previous_access_key).await
@@ -11149,6 +12634,320 @@ mod tests {
         assert!(target_state.peers["remote"].skip_tls_verify);
     }
 
+    fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<OffsetDateTime>) -> SiteReplicationRetryEvent {
+        SiteReplicationRetryEvent {
+            id: format!("evt-{peer}"),
+            peer_deployment_id: peer.to_string(),
+            peer_endpoint: format!("https://{peer}.example.com"),
+            path: path.to_string(),
+            retry_count,
+            failed: retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER,
+            last_error: "remote-operation-failed".to_string(),
+            updated_at,
+            edit_generation: None,
+        }
+    }
+
+    /// P1-3 red-light: the drain must only ever act on deliveries it can
+    /// replay faithfully. IAM / bucket-meta entries collapse per (peer, path)
+    /// with no body persisted — only a snapshot resend is truthful; bucket
+    /// makes/replication configs are re-derivable; destructive bucket ops and
+    /// unrelated `internal:` marker records are never background-replayed.
+    #[test]
+    fn test_classify_site_replication_retry_event_actions() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let classify = |path: &str| classify_site_replication_retry_event(&drain_event("remote", path, 1, Some(now)));
+
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/iam-item"),
+            Some(RetryDrainAction::IamSnapshot)
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
+            Some(RetryDrainAction::BucketMetadataSnapshot)
+        );
+        assert_eq!(classify(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH), Some(RetryDrainAction::IamSnapshot));
+        assert_eq!(
+            classify(SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH),
+            Some(RetryDrainAction::BucketMetadataSnapshot)
+        );
+        assert_eq!(classify(SITE_REPLICATION_PEER_EDIT_PATH), Some(RetryDrainAction::PeerEdit));
+        assert_eq!(
+            classify(
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning&createdAt=1"
+            ),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication"),
+            Some(RetryDrainAction::BucketOpReplay {
+                operation: SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION.to_string(),
+                bucket: "photos".to_string(),
+            })
+        );
+        // Destructive ops are operator territory: replaying a bucket delete
+        // against a peer whose bucket was since recreated is irreversible.
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket"),
+            None
+        );
+        assert_eq!(
+            classify("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket"),
+            None
+        );
+        // `internal:` records store payloads in `last_error`, not failures.
+        assert_eq!(classify(SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH), None);
+        assert_eq!(classify("internal:some-future-marker"), None);
+        assert_eq!(classify("/rustfs/admin/v3/site-replication/peer/unknown"), None);
+    }
+
+    #[test]
+    fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
+        let old = SRIAMItem {
+            r#type: "policy".to_string(),
+            name: "readwrite".to_string(),
+            updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.updated_at = Some(OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("timestamp"));
+
+        let sent = RetrySnapshot::Iam(vec![old]);
+        let changed = RetrySnapshot::Iam(vec![new]);
+        assert_ne!(sent.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn test_retry_snapshot_replays_a_concurrent_deletion_as_a_tombstone() {
+        let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_010).expect("timestamp");
+        let policy = SRIAMItem {
+            r#type: "policy".to_string(),
+            name: "readwrite".to_string(),
+            policy: Some(serde_json::json!({"Version": "2012-10-17"})),
+            ..Default::default()
+        };
+        let replay =
+            RetrySnapshot::replay_after_change(&RetrySnapshot::Iam(vec![policy]), &RetrySnapshot::Iam(Vec::new()), observed_at);
+        let RetrySnapshot::Iam(items) = replay else {
+            panic!("IAM snapshot expected");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "readwrite");
+        assert!(items[0].policy.is_none());
+        assert_eq!(items[0].updated_at, Some(observed_at));
+
+        let bucket = SRBucketMeta {
+            r#type: "tags".to_string(),
+            bucket: "photos".to_string(),
+            tags: Some("encoded-tags".to_string()),
+            ..Default::default()
+        };
+        let replay = RetrySnapshot::replay_after_change(
+            &RetrySnapshot::BucketMetadata(vec![bucket]),
+            &RetrySnapshot::BucketMetadata(Vec::new()),
+            observed_at,
+        );
+        let RetrySnapshot::BucketMetadata(items) = replay else {
+            panic!("bucket metadata snapshot expected");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].bucket, "photos");
+        assert_eq!(items[0].r#type, "tags");
+        assert!(items[0].tags.is_none());
+        assert_eq!(items[0].updated_at, Some(observed_at));
+    }
+
+    /// Exponential backoff gates every attempt: without it a dead peer's
+    /// entries hit `failed` (retry_count >= 3) within 30 minutes of reconcile
+    /// ticks and the retry stats lose their signal.
+    #[test]
+    fn test_site_replication_retry_backoff_schedule() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let at = |secs_ago: i64| Some(now - time::Duration::seconds(secs_ago));
+        let elapsed = |retry_count: u32, secs_ago: i64| {
+            site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", retry_count, at(secs_ago)), now)
+        };
+
+        // No record of when it failed: attempt now.
+        assert!(site_replication_retry_backoff_elapsed(&drain_event("remote", "/p", 1, None), now));
+        // First failure: one reconcile interval.
+        assert!(!elapsed(1, 599));
+        assert!(elapsed(1, 601));
+        // Third failure: 600 * 2^2 = 2400s.
+        assert!(!elapsed(3, 1200));
+        assert!(elapsed(3, 2401));
+        // Ceiling: a long-dead peer is still probed daily, never less often.
+        assert!(!elapsed(30, 86_000));
+        assert!(elapsed(30, 86_401));
+    }
+
+    /// The actionable subset respects classification, peer membership and
+    /// backoff; everything else stays untouched in the queue.
+    #[test]
+    fn test_actionable_site_replication_retry_events_filters() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let old = Some(now - time::Duration::seconds(700));
+        let mut state = SiteReplicationState::default();
+        state
+            .peers
+            .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+        state.retry_queue = vec![
+            // Eligible: known peer, replayable, past backoff.
+            drain_event("remote", SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, 1, old),
+            // Not yet due.
+            drain_event("remote", "/rustfs/admin/v3/site-replication/peer/bucket-meta", 2, Some(now)),
+            // Unknown peer (removed since the failure was recorded).
+            drain_event("gone", "/rustfs/admin/v3/site-replication/peer/iam-item", 1, old),
+            // Marker record, not a delivery failure.
+            drain_event("remote", SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH, 0, old),
+            // Destructive op: operator-only.
+            drain_event(
+                "remote",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
+                1,
+                old,
+            ),
+        ];
+
+        let actionable = actionable_site_replication_retry_events(&state, now);
+        assert_eq!(actionable.len(), 1, "only the due, replayable, known-peer event is actionable");
+        assert_eq!(actionable[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+    }
+
+    /// The drain settles a peer-edit success under a freshly allocated
+    /// generation; legacy queue entries carry `edit_generation: None` and
+    /// must be cleared by that generation-scoped settlement (`(Some, None)`
+    /// falls through to removal), or the drain would spin on them forever.
+    #[test]
+    fn test_settle_clears_legacy_none_generation_event_for_generation_scoped_success() {
+        let target = peer("remote", "https://remote.example.com");
+        let mut queue = vec![drain_event("remote", SITE_REPLICATION_PEER_EDIT_PATH, 1, None)];
+        assert!(queue[0].edit_generation.is_none());
+
+        let settled = settle_site_replication_retry_events(&mut queue, &target, SITE_REPLICATION_PEER_EDIT_PATH, Some(42));
+
+        assert_eq!(settled, 1, "a legacy None-generation event must settle under a newer generation");
+        assert!(queue.is_empty());
+    }
+
+    /// A successful snapshot resend cannot prove a failed *deletion* was
+    /// replayed, so the collapsed entry is escalated (operator-visible,
+    /// drain-idle) instead of cleared — unless a newer failure was stamped
+    /// during the delivery window, which keeps the entry drain-eligible.
+    #[test]
+    fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
+        let target = peer("remote", "https://remote.example.com");
+        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+
+        // Failure re-stamped after the snapshot: untouched, still eligible.
+        let mut queue = vec![drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            2,
+            Some(snapshot_at + time::Duration::seconds(5)),
+        )];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(
+                &mut queue,
+                &target,
+                SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+                Some(snapshot_at),
+            ),
+            0
+        );
+        assert!(!queue[0].failed);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_some(),
+            "a newer failure must stay drain-eligible"
+        );
+
+        // Unchanged since the snapshot: escalated, kept, drain-idle.
+        let mut queue = vec![drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            2,
+            Some(snapshot_at),
+        )];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert_eq!(queue.len(), 1, "the entry must survive until remote absence is proven");
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert!(queue[0].failed);
+        assert_eq!(queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
+        assert!(
+            classify_site_replication_retry_event(&queue[0]).is_none(),
+            "a snapshot-replayed entry must not be re-sent daily"
+        );
+        // Ordinary success dequeues must not clear the marker: collapsed
+        // paths are shared by every entity, so a successful Bob update
+        // proves nothing about a failed Alice deletion (second review
+        // round).
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
+        assert_eq!(queue.len(), 1, "an escalated entry must survive an ordinary delivery success");
+        // Only a repair — the operator's accountability transfer — settles it.
+        assert_eq!(dequeue_site_replication_retry_events_including_escalated(&mut queue, &target, path), 1);
+        assert!(queue.is_empty());
+
+        // A failed Alice deletion is stored under the internal path, so a
+        // successful Bob update on the shared wire path cannot erase it even
+        // before the drain runs.
+        let mut queue = Vec::new();
+        upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+
+        // A later hook failure overwrites the marker and re-arms the drain.
+        let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
+        escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
+        upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
+        assert!(classify_site_replication_retry_event(&queue[0]).is_some());
+
+        // Legacy entry without a timestamp: escalated.
+        let mut queue = vec![drain_event("remote", path, 2, None)];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+
+        // A cloned event can disappear during replay; escalation recreates
+        // the internal liability while leaving another peer's row untouched.
+        let mut queue = vec![drain_event("other", path, 2, Some(snapshot_at))];
+        assert_eq!(
+            escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at)),
+            1
+        );
+        assert!(!queue[0].failed);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[1].peer_deployment_id, target.deployment_id);
+        assert_eq!(queue[1].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+    }
+
+    #[test]
+    fn test_collapsed_retry_queue_migration_preserves_legacy_liability() {
+        let peer = PeerInfo {
+            deployment_id: "remote-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let wire_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut queue = vec![drain_event("remote-dep", wire_path, 2, Some(now))];
+
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, wire_path), 0);
+        assert!(normalize_collapsed_retry_queue_paths(&mut queue));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+        assert!(!normalize_collapsed_retry_queue_paths(&mut queue));
+    }
+
     #[test]
     fn test_pending_endpoint_refresh_retry_summary_redacts_pem() {
         let pem = "-----BEGIN CERTIFICATE-----\nsecret-marker\n-----END CERTIFICATE-----";
@@ -11356,6 +13155,35 @@ mod tests {
         assert!(!peer_capability_response_supported(&remote, StatusCode::NOT_FOUND, b"").expect("legacy peer"));
     }
 
+    /// P1-15 PR2: the add's finalize fan-out delivers peer edits after its
+    /// state transaction has been released — nothing may hold the state-object
+    /// lock across peer traffic. Ordering therefore rests entirely on the
+    /// generation allocated in that commit: an unstamped delivery is applied
+    /// by the receiver in arrival order, which is what the removed process
+    /// guard used to paper over (and never could across two nodes).
+    #[test]
+    fn add_handler_fans_out_peer_edits_under_the_committed_generation() {
+        let src = include_str!("site_replication.rs");
+        let add = src
+            .split("impl Operation for SiteReplicationAddHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SiteReplicationRemoveHandler").next())
+            .expect("add handler block");
+
+        assert!(
+            add.contains("next_peer_edit_generation"),
+            "the add must allocate a fan-out generation (inside the committing transaction)"
+        );
+        assert!(
+            add.contains("peer_edit_path_with_fence"),
+            "the add's finalize fan-out must carry the committed generation fence"
+        );
+        assert!(
+            !add.contains("SITE_REPLICATION_PEER_EDIT_PATH"),
+            "the finalize fan-out must not fall back to the unstamped peer-edit path"
+        );
+    }
+
     #[test]
     fn test_tls_capability_gates_run_before_add_or_edit_state_side_effects() {
         let src = include_str!("site_replication.rs");
@@ -11384,8 +13212,8 @@ mod tests {
         );
         assert!(
             edit.find("require_edit_peer_tls_capability").expect("edit capability gate")
-                < edit.find("save_site_replication_state").expect("state save"),
-            "edit capability gate must run before state is saved"
+                < edit.find("update_site_replication_state(").expect("state commit"),
+            "edit capability gate must run before the state is committed"
         );
     }
 
@@ -11643,12 +13471,33 @@ mod tests {
         // rejects against — dropping either half silently restores
         // last-writer-wins between two nodes of the sending site.
         assert!(
-            handler_block.contains("peer_edit_delivery_is_stale(&state, origin, *generation)"),
+            handler_block.contains("peer_edit_delivery_is_stale(state, origin, *generation)"),
             "SRPeerEditHandler must reject peer edits a newer generation already superseded"
         );
         assert!(
-            handler_block.contains("record_applied_peer_edit_generation(&mut state, origin, *generation);"),
+            handler_block.contains("record_applied_peer_edit_generation(state, origin, *generation);"),
             "SRPeerEditHandler must record the applied generation so later stale deliveries are recognised"
+        );
+        // Fence hardening: origin and generation are self-reported by a
+        // caller the shared service account cannot identify, so the handler
+        // must pass the fence through the admissibility check — against the
+        // same state the fence gates, i.e. inside the transaction — before
+        // reading or raising any high-water mark.
+        assert!(
+            handler_block.contains(".filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence))"),
+            "SRPeerEditHandler must admit a fence only through peer_edit_fence_is_admissible inside the state transaction"
+        );
+        // P1-15 PR2: both halves of the fence and the edit they fence share
+        // ONE transaction. Checking the fence against a state read outside the
+        // lock would let the check pass on one snapshot and the write land on
+        // another — which is the interleaving the fence exists to reject.
+        assert!(
+            handler_block.contains("update_site_replication_state_when_changed(move |state| {"),
+            "SRPeerEditHandler must take the fence decision inside the state transaction"
+        );
+        assert!(
+            !handler_block.contains("save_site_replication_state("),
+            "SRPeerEditHandler must not write the state outside the transaction boundary"
         );
 
         let sender_block = src
@@ -11657,7 +13506,7 @@ mod tests {
             .and_then(|rest| rest.split("pub struct SRPeerEditCapabilitiesHandler").next())
             .expect("SiteReplicationEditHandler block should exist");
         assert!(
-            sender_block.contains("let edit_generation = next_peer_edit_generation(&mut state);"),
+            sender_block.contains("Ok((next_peer_edit_generation(state), peers_to_send))"),
             "the edit handler must allocate the generation inside the committed state, not outside the lock"
         );
     }
@@ -11936,14 +13785,12 @@ mod tests {
         let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
         let add_guard =
             SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
-        let add_state = site_replication_state_process_guard().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
         let remove = tokio::spawn(async move {
             let _ = started_tx.send(());
             let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
             let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let _state = site_replication_state_process_guard().await;
             let _ = entered_tx.send(());
         });
         started_rx.await.expect("remove task started");
@@ -11954,7 +13801,6 @@ mod tests {
         assert!(matches!(entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
 
         drop(callback);
-        drop(add_state);
         drop(add_guard);
         tokio::time::timeout(Duration::from_millis(500), remove)
             .await
@@ -12327,6 +14173,87 @@ mod tests {
         let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
 
         assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
+    }
+
+    /// A deleted expiry state (entry value None, axis set) must travel as an
+    /// explicit timestamped delete item — a peer that missed the live delete
+    /// otherwise keeps stale expiry rules through every repair (review
+    /// finding).
+    #[test]
+    fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
+        let deleted_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut info = SRInfo::default();
+        info.state.peers.insert(
+            "remote-dep".to_string(),
+            PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+        info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                expiry_lc_config: None,
+                expiry_lc_config_updated_at: Some(deleted_at),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+
+        let item = plan
+            .bucket_items
+            .iter()
+            .find(|item| item.r#type == "lc-config")
+            .expect("a deleted expiry state must produce an lc-config delete item");
+        assert!(item.expiry_lc_config.is_none(), "delete items carry no config body");
+        assert_eq!(item.expiry_updated_at, Some(deleted_at));
+        assert_eq!(item.updated_at, Some(deleted_at));
+    }
+
+    /// What each local lifecycle state contributes to the SRInfo entry:
+    /// deletions are timestamped statements, never-configured buckets and
+    /// transition-only configs without an expiry axis say nothing.
+    #[test]
+    fn test_lifecycle_expiry_statement_matrix() {
+        let created = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
+        meta.created = created;
+        // Never configured: load backfills the write time to `created`.
+        meta.lifecycle_config_updated_at = created;
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Deleted: the write time survives deletion and exceeds creation.
+        let deleted_at = created + time::Duration::seconds(100);
+        meta.lifecycle_config_updated_at = deleted_at;
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("deletion is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis, deleted_at);
+
+        // Present with expiry rules and the axis: subset + axis travel.
+        let expiry_axis = created + time::Duration::seconds(50);
+        let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        config.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
+        assert!(subset.is_some());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
+
+        // Transition-only without an axis: nothing to say (a delete stamped
+        // off the whole-config time would erase newer peer expiry state).
+        meta.lifecycle_config_xml = serialize(&lc_config(vec![lc_rule("t1", None, Some(30))])).expect("serialize config");
+        assert!(lifecycle_expiry_statement(&meta).is_none());
+
+        // Transition-only WITH an axis: expiry rules were properly removed —
+        // the delete travels at that axis.
+        let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        transition_only.expiry_updated_at = Some(s3s::dto::Timestamp::from(expiry_axis));
+        meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
+        let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
+        assert!(subset.is_none());
+        assert_eq!(axis.unix_timestamp(), expiry_axis.unix_timestamp());
     }
 
     #[test]
@@ -12736,6 +14663,7 @@ mod tests {
         upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
 
         assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
         assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
         assert!(queue[0].failed);
         assert_eq!(queue[0].last_error, "third");
@@ -12777,19 +14705,18 @@ mod tests {
         );
         assert!(queue.is_empty());
 
-        // Broadcast paths carry no generation and keep settling unconditionally
-        // — their retry events live under their own path and never collide
-        // with a peer-edit delivery.
+        // Collapsed broadcast failures live under an internal snapshot path;
+        // an unrelated success on their shared wire path cannot settle them.
         let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
         upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
-        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 1);
+        assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 0);
+        assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     }
 
-    /// P1-15 review follow-up: the receiving side of the ordering fence. The
-    /// sender's process mutex is per node, so two nodes of the same site can
-    /// fan out in the opposite order to their commits; the receiver decides
-    /// ordering from the generation the sender allocated under the distributed
-    /// state lock.
+    /// P1-15 review follow-up: the receiving side of the ordering fence. Two
+    /// nodes of the sending site can fan out in the opposite order to their
+    /// commits; the receiver decides ordering from the generation the sender
+    /// allocated under the distributed state lock.
     #[test]
     fn peer_edit_fence_rejects_a_delivery_the_newer_edit_already_passed() {
         let mut state = SiteReplicationState::default();
@@ -12819,6 +14746,62 @@ mod tests {
         assert_eq!(peer_edit_path_with_fence(None, 9), SITE_REPLICATION_PEER_EDIT_PATH);
         assert_eq!(peer_edit_path_with_fence(Some(""), 9), SITE_REPLICATION_PEER_EDIT_PATH);
         assert!(peer_edit_fence(&HashMap::new()).is_none());
+    }
+
+    /// P1-15 PR2: an accepted join must PRESERVE the peer-edit high-water
+    /// marks of peers that stayed. Join fan-outs are routine (every add and
+    /// every service-account rotation delivers `SRPeerJoin` to existing
+    /// peers), so a blanket reset here would let any stalled older edit from
+    /// a peer that never left land after the join and roll its record back —
+    /// exactly the interleaving the fence exists to reject.
+    #[test]
+    fn peer_join_preserves_live_edit_generation_marks() {
+        let local = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "https://site-b.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        // `remote` is already a peer and has delivered edits up to generation
+        // 12; the incoming join (say, a rotation fan-out) keeps both sites.
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            applied_edit_generations: BTreeMap::from([(remote.deployment_id.clone(), 12)]),
+            ..Default::default()
+        };
+
+        apply_peer_join(
+            &mut state,
+            &local,
+            SRPeerJoinReq {
+                svc_acct_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                svc_acct_secret_key: "svc-secret".to_string(),
+                svc_acct_parent: "root".to_string(),
+                peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote.clone()),
+                ]),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            },
+            true,
+        );
+
+        assert_eq!(
+            state.applied_edit_generations.get(&remote.deployment_id),
+            Some(&12),
+            "the join must keep the live mark for a peer that stayed: {:?}",
+            state.applied_edit_generations
+        );
+        assert!(
+            peer_edit_delivery_is_stale(&state, &remote.deployment_id, 11),
+            "a stalled pre-join delivery must still be fenced out after the join"
+        );
+        assert_eq!(state.peers.len(), 2, "the join snapshot replaces the local topology");
     }
 
     /// One edit fans out one delivery per peer record under a single
@@ -12880,6 +14863,121 @@ mod tests {
         assert!(peer_edit_delivery_is_stale(&state, origin, generation - 1));
     }
 
+    /// A fence is self-reported: every site authenticates peer traffic with
+    /// the same site-replicator credential, so a compromised peer can stamp
+    /// ANY origin with ANY generation. An origin the receiver does not
+    /// replicate with — or the receiver itself — is ignored and plants no
+    /// mark; a mark a compromised peer plants for a CURRENT origin cannot
+    /// silence that origin, because the staleness window refuses to fence on
+    /// a mark implausibly far above the genuine deliveries.
+    #[test]
+    fn forged_peer_edit_fences_cannot_poison_the_high_water_marks() {
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([
+                (
+                    "site-local".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-local".to_string(),
+                        ..peer("local", "https://local.example:9000")
+                    },
+                ),
+                (
+                    "site-victim".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-victim".to_string(),
+                        ..peer("victim", "https://victim.example:9000")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        // An origin outside the current membership is refused outright...
+        let unknown = ("site-unknown".to_string(), 4u64);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &unknown));
+
+        // No site delivers edits to itself: a fence claiming the receiver as
+        // its origin is forged by construction, current peer or not.
+        let own = ("site-local".to_string(), 4u64);
+        assert!(!peer_edit_fence_is_admissible(&state, "site-local", &own));
+
+        // A current remote peer's fence is admitted and works end to end.
+        let genuine = ("site-victim".to_string(), 1u64);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &genuine));
+        assert!(!peer_edit_delivery_is_stale(&state, &genuine.0, genuine.1));
+        record_applied_peer_edit_generation(&mut state, &genuine.0, genuine.1);
+        assert_eq!(state.applied_edit_generations.get("site-victim"), Some(&1));
+
+        // A forged u64::MAX-scale mark CAN be recorded — the shared service
+        // account means the receiver cannot tell the stamp was forged — but
+        // it is inert: the victim's genuine hybrid-clock deliveries sit far
+        // more than the staleness window below it, so they keep applying
+        // instead of being silently acked-and-dropped.
+        record_applied_peer_edit_generation(&mut state, "site-victim", u64::MAX);
+        assert!(!peer_edit_delivery_is_stale(&state, "site-victim", edit_generation_wall_clock()));
+    }
+
+    /// The staleness window bounds the fence by DISTANCE from the mark, not
+    /// by an absolute clock ceiling, so ordering must hold wherever the
+    /// origin's hybrid clock actually operates. The regression that matters:
+    /// a temporary wall-clock excursion far in the future is persisted by
+    /// `next_peer_edit_generation` (`max(now, prev + 1)` never comes back
+    /// down), and two later edits g+1 then g can arrive in reverse order —
+    /// g must still be fenced, even though both generations dwarf the
+    /// receiver's clock. Conversely a mark further above a delivery than any
+    /// genuine race can explain must not fence it.
+    #[test]
+    fn peer_edit_fence_orders_a_persisted_future_clock_and_defuses_distant_marks() {
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([(
+                "site-origin".to_string(),
+                PeerInfo {
+                    deployment_id: "site-origin".to_string(),
+                    ..peer("origin", "https://origin.example:9000")
+                },
+            )]),
+            ..Default::default()
+        };
+
+        // The origin's clock once jumped ten years ahead; the hybrid clock
+        // keeps allocating from there long after the clock was corrected.
+        let excursion = edit_generation_wall_clock() + 10 * 365 * 24 * 60 * 60 * 1_000_000_000;
+        let fence = ("site-origin".to_string(), excursion + 1);
+        assert!(peer_edit_fence_is_admissible(&state, "site-local", &fence));
+        record_applied_peer_edit_generation(&mut state, &fence.0, fence.1);
+
+        // The reverse delivery of the race: g arrives after g+1 landed.
+        // Without the fence it would commit last and roll g+1 back.
+        assert!(peer_edit_delivery_is_stale(&state, "site-origin", excursion));
+        // Equal generation (same edit's fan-out or a replay) still applies,
+        // as does the next edit.
+        assert!(!peer_edit_delivery_is_stale(&state, "site-origin", excursion + 1));
+        assert!(!peer_edit_delivery_is_stale(&state, "site-origin", excursion + 2));
+
+        // The window's exact boundary: a delivery trailing the mark by the
+        // full window is still fenced; one nanosecond further is not — that
+        // distance is no longer explicable by a genuine race, only by a
+        // forged mark or an excursion the origin has left behind.
+        let mark = fence.1;
+        // A straggler trailing by a concrete hour must still be fenced —
+        // pins the window's real magnitude, not just its symbolic boundary.
+        assert!(peer_edit_delivery_is_stale(&state, "site-origin", mark - 60 * 60 * 1_000_000_000));
+        assert!(peer_edit_delivery_is_stale(
+            &state,
+            "site-origin",
+            mark - PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS
+        ));
+        assert!(!peer_edit_delivery_is_stale(
+            &state,
+            "site-origin",
+            mark - PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS - 1
+        ));
+
+        // A pre-hybrid plain-counter origin trails such a mark by eons: it
+        // is not fenced (the rc.2-era downgrade case), it just runs
+        // unfenced until its counter regime catches up.
+        assert!(!peer_edit_delivery_is_stale(&state, "site-origin", 3));
+    }
+
     /// P1-15 review follow-up: a site that leaves the mesh drops below two
     /// peers, which clears its state object and restarts its generation
     /// counter at zero. A mark left over from its previous membership would
@@ -12917,6 +15015,104 @@ mod tests {
         assert!(!peer_edit_delivery_is_stale(&reloaded, "origin-site", 1));
     }
 
+    /// The unilateral-removal rejoin gap the hybrid clock closes. The origin
+    /// was removed while unreachable, but THIS site never dropped it from
+    /// its peer map, so the load-time mark pruning never fired and the mark
+    /// from the previous membership survives. The origin's recreated state
+    /// object restarts its counter, and with a plain `previous + 1` counter
+    /// every delivery it sent — generations 1, 2, … below the stale mark —
+    /// would be silently acked-and-dropped until the counter caught up. The
+    /// wall-clock floor in `next_peer_edit_generation` lifts the restarted
+    /// counter over every value the deleted lifetime handed out. Reverting
+    /// the allocation to the plain counter (dropping the wall-clock max)
+    /// turns the not-stale assertion red.
+    #[test]
+    fn hybrid_generation_unfences_a_rejoined_origin_whose_counter_restarted() {
+        // First lifetime of the origin's state object: two allocations, both
+        // capped by the wall clock at their own allocation.
+        let mut first_life = SiteReplicationState::default();
+        let straggler = next_peer_edit_generation(&mut first_life);
+        let last_applied = next_peer_edit_generation(&mut first_life);
+        assert!(last_applied > straggler, "allocations must be strictly increasing");
+
+        // The receiver applied up to `last_applied` and keeps the origin in
+        // its peer map across the unilateral removal — reloading must keep
+        // the mark, which is exactly why pruning cannot cover this case.
+        let mut receiver = SiteReplicationState::default();
+        receiver.peers.insert(
+            "origin-site".to_string(),
+            PeerInfo {
+                deployment_id: "origin-site".to_string(),
+                ..peer("origin", "https://origin.example:9000")
+            },
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", last_applied);
+        let mut receiver = parse_site_replication_state(&serde_json::to_vec(&receiver).expect("serialize")).expect("reload");
+        assert_eq!(receiver.applied_edit_generations.get("origin-site"), Some(&last_applied));
+
+        // The origin rejoins with a RECREATED state object: counter back at
+        // zero. The wall-clock floor must lift its first allocation over the
+        // previous lifetime's mark…
+        let mut second_life = SiteReplicationState::default();
+        let restarted = next_peer_edit_generation(&mut second_life);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "the recreated lifetime's first allocation ({restarted}) must not be fenced by the previous lifetime's mark ({last_applied})"
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", restarted);
+
+        // …while a pre-removal delivery still in flight stays below the new
+        // floor and remains correctly fenced — the rollback the fence exists
+        // to reject.
+        assert!(
+            peer_edit_delivery_is_stale(&receiver, "origin-site", straggler),
+            "a pre-removal in-flight delivery ({straggler}) must stay fenced after the rejoin"
+        );
+    }
+
+    /// Marks recorded before the hybrid clock existed are small plain-counter
+    /// values, far below any wall-clock allocation: a restarted origin passes
+    /// them as soon as the SENDER runs the hybrid clock — nothing changes on
+    /// the wire or in the receiver, so pre-hybrid receivers get the fix too.
+    /// The other direction is unchanged: among plain-counter values the
+    /// generation order still fences the delivery that lost the race.
+    #[test]
+    fn hybrid_generation_passes_marks_recorded_by_plain_counter_receivers() {
+        let mut receiver = SiteReplicationState::default();
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", 57);
+        assert!(peer_edit_delivery_is_stale(&receiver, "origin-site", 56));
+        assert!(!peer_edit_delivery_is_stale(&receiver, "origin-site", 57));
+
+        let mut rejoined = SiteReplicationState::default();
+        let restarted = next_peer_edit_generation(&mut rejoined);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "a wall-clock allocation ({restarted}) must clear a plain-counter mark (57)"
+        );
+    }
+
+    /// The `previous + 1` half of the hybrid clock: allocations stay strictly
+    /// increasing even when the wall clock cannot move them forward — two
+    /// allocations inside one clock tick, or a clock that stepped backwards
+    /// mid-lifetime (a counter already ahead of the wall clock advances by
+    /// exactly one per allocation instead of jumping back). Dropping the
+    /// `previous + 1` half (allocating bare wall time) turns this red.
+    #[test]
+    fn hybrid_generation_is_strictly_increasing_when_the_clock_stalls() {
+        let mut state = SiteReplicationState {
+            // A counter far ahead of any wall clock this test will see.
+            edit_generation: u64::MAX / 2,
+            ..Default::default()
+        };
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 1);
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX / 2 + 2);
+        // Saturation pins at the ceiling instead of wrapping; the equal-value
+        // escape (`applied > generation` is false for equal) keeps deliveries
+        // applying rather than fencing the origin out.
+        state.edit_generation = u64::MAX;
+        assert_eq!(next_peer_edit_generation(&mut state), u64::MAX);
+    }
+
     #[test]
     fn test_retry_stats_for_state_counts_pending_and_failed() {
         let state = SiteReplicationState {
@@ -12948,7 +15144,7 @@ mod tests {
             deployment_id: "current-dep".to_string(),
             ..peer("remote", "https://remote.example.com")
         };
-        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let path = SITE_REPLICATION_PEER_EDIT_PATH;
         let mut queue = vec![
             SiteReplicationRetryEvent {
                 id: "same-endpoint".to_string(),
@@ -13830,6 +16026,405 @@ mod tests {
         assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
     }
 
+    fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
+        s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            expiration: expiry_days.map(|days| s3s::dto::LifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            }),
+            transitions: transition_days.map(|days| {
+                vec![s3s::dto::Transition {
+                    days: Some(days),
+                    storage_class: Some(s3s::dto::TransitionStorageClass::from_static(s3s::dto::TransitionStorageClass::GLACIER)),
+                    date: None,
+                }]
+            }),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+        }
+    }
+
+    fn lc_config(rules: Vec<s3s::dto::LifecycleRule>) -> s3s::dto::BucketLifecycleConfiguration {
+        s3s::dto::BucketLifecycleConfiguration {
+            rules,
+            expiry_updated_at: None,
+        }
+    }
+
+    fn rule_ids(config: &s3s::dto::BucketLifecycleConfiguration) -> Vec<&str> {
+        config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
+    }
+
+    /// P1-1 red-light: an incoming expiry-only document must not erase the
+    /// receiver's local transition/tiering rules (today the receiver
+    /// overwrites the whole lifecycle config).
+    #[test]
+    fn test_merge_incoming_lifecycle_preserves_local_transition_rule() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t1"]);
+        let t1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("t1")).unwrap();
+        assert!(t1.transitions.as_ref().is_some_and(|t| !t.is_empty()), "local transition must survive");
+    }
+
+    /// Same-id incoming rule updates the expiry side but the local transition
+    /// side is authoritative (MinIO `CloneNonTransition` + restore).
+    #[test]
+    fn test_merge_incoming_lifecycle_same_id_keeps_local_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), None)])),
+            Some(lc_config(vec![lc_rule("r1", Some(1), Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        assert_eq!(merged.rules.len(), 1);
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7), "incoming expiry wins");
+        assert!(
+            r1.transitions.as_ref().is_some_and(|t| !t.is_empty()),
+            "local transition is authoritative"
+        );
+    }
+
+    /// Trust boundary: whatever the peer sends, its transition fields never
+    /// land here — a new incoming rule is stripped to its expiry parts.
+    #[test]
+    fn test_merge_incoming_lifecycle_strips_incoming_transitions() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("r1", Some(7), Some(1))])),
+            Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let r1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("r1")).unwrap();
+        assert!(
+            r1.transitions.as_ref().is_none_or(|t| t.is_empty()),
+            "incoming transition fields must be discarded"
+        );
+    }
+
+    /// A local rule whose expiry part was dropped upstream loses only the
+    /// expiry fields; a pure-expiry rule disappears entirely.
+    #[test]
+    fn test_merge_incoming_lifecycle_dropped_rule_strips_expiry_keeps_transition() {
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("other", Some(3), None)])),
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["mixed", "other"], "pure-expiry rule not in the incoming set is removed");
+        let mixed = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("mixed")).unwrap();
+        assert!(mixed.expiration.is_none(), "expiry side cleared");
+        assert!(mixed.transitions.as_ref().is_some_and(|t| !t.is_empty()), "transition side kept");
+    }
+
+    /// Peer lifecycle delete merges with the empty set: local transition rules
+    /// survive with their expiry parts cleared; only when nothing remains does
+    /// the whole config disappear.
+    #[test]
+    fn test_merge_incoming_lifecycle_delete_merges_with_empty() {
+        let merged = merge_incoming_lifecycle_config(
+            None,
+            Some(lc_config(vec![
+                lc_rule("mixed", Some(1), Some(30)),
+                lc_rule("pure-expiry", Some(2), None),
+            ])),
+            None,
+        )
+        .expect("transition rules must survive a peer lifecycle delete");
+        assert_eq!(rule_ids(&merged), vec!["mixed"]);
+        assert!(merged.rules[0].expiration.is_none());
+
+        assert!(
+            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None).is_none(),
+            "an all-expiry config deletes cleanly"
+        );
+    }
+
+    /// Disabled rules must survive the merge like enabled ones — the merge
+    /// must not reuse ENABLED-filtered helpers.
+    #[test]
+    fn test_merge_incoming_lifecycle_keeps_disabled_transition_rule() {
+        let mut disabled = lc_rule("t-disabled", None, Some(30));
+        disabled.status = s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::DISABLED);
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![disabled])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["e1", "t-disabled"]);
+    }
+
+    /// Abort-multipart-only rules carry no expiry semantics: local ones stay
+    /// untouched, incoming ones are not installed (they are site-local, like
+    /// MinIO's sender-side filter).
+    #[test]
+    fn test_merge_incoming_lifecycle_abort_mpu_rules_stay_local() {
+        let abort_only = |id: &str| s3s::dto::LifecycleRule {
+            id: Some(id.to_string()),
+            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            prefix: Some(String::new()),
+            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                days_after_initiation: Some(3),
+            }),
+            del_marker_expiration: None,
+            expiration: None,
+            filter: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            transitions: None,
+        };
+
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![abort_only("incoming-abort"), lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![abort_only("local-abort")])),
+            None,
+        )
+        .expect("merge should keep rules");
+
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["e1", "local-abort"],
+            "incoming abort-mpu rule is not installed; local one survives"
+        );
+    }
+
+    /// Repeated delivery of the same document must be byte-stable (rule order
+    /// deterministic), or every broadcast rewrites bucket metadata.
+    #[test]
+    fn test_merge_incoming_lifecycle_is_idempotent() {
+        let incoming = || Some(lc_config(vec![lc_rule("e1", Some(7), None), lc_rule("e2", Some(9), None)]));
+        let local = Some(lc_config(vec![lc_rule("t1", None, Some(30))]));
+
+        let once = merge_incoming_lifecycle_config(incoming(), local, None).expect("first merge");
+        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None).expect("second merge");
+
+        assert_eq!(
+            serialize(&once).expect("serialize once"),
+            serialize(&twice).expect("serialize twice"),
+            "merge must be idempotent for identical input"
+        );
+    }
+
+    /// The merged config records the expiry axis timestamp so the staleness
+    /// guard compares expiry updates against expiry updates (a local
+    /// transition-only edit must not shadow newer peer expiry updates).
+    #[test]
+    fn test_merge_incoming_lifecycle_stamps_expiry_updated_at() {
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let merged = merge_incoming_lifecycle_config(Some(lc_config(vec![lc_rule("e1", Some(7), None)])), None, Some(updated_at))
+            .expect("merge should keep rules");
+
+        let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
+        assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
+    }
+
+    /// MinIO's sender never emits del-marker-expiration rules
+    /// (CloneNonTransition drops them), so a MinIO expiry broadcast must not
+    /// delete this site's del-marker-only rules, and the local del-marker
+    /// side of a same-id rule is authoritative.
+    #[test]
+    fn test_merge_incoming_lifecycle_del_marker_rules_stay_local() {
+        let del_marker_only = |id: &str| {
+            let mut rule = lc_rule(id, None, None);
+            rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+            rule
+        };
+
+        // A local del-marker-only rule survives an incoming expiry document
+        // that does not mention it.
+        let merged = merge_incoming_lifecycle_config(
+            Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
+            Some(lc_config(vec![del_marker_only("dm-local")])),
+            None,
+        )
+        .expect("merge should keep rules");
+        let mut ids = rule_ids(&merged);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["dm-local", "e1"]);
+
+        // Same-id: the incoming expiry side wins, the local del-marker /
+        // abort-mpu side is authoritative and an incoming del-marker field is
+        // discarded at the trust boundary.
+        let mut local_mixed = lc_rule("r1", Some(1), None);
+        local_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+        local_mixed.abort_incomplete_multipart_upload = Some(s3s::dto::AbortIncompleteMultipartUpload {
+            days_after_initiation: Some(5),
+        });
+        let mut incoming_mixed = lc_rule("r1", Some(7), None);
+        incoming_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(9) });
+
+        let merged =
+            merge_incoming_lifecycle_config(Some(lc_config(vec![incoming_mixed])), Some(lc_config(vec![local_mixed])), None)
+                .expect("merge should keep rules");
+        let r1 = &merged.rules[0];
+        assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7));
+        assert_eq!(r1.del_marker_expiration.as_ref().and_then(|d| d.days), Some(3), "local del-marker wins");
+        assert_eq!(
+            r1.abort_incomplete_multipart_upload
+                .as_ref()
+                .and_then(|a| a.days_after_initiation),
+            Some(5),
+            "local abort-mpu wins"
+        );
+    }
+
+    /// Only a well-delimited zero-rule `<LifecycleConfiguration>` document is
+    /// the delete statement; truncated or foreign payloads must be rejected,
+    /// not treated as a delete that erases local expiry rules.
+    #[test]
+    fn test_zero_rule_lifecycle_tombstone_recognition() {
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>"));
+
+        // Documents with rules are not tombstones (they must parse strictly).
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><Rule><ID>x</ID></Rule></LifecycleConfiguration>"
+        ));
+        // Truncated / malformed / foreign payloads are rejected.
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><ExpiryUpdatedAt>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration><Rule></Broken>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"garbage"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<SomethingElse></SomethingElse>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(b""));
+        // Malformed children inside a well-delimited root are still rejected
+        // (second review round): a dangling open tag, stray text, an
+        // unclosed child, or nested markup is not a tombstone.
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration>stray text</LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><A><Rule/></A></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><Marker/></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>&bogus;</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<evil:LifecycleConfiguration/>"));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration><Marker/>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(b"<LifecycleConfiguration/>&bogus;"));
+    }
+
+    #[test]
+    fn test_lifecycle_merge_holds_metadata_transaction_across_read_and_write() {
+        let source = include_str!("site_replication.rs");
+        let apply = source
+            .split("async fn apply_bucket_meta_item")
+            .nth(1)
+            .and_then(|rest| rest.split("fn group_info_requires_upsert").next())
+            .expect("apply_bucket_meta_item source");
+        let acquire = apply
+            .find("acquire_bucket_metadata_transaction_lock_for_incarnation")
+            .expect("lifecycle merge transaction acquisition");
+        let read = apply.find("get_config_from_disk").expect("fresh lifecycle config read");
+        let write = apply
+            .find("update_under_transaction_lock")
+            .expect("lifecycle config write under transaction");
+
+        assert!(
+            acquire < read && read < write,
+            "the transaction must span the lifecycle read, merge, and write"
+        );
+    }
+
+    /// The staleness axis an incoming lc-config item must beat: the expiry
+    /// axis when present; the whole-config write time only for deleted or
+    /// legacy-with-expiry state; epoch for a transition-only config (its
+    /// whole-config time moves on transition edits and must not shadow
+    /// independent peer expiry updates — review finding).
+    #[test]
+    fn test_local_lifecycle_staleness_axis_selection() {
+        let whole = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let axis_ts = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
+
+        let mut with_axis = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        with_axis.expiry_updated_at = Some(s3s::dto::Timestamp::from(axis_ts));
+        assert_eq!(local_lifecycle_staleness_axis(Some(&with_axis), whole), axis_ts);
+
+        let legacy_with_expiry = lc_config(vec![lc_rule("e1", Some(7), None)]);
+        assert_eq!(local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole), whole);
+
+        let transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&transition_only), whole),
+            OffsetDateTime::UNIX_EPOCH,
+            "a transition-only config has no expiry state to protect"
+        );
+
+        assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
+    }
+
+    /// Sender-side filter: only the expiry subset leaves this site. MinIO
+    /// peers install incoming rules verbatim, so a full document would plant
+    /// this site's transition rules there.
+    #[test]
+    fn test_lifecycle_expiry_subset_xml_strips_transitions() {
+        let full = serialize(&lc_config(vec![lc_rule("mixed", Some(1), Some(30)), lc_rule("t-only", None, Some(7))]))
+            .expect("serialize full config");
+
+        let subset = lifecycle_expiry_subset_xml(&full).expect("expiry subset should remain");
+        let parsed: s3s::dto::BucketLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
+        assert_eq!(rule_ids(&parsed), vec!["mixed"]);
+        assert!(parsed.rules[0].transitions.is_none(), "transition side must not travel");
+
+        let transition_only =
+            serialize(&lc_config(vec![lc_rule("t-only", None, Some(7))])).expect("serialize transition-only config");
+        assert!(
+            lifecycle_expiry_subset_xml(&transition_only).is_none(),
+            "a transition-only config states 'no expiry rules' (delete semantics)"
+        );
+        assert!(lifecycle_expiry_subset_xml(b"").is_none());
+    }
+
+    /// A local parse failure must forward the document unfiltered — mapping
+    /// it to `None` would delete the peers' replicated expiry rules.
+    #[test]
+    fn test_lifecycle_expiry_subset_xml_forwards_unparseable_config() {
+        let garbage = b"<LifecycleConfiguration><Rule></Broken>";
+        assert_eq!(lifecycle_expiry_subset_xml(garbage).as_deref(), Some(garbage.as_slice()));
+    }
+
     // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
     // drop only a sender-owned site-replication ARN, never an operator's own role — the same
     // rule the merge path applies, so both paths agree on what is ours to rewrite.
@@ -13944,7 +16539,10 @@ mod tests {
         assert!(!target.secure);
         assert_eq!(target.target_bucket, "photos");
         assert_eq!(target.deployment_id, "remote");
-        assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        // Freshly minted ARNs use the `minio` partition so madmin-go tooling
+        // can parse them; legacy `arn:rustfs:` targets are preserved as-is
+        // (see the MinIO-era preservation test below).
+        assert_eq!(target.arn, "arn:minio:replication::remote:photos");
         assert_eq!(target.region, "us-east-1");
         let credentials = target
             .credentials
@@ -15283,71 +17881,353 @@ mod tests {
         assert!(parse_site_resync_page(&query, &newer).is_err());
     }
 
-    /// P1-15 review follow-up: isolates the PROCESS guard. One writer uses
-    /// the legacy shape that the not-yet-migrated call sites still use (take
-    /// the process mutex, then load / mutate / save through the plain
-    /// helpers, which take their own per-IO object locks); the other runs the
-    /// full transaction. They only stay serialized because the transaction
-    /// also takes the process mutex — drop it there and this test loses one
-    /// of the two updates.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// P1-15 PR2: the persist-or-skip side of the transaction. A miss
+    /// (`StateCommit::Unchanged`) must not write at all: the shared persist
+    /// helper clears the whole object once a state has ≤1 peer and no pending
+    /// rotation/removal, so a no-op ack or clear that "harmlessly" persisted
+    /// would delete the retry queue and every other field along with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_transaction_serializes_against_a_process_only_legacy_writer() {
+    async fn test_missed_pending_clear_must_not_rewrite_the_state_object() {
         publish_ready_iam_context().await;
 
+        // One peer, no pending records: exactly the shape the persist helper's clear
+        // branch fires on. Only the test-only seeder can write it.
         let seed = SiteReplicationState {
+            peers: BTreeMap::from([(
+                "site-solo".to_string(),
+                PeerInfo {
+                    deployment_id: "site-solo".to_string(),
+                    ..peer("site-solo", "https://solo.example:9000")
+                },
+            )]),
+            retry_queue: vec![SiteReplicationRetryEvent {
+                id: "evt-1".to_string(),
+                peer_deployment_id: "site-gone".to_string(),
+                peer_endpoint: "https://gone.example:9000".to_string(),
+                path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
+                retry_count: 2,
+                failed: false,
+                last_error: "peer offline".to_string(),
+                updated_at: Some(OffsetDateTime::now_utc()),
+                edit_generation: None,
+            }],
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        clear_pending_remove("no-such-remove").await.expect("no-op clear");
+        mark_pending_rotation_peer_acked("no-such-rotation", "site-x")
+            .await
+            .expect("no-op ack");
+        record_pending_remove_secret_candidate("no-such-remove", "secret".to_string())
+            .await
+            .expect("no-op candidate");
+
+        let reloaded = load_site_replication_state().await.expect("reload");
+        assert_eq!(
+            reloaded.retry_queue.len(),
+            1,
+            "a missed pending lookup persisted (and therefore cleared) the state object"
+        );
+        assert_eq!(reloaded.peers.len(), 1, "the peer record must survive the no-op calls");
+    }
+
+    /// Review follow-up on P1-15 PR2 (overtrue): two joins accepted by the
+    /// same node must not interleave their IAM writes with each other's
+    /// commits. Join A loads a stale snapshot and pauses before its IAM
+    /// write; join B (newer) applies secret B and commits; A resumes, its
+    /// IAM write would overwrite secret B, and its commit is then refused as
+    /// superseded — the persisted state advertises B's contract while IAM
+    /// holds A's secret. `admit_peer_join` closes this by serializing the
+    /// whole admission under the lifecycle guard and re-checking staleness
+    /// BEFORE the IAM step: with the guard, B cannot even start while A is
+    /// gated mid-IAM. Remove the guard (or move the IAM step ahead of the
+    /// fresh staleness check) and this test deadlocks or records B's IAM
+    /// write before A finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
+        publish_ready_iam_context().await;
+
+        // Whole-second timestamps so the RFC3339 round trip through the state
+        // object cannot lose sub-second precision under the equality asserts.
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
+        let local = PeerInfo {
+            deployment_id: "site-local".to_string(),
+            ..peer("site-local", "https://local.example:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-remote".to_string(),
+            ..peer("site-remote", "https://remote.example:9000")
+        };
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            updated_at: Some(now - Duration::from_secs(60)),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        let join_peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote.clone()),
+        ]);
+        let join_req = |updated_at: OffsetDateTime, secret: &str| SRPeerJoinReq {
+            svc_acct_access_key: "svc-join".to_string(),
+            svc_acct_secret_key: secret.to_string(),
+            svc_acct_parent: "root".to_string(),
+            peers: join_peers.clone(),
+            updated_at: Some(updated_at),
+        };
+
+        let iam_log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (a_entered_tx, a_entered_rx) = tokio::sync::oneshot::channel();
+        let (a_gate_tx, a_gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Join A (older, T1): pauses inside its IAM step.
+        let log_a = iam_log.clone();
+        let endpoint_a = "https://local.example:9000".to_string();
+        let req_a = join_req(now - Duration::from_secs(30), "secret-a");
+        let join_a = tokio::spawn(async move {
+            admit_peer_join(endpoint_a, req_a, true, move |_req| async move {
+                let _ = a_entered_tx.send(());
+                let _ = a_gate_rx.await;
+                log_a.lock().expect("iam log").push("iam-a");
+                Ok(())
+            })
+            .await
+        });
+        a_entered_rx.await.expect("join A reached its IAM step");
+
+        // Join B (newer, T2) arrives while A is gated mid-IAM. The lifecycle
+        // guard must hold it at the door.
+        let log_b = iam_log.clone();
+        let endpoint_b = "https://local.example:9000".to_string();
+        let req_b = join_req(now, "secret-b");
+        let join_b = tokio::spawn(async move {
+            admit_peer_join(endpoint_b, req_b, true, move |_req| async move {
+                log_b.lock().expect("iam log").push("iam-b");
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            iam_log.lock().expect("iam log").is_empty(),
+            "join B ran its IAM step while join A was still mid-admission: {:?}",
+            iam_log.lock().expect("iam log")
+        );
+
+        a_gate_tx.send(()).expect("release join A");
+        let outcome_a = join_a.await.expect("join A task").expect("join A admission");
+        let outcome_b = join_b.await.expect("join B task").expect("join B admission");
+        assert!(matches!(outcome_a, PeerJoinOutcome::Applied(..)), "join A must commit first");
+        assert!(
+            matches!(outcome_b, PeerJoinOutcome::Applied(..)),
+            "the newer join B must still apply after A"
+        );
+        assert_eq!(
+            *iam_log.lock().expect("iam log"),
+            vec!["iam-a", "iam-b"],
+            "IAM writes must land in admission order, ending on the committed join's secret"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").updated_at,
+            Some(now),
+            "the persisted state must end on join B, matching the last IAM write"
+        );
+    }
+
+    /// Review follow-up on P1-15 PR2 (overtrue, round 2): the same
+    /// interleaving driven by two SEPARATE NODES, which the process-local
+    /// lifecycle guard cannot reach. Both admissions run
+    /// `admit_peer_join_across_nodes` — the production path minus the
+    /// process-local guard, exactly what a second node executes — so only
+    /// the distributed join-admission lock keeps join B out while join A is
+    /// gated mid-IAM. Remove that lock and B's IAM write lands during A's
+    /// admission: the assertion on the empty IAM log turns red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_peer_join_admission_serializes_across_separate_nodes() {
+        publish_ready_iam_context().await;
+
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
+        let local = PeerInfo {
+            deployment_id: "site-local".to_string(),
+            ..peer("site-local", "https://local.example:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-remote".to_string(),
+            ..peer("site-remote", "https://remote.example:9000")
+        };
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            updated_at: Some(now - Duration::from_secs(60)),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+
+        let join_peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote.clone()),
+        ]);
+        let join_req = |updated_at: OffsetDateTime, secret: &str| SRPeerJoinReq {
+            svc_acct_access_key: "svc-join".to_string(),
+            svc_acct_secret_key: secret.to_string(),
+            svc_acct_parent: "root".to_string(),
+            peers: join_peers.clone(),
+            updated_at: Some(updated_at),
+        };
+
+        let iam_log: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (a_entered_tx, a_entered_rx) = tokio::sync::oneshot::channel();
+        let (a_gate_tx, a_gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Node A (older join, T1) pauses inside its IAM step while holding
+        // only the distributed admission lock.
+        let log_a = iam_log.clone();
+        let req_a = join_req(now - Duration::from_secs(30), "secret-a");
+        let join_a = tokio::spawn(async move {
+            admit_peer_join_across_nodes("https://local.example:9000".to_string(), req_a, true, move |_req| async move {
+                let _ = a_entered_tx.send(());
+                let _ = a_gate_rx.await;
+                log_a.lock().expect("iam log").push("iam-a");
+                Ok(())
+            })
+            .await
+        });
+        a_entered_rx.await.expect("node A reached its IAM step");
+
+        // Node B (newer join, T2) arrives on "another node": no process-local
+        // guard applies. The distributed admission lock must hold it.
+        let log_b = iam_log.clone();
+        let req_b = join_req(now, "secret-b");
+        let join_b = tokio::spawn(async move {
+            admit_peer_join_across_nodes("https://local.example:9000".to_string(), req_b, true, move |_req| async move {
+                log_b.lock().expect("iam log").push("iam-b");
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            iam_log.lock().expect("iam log").is_empty(),
+            "node B ran its IAM step while node A was still mid-admission: {:?}",
+            iam_log.lock().expect("iam log")
+        );
+
+        a_gate_tx.send(()).expect("release node A");
+        let outcome_a = join_a.await.expect("node A task").expect("node A admission");
+        let outcome_b = join_b.await.expect("node B task").expect("node B admission");
+        assert!(matches!(outcome_a, PeerJoinOutcome::Applied(..)), "node A must commit first");
+        assert!(
+            matches!(outcome_b, PeerJoinOutcome::Applied(..)),
+            "the newer join B must still apply after A"
+        );
+        assert_eq!(
+            *iam_log.lock().expect("iam log"),
+            vec!["iam-a", "iam-b"],
+            "IAM writes must land in admission order, ending on the committed join's secret"
+        );
+        assert_eq!(
+            load_site_replication_state().await.expect("reload").updated_at,
+            Some(now),
+            "the persisted state must end on join B, matching the last IAM write"
+        );
+    }
+
+    /// P1-15 PR2: the three-way contract of `finalize_pending_rotation_if_complete`
+    /// — no pending means "already finalized" (true, nothing written), a
+    /// different or incomplete rotation is left alone (false), and a fully
+    /// acked rotation is cleared in the same transaction that reports true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_finalize_pending_rotation_three_way_contract() {
+        publish_ready_iam_context().await;
+
+        let local_peer = PeerInfo {
+            deployment_id: "site-local".to_string(),
+            ..peer("site-local", "https://local.example:9000")
+        };
+        let remote_peer = PeerInfo {
+            deployment_id: "site-remote".to_string(),
+            ..peer("site-remote", "https://remote.example:9000")
+        };
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local_peer.deployment_id.clone(), local_peer.clone()),
+                (remote_peer.deployment_id.clone(), remote_peer.clone()),
+            ]),
             pending_rotation: Some(PendingRotation {
-                id: "rot-legacy".to_string(),
+                id: "rot-final".to_string(),
                 access_key: "svc-account".to_string(),
+                peers: BTreeMap::from([
+                    (local_peer.deployment_id.clone(), local_peer.clone()),
+                    (remote_peer.deployment_id.clone(), remote_peer.clone()),
+                ]),
                 ..Default::default()
             }),
             ..Default::default()
         };
         save_site_replication_state(&seed).await.expect("seed state");
 
-        const ROUNDS: usize = 8;
-        for round in 0..ROUNDS {
-            let legacy_id = format!("legacy-{round}");
-            let legacy = tokio::spawn(async move {
-                // Exactly what an unmigrated call site does today.
-                let _guard = site_replication_state_process_guard().await;
-                let mut state = load_site_replication_state().await.expect("legacy load");
-                if let Some(pending) = state.pending_rotation.as_mut() {
-                    pending.secret_candidates.push(legacy_id);
-                }
-                save_site_replication_state(&state).await.expect("legacy save");
-            });
-            let ack_id = format!("ack-{round}");
-            let migrated = tokio::spawn(async move {
-                mark_pending_rotation_peer_acked("rot-legacy", &ack_id)
-                    .await
-                    .expect("transaction writer");
-            });
-            legacy.await.expect("legacy task");
-            migrated.await.expect("transaction task");
-        }
+        assert!(
+            !finalize_pending_rotation_if_complete("other-rotation", &local_peer)
+                .await
+                .expect("mismatched id"),
+            "a different rotation id must not finalize"
+        );
+        assert!(
+            !finalize_pending_rotation_if_complete("rot-final", &local_peer)
+                .await
+                .expect("incomplete acks"),
+            "an un-acked remote peer must block finalization"
+        );
+        assert!(
+            load_site_replication_state()
+                .await
+                .expect("reload")
+                .pending_rotation
+                .is_some(),
+            "the pending rotation must survive both refusals"
+        );
 
-        let final_state = load_site_replication_state().await.expect("reload");
-        let pending = final_state.pending_rotation.expect("pending rotation survives");
-        for round in 0..ROUNDS {
-            assert!(
-                pending.secret_candidates.contains(&format!("legacy-{round}")),
-                "legacy writer update {round} was lost; candidates: {:?}",
-                pending.secret_candidates
-            );
-            assert!(
-                pending.acked_deployment_ids.contains(&format!("ack-{round}")),
-                "transaction writer update {round} was lost; acks: {:?}",
-                pending.acked_deployment_ids
-            );
-        }
+        mark_pending_rotation_peer_acked("rot-final", &remote_peer.deployment_id)
+            .await
+            .expect("ack remote");
+        assert!(
+            finalize_pending_rotation_if_complete("rot-final", &local_peer)
+                .await
+                .expect("finalize"),
+            "a fully acked rotation must finalize"
+        );
+        assert!(
+            load_site_replication_state()
+                .await
+                .expect("reload")
+                .pending_rotation
+                .is_none(),
+            "finalization must clear the pending rotation"
+        );
+        assert!(
+            finalize_pending_rotation_if_complete("rot-final", &local_peer)
+                .await
+                .expect("idempotent"),
+            "no pending rotation means already finalized"
+        );
     }
 
-    /// P1-15 review follow-up: isolates the DISTRIBUTED guard. Both writers
-    /// bypass the process mutex, which is what two separate nodes do — the
-    /// mutex is per process and cannot serialize them. Only the state-object
-    /// write lock keeps their read-modify-write sequences apart; drop it and
-    /// this test loses an update.
+    /// P1-15 review follow-up: isolates the DISTRIBUTED guard, which is now
+    /// the whole boundary. Two "nodes" run the production transaction
+    /// concurrently; only the state-object write lock keeps their
+    /// read-modify-write sequences apart — drop it and this test loses an
+    /// update.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_state_object_lock_serializes_writers_from_separate_nodes() {
@@ -15363,11 +18243,10 @@ mod tests {
         };
         save_site_replication_state(&seed).await.expect("seed state");
 
-        // Each "node" runs the production transaction minus the process
-        // mutex — the distributed state-object lock is the only thing left
-        // to keep them apart.
+        // Each "node" runs the production transaction; the distributed
+        // state-object lock is the only thing keeping them apart.
         fn node_local_update(candidate: String) -> impl std::future::Future<Output = S3Result<()>> {
-            update_site_replication_state_as_separate_node(move |state| {
+            update_site_replication_state(move |state| {
                 if let Some(pending) = state.pending_rotation.as_mut() {
                     pending.secret_candidates.push(candidate);
                 }
@@ -15397,10 +18276,9 @@ mod tests {
     }
 
     /// P1-15 review follow-up: the sending side of the peer-edit ordering
-    /// fence, driven by two separate nodes. Both bypass the process mutex —
-    /// which is exactly what two nodes of one site do — so the generation is
-    /// only unique because it is allocated inside the state transaction, under
-    /// the distributed state-object lock. Two nodes sharing a generation would
+    /// fence, driven by two separate nodes. The generation is unique only
+    /// because it is allocated inside the state transaction, under the
+    /// distributed state-object lock. Two nodes sharing a generation would
     /// leave the receiver unable to tell which edit is newer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
@@ -15419,7 +18297,7 @@ mod tests {
         save_site_replication_state(&seed).await.expect("seed state");
 
         fn node_local_allocate() -> impl std::future::Future<Output = S3Result<u64>> {
-            update_site_replication_state_as_separate_node(|state| Ok(next_peer_edit_generation(state)))
+            update_site_replication_state(|state| Ok(next_peer_edit_generation(state)))
         }
 
         const ROUNDS: usize = 8;
@@ -15437,10 +18315,77 @@ mod tests {
             generations.len(),
             "two nodes took the same edit generation, so their deliveries cannot be ordered: {generations:?}"
         );
+        // The hybrid clock allocates `max(wall nanos, previous + 1)` — the
+        // persisted counter is the largest allocation, and the `+ 1` half
+        // keeps allocations distinct even inside one clock tick.
+        assert_eq!(
+            Some(&load_site_replication_state().await.expect("reload").edit_generation),
+            unique.last(),
+            "the persisted counter must be the largest allocation handed out"
+        );
+    }
+
+    /// The unilateral-removal rejoin, end to end across the state object's
+    /// real lifecycle: dropping below two peers clears the object (the
+    /// counter dies with it), and the recreated object's first allocation —
+    /// raced by two nodes — must clear the previous lifetime's values via
+    /// the wall-clock floor, so a receiver still holding the old mark
+    /// accepts the restarted counter instead of fencing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
+        publish_ready_iam_context().await;
+        let seed = || SiteReplicationState {
+            peers: ["site-a", "site-b"]
+                .into_iter()
+                .map(|name| (name.to_string(), peer(name, &format!("https://{name}.example:9000"))))
+                .collect(),
+            ..Default::default()
+        };
+
+        save_site_replication_state(&seed()).await.expect("seed state");
+        let straggler = update_site_replication_state(|state| Ok(next_peer_edit_generation(state)))
+            .await
+            .expect("first-life allocation");
+        let last_applied = update_site_replication_state(|state| Ok(next_peer_edit_generation(state)))
+            .await
+            .expect("first-life allocation");
+        // A receiver that never dropped this site from its peer map holds
+        // this mark across the removal.
+        let mut receiver = SiteReplicationState::default();
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", last_applied);
+
+        // Unilateral removal: the site drops below two peers, which clears
+        // its state object and the counter with it.
+        let mut departed = seed();
+        departed.peers.remove("site-b");
+        save_site_replication_state(&departed).await.expect("clear state");
         assert_eq!(
             load_site_replication_state().await.expect("reload").edit_generation,
-            generations.len() as u64,
-            "the persisted counter must account for every allocation"
+            0,
+            "clearing the state object must take the counter with it"
+        );
+
+        // Rejoin recreates the state object; two nodes race the first
+        // allocation of the new life.
+        save_site_replication_state(&seed()).await.expect("recreate state");
+        let node_a = tokio::spawn(update_site_replication_state(|state| Ok(next_peer_edit_generation(state))));
+        let node_b = tokio::spawn(update_site_replication_state(|state| Ok(next_peer_edit_generation(state))));
+        let generation_a = node_a.await.expect("node a task").expect("node a allocation");
+        let generation_b = node_b.await.expect("node b task").expect("node b allocation");
+        assert_ne!(generation_a, generation_b, "racing allocations must stay distinct");
+
+        // The receiver's stale mark must not fence the restarted counter…
+        let restarted = generation_a.min(generation_b);
+        assert!(
+            !peer_edit_delivery_is_stale(&receiver, "origin-site", restarted),
+            "the recreated life's first allocation ({restarted}) must clear the previous life's mark ({last_applied})"
+        );
+        record_applied_peer_edit_generation(&mut receiver, "origin-site", restarted);
+        // …while the cleared life's in-flight leftovers stay fenced.
+        assert!(
+            peer_edit_delivery_is_stale(&receiver, "origin-site", straggler),
+            "a pre-removal in-flight delivery ({straggler}) must stay fenced after the rejoin"
         );
     }
 
@@ -15456,17 +18401,31 @@ mod tests {
     async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
         publish_ready_iam_context().await;
 
+        const ROUNDS: usize = 8;
         let seed = SiteReplicationState {
             pending_rotation: Some(PendingRotation {
                 id: "rot-1".to_string(),
                 access_key: "svc-account".to_string(),
                 ..Default::default()
             }),
+            // Retry events are only recorded for current peers; seed them so
+            // the concurrency assertion below exercises the persist path.
+            peers: (0..ROUNDS)
+                .map(|round| {
+                    let deployment_id = format!("peer-{round}-deployment");
+                    (
+                        deployment_id.clone(),
+                        PeerInfo {
+                            endpoint: format!("https://peer-{round}.example:9000"),
+                            deployment_id,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
             ..Default::default()
         };
         save_site_replication_state(&seed).await.expect("seed state");
-
-        const ROUNDS: usize = 8;
         for round in 0..ROUNDS {
             let peer = PeerInfo {
                 endpoint: format!("https://peer-{round}.example:9000"),

@@ -187,7 +187,6 @@ impl RulesMap {
     /// # Parameters
     /// * `event_name` - The EventName from which to remove the rule.
     /// * `pattern` - The pattern of the rule to be removed.
-    #[allow(dead_code)]
     pub fn remove_rule(&mut self, event_name: &EventName, pattern: &str) {
         let mut remove_event = false;
 
@@ -209,7 +208,6 @@ impl RulesMap {
     ///
     /// # Parameters
     /// * `event_names` - A slice of EventNames to be removed.
-    #[allow(dead_code)]
     pub fn remove_rules(&mut self, event_names: &[EventName]) {
         for event_name in event_names {
             self.map.remove(event_name);
@@ -223,7 +221,6 @@ impl RulesMap {
     /// * `event_name` - The EventName to update.
     /// * `pattern` - The pattern of the rule to be updated.
     /// * `target_id` - The TargetID to be added.
-    #[allow(dead_code)]
     pub fn update_rule(&mut self, event_name: EventName, pattern: String, target_id: TargetID) {
         self.map.entry(event_name).or_default().add(pattern, target_id);
         self.total_events_mask |= event_name.mask(); // Update only the relevant bitmask

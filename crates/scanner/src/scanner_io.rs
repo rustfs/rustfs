@@ -231,6 +231,10 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
+    // A write invalidates this bucket's prefix-usage answers on the spot so
+    // admin/console consumers never ride the full TTL after a change
+    // (rustfs/backlog#1872).
+    crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
@@ -3849,17 +3853,6 @@ impl ScannerIODisk for Disk {
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
-                error!(
-                    target: "rustfs::scanner::io",
-                    event = EVENT_SCANNER_DISK_BUCKET_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_IO,
-                    bucket = %item.bucket,
-                    object = %item.object_path(),
-                    state = "file_info_versions_failed",
-                    error = %e,
-                    "Scanner disk bucket failed to resolve file info versions"
-                );
                 return Err(scanner_metadata_corrupt_error(
                     format!("failed to resolve file info versions: {e}"),
                     &item.bucket,
@@ -4262,6 +4255,7 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("bucket should be removed from the first pool only");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());

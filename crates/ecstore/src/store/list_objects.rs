@@ -3845,7 +3845,7 @@ impl ECStore {
         .await
     }
 
-    pub(crate) async fn inner_list_object_versions_for_lifecycle(
+    pub(crate) async fn list_object_versions_for_lifecycle(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,

@@ -31,7 +31,6 @@
 //! ```
 
 // Allow dead_code for public API that may be used by external modules or future features
-#![allow(dead_code)]
 //! # Key Features
 //!
 //! - Early lock release after metadata read

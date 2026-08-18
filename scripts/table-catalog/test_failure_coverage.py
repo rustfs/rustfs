@@ -48,6 +48,8 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertIn("expected-version-token", by_name["stale-token-commit-conflict"]["body"])
         self.assertIn("expected-metadata-location", by_name["stale-token-commit-conflict"]["body"])
         self.assertIn("new-metadata-location", by_name["stale-token-commit-conflict"]["body"])
+        self.assertEqual(by_name["stale-token-commit-conflict"]["body"]["requirements"], [])
+        self.assertEqual(by_name["stale-token-commit-conflict"]["body"]["updates"], [])
         self.assertNotIn("base", by_name["stale-token-commit-conflict"]["body"])
         self.assertEqual(
             by_name["diagnostics-after-finalization-gap"]["path"],
@@ -56,6 +58,8 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertEqual(by_name["diagnostics-after-finalization-gap"]["method"], "GET")
         self.assertEqual(by_name["recovery-repairs-idempotency-index"]["method"], "POST")
         self.assertIn("does_not_exist.metadata.json", json.dumps(by_name["missing-metadata-object-rejected"]))
+        self.assertEqual(by_name["missing-metadata-object-rejected"]["body"]["requirements"], [])
+        self.assertEqual(by_name["missing-metadata-object-rejected"]["body"]["updates"], [])
         self.assertNotIn("base", by_name["missing-metadata-object-rejected"]["body"])
 
     def test_cli_prints_failure_matrix_and_probe_plan(self) -> None:

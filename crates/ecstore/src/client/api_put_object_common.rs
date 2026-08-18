@@ -30,10 +30,6 @@ pub fn is_object(reader: &ReaderImpl) -> bool {
     matches!(reader, ReaderImpl::ObjectBody(_))
 }
 
-pub fn is_read_at(reader: ReaderImpl) -> bool {
-    matches!(reader, ReaderImpl::ObjectBody(_))
-}
-
 pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<(i64, i64, i64), std::io::Error> {
     let unknown_size;
     let mut object_size = object_size;

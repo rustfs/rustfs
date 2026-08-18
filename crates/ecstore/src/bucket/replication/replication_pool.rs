@@ -217,6 +217,10 @@ impl DurableMrfBacklogTracker {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+)]
 fn durable_mrf_backlog_tracker_from_entries(entries: &[MrfReplicateEntry]) -> DurableMrfBacklogTracker {
     let mut tracker = DurableMrfBacklogTracker {
         available: true,
@@ -712,6 +716,10 @@ pub struct ReplicationPool<S: ReplicationStorage> {
 
     // MRF worker lifecycle
     mrf_worker_cancellations: Mutex<Vec<CancellationToken>>,
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     mrf_stop_tx: Sender<()>,
 
     // Worker size tracking
@@ -940,6 +948,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Resizes worker priority and counts
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     pub async fn resize_worker_priority(
         &self,
         pri: ReplicationPriority,
@@ -1180,6 +1192,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Queues an MRF save operation
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
         let _ = self.queue_mrf_save_admission(entry, "mrf_worker").await;
     }
@@ -1651,6 +1667,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Worker function for handling regular replication operations
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     async fn add_worker(
         &self,
         mut rx: Receiver<ReplicationOperation>,
@@ -1664,6 +1684,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Worker function for handling large object replication operations
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     async fn add_large_worker(
         &self,
         mut rx: Receiver<ReplicationOperation>,
@@ -1678,6 +1702,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Worker function for handling MRF (Most Recent Failures) operations
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     async fn add_mrf_worker(
         &self,
         mut rx: Receiver<ReplicationOperation>,
@@ -1691,6 +1719,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Delete resync metadata from replication resync state in memory
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     pub async fn delete_resync_metadata(&self, bucket: &str) {
         let mut status_map = self.resyncer.status_map.write().await;
         status_map.remove(bucket);

@@ -25,6 +25,10 @@ use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
 pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
+pub const ENV_KMS_VAULT_ADDRESS: &str = "RUSTFS_KMS_VAULT_ADDRESS";
+pub const ENV_KMS_VAULT_TOKEN: &str = "RUSTFS_KMS_VAULT_TOKEN";
+pub const ENV_KMS_VAULT_NAMESPACE: &str = "RUSTFS_KMS_VAULT_NAMESPACE";
+pub const ENV_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
@@ -35,6 +39,9 @@ pub const ENV_KMS_VAULT_APPROLE_SECRET_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_SECR
 pub const ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE";
 pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
 pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
+pub const ENV_KMS_VAULT_KUBERNETES_ROLE: &str = "RUSTFS_KMS_VAULT_KUBERNETES_ROLE";
+pub const ENV_KMS_VAULT_KUBERNETES_MOUNT: &str = "RUSTFS_KMS_VAULT_KUBERNETES_MOUNT";
+pub const ENV_KMS_VAULT_KUBERNETES_JWT_PATH: &str = "RUSTFS_KMS_VAULT_KUBERNETES_JWT_PATH";
 pub const ENV_KMS_AWS_REGION: &str = "RUSTFS_KMS_AWS_REGION";
 pub const ENV_KMS_AWS_ENDPOINT_URL: &str = "RUSTFS_KMS_AWS_ENDPOINT_URL";
 /// Age in whole seconds beyond which a key is reported as due for rotation;
@@ -45,6 +52,9 @@ pub const ENV_KMS_ROTATION_MAX_WRAPS: &str = "RUSTFS_KMS_ROTATION_MAX_WRAPS";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";
+pub const DEFAULT_VAULT_KUBERNETES_MOUNT: &str = "kubernetes";
+/// Where the kubelet projects a pod's ServiceAccount token by default.
+pub const DEFAULT_VAULT_KUBERNETES_JWT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
 /// Upper bound applied to `KmsConfig::timeout` when deriving backend behavior.
 ///
@@ -82,6 +92,14 @@ fn default_vault_kv2_mount_path() -> String {
 
 fn default_vault_approle_mount() -> String {
     DEFAULT_VAULT_APPROLE_MOUNT.to_string()
+}
+
+fn default_vault_kubernetes_mount() -> String {
+    DEFAULT_VAULT_KUBERNETES_MOUNT.to_string()
+}
+
+fn default_vault_kubernetes_jwt_path() -> PathBuf {
+    PathBuf::from(DEFAULT_VAULT_KUBERNETES_JWT_PATH)
 }
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
@@ -490,6 +508,23 @@ pub enum VaultAuthMethod {
         #[serde(default)]
         refresh_safety_window_secs: Option<u64>,
     },
+    /// Kubernetes authentication: the pod's ServiceAccount token is exchanged
+    /// for a lease-bound Vault token that is renewed in the background.
+    Kubernetes {
+        /// Vault role bound to this ServiceAccount.
+        role: String,
+        /// Kubernetes auth engine mount path.
+        #[serde(default = "default_vault_kubernetes_mount")]
+        mount: String,
+        /// Projected ServiceAccount token to present. Re-read on every login so
+        /// a token the kubelet rotates is picked up without a restart.
+        #[serde(default = "default_vault_kubernetes_jwt_path")]
+        jwt_path: PathBuf,
+        /// Fail-closed margin in seconds, as on `AppRole`. Defaults to the
+        /// per-attempt timeout.
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
     /// Agent-managed token file (for example a Vault Agent auto-auth sink):
     /// the token is read from `path` and re-read periodically so a token
     /// rotated by the agent is picked up without a restart.
@@ -520,6 +555,16 @@ impl VaultAuthMethod {
         }
     }
 
+    /// Kubernetes authentication with the default mount and projected token path.
+    pub fn kubernetes(role: String) -> Self {
+        Self::Kubernetes {
+            role,
+            mount: default_vault_kubernetes_mount(),
+            jwt_path: default_vault_kubernetes_jwt_path(),
+            refresh_safety_window_secs: None,
+        }
+    }
+
     /// Agent-managed token file with the default poll interval.
     pub fn token_file(path: PathBuf) -> Self {
         Self::TokenFile {
@@ -546,6 +591,20 @@ impl fmt::Debug for VaultAuthMethod {
                 .field("secret_id", &redacted_secret(secret_id))
                 .field("secret_id_file", secret_id_file)
                 .field("mount", mount)
+                .field("refresh_safety_window_secs", refresh_safety_window_secs)
+                .finish(),
+            // No redaction: the role and mount name a Vault binding, and the
+            // ServiceAccount token itself is never held on this type.
+            Self::Kubernetes {
+                role,
+                mount,
+                jwt_path,
+                refresh_safety_window_secs,
+            } => f
+                .debug_struct("Kubernetes")
+                .field("role", role)
+                .field("mount", mount)
+                .field("jwt_path", jwt_path)
                 .field("refresh_safety_window_secs", refresh_safety_window_secs)
                 .finish(),
             Self::TokenFile {
@@ -1028,50 +1087,12 @@ impl KmsConfig {
                 });
             }
             KmsBackend::VaultKv2 => {
-                let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let auth_method = vault_auth_method_from_env()?;
-                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
-
-                let mount_path = match get_env_opt_str("RUSTFS_KMS_VAULT_MOUNT_PATH") {
-                    Some(path) => {
-                        tracing::warn!(
-                            "RUSTFS_KMS_VAULT_MOUNT_PATH is deprecated for the Vault KV2 backend: it never calls the Transit engine and the value is stored but unused"
-                        );
-                        path
-                    }
-                    None => default_vault_kv2_mount_path(),
-                };
-
-                config.backend_config = BackendConfig::VaultKv2(Box::new(VaultConfig {
-                    address,
-                    auth_method,
-                    namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
-                    mount_path,
-                    kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
-                    key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
-                    tls: vault_tls_config(skip_tls_verify),
-                }));
+                config.backend_config =
+                    BackendConfig::VaultKv2(Box::new(vault_kv2_config_from_env(VaultCliOverrides::default())?));
             }
             KmsBackend::VaultTransit => {
-                let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let auth_method = vault_auth_method_from_env()?;
-                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
-
-                config.backend_config = BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
-                    address,
-                    auth_method,
-                    namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
-                    mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
-                    metadata_kv_mount: get_env_str(
-                        ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT,
-                        DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT,
-                    ),
-                    metadata_key_prefix: get_env_str(
-                        ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX,
-                        DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX,
-                    ),
-                    tls: vault_tls_config(skip_tls_verify),
-                }));
+                config.backend_config =
+                    BackendConfig::VaultTransit(Box::new(vault_transit_config_from_env(VaultCliOverrides::default())?));
             }
             KmsBackend::Static => {
                 // Read from file first, then fall back to direct env var
@@ -1202,6 +1223,78 @@ fn is_under_temp_dir(path: &Path) -> bool {
     path.starts_with(std::env::temp_dir())
 }
 
+/// Command-line values that take precedence over the matching environment
+/// variables when assembling a Vault backend configuration.
+///
+/// Every field has a `RUSTFS_KMS_VAULT_*` equivalent that the CLI layer already
+/// reads, so these are only set when the operator passed an explicit flag.
+///
+/// Deliberately not `Debug`: `token` holds the raw Vault token, and the
+/// redacting `Debug` impls elsewhere in this module exist because a derived one
+/// would print it. Denying the derive makes a future `{overrides:?}` a compile
+/// error instead of a leak.
+#[derive(Default, Clone, Copy)]
+pub struct VaultCliOverrides<'a> {
+    pub address: Option<&'a str>,
+    pub token: Option<&'a str>,
+    pub mount_path: Option<&'a str>,
+}
+
+/// Assemble the Vault KV2 backend configuration from the environment.
+///
+/// Shared by [`KmsConfig::from_env`] and the server's command-line startup path
+/// so both resolve the same auth method, namespace, TLS and mount settings.
+pub fn vault_kv2_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<VaultConfig> {
+    let mount_path = match overrides
+        .mount_path
+        .map(str::to_string)
+        .or_else(|| get_env_opt_str(ENV_KMS_VAULT_MOUNT_PATH))
+    {
+        Some(path) => {
+            tracing::warn!(
+                "RUSTFS_KMS_VAULT_MOUNT_PATH is deprecated for the Vault KV2 backend: it never calls the Transit engine and the value is stored but unused"
+            );
+            path
+        }
+        None => default_vault_kv2_mount_path(),
+    };
+
+    Ok(VaultConfig {
+        address: vault_address_from_env(overrides.address),
+        auth_method: vault_auth_method_from_env(overrides.token)?,
+        namespace: get_env_opt_str(ENV_KMS_VAULT_NAMESPACE),
+        mount_path,
+        kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
+        key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
+        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+    })
+}
+
+/// Assemble the Vault Transit backend configuration from the environment.
+///
+/// Companion to [`vault_kv2_config_from_env`]; see there for why both entry
+/// points share it.
+pub fn vault_transit_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<VaultTransitConfig> {
+    Ok(VaultTransitConfig {
+        address: vault_address_from_env(overrides.address),
+        auth_method: vault_auth_method_from_env(overrides.token)?,
+        namespace: get_env_opt_str(ENV_KMS_VAULT_NAMESPACE),
+        mount_path: overrides
+            .mount_path
+            .map(str::to_string)
+            .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_MOUNT_PATH, "transit")),
+        metadata_kv_mount: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT),
+        metadata_key_prefix: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX),
+        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+    })
+}
+
+fn vault_address_from_env(override_value: Option<&str>) -> String {
+    override_value
+        .map(str::to_string)
+        .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_ADDRESS, "http://localhost:8200"))
+}
+
 /// Resolve the Vault auth method from environment variables.
 ///
 /// Setting `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID` selects AppRole authentication;
@@ -1209,27 +1302,59 @@ fn is_under_temp_dir(path: &Path) -> bool {
 /// (re-read on every login, mirroring the `RUSTFS_KMS_STATIC_SECRET_KEY_FILE`
 /// precedent) or inline from `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID`, with the
 /// file taking precedence. Without a role id the legacy token flow applies.
-fn vault_auth_method_from_env() -> Result<VaultAuthMethod> {
+///
+/// `RUSTFS_KMS_VAULT_KUBERNETES_ROLE` selects Kubernetes authentication, which
+/// presents the pod's projected ServiceAccount token.
+///
+/// `token_override` carries a token supplied on the command line; it stands in
+/// for `RUSTFS_KMS_VAULT_TOKEN` everywhere below, including the conflict checks,
+/// so a flag and the variable it mirrors select the same method.
+fn vault_auth_method_from_env(token_override: Option<&str>) -> Result<VaultAuthMethod> {
+    let token = token_override
+        .map(str::to_string)
+        .or_else(|| get_env_opt_str(ENV_KMS_VAULT_TOKEN));
+    let role_id = get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID);
+    let kubernetes_role = get_env_opt_str(ENV_KMS_VAULT_KUBERNETES_ROLE);
+
     if let Some(token_file) = get_env_opt_str(ENV_KMS_VAULT_TOKEN_FILE) {
         // A token file names one authoritative credential source; combining it
         // with another one would leave the effective identity ambiguous, so
         // that is a configuration error rather than a precedence rule.
-        if get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID).is_some() {
-            return Err(KmsError::configuration_error(format!(
-                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with {ENV_KMS_VAULT_APPROLE_ROLE_ID}; configure exactly one Vault auth method"
-            )));
-        }
-        if get_env_opt_str("RUSTFS_KMS_VAULT_TOKEN").is_some() {
-            return Err(KmsError::configuration_error(format!(
-                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with RUSTFS_KMS_VAULT_TOKEN; configure exactly one Vault auth method"
-            )));
+        for (name, configured) in [
+            (ENV_KMS_VAULT_APPROLE_ROLE_ID, role_id.is_some()),
+            (ENV_KMS_VAULT_KUBERNETES_ROLE, kubernetes_role.is_some()),
+            (ENV_KMS_VAULT_TOKEN, token.is_some()),
+        ] {
+            if configured {
+                return Err(KmsError::configuration_error(format!(
+                    "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with {name}; configure exactly one Vault auth method"
+                )));
+            }
         }
         return Ok(VaultAuthMethod::token_file(PathBuf::from(token_file)));
     }
 
-    let Some(role_id) = get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID) else {
+    if let Some(role) = kubernetes_role {
+        // Unlike a leftover static token, a second login method is never a
+        // stale remnant: both were configured deliberately and neither can be
+        // ranked over the other.
+        if role_id.is_some() {
+            return Err(KmsError::configuration_error(format!(
+                "{ENV_KMS_VAULT_KUBERNETES_ROLE} cannot be combined with {ENV_KMS_VAULT_APPROLE_ROLE_ID}; configure exactly one Vault auth method"
+            )));
+        }
+        return Ok(VaultAuthMethod::Kubernetes {
+            role,
+            mount: get_env_str(ENV_KMS_VAULT_KUBERNETES_MOUNT, DEFAULT_VAULT_KUBERNETES_MOUNT),
+            jwt_path: get_env_opt_str(ENV_KMS_VAULT_KUBERNETES_JWT_PATH)
+                .map_or_else(default_vault_kubernetes_jwt_path, PathBuf::from),
+            refresh_safety_window_secs: None,
+        });
+    }
+
+    let Some(role_id) = role_id else {
         return Ok(VaultAuthMethod::Token {
-            token: get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token"),
+            token: token.unwrap_or_else(|| "dev-token".to_string()),
         });
     };
 
@@ -1270,6 +1395,22 @@ fn validate_vault_auth_method(backend_name: &str, auth_method: &VaultAuthMethod)
             }
             if mount.is_empty() {
                 return Err(KmsError::configuration_error(format!("{backend_name} AppRole mount cannot be empty")));
+            }
+            Ok(())
+        }
+        VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } => {
+            if role.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} Kubernetes role cannot be empty")));
+            }
+            if mount.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} Kubernetes mount cannot be empty")));
+            }
+            if jwt_path.as_os_str().is_empty() {
+                return Err(KmsError::configuration_error(format!(
+                    "{backend_name} Kubernetes ServiceAccount token path cannot be empty"
+                )));
             }
             Ok(())
         }
@@ -1974,6 +2115,106 @@ mod tests {
         vault_config(VaultAuthMethod::token_file(PathBuf::from("/run/vault-agent/token")))
             .validate()
             .expect("well-formed token file auth must validate");
+    }
+
+    /// A Kubernetes role alone configures the method: the credential is the
+    /// pod's projected ServiceAccount token, so nothing secret is in the
+    /// environment and the mount and token path fall back to the cluster
+    /// defaults.
+    #[test]
+    fn test_from_env_selects_kubernetes() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                (ENV_KMS_VAULT_ADDRESS, Some("https://vault.example.com")),
+                (ENV_KMS_VAULT_KUBERNETES_ROLE, Some("rustfs")),
+                (ENV_KMS_VAULT_KUBERNETES_MOUNT, None),
+                (ENV_KMS_VAULT_KUBERNETES_JWT_PATH, None),
+                (ENV_KMS_VAULT_TOKEN, None),
+                (ENV_KMS_VAULT_TOKEN_FILE, None),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, None),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                let vault = config.vault_transit_config().expect("vault transit backend config");
+                let VaultAuthMethod::Kubernetes {
+                    role,
+                    mount,
+                    jwt_path,
+                    refresh_safety_window_secs,
+                } = &vault.auth_method
+                else {
+                    panic!(
+                        "a kubernetes role in the environment must select Kubernetes auth, got {:?}",
+                        vault.auth_method
+                    );
+                };
+                assert_eq!(role, "rustfs");
+                assert_eq!(mount, DEFAULT_VAULT_KUBERNETES_MOUNT);
+                assert_eq!(jwt_path, Path::new(DEFAULT_VAULT_KUBERNETES_JWT_PATH));
+                assert_eq!(refresh_safety_window_secs, &None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_kubernetes_is_mutually_exclusive_with_other_auth() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                (ENV_KMS_VAULT_KUBERNETES_ROLE, Some("rustfs")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+                (ENV_KMS_VAULT_TOKEN, None),
+                (ENV_KMS_VAULT_TOKEN_FILE, None),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("kubernetes combined with approle must be rejected");
+                assert!(error.to_string().contains(ENV_KMS_VAULT_KUBERNETES_ROLE));
+                assert!(error.to_string().contains(ENV_KMS_VAULT_APPROLE_ROLE_ID));
+            },
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_kubernetes_settings() {
+        let vault_config = |auth_method: VaultAuthMethod| KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let error = vault_config(VaultAuthMethod::kubernetes(String::new()))
+            .validate()
+            .expect_err("an empty kubernetes role must be rejected");
+        assert!(error.to_string().contains("role"), "got {error}");
+
+        let error = vault_config(VaultAuthMethod::Kubernetes {
+            role: "rustfs".to_string(),
+            mount: String::new(),
+            jwt_path: PathBuf::from(DEFAULT_VAULT_KUBERNETES_JWT_PATH),
+            refresh_safety_window_secs: None,
+        })
+        .validate()
+        .expect_err("an empty kubernetes mount must be rejected");
+        assert!(error.to_string().contains("mount"), "got {error}");
+
+        let error = vault_config(VaultAuthMethod::Kubernetes {
+            role: "rustfs".to_string(),
+            mount: DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(),
+            jwt_path: PathBuf::new(),
+            refresh_safety_window_secs: None,
+        })
+        .validate()
+        .expect_err("an empty ServiceAccount token path must be rejected");
+        assert!(error.to_string().contains("token path"), "got {error}");
+
+        vault_config(VaultAuthMethod::kubernetes("rustfs".to_string()))
+            .validate()
+            .expect("well-formed kubernetes auth must validate");
     }
 
     /// Every KV2 read, write and listing is routed through `kv_mount`, so an

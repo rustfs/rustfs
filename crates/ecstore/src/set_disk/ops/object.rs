@@ -315,6 +315,41 @@ async fn get_object_reader_with_context(
     GetObjectReader::new_with_resolver(reader, range, object_info, opts, headers, ctx.object_encryption_resolver()).await
 }
 
+async fn get_legacy_object_reader_with_context<R>(
+    ctx: &InstanceContext,
+    reader: R,
+    terminal: tokio::sync::oneshot::Receiver<Result<()>>,
+    range: Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<(GetObjectReader, usize, i64)>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    // ReadPlan validates this size below; failure here only keeps the terminal
+    // guard inside the transform until that validation returns its typed error.
+    let full_plaintext_size = object_info.get_actual_size().ok();
+    let whole_object = opts.part_number.is_none()
+        && match (&range, full_plaintext_size) {
+            (None, _) => true,
+            (Some(range), Some(size)) => range
+                .get_offset_length(size)
+                .is_ok_and(|(offset, length)| offset == 0 && length == size),
+            (Some(_), None) => false,
+        };
+    let (source, terminal): (Box<dyn AsyncRead + Unpin + Send + Sync>, _) = if whole_object {
+        (Box::new(reader), Some(terminal))
+    } else {
+        (Box::new(LegacyDuplexProducerReader::new(reader, terminal)), None)
+    };
+    let (mut reader, offset, length) = get_object_reader_with_context(ctx, source, range, object_info, opts, headers).await?;
+    if let Some(terminal) = terminal {
+        reader.stream = Box::new(LegacyDuplexProducerReader::new(reader.stream, terminal));
+    }
+    Ok((reader, offset, length))
+}
+
 fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
     range.is_none()
         && opts.part_number.is_none()
@@ -899,6 +934,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &object_info,
                 &opts,
                 &self.ctx.tier_config_mgr(),
+                self.ctx.object_encryption_resolver(),
             )
             .await?;
             return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
@@ -1089,8 +1125,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
+        let (producer_terminal_tx, producer_terminal_rx) = tokio::sync::oneshot::channel();
         let (mut reader, offset, length) =
-            get_object_reader_with_context(&self.ctx, Box::new(rd), range, &object_info, opts, &h).await?;
+            get_legacy_object_reader_with_context(&self.ctx, rd, producer_terminal_rx, range, &object_info, opts, &h).await?;
         // Carry the hook probe result so the app layer skips its now-redundant
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
@@ -1110,7 +1147,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
             // Disk read timeouts must be enforced at the actual disk I/O operations.
-            if let Err(e) = Self::get_object_with_fileinfo(
+            let producer_result = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
                 erasure_cache,
@@ -1128,9 +1165,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 object_class.as_str(),
                 size_bucket,
             )
-            .await
-            {
-                let reason = classify_storage_error(&e);
+            .await;
+            if let Err(e) = &producer_result {
+                let reason = classify_storage_error(e);
                 if reason == GetObjectFailureReason::DownstreamClosed {
                     debug!(
                         event = EVENT_SET_DISK_WRITE,
@@ -1169,6 +1206,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
             };
+            let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
         });
 
         Ok(reader)
@@ -2557,6 +2595,420 @@ impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
     }
 }
 
+struct LegacyDuplexProducerReader<R> {
+    inner: Option<R>,
+    terminal: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    inner_eof: bool,
+}
+
+impl<R> LegacyDuplexProducerReader<R> {
+    fn new(inner: R, terminal: tokio::sync::oneshot::Receiver<Result<()>>) -> Self {
+        Self {
+            inner: Some(inner),
+            terminal: Some(terminal),
+            inner_eof: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LegacyDuplexProducerReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if !self.inner_eof {
+            let before = buf.filled().len();
+            if let Some(inner) = self.inner.as_mut() {
+                match Pin::new(inner).poll_read(cx, buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) if buf.filled().len() > before => return Poll::Ready(Ok(())),
+                    Poll::Ready(Ok(())) => {
+                        self.inner_eof = true;
+                        self.inner = None;
+                    }
+                }
+            } else {
+                self.inner_eof = true;
+            }
+        }
+
+        let Some(terminal) = self.terminal.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(terminal).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(()))) => {
+                self.terminal = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(err))) => {
+                self.terminal = None;
+                Poll::Ready(Err(std::io::Error::other(err)))
+            }
+            Poll::Ready(Err(_)) => {
+                self.terminal = None;
+                Poll::Ready(Err(std::io::Error::other(StorageError::Unexpected)))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_duplex_producer_reader_tests {
+    use super::*;
+    use crate::object_api::{EncryptionResolutionError, ObjectEncryptionResolver, ReadEncryptionMaterial, ReadEncryptionMode};
+    use rustfs_utils::CompressionAlgorithm;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_DUPLEX_CAPACITY: usize = 64 * 1024;
+
+    fn storage_error_source(error: &std::io::Error) -> &StorageError {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("legacy duplex terminal error should retain StorageError source")
+    }
+
+    async fn compressed_fixture(plaintext: Vec<u8>, recorded_size: usize) -> (Vec<u8>, ObjectInfo) {
+        let mut compressor = rustfs_rio::CompressReader::new(std::io::Cursor::new(plaintext), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        compressor
+            .read_to_end(&mut compressed)
+            .await
+            .expect("compress test plaintext");
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            CompressionAlgorithm::default().to_string(),
+        );
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, recorded_size.to_string());
+        let object_info = ObjectInfo {
+            size: i64::try_from(compressed.len()).expect("compressed fixture length should fit in i64"),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        (compressed, object_info)
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_allows_clean_completion() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer
+            .write_all(b"complete")
+            .await
+            .expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx.send(Ok(())).expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("clean producer completion should surface clean EOF");
+
+        assert_eq!(out, b"complete");
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_ignores_zero_capacity_read_buf() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"body").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::FileCorrupt))
+            .expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut empty = [];
+        std::future::poll_fn(|cx| {
+            let mut read_buf = ReadBuf::new(&mut empty);
+            Pin::new(&mut reader).poll_read(cx, &mut read_buf)
+        })
+        .await
+        .expect("zero-capacity reads should complete without observing EOF or terminal state");
+        assert!(!reader.inner_eof);
+        assert!(reader.terminal.is_some());
+
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("subsequent reads must still receive data and the terminal error");
+        assert_eq!(out, b"body");
+        assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_surfaces_terminal_error_after_partial_data() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"partial").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::FileCorrupt))
+            .expect("terminal receiver should remain installed");
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("terminal producer error must not become clean EOF");
+
+        assert_eq!(out, b"partial");
+        assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_surfaces_terminal_error_after_declared_length() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        writer.write_all(b"exact").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        terminal_tx
+            .send(Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "remote body reset after final byte",
+            ))))
+            .expect("terminal receiver should remain installed");
+
+        let reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut reader =
+            HashReader::from_stream(reader, 5, 5, None, None, false).expect("hash reader should accept exact declared length");
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("producer terminal error after the declared length must still fail");
+
+        assert_eq!(out, b"exact");
+        assert!(
+            matches!(storage_error_source(&err), StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_compressed_reader_surfaces_terminal_error_after_complete_plaintext() {
+        let plaintext = b"compressed terminal result must survive the plaintext limit".repeat(16);
+        let (compressed, object_info) = compressed_fixture(plaintext.clone(), plaintext.len()).await;
+        let full_range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: i64::try_from(plaintext.len()).expect("plaintext fixture length should fit in i64") - 1,
+        };
+        for range in [None, Some(full_range)] {
+            let (mut writer, reader) = tokio::io::duplex(compressed.len().max(1));
+            writer
+                .write_all(&compressed)
+                .await
+                .expect("compressed body should fit in duplex buffer");
+            drop(writer);
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            terminal_tx
+                .send(Err(StorageError::FileCorrupt))
+                .expect("terminal receiver should remain installed");
+
+            let (mut reader, _, _) = get_legacy_object_reader_with_context(
+                &InstanceContext::new(),
+                reader,
+                terminal_rx,
+                range,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("compressed read plan should build");
+            let mut out = Vec::new();
+            let err = reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("terminal error after complete decompression must not become clean EOF");
+
+            assert_eq!(out, plaintext);
+            assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_reader_rejects_extra_data_without_backpressure_deadlock() {
+        let payload = vec![0x5a; TEST_DUPLEX_CAPACITY * 2];
+        let (mut writer, reader) = tokio::io::duplex(TEST_DUPLEX_CAPACITY);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let result = writer.write_all(&payload).await;
+            drop(writer);
+            let terminal_result = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| StorageError::Io(std::io::Error::new(err.kind(), err.to_string())));
+            let _ = terminal_tx.send(terminal_result);
+            result
+        });
+        let reader = crate::io_support::rio::HardLimitReader::new(reader, 1);
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+
+        let mut out = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_to_end(&mut out))
+            .await
+            .expect("extra data beyond the declared size must not deadlock")
+            .expect_err("extra data beyond the declared size must fail closed");
+        assert_eq!(out, [0x5a]);
+        drop(reader);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+            .await
+            .expect("producer must unblock after the read fails")
+            .expect("producer task should not panic");
+    }
+
+    #[tokio::test]
+    async fn legacy_terminal_reader_releases_unconsumed_source_before_waiting() {
+        let payload = vec![0x5a; TEST_DUPLEX_CAPACITY * 2];
+        let (mut writer, reader) = tokio::io::duplex(TEST_DUPLEX_CAPACITY);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let result = writer.write_all(&payload).await;
+            drop(writer);
+            let terminal_result = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|err| StorageError::Io(std::io::Error::new(err.kind(), err.to_string())));
+            let _ = terminal_tx.send(terminal_result);
+            result
+        });
+        let reader = rustfs_rio::LimitReader::new(reader, 1);
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+
+        let mut out = Vec::new();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read_to_end(&mut out))
+            .await
+            .expect("terminal wait must not deadlock behind unconsumed source data")
+            .expect_err("unconsumed source data must fail the producer terminal result");
+        assert_eq!(out, [0x5a]);
+        assert!(
+            matches!(storage_error_source(&err), StorageError::Io(io_error) if io_error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        producer
+            .await
+            .expect("producer task should not panic")
+            .expect_err("source should close early");
+    }
+
+    struct FixedEncryptionResolver {
+        key_bytes: [u8; 32],
+        base_nonce: [u8; 12],
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for FixedEncryptionResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: crate::object_api::ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            Ok(Some(ReadEncryptionMaterial {
+                key_bytes: self.key_bytes,
+                mode: ReadEncryptionMode::Direct {
+                    base_nonce: self.base_nonce,
+                },
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_encrypted_reader_surfaces_terminal_error_after_complete_plaintext() {
+        let plaintext = b"encrypted terminal result must survive the plaintext limit".repeat(16);
+        let key_bytes = [0x31; 32];
+        let base_nonce = [0x42; 12];
+        let mut encryptor = rustfs_rio::EncryptReader::new(std::io::Cursor::new(plaintext.clone()), key_bytes, base_nonce);
+        let mut encrypted = Vec::new();
+        encryptor.read_to_end(&mut encrypted).await.expect("encrypt test plaintext");
+
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "encrypted-object".to_string(),
+            size: i64::try_from(encrypted.len()).expect("encrypted fixture length should fit in i64"),
+            user_defined: Arc::new(HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let ctx = InstanceContext::new();
+        assert!(
+            ctx.set_object_encryption_resolver(Arc::new(FixedEncryptionResolver { key_bytes, base_nonce }))
+                .is_ok(),
+            "fresh context should accept resolver"
+        );
+        let full_range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: i64::try_from(plaintext.len()).expect("plaintext fixture length should fit in i64") - 1,
+        };
+        for range in [None, Some(full_range)] {
+            let (mut writer, reader) = tokio::io::duplex(encrypted.len().max(1));
+            writer
+                .write_all(&encrypted)
+                .await
+                .expect("encrypted body should fit in duplex buffer");
+            drop(writer);
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            terminal_tx
+                .send(Err(StorageError::FileCorrupt))
+                .expect("terminal receiver should remain installed");
+
+            let (mut reader, _, _) = get_legacy_object_reader_with_context(
+                &ctx,
+                reader,
+                terminal_rx,
+                range,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("encrypted read plan should build");
+            let mut out = Vec::new();
+            let err = reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("terminal error after complete decryption must not become clean EOF");
+
+            assert_eq!(out, plaintext);
+            assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_duplex_reader_fails_closed_when_terminal_channel_closes() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+        writer.write_all(b"body").await.expect("duplex write should fit in buffer");
+        drop(writer);
+        drop(terminal_tx);
+
+        let mut reader = LegacyDuplexProducerReader::new(reader, terminal_rx);
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("producer disappearance must fail closed");
+
+        assert_eq!(out, b"body");
+        assert!(matches!(storage_error_source(&err), StorageError::Unexpected));
+    }
+}
+
 struct TransitionUploadWriter<W> {
     inner: W,
     produced: u64,
@@ -3055,6 +3507,10 @@ struct TransitionUploadedSaveProbeState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionUploadedSaveProbe {
     state: Arc<TransitionUploadedSaveProbeState>,
 }
@@ -3065,6 +3521,10 @@ static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Opti
 
 #[cfg(test)]
 impl TransitionUploadedSaveProbe {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedSaveProbeState {
             bucket: bucket.to_string(),
@@ -3081,6 +3541,10 @@ impl TransitionUploadedSaveProbe {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn attempts(&self) -> usize {
         self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -3286,6 +3750,10 @@ struct TransitionCommitBarrierState {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+)]
 struct TransitionCommitBarrier {
     state: Arc<TransitionCommitBarrierState>,
 }
@@ -3296,14 +3764,26 @@ static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Ar
 
 #[cfg(test)]
 impl TransitionCommitBarrier {
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_before_lock_lost_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLockLost)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseValidation)
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn install_after_lease_check(bucket: &str, object: &str) -> Self {
         Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseValidation)
     }
@@ -3326,12 +3806,20 @@ impl TransitionCommitBarrier {
         Self { state }
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("transition should reach the deterministic commit barrier");
     }
 
+    #[allow(
+        dead_code,
+        reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
+    )]
     fn release(&self) {
         self.state.release.notify_one();
     }
@@ -5168,7 +5656,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // TODO: Lifecycle
 
         let mut version_found = true;
-        let (mut goi, write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
+        // delete_object_version below derives its own majority quorum from the
+        // disk array, so the object-derived quorum here is unused.
+        let (mut goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
@@ -5922,7 +6412,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         for disk in disks.iter() {
-            if let Some(disk) = disk {
+            if disk.is_some() {
                 continue;
             }
             let _ = self
@@ -6065,6 +6555,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &oi,
                 &opts,
                 &self_.ctx.tier_config_mgr(),
+                self_.ctx.object_encryption_resolver(),
             )
             .await;
             if let Err(err) = gr {
@@ -6134,6 +6625,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     &oi,
                     &part_opts,
                     &self_.ctx.tier_config_mgr(),
+                    self_.ctx.object_encryption_resolver(),
                 )
                 .await
                 .map_err(StorageError::Io)?;
@@ -7051,7 +7543,7 @@ mod get_object_downstream_close_accounting_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use crate::diagnostics::get::{
-        GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT,
+        GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_OBJECT_PATH_INTERNAL_META, GET_STAGE_DECODE, GET_STAGE_EMIT,
         GetObjectFailureReason,
     };
     use crate::disk::RUSTFS_META_BUCKET;
@@ -7183,8 +7675,8 @@ mod get_object_downstream_close_accounting_tests {
             legacy_completed,
             internal_cancelled,
             legacy_cancelled,
-            internal_unsafe_miss,
-            legacy_unsafe_miss,
+            internal_not_found_miss,
+            legacy_not_found_miss,
             internal_saved,
             legacy_saved,
         ) = metrics::with_local_recorder(&recorder, || {
@@ -7260,7 +7752,7 @@ mod get_object_downstream_close_accounting_tests {
                         &[
                             ("path", GET_OBJECT_PATH_INTERNAL_META),
                             ("decision", "miss"),
-                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_NOT_FOUND),
                         ],
                     ),
                     recorder.counter_value(
@@ -7268,7 +7760,7 @@ mod get_object_downstream_close_accounting_tests {
                         &[
                             ("path", GET_OBJECT_PATH_LEGACY_DUPLEX),
                             ("decision", "miss"),
-                            ("reason", GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST),
+                            ("reason", GET_METADATA_EARLY_STOP_REASON_NOT_FOUND),
                         ],
                     ),
                     recorder.histogram_values(
@@ -7319,21 +7811,21 @@ mod get_object_downstream_close_accounting_tests {
             "internal metadata lifecycle cancelled count must not leak into legacy_duplex"
         );
         assert_eq!(
-            internal_unsafe_miss, 1,
-            "internal metadata unsafe early-stop miss must retain its path label"
+            internal_not_found_miss, 1,
+            "internal metadata not-found early-stop miss must retain its path label"
         );
         assert_eq!(
-            legacy_unsafe_miss, 0,
-            "internal metadata unsafe early-stop miss must not leak into legacy_duplex"
+            legacy_not_found_miss, 0,
+            "internal metadata not-found early-stop miss must not leak into legacy_duplex"
         );
         assert_eq!(
             internal_saved,
             vec![0.0],
-            "internal metadata unsafe miss must record zero saved responses on internal_meta"
+            "internal metadata not-found miss must record zero saved responses on internal_meta"
         );
         assert!(
             legacy_saved.is_empty(),
-            "internal metadata unsafe miss saved responses must not leak into legacy_duplex"
+            "internal metadata not-found miss saved responses must not leak into legacy_duplex"
         );
     }
 }
@@ -9716,6 +10208,288 @@ mod transition_upload_integrity_tests {
         assert!(backend.contains(remote_object).await, "committed remote object should remain available");
     }
 
+    /// Compresses `plaintext` with the codec the PUT path uses, so the stored
+    /// bytes round-trip through the read path's decompressor.
+    async fn compress_for_storage(plaintext: &[u8]) -> Vec<u8> {
+        let mut reader = crate::io_support::rio::compression_reader(
+            Cursor::new(plaintext.to_vec()),
+            rustfs_utils::CompressionAlgorithm::default(),
+            false,
+        );
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("plaintext should compress");
+        assert!(compressed.len() < plaintext.len(), "test payload must actually compress");
+        compressed
+    }
+
+    /// Writes a genuinely compressed object: stored data is `compressed`, and the
+    /// metadata marks it compressed with the plaintext length as its actual size,
+    /// exactly as the app-layer compress path records it.
+    async fn write_compressed_source(
+        set_disks: &Arc<SetDisks>,
+        disk_stores: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        plaintext: &[u8],
+        compressed: &[u8],
+    ) -> ObjectInfo {
+        for disk in disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            crate::io_support::rio::compression_metadata_value(rustfs_utils::CompressionAlgorithm::default()),
+        );
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+        let stream = crate::io_support::rio::HashReader::from_stream(
+            Cursor::new(compressed.to_vec()),
+            compressed.len() as i64,
+            plaintext.len() as i64,
+            None,
+            None,
+            false,
+        )
+        .expect("hash reader over compressed bytes");
+        let mut reader = PutObjReader::new(stream);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    user_defined,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("compressed object should be written")
+    }
+
+    async fn read_transitioned(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> (Vec<u8>, i64) {
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, range, HeaderMap::new(), opts)
+            .await
+            .expect("transitioned object reader should open");
+        let published_size = reader.object_info.size;
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("transitioned body should drain");
+        (body, published_size)
+    }
+
+    /// Transition uploads the object's STORED bytes, so a tiered read has to
+    /// apply the same transform an erasure read would. #6107 routed this path
+    /// through `ReadPlan` to stop serving an encrypted object's ciphertext;
+    /// compression rides the same plan, and nothing pinned it (backlog#1851).
+    /// Without the transform this GET returns the compressed bytes under the
+    /// compressed size — silent corruption for every client of a compressed
+    /// object that ILM has moved to a warm tier.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_compressed_object_get_returns_plaintext() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-get-bucket";
+        let object = "object.txt";
+        let plaintext = b"transitioned compressed objects must decompress on read ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let (local_body, local_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(local_body, plaintext, "control: the pre-transition read must decompress");
+        assert_eq!(
+            local_size,
+            plaintext.len() as i64,
+            "control: the pre-transition read publishes the plaintext size"
+        );
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should upload one remote candidate");
+        let remote_bytes = backend
+            .bytes(&put_versions[0].0)
+            .await
+            .expect("remote candidate should be stored");
+        assert_eq!(
+            remote_bytes, compressed,
+            "transition uploads the stored representation; the read side is what has to decode it"
+        );
+
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(body, plaintext, "a tiered read must return the object's content, not its stored bytes");
+        assert_eq!(
+            published_size,
+            plaintext.len() as i64,
+            "a tiered read must publish the plaintext size, not the compressed one"
+        );
+    }
+
+    /// A ranged tiered read is expressed in plaintext coordinates, so the plan
+    /// has to translate it into the remote copy's compressed extent and skip
+    /// into the decompressed stream — the same translation the erasure path does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_compressed_object_range_get_returns_plaintext_slice() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-range-bucket";
+        let object = "object.txt";
+        let plaintext = b"ranged reads of transitioned compressed objects must land in plaintext ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        // Deliberately past the compressed size, so a range still measured in
+        // stored coordinates could not produce this slice.
+        let start = compressed.len() as i64 + 4096;
+        let end = start + 511;
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end,
+        };
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, Some(range), &opts).await;
+
+        let expected = &plaintext[start as usize..=end as usize];
+        assert_eq!(body, expected, "a ranged tiered read must return that plaintext slice");
+        assert_eq!(published_size, expected.len() as i64, "a ranged tiered read publishes the slice length");
+    }
+
+    /// The restore copy-back re-writes the object under its original metadata,
+    /// which still says "compressed". It therefore has to keep receiving the
+    /// STORED bytes: `restore_request_active` holds it on the plan's `Plain`
+    /// branch, and decompressing there would write plaintext under compressed
+    /// metadata.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_read_of_transitioned_compressed_object_keeps_stored_bytes() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-compressed-restore-bucket";
+        let object = "object.txt";
+        let plaintext = b"restore copy-back must keep the stored representation intact ".repeat(20_000);
+        let compressed = compress_for_storage(&plaintext).await;
+        let original = write_compressed_source(&set_disks, &disk_stores, bucket, object, &plaintext, &compressed).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let oi = set_disks
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("transitioned metadata should resolve");
+        let restore_opts = ObjectOptions {
+            no_lock: true,
+            part_number: Some(1),
+            transition: TransitionOptions {
+                restore_request: s3s::dto::RestoreRequest {
+                    days: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            bucket,
+            object,
+            &None,
+            &HeaderMap::new(),
+            &oi,
+            &restore_opts,
+            &set_disks.ctx.tier_config_mgr(),
+            set_disks.ctx.object_encryption_resolver(),
+        )
+        .await
+        .expect("restore read of the tiered copy should open");
+        let published_size = reader.object_info.size;
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("restore body should drain");
+
+        assert_eq!(body, compressed, "a restore read must copy the stored bytes back verbatim");
+        assert_eq!(
+            published_size,
+            compressed.len() as i64,
+            "a restore read must keep publishing the stored size"
+        );
+    }
+
+    /// Plain objects must keep streaming the remote bytes through untouched:
+    /// their plan is `Plain`, so the tiered read stays byte-identical.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_plain_object_get_is_unchanged() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-plain-get-bucket";
+        let object = "object.bin";
+        let payload = b"plain transitioned objects must keep reading back byte-identical ".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let (body, published_size) = read_transitioned(&set_disks, bucket, object, None, &opts).await;
+        assert_eq!(body, payload);
+        assert_eq!(published_size, payload.len() as i64);
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 100,
+            end: 611,
+        };
+        let (ranged_body, ranged_size) = read_transitioned(&set_disks, bucket, object, Some(range), &opts).await;
+        assert_eq!(ranged_body, &payload[100..=611]);
+        assert_eq!(ranged_size, payload.len() as i64, "a plain ranged read keeps publishing the object size");
+    }
+
     async fn corrupt_beyond_read_quorum(
         temp_dirs: &[tempfile::TempDir],
         bucket: &str,
@@ -11180,7 +11954,7 @@ mod put_object_tmp_cleanup_tests {
     use tokio::io::AsyncReadExt;
 
     /// Large enough that the erasure shards are written as real tmp files
-    /// (never inlined into xl.meta), so both tests exercise actual cleanup.
+    /// (never inlined into xl.meta), so the cleanup tests exercise actual cleanup.
     const TEST_OBJECT_SIZE: usize = 1 << 20;
 
     /// Entries under `.rustfs.sys/tmp` on every disk, excluding the `.trash`
@@ -11204,6 +11978,18 @@ mod put_object_tmp_cleanup_tests {
         leftovers
     }
 
+    async fn wait_for_tmp_workspace_to_drain(temp_dirs: &[TempDir], failure_context: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leftovers = non_trash_tmp_entries(temp_dirs).await;
+            if leftovers.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{failure_context}, leftovers: {leftovers:?}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     async fn put_object_success_eventually_cleans_tmp_workspace() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -11219,22 +12005,39 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("put_object should succeed");
 
-        // The speculative cleanup runs on a spawned task off the PUT response
-        // path, so poll for the tmp workspace to drain instead of asserting
-        // immediately.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let leftovers = non_trash_tmp_entries(&temp_dirs).await;
-            if leftovers.is_empty() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "tmp workspace should drain after a successful PUT, leftovers: {leftovers:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        wait_for_tmp_workspace_to_drain(&temp_dirs, "tmp workspace should drain after a successful PUT").await;
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn cancelled_put_before_rename_cleans_tmp_workspace() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+
+        let bucket = "tmp-clean-cancelled-bucket";
+        let object = "cancelled-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterQuotaReservation);
+        let cancelled_set = set_disks.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![8u8; TEST_OBJECT_SIZE]);
+            cancelled_set
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        put.abort();
+        let join_error = put.await.expect_err("the paused PUT task must be cancelled");
+        assert!(join_error.is_cancelled(), "the paused PUT task must not panic");
+
+        // Keep the barrier armed so a detached child cannot proceed and hide
+        // missing cancellation cleanup.
+        wait_for_tmp_workspace_to_drain(&temp_dirs, "cancelling before rename should drain the tmp workspace").await;
+
+        drop(barrier);
         drop(temp_dirs);
     }
 

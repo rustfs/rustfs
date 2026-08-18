@@ -15,25 +15,35 @@
 use rustfs_common::metrics::IlmAction;
 
 use crate::bucket::lifecycle::lifecycle::ObjectOpts;
+use crate::bucket::replication::ReplicationLifecycleBridge;
 pub(crate) use crate::bucket::replication::ReplicationStatusType;
 #[cfg(test)]
 pub(crate) use crate::bucket::replication::VersionPurgeStatusType;
 pub(crate) use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, ReplicationObjectBridge, replication_state_to_filemeta,
 };
-use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 use crate::storage_api_contracts::object::DeletedObject;
 
-pub(crate) type LifecycleReplicationConfig = ReplicationLifecycleConfig;
-
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) fn has_pending_version_purge(obj: &ObjectOpts) -> bool {
     obj.version_purge_status.is_pending()
 }
 
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) fn has_pending_object_replication(obj: &ObjectOpts) -> bool {
     replication_status_blocks_lifecycle(&obj.replication_status)
 }
 
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) fn has_pending_lifecycle_replication(obj: &ObjectOpts) -> bool {
     has_pending_object_replication(obj) || has_pending_version_purge(obj)
 }

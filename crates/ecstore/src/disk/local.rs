@@ -665,6 +665,7 @@ async fn remove_empty_directory_tree_under_mount_lease(
 }
 
 #[cfg(unix)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn remove_empty_directory_tree_with(
     root: &Path,
     before_descend: impl FnMut(&Path) -> std::io::Result<()>,
@@ -1016,13 +1017,29 @@ fn record_direct_read_page_fault_delta(path: &'static str, stage: &'static str, 
 /// When enabled, shard reads bypass the page cache using O_DIRECT flag.
 /// Requires aligned buffers (typically 512 bytes or 4096 bytes).
 /// Default: false (uses page cache via mmap/pread).
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: bool = false;
 
 /// Minimum shard size threshold for O_DIRECT reads.
 /// Only shards larger than this threshold will use O_DIRECT.
 /// Default: 4MB.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Enable O_DIRECT for erasure shard / multipart part data writes (Linux only).
@@ -1036,7 +1053,15 @@ const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
 /// EINVAL/EOPNOTSUPP (tmpfs, overlayfs, 9p, ...) latch the path off and fall
 /// back to buffered writes for the whole disk. Non-Linux always falls back.
 /// Default: false (buffered writes via the page cache, as before).
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: bool = false;
 const ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: &str = "RUSTFS_OBJECT_MMAP_POPULATE_ENABLE";
 const DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: bool = false;
@@ -1095,12 +1120,14 @@ macro_rules! cached_read_env {
 
 cached_read_env! {
     /// Check if O_DIRECT reads are enabled.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn is_direct_io_read_enabled() -> bool =
         rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE);
 }
 
 cached_read_env! {
     /// Check if O_DIRECT shard/part data writes are enabled.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn is_direct_io_write_enabled() -> bool =
         rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE);
 }
@@ -1456,6 +1483,7 @@ pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
 
 cached_read_env! {
     /// Get the O_DIRECT read threshold size.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn get_direct_io_read_threshold() -> usize =
         rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
 }
@@ -1673,12 +1701,20 @@ impl DirectIoWriteState {
 /// Target staging size for O_DIRECT writes, rounded up to the DIO alignment.
 /// Bounds the per-writer aligned bounce buffer and batches many shard blocks
 /// into one positioned write to keep the syscall count low.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DIRECT_WRITE_STAGING_BYTES: usize = 1024 * 1024;
 
 /// Aligned bounce-buffer capacity for a given DIO alignment: the target staging
 /// size rounded up to a whole multiple of `align` so the buffer address, every
 /// flushed batch length, and every write offset stay alignment-correct.
 /// Platform-independent (no O_DIRECT), so it is unit-tested on any host.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 fn direct_write_staging_capacity(align: usize) -> usize {
     debug_assert!(align.is_power_of_two() && align >= 512);
     DIRECT_WRITE_STAGING_BYTES.div_ceil(align) * align
@@ -1687,6 +1723,10 @@ fn direct_write_staging_capacity(align: usize) -> usize {
 /// Split `filled` staged bytes into the alignment-sized prefix written with
 /// O_DIRECT and the sub-alignment tail written buffered. Platform-independent,
 /// so the tail-boundary math is unit-tested on any host.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 fn direct_write_tail_split(filled: usize, align: usize) -> (usize, usize) {
     let aligned = filled - (filled % align);
     (aligned, filled - aligned)
@@ -2142,6 +2182,7 @@ fn set_delete_version_fail_after_data_staged(path: &str) {
 }
 
 #[cfg(test)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(crate) fn set_delete_version_fail_after_commit(root: &Path, path: &str) {
     DELETE_VERSION_FAIL_AFTER_COMMIT
         .lock()
@@ -2447,6 +2488,10 @@ enum SyncMode {
     FileOnly,
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
+)]
 struct FileCacheReclaimWriter {
     inner: File,
     reclaim_len: usize,
@@ -2454,6 +2499,10 @@ struct FileCacheReclaimWriter {
     reclaimed: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
+)]
 struct FileCacheReclaimReader {
     inner: File,
     reclaim_offset: u64,
@@ -2519,6 +2568,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim metrics emitter reached only from the Linux-gated reclaim paths (backlog#1823)"
+)]
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
     // Runs per read-stream page-cache reclaim window; skip the whole emission
     // (three metric-key constructions) when general metrics are disabled.
@@ -3071,6 +3124,7 @@ impl LocalIoBackend for StdBackend {
             use memmap2::MmapOptions;
             use std::time::{Duration as StdDuration, Instant as StdInstant};
 
+            #[allow(dead_code, reason = "mmap copy result slot kept beside the mapping it owns (backlog#1823)")]
             struct MmapCopyReadResult {
                 bytes: Bytes,
                 access_check_duration: StdDuration,
@@ -4704,6 +4758,10 @@ fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     Arc::new(StdBackend::new(root))
 }
 
+#[allow(
+    dead_code,
+    reason = "path cache and cwd slots retained beside the disk root they derive from (backlog#1823)"
+)]
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
@@ -5490,6 +5548,7 @@ impl LocalDisk {
         Ok(Self::resolve_abs_path_from(&self.root, path.as_ref()))
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn io_resolve_abs_path(&self, path: impl AsRef<Path>) -> PathBuf {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy();
@@ -5567,15 +5626,24 @@ impl LocalDisk {
     }
 
     // Check if a path is valid
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
+    )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         check_local_disk_valid_path(self.io_root(), path)
     }
 
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function reject_local_disk_symlink_components; no caller in this port (backlog#1823)"
+    )]
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(self.io_root(), path)
     }
 
     // Batch path generation with single lock acquisition
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn get_object_paths_batch(&self, requests: &[(String, String)]) -> Result<Vec<PathBuf>> {
         let mut results = Vec::with_capacity(requests.len());
         let mut cache_misses = Vec::new();
@@ -6488,12 +6556,13 @@ impl LocalDisk {
         Ok(f)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
         let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
         Ok(f)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
     }

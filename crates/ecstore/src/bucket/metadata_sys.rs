@@ -60,12 +60,14 @@ struct ConfigWriteLockProbeState {
 static CONFIG_WRITE_LOCK_PROBES: std::sync::OnceLock<StdMutex<Vec<Arc<ConfigWriteLockProbeState>>>> = std::sync::OnceLock::new();
 
 #[cfg(any(test, feature = "test-util"))]
+#[allow(dead_code, reason = "installed by tests behind `--features test-util` (backlog#1823)")]
 pub struct ConfigWriteLockProbe {
     state: Arc<ConfigWriteLockProbeState>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl ConfigWriteLockProbe {
+    #[allow(dead_code, reason = "installed by tests behind `--features test-util` (backlog#1823)")]
     pub fn install(bucket: &str) -> Self {
         let state = Arc::new(ConfigWriteLockProbeState {
             bucket: bucket.to_string(),
@@ -84,6 +86,7 @@ impl ConfigWriteLockProbe {
         Self { state }
     }
 
+    #[allow(dead_code, reason = "installed by tests behind `--features test-util` (backlog#1823)")]
     pub async fn wait_until_attempted(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
@@ -656,6 +659,16 @@ pub async fn update_under_transaction_lock(
     update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data).await
 }
 
+/// Clear one config file while the caller holds this bucket's transaction lock.
+pub async fn delete_under_transaction_lock(
+    guard: &BucketMetadataMutationGuard,
+    bucket: &str,
+    config_file: &str,
+) -> Result<OffsetDateTime> {
+    guard.ensure_valid(bucket)?;
+    delete_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file).await
+}
+
 pub async fn update_quota_if_incarnation(
     bucket: &str,
     data: Vec<u8>,
@@ -795,6 +808,14 @@ pub async fn acquire_bucket_metadata_transaction_lock(bucket: &str) -> Result<Bu
     acquire_config_write_guard(get_bucket_metadata_sys()?, bucket).await
 }
 
+/// Acquire the bucket transaction lock only if its incarnation still matches.
+pub async fn acquire_bucket_metadata_transaction_lock_for_incarnation(
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+) -> Result<BucketMetadataMutationGuard> {
+    acquire_config_write_guard_for_incarnation(get_bucket_metadata_sys()?, bucket, Some(expected_incarnation_id)).await
+}
+
 pub(crate) async fn acquire_bucket_metadata_transaction_lock_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -872,6 +893,10 @@ pub async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, OffsetDateTi
     bucket_meta_sys.get_bucket_policy_raw(bucket).await
 }
 
+#[allow(
+    dead_code,
+    reason = "free-function facade over the live BucketMetadataSys::get_bucket_acl_config; no caller in this port (backlog#1823)"
+)]
 pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -1086,6 +1111,10 @@ pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
     bucket_meta_sys.get_config_from_disk(bucket).await
 }
 
+#[allow(
+    dead_code,
+    reason = "ambient-facade variant of the live created_at_in; no caller in this port (backlog#1823)"
+)]
 pub async fn created_at(bucket: &str) -> Result<OffsetDateTime> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -1599,6 +1628,7 @@ impl BucketMetadataSys {
     /// [`Self::update`], with the payload computed from the loaded metadata
     /// instead of supplied up front. Loads through this system's own store so
     /// the read and the persisted write target the same instance.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn update_config_with<F>(&self, bucket: &str, config_file: &str, mutate: F) -> Result<OffsetDateTime>
     where
         F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
@@ -1703,6 +1733,7 @@ impl BucketMetadataSys {
     /// A miss is never published as an authoritative default, and a snapshot
     /// read before delete plus same-name recreation cannot replace the new
     /// generation.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(crate) async fn reload_from_store(&self, bucket: &str) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(Error::other("errInvalidArgument"));

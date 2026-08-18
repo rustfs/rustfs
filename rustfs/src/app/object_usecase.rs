@@ -86,8 +86,8 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+    preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -1074,7 +1074,7 @@ where
 }
 
 impl futures::Stream for MemoryTrackedBytesStream {
-    type Item = std::io::Result<Bytes>;
+    type Item = Result<Bytes, S3StdError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -1105,7 +1105,8 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
-            ))));
+            )
+            .into())));
         }
 
         let Some(bytes) = this.bytes.take() else {
@@ -1129,6 +1130,16 @@ impl futures::Stream for MemoryTrackedBytesStream {
             );
         }
         Poll::Ready(Some(Ok(bytes)))
+    }
+}
+
+impl ByteStream for MemoryTrackedBytesStream {
+    fn remaining_length(&self) -> RemainingLength {
+        if self.emitted || self.bytes.is_none() {
+            RemainingLength::new_exact(0)
+        } else {
+            RemainingLength::new_exact(self.expected)
+        }
     }
 }
 
@@ -2241,10 +2252,11 @@ fn get_object_resume_control(ctx: GetObjectResumeContext) -> GetObjectResumeCont
 /// disks" failures keep the existing fail-loud behavior.
 fn is_object_relocation_error(err: &std::io::Error) -> bool {
     let Some(inner) = err.get_ref() else { return false };
-    matches!(
-        inner.downcast_ref::<StorageError>(),
-        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..))
-    )
+    match inner.downcast_ref::<StorageError>() {
+        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..)) => true,
+        Some(StorageError::Io(source)) => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 /// Resolve the S3 request-body inter-chunk read timeout from the environment.
@@ -4148,7 +4160,7 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -5798,7 +5810,9 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, inbound_replication_put);
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
@@ -10080,6 +10094,19 @@ mod tests {
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
         assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
         assert_eq!(metadata.get("x-amz-meta-x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+
+        let mut replication_headers = HeaderMap::new();
+        insert_header(&mut replication_headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(
+            &mut replication_headers,
+            rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        let mut replica_metadata = HashMap::new();
+        let explicit_clear = has_replication_retention_update(&replication_headers, true);
+        apply_bucket_default_lock_retention("bucket", &state, &mut replica_metadata, explicit_clear).unwrap();
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
@@ -12866,7 +12893,10 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("a short memory body must fail the stream instead of serving a truncated body");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
         assert!(stream.next().await.is_none(), "stream must terminate after the error");
     }
 
@@ -12885,7 +12915,22 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn memory_blob_preserves_exact_remaining_length() {
+        let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            GetObjectBodyLifecycle::disabled(),
+        );
+
+        assert_eq!(blob.remaining_length().exact(), Some(5));
     }
 
     #[tokio::test]
@@ -13163,6 +13208,7 @@ mod tests {
             StorageError::FileNotFound,
             StorageError::ObjectNotFound("test-bucket".to_string(), "relocated-object".to_string()),
             StorageError::InsufficientReadQuorum("test-bucket".to_string(), "relocated-object".to_string()),
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "relocated shard disappeared")),
         ] {
             let reopen_count = Arc::new(AtomicUsize::new(0));
             let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
