@@ -32,7 +32,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -351,6 +351,20 @@ impl HealRequest {
 }
 
 /// Heal task
+/// Incremental view over a task's retained result items (HS-06).
+///
+/// `next_seq` is the cursor a client should pass on its next poll; `min_seq`
+/// is the oldest sequence still retained; `lagged` means the client's cursor
+/// fell behind `min_seq` and items were skipped — the client should restart
+/// from `min_seq`.
+#[derive(Debug, Clone)]
+pub struct HealResultWindow {
+    pub items: Vec<HealResultItem>,
+    pub next_seq: u64,
+    pub min_seq: u64,
+    pub lagged: bool,
+}
+
 pub struct HealTask {
     /// Task ID
     pub id: String,
@@ -373,8 +387,16 @@ pub struct HealTask {
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
-    /// Result items collected from storage heal calls.
-    pub result_items: Arc<RwLock<Vec<HealResultItem>>>,
+    /// Result items collected from storage heal calls, each stamped with a
+    /// monotonically increasing sequence number for incremental consumption
+    /// (the client passes the last seen seq back and receives only newer
+    /// items; see `get_result_items_since`).
+    pub result_items: Arc<RwLock<Vec<(u64, HealResultItem)>>>,
+    /// Next sequence number to assign; starts at 1.
+    next_item_seq: Arc<AtomicU64>,
+    /// Sequence number of the oldest item still inside the retention window;
+    /// equals `next_item_seq` while the window is empty.
+    min_available_seq: Arc<AtomicU64>,
     result_items_truncated: Arc<AtomicBool>,
     batch_failure: Arc<RwLock<Option<BatchHealFailure>>>,
     batch_failure_recorded: Arc<AtomicBool>,
@@ -426,6 +448,8 @@ impl HealTask {
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
+            next_item_seq: Arc::new(AtomicU64::new(1)),
+            min_available_seq: Arc::new(AtomicU64::new(1)),
             result_items_truncated: Arc::new(AtomicBool::new(false)),
             batch_failure: Arc::new(RwLock::new(None)),
             batch_failure_recorded: Arc::new(AtomicBool::new(false)),
@@ -911,7 +935,45 @@ impl HealTask {
     }
 
     pub async fn get_result_items(&self) -> Vec<HealResultItem> {
+        self.result_items.read().await.iter().map(|(_, item)| item.clone()).collect()
+    }
+
+    /// Sequence-stamped retained window, used when archiving a completed
+    /// task so incremental cursors survive the transition (HS-06).
+    pub async fn get_seqed_result_items(&self) -> Vec<(u64, HealResultItem)> {
         self.result_items.read().await.clone()
+    }
+
+    /// Incremental result window (HS-06): `since = None` returns the full
+    /// retained window (legacy snapshot semantics); `since = Some(seq)`
+    /// returns only items stamped with a sequence greater than `seq`.
+    /// `lagged` warns that the caller's cursor fell behind the window start
+    /// and items were skipped (the response carries `min_seq` as the catch-up
+    /// cursor).
+    pub async fn get_result_items_since(&self, since: Option<u64>) -> HealResultWindow {
+        let result_items = self.result_items.read().await;
+        let next_seq = self.next_item_seq.load(Ordering::Relaxed);
+        let min_seq = self.min_available_seq.load(Ordering::Relaxed);
+        let mut lagged = false;
+        let items = match since {
+            None => result_items.iter().map(|(_, item)| item.clone()).collect::<Vec<_>>(),
+            Some(cursor) => {
+                if cursor + 1 < min_seq {
+                    lagged = true;
+                }
+                result_items
+                    .iter()
+                    .filter(|(seq, _)| *seq > cursor)
+                    .map(|(_, item)| item.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        HealResultWindow {
+            items,
+            next_seq,
+            min_seq,
+            lagged,
+        }
     }
 
     pub fn result_items_truncated(&self) -> bool {
@@ -919,10 +981,17 @@ impl HealTask {
     }
 
     async fn record_result_item(&self, result: HealResultItem) {
+        let seq = self.next_item_seq.fetch_add(1, Ordering::Relaxed);
         let mut result_items = self.result_items.write().await;
         if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {
-            result_items.push(result);
+            result_items.push((seq, result));
         } else {
+            // Slide the window: the oldest item leaves and the cursor for the
+            // oldest still-available item moves forward with it.
+            result_items.remove(0);
+            self.min_available_seq
+                .store(result_items.first().map_or(seq, |(oldest, _)| *oldest), Ordering::Relaxed);
+            result_items.push((seq, result));
             self.result_items_truncated.store(true, Ordering::Relaxed);
         }
     }
@@ -3878,6 +3947,69 @@ mod tests {
 
         assert_eq!(task.get_result_items().await.len(), MAX_RETAINED_HEAL_RESULT_ITEMS);
         assert!(task.result_items_truncated());
+    }
+
+    // HS-06 (backlog#1870): incremental result windows.
+    #[tokio::test]
+    async fn result_items_seq_is_monotonic_and_incremental_slices_work() {
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(HealRequest::bucket("bucket-a".to_string()), storage);
+
+        for round in 0..5u64 {
+            let item = HealResultItem {
+                object_size: round as usize,
+                ..Default::default()
+            };
+            task.record_result_item(item).await;
+        }
+
+        let full = task.get_result_items_since(None).await;
+        assert_eq!(full.items.len(), 5, "None keeps the full-snapshot semantics");
+        assert_eq!(full.next_seq, 6, "next_seq is one past the last assigned");
+        assert_eq!(full.min_seq, 1, "nothing was evicted yet");
+        assert!(!full.lagged);
+
+        // Incremental: only items newer than the cursor.
+        let incremental = task.get_result_items_since(Some(3)).await;
+        assert_eq!(
+            incremental.items.iter().map(|item| item.object_size).collect::<Vec<_>>(),
+            vec![3, 4],
+            "only sequences greater than the cursor are returned"
+        );
+        assert_eq!(incremental.next_seq, 6);
+
+        // A cursor at the head is not lagging.
+        assert!(!task.get_result_items_since(Some(0)).await.lagged);
+    }
+
+    #[tokio::test]
+    async fn result_items_window_slide_moves_min_seq_and_flags_lagging_cursors() {
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(HealRequest::bucket("bucket-a".to_string()), storage);
+
+        // Fill the window completely, then push two more items: seq 1 and 2
+        // are evicted by the slide.
+        for _ in 0..(MAX_RETAINED_HEAL_RESULT_ITEMS + 2) {
+            task.record_result_item(HealResultItem::default()).await;
+        }
+
+        let full = task.get_result_items_since(None).await;
+        assert_eq!(full.items.len(), MAX_RETAINED_HEAL_RESULT_ITEMS);
+        assert_eq!(full.min_seq, 3, "each evicted head item moved the oldest-available cursor");
+        assert!(task.result_items_truncated());
+
+        // A client still polling from before the eviction is lagging.
+        let lagging = task.get_result_items_since(Some(0)).await;
+        assert!(lagging.lagged, "a cursor behind min_seq must be flagged");
+        assert_eq!(lagging.min_seq, 3, "the response tells the client where to restart");
+
+        // A cursor inside the window is fine.
+        assert!(!task.get_result_items_since(Some(3)).await.lagged);
+
+        // The lagging client restarts from min_seq and gets the full window.
+        let catch_up = task.get_result_items_since(Some(3)).await;
+        assert_eq!(catch_up.items.len(), MAX_RETAINED_HEAL_RESULT_ITEMS - 1);
+        assert!(!catch_up.lagged);
     }
 
     #[tokio::test]

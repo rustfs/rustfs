@@ -205,3 +205,12 @@ pub const DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default MRF replay batch size.
 pub const DEFAULT_HEAL_MRF_REPLAY_BATCH: usize = 256;
+
+/// Environment variable selecting how admin heal starts behave when the
+/// requested path overlaps an already running or queued heal: `merge`
+/// (default, keep today's dedup/merge semantics) or `minio_error` (return a
+/// typed already-running / overlapping-paths rejection like madmin).
+pub const ENV_HEAL_OVERLAP_POLICY: &str = "RUSTFS_HEAL_OVERLAP_POLICY";
+
+/// Default overlap policy: merge duplicate/overlapping requests.
+pub const DEFAULT_HEAL_OVERLAP_POLICY: &str = "merge";
