@@ -782,6 +782,7 @@ const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
+const ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE: &str = "RUSTFS_GET_SMALL_BODY_ONCE_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
 const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
 const GET_READER_STREAM_POLL_PENDING: &str = "pending";
@@ -811,6 +812,18 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_small_body_once_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false))
+    }
 }
 
 fn is_get_seek_buffer_enabled() -> bool {
@@ -930,6 +943,30 @@ struct MemoryTrackedBytesStream {
     source: &'static str,
     _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     lifecycle: GetObjectBodyLifecycle,
+}
+
+struct MemoryOnceBodyOwner {
+    bytes: Bytes,
+    _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    // Body::Once has no poll hook, so this opt-in path only holds the request
+    // guard until the bytes are dropped; the result status remains unknown.
+    _lifecycle: GetObjectBodyLifecycle,
+}
+
+impl MemoryOnceBodyOwner {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>, lifecycle: GetObjectBodyLifecycle) -> Self {
+        Self {
+            bytes,
+            _guard: guard,
+            _lifecycle: lifecycle,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MemoryOnceBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -4160,7 +4197,12 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = if is_get_small_body_once_enabled() && bytes_len == remaining {
+            let owner = MemoryOnceBodyOwner::new(bytes, guard, lifecycle);
+            StreamingBlob::from_bytes(Bytes::from_owner(owner))
+        } else {
+            StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle))
+        };
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -12953,6 +12995,46 @@ mod tests {
         );
 
         assert_eq!(blob.remaining_length().exact(), Some(5));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_holds_guard_until_bytes_drop() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let initial = GetObjectGuard::concurrent_count();
+            let guard = GetObjectGuard::new();
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"hello"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::tracked(guard),
+            );
+            let mut body = s3s::Body::from(blob);
+            let bytes = body.take_bytes().expect("opt-in exact memory body should stay on Body::Once");
+
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+            drop(bytes);
+            assert_eq!(GetObjectGuard::concurrent_count(), initial);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_rejects_length_mismatch() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"test"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::disabled(),
+            );
+            let mut body = s3s::Body::from(blob);
+
+            assert!(body.take_bytes().is_none(), "mismatched memory body must keep the guarded stream path");
+        });
     }
 
     #[tokio::test]
